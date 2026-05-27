@@ -1,0 +1,27 @@
+[package]
+name = "av-mesh"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Local AV cache mesh prototype with UDP-FEC cache replication and HLS egress"
+repository = "https://github.com/wavey-ai/av-mesh"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+bytes = "1.9"
+clap = { version = "4.5", features = ["derive"] }
+http = "1"
+message-packetizer = { path = "../message-packetizer" }
+playlists = { path = "../playlists" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.45", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+web-service = { path = "../web-services/web-service" }
+
+[patch."https://github.com/wavey-ai/playlists.git"]
+playlists = { path = "../playlists" }
+
