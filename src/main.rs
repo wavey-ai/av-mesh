@@ -3,7 +3,7 @@ mod control;
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use control::{
     packetize_control_message, reassemble_unsigned_control_packets, MeshControlEvent,
     MeshControlMessage,
@@ -12,23 +12,32 @@ use http::{Method, Request, StatusCode};
 use playlists::chunk_cache::ChunkCache;
 use playlists::mesh::{CacheMesh, CacheMeshConfig, CacheMeshHandle};
 use playlists::Options as CacheOptions;
+use rist_core_pure::{packet::rtcp::NackMode, time::ntp_now, ReceivedPayload};
+use rist_mio_pure::{MainMioReceiver, SimpleMioReceiver};
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::net::UdpSocket;
-use tokio::sync::RwLock;
-use tokio::time::sleep;
-use tracing::{info, warn};
+use tokio::{
+    net::UdpSocket,
+    sync::{watch, RwLock},
+    time::{interval, sleep, MissedTickBehavior},
+};
+use tracing::{debug, info, warn};
 use web_service::{
     load_default_tls_base64, load_tls_base64_from_paths, H2H3Server, HandlerResponse,
     HandlerResult, Router, Server, ServerBuilder, ServerError, StreamWriter,
 };
 
 const DEFAULT_STREAM_ID: u64 = 1;
+const DEFAULT_FLOW_ID: u32 = 0x7273_7401;
+const MAX_RIST_DRAIN_PER_TICK: usize = 128;
 const PART_WAIT_MS: u64 = 3_000;
+const RIST_POLL_MS: u64 = 1;
+const RTCP_INTERVAL_MS: u64 = 20;
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "av-mesh", about = "Run a local AV mesh node")]
@@ -47,6 +56,15 @@ struct Args {
 
     #[arg(long, default_value = "127.0.0.1:10001")]
     ingest_bind: SocketAddr,
+
+    #[arg(long, default_value = "127.0.0.1:7000")]
+    rist_bind: SocketAddr,
+
+    #[arg(long, value_enum, default_value = "main")]
+    rist_profile: RistProfile,
+
+    #[arg(long, value_parser = parse_u32_auto, default_value = "0x72737401")]
+    flow_id: u32,
 
     #[arg(long, default_value_t = 9444)]
     http_port: u16,
@@ -71,6 +89,21 @@ struct Args {
 
     #[arg(long, default_value_t = 2048)]
     slot_kb: usize,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RistProfile {
+    Simple,
+    Main,
+}
+
+impl RistProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Simple => "simple",
+            Self::Main => "main",
+        }
+    }
 }
 
 #[tokio::main]
@@ -116,9 +149,38 @@ async fn main() -> Result<()> {
         "mesh control message packetized"
     );
 
-    let ingest_cache = Arc::clone(&cache);
-    let ingest_bind = args.ingest_bind;
-    let ingest_task = tokio::spawn(async move { run_udp_ingest(ingest_bind, ingest_cache).await });
+    let (ingest_shutdown_tx, ingest_shutdown_rx) = watch::channel(());
+
+    let udp_socket = UdpSocket::bind(args.ingest_bind)
+        .await
+        .with_context(|| format!("failed to bind UDP ingest on {}", args.ingest_bind))?;
+    info!(bind = %udp_socket.local_addr()?, "UDP contributor ingest listening");
+    let udp_ingest_task = tokio::spawn(run_udp_ingest(
+        udp_socket,
+        Arc::clone(&cache),
+        ingest_shutdown_rx.clone(),
+    ));
+
+    let rist_config = RistIngestConfig {
+        bind: args.rist_bind,
+        profile: args.rist_profile,
+        flow_id: args.flow_id,
+    };
+    let rist_receiver =
+        RistReceiver::bind(rist_config.profile, rist_config.bind, rist_config.flow_id)
+            .with_context(|| format!("failed to bind RIST ingest on {}", rist_config.bind))?;
+    info!(
+        bind = %rist_config.bind,
+        profile = rist_config.profile.as_str(),
+        flow_id = format_args!("0x{:08x}", rist_config.flow_id),
+        "RIST contributor ingest listening"
+    );
+    let rist_ingest_task = tokio::spawn(run_rist_ingest(
+        rist_receiver,
+        rist_config,
+        Arc::clone(&cache),
+        ingest_shutdown_rx,
+    ));
 
     let (cert, key) = load_tls(&args)?;
     let router = Box::new(AppRouter::new(Arc::clone(&cache), Arc::clone(&mesh_handle)));
@@ -135,7 +197,13 @@ async fn main() -> Result<()> {
 
     println!("node:    {} ({})", node_id, args.region);
     println!("mesh:    {}", mesh_handle.local_addr());
-    println!("ingest:  udp://{}", args.ingest_bind);
+    println!("udp:     udp://{}", args.ingest_bind);
+    println!(
+        "rist:    rist://127.0.0.1:{} profile={} flow_id=0x{:08x}",
+        args.rist_bind.port(),
+        args.rist_profile.as_str(),
+        args.flow_id
+    );
     println!(
         "hls:     https://127.0.0.1:{}/live/stream.m3u8",
         args.http_port
@@ -144,9 +212,11 @@ async fn main() -> Result<()> {
 
     tokio::signal::ctrl_c().await?;
     mesh_handle.shutdown();
+    let _ = ingest_shutdown_tx.send(());
     let _ = handle.shutdown_tx.send(());
     let _ = handle.finished_rx.await;
-    ingest_task.abort();
+    let _ = udp_ingest_task.await;
+    let _ = rist_ingest_task.await;
     Ok(())
 }
 
@@ -159,6 +229,18 @@ impl Args {
         self.window_parts = self.window_parts.max(self.parts_per_segment * 3).max(6);
         self.slot_kb = self.slot_kb.max(64);
         Ok(self)
+    }
+}
+
+fn parse_u32_auto(value: &str) -> std::result::Result<u32, String> {
+    let trimmed = value.trim();
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        u32::from_str_radix(hex, 16).map_err(|err| err.to_string())
+    } else {
+        trimmed.parse::<u32>().map_err(|err| err.to_string())
     }
 }
 
@@ -178,20 +260,127 @@ fn load_tls(args: &Args) -> Result<(String, String)> {
     }
 }
 
-async fn run_udp_ingest(bind: SocketAddr, cache: Arc<LiveTsCache>) -> Result<()> {
-    let socket = UdpSocket::bind(bind)
-        .await
-        .with_context(|| format!("failed to bind UDP ingest on {bind}"))?;
-    info!(bind = %socket.local_addr()?, "UDP contributor ingest listening");
-
+async fn run_udp_ingest(
+    socket: UdpSocket,
+    cache: Arc<LiveTsCache>,
+    mut shutdown_rx: watch::Receiver<()>,
+) -> Result<()> {
     let mut buf = vec![0u8; 65_536];
     loop {
-        let (len, peer) = socket.recv_from(&mut buf).await?;
-        if len == 0 {
-            continue;
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                cache.rotate_if_due(true).await?;
+                info!("UDP contributor ingest shutting down");
+                return Ok(());
+            }
+            received = socket.recv_from(&mut buf) => {
+                let (len, peer) = received?;
+                if len == 0 {
+                    continue;
+                }
+                if let Err(error) = cache.push_payload(&buf[..len]).await {
+                    warn!(peer = %peer, error = %error, "failed to cache UDP contributor payload");
+                }
+            }
         }
-        if let Err(error) = cache.push_payload(&buf[..len]).await {
-            warn!(peer = %peer, error = %error, "failed to cache contributor payload");
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RistIngestConfig {
+    bind: SocketAddr,
+    profile: RistProfile,
+    flow_id: u32,
+}
+
+enum RistReceiver {
+    Simple(SimpleMioReceiver),
+    Main(MainMioReceiver),
+}
+
+impl RistReceiver {
+    fn bind(profile: RistProfile, addr: SocketAddr, flow_id: u32) -> io::Result<Self> {
+        match profile {
+            RistProfile::Simple => {
+                SimpleMioReceiver::bind(addr, flow_id, "av-mesh", NackMode::Range).map(Self::Simple)
+            }
+            RistProfile::Main => {
+                MainMioReceiver::bind(addr, flow_id, "av-mesh", NackMode::Range).map(Self::Main)
+            }
+        }
+    }
+
+    fn try_recv_payload(
+        &mut self,
+        buf: &mut [u8],
+    ) -> io::Result<Option<(SocketAddr, ReceivedPayload)>> {
+        match self {
+            Self::Simple(receiver) => receiver.try_recv_payload(buf),
+            Self::Main(receiver) => receiver.try_recv_payload(buf),
+        }
+    }
+
+    fn poll_rtcp_and_send(&mut self, now: Instant, now_ntp: u64) -> io::Result<()> {
+        match self {
+            Self::Simple(receiver) => receiver.poll_rtcp_and_send(now, now_ntp).map(|_| ()),
+            Self::Main(receiver) => receiver.poll_rtcp_and_send(now, now_ntp).map(|_| ()),
+        }
+    }
+}
+
+async fn run_rist_ingest(
+    mut receiver: RistReceiver,
+    config: RistIngestConfig,
+    cache: Arc<LiveTsCache>,
+    mut shutdown_rx: watch::Receiver<()>,
+) -> Result<()> {
+    let mut buf = vec![0u8; 65_536];
+    let mut poll = interval(Duration::from_millis(RIST_POLL_MS));
+    poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut last_rtcp = Instant::now();
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                cache.rotate_if_due(true).await?;
+                info!("RIST contributor ingest shutting down");
+                return Ok(());
+            }
+            _ = poll.tick() => {
+                for _ in 0..MAX_RIST_DRAIN_PER_TICK {
+                    match receiver.try_recv_payload(&mut buf) {
+                        Ok(Some((peer, payload))) => {
+                            if payload.duplicate {
+                                continue;
+                            }
+                            if payload.recovered {
+                                debug!(peer = %peer, "RIST payload recovered by protocol repair");
+                            }
+                            if let Err(error) = cache.push_payload(&payload.payload).await {
+                                warn!(peer = %peer, error = %error, "failed to cache RIST payload");
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(error) => {
+                            warn!(bind = %config.bind, error = %error, "RIST receive failed");
+                            break;
+                        }
+                    }
+                }
+
+                cache.rotate_if_due(false).await?;
+
+                let now = Instant::now();
+                if now.duration_since(last_rtcp) >= Duration::from_millis(RTCP_INTERVAL_MS) {
+                    if let Err(error) = receiver.poll_rtcp_and_send(now, ntp_now()) {
+                        if error.kind() != io::ErrorKind::WouldBlock {
+                            debug!(error = %error, "RIST RTCP poll failed");
+                        }
+                    }
+                    last_rtcp = now;
+                }
+            }
         }
     }
 }
@@ -250,6 +439,24 @@ impl LiveTsCache {
             if now.duration_since(state.current_started) >= self.part_target
                 || state.current.len() >= self.max_part_bytes
             {
+                state.take_current(now, now_ms)
+            } else {
+                None
+            }
+        };
+
+        if let Some(part) = finalized {
+            self.commit_part(part).await?;
+        }
+        Ok(())
+    }
+
+    async fn rotate_if_due(&self, force: bool) -> Result<()> {
+        let now = Instant::now();
+        let now_ms = now_unix_ms();
+        let finalized = {
+            let mut state = self.state.write().await;
+            if force || now.duration_since(state.current_started) >= self.part_target {
                 state.take_current(now, now_ms)
             } else {
                 None
@@ -719,5 +926,160 @@ mod tests {
         assert_eq!(parse_part_path("/live/part42.ts"), Some(42));
         assert_eq!(parse_segment_path("/live/seg7.ts"), Some(7));
         assert_eq!(parse_part_path("/live/seg7.ts"), None);
+    }
+
+    #[test]
+    fn parses_decimal_and_hex_flow_ids() {
+        assert_eq!(parse_u32_auto("0x72737401").unwrap(), DEFAULT_FLOW_ID);
+        assert_eq!(parse_u32_auto("1920168961").unwrap(), DEFAULT_FLOW_ID);
+    }
+
+    #[tokio::test]
+    async fn rist_ingest_writes_cache_parts() {
+        use tokio::time::timeout;
+
+        let bind = unused_loopback_addr();
+        let cache = LiveTsCache::new(1, Duration::from_millis(100), 2, 6, 64).await;
+        let receiver = RistReceiver::bind(RistProfile::Main, bind, DEFAULT_FLOW_ID).unwrap();
+        let config = RistIngestConfig {
+            bind,
+            profile: RistProfile::Main,
+            flow_id: DEFAULT_FLOW_ID,
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let task = tokio::spawn(run_rist_ingest(
+            receiver,
+            config,
+            Arc::clone(&cache),
+            shutdown_rx,
+        ));
+
+        send_rist_payloads(bind, 4).await;
+
+        let bytes = timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some((bytes, _hash)) = cache.get_part_blocking(0).await {
+                    break bytes;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(!bytes.is_empty());
+        assert!(cache.playlist().await.contains("part0.ts"));
+
+        let _ = shutdown_tx.send(());
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rist_ingest_replicates_to_peer_cache() {
+        use playlists::mesh::{CacheMesh, CacheMeshConfig};
+        use tokio::time::timeout;
+
+        let mesh_a_addr = unused_loopback_addr();
+        let mesh_b_addr = unused_loopback_addr();
+        let rist_addr = unused_loopback_addr();
+
+        let cache_a = LiveTsCache::new(1, Duration::from_millis(100), 2, 6, 64).await;
+        let cache_b = LiveTsCache::new(1, Duration::from_millis(100), 2, 6, 64).await;
+
+        let mesh_a = CacheMesh::new(
+            Arc::clone(&cache_a.chunk_cache),
+            CacheMeshConfig::new("uk-test", "uk", mesh_a_addr).with_peer(mesh_b_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        let mesh_b = CacheMesh::new(
+            Arc::clone(&cache_b.chunk_cache),
+            CacheMeshConfig::new("us-test", "us", mesh_b_addr).with_peer(mesh_a_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+
+        let receiver = RistReceiver::bind(RistProfile::Main, rist_addr, DEFAULT_FLOW_ID).unwrap();
+        let config = RistIngestConfig {
+            bind: rist_addr,
+            profile: RistProfile::Main,
+            flow_id: DEFAULT_FLOW_ID,
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let task = tokio::spawn(run_rist_ingest(
+            receiver,
+            config,
+            Arc::clone(&cache_a),
+            shutdown_rx,
+        ));
+
+        send_rist_payloads(rist_addr, 4).await;
+
+        let bytes = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some((bytes, hash)) = cache_b.chunk_cache.get_for_stream_id(1, 0).await {
+                    if hash != 0 || !bytes.is_empty() {
+                        break bytes;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(!bytes.is_empty());
+        assert!(cache_b.playlist().await.contains("part0.ts"));
+
+        let _ = shutdown_tx.send(());
+        task.await.unwrap().unwrap();
+        mesh_a.shutdown();
+        mesh_b.shutdown();
+    }
+
+    fn unused_loopback_addr() -> SocketAddr {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        drop(socket);
+        addr
+    }
+
+    async fn send_rist_payloads(peer: SocketAddr, count: usize) {
+        use rist_core_pure::time::ntp_now;
+        use rist_mio_pure::MainMioSender;
+        use std::net::{Ipv4Addr, SocketAddrV4};
+
+        let local = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+        let mut sender = MainMioSender::connect(local, peer, DEFAULT_FLOW_ID, 8192).unwrap();
+        let mut feedback_buf = vec![0u8; 65_536];
+        let payload = vec![0x47; 1316];
+
+        for _ in 0..count {
+            loop {
+                match sender.send_payload(&payload, ntp_now(), Instant::now()) {
+                    Ok(_) => break,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        drive_rist_feedback(&mut sender, &mut feedback_buf);
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("RIST send failed: {error}"),
+                }
+            }
+            drive_rist_feedback(&mut sender, &mut feedback_buf);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn drive_rist_feedback(sender: &mut rist_mio_pure::MainMioSender, buf: &mut [u8]) {
+        for _ in 0..32 {
+            match sender.try_recv_feedback_and_retransmit(buf) {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("RIST feedback failed: {error}"),
+            }
+        }
     }
 }

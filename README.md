@@ -11,9 +11,8 @@ The first implementation keeps the control surface intentionally small:
 - `web-service` serves HTTPS HLS playlists, parts, segments, and health checks.
 - `message-packetizer` packetizes mesh control events so the control plane can
   later move over RIST/SRT-sized datagrams with signing enabled.
-- Contributor ingest is a local UDP MPEG-TS datagram endpoint in this prototype.
-  RIST and the existing `web-services/upload-response` UDP-FEC ingest path are
-  the intended production protocol frontends.
+- Contributor ingest supports pure-Rust RIST and a local UDP MPEG-TS datagram
+  endpoint in this prototype.
 
 ## Local two-region prototype
 
@@ -26,7 +25,8 @@ cargo run -- \
   --mesh-bind 127.0.0.1:9101 \
   --peer 127.0.0.1:9201 \
   --http-port 9444 \
-  --ingest-bind 127.0.0.1:10001
+  --ingest-bind 127.0.0.1:10001 \
+  --rist-bind 127.0.0.1:7000
 ```
 
 Run the US node:
@@ -38,10 +38,11 @@ cargo run -- \
   --mesh-bind 127.0.0.1:9201 \
   --peer 127.0.0.1:9101 \
   --http-port 9445 \
-  --ingest-bind 127.0.0.1:10002
+  --ingest-bind 127.0.0.1:10002 \
+  --rist-bind 127.0.0.1:7001
 ```
 
-Publish a local MPEG-TS stream into the UK node:
+Publish a local MPEG-TS stream into the UK node over plain UDP:
 
 ```bash
 ffmpeg -re -f lavfi -i testsrc=size=1280x720:rate=30 \
@@ -49,6 +50,12 @@ ffmpeg -re -f lavfi -i testsrc=size=1280x720:rate=30 \
   -c:v libx264 -preset veryfast -tune zerolatency \
   -c:a aac -f mpegts udp://127.0.0.1:10001?pkt_size=1316
 ```
+
+Or publish over RIST with a RIST-capable sender such as OBS:
+
+- URL: `rist://127.0.0.1:7000`
+- Profile: `main`
+- Flow ID: `0x72737401`
 
 Then read either region:
 
@@ -66,11 +73,10 @@ This is not the final multi-protocol edge deployment yet. The current milestone
 proves the shared-cache behavior needed by the requested mesh:
 
 1. A node can discover configured peers with UDP-FEC `HELLO` frames.
-2. A node can write media parts to a `playlists::ChunkCache`.
+2. A node can ingest MPEG-TS from RIST or local UDP and write media parts to a
+   `playlists::ChunkCache`.
 3. Peers replicate those slots over UDP-FEC and serve them as HLS parts.
 4. Region identity is explicit, starting with `uk` and `us`.
 
-Next steps are to wire RIST ingest from `web-services/examples/obs-rist-llhls`
-or `upload-response::PureRistIngest` into the same `LiveTsCache`, then broaden
-contributor protocols behind the existing `web-services` proxy/ingest layer.
-
+Next steps are to broaden contributor protocols behind the existing
+`web-services` proxy/ingest layer and add production deployment topology.
