@@ -124,7 +124,7 @@ scripts/two-region-smoke.sh
 The smoke script builds the binaries, starts UK and US nodes on local high
 ports with UDP-FEC and RIST mesh backhauls configured, sends distinct HTTP, raw
 UDP, UDP-FEC, and RIST ingest payloads into UK, and verifies those exact HLS
-parts can be read from both UK and US.
+parts can be read from both UK and US by several concurrent clients.
 
 ## Current scope
 

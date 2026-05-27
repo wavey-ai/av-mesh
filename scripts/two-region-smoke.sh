@@ -20,6 +20,7 @@ UK_RIST="${UK_RIST:-127.0.0.1:17000}"
 US_RIST="${US_RIST:-127.0.0.1:17001}"
 UK_RIST_MESH="${UK_RIST_MESH:-127.0.0.1:17100}"
 US_RIST_MESH="${US_RIST_MESH:-127.0.0.1:17101}"
+SMOKE_USERS="${SMOKE_USERS:-8}"
 
 UK_PID=""
 US_PID=""
@@ -116,6 +117,45 @@ publish_part() {
   wait_for_part "${US_HTTP}" us "${seq}" "${payload}"
 }
 
+verify_many_hls_users() {
+  local pids=()
+  local failed=0
+
+  for region in uk us; do
+    local port
+    if [[ "${region}" == "uk" ]]; then
+      port="${UK_HTTP}"
+    else
+      port="${US_HTTP}"
+    fi
+
+    for user in $(seq 1 "${SMOKE_USERS}"); do
+      (
+        curl -skfs "https://127.0.0.1:${port}/live/stream.m3u8" >/dev/null
+        for part in 0 1 2 3; do
+          curl -skfs "https://127.0.0.1:${port}/live/part${part}.ts" >/dev/null
+        done
+      ) >"${TMPDIR}/${region}-user-${user}.log" 2>&1 &
+      pids+=("$!")
+    done
+  done
+
+  for pid in "${pids[@]}"; do
+    if ! wait "${pid}"; then
+      failed=1
+    fi
+  done
+
+  if [[ "${failed}" -ne 0 ]]; then
+    echo "one or more concurrent HLS users failed" >&2
+    echo "--- uk log ---" >&2
+    sed -n '1,200p' "${TMPDIR}/uk.log" >&2 || true
+    echo "--- us log ---" >&2
+    sed -n '1,200p' "${TMPDIR}/us.log" >&2 || true
+    return 1
+  fi
+}
+
 cd "${ROOT}"
 cargo build --locked --bins
 
@@ -164,5 +204,6 @@ publish_part http 0 'AVMESH-SMOKE-HTTP-0000'
 publish_part udp 1 'AVMESH-SMOKE-UDP-0001'
 publish_part udp-fec 2 'AVMESH-SMOKE-FEC-0002'
 publish_part rist 3 'AVMESH-SMOKE-RIST-0003'
+verify_many_hls_users
 
-echo "two-region smoke passed: http udp udp-fec rist ingest all reached UK and US HLS"
+echo "two-region smoke passed: http udp udp-fec rist ingest reached UK/US HLS for ${SMOKE_USERS} users per region"
