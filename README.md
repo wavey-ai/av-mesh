@@ -59,6 +59,16 @@ ffmpeg -re -f lavfi -i testsrc=size=1280x720:rate=30 \
   -c:a aac -f mpegts udp://127.0.0.1:10001?pkt_size=1316
 ```
 
+For stdin-based tooling, the prototype also includes a raw UDP sender:
+
+```bash
+ffmpeg -re -f lavfi -i testsrc=size=1280x720:rate=30 \
+  -f lavfi -i sine=frequency=1000:sample_rate=48000 \
+  -c:v libx264 -preset veryfast -tune zerolatency \
+  -c:a aac -f mpegts - | \
+  cargo run --bin udp-send -- 127.0.0.1:10001
+```
+
 Or publish MPEG-TS bytes over UDP-FEC:
 
 ```bash
@@ -74,6 +84,16 @@ Or publish over RIST with a RIST-capable sender such as OBS:
 - URL: `rist://127.0.0.1:7000`
 - Profile: `main`
 - Flow ID: `0x72737401`
+
+Or with the included stdin RIST sender:
+
+```bash
+ffmpeg -re -f lavfi -i testsrc=size=1280x720:rate=30 \
+  -f lavfi -i sine=frequency=1000:sample_rate=48000 \
+  -c:v libx264 -preset veryfast -tune zerolatency \
+  -c:a aac -f mpegts - | \
+  cargo run --bin rist-send -- 127.0.0.1:7000
+```
 
 Or publish MPEG-TS bytes over HTTP:
 
@@ -102,9 +122,9 @@ scripts/two-region-smoke.sh
 ```
 
 The smoke script builds the binaries, starts UK and US nodes on local high
-ports with UDP-FEC and RIST mesh backhauls configured, sends a small UDP-FEC
-ingest payload into UK, and verifies both UK and US can serve
-`/live/stream.m3u8` plus `/live/part0.ts`.
+ports with UDP-FEC and RIST mesh backhauls configured, sends distinct HTTP, raw
+UDP, UDP-FEC, and RIST ingest payloads into UK, and verifies those exact HLS
+parts can be read from both UK and US.
 
 ## Current scope
 

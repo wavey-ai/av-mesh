@@ -3,6 +3,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${ROOT}/target/debug/av-mesh"
+UDP_BIN="${ROOT}/target/debug/udp-send"
+UDP_FEC_BIN="${ROOT}/target/debug/udp-fec-send"
+RIST_BIN="${ROOT}/target/debug/rist-send"
 TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/av-mesh-smoke.XXXXXX")"
 
 UK_MESH="${UK_MESH:-127.0.0.1:19101}"
@@ -50,19 +53,30 @@ wait_for_health() {
   return 1
 }
 
-wait_for_playlist() {
+wait_for_part() {
   local port="$1"
   local name="$2"
-  for _ in $(seq 1 100); do
-    if curl -skfs "https://127.0.0.1:${port}/live/stream.m3u8" | tee "${TMPDIR}/${name}.m3u8" | grep -q 'part0.ts'; then
-      return 0
+  local seq="$3"
+  local expected="$4"
+  local part_file="${TMPDIR}/${name}-part${seq}.ts"
+  local expected_file="${TMPDIR}/expected-part${seq}.ts"
+
+  printf '%s' "${expected}" >"${expected_file}"
+  for _ in $(seq 1 120); do
+    if curl -skfs "https://127.0.0.1:${port}/live/part${seq}.ts" >"${part_file}"; then
+      if cmp -s "${expected_file}" "${part_file}"; then
+        return 0
+      fi
     fi
     sleep 0.1
   done
 
-  echo "${name} playlist did not expose part0.ts" >&2
+  echo "${name} part${seq}.ts did not match expected payload" >&2
+  echo "--- ${name} part${seq}.ts ---" >&2
+  cat "${part_file}" >&2 || true
+  echo >&2
   echo "--- ${name} playlist ---" >&2
-  cat "${TMPDIR}/${name}.m3u8" >&2 || true
+  curl -skfs "https://127.0.0.1:${port}/live/stream.m3u8" >&2 || true
   echo "--- uk log ---" >&2
   sed -n '1,200p' "${TMPDIR}/uk.log" >&2 || true
   echo "--- us log ---" >&2
@@ -70,13 +84,40 @@ wait_for_playlist() {
   return 1
 }
 
-part_size() {
-  local port="$1"
-  curl -skfs "https://127.0.0.1:${port}/live/part0.ts" | wc -c | tr -d '[:space:]'
+publish_part() {
+  local protocol="$1"
+  local seq="$2"
+  local payload="$3"
+
+  case "${protocol}" in
+    http)
+      printf '%s' "${payload}" \
+        | curl -skfs -X POST --data-binary @- "https://127.0.0.1:${UK_HTTP}/ingest" >/dev/null
+      ;;
+    udp)
+      printf '%s' "${payload}" \
+        | "${UDP_BIN}" "${UK_UDP}" >/dev/null
+      ;;
+    udp-fec)
+      printf '%s' "${payload}" \
+        | "${UDP_FEC_BIN}" "${UK_FEC}" >/dev/null
+      ;;
+    rist)
+      printf '%s' "${payload}" \
+        | "${RIST_BIN}" "${UK_RIST}" >/dev/null
+      ;;
+    *)
+      echo "unknown publish protocol: ${protocol}" >&2
+      return 1
+      ;;
+  esac
+
+  wait_for_part "${UK_HTTP}" uk "${seq}" "${payload}"
+  wait_for_part "${US_HTTP}" us "${seq}" "${payload}"
 }
 
 cd "${ROOT}"
-cargo build --locked
+cargo build --locked --bins
 
 RUST_LOG="${RUST_LOG:-av_mesh=info,playlists=info,web_service=info}" \
   "${BIN}" \
@@ -119,18 +160,9 @@ US_PID="$!"
 wait_for_health "${UK_HTTP}" uk
 wait_for_health "${US_HTTP}" us
 
-printf 'AVMESH-SMOKE-PART-0001' \
-  | "${ROOT}/target/debug/udp-fec-send" "${UK_FEC}" >/dev/null
+publish_part http 0 'AVMESH-SMOKE-HTTP-0000'
+publish_part udp 1 'AVMESH-SMOKE-UDP-0001'
+publish_part udp-fec 2 'AVMESH-SMOKE-FEC-0002'
+publish_part rist 3 'AVMESH-SMOKE-RIST-0003'
 
-wait_for_playlist "${UK_HTTP}" uk
-wait_for_playlist "${US_HTTP}" us
-
-UK_PART_SIZE="$(part_size "${UK_HTTP}")"
-US_PART_SIZE="$(part_size "${US_HTTP}")"
-
-if [[ "${UK_PART_SIZE}" -le 0 || "${US_PART_SIZE}" -le 0 ]]; then
-  echo "expected non-empty HLS parts; uk=${UK_PART_SIZE} us=${US_PART_SIZE}" >&2
-  exit 1
-fi
-
-echo "two-region smoke passed: uk_part=${UK_PART_SIZE} bytes us_part=${US_PART_SIZE} bytes"
+echo "two-region smoke passed: http udp udp-fec rist ingest all reached UK and US HLS"

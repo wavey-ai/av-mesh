@@ -28,11 +28,10 @@ jobs:
         run: cargo fmt --check
 
       - name: Check
-        run: cargo check --locked
+        run: cargo check --locked --bins
 
       - name: Test
         run: cargo test --locked
 
       - name: Two-region smoke
         run: scripts/two-region-smoke.sh
-
