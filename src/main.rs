@@ -64,7 +64,7 @@ struct Args {
     #[arg(long, value_enum, default_value = "main")]
     rist_profile: RistProfile,
 
-    #[arg(long, value_parser = parse_u32_auto, default_value = "0x72737401")]
+    #[arg(long, value_parser = parse_u32_auto, default_value_t = DEFAULT_FLOW_ID)]
     flow_id: u32,
 
     #[arg(long, default_value_t = 9444)]

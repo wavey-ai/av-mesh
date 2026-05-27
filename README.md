@@ -77,6 +77,16 @@ Then read either region:
 The server uses the local TLS material from `web-services`; clients will need to
 trust that cert or use an insecure local test client.
 
+For a quick automated check, run:
+
+```bash
+scripts/two-region-smoke.sh
+```
+
+The smoke script builds the binary, starts UK and US nodes on local high ports,
+posts a small HTTP ingest payload into UK, and verifies both UK and US can serve
+`/live/stream.m3u8` plus `/live/part0.ts`.
+
 ## Current scope
 
 This is not the final multi-protocol edge deployment yet. The current milestone
