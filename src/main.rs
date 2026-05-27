@@ -4,7 +4,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use clap::Parser;
-use control::{packetize_control_message, MeshControlEvent, MeshControlMessage};
+use control::{
+    packetize_control_message, reassemble_unsigned_control_packets, MeshControlEvent,
+    MeshControlMessage,
+};
 use http::{Method, Request, StatusCode};
 use playlists::chunk_cache::ChunkCache;
 use playlists::mesh::{CacheMesh, CacheMeshConfig, CacheMeshHandle};
@@ -106,8 +109,10 @@ async fn main() -> Result<()> {
             mesh_addr: mesh_handle.local_addr().to_string(),
         },
     })?;
+    let control_echo = reassemble_unsigned_control_packets(&control_packets)?;
     info!(
         packets = control_packets.len(),
+        event = ?control_echo.event,
         "mesh control message packetized"
     );
 
