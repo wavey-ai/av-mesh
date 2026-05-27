@@ -152,7 +152,7 @@ dependencies = [
  "bytes",
  "clap 4.6.1",
  "http",
- "message-packetizer 0.1.0",
+ "message-packetizer 0.1.0 (git+https://github.com/wavey-ai/message-packetizer.git)",
  "playlists",
  "serde",
  "serde_json",
@@ -1225,6 +1225,8 @@ checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
 [[package]]
 name = "message-packetizer"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9be79722528933c355e5eabe3d7ff8a08a1a0f7da00463cbba05e6bdd632647"
 dependencies = [
  "base64",
  "bytes",
@@ -1244,8 +1246,7 @@ dependencies = [
 [[package]]
 name = "message-packetizer"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9be79722528933c355e5eabe3d7ff8a08a1a0f7da00463cbba05e6bdd632647"
+source = "git+https://github.com/wavey-ai/message-packetizer.git#b3512022f0c0af47899cf341bde7fcb77e6f9c06"
 dependencies = [
  "base64",
  "bytes",
@@ -1366,6 +1367,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 [[package]]
 name = "playlists"
 version = "0.1.3"
+source = "git+https://github.com/wavey-ai/playlists.git#18cd7597cea87dd79dd5d6e397ed0735943f880b"
 dependencies = [
  "access-unit",
  "bytes",
@@ -2510,6 +2512,7 @@ dependencies = [
 [[package]]
 name = "web-service"
 version = "0.1.0"
+source = "git+https://github.com/wavey-ai/web-services.git#c714423c16063c39445e6fba4383dd2fff84a6ee"
 dependencies = [
  "anyhow",
  "async-trait",
