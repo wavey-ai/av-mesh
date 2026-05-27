@@ -11,8 +11,8 @@ The first implementation keeps the control surface intentionally small:
 - `web-service` serves HTTPS HLS playlists, parts, segments, and health checks.
 - `message-packetizer` packetizes mesh control events so the control plane can
   later move over RIST/SRT-sized datagrams with signing enabled.
-- Contributor ingest supports pure-Rust RIST and a local UDP MPEG-TS datagram
-  endpoint in this prototype.
+- Contributor ingest supports pure-Rust RIST, local UDP MPEG-TS datagrams, and
+  streamed HTTP `POST`/`PUT /ingest` uploads in this prototype.
 
 ## Local two-region prototype
 
@@ -57,6 +57,16 @@ Or publish over RIST with a RIST-capable sender such as OBS:
 - Profile: `main`
 - Flow ID: `0x72737401`
 
+Or publish MPEG-TS bytes over HTTP:
+
+```bash
+ffmpeg -re -f lavfi -i testsrc=size=1280x720:rate=30 \
+  -f lavfi -i sine=frequency=1000:sample_rate=48000 \
+  -c:v libx264 -preset veryfast -tune zerolatency \
+  -c:a aac -f mpegts - | \
+  curl -k -X POST --data-binary @- https://127.0.0.1:9444/ingest
+```
+
 Then read either region:
 
 - UK playlist: `https://127.0.0.1:9444/live/stream.m3u8`
@@ -73,8 +83,8 @@ This is not the final multi-protocol edge deployment yet. The current milestone
 proves the shared-cache behavior needed by the requested mesh:
 
 1. A node can discover configured peers with UDP-FEC `HELLO` frames.
-2. A node can ingest MPEG-TS from RIST or local UDP and write media parts to a
-   `playlists::ChunkCache`.
+2. A node can ingest MPEG-TS from RIST, local UDP, or streamed HTTP and write
+   media parts to a `playlists::ChunkCache`.
 3. Peers replicate those slots over UDP-FEC and serve them as HLS parts.
 4. Region identity is explicit, starting with `uk` and `us`.
 

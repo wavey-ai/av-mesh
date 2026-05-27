@@ -12,6 +12,7 @@ anyhow = "1.0"
 async-trait = "0.1"
 bytes = "1.9"
 clap = { version = "4.5", features = ["derive"] }
+futures-util = "0.3"
 http = "1"
 message-packetizer = { git = "https://github.com/wavey-ai/message-packetizer.git" }
 playlists = { git = "https://github.com/wavey-ai/playlists.git" }

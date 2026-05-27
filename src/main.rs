@@ -8,6 +8,7 @@ use control::{
     packetize_control_message, reassemble_unsigned_control_packets, MeshControlEvent,
     MeshControlMessage,
 };
+use futures_util::StreamExt;
 use http::{Method, Request, StatusCode};
 use playlists::chunk_cache::ChunkCache;
 use playlists::mesh::{CacheMesh, CacheMeshConfig, CacheMeshHandle};
@@ -28,7 +29,7 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 use web_service::{
-    load_default_tls_base64, load_tls_base64_from_paths, H2H3Server, HandlerResponse,
+    load_default_tls_base64, load_tls_base64_from_paths, BodyStream, H2H3Server, HandlerResponse,
     HandlerResult, Router, Server, ServerBuilder, ServerError, StreamWriter,
 };
 
@@ -777,6 +778,11 @@ impl Router for AppRouter {
                 Some(Bytes::from_static(b"OK")),
                 Some("text/plain"),
             )),
+            "/ingest" => Ok(response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                Some(Bytes::from_static(b"use POST or PUT /ingest\n")),
+                Some("text/plain"),
+            )),
             "/live/stream.m3u8" => {
                 let playlist = self.cache.playlist().await;
                 Ok(response(
@@ -815,6 +821,54 @@ impl Router for AppRouter {
                 Ok(response(StatusCode::NOT_FOUND, None, None))
             }
         }
+    }
+
+    async fn route_body(
+        &self,
+        req: Request<()>,
+        mut body: BodyStream,
+    ) -> HandlerResult<HandlerResponse> {
+        if req.uri().path() != "/ingest" {
+            return self.route(req).await;
+        }
+
+        if req.method() != Method::POST && req.method() != Method::PUT {
+            return Ok(response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                Some(Bytes::from_static(b"use POST or PUT /ingest\n")),
+                Some("text/plain"),
+            ));
+        }
+
+        let mut chunks = 0u64;
+        let mut bytes = 0u64;
+        while let Some(next) = body.next().await {
+            let chunk = next?;
+            if chunk.is_empty() {
+                continue;
+            }
+            bytes = bytes.saturating_add(chunk.len() as u64);
+            chunks = chunks.saturating_add(1);
+            self.cache.push_payload(&chunk).await.map_err(|err| {
+                ServerError::Config(format!("HTTP ingest cache write failed: {err}"))
+            })?;
+        }
+        self.cache
+            .rotate_if_due(true)
+            .await
+            .map_err(|err| ServerError::Config(format!("HTTP ingest flush failed: {err}")))?;
+
+        Ok(response(
+            StatusCode::ACCEPTED,
+            Some(Bytes::from(format!(
+                "accepted {bytes} bytes in {chunks} chunks\n"
+            ))),
+            Some("text/plain"),
+        ))
+    }
+
+    fn has_body_handler(&self, path: &str) -> bool {
+        path == "/ingest"
     }
 
     fn is_streaming(&self, _path: &str) -> bool {
@@ -975,6 +1029,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_body_ingest_writes_cache_parts() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let router = AppRouter::new(Arc::clone(&cache), Arc::clone(&mesh));
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/ingest")
+            .body(())
+            .unwrap();
+        let body: BodyStream = Box::pin(futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(b"http-part-0")),
+            Ok(Bytes::from_static(b"http-part-1")),
+        ]));
+
+        let response = router.route_body(req, body).await.unwrap();
+
+        assert_eq!(response.status, StatusCode::ACCEPTED);
+        let (bytes, _hash) = cache.get_part_blocking(0).await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"http-part-0http-part-1"));
+        assert!(cache.playlist().await.contains("part0.ts"));
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn http_body_ingest_replicates_to_peer_cache() {
+        use playlists::mesh::{CacheMesh, CacheMeshConfig};
+        use tokio::time::timeout;
+
+        let mesh_a_addr = unused_loopback_addr();
+        let mesh_b_addr = unused_loopback_addr();
+        let cache_a = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let cache_b = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+
+        let mesh_a = CacheMesh::new(
+            Arc::clone(&cache_a.chunk_cache),
+            CacheMeshConfig::new("uk-http-test", "uk", mesh_a_addr).with_peer(mesh_b_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        let mesh_b = CacheMesh::new(
+            Arc::clone(&cache_b.chunk_cache),
+            CacheMeshConfig::new("us-http-test", "us", mesh_b_addr).with_peer(mesh_a_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+
+        let router = AppRouter::new(Arc::clone(&cache_a), Arc::new(mesh_a));
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/ingest")
+            .body(())
+            .unwrap();
+        let body: BodyStream = Box::pin(futures_util::stream::iter(vec![Ok(Bytes::from_static(
+            b"http-mesh-part",
+        ))]));
+
+        let response = router.route_body(req, body).await.unwrap();
+        assert_eq!(response.status, StatusCode::ACCEPTED);
+
+        let bytes = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some((bytes, hash)) = cache_b.chunk_cache.get_for_stream_id(1, 0).await {
+                    if hash != 0 || !bytes.is_empty() {
+                        break bytes;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(bytes, Bytes::from_static(b"http-mesh-part"));
+        mesh_b.shutdown();
+    }
+
+    #[tokio::test]
     async fn rist_ingest_replicates_to_peer_cache() {
         use playlists::mesh::{CacheMesh, CacheMeshConfig};
         use tokio::time::timeout;
@@ -1037,6 +1170,17 @@ mod tests {
         task.await.unwrap().unwrap();
         mesh_a.shutdown();
         mesh_b.shutdown();
+    }
+
+    async fn mesh_handle_for_tests(cache: Arc<ChunkCache>) -> Arc<CacheMeshHandle> {
+        let mesh = CacheMesh::new(
+            cache,
+            CacheMeshConfig::new("test-node", "test", unused_loopback_addr()),
+        )
+        .start()
+        .await
+        .unwrap();
+        Arc::new(mesh)
     }
 
     fn unused_loopback_addr() -> SocketAddr {
