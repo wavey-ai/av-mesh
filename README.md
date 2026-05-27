@@ -1,5 +1,7 @@
 # av-mesh
 
+[![CI](https://github.com/wavey-ai/av-mesh/actions/workflows/ci.yml/badge.svg)](https://github.com/wavey-ai/av-mesh/actions/workflows/ci.yml)
+
 `av-mesh` is the local prototype for a two-region audio/video mesh. A contributor
 can publish media into one region, cache slots replicate to other regions over
 UDP with RaptorQ FEC, and users can read the replicated stream as HLS-style

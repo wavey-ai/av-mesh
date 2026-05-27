@@ -72,7 +72,7 @@ part_size() {
 }
 
 cd "${ROOT}"
-cargo build
+cargo build --locked
 
 RUST_LOG="${RUST_LOG:-av_mesh=info,playlists=info,web_service=info}" \
   "${BIN}" \
@@ -124,4 +124,3 @@ if [[ "${UK_PART_SIZE}" -le 0 || "${US_PART_SIZE}" -le 0 ]]; then
 fi
 
 echo "two-region smoke passed: uk_part=${UK_PART_SIZE} bytes us_part=${US_PART_SIZE} bytes"
-
