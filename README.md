@@ -4,15 +4,15 @@
 
 `av-mesh` is the local prototype for a two-region audio/video mesh. A contributor
 can publish media into one region, cache slots replicate to other regions over
-UDP with RaptorQ FEC, and users can read the replicated stream as HLS-style
-MPEG-TS parts from any region.
+UDP with RaptorQ FEC and an optional RIST backhaul, and users can read the
+replicated stream as HLS-style MPEG-TS parts from any region.
 
 The first implementation keeps the control surface intentionally small:
 
 - `playlists::mesh` provides UDP-FEC cache discovery and slot replication.
 - `web-service` serves HTTPS HLS playlists, parts, segments, and health checks.
-- `message-packetizer` packetizes mesh control events so the control plane can
-  later move over RIST/SRT-sized datagrams with signing enabled.
+- `message-packetizer` packetizes mesh control events and RIST mesh cache-slot
+  frames into RIST/SRT-sized datagrams.
 - Contributor ingest supports pure-Rust RIST, UDP-FEC, local UDP MPEG-TS
   datagrams, and streamed HTTP `POST`/`PUT /ingest` uploads in this prototype.
 
@@ -29,7 +29,9 @@ cargo run -- \
   --http-port 9444 \
   --ingest-bind 127.0.0.1:10001 \
   --fec-bind 127.0.0.1:12001 \
-  --rist-bind 127.0.0.1:7000
+  --rist-bind 127.0.0.1:7000 \
+  --rist-mesh-bind 127.0.0.1:7100 \
+  --rist-mesh-peer 127.0.0.1:7101
 ```
 
 Run the US node:
@@ -43,7 +45,9 @@ cargo run -- \
   --http-port 9445 \
   --ingest-bind 127.0.0.1:10002 \
   --fec-bind 127.0.0.1:12002 \
-  --rist-bind 127.0.0.1:7001
+  --rist-bind 127.0.0.1:7001 \
+  --rist-mesh-bind 127.0.0.1:7101 \
+  --rist-mesh-peer 127.0.0.1:7100
 ```
 
 Publish a local MPEG-TS stream into the UK node over plain UDP:
@@ -98,8 +102,9 @@ scripts/two-region-smoke.sh
 ```
 
 The smoke script builds the binaries, starts UK and US nodes on local high
-ports, sends a small UDP-FEC ingest payload into UK, and verifies both UK and US
-can serve `/live/stream.m3u8` plus `/live/part0.ts`.
+ports with UDP-FEC and RIST mesh backhauls configured, sends a small UDP-FEC
+ingest payload into UK, and verifies both UK and US can serve
+`/live/stream.m3u8` plus `/live/part0.ts`.
 
 ## Current scope
 
@@ -109,7 +114,8 @@ proves the shared-cache behavior needed by the requested mesh:
 1. A node can discover configured peers with UDP-FEC `HELLO` frames.
 2. A node can ingest MPEG-TS from RIST, UDP-FEC, local UDP, or streamed HTTP and
    write media parts to a `playlists::ChunkCache`.
-3. Peers replicate those slots over UDP-FEC and serve them as HLS parts.
+3. Peers replicate those slots over UDP-FEC and optional RIST mesh backhaul, then
+   serve them as HLS parts.
 4. Region identity is explicit, starting with `uk` and `us`.
 
 Next steps are to broaden contributor protocols behind the existing

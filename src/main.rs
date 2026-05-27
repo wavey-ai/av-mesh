@@ -3,7 +3,7 @@ mod control;
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use av_mesh::udp_fec::UdpFecReceiver;
-use bytes::Bytes;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use clap::{Parser, ValueEnum};
 use control::{
     packetize_control_message, reassemble_unsigned_control_packets, MeshControlEvent,
@@ -11,15 +11,16 @@ use control::{
 };
 use futures_util::StreamExt;
 use http::{Method, Request, StatusCode};
+use message_packetizer::{SignedMessageDemuxer, SignedMessageEnvelope};
 use playlists::chunk_cache::ChunkCache;
 use playlists::mesh::{CacheMesh, CacheMeshConfig, CacheMeshHandle};
 use playlists::Options as CacheOptions;
 use rist_core_pure::{packet::rtcp::NackMode, time::ntp_now, ReceivedPayload};
-use rist_mio_pure::{MainMioReceiver, SimpleMioReceiver};
+use rist_mio_pure::{MainMioReceiver, MainMioSender, SimpleMioReceiver, SimpleMioSender};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -36,10 +37,15 @@ use web_service::{
 
 const DEFAULT_STREAM_ID: u64 = 1;
 const DEFAULT_FLOW_ID: u32 = 0x7273_7401;
+const DEFAULT_RIST_MESH_FLOW_ID: u32 = 0x6d65_7368;
 const MAX_RIST_DRAIN_PER_TICK: usize = 128;
+const RIST_HISTORY_PACKETS: usize = 8192;
 const PART_WAIT_MS: u64 = 3_000;
 const RIST_POLL_MS: u64 = 1;
+const RIST_MESH_SYNC_MS: u64 = 20;
 const RTCP_INTERVAL_MS: u64 = 20;
+const RIST_MESH_MAGIC: &[u8; 8] = b"AVRMSH1\0";
+const RIST_MESH_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "av-mesh", about = "Run a local AV mesh node")]
@@ -65,11 +71,20 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:7000")]
     rist_bind: SocketAddr,
 
+    #[arg(long, default_value = "127.0.0.1:7100")]
+    rist_mesh_bind: SocketAddr,
+
+    #[arg(long = "rist-mesh-peer")]
+    rist_mesh_peers: Vec<SocketAddr>,
+
     #[arg(long, value_enum, default_value = "main")]
     rist_profile: RistProfile,
 
     #[arg(long, value_parser = parse_u32_auto, default_value_t = DEFAULT_FLOW_ID)]
     flow_id: u32,
+
+    #[arg(long, value_parser = parse_u32_auto, default_value_t = DEFAULT_RIST_MESH_FLOW_ID)]
+    rist_mesh_flow_id: u32,
 
     #[arg(long, default_value_t = 9444)]
     http_port: u16,
@@ -194,8 +209,53 @@ async fn main() -> Result<()> {
         rist_receiver,
         rist_config,
         Arc::clone(&cache),
-        ingest_shutdown_rx,
+        ingest_shutdown_rx.clone(),
     ));
+
+    let rist_mesh_config = RistMeshConfig {
+        bind: args.rist_mesh_bind,
+        profile: args.rist_profile,
+        flow_id: args.rist_mesh_flow_id,
+    };
+    let rist_mesh_receiver = RistReceiver::bind(
+        rist_mesh_config.profile,
+        rist_mesh_config.bind,
+        rist_mesh_config.flow_id,
+    )
+    .with_context(|| {
+        format!(
+            "failed to bind RIST mesh backhaul on {}",
+            rist_mesh_config.bind
+        )
+    })?;
+    let rist_mesh_remote_slots = Arc::new(RwLock::new(HashSet::new()));
+    info!(
+        bind = %rist_mesh_config.bind,
+        profile = rist_mesh_config.profile.as_str(),
+        flow_id = format_args!("0x{:08x}", rist_mesh_config.flow_id),
+        "RIST cache mesh backhaul listening"
+    );
+    let rist_mesh_receive_task = tokio::spawn(run_rist_mesh_receive(
+        rist_mesh_receiver,
+        rist_mesh_config,
+        node_id.clone(),
+        Arc::clone(&cache.chunk_cache),
+        Arc::clone(&rist_mesh_remote_slots),
+        ingest_shutdown_rx.clone(),
+    ));
+    let rist_mesh_send_task = if args.rist_mesh_peers.is_empty() {
+        None
+    } else {
+        Some(tokio::spawn(run_rist_mesh_send(
+            node_id.clone(),
+            rist_mesh_config.profile,
+            args.rist_mesh_peers.clone(),
+            rist_mesh_config.flow_id,
+            Arc::clone(&cache.chunk_cache),
+            Arc::clone(&rist_mesh_remote_slots),
+            ingest_shutdown_rx,
+        )))
+    };
 
     let (cert, key) = load_tls(&args)?;
     let router = Box::new(AppRouter::new(Arc::clone(&cache), Arc::clone(&mesh_handle)));
@@ -221,6 +281,13 @@ async fn main() -> Result<()> {
         args.flow_id
     );
     println!(
+        "rist-mesh: rist://127.0.0.1:{} profile={} flow_id=0x{:08x} peers={}",
+        args.rist_mesh_bind.port(),
+        args.rist_profile.as_str(),
+        args.rist_mesh_flow_id,
+        args.rist_mesh_peers.len()
+    );
+    println!(
         "hls:     https://127.0.0.1:{}/live/stream.m3u8",
         args.http_port
     );
@@ -234,6 +301,10 @@ async fn main() -> Result<()> {
     let _ = udp_ingest_task.await;
     let _ = fec_ingest_task.await;
     let _ = rist_ingest_task.await;
+    let _ = rist_mesh_receive_task.await;
+    if let Some(task) = rist_mesh_send_task {
+        let _ = task.await;
+    }
     Ok(())
 }
 
@@ -435,6 +506,488 @@ async fn run_rist_ingest(
                     }
                     last_rtcp = now;
                 }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RistMeshConfig {
+    bind: SocketAddr,
+    profile: RistProfile,
+    flow_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RistMeshFrame {
+    node_id: String,
+    stream_id: u64,
+    slot_id: u64,
+    payload: Bytes,
+}
+
+impl RistMeshFrame {
+    fn new(node_id: impl Into<String>, stream_id: u64, slot_id: u64, payload: Bytes) -> Self {
+        Self {
+            node_id: node_id.into(),
+            stream_id,
+            slot_id,
+            payload,
+        }
+    }
+
+    fn encode(&self) -> Result<Bytes> {
+        let node_id = self.node_id.as_bytes();
+        if node_id.len() > u16::MAX as usize {
+            bail!("RIST mesh node id too long");
+        }
+        if self.payload.len() > u32::MAX as usize {
+            bail!("RIST mesh payload too large");
+        }
+
+        let mut out = BytesMut::new();
+        out.put_slice(RIST_MESH_MAGIC);
+        out.put_u8(RIST_MESH_VERSION);
+        out.put_u16(node_id.len() as u16);
+        out.put_slice(node_id);
+        out.put_u64(self.stream_id);
+        out.put_u64(self.slot_id);
+        out.put_u32(self.payload.len() as u32);
+        out.put_slice(&self.payload);
+        Ok(out.freeze())
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < RIST_MESH_MAGIC.len() + 1 + 2 + 8 + 8 + 4 {
+            bail!("RIST mesh frame too short");
+        }
+        let mut buf = bytes;
+        if &buf[..RIST_MESH_MAGIC.len()] != RIST_MESH_MAGIC {
+            bail!("bad RIST mesh magic");
+        }
+        buf.advance(RIST_MESH_MAGIC.len());
+        let version = buf.get_u8();
+        if version != RIST_MESH_VERSION {
+            bail!("unsupported RIST mesh frame version {version}");
+        }
+
+        let node_id = read_rist_mesh_string(&mut buf)?;
+        if buf.remaining() < 20 {
+            bail!("truncated RIST mesh slot header");
+        }
+        let stream_id = buf.get_u64();
+        let slot_id = buf.get_u64();
+        let payload_len = buf.get_u32() as usize;
+        if buf.remaining() != payload_len {
+            bail!("RIST mesh payload length mismatch");
+        }
+
+        Ok(Self {
+            node_id,
+            stream_id,
+            slot_id,
+            payload: Bytes::copy_from_slice(&buf[..payload_len]),
+        })
+    }
+}
+
+fn read_rist_mesh_string(buf: &mut &[u8]) -> Result<String> {
+    if buf.remaining() < 2 {
+        bail!("missing RIST mesh string length");
+    }
+    let len = buf.get_u16() as usize;
+    if buf.remaining() < len {
+        bail!("truncated RIST mesh string");
+    }
+    let value = std::str::from_utf8(&buf[..len])?.to_string();
+    buf.advance(len);
+    Ok(value)
+}
+
+fn packetize_rist_mesh_frame(frame: &RistMeshFrame, sequence: u64) -> Result<Vec<Bytes>> {
+    let envelope = SignedMessageEnvelope {
+        sequence,
+        content: frame.encode()?.to_vec(),
+        timestamp: now_unix_ms() / 1_000,
+        signature: Vec::new(),
+    };
+    Ok(envelope.to_packets())
+}
+
+enum RistSender {
+    Simple(SimpleMioSender),
+    Main(MainMioSender),
+}
+
+impl RistSender {
+    fn connect(profile: RistProfile, peer: SocketAddr, flow_id: u32) -> io::Result<Self> {
+        let local = local_rist_sender_addr(peer);
+        match profile {
+            RistProfile::Simple => {
+                SimpleMioSender::connect(local, peer, flow_id, RIST_HISTORY_PACKETS)
+                    .map(Self::Simple)
+            }
+            RistProfile::Main => {
+                MainMioSender::connect(local, peer, flow_id, RIST_HISTORY_PACKETS).map(Self::Main)
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        match self {
+            Self::Simple(sender) => sender.local_addr(),
+            Self::Main(sender) => sender.local_addr(),
+        }
+    }
+
+    fn send_payload(&mut self, payload: &[u8], ntp_timestamp: u64, now: Instant) -> io::Result<()> {
+        match self {
+            Self::Simple(sender) => sender.send_payload(payload, ntp_timestamp, now).map(|_| ()),
+            Self::Main(sender) => sender.send_payload(payload, ntp_timestamp, now).map(|_| ()),
+        }
+    }
+
+    fn poll_rtcp_and_send(&mut self, now: Instant, ntp_timestamp: u64) -> io::Result<()> {
+        match self {
+            Self::Simple(sender) => sender.poll_rtcp_and_send(now, ntp_timestamp).map(|_| ()),
+            Self::Main(sender) => sender.poll_rtcp_and_send(now, ntp_timestamp).map(|_| ()),
+        }
+    }
+
+    fn drain_feedback(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        for _ in 0..MAX_RIST_DRAIN_PER_TICK {
+            match self {
+                Self::Simple(sender) => match sender.try_recv_feedback_and_retransmit(buf) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return Ok(()),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(error) => return Err(error),
+                },
+                Self::Main(sender) => match sender.try_recv_feedback_and_retransmit(buf) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return Ok(()),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(error) => return Err(error),
+                },
+            }
+        }
+        Ok(())
+    }
+}
+
+fn local_rist_sender_addr(peer: SocketAddr) -> SocketAddr {
+    match peer {
+        SocketAddr::V4(addr) => {
+            let ip = if addr.ip().is_loopback() {
+                Ipv4Addr::LOCALHOST
+            } else {
+                Ipv4Addr::UNSPECIFIED
+            };
+            SocketAddr::new(ip.into(), 0)
+        }
+        SocketAddr::V6(addr) => {
+            let ip = if addr.ip().is_loopback() {
+                Ipv6Addr::LOCALHOST
+            } else {
+                Ipv6Addr::UNSPECIFIED
+            };
+            SocketAddr::new(ip.into(), 0)
+        }
+    }
+}
+
+struct RistMeshPeerSender {
+    peer: SocketAddr,
+    sender: RistSender,
+    sent: HashMap<(u64, usize), usize>,
+}
+
+async fn send_rist_packet(
+    sender: &mut RistSender,
+    packet: &[u8],
+    feedback_buf: &mut [u8],
+) -> io::Result<()> {
+    for _ in 0..8 {
+        match sender.send_payload(packet, ntp_now(), Instant::now()) {
+            Ok(()) => {
+                let _ = sender.drain_feedback(feedback_buf);
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                sender.drain_feedback(feedback_buf)?;
+                tokio::task::yield_now().await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "RIST sender remained blocked",
+    ))
+}
+
+async fn run_rist_mesh_receive(
+    mut receiver: RistReceiver,
+    config: RistMeshConfig,
+    node_id: String,
+    cache: Arc<ChunkCache>,
+    remote_slots: Arc<RwLock<HashSet<(u64, usize)>>>,
+    mut shutdown_rx: watch::Receiver<()>,
+) -> Result<()> {
+    let mut payload_buf = vec![0u8; 65_536];
+    let mut poll = interval(Duration::from_millis(RIST_POLL_MS));
+    poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut last_rtcp = Instant::now();
+    let mut demuxers: HashMap<SocketAddr, SignedMessageDemuxer> = HashMap::new();
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                info!("RIST cache mesh receive task shutting down");
+                return Ok(());
+            }
+            _ = poll.tick() => {
+                for _ in 0..MAX_RIST_DRAIN_PER_TICK {
+                    match receiver.try_recv_payload(&mut payload_buf) {
+                        Ok(Some((peer, payload))) => {
+                            if payload.duplicate {
+                                continue;
+                            }
+                            apply_rist_mesh_packet(
+                                peer,
+                                &payload.payload,
+                                &node_id,
+                                &cache,
+                                &remote_slots,
+                                &mut demuxers,
+                            )
+                            .await;
+                        }
+                        Ok(None) => break,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(error) => {
+                            warn!(bind = %config.bind, error = %error, "RIST cache mesh receive failed");
+                            break;
+                        }
+                    }
+                }
+
+                let now = Instant::now();
+                if now.duration_since(last_rtcp) >= Duration::from_millis(RTCP_INTERVAL_MS) {
+                    if let Err(error) = receiver.poll_rtcp_and_send(now, ntp_now()) {
+                        if error.kind() != io::ErrorKind::WouldBlock {
+                            debug!(error = %error, "RIST cache mesh RTCP poll failed");
+                        }
+                    }
+                    last_rtcp = now;
+                }
+            }
+        }
+    }
+}
+
+async fn apply_rist_mesh_packet(
+    peer: SocketAddr,
+    packet: &[u8],
+    local_node_id: &str,
+    cache: &Arc<ChunkCache>,
+    remote_slots: &Arc<RwLock<HashSet<(u64, usize)>>>,
+    demuxers: &mut HashMap<SocketAddr, SignedMessageDemuxer>,
+) {
+    let demuxer = demuxers
+        .entry(peer)
+        .or_insert_with(SignedMessageDemuxer::new);
+    let (errors, messages) = {
+        let result = demuxer.process_packet(packet);
+        let errors = result
+            .errors
+            .into_iter()
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>();
+        (errors, result.messages)
+    };
+    for error in errors {
+        debug!(peer = %peer, error = %error, "RIST cache mesh packetizer error");
+    }
+
+    for envelope in messages {
+        let frame = match RistMeshFrame::decode(&envelope.content) {
+            Ok(frame) => frame,
+            Err(error) => {
+                warn!(peer = %peer, error = %error, "RIST cache mesh frame decode failed");
+                continue;
+            }
+        };
+        if frame.node_id == local_node_id {
+            continue;
+        }
+
+        let Ok(slot_id) = usize::try_from(frame.slot_id) else {
+            warn!(
+                peer = %peer,
+                node_id = frame.node_id,
+                stream_id = frame.stream_id,
+                slot_id = frame.slot_id,
+                "RIST cache mesh slot id does not fit usize"
+            );
+            continue;
+        };
+        if let Err(error) = cache
+            .add_for_stream_id(frame.stream_id, slot_id, frame.payload)
+            .await
+        {
+            warn!(
+                peer = %peer,
+                node_id = frame.node_id,
+                stream_id = frame.stream_id,
+                slot_id,
+                error,
+                "RIST cache mesh write failed"
+            );
+            continue;
+        }
+        remember_remote_slot(remote_slots, frame.stream_id, slot_id).await;
+        debug!(
+            peer = %peer,
+            node_id = frame.node_id,
+            stream_id = frame.stream_id,
+            slot_id,
+            "RIST cache mesh slot applied"
+        );
+    }
+}
+
+async fn remember_remote_slot(
+    remote_slots: &Arc<RwLock<HashSet<(u64, usize)>>>,
+    stream_id: u64,
+    slot_id: usize,
+) {
+    let mut slots = remote_slots.write().await;
+    slots.insert((stream_id, slot_id));
+    if slot_id >= 128 {
+        let cutoff = slot_id - 128;
+        slots.retain(|(candidate_stream, candidate_slot)| {
+            *candidate_stream != stream_id || *candidate_slot >= cutoff
+        });
+    }
+}
+
+async fn run_rist_mesh_send(
+    node_id: String,
+    profile: RistProfile,
+    peers: Vec<SocketAddr>,
+    flow_id: u32,
+    cache: Arc<ChunkCache>,
+    remote_slots: Arc<RwLock<HashSet<(u64, usize)>>>,
+    mut shutdown_rx: watch::Receiver<()>,
+) -> Result<()> {
+    let mut peer_senders = Vec::new();
+    for peer in peers {
+        let sender = RistSender::connect(profile, peer, flow_id)
+            .with_context(|| format!("failed to connect RIST cache mesh peer {peer}"))?;
+        info!(
+            peer = %peer,
+            local = %sender.local_addr()?,
+            profile = profile.as_str(),
+            flow_id = format_args!("0x{flow_id:08x}"),
+            "RIST cache mesh peer connected"
+        );
+        peer_senders.push(RistMeshPeerSender {
+            peer,
+            sender,
+            sent: HashMap::new(),
+        });
+    }
+
+    let mut feedback_buf = vec![0u8; 65_536];
+    let mut sequence = now_unix_ms();
+    let mut sync = interval(Duration::from_millis(RIST_MESH_SYNC_MS));
+    sync.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut last_rtcp = Instant::now();
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                info!("RIST cache mesh send task shutting down");
+                return Ok(());
+            }
+            _ = sync.tick() => {
+                let now = Instant::now();
+                for peer_sender in &mut peer_senders {
+                    if let Err(error) = peer_sender.sender.drain_feedback(&mut feedback_buf) {
+                        debug!(peer = %peer_sender.peer, error = %error, "RIST cache mesh feedback failed");
+                    }
+                    if now.duration_since(last_rtcp) >= Duration::from_millis(RTCP_INTERVAL_MS) {
+                        if let Err(error) = peer_sender.sender.poll_rtcp_and_send(now, ntp_now()) {
+                            if error.kind() != io::ErrorKind::WouldBlock {
+                                debug!(peer = %peer_sender.peer, error = %error, "RIST cache mesh sender RTCP failed");
+                            }
+                        }
+                    }
+
+                    for (stream_id, stream_idx) in cache.stream_ids().await {
+                        let Some(last) = cache.last(stream_idx) else {
+                            continue;
+                        };
+                        let next = peer_sender.sent
+                            .get(&(stream_id, stream_idx))
+                            .copied()
+                            .and_then(|slot| slot.checked_add(1))
+                            .unwrap_or(0);
+                        if next > last {
+                            continue;
+                        }
+
+                        for slot_id in next..=last {
+                            if remote_slots.read().await.contains(&(stream_id, slot_id)) {
+                                peer_sender.sent.insert((stream_id, stream_idx), slot_id);
+                                continue;
+                            }
+                            let Some((payload, hash)) = cache.get(stream_idx, slot_id).await else {
+                                continue;
+                            };
+                            if hash == 0 && payload.is_empty() {
+                                continue;
+                            }
+
+                            let frame = RistMeshFrame::new(
+                                node_id.clone(),
+                                stream_id,
+                                slot_id as u64,
+                                payload,
+                            );
+                            let packets = match packetize_rist_mesh_frame(&frame, sequence) {
+                                Ok(packets) => packets,
+                                Err(error) => {
+                                    warn!(stream_id, slot_id, error = %error, "RIST cache mesh packetize failed");
+                                    continue;
+                                }
+                            };
+                            sequence = sequence.wrapping_add(1);
+
+                            let mut sent_all_packets = true;
+                            for packet in packets {
+                                if let Err(error) =
+                                    send_rist_packet(&mut peer_sender.sender, &packet, &mut feedback_buf).await
+                                {
+                                    debug!(
+                                        peer = %peer_sender.peer,
+                                        stream_id,
+                                        slot_id,
+                                        error = %error,
+                                        "RIST cache mesh packet send failed"
+                                    );
+                                    sent_all_packets = false;
+                                    break;
+                                }
+                            }
+                            if sent_all_packets {
+                                peer_sender.sent.insert((stream_id, stream_idx), slot_id);
+                            }
+                        }
+                    }
+                }
+                last_rtcp = now;
             }
         }
     }
@@ -1190,6 +1743,82 @@ mod tests {
         .unwrap();
 
         assert_eq!(bytes, Bytes::from_static(b"fec-part-0"));
+    }
+
+    #[test]
+    fn rist_mesh_frame_packetizes_and_roundtrips() {
+        let frame = RistMeshFrame::new("uk", 7, 11, Bytes::from(vec![0x47; 4096]));
+        let packets = packetize_rist_mesh_frame(&frame, 42).unwrap();
+        assert!(packets.len() > 1);
+
+        let mut demuxer = SignedMessageDemuxer::new();
+        let mut decoded = None;
+        for packet in packets {
+            let result = demuxer.process_packet(&packet);
+            assert!(result.errors.is_empty());
+            if let Some(envelope) = result.messages.into_iter().next() {
+                decoded = Some(RistMeshFrame::decode(&envelope.content).unwrap());
+            }
+        }
+
+        assert_eq!(decoded.unwrap(), frame);
+    }
+
+    #[tokio::test]
+    async fn rist_mesh_backhaul_replicates_cache_slots() {
+        use tokio::time::timeout;
+
+        let mesh_addr = unused_loopback_addr();
+        let cache_a = LiveTsCache::new(7, Duration::from_millis(500), 2, 6, 64).await;
+        let cache_b = LiveTsCache::new(7, Duration::from_millis(500), 2, 6, 64).await;
+        let receiver =
+            RistReceiver::bind(RistProfile::Main, mesh_addr, DEFAULT_RIST_MESH_FLOW_ID).unwrap();
+        let config = RistMeshConfig {
+            bind: mesh_addr,
+            profile: RistProfile::Main,
+            flow_id: DEFAULT_RIST_MESH_FLOW_ID,
+        };
+        let remote_rx_slots = Arc::new(RwLock::new(HashSet::new()));
+        let remote_tx_slots = Arc::new(RwLock::new(HashSet::new()));
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let rx_task = tokio::spawn(run_rist_mesh_receive(
+            receiver,
+            config,
+            "us-test".into(),
+            Arc::clone(&cache_b.chunk_cache),
+            remote_rx_slots,
+            shutdown_rx.clone(),
+        ));
+        let tx_task = tokio::spawn(run_rist_mesh_send(
+            "uk-test".into(),
+            RistProfile::Main,
+            vec![mesh_addr],
+            DEFAULT_RIST_MESH_FLOW_ID,
+            Arc::clone(&cache_a.chunk_cache),
+            remote_tx_slots,
+            shutdown_rx,
+        ));
+
+        cache_a.push_payload(b"rist-mesh-part-0").await.unwrap();
+        cache_a.rotate_if_due(true).await.unwrap();
+
+        let bytes = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some((bytes, _hash)) = cache_b.get_part_blocking(0).await {
+                    break bytes;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(bytes, Bytes::from_static(b"rist-mesh-part-0"));
+        assert!(cache_b.playlist().await.contains("part0.ts"));
+
+        let _ = shutdown_tx.send(());
+        rx_task.await.unwrap().unwrap();
+        tx_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]

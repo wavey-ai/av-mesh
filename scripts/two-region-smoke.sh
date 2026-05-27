@@ -15,6 +15,8 @@ UK_FEC="${UK_FEC:-127.0.0.1:12001}"
 US_FEC="${US_FEC:-127.0.0.1:12002}"
 UK_RIST="${UK_RIST:-127.0.0.1:17000}"
 US_RIST="${US_RIST:-127.0.0.1:17001}"
+UK_RIST_MESH="${UK_RIST_MESH:-127.0.0.1:17100}"
+US_RIST_MESH="${US_RIST_MESH:-127.0.0.1:17101}"
 
 UK_PID=""
 US_PID=""
@@ -86,6 +88,8 @@ RUST_LOG="${RUST_LOG:-av_mesh=info,playlists=info,web_service=info}" \
   --ingest-bind "${UK_UDP}" \
   --fec-bind "${UK_FEC}" \
   --rist-bind "${UK_RIST}" \
+  --rist-mesh-bind "${UK_RIST_MESH}" \
+  --rist-mesh-peer "${US_RIST_MESH}" \
   --part-ms 100 \
   --parts-per-segment 2 \
   --window-parts 8 \
@@ -103,6 +107,8 @@ RUST_LOG="${RUST_LOG:-av_mesh=info,playlists=info,web_service=info}" \
   --ingest-bind "${US_UDP}" \
   --fec-bind "${US_FEC}" \
   --rist-bind "${US_RIST}" \
+  --rist-mesh-bind "${US_RIST_MESH}" \
+  --rist-mesh-peer "${UK_RIST_MESH}" \
   --part-ms 100 \
   --parts-per-segment 2 \
   --window-parts 8 \
