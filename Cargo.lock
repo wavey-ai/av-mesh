@@ -166,6 +166,7 @@ dependencies = [
  "http",
  "message-packetizer 0.1.0 (git+https://github.com/wavey-ai/message-packetizer.git)",
  "playlists",
+ "raptorq",
  "rist-core",
  "rist-mio",
  "serde",

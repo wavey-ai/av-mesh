@@ -2,6 +2,7 @@ mod control;
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
+use av_mesh::udp_fec::UdpFecReceiver;
 use bytes::Bytes;
 use clap::{Parser, ValueEnum};
 use control::{
@@ -57,6 +58,9 @@ struct Args {
 
     #[arg(long, default_value = "127.0.0.1:10001")]
     ingest_bind: SocketAddr,
+
+    #[arg(long, default_value = "127.0.0.1:12001")]
+    fec_bind: SocketAddr,
 
     #[arg(long, default_value = "127.0.0.1:7000")]
     rist_bind: SocketAddr,
@@ -162,6 +166,16 @@ async fn main() -> Result<()> {
         ingest_shutdown_rx.clone(),
     ));
 
+    let fec_socket = UdpSocket::bind(args.fec_bind)
+        .await
+        .with_context(|| format!("failed to bind UDP-FEC ingest on {}", args.fec_bind))?;
+    info!(bind = %fec_socket.local_addr()?, "UDP-FEC contributor ingest listening");
+    let fec_ingest_task = tokio::spawn(run_udp_fec_ingest(
+        fec_socket,
+        Arc::clone(&cache),
+        ingest_shutdown_rx.clone(),
+    ));
+
     let rist_config = RistIngestConfig {
         bind: args.rist_bind,
         profile: args.rist_profile,
@@ -199,6 +213,7 @@ async fn main() -> Result<()> {
     println!("node:    {} ({})", node_id, args.region);
     println!("mesh:    {}", mesh_handle.local_addr());
     println!("udp:     udp://{}", args.ingest_bind);
+    println!("fec:     udp+fec://{}", args.fec_bind);
     println!(
         "rist:    rist://127.0.0.1:{} profile={} flow_id=0x{:08x}",
         args.rist_bind.port(),
@@ -217,6 +232,7 @@ async fn main() -> Result<()> {
     let _ = handle.shutdown_tx.send(());
     let _ = handle.finished_rx.await;
     let _ = udp_ingest_task.await;
+    let _ = fec_ingest_task.await;
     let _ = rist_ingest_task.await;
     Ok(())
 }
@@ -267,12 +283,18 @@ async fn run_udp_ingest(
     mut shutdown_rx: watch::Receiver<()>,
 ) -> Result<()> {
     let mut buf = vec![0u8; 65_536];
+    let mut rotate = interval(Duration::from_millis(10));
+    rotate.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => {
                 cache.rotate_if_due(true).await?;
                 info!("UDP contributor ingest shutting down");
                 return Ok(());
+            }
+            _ = rotate.tick() => {
+                cache.rotate_if_due(false).await?;
             }
             received = socket.recv_from(&mut buf) => {
                 let (len, peer) = received?;
@@ -281,6 +303,38 @@ async fn run_udp_ingest(
                 }
                 if let Err(error) = cache.push_payload(&buf[..len]).await {
                     warn!(peer = %peer, error = %error, "failed to cache UDP contributor payload");
+                }
+            }
+        }
+    }
+}
+
+async fn run_udp_fec_ingest(
+    socket: UdpSocket,
+    cache: Arc<LiveTsCache>,
+    mut shutdown_rx: watch::Receiver<()>,
+) -> Result<()> {
+    let mut receiver = UdpFecReceiver::new();
+    let mut buf = vec![0u8; 65_536];
+    let mut rotate = interval(Duration::from_millis(10));
+    rotate.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                cache.rotate_if_due(true).await?;
+                info!("UDP-FEC contributor ingest shutting down");
+                return Ok(());
+            }
+            _ = rotate.tick() => {
+                cache.rotate_if_due(false).await?;
+            }
+            received = socket.recv_from(&mut buf) => {
+                let (len, peer) = received?;
+                if let Some(payload) = receiver.push(peer, &buf[..len]) {
+                    if let Err(error) = cache.push_payload(&payload).await {
+                        warn!(peer = %peer, error = %error, "failed to cache UDP-FEC contributor payload");
+                    }
                 }
             }
         }
@@ -1105,6 +1159,37 @@ mod tests {
 
         assert_eq!(bytes, Bytes::from_static(b"http-mesh-part"));
         mesh_b.shutdown();
+    }
+
+    #[tokio::test]
+    async fn udp_fec_ingest_writes_cache_parts() {
+        use av_mesh::udp_fec::UdpFecSender;
+        use tokio::time::timeout;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind = socket.local_addr().unwrap();
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let task = tokio::spawn(run_udp_fec_ingest(socket, Arc::clone(&cache), shutdown_rx));
+        let mut sender = UdpFecSender::new(bind).await.unwrap();
+
+        sender.send(b"fec-part-0").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = shutdown_tx.send(());
+        task.await.unwrap().unwrap();
+
+        let bytes = timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some((bytes, _hash)) = cache.get_part_blocking(0).await {
+                    break bytes;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(bytes, Bytes::from_static(b"fec-part-0"));
     }
 
     #[tokio::test]

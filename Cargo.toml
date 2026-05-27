@@ -16,6 +16,7 @@ futures-util = "0.3"
 http = "1"
 message-packetizer = { git = "https://github.com/wavey-ai/message-packetizer.git" }
 playlists = { git = "https://github.com/wavey-ai/playlists.git" }
+raptorq = "2"
 rist-core-pure = { package = "rist-core", git = "https://github.com/wavey-ai/rist-rs.git", branch = "pure-rust" }
 rist-mio-pure = { package = "rist-mio", git = "https://github.com/wavey-ai/rist-rs.git", branch = "pure-rust" }
 serde = { version = "1.0", features = ["derive"] }

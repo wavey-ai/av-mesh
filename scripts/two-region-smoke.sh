@@ -11,6 +11,8 @@ UK_HTTP="${UK_HTTP:-19444}"
 US_HTTP="${US_HTTP:-19445}"
 UK_UDP="${UK_UDP:-127.0.0.1:11001}"
 US_UDP="${US_UDP:-127.0.0.1:11002}"
+UK_FEC="${UK_FEC:-127.0.0.1:12001}"
+US_FEC="${US_FEC:-127.0.0.1:12002}"
 UK_RIST="${UK_RIST:-127.0.0.1:17000}"
 US_RIST="${US_RIST:-127.0.0.1:17001}"
 
@@ -82,6 +84,7 @@ RUST_LOG="${RUST_LOG:-av_mesh=info,playlists=info,web_service=info}" \
   --peer "${US_MESH}" \
   --http-port "${UK_HTTP}" \
   --ingest-bind "${UK_UDP}" \
+  --fec-bind "${UK_FEC}" \
   --rist-bind "${UK_RIST}" \
   --part-ms 100 \
   --parts-per-segment 2 \
@@ -98,6 +101,7 @@ RUST_LOG="${RUST_LOG:-av_mesh=info,playlists=info,web_service=info}" \
   --peer "${UK_MESH}" \
   --http-port "${US_HTTP}" \
   --ingest-bind "${US_UDP}" \
+  --fec-bind "${US_FEC}" \
   --rist-bind "${US_RIST}" \
   --part-ms 100 \
   --parts-per-segment 2 \
@@ -110,7 +114,7 @@ wait_for_health "${UK_HTTP}" uk
 wait_for_health "${US_HTTP}" us
 
 printf 'AVMESH-SMOKE-PART-0001' \
-  | curl -skfs -X POST --data-binary @- "https://127.0.0.1:${UK_HTTP}/ingest" >/dev/null
+  | "${ROOT}/target/debug/udp-fec-send" "${UK_FEC}" >/dev/null
 
 wait_for_playlist "${UK_HTTP}" uk
 wait_for_playlist "${US_HTTP}" us
