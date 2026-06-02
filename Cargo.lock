@@ -1095,7 +1095,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-layer",
@@ -1760,7 +1760,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.40",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -1797,7 +1797,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -3131,7 +3131,7 @@ dependencies = [
 [[package]]
 name = "web-service"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/web-services.git?branch=codex%2Fweb-studio-audio-llhls-switch#7371fb5bbbf37716f68dbef9caeb6b2c7fd1973f"
+source = "git+https://github.com/wavey-ai/web-services.git#447b866807b2dcefa72f3f6f9175fdaf91cc0634"
 dependencies = [
  "anyhow",
  "async-trait",

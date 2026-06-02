@@ -127,7 +127,7 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_STREAM_ID)]
     stream_id: u64,
 
-    #[arg(long, default_value_t = 500)]
+    #[arg(long, env = "AV_LL_HLS_PART_MS", default_value_t = 50)]
     part_ms: u64,
 
     #[arg(long, default_value_t = 4)]
@@ -494,8 +494,8 @@ async fn main() -> Result<()> {
 
 impl Args {
     fn normalized(mut self) -> Result<Self> {
-        if self.part_ms < 100 {
-            bail!("--part-ms must be at least 100");
+        if self.part_ms == 0 {
+            bail!("--part-ms must be at least 1");
         }
         self.parts_per_segment = self.parts_per_segment.max(1);
         self.window_parts = self.window_parts.max(self.parts_per_segment * 3).max(6);
@@ -654,17 +654,46 @@ async fn run_udp_fec_ingest(
             }
             received = socket.recv_from(&mut buf) => {
                 let (len, peer) = received?;
+                debug!(
+                    peer = %peer,
+                    datagram_bytes = len,
+                    "UDP-FEC mesh datagram received"
+                );
                 if let Some(decoded) = receiver.push_payload(peer, &buf[..len]) {
+                    let payload_bytes = decoded.payload.len();
                     if let Some(stream_id) = decoded.stream_id {
-                        if let Err(error) = cache
+                        match cache
                             .commit_stream_payload(stream_id, decoded.payload)
                             .await
                         {
-                            warn!(peer = %peer, stream_id, error = %error, "failed to cache stream-prefixed UDP-FEC mesh byte payload");
+                            Ok(sequence) => {
+                                debug!(
+                                    peer = %peer,
+                                    stream_id,
+                                    sequence,
+                                    payload_bytes,
+                                    "cached stream-prefixed UDP-FEC mesh byte payload"
+                                );
+                            }
+                            Err(error) => {
+                                warn!(peer = %peer, stream_id, error = %error, "failed to cache stream-prefixed UDP-FEC mesh byte payload");
+                            }
                         }
                     } else if let Err(error) = cache.push_payload(&decoded.payload).await {
                         warn!(peer = %peer, error = %error, "failed to cache UDP-FEC mesh byte payload");
+                    } else {
+                        debug!(
+                            peer = %peer,
+                            payload_bytes,
+                            "cached UDP-FEC mesh byte payload"
+                        );
                     }
+                } else {
+                    debug!(
+                        peer = %peer,
+                        datagram_bytes = len,
+                        "UDP-FEC mesh datagram buffered awaiting repair/source symbols"
+                    );
                 }
             }
         }
@@ -687,10 +716,16 @@ async fn run_udp_media_fec_ingest(
             }
             received = socket.recv_from(&mut buf) => {
                 let (len, peer) = received?;
+                debug!(
+                    peer = %peer,
+                    datagram_bytes = len,
+                    "media UDP-FEC datagram received"
+                );
                 match decoder.push_datagram(&buf[..len]) {
                     Ok(Some(frame)) => {
                         let stream_id = frame.metadata.stream_id;
                         let sequence = frame.metadata.sequence;
+                        let payload_bytes = frame.payload.len();
                         if let Err(error) = cache
                             .add_media_access_unit(frame.metadata, Bytes::from(frame.payload))
                             .await
@@ -702,9 +737,23 @@ async fn run_udp_media_fec_ingest(
                                 error = %error,
                                 "failed to cache media UDP-FEC access unit"
                             );
+                        } else {
+                            debug!(
+                                peer = %peer,
+                                stream_id,
+                                sequence,
+                                payload_bytes,
+                                "cached media UDP-FEC access unit"
+                            );
                         }
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        debug!(
+                            peer = %peer,
+                            datagram_bytes = len,
+                            "media UDP-FEC datagram buffered awaiting complete access unit"
+                        );
+                    }
                     Err(error) => {
                         warn!(
                             peer = %peer,
@@ -911,6 +960,13 @@ impl LiveTsCache {
         state.last_committed_unix_ms = Some(part.committed_unix_ms);
         state.last_committed_bytes = Some(part.bytes);
         state.last_committed_duration_ms = Some(part.duration_ms);
+        debug!(
+            stream_id = self.stream_id,
+            sequence = part.seq,
+            bytes = part.bytes,
+            duration_ms = part.duration_ms,
+            "committed mesh byte part"
+        );
         Ok(())
     }
 
@@ -935,6 +991,13 @@ impl LiveTsCache {
         state.last_committed_unix_ms = Some(now_ms);
         state.last_committed_bytes = Some(bytes);
         state.last_committed_duration_ms = None;
+        debug!(
+            stream_id,
+            sequence = seq,
+            slot_id,
+            bytes,
+            "committed stream-prefixed mesh payload"
+        );
         Ok(seq)
     }
 
@@ -979,6 +1042,17 @@ impl LiveTsCache {
             state.last_ingest_unix_ms = Some(now_unix_ms());
             state.bytes_received = state.bytes_received.saturating_add(payload.len() as u64);
         }
+
+        debug!(
+            stream_id,
+            sequence = metadata.sequence,
+            slot_id,
+            payload_bytes = payload.len(),
+            serialized_bytes = serialized.len(),
+            codec = ?metadata.codec,
+            keyframe = metadata.flags.is_keyframe(),
+            "committed media access unit"
+        );
 
         Ok(CachedMediaAccessUnit {
             metadata,
@@ -2505,6 +2579,14 @@ async fn start_telemetry_feed(
                     let snapshot = snapshot.with_edge_service(edge_service);
                     match serde_json::to_vec(&snapshot) {
                         Ok(json) => {
+                            debug!(
+                                node_id = %snapshot.node.node_id,
+                                active_streams = snapshot.node.active_streams,
+                                stream_telemetry = snapshot.streams.len(),
+                                peers = snapshot.peers.len(),
+                                bytes = json.len(),
+                                "publishing mesh telemetry snapshot"
+                            );
                             let message = TcpChangesMessage::new(TELEMETRY_TAG, vec![Bytes::from(json)]);
                             if tx.send(message).await.is_err() {
                                 return;
@@ -2587,6 +2669,12 @@ async fn connect_telemetry_peer(
                 let Some(payload) = payload else {
                     return Ok(());
                 };
+                debug!(
+                    peer = %peer,
+                    tag = ?payload.tag,
+                    bytes = payload.val.len(),
+                    "received tcp-changes telemetry payload"
+                );
                 if let Err(error) = router.ingest_tcp_changes_payload(payload).await {
                     warn!(peer = %peer, error = %error, "failed to ingest tcp changes payload");
                 }

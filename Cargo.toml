@@ -17,7 +17,7 @@ linode-private-discovery = ["private-subnet-discovery", "linode-provisioner"]
 anyhow = "1.0"
 async-trait = "0.1"
 bytes = "1.9"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 discovery = { git = "https://github.com/wavey-ai/discovery.git", optional = true }
 futures-util = "0.3"
 h3-quinn = { version = "0.0.10", features = ["datagram"] }
@@ -37,7 +37,7 @@ tokio = { version = "1.45", features = ["full"] }
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-web-service = { git = "https://github.com/wavey-ai/web-services.git", branch = "codex/web-studio-audio-llhls-switch" }
+web-service = { git = "https://github.com/wavey-ai/web-services.git" }
 
 [dev-dependencies]
 base64 = "0.22"

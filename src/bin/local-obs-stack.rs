@@ -36,7 +36,7 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     stream_id: u64,
 
-    #[arg(long, default_value_t = 500)]
+    #[arg(long, env = "AV_LL_HLS_PART_MS", default_value_t = 50)]
     part_ms: u64,
 
     #[arg(long, default_value_t = 19444)]
@@ -110,8 +110,15 @@ async fn main() -> Result<()> {
     let contrib_root = resolve_contrib_root(&args, &mesh_root)?;
     let tls = resolve_tls_material(&args, &mesh_root)?;
     let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| {
-        "av_mesh=debug,av_contrib=debug,rtmp_ingress=debug,upload_response=debug,playlists=info,web_service=info,rist_mio=info,rist_core=info".into()
+        "av_mesh=debug,av_contrib=debug,hls=debug,rtmp_ingress=debug,upload_response=debug,playlists=debug,web_service=debug,rist_mio=info,rist_core=info".into()
     });
+    println!(
+        "[orchestrator] config host={} stream_id={} part_ms={} rust_log={}",
+        args.host, args.stream_id, args.part_ms, rust_log
+    );
+    if let Ok(value) = std::env::var("AV_LL_HLS_PART_MS") {
+        println!("[orchestrator] AV_LL_HLS_PART_MS={value}");
+    }
 
     if !args.no_build {
         run_build(
@@ -260,7 +267,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    println!("[orchestrator] running {name}");
+    println!("[orchestrator] running {name} in {}", cwd.display());
     let status = Command::new("cargo")
         .args(args)
         .current_dir(cwd)
@@ -425,6 +432,7 @@ async fn spawn_service(
         binary.display(),
         args.join(" ")
     );
+    println!("[orchestrator] {name} RUST_LOG={rust_log}");
     let mut child = Command::new(binary)
         .args(&args)
         .current_dir(cwd)
@@ -472,10 +480,13 @@ async fn wait_for_health(
 ) -> Result<()> {
     let deadline = Instant::now() + timeout_duration;
     let url = format!("https://{host}:{port}/up");
+    let mut attempt: u64 = 0;
     while Instant::now() < deadline {
+        attempt = attempt.saturating_add(1);
         if let Some((service, status)) = first_exited(services)? {
             bail!("{service} exited while waiting for {name} health: {status}");
         }
+        println!("[orchestrator] health check attempt {attempt} for {name}: {url}");
         if curl_ok(host, port, &url).await {
             println!("[orchestrator] {name} healthy at {url}");
             return Ok(());
@@ -543,8 +554,8 @@ fn print_ready(args: &Args) {
         args.host, args.us_http_port, args.stream_id
     );
     println!(
-        "[orchestrator] default playlist aliases: https://{}:{}/live/stream.m3u8 and https://{}:{}/live/stream.m3u8",
-        args.host, args.uk_http_port, args.host, args.us_http_port
+        "[orchestrator] LL-HLS part target: {}ms (override with AV_LL_HLS_PART_MS or --part-ms)",
+        args.part_ms
     );
     println!(
         "[orchestrator] LL-HLS tail path for stream {}: /live/{}/tail?mode=part",
@@ -590,6 +601,7 @@ async fn shutdown_services(services: &mut [Service]) {
         match service.child.try_wait() {
             Ok(Some(_)) => {}
             Ok(None) => {
+                println!("[orchestrator] stopping {}", service.name);
                 let _ = service.child.start_kill();
             }
             Err(_) => {}
@@ -597,7 +609,14 @@ async fn shutdown_services(services: &mut [Service]) {
     }
 
     for service in services.iter_mut() {
-        let _ = timeout(Duration::from_secs(5), service.child.wait()).await;
+        match timeout(Duration::from_secs(5), service.child.wait()).await {
+            Ok(Ok(status)) => println!("[orchestrator] {} stopped with {status}", service.name),
+            Ok(Err(error)) => println!(
+                "[orchestrator] failed waiting for {}: {error}",
+                service.name
+            ),
+            Err(_) => println!("[orchestrator] timed out waiting for {}", service.name),
+        }
     }
 
     for service in services.iter_mut() {
