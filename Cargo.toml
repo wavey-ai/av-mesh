@@ -3,25 +3,42 @@ name = "av-mesh"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Local AV cache mesh prototype with UDP-FEC cache replication and HLS egress"
+description = "Local AV cache mesh prototype with RaptorQ-FEC cache replication and HLS egress"
 repository = "https://github.com/wavey-ai/av-mesh"
 readme = "README.md"
+
+[features]
+default = []
+private-subnet-discovery = ["dep:discovery"]
+linode-provisioner = ["dep:linode"]
+linode-private-discovery = ["private-subnet-discovery", "linode-provisioner"]
 
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
 bytes = "1.9"
 clap = { version = "4.5", features = ["derive"] }
+discovery = { path = "../discovery", optional = true }
 futures-util = "0.3"
+h3-quinn = { version = "0.0.10", features = ["datagram"] }
+h3-webtransport = "0.1.2"
 http = "1"
+hyper = { version = "1.6", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+linode = { path = "../linode", optional = true }
 message-packetizer = { git = "https://github.com/wavey-ai/message-packetizer.git" }
-playlists = { git = "https://github.com/wavey-ai/playlists.git" }
-raptorq = "2"
-rist-core-pure = { package = "rist-core", git = "https://github.com/wavey-ai/rist-rs.git", branch = "pure-rust" }
-rist-mio-pure = { package = "rist-mio", git = "https://github.com/wavey-ai/rist-rs.git", branch = "pure-rust" }
+playlists = { path = "../playlists" }
+raptorq-datagram-fec = { path = "../raptor-fec/crates/raptorq-datagram-fec" }
+raptorq-fec-transport = { path = "../raptor-fec/crates/raptorq-fec-transport" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+tcp-changes = { path = "../tcp-changes" }
 tokio = { version = "1.45", features = ["full"] }
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-web-service = { git = "https://github.com/wavey-ai/web-services.git", package = "web-service" }
+web-service = { path = "../web-services/web-service" }
+
+[dev-dependencies]
+base64 = "0.22"
+rcgen = "0.13"
