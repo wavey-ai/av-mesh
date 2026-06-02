@@ -424,7 +424,11 @@ async fn main() -> Result<()> {
     println!("fec:     udp+fec://{}", args.fec_bind);
     println!("media:   udp+media-fec://{}", args.media_fec_bind);
     println!(
-        "hls:     https://127.0.0.1:{}/live/stream.m3u8",
+        "hls:     https://127.0.0.1:{}/live/{}/stream.m3u8",
+        args.http_port, args.stream_id
+    );
+    println!(
+        "hls-default: https://127.0.0.1:{}/live/stream.m3u8",
         args.http_port
     );
     println!("mesh-ui: https://127.0.0.1:{}/mesh", args.http_port);
@@ -1019,7 +1023,11 @@ impl LiveTsCache {
     }
 
     async fn playlist(&self) -> String {
-        let Some((stream_idx, last)) = self.stream_position().await else {
+        self.playlist_for_stream_id(self.stream_id).await
+    }
+
+    async fn playlist_for_stream_id(&self, stream_id: u64) -> String {
+        let Some((stream_idx, last)) = self.stream_position_for_id(stream_id).await else {
             return self.empty_playlist(0);
         };
         let first = last.saturating_sub(self.window_parts.saturating_sub(1));
@@ -1149,12 +1157,21 @@ impl LiveTsCache {
     }
 
     async fn get_part_blocking(&self, seq: u64) -> Option<(Bytes, u64)> {
+        self.get_part_blocking_for_stream_id(self.stream_id, seq)
+            .await
+    }
+
+    async fn get_part_blocking_for_stream_id(
+        &self,
+        stream_id: u64,
+        seq: u64,
+    ) -> Option<(Bytes, u64)> {
         let deadline = Instant::now() + Duration::from_millis(PART_WAIT_MS);
         loop {
-            if let Some((bytes, hash)) = self.get_part_for_stream_id(self.stream_id, seq).await {
+            if let Some((bytes, hash)) = self.get_part_for_stream_id(stream_id, seq).await {
                 return Some((bytes, hash));
             }
-            let Some((_, last)) = self.stream_position().await else {
+            let Some((_, last)) = self.stream_position_for_id(stream_id).await else {
                 return None;
             };
             if seq as usize > last || Instant::now() >= deadline {
@@ -1165,11 +1182,16 @@ impl LiveTsCache {
     }
 
     async fn get_segment(&self, segment: u64) -> Option<Bytes> {
+        self.get_segment_for_stream_id(self.stream_id, segment)
+            .await
+    }
+
+    async fn get_segment_for_stream_id(&self, stream_id: u64, segment: u64) -> Option<Bytes> {
         let first_part = segment.checked_mul(self.parts_per_segment as u64)?;
         let mut out = Vec::new();
         for offset in 0..self.parts_per_segment {
             let seq = first_part + offset as u64;
-            let (bytes, _) = self.get_part_blocking(seq).await?;
+            let (bytes, _) = self.get_part_blocking_for_stream_id(stream_id, seq).await?;
             out.extend_from_slice(&bytes);
         }
         Some(Bytes::from(out))
@@ -3269,6 +3291,18 @@ impl Router for AppRouter {
                 .with_no_store())
             }
             _ => {
+                if let Some(stream_id) = parse_stream_playlist_path(path) {
+                    self.request_replica_for_stream(stream_id, "playlist-demand", None)
+                        .await;
+                    let playlist = self.cache.playlist_for_stream_id(stream_id).await;
+                    return Ok(response(
+                        StatusCode::OK,
+                        Some(Bytes::from(playlist)),
+                        Some("application/vnd.apple.mpegurl"),
+                    )
+                    .with_no_store());
+                }
+
                 if let Some(stream_id) = parse_llhls_tail_path(path) {
                     self.request_replica_for_stream(stream_id, "llhls-tail-demand", None)
                         .await;
@@ -3332,6 +3366,28 @@ impl Router for AppRouter {
                         .headers
                         .push(("x-av-flags".into(), unit.metadata.flags.bits().to_string()));
                     return Ok(media_response);
+                }
+
+                if let Some((stream_id, seq)) = parse_stream_part_path(path) {
+                    self.request_replica_for_stream(stream_id, "playlist-part-demand", None)
+                        .await;
+                    if let Some((bytes, hash)) =
+                        self.cache.get_part_blocking_for_stream_id(stream_id, seq).await
+                    {
+                        return Ok(response(StatusCode::OK, Some(bytes), Some("video/mp2t"))
+                            .with_etag(hash));
+                    }
+                    return Ok(response(StatusCode::NOT_FOUND, None, None));
+                }
+
+                if let Some((stream_id, segment)) = parse_stream_segment_path(path) {
+                    self.request_replica_for_stream(stream_id, "playlist-segment-demand", None)
+                        .await;
+                    if let Some(bytes) = self.cache.get_segment_for_stream_id(stream_id, segment).await
+                    {
+                        return Ok(response(StatusCode::OK, Some(bytes), Some("video/mp2t")));
+                    }
+                    return Ok(response(StatusCode::NOT_FOUND, None, None));
                 }
 
                 if let Some(seq) = parse_part_path(path) {
@@ -3658,6 +3714,35 @@ fn parse_llhls_tail_path(path: &str) -> Option<u64> {
         return None;
     }
     stream_id.parse().ok()
+}
+
+fn parse_stream_playlist_path(path: &str) -> Option<u64> {
+    let rest = path.strip_prefix("/live/")?;
+    let stream_id = rest.strip_suffix("/stream.m3u8")?;
+    if stream_id.is_empty() || stream_id.contains('/') {
+        return None;
+    }
+    stream_id.parse().ok()
+}
+
+fn parse_stream_part_path(path: &str) -> Option<(u64, u64)> {
+    let rest = path.strip_prefix("/live/")?;
+    let (stream_id, part) = rest.split_once("/part")?;
+    let seq = part.strip_suffix(".ts")?;
+    if stream_id.is_empty() || stream_id.contains('/') || seq.is_empty() || seq.contains('/') {
+        return None;
+    }
+    Some((stream_id.parse().ok()?, seq.parse().ok()?))
+}
+
+fn parse_stream_segment_path(path: &str) -> Option<(u64, u64)> {
+    let rest = path.strip_prefix("/live/")?;
+    let (stream_id, segment) = rest.split_once("/seg")?;
+    let seq = segment.strip_suffix(".ts")?;
+    if stream_id.is_empty() || stream_id.contains('/') || seq.is_empty() || seq.contains('/') {
+        return None;
+    }
+    Some((stream_id.parse().ok()?, seq.parse().ok()?))
 }
 
 fn parse_part_path(path: &str) -> Option<u64> {
@@ -4287,10 +4372,26 @@ mod tests {
         assert!(playlist.contains("part0.ts"));
         assert!(playlist.contains("part1.ts"));
         assert!(playlist.contains("seg0.ts"));
+
+        cache
+            .chunk_cache
+            .add_for_stream_id(77, 0, Bytes::from_static(b"stream77-part0"))
+            .await
+            .unwrap();
+        let playlist = cache.playlist_for_stream_id(77).await;
+        assert!(playlist.contains("part0.ts"));
+        assert!(playlist.contains("#EXT-X-PRELOAD-HINT"));
     }
 
     #[test]
     fn parses_live_paths() {
+        assert_eq!(parse_stream_playlist_path("/live/77/stream.m3u8"), Some(77));
+        assert_eq!(parse_stream_part_path("/live/77/part42.ts"), Some((77, 42)));
+        assert_eq!(parse_stream_segment_path("/live/77/seg7.ts"), Some((77, 7)));
+        assert_eq!(parse_stream_playlist_path("/live/stream.m3u8"), None);
+        assert_eq!(parse_stream_playlist_path("/live/77/part42.ts"), None);
+        assert_eq!(parse_stream_part_path("/live/part42.ts"), None);
+        assert_eq!(parse_stream_segment_path("/live/seg7.ts"), None);
         assert_eq!(parse_part_path("/live/part42.ts"), Some(42));
         assert_eq!(parse_segment_path("/live/seg7.ts"), Some(7));
         assert_eq!(parse_part_path("/live/seg7.ts"), None);
@@ -6084,6 +6185,108 @@ mod tests {
             .await
             .iter()
             .any(|command| command.kind == ControlKind::ReplicaRequest));
+        mesh_a.shutdown();
+        mesh_b.shutdown();
+    }
+
+    #[tokio::test]
+    async fn stream_specific_playlist_can_read_playlist_id_from_any_mesh_node() {
+        use playlists::mesh::{CacheMesh, CacheMeshConfig};
+        use tokio::time::timeout;
+
+        let mesh_a_addr = unused_loopback_addr();
+        let mesh_b_addr = unused_loopback_addr();
+        let cache_a = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let cache_b = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+
+        let mut config_a =
+            CacheMeshConfig::new("uk-playlist", "uk", mesh_a_addr).with_peer(mesh_b_addr);
+        config_a.sync_interval = Duration::from_secs(60);
+        let mut config_b =
+            CacheMeshConfig::new("jp-playlist", "jp", mesh_b_addr).with_peer(mesh_a_addr);
+        config_b.sync_interval = Duration::from_secs(60);
+
+        let mesh_a = CacheMesh::new(Arc::clone(&cache_a.chunk_cache), config_a)
+            .start()
+            .await
+            .unwrap();
+        let mesh_b = Arc::new(
+            CacheMesh::new(Arc::clone(&cache_b.chunk_cache), config_b)
+                .start()
+                .await
+                .unwrap(),
+        );
+
+        cache_a
+            .chunk_cache
+            .add_for_stream_id(77, 0, Bytes::from_static(b"playlist-77-part0"))
+            .await
+            .unwrap();
+        cache_a
+            .chunk_cache
+            .add_for_stream_id(77, 1, Bytes::from_static(b"playlist-77-part1"))
+            .await
+            .unwrap();
+
+        let router = app_router_for_tests(Arc::clone(&cache_b), Arc::clone(&mesh_b));
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/live/77/stream.m3u8")
+            .body(())
+            .unwrap();
+        let response = router.route(req).await.unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if cache_b.chunk_cache.get_for_stream_id(77, 1).await.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/live/77/stream.m3u8")
+            .body(())
+            .unwrap();
+        let response = router.route(req).await.unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        let playlist = String::from_utf8(response.body.unwrap().to_vec()).unwrap();
+        assert!(playlist.contains("part0.ts"));
+        assert!(playlist.contains("part1.ts"));
+        assert!(playlist.contains("seg0.ts"));
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/live/77/part0.ts")
+            .body(())
+            .unwrap();
+        let response = router.route(req).await.unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response.body.unwrap(),
+            Bytes::from_static(b"playlist-77-part0")
+        );
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/live/77/seg0.ts")
+            .body(())
+            .unwrap();
+        let response = router.route(req).await.unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response.body.unwrap(),
+            Bytes::from_static(b"playlist-77-part0playlist-77-part1")
+        );
+
+        assert!(router.control.recent().await.iter().any(|command| {
+            command.kind == ControlKind::ReplicaRequest && command.stream_id == Some(77)
+        }));
         mesh_a.shutdown();
         mesh_b.shutdown();
     }

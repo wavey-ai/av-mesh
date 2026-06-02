@@ -247,11 +247,15 @@ printf 'h264-access-unit-bytes' | \
 
 Then read either region:
 
-- UK playlist: `https://127.0.0.1:9444/live/stream.m3u8`
+- UK default playlist: `https://127.0.0.1:9444/live/stream.m3u8`
+- UK stream-specific playlist for playlist/stream id 1:
+  `https://127.0.0.1:9444/live/1/stream.m3u8`
 - UK LLHLS tail for playlist/stream id 1:
   `https://127.0.0.1:9444/live/1/tail?mode=part`
 - UK mesh UI: `https://127.0.0.1:9444/mesh`
-- US playlist: `https://127.0.0.1:9445/live/stream.m3u8`
+- US default playlist: `https://127.0.0.1:9445/live/stream.m3u8`
+- US stream-specific playlist for playlist/stream id 1:
+  `https://127.0.0.1:9445/live/1/stream.m3u8`
 - Health: `https://127.0.0.1:9444/up`
 - Stats: `https://127.0.0.1:9444/api/stats`
 - Mesh snapshot: `https://127.0.0.1:9444/api/mesh`
@@ -279,6 +283,49 @@ choose a playlist id whose bytestream is compatible with its decoder.
 
 The server uses the local TLS material from `web-services`; clients will need to
 trust that cert or use an insecure local test client.
+
+For local OBS testing with both mesh nodes and the contributor ingress under one
+Rust supervisor, run:
+
+```bash
+cargo run --bin local-obs-stack
+```
+
+The supervisor builds `av-mesh` and `../av-contrib`, uses the local bitneedle
+TLS material from `../tls/local.bitneedle.com`, starts UK and US mesh nodes plus
+one `av-contrib` ingress, and prefixes every child process stdout/stderr line
+into the supervisor stdout. By default it uses stream id `1`, UK egress
+`https://local.bitneedle.com:19444/live/1/stream.m3u8`, US egress
+`https://local.bitneedle.com:19445/live/1/stream.m3u8`, default playlist aliases
+at `/live/stream.m3u8`, and mesh dashboards at `/mesh` on both ports. OBS can
+publish RTMP to server
+`rtmp://local.bitneedle.com:19350/live` with stream key `obs-local`, or SRT to
+`srt://local.bitneedle.com:27001?mode=caller`. RIST is also bound on
+`local.bitneedle.com:27000` with main profile and flow id `0x72737401`. The
+supervisor shells out to `curl` for local health checks.
+
+Useful overrides:
+
+```bash
+RUST_LOG=av_mesh=trace,av_contrib=trace,rtmp_ingress=debug \
+  cargo run --bin local-obs-stack -- \
+    --stream-id 4294967351 \
+    --host local.bitneedle.com \
+    --rtmp-bind 127.0.0.1:19351 \
+    --srt-bind 127.0.0.1:27011
+```
+
+Use `--cert` and `--key` to point at alternate PEM files. The default hostname
+must resolve to loopback; on this machine `local.bitneedle.com` resolves to
+`127.0.0.1` and `::1`.
+
+The services already use `tracing_subscriber` with `RUST_LOG` env filters. The
+current detailed logs are mostly `info!` and `debug!`; setting `trace` is
+accepted, but only code paths with `trace!` calls will emit extra trace-level
+events. A true same-process Tokio harness should be the next refactor: expose
+library `run(config, shutdown)` entry points from `av-mesh` and `av-contrib`,
+then have this supervisor call those tasks directly instead of supervising child
+binaries.
 
 For a quick automated check, run:
 
