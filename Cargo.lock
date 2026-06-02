@@ -1095,7 +1095,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-layer",
@@ -1649,7 +1649,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 [[package]]
 name = "playlists"
 version = "0.1.3"
-source = "git+https://github.com/wavey-ai/playlists.git#5701b9b2fdf5b61fa427a96c8d8ca1424f6d8e9a"
+source = "git+https://github.com/wavey-ai/playlists.git#c18b6440ebfacd7f11e47facbae3340849d9dc94"
 dependencies = [
  "access-unit",
  "bytes",
@@ -1760,7 +1760,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.40",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -1797,7 +1797,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -3131,7 +3131,7 @@ dependencies = [
 [[package]]
 name = "web-service"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/web-services.git#b17fc963ec9cea8ca324c63a743ae43592bcb2c8"
+source = "git+https://github.com/wavey-ai/web-services.git#39da362892a65a738d6ce52e94056a7cdc74ef95"
 dependencies = [
  "anyhow",
  "async-trait",

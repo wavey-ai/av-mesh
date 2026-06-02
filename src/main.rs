@@ -103,7 +103,7 @@ impl LiveSlotPayload {
         if payload.len() < MESH_FMP4_SLOT_HEADER_LEN {
             return Self::Opaque(payload);
         }
-        if &payload[..MESH_FMP4_SLOT_MAGIC.len()] != MESH_FMP4_SLOT_MAGIC {
+        if !payload.starts_with(MESH_FMP4_SLOT_MAGIC) {
             return Self::Opaque(payload);
         }
 
