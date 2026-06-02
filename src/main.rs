@@ -60,12 +60,98 @@ const REPLICA_REQUEST_MIN_INTERVAL_MS: u64 = 1_000;
 const MESH_EVENTS_PATH: &str = "/api/mesh/events";
 const MESH_WEBSOCKET_PATH: &str = "/ws/mesh";
 const MEDIA_ACCESS_UNIT_CONTENT_TYPE: &str = "application/vnd.wavey.media-access-unit";
+const LIVE_FMP4_CONTENT_TYPE: &str = "video/mp4";
+const LIVE_TS_CONTENT_TYPE: &str = "video/mp2t";
+const MESH_FMP4_SLOT_MAGIC: &[u8; 8] = b"AVFMP4S1";
+const MESH_FMP4_SLOT_HEADER_LEN: usize = 16;
 const WAVEY_GOOSE_ASSET_PATH: &str = "/assets/wavey-goose.png";
 const WAVEY_GOOSE_PNG: &[u8] = include_bytes!("../assets/wavey-goose.png");
 const TELEMETRY_TAG: [u8; 4] = *b"AVMT";
 const CONTROL_TAG: [u8; 4] = *b"AVMC";
 const DEFAULT_TELEMETRY_STALE_MS: u64 = 30_000;
 const RAW_MESH_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveMediaKind {
+    Fmp4,
+    Ts,
+}
+
+impl LiveMediaKind {
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Fmp4 => "mp4",
+            Self::Ts => "ts",
+        }
+    }
+
+    fn content_type(self) -> &'static str {
+        match self {
+            Self::Fmp4 => LIVE_FMP4_CONTENT_TYPE,
+            Self::Ts => LIVE_TS_CONTENT_TYPE,
+        }
+    }
+}
+
+enum LiveSlotPayload {
+    Fmp4 { init: Option<Bytes>, media: Bytes },
+    Opaque(Bytes),
+}
+
+impl LiveSlotPayload {
+    fn decode(payload: Bytes) -> Self {
+        if payload.len() < MESH_FMP4_SLOT_HEADER_LEN {
+            return Self::Opaque(payload);
+        }
+        if &payload[..MESH_FMP4_SLOT_MAGIC.len()] != MESH_FMP4_SLOT_MAGIC {
+            return Self::Opaque(payload);
+        }
+
+        let init_len = u32::from_be_bytes(payload[8..12].try_into().unwrap()) as usize;
+        let media_len = u32::from_be_bytes(payload[12..16].try_into().unwrap()) as usize;
+        let Some(init_end) = MESH_FMP4_SLOT_HEADER_LEN.checked_add(init_len) else {
+            return Self::Opaque(payload);
+        };
+        let Some(media_end) = init_end.checked_add(media_len) else {
+            return Self::Opaque(payload);
+        };
+        if media_end != payload.len() {
+            return Self::Opaque(payload);
+        }
+
+        let init = (init_len > 0).then(|| payload.slice(MESH_FMP4_SLOT_HEADER_LEN..init_end));
+        let media = payload.slice(init_end..media_end);
+        Self::Fmp4 { init, media }
+    }
+
+    fn media_kind(&self) -> LiveMediaKind {
+        match self {
+            Self::Fmp4 { .. } => LiveMediaKind::Fmp4,
+            Self::Opaque(_) => LiveMediaKind::Ts,
+        }
+    }
+
+    fn init(&self) -> Option<Bytes> {
+        match self {
+            Self::Fmp4 { init, .. } => init.clone(),
+            Self::Opaque(_) => None,
+        }
+    }
+
+    fn media(&self) -> Bytes {
+        match self {
+            Self::Fmp4 { media, .. } => media.clone(),
+            Self::Opaque(payload) => payload.clone(),
+        }
+    }
+
+    fn has_media(&self) -> bool {
+        match self {
+            Self::Fmp4 { media, .. } => !media.is_empty(),
+            Self::Opaque(payload) => !payload.is_empty(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "av-mesh", about = "Run a local AV mesh node")]
@@ -972,12 +1058,20 @@ impl LiveTsCache {
 
     async fn commit_stream_payload(&self, stream_id: u64, payload: Bytes) -> Result<u64> {
         let bytes = payload.len();
+        let decoded = LiveSlotPayload::decode(payload.clone());
+        let media_bytes = decoded.media().len();
+        let media_kind = decoded.media_kind();
+        let init = decoded.init();
         let now_ms = now_unix_ms();
         let seq = {
             let mut state = self.state.write().await;
             state.datagrams_received = state.datagrams_received.saturating_add(1);
             state.bytes_received = state.bytes_received.saturating_add(bytes as u64);
             state.last_ingest_unix_ms = Some(now_ms);
+            state.stream_media_kinds.insert(stream_id, media_kind);
+            if let Some(init) = init {
+                state.stream_inits.insert(stream_id, init);
+            }
             state.next_stream_seq(stream_id)
         };
         let slot_id = usize::try_from(seq).context("stream slot sequence too large")?;
@@ -989,13 +1083,15 @@ impl LiveTsCache {
         let mut state = self.state.write().await;
         state.last_committed_seq = Some(seq);
         state.last_committed_unix_ms = Some(now_ms);
-        state.last_committed_bytes = Some(bytes);
+        state.last_committed_bytes = Some(media_bytes);
         state.last_committed_duration_ms = None;
         debug!(
             stream_id,
             sequence = seq,
             slot_id,
             bytes,
+            media_bytes,
+            media_kind = ?media_kind,
             "committed stream-prefixed mesh payload"
         );
         Ok(seq)
@@ -1102,20 +1198,61 @@ impl LiveTsCache {
 
     async fn playlist_for_stream_id(&self, stream_id: u64) -> String {
         let Some((stream_idx, last)) = self.stream_position_for_id(stream_id).await else {
-            return self.empty_playlist(0);
+            let media_kind = self
+                .media_kind_hint(stream_id)
+                .await
+                .unwrap_or(LiveMediaKind::Fmp4);
+            let include_map = media_kind == LiveMediaKind::Fmp4
+                && self.get_init_for_stream_id(stream_id).await.is_some();
+            return self.empty_playlist(0, media_kind, include_map);
         };
         let first = last.saturating_sub(self.window_parts.saturating_sub(1));
         let mut available = Vec::new();
+        let mut saw_fmp4 = false;
+        let mut saw_ts = false;
+        let mut discovered_init = None;
         for seq in first..=last {
             if let Some((bytes, hash)) = self.chunk_cache.get(stream_idx, seq).await {
-                if hash != 0 || !bytes.is_empty() {
+                let slot = LiveSlotPayload::decode(bytes);
+                if hash != 0 || slot.has_media() {
+                    match slot.media_kind() {
+                        LiveMediaKind::Fmp4 => saw_fmp4 = true,
+                        LiveMediaKind::Ts => saw_ts = true,
+                    }
+                    if let Some(init) = slot.init() {
+                        discovered_init = Some(init);
+                    }
                     available.push(seq as u64);
                 }
             }
         }
         if available.is_empty() {
-            return self.empty_playlist(last);
+            let media_kind = self
+                .media_kind_hint(stream_id)
+                .await
+                .unwrap_or(LiveMediaKind::Fmp4);
+            let include_map = media_kind == LiveMediaKind::Fmp4
+                && self.get_init_for_stream_id(stream_id).await.is_some();
+            return self.empty_playlist(last, media_kind, include_map);
         }
+        if let Some(init) = discovered_init {
+            self.remember_stream_init(stream_id, init).await;
+        }
+        let media_kind = if saw_fmp4 {
+            LiveMediaKind::Fmp4
+        } else if saw_ts {
+            LiveMediaKind::Ts
+        } else {
+            self.media_kind_hint(stream_id)
+                .await
+                .unwrap_or(LiveMediaKind::Fmp4)
+        };
+        self.remember_media_kind(stream_id, media_kind).await;
+        let init = if media_kind == LiveMediaKind::Fmp4 {
+            self.get_init_for_stream_id(stream_id).await
+        } else {
+            None
+        };
 
         let first_available = *available.first().unwrap();
         let media_sequence = first_available / self.parts_per_segment as u64;
@@ -1138,6 +1275,16 @@ impl LiveTsCache {
         out.push_str("#EXT-X-VERSION:9\n");
         out.push_str(&format!("#EXT-X-TARGETDURATION:{target_duration}\n"));
         out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{media_sequence}\n"));
+        if media_kind == LiveMediaKind::Fmp4 {
+            if init.is_some() {
+                out.push_str("#EXT-X-MAP:URI=\"init.mp4\"\n");
+            } else {
+                warn!(
+                    stream_id,
+                    "fMP4 live playlist has media fragments but no init segment"
+                );
+            }
+        }
         out.push_str(&format!("#EXT-X-PART-INF:PART-TARGET={part_target:.3}\n"));
         out.push_str(&format!(
             "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={:.3},HOLD-BACK={:.3}\n",
@@ -1145,36 +1292,86 @@ impl LiveTsCache {
             (part_target * self.parts_per_segment as f64 * 2.0).max(3.0)
         ));
 
+        let extension = media_kind.extension();
         for (segment, group) in groups {
             let mut duration = 0.0;
             for seq in &group {
                 duration += part_target;
                 out.push_str(&format!(
-                    "#EXT-X-PART:DURATION={part_target:.3},URI=\"part{seq}.ts\"\n"
+                    "#EXT-X-PART:DURATION={part_target:.3},URI=\"part{seq}.{extension}\"\n"
                 ));
             }
             if group.len() == self.parts_per_segment {
                 out.push_str(&format!("#EXTINF:{duration:.3},\n"));
-                out.push_str(&format!("seg{segment}.ts\n"));
+                out.push_str(&format!("seg{segment}.{extension}\n"));
             }
         }
 
         out.push_str(&format!(
-            "#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part{next_part}.ts\"\n"
+            "#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part{next_part}.{extension}\"\n"
         ));
         out
     }
 
-    fn empty_playlist(&self, next_part: usize) -> String {
+    fn empty_playlist(
+        &self,
+        next_part: usize,
+        media_kind: LiveMediaKind,
+        include_map: bool,
+    ) -> String {
         let part_target = self.part_target.as_secs_f64();
         let target_duration = (part_target * self.parts_per_segment as f64)
             .ceil()
             .max(1.0) as u64;
+        let extension = media_kind.extension();
+        let map = if include_map {
+            "#EXT-X-MAP:URI=\"init.mp4\"\n"
+        } else {
+            ""
+        };
         format!(
-            "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PART-INF:PART-TARGET={part_target:.3}\n#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={:.3},HOLD-BACK={:.3}\n#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part{next_part}.ts\"\n",
+            "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:0\n{map}#EXT-X-PART-INF:PART-TARGET={part_target:.3}\n#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={:.3},HOLD-BACK={:.3}\n#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part{next_part}.{extension}\"\n",
             part_target * 3.0,
             (part_target * self.parts_per_segment as f64 * 2.0).max(3.0)
         )
+    }
+
+    async fn remember_media_kind(&self, stream_id: u64, media_kind: LiveMediaKind) {
+        let mut state = self.state.write().await;
+        state.stream_media_kinds.insert(stream_id, media_kind);
+    }
+
+    async fn media_kind_hint(&self, stream_id: u64) -> Option<LiveMediaKind> {
+        let state = self.state.read().await;
+        state.stream_media_kinds.get(&stream_id).copied()
+    }
+
+    async fn remember_stream_init(&self, stream_id: u64, init: Bytes) {
+        let mut state = self.state.write().await;
+        state.stream_inits.insert(stream_id, init);
+    }
+
+    async fn get_init_for_stream_id(&self, stream_id: u64) -> Option<Bytes> {
+        {
+            let state = self.state.read().await;
+            if let Some(init) = state.stream_inits.get(&stream_id) {
+                return Some(init.clone());
+            }
+        }
+
+        let (stream_idx, last) = self.stream_position_for_id(stream_id).await?;
+        let first = self.chunk_cache.retained_start(last);
+        for seq in (first..=last).rev() {
+            let Some((bytes, _hash)) = self.chunk_cache.get(stream_idx, seq).await else {
+                continue;
+            };
+            let slot = LiveSlotPayload::decode(bytes);
+            if let Some(init) = slot.init() {
+                self.remember_stream_init(stream_id, init.clone()).await;
+                return Some(init);
+            }
+        }
+        None
     }
 
     async fn stream_position(&self) -> Option<(usize, usize)> {
@@ -1192,8 +1389,13 @@ impl LiveTsCache {
             .chunk_cache
             .get_for_stream_id(stream_id, seq as usize)
             .await?;
-        if hash != 0 || !bytes.is_empty() {
-            return Some((bytes, hash));
+        let slot = LiveSlotPayload::decode(bytes);
+        if hash != 0 || slot.has_media() {
+            if let Some(init) = slot.init() {
+                self.remember_stream_init(stream_id, init).await;
+            }
+            self.remember_media_kind(stream_id, slot.media_kind()).await;
+            return Some((slot.media(), hash));
         }
         None
     }
@@ -1211,8 +1413,13 @@ impl LiveTsCache {
             }
             for seq in start as usize..=last {
                 if let Some((bytes, hash)) = self.chunk_cache.get(stream_idx, seq).await {
-                    if hash != 0 || !bytes.is_empty() {
-                        return Some((seq as u64, bytes, hash));
+                    let slot = LiveSlotPayload::decode(bytes);
+                    if hash != 0 || slot.has_media() {
+                        if let Some(init) = slot.init() {
+                            self.remember_stream_init(stream_id, init).await;
+                        }
+                        self.remember_media_kind(stream_id, slot.media_kind()).await;
+                        return Some((seq as u64, slot.media(), hash));
                     }
                 }
             }
@@ -1222,8 +1429,13 @@ impl LiveTsCache {
         let first = last.saturating_sub(self.window_parts.saturating_sub(1));
         for seq in (first..=last).rev() {
             if let Some((bytes, hash)) = self.chunk_cache.get(stream_idx, seq).await {
-                if hash != 0 || !bytes.is_empty() {
-                    return Some((seq as u64, bytes, hash));
+                let slot = LiveSlotPayload::decode(bytes);
+                if hash != 0 || slot.has_media() {
+                    if let Some(init) = slot.init() {
+                        self.remember_stream_init(stream_id, init).await;
+                    }
+                    self.remember_media_kind(stream_id, slot.media_kind()).await;
+                    return Some((seq as u64, slot.media(), hash));
                 }
             }
         }
@@ -1515,6 +1727,8 @@ struct LiveState {
     last_committed_bytes: Option<usize>,
     last_committed_duration_ms: Option<u64>,
     stream_next_seq: HashMap<u64, u64>,
+    stream_inits: HashMap<u64, Bytes>,
+    stream_media_kinds: HashMap<u64, LiveMediaKind>,
 }
 
 impl LiveState {
@@ -1533,6 +1747,8 @@ impl LiveState {
             last_committed_bytes: None,
             last_committed_duration_ms: None,
             stream_next_seq: HashMap::new(),
+            stream_inits: HashMap::new(),
+            stream_media_kinds: HashMap::new(),
         }
     }
 
@@ -3405,8 +3621,13 @@ impl Router for AppRouter {
                         return Ok(response(StatusCode::NO_CONTENT, None, None).with_no_store());
                     };
                     let bytes_len = bytes.len();
+                    let media_kind = self
+                        .cache
+                        .media_kind_hint(stream_id)
+                        .await
+                        .unwrap_or(LiveMediaKind::Ts);
                     let mut tail_response =
-                        response(StatusCode::OK, Some(bytes), Some("video/mp2t"))
+                        response(StatusCode::OK, Some(bytes), Some(media_kind.content_type()))
                             .with_etag(hash)
                             .with_no_store();
                     tail_response
@@ -3417,6 +3638,20 @@ impl Router for AppRouter {
                         .push(("x-av-stream-id".into(), stream_id.to_string()));
                     read.finish(bytes_len);
                     return Ok(tail_response);
+                }
+
+                if let Some(stream_id) = parse_stream_init_path(path) {
+                    self.request_replica_for_stream(stream_id, "playlist-init-demand", None)
+                        .await;
+                    if let Some(init) = self.cache.get_init_for_stream_id(stream_id).await {
+                        return Ok(response(
+                            StatusCode::OK,
+                            Some(init),
+                            Some(LiveMediaKind::Fmp4.content_type()),
+                        )
+                        .with_no_store());
+                    }
+                    return Ok(response(StatusCode::NOT_FOUND, None, None));
                 }
 
                 if let Some((stream_id, sequence)) = parse_media_unit_path(path) {
@@ -3456,39 +3691,90 @@ impl Router for AppRouter {
                     return Ok(media_response);
                 }
 
-                if let Some((stream_id, seq)) = parse_stream_part_path(path) {
+                if let Some((stream_id, seq, requested_kind)) = parse_stream_part_path(path) {
                     self.request_replica_for_stream(stream_id, "playlist-part-demand", None)
                         .await;
                     if let Some((bytes, hash)) =
                         self.cache.get_part_blocking_for_stream_id(stream_id, seq).await
                     {
-                        return Ok(response(StatusCode::OK, Some(bytes), Some("video/mp2t"))
-                            .with_etag(hash));
+                        let media_kind = self
+                            .cache
+                            .media_kind_hint(stream_id)
+                            .await
+                            .unwrap_or(requested_kind);
+                        return Ok(
+                            response(StatusCode::OK, Some(bytes), Some(media_kind.content_type()))
+                                .with_etag(hash),
+                        );
                     }
                     return Ok(response(StatusCode::NOT_FOUND, None, None));
                 }
 
-                if let Some((stream_id, segment)) = parse_stream_segment_path(path) {
+                if let Some((stream_id, segment, requested_kind)) = parse_stream_segment_path(path) {
                     self.request_replica_for_stream(stream_id, "playlist-segment-demand", None)
                         .await;
                     if let Some(bytes) = self.cache.get_segment_for_stream_id(stream_id, segment).await
                     {
-                        return Ok(response(StatusCode::OK, Some(bytes), Some("video/mp2t")));
+                        let media_kind = self
+                            .cache
+                            .media_kind_hint(stream_id)
+                            .await
+                            .unwrap_or(requested_kind);
+                        return Ok(response(
+                            StatusCode::OK,
+                            Some(bytes),
+                            Some(media_kind.content_type()),
+                        ));
                     }
                     return Ok(response(StatusCode::NOT_FOUND, None, None));
                 }
 
-                if let Some(seq) = parse_part_path(path) {
+                if parse_init_path(path) {
+                    self.request_replica_for_stream(
+                        self.cache.stream_id,
+                        "playlist-init-demand",
+                        None,
+                    )
+                    .await;
+                    if let Some(init) = self.cache.get_init_for_stream_id(self.cache.stream_id).await
+                    {
+                        return Ok(response(
+                            StatusCode::OK,
+                            Some(init),
+                            Some(LiveMediaKind::Fmp4.content_type()),
+                        )
+                        .with_no_store());
+                    }
+                    return Ok(response(StatusCode::NOT_FOUND, None, None));
+                }
+
+                if let Some((seq, requested_kind)) = parse_part_path(path) {
                     if let Some((bytes, hash)) = self.cache.get_part_blocking(seq).await {
-                        return Ok(response(StatusCode::OK, Some(bytes), Some("video/mp2t"))
-                            .with_etag(hash));
+                        let media_kind = self
+                            .cache
+                            .media_kind_hint(self.cache.stream_id)
+                            .await
+                            .unwrap_or(requested_kind);
+                        return Ok(
+                            response(StatusCode::OK, Some(bytes), Some(media_kind.content_type()))
+                                .with_etag(hash),
+                        );
                     }
                     return Ok(response(StatusCode::NOT_FOUND, None, None));
                 }
 
-                if let Some(segment) = parse_segment_path(path) {
+                if let Some((segment, requested_kind)) = parse_segment_path(path) {
                     if let Some(bytes) = self.cache.get_segment(segment).await {
-                        return Ok(response(StatusCode::OK, Some(bytes), Some("video/mp2t")));
+                        let media_kind = self
+                            .cache
+                            .media_kind_hint(self.cache.stream_id)
+                            .await
+                            .unwrap_or(requested_kind);
+                        return Ok(response(
+                            StatusCode::OK,
+                            Some(bytes),
+                            Some(media_kind.content_type()),
+                        ));
                     }
                     return Ok(response(StatusCode::NOT_FOUND, None, None));
                 }
@@ -3813,38 +4099,60 @@ fn parse_stream_playlist_path(path: &str) -> Option<u64> {
     stream_id.parse().ok()
 }
 
-fn parse_stream_part_path(path: &str) -> Option<(u64, u64)> {
+fn parse_stream_init_path(path: &str) -> Option<u64> {
+    let rest = path.strip_prefix("/live/")?;
+    let stream_id = rest.strip_suffix("/init.mp4")?;
+    if stream_id.is_empty() || stream_id.contains('/') {
+        return None;
+    }
+    stream_id.parse().ok()
+}
+
+fn parse_stream_part_path(path: &str) -> Option<(u64, u64, LiveMediaKind)> {
     let rest = path.strip_prefix("/live/")?;
     let (stream_id, part) = rest.split_once("/part")?;
-    let seq = part.strip_suffix(".ts")?;
+    let (seq, media_kind) = strip_live_media_suffix(part)?;
     if stream_id.is_empty() || stream_id.contains('/') || seq.is_empty() || seq.contains('/') {
         return None;
     }
-    Some((stream_id.parse().ok()?, seq.parse().ok()?))
+    Some((stream_id.parse().ok()?, seq.parse().ok()?, media_kind))
 }
 
-fn parse_stream_segment_path(path: &str) -> Option<(u64, u64)> {
+fn parse_stream_segment_path(path: &str) -> Option<(u64, u64, LiveMediaKind)> {
     let rest = path.strip_prefix("/live/")?;
     let (stream_id, segment) = rest.split_once("/seg")?;
-    let seq = segment.strip_suffix(".ts")?;
+    let (seq, media_kind) = strip_live_media_suffix(segment)?;
     if stream_id.is_empty() || stream_id.contains('/') || seq.is_empty() || seq.contains('/') {
         return None;
     }
-    Some((stream_id.parse().ok()?, seq.parse().ok()?))
+    Some((stream_id.parse().ok()?, seq.parse().ok()?, media_kind))
 }
 
-fn parse_part_path(path: &str) -> Option<u64> {
-    path.strip_prefix("/live/part")?
-        .strip_suffix(".ts")?
-        .parse()
-        .ok()
+fn parse_init_path(path: &str) -> bool {
+    path == "/live/init.mp4"
 }
 
-fn parse_segment_path(path: &str) -> Option<u64> {
-    path.strip_prefix("/live/seg")?
-        .strip_suffix(".ts")?
-        .parse()
-        .ok()
+fn parse_part_path(path: &str) -> Option<(u64, LiveMediaKind)> {
+    let part = path.strip_prefix("/live/part")?;
+    let (seq, media_kind) = strip_live_media_suffix(part)?;
+    Some((seq.parse().ok()?, media_kind))
+}
+
+fn parse_segment_path(path: &str) -> Option<(u64, LiveMediaKind)> {
+    let segment = path.strip_prefix("/live/seg")?;
+    let (seq, media_kind) = strip_live_media_suffix(segment)?;
+    Some((seq.parse().ok()?, media_kind))
+}
+
+fn strip_live_media_suffix(value: &str) -> Option<(&str, LiveMediaKind)> {
+    value
+        .strip_suffix(".mp4")
+        .map(|seq| (seq, LiveMediaKind::Fmp4))
+        .or_else(|| {
+            value
+                .strip_suffix(".ts")
+                .map(|seq| (seq, LiveMediaKind::Ts))
+        })
 }
 
 fn parse_media_unit_path(path: &str) -> Option<(u64, u64)> {
@@ -4442,6 +4750,17 @@ mod tests {
     };
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+    fn encode_test_fmp4_slot(init: Option<&[u8]>, media: &[u8]) -> Bytes {
+        let init = init.unwrap_or_default();
+        let mut out = Vec::with_capacity(MESH_FMP4_SLOT_HEADER_LEN + init.len() + media.len());
+        out.extend_from_slice(MESH_FMP4_SLOT_MAGIC);
+        out.extend_from_slice(&(init.len() as u32).to_be_bytes());
+        out.extend_from_slice(&(media.len() as u32).to_be_bytes());
+        out.extend_from_slice(init);
+        out.extend_from_slice(media);
+        Bytes::from(out)
+    }
+
     #[tokio::test]
     async fn playlist_uses_replicated_cache_parts() {
         let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
@@ -4471,17 +4790,104 @@ mod tests {
         assert!(playlist.contains("#EXT-X-PRELOAD-HINT"));
     }
 
+    #[tokio::test]
+    async fn fmp4_stream_slots_emit_mp4_playlist_and_media() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
+
+        cache
+            .commit_stream_payload(77, encode_test_fmp4_slot(Some(b"ftypmoov"), b"moofmdat-a"))
+            .await
+            .unwrap();
+        cache
+            .commit_stream_payload(77, encode_test_fmp4_slot(None, b"moofmdat-b"))
+            .await
+            .unwrap();
+
+        let playlist = cache.playlist_for_stream_id(77).await;
+        assert!(playlist.contains("#EXT-X-MAP:URI=\"init.mp4\""));
+        assert!(playlist.contains("part0.mp4"));
+        assert!(playlist.contains("part1.mp4"));
+        assert!(playlist.contains("seg0.mp4"));
+        assert!(!playlist.contains("AVFMP4S1"));
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/live/77/init.mp4")
+            .body(())
+            .unwrap();
+        let response = router.route(req).await.unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.content_type.as_deref(), Some("video/mp4"));
+        assert_eq!(response.body.unwrap(), Bytes::from_static(b"ftypmoov"));
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/live/77/part0.mp4")
+            .body(())
+            .unwrap();
+        let response = router.route(req).await.unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.content_type.as_deref(), Some("video/mp4"));
+        assert_eq!(response.body.unwrap(), Bytes::from_static(b"moofmdat-a"));
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/live/77/seg0.mp4")
+            .body(())
+            .unwrap();
+        let response = router.route(req).await.unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.content_type.as_deref(), Some("video/mp4"));
+        assert_eq!(
+            response.body.unwrap(),
+            Bytes::from_static(b"moofmdat-amoofmdat-b")
+        );
+
+        mesh.shutdown();
+    }
+
     #[test]
     fn parses_live_paths() {
         assert_eq!(parse_stream_playlist_path("/live/77/stream.m3u8"), Some(77));
-        assert_eq!(parse_stream_part_path("/live/77/part42.ts"), Some((77, 42)));
-        assert_eq!(parse_stream_segment_path("/live/77/seg7.ts"), Some((77, 7)));
+        assert_eq!(parse_stream_init_path("/live/77/init.mp4"), Some(77));
+        assert_eq!(
+            parse_stream_part_path("/live/77/part42.ts"),
+            Some((77, 42, LiveMediaKind::Ts))
+        );
+        assert_eq!(
+            parse_stream_part_path("/live/77/part42.mp4"),
+            Some((77, 42, LiveMediaKind::Fmp4))
+        );
+        assert_eq!(
+            parse_stream_segment_path("/live/77/seg7.ts"),
+            Some((77, 7, LiveMediaKind::Ts))
+        );
+        assert_eq!(
+            parse_stream_segment_path("/live/77/seg7.mp4"),
+            Some((77, 7, LiveMediaKind::Fmp4))
+        );
         assert_eq!(parse_stream_playlist_path("/live/stream.m3u8"), None);
         assert_eq!(parse_stream_playlist_path("/live/77/part42.ts"), None);
         assert_eq!(parse_stream_part_path("/live/part42.ts"), None);
         assert_eq!(parse_stream_segment_path("/live/seg7.ts"), None);
-        assert_eq!(parse_part_path("/live/part42.ts"), Some(42));
-        assert_eq!(parse_segment_path("/live/seg7.ts"), Some(7));
+        assert_eq!(
+            parse_part_path("/live/part42.ts"),
+            Some((42, LiveMediaKind::Ts))
+        );
+        assert_eq!(
+            parse_part_path("/live/part42.mp4"),
+            Some((42, LiveMediaKind::Fmp4))
+        );
+        assert_eq!(
+            parse_segment_path("/live/seg7.ts"),
+            Some((7, LiveMediaKind::Ts))
+        );
+        assert_eq!(
+            parse_segment_path("/live/seg7.mp4"),
+            Some((7, LiveMediaKind::Fmp4))
+        );
         assert_eq!(parse_part_path("/live/seg7.ts"), None);
         assert_eq!(parse_llhls_tail_path("/live/77/tail"), Some(77));
         assert_eq!(parse_llhls_tail_path("/live/not-number/tail"), None);
