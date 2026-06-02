@@ -5,8 +5,6 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONTRIB_ROOT="${CONTRIB_ROOT:-$(cd "${ROOT}/../av-contrib" && pwd)}"
 BIN="${ROOT}/target/debug/av-mesh"
 CONTRIB_BIN="${CONTRIB_ROOT}/target/debug/av-contrib"
-UDP_FEC_BIN="${CONTRIB_ROOT}/target/debug/udp-fec-send"
-RIST_BIN="${CONTRIB_ROOT}/target/debug/rist-send"
 TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/av-mesh-smoke.XXXXXX")"
 
 UK_MESH="${UK_MESH:-127.0.0.1:19101}"
@@ -143,28 +141,11 @@ wait_for_mesh_text() {
 }
 
 publish_part() {
-  local protocol="$1"
-  local seq="$2"
-  local payload="$3"
+  local seq="$1"
+  local payload="$2"
 
-  case "${protocol}" in
-    http)
-      printf '%s' "${payload}" \
-        | curl -skfs -X POST --data-binary @- "https://127.0.0.1:${UK_CONTRIB_HTTP}/ingest" >/dev/null
-      ;;
-    udp-fec)
-      printf '%s' "${payload}" \
-        | "${UDP_FEC_BIN}" "${UK_FEC}" >/dev/null
-      ;;
-    rist)
-      printf '%s' "${payload}" \
-        | "${RIST_BIN}" "${UK_RIST}" >/dev/null
-      ;;
-    *)
-      echo "unknown publish protocol: ${protocol}" >&2
-      return 1
-      ;;
-  esac
+  printf '%s' "${payload}" \
+    | curl -skfs -X POST --data-binary @- "https://127.0.0.1:${UK_CONTRIB_HTTP}/ingest?stream_id=1" >/dev/null
 
   wait_for_part "${UK_HTTP}" uk "${seq}" "${payload}"
   wait_for_part "${US_HTTP}" us "${seq}" "${payload}"
@@ -299,11 +280,11 @@ wait_for_health "${UK_HTTP}" uk
 wait_for_health "${US_HTTP}" us
 wait_for_health "${UK_CONTRIB_HTTP}" contrib
 
-publish_part http 0 'AVMESH-SMOKE-HTTP-0000'
-publish_part udp-fec 1 'AVMESH-SMOKE-FEC-0001'
-publish_part udp-fec 2 'AVMESH-SMOKE-FEC-0002'
-publish_part rist 3 'AVMESH-SMOKE-RIST-0003'
+publish_part 0 'AVMESH-SMOKE-HTTP-0000'
+publish_part 1 'AVMESH-SMOKE-HTTP-0001'
+publish_part 2 'AVMESH-SMOKE-HTTP-0002'
+publish_part 3 'AVMESH-SMOKE-HTTP-0003'
 verify_tcp_changes_control
 verify_many_hls_users
 
-echo "two-region smoke passed: http/rist contributor frontend plus udp-fec mesh bytes reached UK/US HLS, tcp-changes AVMT topology converged, and AVMC warm-stream control reached US for ${SMOKE_USERS} users per region"
+echo "two-region smoke passed: stream-addressed contributor bytes reached UK/US HLS, tcp-changes AVMT topology converged, and AVMC warm-stream control reached US for ${SMOKE_USERS} users per region"

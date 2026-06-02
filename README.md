@@ -6,12 +6,13 @@
 contributor can publish media into one region, all media is stored in
 playlist/cache streams, cache slots replicate to other regions over the shared
 Wavey RaptorQ-FEC datagram protocol, and users can read replicated streams as
-HLS-style MPEG-TS parts from any region.
+LL-HLS artifact bytes or other stream-addressed slots from any region.
 
 RaptorQ-FEC is the mesh transport. Cache synchronization inside the mesh moves
 opaque stream bytes over the Wavey RaptorQ datagram protocol. Contributor-facing
-RIST input belongs in `../av-contrib`, which forwards recovered bytes into the
-mesh FEC socket.
+RIST/SRT/RTMP input belongs in `../av-contrib`, which terminates those
+protocols, packages OBS-style media as fMP4/CMAF LL-HLS artifacts, and publishes
+only stream-addressed artifact bytes into the mesh FEC socket.
 
 The first implementation keeps the mesh transport intentionally small:
 
@@ -39,11 +40,11 @@ The first implementation keeps the mesh transport intentionally small:
   `--edge-webtransport` when a client specifically needs them.
 - `message-packetizer` remains available for bounded UDP-style announcements;
   operator commands use `AVMC` over TCP changes.
-- Contributor ingest through `../av-contrib` supports pure-Rust RIST, streamed
-  HTTP `POST`/`PUT /ingest` MPEG-TS uploads, and HTTP
-  `POST`/`PUT /media/access-unit` non-TS media access units. Its local sender
-  tools can also inject opaque UDP-FEC bytes into mesh byte sockets for smoke
-  tests and protocol debugging.
+- Contributor ingest through `../av-contrib` supports arbitrary non-OBS byte
+  streams via `POST`/`PUT /ingest?stream_id=...`, pure-Rust RIST MPEG-TS, SRT
+  MPEG-TS, RTMP/FLV, and HTTP `POST`/`PUT /media/access-unit` non-TS media
+  access units. OBS-style inputs are boxed into fMP4/CMAF before entering mesh;
+  raw RIST, SRT, RTMP, and MPEG-TS payloads stay outside the mesh boundary.
 - The sibling `../av-contrib` project is the contributor-facing repo boundary.
   It currently owns
   non-TS media access-unit query parsing and uses `raptorq-datagram-fec` for

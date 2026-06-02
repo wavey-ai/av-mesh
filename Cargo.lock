@@ -4,9 +4,8 @@ version = 4
 
 [[package]]
 name = "access-unit"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "089654a0182818690a0efe33f1c8fde8d0cee83a1dd043b6d358525857d1b169"
+version = "0.1.3"
+source = "git+https://github.com/wavey-ai/access-unit.git#80decbb8c7ae0de31755c80c92958665eea28409"
 dependencies = [
  "bytes",
 ]
@@ -161,7 +160,7 @@ dependencies = [
  "hyper-util",
  "linode",
  "message-packetizer 0.1.0 (git+https://github.com/wavey-ai/message-packetizer.git)",
- "playlists 0.1.3",
+ "playlists",
  "raptorq-datagram-fec",
  "raptorq-fec-transport",
  "rcgen",
@@ -483,6 +482,7 @@ dependencies = [
 [[package]]
 name = "discovery"
 version = "0.1.5"
+source = "git+https://github.com/wavey-ai/discovery.git#f442bfae02dbc0fab06355760064e4f2db615755"
 dependencies = [
  "if-addrs",
  "rustdns",
@@ -1341,6 +1341,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 [[package]]
 name = "linode"
 version = "0.0.1"
+source = "git+https://github.com/wavey-ai/linode.git#60477183e77f215f302ae65b067b46bd4cd9fbc4"
 dependencies = [
  "env_logger",
  "lazy_static",
@@ -1648,29 +1649,13 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 [[package]]
 name = "playlists"
 version = "0.1.3"
+source = "git+https://github.com/wavey-ai/playlists.git#7c197f7735aeaebb156f5e16002bbb73470ef673"
 dependencies = [
  "access-unit",
  "bytes",
  "chrono",
  "flate2",
  "raptorq-datagram-fec",
- "thiserror 1.0.69",
- "tls-helpers 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "tokio",
- "tracing",
- "xxhash-rust",
-]
-
-[[package]]
-name = "playlists"
-version = "0.1.3"
-source = "git+https://github.com/wavey-ai/playlists.git#f44837d6a9e46b26a98a946a9c44c541691df944"
-dependencies = [
- "access-unit",
- "bytes",
- "chrono",
- "flate2",
- "raptorq",
  "thiserror 1.0.69",
  "tls-helpers 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "tokio",
@@ -1938,6 +1923,7 @@ checksum = "4d4215fb79ef19442a0c71616aabb0715a386e6a16ed9031775ee3e3f20e7502"
 [[package]]
 name = "raptorq-datagram-fec"
 version = "0.1.0"
+source = "git+https://github.com/wavey-ai/raptor-fec.git#b37b14082a2bfc39476fdb70bdab4597ec19f6a2"
 dependencies = [
  "bytes",
  "raptorq",
@@ -1947,6 +1933,7 @@ dependencies = [
 [[package]]
 name = "raptorq-fec-transport"
 version = "0.1.0"
+source = "git+https://github.com/wavey-ai/raptor-fec.git#b37b14082a2bfc39476fdb70bdab4597ec19f6a2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2549,6 +2536,7 @@ dependencies = [
 [[package]]
 name = "tcp-changes"
 version = "0.1.0"
+source = "git+https://github.com/wavey-ai/tcp-changes.git#37a5f95d44e8789005c0ca6268f030729c7001ec"
 dependencies = [
  "bytes",
  "rustls 0.23.40",
@@ -3143,6 +3131,7 @@ dependencies = [
 [[package]]
 name = "web-service"
 version = "0.1.0"
+source = "git+https://github.com/wavey-ai/web-services.git?branch=codex%2Fweb-studio-audio-llhls-switch#eea26d54aab1f40f1f3bb366456ba400667f59aa"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3163,7 +3152,7 @@ dependencies = [
  "hyper 1.10.0",
  "hyper-rustls",
  "hyper-util",
- "playlists 0.1.3 (git+https://github.com/wavey-ai/playlists.git)",
+ "playlists",
  "quinn",
  "regex",
  "rustls 0.23.40",

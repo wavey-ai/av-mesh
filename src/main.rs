@@ -650,8 +650,15 @@ async fn run_udp_fec_ingest(
             }
             received = socket.recv_from(&mut buf) => {
                 let (len, peer) = received?;
-                if let Some(payload) = receiver.push(peer, &buf[..len]) {
-                    if let Err(error) = cache.push_payload(&payload).await {
+                if let Some(decoded) = receiver.push_payload(peer, &buf[..len]) {
+                    if let Some(stream_id) = decoded.stream_id {
+                        if let Err(error) = cache
+                            .commit_stream_payload(stream_id, decoded.payload)
+                            .await
+                        {
+                            warn!(peer = %peer, stream_id, error = %error, "failed to cache stream-prefixed UDP-FEC mesh byte payload");
+                        }
+                    } else if let Err(error) = cache.push_payload(&decoded.payload).await {
                         warn!(peer = %peer, error = %error, "failed to cache UDP-FEC mesh byte payload");
                     }
                 }
@@ -901,6 +908,30 @@ impl LiveTsCache {
         state.last_committed_bytes = Some(part.bytes);
         state.last_committed_duration_ms = Some(part.duration_ms);
         Ok(())
+    }
+
+    async fn commit_stream_payload(&self, stream_id: u64, payload: Bytes) -> Result<u64> {
+        let bytes = payload.len();
+        let now_ms = now_unix_ms();
+        let seq = {
+            let mut state = self.state.write().await;
+            state.datagrams_received = state.datagrams_received.saturating_add(1);
+            state.bytes_received = state.bytes_received.saturating_add(bytes as u64);
+            state.last_ingest_unix_ms = Some(now_ms);
+            state.next_stream_seq(stream_id)
+        };
+        let slot_id = usize::try_from(seq).context("stream slot sequence too large")?;
+        self.chunk_cache
+            .add_for_stream_id(stream_id, slot_id, payload)
+            .await
+            .map_err(|err| anyhow!("stream-prefixed chunk cache write failed: {err}"))?;
+
+        let mut state = self.state.write().await;
+        state.last_committed_seq = Some(seq);
+        state.last_committed_unix_ms = Some(now_ms);
+        state.last_committed_bytes = Some(bytes);
+        state.last_committed_duration_ms = None;
+        Ok(seq)
     }
 
     async fn add_media_access_unit(
@@ -1387,6 +1418,7 @@ struct LiveState {
     last_committed_unix_ms: Option<u64>,
     last_committed_bytes: Option<usize>,
     last_committed_duration_ms: Option<u64>,
+    stream_next_seq: HashMap<u64, u64>,
 }
 
 impl LiveState {
@@ -1404,7 +1436,15 @@ impl LiveState {
             last_committed_unix_ms: None,
             last_committed_bytes: None,
             last_committed_duration_ms: None,
+            stream_next_seq: HashMap::new(),
         }
+    }
+
+    fn next_stream_seq(&mut self, stream_id: u64) -> u64 {
+        let next = self.stream_next_seq.entry(stream_id).or_insert(0);
+        let seq = *next;
+        *next = next.saturating_add(1);
+        seq
     }
 
     fn take_current(&mut self, now: Instant, now_ms: u64) -> Option<PendingPart> {
@@ -6259,6 +6299,40 @@ mod tests {
         .unwrap();
 
         assert_eq!(bytes, Bytes::from_static(b"fec-part-0"));
+    }
+
+    #[tokio::test]
+    async fn udp_fec_ingest_writes_stream_prefixed_slots() {
+        use raptorq_fec_transport::FecDatagramEncoder;
+        use tokio::time::timeout;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind = socket.local_addr().unwrap();
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let task = tokio::spawn(run_udp_fec_ingest(socket, Arc::clone(&cache), shutdown_rx));
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stream_id = 77;
+        let mut encoder = FecDatagramEncoder::webtransport_with_stream_prefix(stream_id);
+
+        for datagram in encoder.encode_payload(b"prefixed-fmp4-or-bytes").unwrap() {
+            sender.send_to(&datagram, bind).await.unwrap();
+        }
+
+        let bytes = timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some((bytes, _hash)) = cache.get_part_for_stream_id(stream_id, 0).await {
+                    break bytes;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(bytes, Bytes::from_static(b"prefixed-fmp4-or-bytes"));
+        let _ = shutdown_tx.send(());
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
