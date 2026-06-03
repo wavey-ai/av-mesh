@@ -1036,11 +1036,19 @@ fn MeshAlertList(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
                 key=|alert| format!("{}:{}", alert.code, alert.message)
                 let(alert)
             >
-                <div class=format!("alert {}", alert.level)>
-                    <strong>{alert.code}</strong>
-                    <span>{alert.message}</span>
-                    <small>{format!("{} seen / {}", alert.count, optional_unix_age(alert.last_seen_unix_ms))}</small>
-                </div>
+                {
+                    let local_node_id = mesh
+                        .get()
+                        .map(|snapshot| snapshot.node.node_id)
+                        .unwrap_or_default();
+                    view! {
+                        <div class=format!("alert {}", alert.level)>
+                            <strong>{alert.code.clone()}</strong>
+                            <span>{alert.message.clone()}</span>
+                            <small>{alert.meta_text(&local_node_id)}</small>
+                        </div>
+                    }
+                }
             </For>
         </div>
     }
@@ -2626,7 +2634,7 @@ fn build_incidents(
             source: "mesh".to_owned(),
             code: alert.code.clone(),
             message: alert.message.clone(),
-            detail: format!("local {}", mesh.node.node_id),
+            detail: alert.target_detail_text(&mesh.node.node_id),
             count: alert.count.max(1),
             last_seen_unix_ms: alert.last_seen_unix_ms,
         }));
@@ -3971,6 +3979,37 @@ struct MeshAlert {
     count: u64,
     #[serde(default)]
     last_seen_unix_ms: Option<u64>,
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    stream_id_text: Option<String>,
+}
+
+impl MeshAlert {
+    fn target_detail_text(&self, local_node_id: &str) -> String {
+        let mut parts = Vec::new();
+        if let Some(node_id) = &self.node_id {
+            parts.push(format!("node {node_id}"));
+        } else if !local_node_id.is_empty() {
+            parts.push(format!("local {local_node_id}"));
+        }
+        if let Some(stream_id) = &self.stream_id_text {
+            parts.push(format!("stream {stream_id}"));
+        }
+        parts.join(" / ")
+    }
+
+    fn meta_text(&self, local_node_id: &str) -> String {
+        let mut parts = vec![
+            format!("{} seen", self.count),
+            optional_unix_age(self.last_seen_unix_ms),
+        ];
+        let target = self.target_detail_text(local_node_id);
+        if !target.is_empty() {
+            parts.push(target);
+        }
+        parts.join(" / ")
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
