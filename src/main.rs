@@ -29,7 +29,7 @@ use raptorq_fec_transport::{split_stream_id_prefix, FecDatagramDecoder, STREAM_I
 use serde::{de, Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -59,6 +59,7 @@ const PART_WAIT_MS: u64 = 3_000;
 const REPLICA_REQUEST_MIN_INTERVAL_MS: u64 = 1_000;
 const MESH_EVENTS_PATH: &str = "/api/mesh/events";
 const MESH_WEBSOCKET_PATH: &str = "/ws/mesh";
+const DASHBOARD_DIST_ENV: &str = "AV_MESH_DASHBOARD_DIST";
 const MEDIA_ACCESS_UNIT_CONTENT_TYPE: &str = "application/vnd.wavey.media-access-unit";
 const LIVE_FMP4_CONTENT_TYPE: &str = "video/mp4";
 const LIVE_TS_CONTENT_TYPE: &str = "video/mp2t";
@@ -3912,12 +3913,14 @@ impl Router for AppRouter {
                 )),
                 Some("text/plain; charset=utf-8"),
             )),
-            "/mesh" => Ok(response(
-                StatusCode::OK,
-                Some(Bytes::from_static(MESH_DASHBOARD_HTML.as_bytes())),
-                Some("text/html; charset=utf-8"),
-            )
-            .with_no_store()),
+            "/mesh" => Ok(dashboard_dist_response(path).unwrap_or_else(|| {
+                response(
+                    StatusCode::OK,
+                    Some(Bytes::from_static(MESH_DASHBOARD_HTML.as_bytes())),
+                    Some("text/html; charset=utf-8"),
+                )
+                .with_no_store()
+            })),
             WAVEY_GOOSE_ASSET_PATH => Ok(response(
                 StatusCode::OK,
                 Some(Bytes::from_static(WAVEY_GOOSE_PNG)),
@@ -3961,6 +3964,10 @@ impl Router for AppRouter {
                 .with_no_store())
             }
             _ => {
+                if let Some(dashboard_asset) = dashboard_dist_response(path) {
+                    return Ok(dashboard_asset);
+                }
+
                 if let Some(stream_id) = parse_stream_playlist_path(path) {
                     self.request_replica_for_stream(stream_id, "playlist-demand", None)
                         .await;
@@ -4436,6 +4443,67 @@ fn response(
             ),
         ],
         etag: None,
+    }
+}
+
+fn dashboard_dist_response(path: &str) -> Option<HandlerResponse> {
+    let dist_dir = std::env::var_os(DASHBOARD_DIST_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("dashboard/dist"));
+    dashboard_dist_response_from_dir(&dist_dir, path)
+}
+
+fn dashboard_dist_response_from_dir(dist_dir: &Path, path: &str) -> Option<HandlerResponse> {
+    let relative_path = dashboard_dist_relative_path(path)?;
+    let full_path = dist_dir.join(relative_path);
+    let bytes = std::fs::read(full_path).ok()?;
+    Some(
+        response(
+            StatusCode::OK,
+            Some(Bytes::from(bytes)),
+            dashboard_dist_content_type(relative_path),
+        )
+        .with_no_store(),
+    )
+}
+
+fn dashboard_dist_relative_path(path: &str) -> Option<&str> {
+    match path {
+        "/mesh" | "/mesh/" => Some("index.html"),
+        _ => {
+            let candidate = path.strip_prefix('/')?;
+            if candidate.is_empty()
+                || candidate.contains('/')
+                || candidate.contains("..")
+                || !dashboard_dist_asset_extension_allowed(candidate)
+            {
+                return None;
+            }
+            Some(candidate)
+        }
+    }
+}
+
+fn dashboard_dist_asset_extension_allowed(path: &str) -> bool {
+    path.ends_with(".js")
+        || path.ends_with(".wasm")
+        || path.ends_with(".css")
+        || path.ends_with(".ico")
+}
+
+fn dashboard_dist_content_type(path: &str) -> Option<&'static str> {
+    if path.ends_with(".html") {
+        Some("text/html; charset=utf-8")
+    } else if path.ends_with(".js") {
+        Some("text/javascript; charset=utf-8")
+    } else if path.ends_with(".wasm") {
+        Some("application/wasm")
+    } else if path.ends_with(".css") {
+        Some("text/css; charset=utf-8")
+    } else if path.ends_with(".ico") {
+        Some("image/x-icon")
+    } else {
+        None
     }
 }
 
@@ -5592,27 +5660,36 @@ mod tests {
             Some("text/html; charset=utf-8")
         );
         let body = String::from_utf8(response.body.unwrap().to_vec()).unwrap();
-        for expected in [
-            "id=\"map\"",
-            "id=\"nodeRows\"",
-            "id=\"connectionRows\"",
-            "id=\"capacity\"",
-            "id=\"throughput\"",
-            "id=\"contributors\"",
-            "id=\"active\"",
-            "class=\"brand-icon\"",
-            "src=\"/assets/wavey-goose.png\"",
-            "data-action=\"provision-node\"",
-            "data-action=\"close-node\"",
-            "data-action=\"warm-stream\"",
-            "new EventSource('/api/mesh/events')",
-            "renderNodes(nodes)",
-            "renderConnections(s.connections || [])",
-        ] {
-            assert!(
-                body.contains(expected),
-                "dashboard missing expected fragment: {expected}"
-            );
+        if body.contains("av mission control") {
+            for expected in ["av mission control", "type=\"module\"", "av-mesh-dashboard"] {
+                assert!(
+                    body.contains(expected),
+                    "Leptos dashboard missing expected fragment: {expected}"
+                );
+            }
+        } else {
+            for expected in [
+                "id=\"map\"",
+                "id=\"nodeRows\"",
+                "id=\"connectionRows\"",
+                "id=\"capacity\"",
+                "id=\"throughput\"",
+                "id=\"contributors\"",
+                "id=\"active\"",
+                "class=\"brand-icon\"",
+                "src=\"/assets/wavey-goose.png\"",
+                "data-action=\"provision-node\"",
+                "data-action=\"close-node\"",
+                "data-action=\"warm-stream\"",
+                "new EventSource('/api/mesh/events')",
+                "renderNodes(nodes)",
+                "renderConnections(s.connections || [])",
+            ] {
+                assert!(
+                    body.contains(expected),
+                    "legacy dashboard missing expected fragment: {expected}"
+                );
+            }
         }
 
         let icon_req = Request::builder()
@@ -5626,6 +5703,45 @@ mod tests {
         let icon = icon_response.body.unwrap();
         assert!(icon.starts_with(b"\x89PNG\r\n\x1a\n"));
         mesh.shutdown();
+    }
+
+    #[test]
+    fn dashboard_dist_response_serves_leptos_assets_when_present() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("av-mesh-dashboard-dist-test-{}", now_unix_ms()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(
+            temp_dir.join("index.html"),
+            r#"<html><body><script type="module" src="/app.js"></script></body></html>"#,
+        )
+        .unwrap();
+        std::fs::write(temp_dir.join("app.js"), "export default {};").unwrap();
+        std::fs::write(temp_dir.join("app_bg.wasm"), b"\0asm").unwrap();
+
+        let index = dashboard_dist_response_from_dir(&temp_dir, "/mesh").unwrap();
+        assert_eq!(index.status, StatusCode::OK);
+        assert_eq!(
+            index.content_type.as_deref(),
+            Some("text/html; charset=utf-8")
+        );
+        assert!(String::from_utf8(index.body.unwrap().to_vec())
+            .unwrap()
+            .contains("type=\"module\""));
+        assert!(index
+            .headers
+            .iter()
+            .any(|(name, value)| name == "cache-control" && value.contains("no-store")));
+
+        let js = dashboard_dist_response_from_dir(&temp_dir, "/app.js").unwrap();
+        assert_eq!(
+            js.content_type.as_deref(),
+            Some("text/javascript; charset=utf-8")
+        );
+        let wasm = dashboard_dist_response_from_dir(&temp_dir, "/app_bg.wasm").unwrap();
+        assert_eq!(wasm.content_type.as_deref(), Some("application/wasm"));
+        assert!(dashboard_dist_response_from_dir(&temp_dir, "/live/stream.m3u8").is_none());
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[tokio::test]

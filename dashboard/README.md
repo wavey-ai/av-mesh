@@ -26,6 +26,15 @@ The default endpoint URLs match the local OBS stack:
 The dashboard prefers the SSE event streams and falls back to JSON polling when
 either service is unavailable or reconnecting.
 
-The app is intentionally separate from the `av-mesh` binary for now. Once the
-UI shape settles, the built `dist/` assets can be served from `av-mesh` as the
-replacement for the embedded `/mesh` HTML.
+Build for `av-mesh` to serve at `/mesh`:
+
+```sh
+cd /Users/jamie/wavey.ai/av-mesh/dashboard
+trunk build --release
+```
+
+`av-mesh` serves `dashboard/dist/index.html` at `/mesh` when the build output is
+present, and serves the hashed JS/CSS/WASM files from the same directory. Set
+`AV_MESH_DASHBOARD_DIST=/path/to/dist` to point a running node at a different
+dashboard build. If no built dashboard is available, `av-mesh` falls back to the
+embedded legacy `/mesh` page.
