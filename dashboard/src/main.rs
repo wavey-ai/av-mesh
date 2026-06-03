@@ -376,6 +376,15 @@ fn App() -> impl IntoView {
                     contrib_events_active
                 />
 
+                <PipelineReadiness
+                    mesh
+                    contrib
+                    probes=playback_probes
+                    started_unix_ms=dashboard_started_unix_ms
+                    mesh_events_active
+                    contrib_events_active
+                />
+
                 <div class="workspace">
                     <section class="panel map-panel">
                         <div class="panel-head">
@@ -566,6 +575,71 @@ fn IncidentRollup(
                     incident_empty_text(&mesh_snapshot, &contrib_status, &probes, feed)
                 }}</p>
             </Show>
+        </section>
+    }
+}
+
+#[component]
+fn PipelineReadiness(
+    mesh: ReadSignal<Option<MeshApiSnapshot>>,
+    contrib: ReadSignal<Option<ContribStatus>>,
+    probes: ReadSignal<PlaybackProbeState>,
+    started_unix_ms: u64,
+    mesh_events_active: ReadSignal<bool>,
+    contrib_events_active: ReadSignal<bool>,
+) -> impl IntoView {
+    view! {
+        <section class="band pipeline">
+            <div class="pipeline-head">
+                <h2>"Pipeline"</h2>
+                <span>{move || {
+                    let mesh_snapshot = mesh.get();
+                    let contrib_status = contrib.get();
+                    let probes = probes.get();
+                    let feed = DashboardFeedHealth::new(
+                        started_unix_ms,
+                        mesh_events_active.get(),
+                        contrib_events_active.get(),
+                    );
+                    pipeline_summary_text(&build_pipeline_stages(
+                        &mesh_snapshot,
+                        &contrib_status,
+                        &probes,
+                        feed,
+                    ))
+                }}</span>
+            </div>
+            <div class="pipeline-grid">
+                <For
+                    each=move || {
+                        let mesh_snapshot = mesh.get();
+                        let contrib_status = contrib.get();
+                        let probes = probes.get();
+                        let feed = DashboardFeedHealth::new(
+                            started_unix_ms,
+                            mesh_events_active.get(),
+                            contrib_events_active.get(),
+                        );
+                        build_pipeline_stages(&mesh_snapshot, &contrib_status, &probes, feed)
+                    }
+                    key=|stage| stage.key
+                    let(stage)
+                >
+                    {
+                        let class_name = stage.class_name();
+                        let title = stage.title;
+                        let status = stage.status;
+                        let detail = stage.detail;
+                        view! {
+                            <div class=class_name>
+                                <strong>{title}</strong>
+                                <span>{status}</span>
+                                <small>{detail}</small>
+                            </div>
+                        }
+                    }
+                </For>
+            </div>
         </section>
     }
 }
@@ -1847,6 +1921,335 @@ impl DashboardFeedHealth {
             contrib_events_active,
         }
     }
+
+    fn within_startup_grace(self) -> bool {
+        now_unix_ms().saturating_sub(self.started_unix_ms) < DASHBOARD_FEED_MISSING_GRACE_MS
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PipelineStage {
+    key: &'static str,
+    title: &'static str,
+    level: &'static str,
+    status: String,
+    detail: String,
+}
+
+impl PipelineStage {
+    fn new(
+        key: &'static str,
+        title: &'static str,
+        level: &'static str,
+        status: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            key,
+            title,
+            level,
+            status: status.into(),
+            detail: detail.into(),
+        }
+    }
+
+    fn class_name(&self) -> String {
+        format!("pipeline-stage {}", self.level)
+    }
+}
+
+fn build_pipeline_stages(
+    mesh: &Option<MeshApiSnapshot>,
+    contrib: &Option<ContribStatus>,
+    probes: &PlaybackProbeState,
+    feed: DashboardFeedHealth,
+) -> Vec<PipelineStage> {
+    vec![
+        pipeline_ingest_stage(contrib.as_ref()),
+        pipeline_fmp4_stage(contrib.as_ref()),
+        pipeline_mesh_stage(mesh.as_ref(), contrib.as_ref()),
+        pipeline_playback_stage(probes),
+        pipeline_control_stage(mesh.as_ref(), contrib.as_ref(), feed),
+    ]
+}
+
+fn pipeline_summary_text(stages: &[PipelineStage]) -> String {
+    let ready = stages.iter().filter(|stage| stage.level == "ready").count();
+    let errors = stages.iter().filter(|stage| stage.level == "error").count();
+    let warnings = stages.iter().filter(|stage| stage.level == "warn").count();
+    let waiting = stages
+        .iter()
+        .filter(|stage| stage.level == "waiting")
+        .count();
+    format!(
+        "{ready}/{} ready / {errors} errors / {warnings} warnings / {waiting} waiting",
+        stages.len()
+    )
+}
+
+fn pipeline_ingest_stage(contrib: Option<&ContribStatus>) -> PipelineStage {
+    let Some(contrib) = contrib else {
+        return PipelineStage::new(
+            "ingest",
+            "ingest",
+            "waiting",
+            "waiting",
+            "contrib status unavailable",
+        );
+    };
+
+    let active_protocols = contrib
+        .runtime
+        .protocols
+        .iter()
+        .filter(|protocol| protocol.active_sessions > 0)
+        .map(|protocol| protocol.protocol.clone())
+        .collect::<Vec<_>>();
+    let listener_count = enabled_listener_count(contrib);
+    let detail = if active_protocols.is_empty() {
+        format!(
+            "{listener_count} listener(s) enabled / {}",
+            contrib.health.detail_text()
+        )
+    } else {
+        format!(
+            "active {} / {}",
+            active_protocols.join(", "),
+            contrib.health.detail_text()
+        )
+    };
+
+    if contrib_health_age_is_fresh(
+        contrib.health.input_seen,
+        contrib.health.last_input_age_ms,
+        &contrib.health,
+    ) {
+        PipelineStage::new("ingest", "ingest", "ready", "receiving bytes", detail)
+    } else if contrib.health.input_seen {
+        PipelineStage::new("ingest", "ingest", "warn", "input stale", detail)
+    } else if listener_count > 0 {
+        PipelineStage::new("ingest", "ingest", "waiting", "listening", detail)
+    } else {
+        PipelineStage::new("ingest", "ingest", "warn", "no listeners", detail)
+    }
+}
+
+fn pipeline_fmp4_stage(contrib: Option<&ContribStatus>) -> PipelineStage {
+    let Some(contrib) = contrib else {
+        return PipelineStage::new(
+            "fmp4",
+            "fMP4",
+            "waiting",
+            "waiting",
+            "contrib status unavailable",
+        );
+    };
+
+    let runtime = &contrib.runtime.fmp4;
+    let detail = format!(
+        "{} parts / {} media / {} init / {} / {}",
+        runtime.parts,
+        format_bytes(runtime.bytes),
+        format_bytes(runtime.init_bytes),
+        runtime.track_summary(),
+        contrib.health.detail_text()
+    );
+    if runtime.publish_errors > 0 {
+        PipelineStage::new(
+            "fmp4",
+            "fMP4",
+            "error",
+            format!("{} publish errors", runtime.publish_errors),
+            detail,
+        )
+    } else if contrib_health_age_is_fresh(
+        contrib.health.output_seen,
+        contrib.health.last_output_age_ms,
+        &contrib.health,
+    ) {
+        PipelineStage::new("fmp4", "fMP4", "ready", "publishing parts", detail)
+    } else if contrib.health.fmp4_input_seen {
+        PipelineStage::new("fmp4", "fMP4", "warn", "input without fresh output", detail)
+    } else if contrib.health.input_seen {
+        PipelineStage::new(
+            "fmp4",
+            "fMP4",
+            "waiting",
+            "waiting for boxed output",
+            detail,
+        )
+    } else {
+        PipelineStage::new("fmp4", "fMP4", "waiting", "waiting for input", detail)
+    }
+}
+
+fn pipeline_mesh_stage(
+    mesh: Option<&MeshApiSnapshot>,
+    contrib: Option<&ContribStatus>,
+) -> PipelineStage {
+    let forward_errors = contrib
+        .map(|contrib| contrib.runtime.mesh_forward.errors())
+        .unwrap_or_default();
+    let forward_payloads = contrib
+        .map(|contrib| contrib.runtime.mesh_forward.payloads())
+        .unwrap_or_default();
+    let forward_detail = contrib
+        .map(|contrib| contrib.runtime.mesh_forward.detail_text())
+        .unwrap_or_else(|| "contrib status unavailable".to_owned());
+    let mesh_active = mesh
+        .map(|mesh| {
+            mesh.aggregate.active_streams > 0
+                || mesh.stream.latest_mesh_part.is_some()
+                || mesh.stream.latest_local_part.is_some()
+                || mesh.streams.iter().any(StreamTelemetry::active)
+        })
+        .unwrap_or(false);
+    let mesh_detail = mesh
+        .map(|mesh| {
+            format!(
+                "{} active stream(s) / {} node(s) / local part {} / mesh part {}",
+                mesh.aggregate.active_streams,
+                mesh.aggregate.node_count,
+                optional_u64(mesh.stream.latest_local_part),
+                optional_u64(mesh.stream.latest_mesh_part)
+            )
+        })
+        .unwrap_or_else(|| "mesh status unavailable".to_owned());
+    let detail = format!("{forward_detail} / {mesh_detail}");
+
+    if forward_errors > 0 {
+        PipelineStage::new(
+            "mesh",
+            "mesh",
+            "error",
+            format!("{forward_errors} forward errors"),
+            detail,
+        )
+    } else if mesh_active {
+        PipelineStage::new("mesh", "mesh", "ready", "stream visible", detail)
+    } else if forward_payloads > 0 {
+        PipelineStage::new("mesh", "mesh", "warn", "forwarding but not visible", detail)
+    } else {
+        PipelineStage::new(
+            "mesh",
+            "mesh",
+            "waiting",
+            "waiting for mesh payloads",
+            detail,
+        )
+    }
+}
+
+fn pipeline_playback_stage(probes: &PlaybackProbeState) -> PipelineStage {
+    if probes.probes.is_empty() {
+        return PipelineStage::new(
+            "playback",
+            "playback",
+            "waiting",
+            "waiting",
+            "no playlist probe targets yet",
+        );
+    }
+
+    let ready = probes.ready_count();
+    let total = probes.probes.len();
+    let failures = total.saturating_sub(ready);
+    let detail = probes
+        .probes
+        .iter()
+        .map(|probe| format!("{} {}", probe.label, probe.status_text()))
+        .collect::<Vec<_>>()
+        .join(" / ");
+    if failures == 0 {
+        PipelineStage::new(
+            "playback",
+            "playback",
+            "ready",
+            format!("{ready}/{total} playlists"),
+            detail,
+        )
+    } else if ready > 0 {
+        PipelineStage::new(
+            "playback",
+            "playback",
+            "warn",
+            format!("{failures}/{total} failing"),
+            detail,
+        )
+    } else {
+        PipelineStage::new(
+            "playback",
+            "playback",
+            "error",
+            format!("{failures}/{total} failing"),
+            detail,
+        )
+    }
+}
+
+fn pipeline_control_stage(
+    mesh: Option<&MeshApiSnapshot>,
+    contrib: Option<&ContribStatus>,
+    feed: DashboardFeedHealth,
+) -> PipelineStage {
+    let Some(mesh) = mesh else {
+        return PipelineStage::new(
+            "control",
+            "control",
+            "waiting",
+            "waiting",
+            "mesh status unavailable",
+        );
+    };
+
+    let telemetry_total = mesh.orchestration.telemetry_peers.len();
+    let telemetry_connected = mesh
+        .orchestration
+        .telemetry_peers
+        .iter()
+        .filter(|peer| peer.state == "connected")
+        .count();
+    let mesh_feed = if feed.mesh_events_active {
+        "mesh SSE"
+    } else {
+        "mesh polling"
+    };
+    let contrib_feed = if feed.contrib_events_active {
+        "contrib SSE"
+    } else if contrib.is_some() {
+        "contrib polling"
+    } else {
+        "contrib waiting"
+    };
+    let control = if mesh.orchestration.control_dispatch_ready {
+        "control bus connected"
+    } else {
+        "control bus local-only"
+    };
+    let detail =
+        format!("{mesh_feed} / {contrib_feed} / {telemetry_connected}/{telemetry_total} telemetry / {control}");
+
+    if feed.within_startup_grace() && (!feed.mesh_events_active || !feed.contrib_events_active) {
+        PipelineStage::new("control", "control", "waiting", "connecting hoses", detail)
+    } else if !feed.mesh_events_active || !feed.contrib_events_active {
+        PipelineStage::new("control", "control", "warn", "polling fallback", detail)
+    } else if telemetry_total > 0 && telemetry_connected == 0 {
+        PipelineStage::new(
+            "control",
+            "control",
+            "warn",
+            "telemetry disconnected",
+            detail,
+        )
+    } else if mesh.orchestration.control_dispatch_ready {
+        PipelineStage::new("control", "control", "ready", "data hoses up", detail)
+    } else {
+        PipelineStage::new("control", "control", "warn", "local control only", detail)
+    }
+}
+
+fn contrib_health_age_is_fresh(seen: bool, age_ms: Option<u64>, health: &ContribHealth) -> bool {
+    seen && age_ms.is_some_and(|age_ms| age_ms <= health.stale_threshold_ms.max(1))
 }
 
 #[derive(Clone, Debug)]
