@@ -675,9 +675,9 @@ main {
   display: grid;
   grid-template-columns:
     minmax(90px, 0.8fr) minmax(110px, 1fr) 72px 72px 72px minmax(150px, 1.3fr)
-    110px;
+    110px minmax(150px, 1.1fr);
   gap: 10px;
-  min-width: 790px;
+  min-width: 950px;
   padding: 9px 0;
   border-bottom: 1px solid var(--line);
 }

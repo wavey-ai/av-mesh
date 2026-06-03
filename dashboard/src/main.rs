@@ -413,7 +413,7 @@ fn App() -> impl IntoView {
                         </div>
                         <PlaybackProbeList probes=playback_probes />
                         <LocalStream mesh />
-                        <StreamTable mesh />
+                        <StreamTable mesh rates=mesh_rates />
                         <ReplicaPlan mesh />
                     </section>
 
@@ -939,26 +939,40 @@ fn LocalStream(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
 }
 
 #[component]
-fn StreamTable(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
+fn StreamTable(
+    mesh: ReadSignal<Option<MeshApiSnapshot>>,
+    rates: ReadSignal<MeshRateSnapshot>,
+) -> impl IntoView {
     view! {
         <div class="table">
             <div class="table-head stream-row">
-                <span>"stream"</span><span>"node"</span><span>"state"</span><span>"local"</span><span>"mesh"</span><span>"age"</span><span>"bytes"</span>
+                <span>"stream"</span><span>"node"</span><span>"state"</span><span>"local"</span><span>"mesh"</span><span>"age"</span><span>"bytes"</span><span>"rate"</span>
             </div>
             <For
                 each=move || mesh.get().map(|m| m.streams).unwrap_or_default()
                 key=|stream| format!("{}:{}", stream.node_id, stream.stream_id_text)
                 let(stream)
             >
-                <div class=stream.class_name()>
-                    <span>{stream.display_stream_id()}</span>
-                    <span>{stream.node_id.clone()}</span>
-                    <span>{stream.status_text()}</span>
-                    <span>{optional_u64(stream.latest_local_part)}</span>
-                    <span>{optional_u64(stream.latest_mesh_part)}</span>
-                    <span>{stream.age_text()}</span>
-                    <span>{format_bytes(stream.bytes_received)}</span>
-                </div>
+                {
+                    let class_name = stream.class_name();
+                    let rate_key = stream.rate_key();
+                    let rate_stream = stream.clone();
+                    view! {
+                        <div class=class_name>
+                            <span>{stream.display_stream_id()}</span>
+                            <span>{stream.node_id.clone()}</span>
+                            <span>{stream.status_text()}</span>
+                            <span>{optional_u64(stream.latest_local_part)}</span>
+                            <span>{optional_u64(stream.latest_mesh_part)}</span>
+                            <span>{stream.age_text()}</span>
+                            <span>{format_bytes(stream.bytes_received)}</span>
+                            <span>{move || {
+                                let rate = rates.get().streams.get(&rate_key).copied();
+                                rate_stream.rate_text(rate)
+                            }}</span>
+                        </div>
+                    }
+                }
             </For>
         </div>
     }
@@ -2158,6 +2172,7 @@ struct MeshRateSample {
     sampled_unix_ms: u64,
     bytes_received: u64,
     datagrams_received: u64,
+    streams: HashMap<String, StreamRateCounters>,
     edges: HashMap<String, EdgeRateCounters>,
     telemetry_peers: HashMap<String, TelemetryPeerRateCounters>,
 }
@@ -2178,6 +2193,19 @@ impl MeshRateSample {
             sampled_unix_ms: nonzero_u64(snapshot.updated_unix_ms).unwrap_or_else(now_unix_ms),
             bytes_received: stream_bytes.max(snapshot.stream.bytes_received),
             datagrams_received: stream_datagrams.max(snapshot.stream.datagrams_received),
+            streams: snapshot
+                .streams
+                .iter()
+                .map(|stream| {
+                    (
+                        stream.rate_key(),
+                        StreamRateCounters {
+                            bytes_received: stream.bytes_received,
+                            datagrams_received: stream.datagrams_received,
+                        },
+                    )
+                })
+                .collect(),
             edges: snapshot
                 .edge_services
                 .iter()
@@ -2212,6 +2240,51 @@ impl MeshRateSample {
                 })
                 .collect(),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StreamRateCounters {
+    bytes_received: u64,
+    datagrams_received: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StreamRateSnapshot {
+    ready: bool,
+    window_ms: u64,
+    bytes_per_sec: f64,
+    datagrams_per_sec: f64,
+}
+
+impl StreamRateSnapshot {
+    fn from_delta(
+        previous: StreamRateCounters,
+        current: StreamRateCounters,
+        window_ms: u64,
+    ) -> Self {
+        Self {
+            ready: window_ms >= 250,
+            window_ms,
+            bytes_per_sec: counter_rate(previous.bytes_received, current.bytes_received, window_ms),
+            datagrams_per_sec: counter_rate(
+                previous.datagrams_received,
+                current.datagrams_received,
+                window_ms,
+            ),
+        }
+    }
+
+    fn text(&self) -> String {
+        if !self.ready {
+            return "rate waiting".to_owned();
+        }
+        format!(
+            "{} / {} / {}",
+            format_bytes_per_sec(true, self.bytes_per_sec),
+            format_count_per_sec(self.datagrams_per_sec, "datagrams"),
+            format_rate_window(self.window_ms)
+        )
     }
 }
 
@@ -2369,6 +2442,7 @@ struct MeshRateSnapshot {
     window_ms: u64,
     bytes_per_sec: f64,
     datagrams_per_sec: f64,
+    streams: HashMap<String, StreamRateSnapshot>,
     edges: HashMap<String, EdgeRateSnapshot>,
     telemetry_peers: HashMap<String, TelemetryPeerRateSnapshot>,
 }
@@ -2387,6 +2461,17 @@ impl MeshRateSnapshot {
                 current.datagrams_received,
                 window_ms,
             ),
+            streams: current
+                .streams
+                .iter()
+                .map(|(stream, current)| {
+                    let previous = previous.streams.get(stream).copied().unwrap_or_default();
+                    (
+                        stream.clone(),
+                        StreamRateSnapshot::from_delta(previous, *current, window_ms),
+                    )
+                })
+                .collect(),
             edges: current
                 .edges
                 .iter()
@@ -3035,6 +3120,10 @@ struct StreamTelemetry {
 }
 
 impl StreamTelemetry {
+    fn rate_key(&self) -> String {
+        format!("{}:{}", self.node_id, self.stream_id_text)
+    }
+
     fn display_stream_id(&self) -> String {
         if self.stream_id_text.is_empty() {
             "-".to_owned()
@@ -3089,6 +3178,14 @@ impl StreamTelemetry {
             detail.push(format!("part {}", format_bytes(bytes as u64)));
         }
         detail.join(" / ")
+    }
+
+    fn rate_text(&self, rate: Option<StreamRateSnapshot>) -> String {
+        match rate {
+            Some(rate) if rate.ready => rate.text(),
+            _ if self.active() => "rate waiting".to_owned(),
+            _ => "idle".to_owned(),
+        }
     }
 }
 
