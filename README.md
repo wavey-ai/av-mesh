@@ -285,13 +285,13 @@ The server uses the local TLS material from `web-services`; clients will need to
 trust that cert or use an insecure local test client.
 
 For local OBS testing with both mesh nodes and the contributor ingress under one
-Rust supervisor, run:
+Rust supervisor, use the `local-obs-stack` binary owned by `../av-contrib`:
 
 ```bash
-cargo run --bin local-obs-stack
+cargo run --manifest-path ../av-contrib/Cargo.toml --bin local-obs-stack --release
 ```
 
-The supervisor builds `av-mesh` and `../av-contrib`, uses the local bitneedle
+The supervisor builds release `av-mesh` and `../av-contrib`, uses the local bitneedle
 TLS material from `../tls/local.bitneedle.com`, starts UK and US mesh nodes plus
 one `av-contrib` ingress, and prefixes every child process stdout/stderr line
 into the supervisor stdout. By default it uses stream id `1`, UK egress
@@ -301,14 +301,14 @@ at `/live/stream.m3u8`, and mesh dashboards at `/mesh` on both ports. OBS can
 publish RTMP to server
 `rtmp://local.bitneedle.com:19350/live` with stream key `obs-local`, or SRT to
 `srt://local.bitneedle.com:27001?mode=caller`. RIST is also bound on
-`local.bitneedle.com:27000` with main profile and flow id `0x72737401`. The
+`local.bitneedle.com:27000` with main profile and flow id `0x11223344`. The
 supervisor shells out to `curl` for local health checks.
 
 Useful overrides:
 
 ```bash
 RUST_LOG=av_mesh=trace,av_contrib=trace,rtmp_ingress=debug \
-  cargo run --bin local-obs-stack -- \
+  cargo run --manifest-path ../av-contrib/Cargo.toml --bin local-obs-stack --release -- \
     --stream-id 4294967351 \
     --host local.bitneedle.com \
     --rtmp-bind 127.0.0.1:19351 \
