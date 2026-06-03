@@ -1,4 +1,4 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use gloo_net::http::Request;
 use gloo_timers::callback::Interval;
@@ -332,6 +332,7 @@ fn App() -> impl IntoView {
                             <span>{move || mesh.get().map(|m| format!("updated {} / {} peers / {} links / {} alerts", age_text(m.updated_unix_ms), m.peers.len(), m.connections.len(), m.alerts.len())).unwrap_or_else(|| "waiting".to_owned())}</span>
                         </div>
                         <MeshAlertList mesh />
+                        <TopologyGraph mesh />
                         <div class="node-map">
                             <For
                                 each=move || mesh.get().map(|m| m.nodes).unwrap_or_default()
@@ -577,6 +578,43 @@ fn MeshAlertList(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
                     <small>{format!("{} seen / {}", alert.count, optional_unix_age(alert.last_seen_unix_ms))}</small>
                 </div>
             </For>
+        </div>
+    }
+}
+
+#[component]
+fn TopologyGraph(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
+    view! {
+        <div class="topology-graph">
+            <svg viewBox="0 0 720 260" role="img" aria-label="mesh topology graph">
+                <For
+                    each=move || build_topology_graph(mesh.get()).links
+                    key=|link| link.key.clone()
+                    let(link)
+                >
+                    <line
+                        class=link.class_name()
+                        x1=format!("{:.1}", link.x1)
+                        y1=format!("{:.1}", link.y1)
+                        x2=format!("{:.1}", link.x2)
+                        y2=format!("{:.1}", link.y2)
+                    />
+                </For>
+                <For
+                    each=move || build_topology_graph(mesh.get()).nodes
+                    key=|node| node.node_id.clone()
+                    let(node)
+                >
+                    <g class=node.class_name() transform=format!("translate({:.1} {:.1})", node.x, node.y)>
+                        <circle r="23"></circle>
+                        <text class="topology-node-label" y="4">{node.short_label()}</text>
+                        <text class="topology-node-detail" y="39">{node.detail_text()}</text>
+                    </g>
+                </For>
+            </svg>
+            <Show when=move || mesh.get().map(|m| m.nodes.is_empty()).unwrap_or(true)>
+                <div class="topology-empty">"waiting for mesh topology"</div>
+            </Show>
         </div>
     }
 }
@@ -1042,6 +1080,169 @@ fn short_clock() -> String {
         .to_locale_time_string("en-GB")
         .as_string()
         .unwrap_or_else(|| "now".to_owned())
+}
+
+#[derive(Clone, Debug, Default)]
+struct TopologyGraphData {
+    nodes: Vec<TopologyGraphNode>,
+    links: Vec<TopologyGraphLink>,
+}
+
+#[derive(Clone, Debug)]
+struct TopologyGraphNode {
+    node_id: String,
+    region: String,
+    active_streams: u64,
+    severity: TopologyNodeSeverity,
+    x: f64,
+    y: f64,
+}
+
+impl TopologyGraphNode {
+    fn short_label(&self) -> String {
+        if self.node_id.chars().count() <= 10 {
+            self.node_id.clone()
+        } else {
+            format!("{}...", self.node_id.chars().take(10).collect::<String>())
+        }
+    }
+
+    fn detail_text(&self) -> String {
+        format!("{} / {} active", self.region, self.active_streams)
+    }
+
+    fn class_name(&self) -> String {
+        format!("topology-node {}", self.severity.class_name())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TopologyNodeSeverity {
+    Idle,
+    Active,
+    Warn,
+    Error,
+}
+
+impl TopologyNodeSeverity {
+    fn class_name(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Active => "active",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TopologyGraphLink {
+    key: String,
+    resolved: bool,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+}
+
+impl TopologyGraphLink {
+    fn class_name(&self) -> &'static str {
+        if self.resolved {
+            "topology-link"
+        } else {
+            "topology-link unresolved"
+        }
+    }
+}
+
+fn build_topology_graph(snapshot: Option<MeshApiSnapshot>) -> TopologyGraphData {
+    let Some(snapshot) = snapshot else {
+        return TopologyGraphData::default();
+    };
+    let mut nodes = snapshot.nodes;
+    nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+
+    let count = nodes.len().max(1);
+    let center_x = 360.0;
+    let center_y = 124.0;
+    let radius_x = 270.0;
+    let radius_y = 78.0;
+    let mut graph_nodes = Vec::with_capacity(nodes.len());
+    let mut positions = HashMap::with_capacity(nodes.len());
+
+    for (index, node) in nodes.into_iter().enumerate() {
+        let (x, y) = if count == 1 {
+            (center_x, center_y)
+        } else {
+            let angle = -std::f64::consts::FRAC_PI_2
+                + (index as f64 * std::f64::consts::TAU / count as f64);
+            (
+                center_x + angle.cos() * radius_x,
+                center_y + angle.sin() * radius_y,
+            )
+        };
+        let severity = topology_node_severity(&node);
+        positions.insert(node.node_id.clone(), (x, y));
+        graph_nodes.push(TopologyGraphNode {
+            node_id: node.node_id,
+            region: node.region,
+            active_streams: node.active_streams,
+            severity,
+            x,
+            y,
+        });
+    }
+
+    let links = snapshot
+        .connections
+        .into_iter()
+        .filter_map(|connection| {
+            let (x1, y1) = *positions.get(&connection.source_node_id)?;
+            let (x2, y2, resolved) = if let Some(target_node_id) = &connection.target_node_id {
+                let (x2, y2) = *positions.get(target_node_id)?;
+                (x2, y2, true)
+            } else {
+                let dx = x1 - center_x;
+                let dy = y1 - center_y;
+                let len = (dx * dx + dy * dy).sqrt().max(1.0);
+                (x1 + (dx / len * 58.0), y1 + (dy / len * 38.0), false)
+            };
+            Some(TopologyGraphLink {
+                key: format!(
+                    "{}:{}:{}",
+                    connection.source_node_id,
+                    connection
+                        .target_node_id
+                        .as_deref()
+                        .unwrap_or(&connection.target_addr),
+                    connection.state
+                ),
+                resolved,
+                x1,
+                y1,
+                x2,
+                y2,
+            })
+        })
+        .collect();
+
+    TopologyGraphData {
+        nodes: graph_nodes,
+        links,
+    }
+}
+
+fn topology_node_severity(node: &MeshNode) -> TopologyNodeSeverity {
+    let storage = percent(node.used_storage_bytes, node.total_storage_bytes);
+    if node.draining || storage >= 95.0 {
+        TopologyNodeSeverity::Error
+    } else if storage >= 85.0 {
+        TopologyNodeSeverity::Warn
+    } else if node.active_streams > 0 || node.contributor_streams > 0 {
+        TopologyNodeSeverity::Active
+    } else {
+        TopologyNodeSeverity::Idle
+    }
 }
 
 fn now_unix_ms() -> u64 {

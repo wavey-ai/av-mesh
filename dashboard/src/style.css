@@ -203,6 +203,81 @@ main {
   margin-bottom: 12px;
 }
 
+.topology-graph {
+  position: relative;
+  margin-bottom: 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fbfdff;
+}
+
+.topology-graph svg {
+  display: block;
+  width: 100%;
+  min-height: 220px;
+}
+
+.topology-link {
+  stroke: #94a3b8;
+  stroke-width: 2.5;
+}
+
+.topology-link.unresolved {
+  stroke: var(--amber);
+  stroke-dasharray: 7 6;
+}
+
+.topology-node circle {
+  stroke-width: 3;
+  fill: #fff;
+}
+
+.topology-node.idle circle {
+  stroke: #94a3b8;
+}
+
+.topology-node.active circle {
+  stroke: var(--green);
+  fill: #ecfdf5;
+}
+
+.topology-node.warn circle {
+  stroke: var(--amber);
+  fill: #fff8ee;
+}
+
+.topology-node.error circle {
+  stroke: var(--red);
+  fill: #fff1f1;
+}
+
+.topology-node text {
+  text-anchor: middle;
+  paint-order: stroke;
+  stroke: #fff;
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+
+.topology-node-label {
+  font-size: 13px;
+  font-weight: 700;
+  fill: var(--ink);
+}
+
+.topology-node-detail {
+  font-size: 11px;
+  fill: var(--muted);
+}
+
+.topology-empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+}
+
 .node-map {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(185px, 1fr));
