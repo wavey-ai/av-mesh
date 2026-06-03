@@ -751,6 +751,45 @@ main {
   width: 100%;
 }
 
+.control-preview {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.control-preview-card {
+  display: grid;
+  grid-template-columns: 82px minmax(0, 1fr);
+  gap: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 9px 10px;
+  background: #fff;
+}
+
+.control-preview-card.ready {
+  border-left: 4px solid var(--green);
+}
+
+.control-preview-card.warn {
+  border-left: 4px solid var(--amber);
+}
+
+.control-preview-card.danger {
+  border-left: 4px solid var(--red);
+}
+
+.control-preview-card span,
+.control-preview-card small {
+  overflow-wrap: anywhere;
+}
+
+.control-preview-card small {
+  grid-column: 1 / -1;
+  color: var(--muted);
+}
+
 .command {
   display: grid;
   grid-template-columns: minmax(118px, 0.7fr) minmax(0, 1.3fr);
@@ -932,6 +971,7 @@ main {
 
   .endpoint-grid,
   .control-grid,
+  .control-preview,
   .command-health-grid,
   .orchestration-grid,
   .runtime-grid {

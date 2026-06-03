@@ -2,6 +2,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     rc::Rc,
+    sync::Arc,
 };
 
 use gloo_net::http::Request;
@@ -455,6 +456,7 @@ fn App() -> impl IntoView {
                                 }));
                             }>"Close node"</button>
                         </div>
+                        <ControlTargetPreview mesh stream_id region node_id />
                         <CommandList mesh />
                     </section>
                 </div>
@@ -1105,6 +1107,63 @@ fn ControlCommandHealth(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoV
                 value=move || mesh.get().map(|m| latest_command_status(&m.recent_commands, "provision_node")).unwrap_or_else(|| "-".to_owned())
                 detail=move || mesh.get().map(|m| latest_command_meta(&m.recent_commands, "provision_node")).unwrap_or_else(|| "no provision commands".to_owned())
             />
+        </div>
+    }
+}
+
+#[component]
+fn ControlTargetPreview(
+    mesh: ReadSignal<Option<MeshApiSnapshot>>,
+    stream_id: ReadSignal<String>,
+    region: ReadSignal<String>,
+    node_id: ReadSignal<String>,
+) -> impl IntoView {
+    view! {
+        <div class="control-preview">
+            <ControlPreviewCard
+                title="warm"
+                preview=move || {
+                    let snapshot = mesh.get();
+                    control_warm_preview(
+                        snapshot.as_ref(),
+                        &stream_id.get(),
+                        &region.get(),
+                        &node_id.get(),
+                    )
+                }
+            />
+            <ControlPreviewCard
+                title="close"
+                preview=move || {
+                    let snapshot = mesh.get();
+                    control_close_preview(snapshot.as_ref(), &region.get(), &node_id.get())
+                }
+            />
+            <ControlPreviewCard
+                title="provision"
+                preview=move || {
+                    let snapshot = mesh.get();
+                    control_provision_preview(snapshot.as_ref(), &region.get(), &node_id.get())
+                }
+            />
+        </div>
+    }
+}
+
+#[component]
+fn ControlPreviewCard<P>(title: &'static str, preview: P) -> impl IntoView
+where
+    P: Fn() -> ControlPreview + Send + Sync + 'static,
+{
+    let preview = Arc::new(preview);
+    let class_preview = preview.clone();
+    let summary_preview = preview.clone();
+    let detail_preview = preview;
+    view! {
+        <div class=move || class_preview().class_name()>
+            <strong>{title}</strong>
+            <span>{move || summary_preview().summary}</span>
+            <small>{move || detail_preview().detail}</small>
         </div>
     }
 }
@@ -3412,6 +3471,205 @@ fn latest_command_meta(commands: &[ControlCommand], kind: &str) -> String {
         .find(|command| command_kind_matches(&command.kind, kind))
         .map(|command| command.meta_text())
         .unwrap_or_else(|| "no provision commands".to_owned())
+}
+
+#[derive(Clone, Debug)]
+struct ControlPreview {
+    level: &'static str,
+    summary: String,
+    detail: String,
+}
+
+impl ControlPreview {
+    fn new(level: &'static str, summary: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            level,
+            summary: summary.into(),
+            detail: detail.into(),
+        }
+    }
+
+    fn class_name(&self) -> String {
+        format!("control-preview-card {}", self.level)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ControlTargetScope {
+    summary: String,
+    detail: String,
+    visible_count: usize,
+    global: bool,
+}
+
+fn control_warm_preview(
+    mesh: Option<&MeshApiSnapshot>,
+    stream_id: &str,
+    region: &str,
+    node_id: &str,
+) -> ControlPreview {
+    let target = control_target_scope(mesh, region, node_id);
+    let stream_id = stream_id.trim();
+    if !valid_stream_id_text(stream_id) {
+        return ControlPreview::new(
+            "warn",
+            "stream missing",
+            format!("{} / stream id must be decimal", target.detail),
+        );
+    }
+    let level = if target.global { "warn" } else { "ready" };
+    ControlPreview::new(
+        level,
+        target.summary,
+        format!("stream {stream_id} / {}", target.detail),
+    )
+}
+
+fn control_close_preview(
+    mesh: Option<&MeshApiSnapshot>,
+    region: &str,
+    node_id: &str,
+) -> ControlPreview {
+    let target = control_target_scope(mesh, region, node_id);
+    let level = if target.global {
+        "danger"
+    } else if target.visible_count == 0 {
+        "warn"
+    } else {
+        "warn"
+    };
+    let summary = if target.global {
+        "global close".to_owned()
+    } else {
+        target.summary
+    };
+    ControlPreview::new(level, summary, target.detail)
+}
+
+fn control_provision_preview(
+    mesh: Option<&MeshApiSnapshot>,
+    region: &str,
+    node_id: &str,
+) -> ControlPreview {
+    let Some(mesh) = mesh else {
+        return ControlPreview::new("warn", "waiting", "mesh status unavailable");
+    };
+    let provision = &mesh.orchestration.provision;
+    let request = provision_request_text(region, node_id);
+    if !provision.enabled {
+        return ControlPreview::new(
+            "warn",
+            "disabled",
+            format!("no backend configured / {request}"),
+        );
+    }
+
+    let ready = provision
+        .backend_statuses
+        .iter()
+        .filter(|backend| backend.state == "ready")
+        .count();
+    let blocked = provision
+        .backend_statuses
+        .iter()
+        .filter(|backend| backend.state == "blocked" || backend.state == "error")
+        .count();
+    let backends = if provision.backends.is_empty() {
+        "no backend".to_owned()
+    } else {
+        provision.backends.join(", ")
+    };
+
+    if ready > 0 {
+        ControlPreview::new(
+            "ready",
+            format!("{ready} ready"),
+            format!("{backends} / local executor / {request}"),
+        )
+    } else if blocked > 0 {
+        ControlPreview::new(
+            "danger",
+            format!("{blocked} blocked"),
+            format!("{backends} / {request}"),
+        )
+    } else {
+        ControlPreview::new("warn", "not ready", format!("{backends} / {request}"))
+    }
+}
+
+fn control_target_scope(
+    mesh: Option<&MeshApiSnapshot>,
+    region: &str,
+    node_id: &str,
+) -> ControlTargetScope {
+    let node_id = node_id.trim();
+    let region = region.trim();
+    if !node_id.is_empty() {
+        let observed = mesh
+            .map(|mesh| mesh.nodes.iter().any(|node| node.node_id == node_id))
+            .unwrap_or(false);
+        return ControlTargetScope {
+            summary: format!("node {node_id}"),
+            detail: if observed {
+                "explicit node target observed".to_owned()
+            } else {
+                "explicit node target not observed in telemetry".to_owned()
+            },
+            visible_count: usize::from(observed),
+            global: false,
+        };
+    }
+
+    if !region.is_empty() {
+        let nodes = mesh
+            .map(|mesh| {
+                mesh.nodes
+                    .iter()
+                    .filter(|node| node.region == region)
+                    .map(|node| node.node_id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        return ControlTargetScope {
+            summary: format!("{} regional nodes", nodes.len()),
+            detail: if nodes.is_empty() {
+                format!("region {region} has no visible telemetry nodes")
+            } else {
+                format!("region {region}: {}", nodes.join(", "))
+            },
+            visible_count: nodes.len(),
+            global: false,
+        };
+    }
+
+    let visible = mesh.map(|mesh| mesh.nodes.len()).unwrap_or_default();
+    ControlTargetScope {
+        summary: "global".to_owned(),
+        detail: format!("{visible} visible nodes; empty target is accepted by AVMC subscribers"),
+        visible_count: visible,
+        global: true,
+    }
+}
+
+fn provision_request_text(region: &str, node_id: &str) -> String {
+    let mut parts = Vec::new();
+    let node_id = node_id.trim();
+    let region = region.trim();
+    if !node_id.is_empty() {
+        parts.push(format!("node {node_id}"));
+    }
+    if !region.is_empty() {
+        parts.push(format!("region {region}"));
+    }
+    if parts.is_empty() {
+        "default request".to_owned()
+    } else {
+        parts.join(" / ")
+    }
+}
+
+fn valid_stream_id_text(stream_id: &str) -> bool {
+    !stream_id.is_empty() && stream_id.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn command_kind_matches(left: &str, right: &str) -> bool {
