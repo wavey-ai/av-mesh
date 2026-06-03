@@ -499,7 +499,7 @@ fn ContribView(contrib: ReadSignal<Option<ContribStatus>>) -> impl IntoView {
                 <RuntimeCell label="raw http" value=move || contrib.get().map(|c| c.runtime.raw_http.requests.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} / {} datagrams / {}", format_bytes(c.runtime.raw_http.bytes), c.runtime.raw_http.datagrams, optional_age(c.runtime.raw_http.last_seen_age_ms))).unwrap_or_default() />
                 <RuntimeCell label="media au" value=move || contrib.get().map(|c| c.runtime.media_access_units.requests.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} / {} datagrams / {}", format_bytes(c.runtime.media_access_units.payload_bytes), c.runtime.media_access_units.datagrams, optional_age(c.runtime.media_access_units.last_seen_age_ms))).unwrap_or_default() />
                 <RuntimeCell label="mesh tx" value=move || contrib.get().map(|c| c.runtime.mesh_forward.payloads().to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| c.runtime.mesh_forward.detail_text()).unwrap_or_default() />
-                <RuntimeCell label="mpeg-ts" value=move || contrib.get().map(|c| c.runtime.mpeg_ts.slots.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} / {}", format_bytes(c.runtime.mpeg_ts.bytes), optional_age(c.runtime.mpeg_ts.last_seen_age_ms))).unwrap_or_default() />
+                <RuntimeCell label="mpeg-ts" value=move || contrib.get().map(|c| c.runtime.mpeg_ts.slots.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| c.runtime.mpeg_ts.detail_text()).unwrap_or_default() />
                 <RuntimeCell label="rtmp" value=move || contrib.get().map(|c| c.runtime.rtmp.access_units.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} / {}", format_bytes(c.runtime.rtmp.bytes), optional_age(c.runtime.rtmp.last_seen_age_ms))).unwrap_or_default() />
                 <RuntimeCell label="fmp4" value=move || contrib.get().map(|c| c.runtime.fmp4.parts.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} media / {} init / {}", format_bytes(c.runtime.fmp4.bytes), format_bytes(c.runtime.fmp4.init_bytes), optional_age(c.runtime.fmp4.last_publish_age_ms))).unwrap_or_default() />
                 <RuntimeCell label="tracks" value=move || contrib.get().map(|c| c.runtime.fmp4.track_summary()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| c.runtime.fmp4.track_detail()).unwrap_or_default() />
@@ -2449,6 +2449,33 @@ struct MpegTsRuntime {
     bytes: u64,
     #[serde(default)]
     last_seen_age_ms: Option<u64>,
+    #[serde(default)]
+    continuity_errors: u64,
+    #[serde(default)]
+    continuity_dropped_bytes: u64,
+    #[serde(default)]
+    payload_drops: u64,
+    #[serde(default)]
+    payload_drop_bytes: u64,
+    #[serde(default)]
+    last_error_age_ms: Option<u64>,
+}
+
+impl MpegTsRuntime {
+    fn detail_text(&self) -> String {
+        format!(
+            "{} / {} continuity / {} drops / {} damaged / last error {} / seen {}",
+            format_bytes(self.bytes),
+            self.continuity_errors,
+            self.payload_drops,
+            format_bytes(
+                self.continuity_dropped_bytes
+                    .saturating_add(self.payload_drop_bytes)
+            ),
+            optional_age(self.last_error_age_ms),
+            optional_age(self.last_seen_age_ms)
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
