@@ -284,6 +284,22 @@ choose a playlist id whose bytestream is compatible with its decoder.
 The server uses the local TLS material from `web-services`; clients will need to
 trust that cert or use an insecure local test client.
 
+## Rust dashboard
+
+The experimental Rust UI lives in `dashboard/` and uses latest Leptos alpha in
+CSR mode. It consumes `av-mesh` `/api/mesh`, `av-contrib` `/api/status`, and
+the existing `av-mesh` `/api/control/*` commands.
+
+```bash
+cd dashboard
+cargo install trunk --locked
+trunk serve --address 127.0.0.1 --port 5188
+```
+
+By default it points at the local OBS stack endpoints:
+`https://local.bitneedle.com:19444/api/mesh` and
+`https://local.bitneedle.com:19443/api/status`.
+
 For local OBS testing with both mesh nodes and the contributor ingress under one
 Rust supervisor, use the `local-obs-stack` binary owned by `../av-contrib`:
 

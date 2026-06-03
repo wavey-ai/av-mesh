@@ -1,4 +1,5 @@
 /target/
+/dashboard/dist/
+/dashboard/target/
 .DS_Store
 *.log
-

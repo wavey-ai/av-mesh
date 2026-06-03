@@ -1,0 +1,772 @@
+use gloo_net::http::Request;
+use gloo_timers::callback::Interval;
+use leptos::{mount::mount_to_body, prelude::*};
+use serde::{de::DeserializeOwned, Deserialize};
+use serde_json::{json, Value};
+use wasm_bindgen_futures::spawn_local;
+
+const DEFAULT_MESH_API: &str = "https://local.bitneedle.com:19444/api/mesh";
+const DEFAULT_CONTRIB_API: &str = "https://local.bitneedle.com:19443/api/status";
+
+fn main() {
+    console_error_panic_hook::set_once();
+    mount_to_body(App);
+}
+
+#[component]
+fn App() -> impl IntoView {
+    let (mesh_api, set_mesh_api) = signal(endpoint_from_query("mesh", DEFAULT_MESH_API));
+    let (contrib_api, set_contrib_api) =
+        signal(endpoint_from_query("contrib", DEFAULT_CONTRIB_API));
+    let (mesh, set_mesh) = signal(None::<MeshApiSnapshot>);
+    let (contrib, set_contrib) = signal(None::<ContribStatus>);
+    let (status, set_status) = signal(String::from("starting"));
+    let (control_status, set_control_status) = signal(String::from("idle"));
+    let (stream_id, set_stream_id) = signal(String::from("1"));
+    let (region, set_region) = signal(String::new());
+    let (node_id, set_node_id) = signal(String::new());
+
+    let refresh = move || {
+        let mesh_url = mesh_api.get();
+        let contrib_url = contrib_api.get();
+        set_status.set("refreshing".to_owned());
+        spawn_local(async move {
+            let mesh_result = fetch_json::<MeshApiSnapshot>(&mesh_url).await;
+            let contrib_result = fetch_json::<ContribStatus>(&contrib_url).await;
+
+            match (mesh_result, contrib_result) {
+                (Ok(mesh_snapshot), Ok(contrib_status)) => {
+                    set_mesh.set(Some(mesh_snapshot));
+                    set_contrib.set(Some(contrib_status));
+                    set_status.set(format!("ok {}", short_clock()));
+                }
+                (mesh_result, contrib_result) => {
+                    let mut errors = Vec::new();
+                    match mesh_result {
+                        Ok(mesh_snapshot) => set_mesh.set(Some(mesh_snapshot)),
+                        Err(error) => errors.push(format!("mesh: {error}")),
+                    }
+                    match contrib_result {
+                        Ok(contrib_status) => set_contrib.set(Some(contrib_status)),
+                        Err(error) => errors.push(format!("contrib: {error}")),
+                    }
+                    set_status.set(errors.join(" | "));
+                }
+            }
+        });
+    };
+
+    refresh();
+    Interval::new(2_000, refresh).forget();
+
+    let send_control = move |action: &'static str, body: Value| {
+        let mesh_url = mesh_api.get();
+        set_control_status.set(format!("{action} pending"));
+        spawn_local(async move {
+            let endpoint = mesh_control_url(&mesh_url, action);
+            match post_json(&endpoint, &body).await {
+                Ok(()) => set_control_status.set(format!("{action} accepted {}", short_clock())),
+                Err(error) => set_control_status.set(format!("{action} failed: {error}")),
+            }
+        });
+    };
+
+    view! {
+        <div class="shell">
+            <header class="topbar">
+                <div class="brand">
+                    <img class="brand-icon" src="/assets/wavey-goose.png" alt="" />
+                    <div>
+                        <h1>"av mission control"</h1>
+                        <p>{move || status.get()}</p>
+                    </div>
+                </div>
+                <div class="endpoint-grid">
+                    <label>
+                        <span>"mesh"</span>
+                        <input
+                            prop:value=move || mesh_api.get()
+                            on:input=move |event| set_mesh_api.set(event_target_value(&event))
+                        />
+                    </label>
+                    <label>
+                        <span>"contrib"</span>
+                        <input
+                            prop:value=move || contrib_api.get()
+                            on:input=move |event| set_contrib_api.set(event_target_value(&event))
+                        />
+                    </label>
+                    <button class="primary" on:click=move |_| refresh()>"Refresh"</button>
+                </div>
+            </header>
+
+            <main>
+                <section class="band metrics">
+                    <Metric label="nodes" value=move || mesh.get().map(|m| m.aggregate.node_count.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || mesh.get().map(|m| format!("{} links / local {}", m.aggregate.connection_count, m.node.node_id)).unwrap_or_default() />
+                    <Metric label="storage" value=move || mesh.get().map(|m| format_bytes(m.aggregate.used_storage_bytes)).unwrap_or_else(|| "-".to_owned()) detail=move || mesh.get().map(|m| format!("of {}", format_bytes(m.aggregate.total_storage_bytes))).unwrap_or_default() />
+                    <Metric label="egress" value=move || mesh.get().map(|m| format_bps(m.aggregate.total_egress_capacity_bps)).unwrap_or_else(|| "-".to_owned()) detail=move || mesh.get().map(|m| format!("{} ingress / {} active", m.aggregate.contributor_streams, m.aggregate.active_streams)).unwrap_or_default() />
+                    <Metric label="ingest" value=move || contrib.get().map(|c| enabled_listener_count(&c).to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("stream {}", c.advertised_hls_stream_id)).unwrap_or_default() />
+                </section>
+
+                <div class="workspace">
+                    <section class="panel map-panel">
+                        <div class="panel-head">
+                            <h2>"Topology"</h2>
+                            <span>{move || mesh.get().map(|m| format!("updated {} / {} peers / {} links", age_text(m.updated_unix_ms), m.peers.len(), m.connections.len())).unwrap_or_else(|| "waiting".to_owned())}</span>
+                        </div>
+                        <div class="node-map">
+                            <For
+                                each=move || mesh.get().map(|m| m.nodes).unwrap_or_default()
+                                key=|node| node.node_id.clone()
+                                let(node)
+                            >
+                                <NodeTile node />
+                            </For>
+                        </div>
+                        <PeerList mesh />
+                        <ConnectionList mesh />
+                    </section>
+
+                    <section class="panel">
+                        <div class="panel-head">
+                            <h2>"Contributor"</h2>
+                            <span>{move || contrib.get().map(|c| c.status).unwrap_or_else(|| "waiting".to_owned())}</span>
+                        </div>
+                        <ContribView contrib />
+                    </section>
+                </div>
+
+                <div class="workspace lower">
+                    <section class="panel">
+                        <div class="panel-head">
+                            <h2>"Streams"</h2>
+                            <span>{move || mesh.get().map(|m| format!("{} observed / {} planned", m.streams.len(), m.planned_replicas.len())).unwrap_or_else(|| "0 observed".to_owned())}</span>
+                        </div>
+                        <LocalStream mesh />
+                        <StreamTable mesh />
+                        <ReplicaPlan mesh />
+                    </section>
+
+                    <section class="panel">
+                        <div class="panel-head">
+                            <h2>"Controls"</h2>
+                            <span>{move || control_status.get()}</span>
+                        </div>
+                        <div class="control-grid">
+                            <label>
+                                <span>"stream"</span>
+                                <input prop:value=move || stream_id.get() on:input=move |event| set_stream_id.set(event_target_value(&event)) />
+                            </label>
+                            <label>
+                                <span>"region"</span>
+                                <input prop:value=move || region.get() on:input=move |event| set_region.set(event_target_value(&event)) />
+                            </label>
+                            <label>
+                                <span>"node"</span>
+                                <input prop:value=move || node_id.get() on:input=move |event| set_node_id.set(event_target_value(&event)) />
+                            </label>
+                            <button on:click=move |_| {
+                                send_control("warm-stream", json!({
+                                    "stream_id": stream_id.get(),
+                                    "region": optional_text(region.get())
+                                }));
+                            }>"Warm stream"</button>
+                            <button on:click=move |_| {
+                                send_control("provision-node", json!({
+                                    "node_id": optional_text(node_id.get()),
+                                    "region": optional_text(region.get())
+                                }));
+                            }>"Provision"</button>
+                            <button class="danger" on:click=move |_| {
+                                send_control("close-node", json!({
+                                    "node_id": optional_text(node_id.get()),
+                                    "region": optional_text(region.get())
+                                }));
+                            }>"Close node"</button>
+                        </div>
+                        <CommandList mesh />
+                    </section>
+                </div>
+
+                <section class="panel">
+                    <div class="panel-head">
+                        <h2>"Edges"</h2>
+                        <span>{move || mesh.get().map(|m| format!("{} services", m.edge_services.len())).unwrap_or_else(|| "0 services".to_owned())}</span>
+                    </div>
+                    <EdgeGrid mesh />
+                </section>
+            </main>
+        </div>
+    }
+}
+
+#[component]
+fn Metric<V, D>(label: &'static str, value: V, detail: D) -> impl IntoView
+where
+    V: Fn() -> String + Send + Sync + 'static,
+    D: Fn() -> String + Send + Sync + 'static,
+{
+    view! {
+        <article class="metric">
+            <span>{label}</span>
+            <strong>{value}</strong>
+            <em>{detail}</em>
+        </article>
+    }
+}
+
+#[component]
+fn NodeTile(node: MeshNode) -> impl IntoView {
+    let storage_pct = percent(node.used_storage_bytes, node.total_storage_bytes);
+    let class = if node.draining {
+        "node draining"
+    } else {
+        "node"
+    };
+    view! {
+        <article class=class>
+            <div>
+                <strong>{node.node_id.clone()}</strong>
+                <span>{format!("{} / {}", node.region, node.continent)}</span>
+            </div>
+            <div class="node-stats">
+                <span>{format!("{} active", node.active_streams)}</span>
+                <span>{format!("{} ingress", node.contributor_streams)}</span>
+                <span>{format_bps(node.egress_capacity_bps)}</span>
+            </div>
+            <div class="bar"><i style=format!("width: {:.1}%", storage_pct)></i></div>
+            <small>{format!("{} used", format_bytes(node.used_storage_bytes))}</small>
+        </article>
+    }
+}
+
+#[component]
+fn ContribView(contrib: ReadSignal<Option<ContribStatus>>) -> impl IntoView {
+    view! {
+        <div class="contrib">
+            <div class="kv">
+                <span>"advertised hls"</span>
+                <strong>{move || contrib.get().map(|c| c.advertised_hls_path).unwrap_or_else(|| "-".to_owned())}</strong>
+            </div>
+            <div class="kv">
+                <span>"byte fec"</span>
+                <strong>{move || contrib.get().map(|c| c.mesh.byte_fec_target).unwrap_or_else(|| "-".to_owned())}</strong>
+            </div>
+            <div class="kv">
+                <span>"media fec"</span>
+                <strong>{move || contrib.get().map(|c| c.mesh.media_fec_target).unwrap_or_else(|| "-".to_owned())}</strong>
+            </div>
+            <div class="listener-list">
+                <For
+                    each=move || contrib.get().map(|c| c.listeners).unwrap_or_default()
+                    key=|listener| listener.protocol.clone()
+                    let(listener)
+                >
+                    <div class=if listener.enabled { "listener on" } else { "listener" }>
+                        <strong>{listener.protocol}</strong>
+                        <span>{listener.bind.unwrap_or_else(|| "disabled".to_owned())}</span>
+                        <small>{format!("stream {}", listener.output_stream_id)}</small>
+                    </div>
+                </For>
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn PeerList(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
+    view! {
+        <div class="mini-list">
+            <For
+                each=move || mesh.get().map(|m| m.peers).unwrap_or_default()
+                key=|peer| peer.addr.clone()
+                let(peer)
+            >
+                <span>{format!("{} {}", peer.addr, peer.state)}</span>
+            </For>
+        </div>
+    }
+}
+
+#[component]
+fn ConnectionList(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
+    view! {
+        <div class="table compact">
+            <div class="table-head connection-row">
+                <span>"source"</span><span>"target"</span><span>"state"</span>
+            </div>
+            <For
+                each=move || mesh.get().map(|m| m.connections).unwrap_or_default()
+                key=|connection| format!("{}:{}", connection.source_node_id, connection.target_addr)
+                let(connection)
+            >
+                <div class="connection-row">
+                    <span>{connection.source_node_id}</span>
+                    <span>{connection.target_node_id.unwrap_or(connection.target_addr)}</span>
+                    <span>{connection.state}</span>
+                </div>
+            </For>
+        </div>
+    }
+}
+
+#[component]
+fn LocalStream(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
+    view! {
+        <div class="local-stream">
+            <span>{move || mesh.get().map(|m| format!("local stream {}", m.stream.stream_id_text)).unwrap_or_else(|| "local stream -".to_owned())}</span>
+            <strong>{move || mesh.get().map(|m| format_bytes(m.stream.bytes_received)).unwrap_or_else(|| "-".to_owned())}</strong>
+            <em>{move || mesh.get().map(|m| format!("local {} / mesh {} / {} datagrams", optional_u64(m.stream.latest_local_part), optional_u64(m.stream.latest_mesh_part), m.stream.datagrams_received)).unwrap_or_default()}</em>
+        </div>
+    }
+}
+
+#[component]
+fn StreamTable(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
+    view! {
+        <div class="table">
+            <div class="table-head stream-row">
+                <span>"stream"</span><span>"node"</span><span>"local"</span><span>"mesh"</span><span>"bytes"</span>
+            </div>
+            <For
+                each=move || mesh.get().map(|m| m.streams).unwrap_or_default()
+                key=|stream| format!("{}:{}", stream.node_id, stream.stream_id_text)
+                let(stream)
+            >
+                <div class="stream-row">
+                    <span>{stream.display_stream_id()}</span>
+                    <span>{stream.node_id}</span>
+                    <span>{optional_u64(stream.latest_local_part)}</span>
+                    <span>{optional_u64(stream.latest_mesh_part)}</span>
+                    <span>{format_bytes(stream.bytes_received)}</span>
+                </div>
+            </For>
+        </div>
+    }
+}
+
+#[component]
+fn ReplicaPlan(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
+    view! {
+        <div class="table compact">
+            <div class="table-head plan-row">
+                <span>"planned stream"</span><span>"target"</span><span>"score"</span>
+            </div>
+            <For
+                each=move || mesh.get().map(|m| m.planned_replicas).unwrap_or_default()
+                key=|replica| format!("{}:{}", replica.stream_id_text, replica.target_node_id)
+                let(replica)
+            >
+                <div class="plan-row">
+                    <span>{replica.stream_id_text}</span>
+                    <span>{replica.target_node_id}</span>
+                    <span>{format!("{:.2}", replica.score)}</span>
+                </div>
+            </For>
+        </div>
+    }
+}
+
+#[component]
+fn CommandList(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
+    view! {
+        <div class="commands">
+            <For
+                each=move || mesh.get().map(|m| m.recent_commands).unwrap_or_default()
+                key=|command| command.id
+                let(command)
+            >
+                <div class="command">
+                    <strong>{command.kind.clone()}</strong>
+                    <span>{command.status.clone()}</span>
+                    <small>{command.target_text()}</small>
+                </div>
+            </For>
+        </div>
+    }
+}
+
+#[component]
+fn EdgeGrid(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
+    view! {
+        <div class="edge-grid">
+            <For
+                each=move || mesh.get().map(|m| m.edge_services).unwrap_or_default()
+                key=|edge| edge.node_id.clone()
+                let(edge)
+            >
+                <article class=if edge.draining { "edge draining" } else { "edge" }>
+                    <div>
+                        <strong>{edge.node_id}</strong>
+                        <span>{format!("{} / {}", edge.region, edge.continent)}</span>
+                    </div>
+                    <p>{edge.playback_base_url.unwrap_or_else(|| "no playback url".to_owned())}</p>
+                    <div class="edge-stats">
+                        <span>{format!("{} readers", edge.active_readers)}</span>
+                        <span>{format!("{} served", format_bytes(edge.bytes_served))}</span>
+                        <span>{format!("{} tails", edge.llhls_tail_requests)}</span>
+                    </div>
+                </article>
+            </For>
+        </div>
+    }
+}
+
+async fn fetch_json<T>(url: &str) -> Result<T, String>
+where
+    T: DeserializeOwned,
+{
+    let response = Request::get(url)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.ok() {
+        return Err(format!("HTTP {}", response.status()));
+    }
+    response
+        .json::<T>()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn post_json(url: &str, body: &Value) -> Result<(), String> {
+    let response = Request::post(url)
+        .header("Accept", "application/json")
+        .json(body)
+        .map_err(|error| error.to_string())?
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if response.ok() {
+        Ok(())
+    } else {
+        Err(format!("HTTP {}", response.status()))
+    }
+}
+
+fn mesh_control_url(mesh_api: &str, action: &str) -> String {
+    let base = mesh_api
+        .split_once("/api/mesh")
+        .map(|(base, _)| base)
+        .unwrap_or(mesh_api.trim_end_matches('/'));
+    format!("{base}/api/control/{action}")
+}
+
+fn endpoint_from_query(key: &str, fallback: &str) -> String {
+    let Some(window) = web_sys::window() else {
+        return fallback.to_owned();
+    };
+    let Ok(search) = window.location().search() else {
+        return fallback.to_owned();
+    };
+    let prefix = format!("{key}=");
+    search
+        .trim_start_matches('?')
+        .split('&')
+        .filter_map(|part| part.split_once('='))
+        .find_map(|(name, value)| {
+            if name == key {
+                Some(value.replace("%3A", ":").replace("%2F", "/"))
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            search
+                .trim_start_matches('?')
+                .split('&')
+                .find_map(|part| part.strip_prefix(&prefix).map(ToOwned::to_owned))
+        })
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+fn enabled_listener_count(contrib: &ContribStatus) -> usize {
+    contrib
+        .listeners
+        .iter()
+        .filter(|listener| listener.enabled)
+        .count()
+}
+
+fn optional_text(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+fn optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn format_bps(bps: u64) -> String {
+    if bps >= 1_000_000_000 {
+        format!("{:.1} Gbps", bps as f64 / 1_000_000_000.0)
+    } else if bps >= 1_000_000 {
+        format!("{:.1} Mbps", bps as f64 / 1_000_000.0)
+    } else if bps >= 1_000 {
+        format!("{:.1} Kbps", bps as f64 / 1_000.0)
+    } else {
+        format!("{bps} bps")
+    }
+}
+
+fn percent(used: u64, total: u64) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    ((used as f64 / total as f64) * 100.0).clamp(0.0, 100.0)
+}
+
+fn age_text(unix_ms: u64) -> String {
+    let now = js_sys::Date::now() as u64;
+    let age = now.saturating_sub(unix_ms);
+    if age < 1_000 {
+        "now".to_owned()
+    } else if age < 60_000 {
+        format!("{}s ago", age / 1_000)
+    } else {
+        format!("{}m ago", age / 60_000)
+    }
+}
+
+fn short_clock() -> String {
+    js_sys::Date::new_0()
+        .to_locale_time_string("en-GB")
+        .as_string()
+        .unwrap_or_else(|| "now".to_owned())
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct MeshApiSnapshot {
+    #[serde(default)]
+    updated_unix_ms: u64,
+    #[serde(default)]
+    node: MeshNode,
+    #[serde(default)]
+    peers: Vec<PeerSnapshot>,
+    #[serde(default)]
+    stream: StatsSnapshot,
+    #[serde(default)]
+    recent_commands: Vec<ControlCommand>,
+    #[serde(default)]
+    planned_replicas: Vec<ReplicaPlacementSnapshot>,
+    #[serde(default)]
+    aggregate: AggregateMetrics,
+    #[serde(default)]
+    nodes: Vec<MeshNode>,
+    #[serde(default)]
+    edge_services: Vec<EdgeServiceSnapshot>,
+    #[serde(default)]
+    connections: Vec<ConnectionSnapshot>,
+    #[serde(default)]
+    streams: Vec<StreamTelemetry>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct MeshNode {
+    #[serde(default)]
+    node_id: String,
+    #[serde(default)]
+    region: String,
+    #[serde(default)]
+    continent: String,
+    #[serde(default)]
+    total_storage_bytes: u64,
+    #[serde(default)]
+    used_storage_bytes: u64,
+    #[serde(default)]
+    egress_capacity_bps: u64,
+    #[serde(default)]
+    contributor_streams: u64,
+    #[serde(default)]
+    active_streams: u64,
+    #[serde(default)]
+    draining: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct PeerSnapshot {
+    #[serde(default)]
+    addr: String,
+    #[serde(default)]
+    state: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct StatsSnapshot {
+    #[serde(default)]
+    stream_id_text: String,
+    #[serde(default)]
+    latest_local_part: Option<u64>,
+    #[serde(default)]
+    latest_mesh_part: Option<u64>,
+    #[serde(default)]
+    bytes_received: u64,
+    #[serde(default)]
+    datagrams_received: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct AggregateMetrics {
+    #[serde(default)]
+    node_count: usize,
+    #[serde(default)]
+    connection_count: usize,
+    #[serde(default)]
+    total_storage_bytes: u64,
+    #[serde(default)]
+    used_storage_bytes: u64,
+    #[serde(default)]
+    total_egress_capacity_bps: u64,
+    #[serde(default)]
+    contributor_streams: u64,
+    #[serde(default)]
+    active_streams: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ConnectionSnapshot {
+    #[serde(default)]
+    source_node_id: String,
+    #[serde(default)]
+    target_addr: String,
+    #[serde(default)]
+    target_node_id: Option<String>,
+    #[serde(default)]
+    state: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct EdgeServiceSnapshot {
+    #[serde(default)]
+    node_id: String,
+    #[serde(default)]
+    region: String,
+    #[serde(default)]
+    continent: String,
+    #[serde(default)]
+    playback_base_url: Option<String>,
+    #[serde(default)]
+    active_readers: u64,
+    #[serde(default)]
+    bytes_served: u64,
+    #[serde(default)]
+    llhls_tail_requests: u64,
+    #[serde(default)]
+    draining: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct StreamTelemetry {
+    #[serde(default)]
+    node_id: String,
+    #[serde(default)]
+    stream_id_text: String,
+    #[serde(default)]
+    latest_local_part: Option<u64>,
+    #[serde(default)]
+    latest_mesh_part: Option<u64>,
+    #[serde(default)]
+    bytes_received: u64,
+}
+
+impl StreamTelemetry {
+    fn display_stream_id(&self) -> String {
+        if self.stream_id_text.is_empty() {
+            "-".to_owned()
+        } else {
+            self.stream_id_text.clone()
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ReplicaPlacementSnapshot {
+    #[serde(default)]
+    stream_id_text: String,
+    #[serde(default)]
+    target_node_id: String,
+    #[serde(default)]
+    score: f64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ControlCommand {
+    #[serde(default)]
+    id: u64,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    stream_id_text: Option<String>,
+    #[serde(default)]
+    status: String,
+}
+
+impl ControlCommand {
+    fn target_text(&self) -> String {
+        [
+            self.node_id.as_deref(),
+            self.region.as_deref(),
+            self.stream_id_text.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" / ")
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ContribStatus {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    advertised_hls_stream_id: String,
+    #[serde(default)]
+    advertised_hls_path: String,
+    #[serde(default)]
+    mesh: ContribMeshStatus,
+    #[serde(default)]
+    listeners: Vec<ListenerStatus>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ContribMeshStatus {
+    #[serde(default)]
+    byte_fec_target: String,
+    #[serde(default)]
+    media_fec_target: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ListenerStatus {
+    #[serde(default)]
+    protocol: String,
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    bind: Option<String>,
+    #[serde(default)]
+    output_stream_id: String,
+}
