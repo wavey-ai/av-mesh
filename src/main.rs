@@ -1877,6 +1877,7 @@ struct MeshApiSnapshot {
     aggregate: AggregateMetrics,
     alerts: Vec<MeshAlert>,
     activity: Vec<MeshActivity>,
+    telemetry: TelemetryHealthSnapshot,
     orchestration: OrchestrationStatus,
     nodes: Vec<MeshNode>,
     edge_services: Vec<EdgeServiceSnapshot>,
@@ -1928,6 +1929,22 @@ struct AggregateMetrics {
     total_egress_capacity_bps: u64,
     contributor_streams: u64,
     active_streams: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct TelemetryHealthSnapshot {
+    stale_after_ms: u64,
+    fresh_remote_count: usize,
+    stale_remote_count: usize,
+    stale_nodes: Vec<TelemetryNodeHealth>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct TelemetryNodeHealth {
+    node_id: String,
+    region: String,
+    updated_unix_ms: u64,
+    age_ms: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -2383,6 +2400,7 @@ impl DemandTracker {
 #[derive(Debug, Clone)]
 struct TelemetryAggregator {
     snapshots: Arc<RwLock<HashMap<String, MeshSnapshot>>>,
+    stale_nodes: Arc<RwLock<Vec<TelemetryNodeHealth>>>,
     stale_after_ms: u64,
 }
 
@@ -2396,6 +2414,7 @@ impl TelemetryAggregator {
     fn new(stale_after_ms: u64) -> Self {
         Self {
             snapshots: Arc::new(RwLock::new(HashMap::new())),
+            stale_nodes: Arc::new(RwLock::new(Vec::new())),
             stale_after_ms,
         }
     }
@@ -2411,37 +2430,95 @@ impl TelemetryAggregator {
     }
 
     async fn ingest_snapshot(&self, snapshot: MeshSnapshot) {
+        let node_id = snapshot.node.node_id.clone();
         self.snapshots
             .write()
             .await
-            .insert(snapshot.node.node_id.clone(), snapshot);
+            .insert(node_id.clone(), snapshot);
+        self.stale_nodes
+            .write()
+            .await
+            .retain(|node| node.node_id != node_id);
     }
 
     #[cfg(test)]
     async fn snapshot(&self, local: MeshSnapshot) -> MeshApiSnapshot {
-        let snapshots = self.snapshots_with_local(local.clone()).await;
+        let (snapshots, telemetry) = self.snapshots_with_local(local.clone()).await;
         MeshApiSnapshot::from_snapshots(
             local,
             snapshots,
+            telemetry,
             Vec::new(),
             OrchestrationStatus::default(),
         )
     }
 
-    async fn snapshots_with_local(&self, local: MeshSnapshot) -> Vec<MeshSnapshot> {
+    async fn snapshots_with_local(
+        &self,
+        local: MeshSnapshot,
+    ) -> (Vec<MeshSnapshot>, TelemetryHealthSnapshot) {
         let now_ms = now_unix_ms();
         let mut snapshots = self.snapshots.write().await;
+        let stale_nodes = snapshots
+            .values()
+            .filter(|snapshot| self.is_stale(snapshot, now_ms))
+            .map(|snapshot| TelemetryNodeHealth::from_snapshot(snapshot, now_ms))
+            .collect::<Vec<_>>();
         snapshots.retain(|_, snapshot| !self.is_stale(snapshot, now_ms));
-        let mut snapshots = snapshots.clone();
-        snapshots.insert(local.node.node_id.clone(), local);
-        let mut snapshots = snapshots.into_values().collect::<Vec<_>>();
-        snapshots.sort_by(|left, right| left.node.node_id.cmp(&right.node.node_id));
-        snapshots
+        let fresh_remote_count = snapshots.len();
+        if !stale_nodes.is_empty() {
+            self.remember_stale_nodes(stale_nodes).await;
+        }
+        let remembered_stale_nodes = self.stale_nodes.read().await.clone();
+        let telemetry = TelemetryHealthSnapshot {
+            stale_after_ms: self.stale_after_ms,
+            fresh_remote_count,
+            stale_remote_count: remembered_stale_nodes.len(),
+            stale_nodes: remembered_stale_nodes,
+        };
+
+        let mut snapshots_with_local = snapshots.clone();
+        snapshots_with_local.insert(local.node.node_id.clone(), local);
+        let mut snapshots_with_local = snapshots_with_local.into_values().collect::<Vec<_>>();
+        snapshots_with_local.sort_by(|left, right| left.node.node_id.cmp(&right.node.node_id));
+        (snapshots_with_local, telemetry)
     }
 
     fn is_stale(&self, snapshot: &MeshSnapshot, now_ms: u64) -> bool {
         self.stale_after_ms > 0
             && now_ms.saturating_sub(snapshot.updated_unix_ms) > self.stale_after_ms
+    }
+
+    async fn remember_stale_nodes(&self, stale_nodes: Vec<TelemetryNodeHealth>) {
+        let mut remembered = self.stale_nodes.write().await;
+        for stale_node in stale_nodes {
+            if let Some(existing) = remembered
+                .iter_mut()
+                .find(|node| node.node_id == stale_node.node_id)
+            {
+                *existing = stale_node;
+            } else {
+                remembered.push(stale_node);
+            }
+        }
+        remembered.sort_by(|left, right| {
+            right
+                .age_ms
+                .cmp(&left.age_ms)
+                .then_with(|| left.node_id.cmp(&right.node_id))
+        });
+        remembered.truncate(32);
+    }
+}
+
+impl TelemetryNodeHealth {
+    fn from_snapshot(snapshot: &MeshSnapshot, now_ms: u64) -> Self {
+        Self {
+            node_id: snapshot.node.node_id.clone(),
+            region: snapshot.node.region.clone(),
+            updated_unix_ms: snapshot.updated_unix_ms,
+            age_ms: now_ms.saturating_sub(snapshot.updated_unix_ms),
+        }
     }
 }
 
@@ -2551,6 +2628,7 @@ impl MeshApiSnapshot {
     fn from_snapshots(
         local: MeshSnapshot,
         snapshots: Vec<MeshSnapshot>,
+        telemetry: TelemetryHealthSnapshot,
         planned_replicas: Vec<ReplicaPlacement>,
         orchestration: OrchestrationStatus,
     ) -> Self {
@@ -2633,6 +2711,7 @@ impl MeshApiSnapshot {
             &local.node.node_id,
             &streams,
             &recent_commands,
+            &telemetry,
             &orchestration.provision,
             &orchestration.telemetry_peers,
         );
@@ -2649,6 +2728,7 @@ impl MeshApiSnapshot {
             aggregate,
             alerts,
             activity,
+            telemetry,
             orchestration,
             nodes,
             edge_services,
@@ -2667,6 +2747,7 @@ fn derive_mesh_alerts(
     local_node_id: &str,
     streams: &[StreamTelemetry],
     recent_commands: &[ControlCommand],
+    telemetry: &TelemetryHealthSnapshot,
     provision: &ProvisionStatus,
     telemetry_peers: &[TelemetryPeerStatus],
 ) -> Vec<MeshAlert> {
@@ -2877,6 +2958,34 @@ fn derive_mesh_alerts(
             count: unavailable_telemetry_peers as u64,
             last_seen_unix_ms: Some(now),
             node_id: None,
+            stream_id_text: None,
+        });
+    }
+
+    if telemetry.stale_remote_count > 0 {
+        let latest_stale_node = telemetry
+            .stale_nodes
+            .iter()
+            .max_by_key(|node| node.updated_unix_ms);
+        let node_id = latest_stale_node.map(|node| node.node_id.clone());
+        let detail = latest_stale_node
+            .map(|node| {
+                format!(
+                    "latest stale node {} in {} last updated {} ms ago",
+                    node.node_id, node.region, node.age_ms
+                )
+            })
+            .unwrap_or_else(|| "stale telemetry node details unavailable".into());
+        alerts.push(MeshAlert {
+            level: "warn",
+            code: "telemetry_snapshot_stale",
+            message: format!(
+                "{} mesh telemetry snapshot(s) have aged out; {detail}.",
+                telemetry.stale_remote_count
+            ),
+            count: telemetry.stale_remote_count as u64,
+            last_seen_unix_ms: latest_stale_node.map(|node| node.updated_unix_ms),
+            node_id,
             stream_id_text: None,
         });
     }
@@ -3781,13 +3890,14 @@ impl AppRouter {
 
     async fn mesh_api_snapshot(&self) -> MeshApiSnapshot {
         let local = self.local_mesh_snapshot().await;
-        let snapshots = self.telemetry.snapshots_with_local(local.clone()).await;
+        let (snapshots, telemetry) = self.telemetry.snapshots_with_local(local.clone()).await;
         let planned_replicas = self
             .plan_all_active_replicas_from_snapshots(&snapshots)
             .await;
         MeshApiSnapshot::from_snapshots(
             local,
             snapshots,
+            telemetry,
             planned_replicas,
             self.orchestration_status().await,
         )
@@ -4097,7 +4207,7 @@ impl AppRouter {
         };
 
         let local = self.local_mesh_snapshot().await;
-        let snapshots = self.telemetry.snapshots_with_local(local).await;
+        let (snapshots, _) = self.telemetry.snapshots_with_local(local).await;
         let mut node_ids = snapshots
             .into_iter()
             .filter(|snapshot| snapshot.node.region == *region)
@@ -4213,7 +4323,7 @@ impl AppRouter {
         }
 
         let local = self.local_mesh_snapshot().await;
-        let snapshots = self.telemetry.snapshots_with_local(local).await;
+        let (snapshots, _) = self.telemetry.snapshots_with_local(local).await;
         let region = demand_region.unwrap_or(&self.node.region);
         let continent = snapshots
             .iter()
@@ -4266,7 +4376,7 @@ impl AppRouter {
 
     async fn known_active_stream_ids(&self) -> Vec<u64> {
         let local = self.local_mesh_snapshot().await;
-        let snapshots = self.telemetry.snapshots_with_local(local).await;
+        let (snapshots, _) = self.telemetry.snapshots_with_local(local).await;
         let mut stream_ids = self.cache.active_stream_ids().await;
         for snapshot in snapshots {
             stream_ids.extend(snapshot_stream_ids(&snapshot));
@@ -4288,7 +4398,7 @@ impl AppRouter {
 
     async fn request_planned_local_replica(&self, stream_id: u64, reason: &'static str) -> bool {
         let local = self.local_mesh_snapshot().await;
-        let snapshots = self.telemetry.snapshots_with_local(local).await;
+        let (snapshots, _) = self.telemetry.snapshots_with_local(local).await;
         let local_bytes = self
             .cache
             .estimated_storage_bytes_for_stream(stream_id)
@@ -6406,6 +6516,16 @@ mod tests {
             .await;
 
         assert_eq!(snapshot.aggregate.node_count, 2);
+        assert_eq!(snapshot.telemetry.fresh_remote_count, 1);
+        assert_eq!(snapshot.telemetry.stale_remote_count, 1);
+        assert_eq!(snapshot.telemetry.stale_nodes[0].node_id, "jp-edge-old");
+        assert_eq!(snapshot.telemetry.stale_nodes[0].region, "jp-east");
+        assert!(snapshot.telemetry.stale_nodes[0].age_ms >= 1_000);
+        assert!(snapshot
+            .alerts
+            .iter()
+            .any(|alert| alert.code == "telemetry_snapshot_stale"
+                && alert.node_id.as_deref() == Some("jp-edge-old")));
         assert!(snapshot
             .nodes
             .iter()

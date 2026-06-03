@@ -392,6 +392,7 @@ fn App() -> impl IntoView {
                             <span>{move || mesh.get().map(|m| format!("updated {} / {} peers / {} links / {} alerts", age_text(m.updated_unix_ms), m.peers.len(), m.connections.len(), m.alerts.len())).unwrap_or_else(|| "waiting".to_owned())}</span>
                         </div>
                         <MeshAlertList mesh />
+                        <TopologyTelemetryHealth mesh />
                         <TopologyGraph mesh />
                         <div class="node-map">
                             <For
@@ -892,6 +893,34 @@ fn MeshAlertList(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
                     <strong>{alert.code}</strong>
                     <span>{alert.message}</span>
                     <small>{format!("{} seen / {}", alert.count, optional_unix_age(alert.last_seen_unix_ms))}</small>
+                </div>
+            </For>
+        </div>
+    }
+}
+
+#[component]
+fn TopologyTelemetryHealth(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
+    view! {
+        <div class="topology-health">
+            <div class=move || {
+                mesh.get()
+                    .map(|snapshot| snapshot.telemetry.class_name())
+                    .unwrap_or("topology-health-card waiting")
+            }>
+                <strong>"telemetry"</strong>
+                <span>{move || mesh.get().map(|snapshot| snapshot.telemetry.summary_text()).unwrap_or_else(|| "waiting".to_owned())}</span>
+                <small>{move || mesh.get().map(|snapshot| snapshot.telemetry.detail_text()).unwrap_or_else(|| "mesh topology telemetry unavailable".to_owned())}</small>
+            </div>
+            <For
+                each=move || mesh.get().map(|snapshot| snapshot.telemetry.stale_nodes).unwrap_or_default()
+                key=|node| node.node_id.clone()
+                let(node)
+            >
+                <div class="topology-health-card warn">
+                    <strong>{node.node_id.clone()}</strong>
+                    <span>"stale"</span>
+                    <small>{node.detail_text()}</small>
                 </div>
             </For>
         </div>
@@ -3258,6 +3287,8 @@ struct MeshApiSnapshot {
     #[serde(default)]
     activity: Vec<ActivityItem>,
     #[serde(default)]
+    telemetry: TelemetryHealth,
+    #[serde(default)]
     orchestration: OrchestrationStatus,
     #[serde(default)]
     nodes: Vec<MeshNode>,
@@ -3333,6 +3364,65 @@ struct AggregateMetrics {
     contributor_streams: u64,
     #[serde(default)]
     active_streams: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct TelemetryHealth {
+    #[serde(default)]
+    stale_after_ms: u64,
+    #[serde(default)]
+    fresh_remote_count: usize,
+    #[serde(default)]
+    stale_remote_count: usize,
+    #[serde(default)]
+    stale_nodes: Vec<TelemetryNodeHealth>,
+}
+
+impl TelemetryHealth {
+    fn class_name(&self) -> &'static str {
+        if self.stale_remote_count > 0 {
+            "topology-health-card warn"
+        } else {
+            "topology-health-card ready"
+        }
+    }
+
+    fn summary_text(&self) -> String {
+        format!(
+            "{} fresh / {} stale",
+            self.fresh_remote_count, self.stale_remote_count
+        )
+    }
+
+    fn detail_text(&self) -> String {
+        format!(
+            "remote telemetry snapshots / stale after {}",
+            format_duration_ms_plain(self.stale_after_ms)
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct TelemetryNodeHealth {
+    #[serde(default)]
+    node_id: String,
+    #[serde(default)]
+    region: String,
+    #[serde(default)]
+    updated_unix_ms: u64,
+    #[serde(default)]
+    age_ms: u64,
+}
+
+impl TelemetryNodeHealth {
+    fn detail_text(&self) -> String {
+        format!(
+            "{} / age {} / last {}",
+            self.region,
+            format_duration_ms_plain(self.age_ms),
+            optional_unix_age(nonzero_u64(self.updated_unix_ms))
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
