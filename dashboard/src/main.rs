@@ -502,6 +502,7 @@ fn ContribView(contrib: ReadSignal<Option<ContribStatus>>) -> impl IntoView {
                 <RuntimeCell label="mpeg-ts" value=move || contrib.get().map(|c| c.runtime.mpeg_ts.slots.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} / {}", format_bytes(c.runtime.mpeg_ts.bytes), optional_age(c.runtime.mpeg_ts.last_seen_age_ms))).unwrap_or_default() />
                 <RuntimeCell label="rtmp" value=move || contrib.get().map(|c| c.runtime.rtmp.access_units.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} / {}", format_bytes(c.runtime.rtmp.bytes), optional_age(c.runtime.rtmp.last_seen_age_ms))).unwrap_or_default() />
                 <RuntimeCell label="fmp4" value=move || contrib.get().map(|c| c.runtime.fmp4.parts.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} media / {} init / {}", format_bytes(c.runtime.fmp4.bytes), format_bytes(c.runtime.fmp4.init_bytes), optional_age(c.runtime.fmp4.last_publish_age_ms))).unwrap_or_default() />
+                <RuntimeCell label="tracks" value=move || contrib.get().map(|c| c.runtime.fmp4.track_summary()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| c.runtime.fmp4.track_detail()).unwrap_or_default() />
                 <RuntimeCell label="hls" value=move || contrib.get().map(|c| c.runtime.hls.responses_total.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} errors / {} 404s / {}", c.runtime.hls.response_errors, c.runtime.hls.response_not_found, optional_age(c.runtime.hls.last_response_age_ms))).unwrap_or_default() />
                 <RuntimeCell label="sessions" value=move || contrib.get().map(|c| c.runtime.ingest_sessions.active.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} started / {} ended", c.runtime.ingest_sessions.started, c.runtime.ingest_sessions.ended)).unwrap_or_default() />
                 <RuntimeCell label="errors" value=move || contrib.get().map(|c| c.runtime.fmp4.publish_errors.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} alerts", c.alerts.len())).unwrap_or_default() />
@@ -2472,6 +2473,41 @@ struct Fmp4Runtime {
     publish_errors: u64,
     #[serde(default)]
     last_publish_age_ms: Option<u64>,
+    #[serde(default)]
+    video_codec: Option<String>,
+    #[serde(default)]
+    video_width: Option<u16>,
+    #[serde(default)]
+    video_height: Option<u16>,
+    #[serde(default)]
+    video_parts: u64,
+    #[serde(default)]
+    video_access_units: u64,
+    #[serde(default)]
+    audio_codec: Option<String>,
+    #[serde(default)]
+    audio_parts: u64,
+    #[serde(default)]
+    audio_access_units: u64,
+}
+
+impl Fmp4Runtime {
+    fn track_summary(&self) -> String {
+        let video = match (&self.video_codec, self.video_width, self.video_height) {
+            (Some(codec), Some(width), Some(height)) => format!("{codec} {width}x{height}"),
+            (Some(codec), _, _) => codec.clone(),
+            _ => "no video".to_owned(),
+        };
+        let audio = self.audio_codec.as_deref().unwrap_or("no audio");
+        format!("{video} / {audio}")
+    }
+
+    fn track_detail(&self) -> String {
+        format!(
+            "{} video parts / {} video AUs / {} audio parts / {} audio AUs",
+            self.video_parts, self.video_access_units, self.audio_parts, self.audio_access_units
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
