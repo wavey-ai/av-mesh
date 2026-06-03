@@ -823,7 +823,26 @@ fn OrchestrationView(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView
                 }).unwrap_or_else(|| "tcp-changes telemetry peers".to_owned())
             />
         </div>
+        <ControlCommandHealth mesh />
         <TelemetryPeerList mesh />
+    }
+}
+
+#[component]
+fn ControlCommandHealth(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
+    view! {
+        <div class="command-health-grid">
+            <RuntimeCell
+                label="commands"
+                value=move || mesh.get().map(|m| m.recent_commands.len().to_string()).unwrap_or_else(|| "-".to_owned())
+                detail=move || mesh.get().map(|m| command_health_detail(&m.recent_commands)).unwrap_or_else(|| "recent control actions".to_owned())
+            />
+            <RuntimeCell
+                label="provision"
+                value=move || mesh.get().map(|m| latest_command_status(&m.recent_commands, "provision_node")).unwrap_or_else(|| "-".to_owned())
+                detail=move || mesh.get().map(|m| latest_command_meta(&m.recent_commands, "provision_node")).unwrap_or_else(|| "no provision commands".to_owned())
+            />
+        </div>
     }
 }
 
@@ -855,10 +874,10 @@ fn CommandList(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
                 key=|command| command.id
                 let(command)
             >
-                <div class="command">
-                    <strong>{command.kind.clone()}</strong>
-                    <span>{command.status.clone()}</span>
-                    <small>{command.target_text()}</small>
+                <div class=command.class_name()>
+                    <strong>{command.kind_label()}</strong>
+                    <span>{command.status_text()}</span>
+                    <small>{command.meta_text()}</small>
                 </div>
             </For>
         </div>
@@ -1941,8 +1960,33 @@ struct ControlCommand {
 }
 
 impl ControlCommand {
+    fn status_kind(&self) -> CommandStatusKind {
+        CommandStatusKind::from_status(&self.status)
+    }
+
+    fn class_name(&self) -> &'static str {
+        match self.status_kind() {
+            CommandStatusKind::Running => "command running",
+            CommandStatusKind::Ok => "command ok",
+            CommandStatusKind::Warn => "command warn",
+            CommandStatusKind::Error => "command error",
+        }
+    }
+
+    fn kind_label(&self) -> String {
+        command_kind_label(&self.kind)
+    }
+
+    fn status_text(&self) -> String {
+        if self.status.is_empty() {
+            "pending".to_owned()
+        } else {
+            self.status.clone()
+        }
+    }
+
     fn target_text(&self) -> String {
-        [
+        let target = [
             self.node_id.as_deref(),
             self.region.as_deref(),
             self.stream_id_text.as_deref(),
@@ -1950,8 +1994,132 @@ impl ControlCommand {
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()
-        .join(" / ")
+        .join(" / ");
+        if target.is_empty() {
+            "all local targets".to_owned()
+        } else {
+            target
+        }
     }
+
+    fn meta_text(&self) -> String {
+        let mut parts = Vec::new();
+        if self.id != 0 {
+            parts.push(format!("id {}", self.id));
+            parts.push(optional_unix_age(Some(self.id)));
+        }
+        parts.push(self.target_text());
+        parts.join(" / ")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommandStatusKind {
+    Running,
+    Ok,
+    Warn,
+    Error,
+}
+
+impl CommandStatusKind {
+    fn from_status(status: &str) -> Self {
+        let status = status.to_ascii_lowercase();
+        if status.contains("failed") || status.contains("timed out") || status.contains("error") {
+            Self::Error
+        } else if status.contains("skipped") {
+            Self::Warn
+        } else if status.contains("accepted")
+            || status.contains("running")
+            || status.contains("dispatch")
+        {
+            Self::Running
+        } else {
+            Self::Ok
+        }
+    }
+}
+
+fn command_health_detail(commands: &[ControlCommand]) -> String {
+    let failures = commands
+        .iter()
+        .filter(|command| command.status_kind() == CommandStatusKind::Error)
+        .count();
+    let warnings = commands
+        .iter()
+        .filter(|command| command.status_kind() == CommandStatusKind::Warn)
+        .count();
+    let running = commands
+        .iter()
+        .filter(|command| command.status_kind() == CommandStatusKind::Running)
+        .count();
+    format!("{failures} failed / {warnings} skipped / {running} running")
+}
+
+fn latest_command_status(commands: &[ControlCommand], kind: &str) -> String {
+    commands
+        .iter()
+        .find(|command| command_kind_matches(&command.kind, kind))
+        .map(|command| match command.status_kind() {
+            CommandStatusKind::Running => "running",
+            CommandStatusKind::Ok => "ok",
+            CommandStatusKind::Warn => "skipped",
+            CommandStatusKind::Error => "failed",
+        })
+        .unwrap_or("none")
+        .to_owned()
+}
+
+fn latest_command_meta(commands: &[ControlCommand], kind: &str) -> String {
+    commands
+        .iter()
+        .find(|command| command_kind_matches(&command.kind, kind))
+        .map(|command| command.meta_text())
+        .unwrap_or_else(|| "no provision commands".to_owned())
+}
+
+fn command_kind_matches(left: &str, right: &str) -> bool {
+    command_kind_key(left) == command_kind_key(right)
+}
+
+fn command_kind_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| *ch != '_' && *ch != '-' && !ch.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn command_kind_label(value: &str) -> String {
+    if value.is_empty() {
+        return "command".to_owned();
+    }
+    if value.contains('_') || value.contains('-') {
+        return value
+            .split(['_', '-'])
+            .filter(|part| !part.is_empty())
+            .map(capitalize_ascii)
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+    let mut out = String::with_capacity(value.len() + 4);
+    for (idx, ch) in value.chars().enumerate() {
+        if idx > 0 && ch.is_ascii_uppercase() {
+            out.push(' ');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn capitalize_ascii(value: &str) -> String {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut out = String::with_capacity(value.len());
+    out.extend(first.to_uppercase());
+    out.extend(chars);
+    out
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
