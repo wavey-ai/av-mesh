@@ -382,7 +382,7 @@ main {
 
 .orchestration-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
   margin-bottom: 12px;
 }
@@ -556,6 +556,48 @@ main {
 
 .command small {
   grid-column: 1 / -1;
+}
+
+.hose-list {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.hose-list:empty {
+  display: none;
+}
+
+.hose {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) 92px;
+  gap: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 9px 10px;
+  background: #fff;
+}
+
+.hose.connected {
+  border-left: 4px solid var(--green);
+}
+
+.hose.warn {
+  border-left: 4px solid var(--amber);
+}
+
+.hose.error {
+  border-left: 4px solid var(--red);
+}
+
+.hose strong,
+.hose small {
+  overflow-wrap: anywhere;
+}
+
+.hose small {
+  grid-column: 1 / -1;
+  color: var(--muted);
 }
 
 .edge-grid {

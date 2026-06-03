@@ -789,6 +789,38 @@ fn OrchestrationView(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView
                 value=move || mesh.get().map(|m| format!("{}ms", m.orchestration.provision.timeout_ms)).unwrap_or_else(|| "-".to_owned())
                 detail=move || "provision command budget".to_owned()
             />
+            <RuntimeCell
+                label="data hoses"
+                value=move || mesh.get().map(|m| {
+                    let total = m.orchestration.telemetry_peers.len();
+                    let connected = m.orchestration.telemetry_peers.iter().filter(|peer| peer.state == "connected").count();
+                    format!("{connected}/{total}")
+                }).unwrap_or_else(|| "-".to_owned())
+                detail=move || mesh.get().map(|m| {
+                    let payloads = m.orchestration.telemetry_peers.iter().map(|peer| peer.payloads).sum::<u64>();
+                    format!("{payloads} tcp-changes payloads")
+                }).unwrap_or_else(|| "tcp-changes telemetry peers".to_owned())
+            />
+        </div>
+        <TelemetryPeerList mesh />
+    }
+}
+
+#[component]
+fn TelemetryPeerList(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
+    view! {
+        <div class="hose-list">
+            <For
+                each=move || mesh.get().map(|m| m.orchestration.telemetry_peers).unwrap_or_default()
+                key=|peer| peer.peer.clone()
+                let(peer)
+            >
+                <div class=peer.class_name()>
+                    <strong>{peer.peer.clone()}</strong>
+                    <span>{peer.state.clone()}</span>
+                    <small>{peer.meta_text()}</small>
+                </div>
+            </For>
         </div>
     }
 }
@@ -1597,6 +1629,8 @@ struct OrchestrationStatus {
     control_dispatch_ready: bool,
     #[serde(default)]
     provision: ProvisionStatus,
+    #[serde(default)]
+    telemetry_peers: Vec<TelemetryPeerStatus>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1607,6 +1641,63 @@ struct ProvisionStatus {
     backends: Vec<String>,
     #[serde(default)]
     timeout_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct TelemetryPeerStatus {
+    #[serde(default)]
+    peer: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    connect_attempts: u64,
+    #[serde(default)]
+    disconnects: u64,
+    #[serde(default)]
+    payloads: u64,
+    #[serde(default)]
+    bytes: u64,
+    #[serde(default)]
+    last_connected_unix_ms: Option<u64>,
+    #[serde(default)]
+    last_payload_unix_ms: Option<u64>,
+    #[serde(default)]
+    last_error: Option<String>,
+}
+
+impl TelemetryPeerStatus {
+    fn class_name(&self) -> &'static str {
+        match self.state.as_str() {
+            "connected" => "hose connected",
+            "connecting" | "configured" => "hose warn",
+            "error" => "hose error",
+            _ => "hose warn",
+        }
+    }
+
+    fn meta_text(&self) -> String {
+        let mut parts = vec![
+            format!("{} attempts", self.connect_attempts),
+            format!("{} disconnects", self.disconnects),
+            format!("{} payloads", self.payloads),
+            format_bytes(self.bytes),
+        ];
+        if self.last_payload_unix_ms.is_some() {
+            parts.push(format!(
+                "last payload {}",
+                optional_unix_age(self.last_payload_unix_ms)
+            ));
+        } else if self.last_connected_unix_ms.is_some() {
+            parts.push(format!(
+                "connected {}",
+                optional_unix_age(self.last_connected_unix_ms)
+            ));
+        }
+        if let Some(error) = &self.last_error {
+            parts.push(error.clone());
+        }
+        parts.join(" / ")
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

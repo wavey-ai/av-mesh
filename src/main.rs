@@ -350,6 +350,7 @@ async fn main() -> Result<()> {
     let demand_tracker = DemandTracker::default();
     let lifecycle = NodeLifecycle::default();
     let telemetry_aggregator = TelemetryAggregator::new(args.telemetry_stale_ms);
+    let telemetry_peer_monitor = TelemetryPeerMonitor::new(&args.telemetry_peers);
     let playback_base_url = args
         .playback_base_url
         .as_deref()
@@ -480,12 +481,14 @@ async fn main() -> Result<()> {
         playback_base_url.clone(),
         edge_load.clone(),
         provision_executor.clone(),
+        telemetry_peer_monitor.clone(),
     );
     let telemetry_collector_tasks = start_telemetry_collectors(
         args.telemetry_peers.clone(),
         args.telemetry_dns_name.clone(),
         cert.clone(),
         router.clone(),
+        telemetry_peer_monitor.clone(),
         ingest_shutdown_rx.clone(),
     );
     let replication_planner_task = tokio::spawn(run_replication_planner(
@@ -1862,6 +1865,20 @@ struct MeshApiSnapshot {
     streams: Vec<StreamTelemetry>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct TelemetryPeerStatus {
+    peer: String,
+    state: String,
+    connect_attempts: u64,
+    disconnects: u64,
+    payloads: u64,
+    bytes: u64,
+    last_connected_unix_ms: Option<u64>,
+    last_payload_unix_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct ReplicaPlacementSnapshot {
     stream_id: u64,
@@ -1898,6 +1915,7 @@ struct AggregateMetrics {
 struct OrchestrationStatus {
     control_dispatch_ready: bool,
     provision: ProvisionStatus,
+    telemetry_peers: Vec<TelemetryPeerStatus>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -2369,6 +2387,101 @@ impl TelemetryAggregator {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct TelemetryPeerMonitor {
+    peers: Arc<RwLock<HashMap<String, TelemetryPeerStatus>>>,
+}
+
+impl TelemetryPeerMonitor {
+    fn new(peers: &[SocketAddr]) -> Self {
+        let peers = peers
+            .iter()
+            .map(|peer| {
+                let peer = peer.to_string();
+                (
+                    peer.clone(),
+                    TelemetryPeerStatus {
+                        peer,
+                        state: "configured".into(),
+                        ..TelemetryPeerStatus::default()
+                    },
+                )
+            })
+            .collect();
+        Self {
+            peers: Arc::new(RwLock::new(peers)),
+        }
+    }
+
+    async fn record_connecting(&self, peer: SocketAddr) {
+        let mut peers = self.peers.write().await;
+        let status = peers
+            .entry(peer.to_string())
+            .or_insert_with(|| TelemetryPeerStatus {
+                peer: peer.to_string(),
+                state: "configured".into(),
+                ..TelemetryPeerStatus::default()
+            });
+        status.state = "connecting".into();
+        status.connect_attempts = status.connect_attempts.saturating_add(1);
+    }
+
+    async fn record_connected(&self, peer: SocketAddr) {
+        let mut peers = self.peers.write().await;
+        let status = peers
+            .entry(peer.to_string())
+            .or_insert_with(|| TelemetryPeerStatus {
+                peer: peer.to_string(),
+                ..TelemetryPeerStatus::default()
+            });
+        status.state = "connected".into();
+        status.last_connected_unix_ms = Some(now_unix_ms());
+        status.last_error = None;
+    }
+
+    async fn record_payload(&self, peer: SocketAddr, bytes: usize) {
+        let mut peers = self.peers.write().await;
+        let status = peers
+            .entry(peer.to_string())
+            .or_insert_with(|| TelemetryPeerStatus {
+                peer: peer.to_string(),
+                ..TelemetryPeerStatus::default()
+            });
+        status.payloads = status.payloads.saturating_add(1);
+        status.bytes = status.bytes.saturating_add(bytes as u64);
+        status.last_payload_unix_ms = Some(now_unix_ms());
+    }
+
+    async fn record_disconnected(&self, peer: SocketAddr, error: Option<String>) {
+        let mut peers = self.peers.write().await;
+        let status = peers
+            .entry(peer.to_string())
+            .or_insert_with(|| TelemetryPeerStatus {
+                peer: peer.to_string(),
+                ..TelemetryPeerStatus::default()
+            });
+        status.state = if error.is_some() {
+            "error".into()
+        } else {
+            "disconnected".into()
+        };
+        status.disconnects = status.disconnects.saturating_add(1);
+        status.last_error = error;
+    }
+
+    async fn snapshot(&self) -> Vec<TelemetryPeerStatus> {
+        let mut peers = self
+            .peers
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        peers.sort_by(|left, right| left.peer.cmp(&right.peer));
+        peers
+    }
+}
+
 impl MeshSnapshot {
     fn with_edge_service(mut self, edge_service: EdgeServiceSnapshot) -> Self {
         self.edge_service = Some(edge_service);
@@ -2460,6 +2573,7 @@ impl MeshApiSnapshot {
             &connections,
             &local.stream,
             &recent_commands,
+            &orchestration.telemetry_peers,
         );
         let activity = derive_mesh_activity(&aggregate, &alerts, &recent_commands);
 
@@ -2490,6 +2604,7 @@ fn derive_mesh_alerts(
     connections: &[ConnectionSnapshot],
     local_stream: &StatsSnapshot,
     recent_commands: &[ControlCommand],
+    telemetry_peers: &[TelemetryPeerStatus],
 ) -> Vec<MeshAlert> {
     let now = now_unix_ms();
     let mut alerts = Vec::new();
@@ -2665,6 +2780,38 @@ fn derive_mesh_alerts(
             message: "One or more recent orchestration commands were skipped.".into(),
             count: skipped_commands,
             last_seen_unix_ms: last_command_issue,
+            node_id: None,
+            stream_id_text: None,
+        });
+    }
+
+    let unavailable_telemetry_peers = telemetry_peers
+        .iter()
+        .filter(|peer| peer.state != "connected")
+        .count();
+    if unavailable_telemetry_peers > 0 {
+        let latest_error_peer = telemetry_peers
+            .iter()
+            .filter(|peer| peer.state != "connected")
+            .max_by_key(|peer| {
+                peer.last_payload_unix_ms
+                    .or(peer.last_connected_unix_ms)
+                    .unwrap_or(0)
+            });
+        let peer = latest_error_peer
+            .map(|peer| peer.peer.as_str())
+            .unwrap_or("unknown peer");
+        let state = latest_error_peer
+            .map(|peer| peer.state.as_str())
+            .unwrap_or("unknown");
+        alerts.push(MeshAlert {
+            level: "warn",
+            code: "telemetry_peer_unavailable",
+            message: format!(
+                "{unavailable_telemetry_peers} tcp-changes telemetry peer(s) are not connected; latest is {peer} ({state})."
+            ),
+            count: unavailable_telemetry_peers as u64,
+            last_seen_unix_ms: Some(now),
             node_id: None,
             stream_id_text: None,
         });
@@ -3317,6 +3464,7 @@ fn start_telemetry_collectors(
     dns_name: String,
     ca_cert: String,
     router: AppRouter,
+    telemetry_peers: TelemetryPeerMonitor,
     shutdown_rx: watch::Receiver<()>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     peers
@@ -3325,15 +3473,24 @@ fn start_telemetry_collectors(
             let dns_name = dns_name.clone();
             let ca_cert = ca_cert.clone();
             let router = router.clone();
+            let telemetry_peers = telemetry_peers.clone();
             let mut shutdown_rx = shutdown_rx.clone();
             tokio::spawn(async move {
                 loop {
                     let connect_shutdown_rx = shutdown_rx.clone();
                     tokio::select! {
                         _ = shutdown_rx.changed() => return,
-                        result = connect_telemetry_peer(peer, &dns_name, &ca_cert, router.clone(), connect_shutdown_rx) => {
-                            if let Err(error) = result {
-                                warn!(peer = %peer, error = %error, "telemetry peer collector disconnected");
+                        result = connect_telemetry_peer(peer, &dns_name, &ca_cert, router.clone(), telemetry_peers.clone(), connect_shutdown_rx) => {
+                            match result {
+                                Ok(()) => {
+                                    telemetry_peers.record_disconnected(peer, None).await;
+                                    info!(peer = %peer, "telemetry peer collector disconnected");
+                                }
+                                Err(error) => {
+                                    let error_text = error.to_string();
+                                    telemetry_peers.record_disconnected(peer, Some(error_text.clone())).await;
+                                    warn!(peer = %peer, error = %error_text, "telemetry peer collector disconnected");
+                                }
                             }
                             tokio::select! {
                                 _ = shutdown_rx.changed() => return,
@@ -3352,8 +3509,10 @@ async fn connect_telemetry_peer(
     dns_name: &str,
     ca_cert: &str,
     router: AppRouter,
+    telemetry_peers: TelemetryPeerMonitor,
     mut shutdown_rx: watch::Receiver<()>,
 ) -> Result<()> {
+    telemetry_peers.record_connecting(peer).await;
     let client = TcpChangesClient::new(dns_name.to_string(), peer, ca_cert.to_string());
     let (up_rx, _fin_rx, client_shutdown, mut rx) = client
         .start("HELLO")
@@ -3362,6 +3521,7 @@ async fn connect_telemetry_peer(
     up_rx
         .await
         .map_err(|_| anyhow!("tcp changes telemetry peer {peer} ended before ready"))?;
+    telemetry_peers.record_connected(peer).await;
     info!(peer = %peer, "telemetry peer collector connected");
 
     loop {
@@ -3380,6 +3540,7 @@ async fn connect_telemetry_peer(
                     bytes = payload.val.len(),
                     "received tcp-changes telemetry payload"
                 );
+                telemetry_peers.record_payload(peer, payload.val.len()).await;
                 if let Err(error) = router.ingest_tcp_changes_payload(payload).await {
                     warn!(peer = %peer, error = %error, "failed to ingest tcp changes payload");
                 }
@@ -3402,6 +3563,7 @@ struct AppRouter {
     playback_base_url: Option<String>,
     edge_load: EdgeLoad,
     provision: ProvisionExecutor,
+    telemetry_peers: TelemetryPeerMonitor,
 }
 
 impl AppRouter {
@@ -3418,6 +3580,7 @@ impl AppRouter {
         playback_base_url: Option<String>,
         edge_load: EdgeLoad,
         provision: ProvisionExecutor,
+        telemetry_peers: TelemetryPeerMonitor,
     ) -> Self {
         Self {
             cache,
@@ -3432,6 +3595,7 @@ impl AppRouter {
             playback_base_url,
             edge_load,
             provision,
+            telemetry_peers,
         }
     }
 
@@ -3485,6 +3649,7 @@ impl AppRouter {
         OrchestrationStatus {
             control_dispatch_ready: self.dispatch.ready().await,
             provision: self.provision.status(),
+            telemetry_peers: self.telemetry_peers.snapshot().await,
         }
     }
 
@@ -6198,6 +6363,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mesh_api_reports_telemetry_peer_data_hose_status() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let peer = unused_tcp_loopback_addr();
+        let monitor = TelemetryPeerMonitor::new(&[peer]);
+        monitor.record_connecting(peer).await;
+        monitor
+            .record_disconnected(peer, Some("dial failed".into()))
+            .await;
+        let router = app_router_for_tests_with_telemetry_monitor(
+            Arc::clone(&cache),
+            Arc::clone(&mesh),
+            monitor.clone(),
+        );
+
+        let snapshot = router.mesh_api_snapshot().await;
+        assert_eq!(snapshot.orchestration.telemetry_peers.len(), 1);
+        let peer_status = &snapshot.orchestration.telemetry_peers[0];
+        assert_eq!(peer_status.peer, peer.to_string());
+        assert_eq!(peer_status.state, "error");
+        assert_eq!(peer_status.connect_attempts, 1);
+        assert_eq!(peer_status.disconnects, 1);
+        assert_eq!(peer_status.last_error.as_deref(), Some("dial failed"));
+        assert!(snapshot
+            .alerts
+            .iter()
+            .any(|alert| alert.code == "telemetry_peer_unavailable"));
+
+        monitor.record_connecting(peer).await;
+        monitor.record_connected(peer).await;
+        monitor.record_payload(peer, 512).await;
+        let snapshot = router.mesh_api_snapshot().await;
+        let peer_status = &snapshot.orchestration.telemetry_peers[0];
+        assert_eq!(peer_status.state, "connected");
+        assert_eq!(peer_status.connect_attempts, 2);
+        assert_eq!(peer_status.payloads, 1);
+        assert_eq!(peer_status.bytes, 512);
+        assert!(!snapshot
+            .alerts
+            .iter()
+            .any(|alert| alert.code == "telemetry_peer_unavailable"));
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
     async fn mesh_api_reports_edge_response_errors() {
         let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
         let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
@@ -6649,6 +6859,7 @@ mod tests {
                     "local.wavey.ai",
                     &cert,
                     collector_router,
+                    TelemetryPeerMonitor::new(&[telemetry_bind]),
                     collector_shutdown_rx,
                 )
                 .await
@@ -8003,6 +8214,7 @@ mod tests {
             ReplicationPolicy::default(),
             TelemetryAggregator::default(),
             ProvisionExecutor::disabled(),
+            TelemetryPeerMonitor::default(),
         )
     }
 
@@ -8013,6 +8225,39 @@ mod tests {
         telemetry: TelemetryAggregator,
         provision: ProvisionExecutor,
     ) -> AppRouter {
+        app_router_for_tests_with_policy_telemetry_provision_and_monitor(
+            cache,
+            mesh,
+            replication_policy,
+            telemetry,
+            provision,
+            TelemetryPeerMonitor::default(),
+        )
+    }
+
+    fn app_router_for_tests_with_telemetry_monitor(
+        cache: Arc<LiveTsCache>,
+        mesh: Arc<CacheMeshHandle>,
+        monitor: TelemetryPeerMonitor,
+    ) -> AppRouter {
+        app_router_for_tests_with_policy_telemetry_provision_and_monitor(
+            cache,
+            mesh,
+            ReplicationPolicy::default(),
+            TelemetryAggregator::default(),
+            ProvisionExecutor::disabled(),
+            monitor,
+        )
+    }
+
+    fn app_router_for_tests_with_policy_telemetry_provision_and_monitor(
+        cache: Arc<LiveTsCache>,
+        mesh: Arc<CacheMeshHandle>,
+        replication_policy: ReplicationPolicy,
+        telemetry: TelemetryAggregator,
+        provision: ProvisionExecutor,
+        monitor: TelemetryPeerMonitor,
+    ) -> AppRouter {
         app_router_for_tests_with_node_policy_telemetry_and_provision(
             cache,
             mesh,
@@ -8020,6 +8265,7 @@ mod tests {
             replication_policy,
             telemetry,
             provision,
+            monitor,
         )
     }
 
@@ -8030,6 +8276,7 @@ mod tests {
         replication_policy: ReplicationPolicy,
         telemetry: TelemetryAggregator,
         provision: ProvisionExecutor,
+        monitor: TelemetryPeerMonitor,
     ) -> AppRouter {
         AppRouter::new(
             cache,
@@ -8044,6 +8291,7 @@ mod tests {
             Some("https://test-node.local/live".into()),
             EdgeLoad::default(),
             provision,
+            monitor,
         )
     }
 
