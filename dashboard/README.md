@@ -15,7 +15,7 @@ Run locally with Trunk:
 ```sh
 cd /Users/jamie/wavey.ai/av-mesh/dashboard
 cargo install trunk --locked
-trunk serve --address 127.0.0.1 --port 5188
+make serve
 ```
 
 The default endpoint URLs match the local OBS stack:
@@ -30,7 +30,7 @@ Build for `av-mesh` to serve at `/mesh`:
 
 ```sh
 cd /Users/jamie/wavey.ai/av-mesh/dashboard
-trunk build --release
+make build
 ```
 
 `av-mesh` serves `dashboard/dist/index.html` at `/mesh` when the build output is
@@ -44,3 +44,5 @@ unless started with `--no-dashboard-build`, and injects the dist path into both
 local mesh nodes with `AV_MESH_DASHBOARD_DIST`. The supervisor defaults LL-HLS
 parts to 50 ms and accepts `AV_LL_HLS_PART_MS` or `--part-ms` to test a
 different part target.
+
+Run `make help` in this directory for the direct UI tasks.

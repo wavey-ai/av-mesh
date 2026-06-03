@@ -305,7 +305,7 @@ For local OBS testing with both mesh nodes and the contributor ingress under one
 Rust supervisor, use the `local-obs-stack` binary owned by `../av-contrib`:
 
 ```bash
-cargo run --manifest-path ../av-contrib/Cargo.toml --bin local-obs-stack --release
+make local-stack
 ```
 
 The supervisor builds release `av-mesh`, release `../av-contrib`, and the
@@ -327,13 +327,10 @@ health checks.
 Useful overrides:
 
 ```bash
-AV_LL_HLS_PART_MS=67 \
+PART_MS=67 \
 RUST_LOG=av_mesh=trace,av_contrib=trace,rtmp_ingress=debug \
-  cargo run --manifest-path ../av-contrib/Cargo.toml --bin local-obs-stack --release -- \
-    --stream-id 4294967351 \
-    --host local.bitneedle.com \
-    --rtmp-bind 127.0.0.1:19351 \
-    --srt-bind 127.0.0.1:27011
+  STACK_ARGS="--rtmp-bind 127.0.0.1:19351 --srt-bind 127.0.0.1:27011" \
+  make local-stack STREAM_ID=4294967351 HOST=local.bitneedle.com
 ```
 
 Use `--cert` and `--key` to point at alternate PEM files. The default hostname
@@ -343,6 +340,7 @@ must resolve to loopback; on this machine `local.bitneedle.com` resolves to
 Use `--dashboard-dist /path/to/dist` to reuse a specific dashboard build. Use
 `--no-dashboard-build` to skip the Trunk build and let `av-mesh` use an existing
 dist or its fallback page. `--no-build` skips all release and dashboard builds.
+Run `make help` for direct mesh service and dashboard tasks.
 
 The services already use `tracing_subscriber` with `RUST_LOG` env filters. The
 current detailed logs are mostly `info!` and `debug!`; setting `trace` is
