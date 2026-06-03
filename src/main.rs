@@ -70,6 +70,9 @@ const TELEMETRY_TAG: [u8; 4] = *b"AVMT";
 const CONTROL_TAG: [u8; 4] = *b"AVMC";
 const DEFAULT_TELEMETRY_STALE_MS: u64 = 30_000;
 const RAW_MESH_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const MESH_STORAGE_WARN_PCT: u64 = 85;
+const MESH_STORAGE_ERROR_PCT: u64 = 95;
+const MESH_MIN_STALE_INGEST_ALERT_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LiveMediaKind {
@@ -1847,6 +1850,7 @@ struct MeshApiSnapshot {
     recent_commands: Vec<ControlCommand>,
     planned_replicas: Vec<ReplicaPlacementSnapshot>,
     aggregate: AggregateMetrics,
+    alerts: Vec<MeshAlert>,
     nodes: Vec<MeshNode>,
     edge_services: Vec<EdgeServiceSnapshot>,
     connections: Vec<ConnectionSnapshot>,
@@ -1883,6 +1887,19 @@ struct AggregateMetrics {
     total_egress_capacity_bps: u64,
     contributor_streams: u64,
     active_streams: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct MeshAlert {
+    level: &'static str,
+    code: &'static str,
+    message: String,
+    count: u64,
+    last_seen_unix_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_id_text: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2298,24 +2315,217 @@ impl MeshApiSnapshot {
         connections.dedup();
         aggregate.connection_count = connections.len();
 
+        let planned_replicas = planned_replicas
+            .into_iter()
+            .map(ReplicaPlacementSnapshot::from)
+            .collect::<Vec<_>>();
+        let recent_commands = local.recent_commands;
+        let alerts = derive_mesh_alerts(
+            &aggregate,
+            &nodes,
+            &edge_services,
+            &connections,
+            &local.stream,
+            &recent_commands,
+        );
+
         MeshApiSnapshot {
             updated_unix_ms: now_unix_ms(),
             node: local.node,
             peers: local.peers,
             stream: local.stream,
             replication_policy: local.replication_policy,
-            recent_commands: local.recent_commands,
-            planned_replicas: planned_replicas
-                .into_iter()
-                .map(ReplicaPlacementSnapshot::from)
-                .collect(),
+            recent_commands,
+            planned_replicas,
             aggregate,
+            alerts,
             nodes,
             edge_services,
             connections,
             streams,
         }
     }
+}
+
+fn derive_mesh_alerts(
+    aggregate: &AggregateMetrics,
+    nodes: &[MeshNode],
+    edge_services: &[EdgeServiceSnapshot],
+    connections: &[ConnectionSnapshot],
+    local_stream: &StatsSnapshot,
+    recent_commands: &[ControlCommand],
+) -> Vec<MeshAlert> {
+    let now = now_unix_ms();
+    let mut alerts = Vec::new();
+
+    if aggregate.node_count <= 1 {
+        alerts.push(MeshAlert {
+            level: "warn",
+            code: "mesh_single_node",
+            message:
+                "Only one mesh node is visible; failover and regional routing are not available."
+                    .into(),
+            count: aggregate.node_count as u64,
+            last_seen_unix_ms: Some(now),
+            node_id: None,
+            stream_id_text: None,
+        });
+    } else if aggregate.connection_count == 0 {
+        alerts.push(MeshAlert {
+            level: "error",
+            code: "mesh_no_links",
+            message: "Multiple mesh nodes are visible, but no mesh links are currently reported."
+                .into(),
+            count: aggregate.node_count as u64,
+            last_seen_unix_ms: Some(now),
+            node_id: None,
+            stream_id_text: None,
+        });
+    }
+
+    let unknown_peers = connections
+        .iter()
+        .filter(|connection| connection.target_node_id.is_none())
+        .count();
+    if unknown_peers > 0 {
+        alerts.push(MeshAlert {
+            level: "warn",
+            code: "mesh_unknown_peers",
+            message: "Some mesh peer addresses do not resolve to known node ids.".into(),
+            count: unknown_peers as u64,
+            last_seen_unix_ms: Some(now),
+            node_id: None,
+            stream_id_text: None,
+        });
+    }
+
+    let draining_nodes = nodes.iter().filter(|node| node.draining).count();
+    if draining_nodes > 0 {
+        alerts.push(MeshAlert {
+            level: "warn",
+            code: "nodes_draining",
+            message: "One or more mesh nodes are marked draining.".into(),
+            count: draining_nodes as u64,
+            last_seen_unix_ms: Some(now),
+            node_id: None,
+            stream_id_text: None,
+        });
+    }
+
+    let playback_missing = edge_services
+        .iter()
+        .filter(|edge| edge.playback_base_url.is_none())
+        .count();
+    if playback_missing > 0 {
+        alerts.push(MeshAlert {
+            level: "warn",
+            code: "edge_playback_missing",
+            message: "One or more nodes do not advertise a public LL-HLS playback base URL.".into(),
+            count: playback_missing as u64,
+            last_seen_unix_ms: Some(now),
+            node_id: None,
+            stream_id_text: None,
+        });
+    }
+
+    let storage_error_nodes = nodes
+        .iter()
+        .filter(|node| storage_percent(node) >= MESH_STORAGE_ERROR_PCT)
+        .count();
+    let storage_warn_nodes = nodes
+        .iter()
+        .filter(|node| storage_percent(node) >= MESH_STORAGE_WARN_PCT)
+        .count();
+    if storage_error_nodes > 0 {
+        alerts.push(MeshAlert {
+            level: "error",
+            code: "storage_exhausted",
+            message: format!(
+                "{storage_error_nodes} node(s) are at or above {MESH_STORAGE_ERROR_PCT}% storage usage."
+            ),
+            count: storage_error_nodes as u64,
+            last_seen_unix_ms: Some(now),
+            node_id: None,
+            stream_id_text: None,
+        });
+    } else if storage_warn_nodes > 0 {
+        alerts.push(MeshAlert {
+            level: "warn",
+            code: "storage_pressure",
+            message: format!(
+                "{storage_warn_nodes} node(s) are at or above {MESH_STORAGE_WARN_PCT}% storage usage."
+            ),
+            count: storage_warn_nodes as u64,
+            last_seen_unix_ms: Some(now),
+            node_id: None,
+            stream_id_text: None,
+        });
+    }
+
+    let mut failed_commands = 0u64;
+    let mut skipped_commands = 0u64;
+    let mut last_command_issue = None;
+    for command in recent_commands {
+        let status = command.status.to_ascii_lowercase();
+        if status.contains("failed") || status.contains("timed out") || status.contains("error") {
+            failed_commands = failed_commands.saturating_add(1);
+            last_command_issue = Some(last_command_issue.unwrap_or(0).max(command.created_unix_ms));
+        } else if status.contains("skipped") {
+            skipped_commands = skipped_commands.saturating_add(1);
+            last_command_issue = Some(last_command_issue.unwrap_or(0).max(command.created_unix_ms));
+        }
+    }
+    if failed_commands > 0 {
+        alerts.push(MeshAlert {
+            level: "error",
+            code: "control_failures",
+            message: "One or more recent orchestration commands failed.".into(),
+            count: failed_commands,
+            last_seen_unix_ms: last_command_issue,
+            node_id: None,
+            stream_id_text: None,
+        });
+    } else if skipped_commands > 0 {
+        alerts.push(MeshAlert {
+            level: "warn",
+            code: "control_skipped",
+            message: "One or more recent orchestration commands were skipped.".into(),
+            count: skipped_commands,
+            last_seen_unix_ms: last_command_issue,
+            node_id: None,
+            stream_id_text: None,
+        });
+    }
+
+    if let Some(age_ms) = local_stream.last_ingest_age_ms {
+        let stale_threshold_ms = local_stream
+            .part_target_ms
+            .saturating_mul(local_stream.window_parts as u64)
+            .max(MESH_MIN_STALE_INGEST_ALERT_MS);
+        if local_stream.latest_local_part.is_some() && age_ms > stale_threshold_ms {
+            alerts.push(MeshAlert {
+                level: "warn",
+                code: "local_ingest_stale",
+                message: format!(
+                    "Local stream {} has not ingested bytes for {} ms.",
+                    local_stream.stream_id_text, age_ms
+                ),
+                count: 1,
+                last_seen_unix_ms: now.checked_sub(age_ms),
+                node_id: None,
+                stream_id_text: Some(local_stream.stream_id_text.clone()),
+            });
+        }
+    }
+
+    alerts
+}
+
+fn storage_percent(node: &MeshNode) -> u64 {
+    if node.total_storage_bytes == 0 {
+        return 0;
+    }
+    node.used_storage_bytes.saturating_mul(100) / node.total_storage_bytes
 }
 
 fn snapshot_stream_for_id(snapshot: &MeshSnapshot, stream_id: u64) -> Option<StreamTelemetry> {
@@ -5474,6 +5684,66 @@ mod tests {
             .unwrap()
             .iter()
             .any(|node| node["node_id"] == "us-1"));
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn mesh_api_reports_operational_alerts() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let telemetry = TelemetryAggregator::default();
+        let mut remote = telemetry_snapshot_for_tests(
+            "full-node",
+            "us-east",
+            "na",
+            37.4,
+            -78.6,
+            vec![PeerSnapshot {
+                addr: "10.0.0.9:29101".into(),
+                state: "discovered".into(),
+            }],
+            5,
+        );
+        remote.node.used_storage_bytes = 960_000;
+        telemetry.ingest_snapshot(remote).await;
+        let router =
+            app_router_for_tests_with_telemetry(Arc::clone(&cache), Arc::clone(&mesh), telemetry);
+
+        router
+            .execute_control(
+                ControlKind::ProvisionNode,
+                ControlRequest {
+                    node_id: Some("new-node".into()),
+                    region: Some("us-east".into()),
+                    stream_id: None,
+                },
+            )
+            .await;
+
+        let response = router
+            .route(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/mesh")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.body.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let alert_codes = json["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|alert| alert["code"].as_str().unwrap())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(alert_codes.contains("mesh_unknown_peers"));
+        assert!(alert_codes.contains("edge_playback_missing"));
+        assert!(alert_codes.contains("storage_exhausted"));
+        assert!(alert_codes.contains("control_skipped"));
         mesh.shutdown();
     }
 

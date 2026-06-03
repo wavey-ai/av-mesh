@@ -277,7 +277,7 @@ fn App() -> impl IntoView {
 
             <main>
                 <section class="band metrics">
-                    <Metric label="nodes" value=move || mesh.get().map(|m| m.aggregate.node_count.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || mesh.get().map(|m| format!("{} links / local {}", m.aggregate.connection_count, m.node.node_id)).unwrap_or_default() />
+                    <Metric label="nodes" value=move || mesh.get().map(|m| m.aggregate.node_count.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || mesh.get().map(|m| format!("{} links / {} alerts / local {}", m.aggregate.connection_count, m.alerts.len(), m.node.node_id)).unwrap_or_default() />
                     <Metric label="storage" value=move || mesh.get().map(|m| format_bytes(m.aggregate.used_storage_bytes)).unwrap_or_else(|| "-".to_owned()) detail=move || mesh.get().map(|m| format!("of {}", format_bytes(m.aggregate.total_storage_bytes))).unwrap_or_default() />
                     <Metric label="egress" value=move || mesh.get().map(|m| format_bps(m.aggregate.total_egress_capacity_bps)).unwrap_or_else(|| "-".to_owned()) detail=move || mesh.get().map(|m| format!("{} ingress / {} active", m.aggregate.contributor_streams, m.aggregate.active_streams)).unwrap_or_default() />
                     <Metric label="ingest" value=move || contrib.get().map(|c| c.runtime.fmp4.parts.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} listeners / {} publish errors", enabled_listener_count(&c), c.runtime.fmp4.publish_errors)).unwrap_or_default() />
@@ -287,8 +287,9 @@ fn App() -> impl IntoView {
                     <section class="panel map-panel">
                         <div class="panel-head">
                             <h2>"Topology"</h2>
-                            <span>{move || mesh.get().map(|m| format!("updated {} / {} peers / {} links", age_text(m.updated_unix_ms), m.peers.len(), m.connections.len())).unwrap_or_else(|| "waiting".to_owned())}</span>
+                            <span>{move || mesh.get().map(|m| format!("updated {} / {} peers / {} links / {} alerts", age_text(m.updated_unix_ms), m.peers.len(), m.connections.len(), m.alerts.len())).unwrap_or_else(|| "waiting".to_owned())}</span>
                         </div>
+                        <MeshAlertList mesh />
                         <div class="node-map">
                             <For
                                 each=move || mesh.get().map(|m| m.nodes).unwrap_or_default()
@@ -494,6 +495,25 @@ fn PeerList(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
                 let(peer)
             >
                 <span>{format!("{} {}", peer.addr, peer.state)}</span>
+            </For>
+        </div>
+    }
+}
+
+#[component]
+fn MeshAlertList(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
+    view! {
+        <div class="alert-list mesh-alerts">
+            <For
+                each=move || mesh.get().map(|m| m.alerts).unwrap_or_default()
+                key=|alert| format!("{}:{}", alert.code, alert.message)
+                let(alert)
+            >
+                <div class=format!("alert {}", alert.level)>
+                    <strong>{alert.code}</strong>
+                    <span>{alert.message}</span>
+                    <small>{format!("{} seen / {}", alert.count, optional_unix_age(alert.last_seen_unix_ms))}</small>
+                </div>
             </For>
         </div>
     }
@@ -835,6 +855,8 @@ struct MeshApiSnapshot {
     #[serde(default)]
     aggregate: AggregateMetrics,
     #[serde(default)]
+    alerts: Vec<MeshAlert>,
+    #[serde(default)]
     nodes: Vec<MeshNode>,
     #[serde(default)]
     edge_services: Vec<EdgeServiceSnapshot>,
@@ -904,6 +926,20 @@ struct AggregateMetrics {
     contributor_streams: u64,
     #[serde(default)]
     active_streams: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct MeshAlert {
+    #[serde(default)]
+    level: String,
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    count: u64,
+    #[serde(default)]
+    last_seen_unix_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

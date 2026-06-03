@@ -290,6 +290,14 @@ main {
   gap: 8px;
 }
 
+.mesh-alerts {
+  margin-bottom: 12px;
+}
+
+.mesh-alerts:empty {
+  display: none;
+}
+
 .runtime-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
