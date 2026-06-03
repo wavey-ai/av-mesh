@@ -482,7 +482,7 @@ fn App() -> impl IntoView {
                         <h2>"Edges"</h2>
                         <span>{move || mesh.get().map(|m| format!("{} services", m.edge_services.len())).unwrap_or_else(|| "0 services".to_owned())}</span>
                     </div>
-                    <EdgeGrid mesh />
+                    <EdgeGrid mesh rates=mesh_rates />
                 </section>
             </main>
         </div>
@@ -1110,7 +1110,10 @@ fn CommandList(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
 }
 
 #[component]
-fn EdgeGrid(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
+fn EdgeGrid(
+    mesh: ReadSignal<Option<MeshApiSnapshot>>,
+    rates: ReadSignal<MeshRateSnapshot>,
+) -> impl IntoView {
     view! {
         <div class="edge-grid">
             <For
@@ -1118,14 +1121,14 @@ fn EdgeGrid(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
                 key=|edge| edge.node_id.clone()
                 let(edge)
             >
-                <EdgeCard edge />
+                <EdgeCard edge rates />
             </For>
         </div>
     }
 }
 
 #[component]
-fn EdgeCard(edge: EdgeServiceSnapshot) -> impl IntoView {
+fn EdgeCard(edge: EdgeServiceSnapshot, rates: ReadSignal<MeshRateSnapshot>) -> impl IntoView {
     let class = if edge.draining {
         "edge draining"
     } else if edge.response_errors > 0 {
@@ -1141,6 +1144,10 @@ fn EdgeCard(edge: EdgeServiceSnapshot) -> impl IntoView {
         .clone()
         .unwrap_or_else(|| "no playback url".to_owned());
     let recent_responses = edge.recent_responses.clone();
+    let traffic_rate_node_id = edge.node_id.clone();
+    let tail_rate_node_id = edge.node_id.clone();
+    let response_rate_node_id = edge.node_id.clone();
+    let window_rate_node_id = edge.node_id.clone();
     view! {
         <article class=class>
             <div>
@@ -1153,6 +1160,24 @@ fn EdgeCard(edge: EdgeServiceSnapshot) -> impl IntoView {
                 <span>{format!("{} tail reads", edge.requests_served)}</span>
                 <span>{format!("{} tails", edge.llhls_tail_requests)}</span>
                 <span>{format!("{} served", format_bytes(edge.bytes_served))}</span>
+            </div>
+            <div class="edge-stats edge-rate-stats">
+                <span>{move || {
+                    let rate = rates.get().edges.get(&traffic_rate_node_id).copied();
+                    edge_rate_traffic_text(rate)
+                }}</span>
+                <span>{move || {
+                    let rate = rates.get().edges.get(&tail_rate_node_id).copied();
+                    edge_rate_tail_text(rate)
+                }}</span>
+                <span>{move || {
+                    let rate = rates.get().edges.get(&response_rate_node_id).copied();
+                    edge_rate_response_text(rate)
+                }}</span>
+                <span>{move || {
+                    let rate = rates.get().edges.get(&window_rate_node_id).copied();
+                    edge_rate_window_text(rate)
+                }}</span>
             </div>
             <div class="edge-stats edge-http-stats">
                 <span>{format!("{} responses", edge.responses_total)}</span>
@@ -1174,6 +1199,34 @@ fn EdgeCard(edge: EdgeServiceSnapshot) -> impl IntoView {
                 </For>
             </div>
         </article>
+    }
+}
+
+fn edge_rate_traffic_text(rate: Option<EdgeRateSnapshot>) -> String {
+    match rate {
+        Some(rate) if rate.ready => rate.traffic_text(),
+        _ => "rate waiting".to_owned(),
+    }
+}
+
+fn edge_rate_tail_text(rate: Option<EdgeRateSnapshot>) -> String {
+    match rate {
+        Some(rate) if rate.ready => rate.tail_text(),
+        _ => "tails waiting".to_owned(),
+    }
+}
+
+fn edge_rate_response_text(rate: Option<EdgeRateSnapshot>) -> String {
+    match rate {
+        Some(rate) if rate.ready => rate.response_text(),
+        _ => "responses waiting".to_owned(),
+    }
+}
+
+fn edge_rate_window_text(rate: Option<EdgeRateSnapshot>) -> String {
+    match rate {
+        Some(rate) if rate.ready => format_rate_window(rate.window_ms),
+        _ => "window waiting".to_owned(),
     }
 }
 
@@ -1316,7 +1369,7 @@ fn accept_mesh_snapshot(
 ) {
     let sample = MeshRateSample::from_snapshot(&snapshot);
     if let Some(previous) = last_sample.get() {
-        set_rates.set(MeshRateSnapshot::from_delta(previous, sample));
+        set_rates.set(MeshRateSnapshot::from_delta(previous, sample.clone()));
     }
     set_last_sample.set(Some(sample));
     set_mesh.set(Some(snapshot));
@@ -2083,11 +2136,12 @@ fn now_unix_ms() -> u64 {
     js_sys::Date::now() as u64
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct MeshRateSample {
     sampled_unix_ms: u64,
     bytes_received: u64,
     datagrams_received: u64,
+    edges: HashMap<String, EdgeRateCounters>,
 }
 
 impl MeshRateSample {
@@ -2106,16 +2160,121 @@ impl MeshRateSample {
             sampled_unix_ms: nonzero_u64(snapshot.updated_unix_ms).unwrap_or_else(now_unix_ms),
             bytes_received: stream_bytes.max(snapshot.stream.bytes_received),
             datagrams_received: stream_datagrams.max(snapshot.stream.datagrams_received),
+            edges: snapshot
+                .edge_services
+                .iter()
+                .map(|edge| {
+                    (
+                        edge.node_id.clone(),
+                        EdgeRateCounters {
+                            requests_served: edge.requests_served,
+                            bytes_served: edge.bytes_served,
+                            llhls_tail_requests: edge.llhls_tail_requests,
+                            responses_total: edge.responses_total,
+                            response_errors: edge.response_errors,
+                            response_not_found: edge.response_not_found,
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+struct EdgeRateCounters {
+    requests_served: u64,
+    bytes_served: u64,
+    llhls_tail_requests: u64,
+    responses_total: u64,
+    response_errors: u64,
+    response_not_found: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct EdgeRateSnapshot {
+    ready: bool,
+    window_ms: u64,
+    requests_per_sec: f64,
+    bytes_per_sec: f64,
+    tail_requests_per_sec: f64,
+    responses_per_sec: f64,
+    errors_per_sec: f64,
+    not_found_per_sec: f64,
+}
+
+impl EdgeRateSnapshot {
+    fn from_delta(previous: EdgeRateCounters, current: EdgeRateCounters, window_ms: u64) -> Self {
+        Self {
+            ready: window_ms >= 250,
+            window_ms,
+            requests_per_sec: counter_rate(
+                previous.requests_served,
+                current.requests_served,
+                window_ms,
+            ),
+            bytes_per_sec: counter_rate(previous.bytes_served, current.bytes_served, window_ms),
+            tail_requests_per_sec: counter_rate(
+                previous.llhls_tail_requests,
+                current.llhls_tail_requests,
+                window_ms,
+            ),
+            responses_per_sec: counter_rate(
+                previous.responses_total,
+                current.responses_total,
+                window_ms,
+            ),
+            errors_per_sec: counter_rate(
+                previous.response_errors,
+                current.response_errors,
+                window_ms,
+            ),
+            not_found_per_sec: counter_rate(
+                previous.response_not_found,
+                current.response_not_found,
+                window_ms,
+            ),
+        }
+    }
+
+    fn traffic_text(&self) -> String {
+        if !self.ready {
+            return "rate waiting".to_owned();
+        }
+        format!(
+            "{} / {}",
+            format_bytes_per_sec(true, self.bytes_per_sec),
+            format_count_per_sec(self.requests_per_sec, "reads")
+        )
+    }
+
+    fn response_text(&self) -> String {
+        if !self.ready {
+            return "rate waiting".to_owned();
+        }
+        format!(
+            "{} / {} / {}",
+            format_count_per_sec(self.responses_per_sec, "responses"),
+            format_count_per_sec(self.errors_per_sec, "errors"),
+            format_count_per_sec(self.not_found_per_sec, "404s")
+        )
+    }
+
+    fn tail_text(&self) -> String {
+        if !self.ready {
+            return "tail rate waiting".to_owned();
+        }
+        format_count_per_sec(self.tail_requests_per_sec, "tails")
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 struct MeshRateSnapshot {
     ready: bool,
     window_ms: u64,
     bytes_per_sec: f64,
     datagrams_per_sec: f64,
+    edges: HashMap<String, EdgeRateSnapshot>,
 }
 
 impl MeshRateSnapshot {
@@ -2132,6 +2291,17 @@ impl MeshRateSnapshot {
                 current.datagrams_received,
                 window_ms,
             ),
+            edges: current
+                .edges
+                .iter()
+                .map(|(node_id, current)| {
+                    let previous = previous.edges.get(node_id).copied().unwrap_or_default();
+                    (
+                        node_id.clone(),
+                        EdgeRateSnapshot::from_delta(previous, *current, window_ms),
+                    )
+                })
+                .collect(),
         }
     }
 
