@@ -5,7 +5,9 @@ Leptos CSR mission-control UI for `av-mesh` and `av-contrib`.
 It consumes:
 
 - `av-mesh` `/api/mesh`
+- `av-mesh` `/api/mesh/events`
 - `av-contrib` `/api/status`
+- `av-contrib` `/api/status/events`
 - `av-mesh` `/api/control/*`
 
 Run locally with Trunk:
@@ -20,6 +22,9 @@ The default endpoint URLs match the local OBS stack:
 
 - `https://local.bitneedle.com:19444/api/mesh`
 - `https://local.bitneedle.com:19443/api/status`
+
+The dashboard prefers the SSE event streams and falls back to JSON polling when
+either service is unavailable or reconnecting.
 
 The app is intentionally separate from the `av-mesh` binary for now. Once the
 UI shape settles, the built `dist/` assets can be served from `av-mesh` as the

@@ -27,53 +27,64 @@ fn App() -> impl IntoView {
     let (status, set_status) = signal(String::from("starting"));
     let (mesh_feed, set_mesh_feed) = signal(String::from("mesh feed starting"));
     let (mesh_events_active, set_mesh_events_active) = signal(false);
+    let (contrib_feed, set_contrib_feed) = signal(String::from("contrib feed starting"));
+    let (contrib_events_active, set_contrib_events_active) = signal(false);
     let (control_status, set_control_status) = signal(String::from("idle"));
     let (stream_id, set_stream_id) = signal(String::from("1"));
     let (region, set_region) = signal(String::new());
     let (node_id, set_node_id) = signal(String::new());
-    let mesh_event_handle = Rc::new(RefCell::new(None::<MeshEventHandle>));
+    let mesh_event_handle = Rc::new(RefCell::new(None::<DashboardEventHandle>));
+    let contrib_event_handle = Rc::new(RefCell::new(None::<DashboardEventHandle>));
 
     let refresh = move || {
         let mesh_url = mesh_api.get();
         let contrib_url = contrib_api.get();
         let poll_mesh = !mesh_events_active.get();
-        let feed = if poll_mesh { "polling" } else { "events" };
-        set_status.set(format!("refreshing / mesh {feed}"));
+        let poll_contrib = !contrib_events_active.get();
+        let mesh_feed_mode = if poll_mesh { "polling" } else { "events" };
+        let contrib_feed_mode = if poll_contrib { "polling" } else { "events" };
+        set_status.set(format!(
+            "refreshing / mesh {mesh_feed_mode} / contrib {contrib_feed_mode}"
+        ));
         spawn_local(async move {
             let mesh_result = if poll_mesh {
                 Some(fetch_json::<MeshApiSnapshot>(&mesh_url).await)
             } else {
                 None
             };
-            let contrib_result = fetch_json::<ContribStatus>(&contrib_url).await;
+            let contrib_result = if poll_contrib {
+                Some(fetch_json::<ContribStatus>(&contrib_url).await)
+            } else {
+                None
+            };
 
-            match (mesh_result, contrib_result) {
-                (Some(Ok(mesh_snapshot)), Ok(contrib_status)) => {
+            let mut errors = Vec::new();
+            match mesh_result {
+                Some(Ok(mesh_snapshot)) => {
                     set_mesh.set(Some(mesh_snapshot));
-                    set_contrib.set(Some(contrib_status));
                     set_mesh_feed.set(format!("mesh polling {}", short_clock()));
-                    set_status.set(format!("ok {} / mesh polling", short_clock()));
                 }
-                (None, Ok(contrib_status)) => {
+                Some(Err(error)) => errors.push(format!("mesh: {error}")),
+                None => {}
+            }
+            match contrib_result {
+                Some(Ok(contrib_status)) => {
                     set_contrib.set(Some(contrib_status));
-                    set_status.set(format!("ok {} / mesh events", short_clock()));
+                    set_contrib_feed.set(format!("contrib polling {}", short_clock()));
                 }
-                (mesh_result, contrib_result) => {
-                    let mut errors = Vec::new();
-                    match mesh_result {
-                        Some(Ok(mesh_snapshot)) => {
-                            set_mesh.set(Some(mesh_snapshot));
-                            set_mesh_feed.set(format!("mesh polling {}", short_clock()));
-                        }
-                        Some(Err(error)) => errors.push(format!("mesh: {error}")),
-                        None => {}
-                    }
-                    match contrib_result {
-                        Ok(contrib_status) => set_contrib.set(Some(contrib_status)),
-                        Err(error) => errors.push(format!("contrib: {error}")),
-                    }
-                    set_status.set(errors.join(" | "));
-                }
+                Some(Err(error)) => errors.push(format!("contrib: {error}")),
+                None => {}
+            }
+
+            if errors.is_empty() {
+                set_status.set(format!(
+                    "ok {} / mesh {} / contrib {}",
+                    short_clock(),
+                    if poll_mesh { "polling" } else { "events" },
+                    if poll_contrib { "polling" } else { "events" }
+                ));
+            } else {
+                set_status.set(errors.join(" | "));
             }
         });
     };
@@ -136,15 +147,82 @@ fn App() -> impl IntoView {
             }));
             source.set_onerror(Some(onerror.as_ref().unchecked_ref()));
 
-            *mesh_event_handle.borrow_mut() = Some(MeshEventHandle {
+            *mesh_event_handle.borrow_mut() = Some(DashboardEventHandle {
                 source,
-                _onmesh: onmesh,
+                _onmessage: onmesh,
+                _onerror: onerror,
+            });
+        })
+    };
+
+    let connect_contrib_events = {
+        let contrib_event_handle = contrib_event_handle.clone();
+        Rc::new(move || {
+            if let Some(handle) = contrib_event_handle.borrow_mut().take() {
+                handle.close();
+            }
+
+            let events_url = contrib_events_url(&contrib_api.get());
+            set_contrib_events_active.set(false);
+            set_contrib_feed.set(format!("contrib events connecting {}", short_clock()));
+
+            let source = match EventSource::new(&events_url) {
+                Ok(source) => source,
+                Err(error) => {
+                    set_contrib_feed.set(format!("contrib polling: {}", js_error_text(error)));
+                    return;
+                }
+            };
+
+            let event_url = events_url.clone();
+            let oncontrib =
+                Closure::<dyn FnMut(MessageEvent)>::wrap(Box::new(move |event: MessageEvent| {
+                    let Some(data) = event.data().as_string() else {
+                        set_contrib_events_active.set(false);
+                        set_contrib_feed.set("contrib events: non-text payload".to_owned());
+                        return;
+                    };
+                    match serde_json::from_str::<ContribStatus>(&data) {
+                        Ok(snapshot) => {
+                            set_contrib.set(Some(snapshot));
+                            set_contrib_events_active.set(true);
+                            set_contrib_feed.set(format!("contrib events {}", short_clock()));
+                            set_status.set(format!("ok {} / contrib events", short_clock()));
+                        }
+                        Err(error) => {
+                            set_contrib_events_active.set(false);
+                            set_contrib_feed.set(format!("contrib events parse error: {error}"));
+                        }
+                    }
+                }));
+
+            if let Err(error) = source
+                .add_event_listener_with_callback("contrib", oncontrib.as_ref().unchecked_ref())
+            {
+                source.close();
+                set_contrib_feed.set(format!("contrib polling: {}", js_error_text(error)));
+                return;
+            }
+
+            let onerror = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
+                set_contrib_events_active.set(false);
+                set_contrib_feed.set(format!(
+                    "contrib events reconnecting {} ({event_url})",
+                    short_clock()
+                ));
+            }));
+            source.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+
+            *contrib_event_handle.borrow_mut() = Some(DashboardEventHandle {
+                source,
+                _onmessage: oncontrib,
                 _onerror: onerror,
             });
         })
     };
 
     connect_mesh_events();
+    connect_contrib_events();
     refresh();
     Interval::new(2_000, refresh).forget();
 
@@ -167,7 +245,7 @@ fn App() -> impl IntoView {
                     <img class="brand-icon" src="/assets/wavey-goose.png" alt="" />
                     <div>
                         <h1>"av mission control"</h1>
-                        <p>{move || format!("{} / {}", status.get(), mesh_feed.get())}</p>
+                        <p>{move || format!("{} / {} / {}", status.get(), mesh_feed.get(), contrib_feed.get())}</p>
                     </div>
                 </div>
                 <div class="endpoint-grid">
@@ -187,8 +265,10 @@ fn App() -> impl IntoView {
                     </label>
                     <button class="primary" on:click={
                         let connect_mesh_events = connect_mesh_events.clone();
+                        let connect_contrib_events = connect_contrib_events.clone();
                         move |_| {
                             connect_mesh_events();
+                            connect_contrib_events();
                             refresh();
                         }
                     }>"Refresh"</button>
@@ -576,13 +656,13 @@ async fn post_json(url: &str, body: &Value) -> Result<(), String> {
     }
 }
 
-struct MeshEventHandle {
+struct DashboardEventHandle {
     source: EventSource,
-    _onmesh: Closure<dyn FnMut(MessageEvent)>,
+    _onmessage: Closure<dyn FnMut(MessageEvent)>,
     _onerror: Closure<dyn FnMut(Event)>,
 }
 
-impl MeshEventHandle {
+impl DashboardEventHandle {
     fn close(self) {
         self.source.close();
     }
@@ -594,6 +674,14 @@ fn mesh_events_url(mesh_api: &str) -> String {
         .map(|(base, _)| base)
         .unwrap_or(mesh_api.trim_end_matches('/'));
     format!("{base}/api/mesh/events")
+}
+
+fn contrib_events_url(contrib_api: &str) -> String {
+    let base = contrib_api
+        .split_once("/api/status")
+        .map(|(base, _)| base)
+        .unwrap_or(contrib_api.trim_end_matches('/'));
+    format!("{base}/api/status/events")
 }
 
 fn mesh_control_url(mesh_api: &str, action: &str) -> String {
