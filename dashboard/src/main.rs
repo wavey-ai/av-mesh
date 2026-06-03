@@ -498,6 +498,7 @@ fn ContribView(contrib: ReadSignal<Option<ContribStatus>>) -> impl IntoView {
                 <RuntimeCell label="health" value=move || contrib.get().map(|c| c.health.state).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| c.health.detail_text()).unwrap_or_default() />
                 <RuntimeCell label="raw http" value=move || contrib.get().map(|c| c.runtime.raw_http.requests.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} / {} datagrams / {}", format_bytes(c.runtime.raw_http.bytes), c.runtime.raw_http.datagrams, optional_age(c.runtime.raw_http.last_seen_age_ms))).unwrap_or_default() />
                 <RuntimeCell label="media au" value=move || contrib.get().map(|c| c.runtime.media_access_units.requests.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} / {} datagrams / {}", format_bytes(c.runtime.media_access_units.payload_bytes), c.runtime.media_access_units.datagrams, optional_age(c.runtime.media_access_units.last_seen_age_ms))).unwrap_or_default() />
+                <RuntimeCell label="mesh tx" value=move || contrib.get().map(|c| c.runtime.mesh_forward.payloads().to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| c.runtime.mesh_forward.detail_text()).unwrap_or_default() />
                 <RuntimeCell label="mpeg-ts" value=move || contrib.get().map(|c| c.runtime.mpeg_ts.slots.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} / {}", format_bytes(c.runtime.mpeg_ts.bytes), optional_age(c.runtime.mpeg_ts.last_seen_age_ms))).unwrap_or_default() />
                 <RuntimeCell label="rtmp" value=move || contrib.get().map(|c| c.runtime.rtmp.access_units.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} / {}", format_bytes(c.runtime.rtmp.bytes), optional_age(c.runtime.rtmp.last_seen_age_ms))).unwrap_or_default() />
                 <RuntimeCell label="fmp4" value=move || contrib.get().map(|c| c.runtime.fmp4.parts.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} media / {} init / {}", format_bytes(c.runtime.fmp4.bytes), format_bytes(c.runtime.fmp4.init_bytes), optional_age(c.runtime.fmp4.last_publish_age_ms))).unwrap_or_default() />
@@ -1142,6 +1143,10 @@ fn optional_age(value: Option<u64>) -> String {
 
 fn optional_unix_age(value: Option<u64>) -> String {
     value.map(age_text).unwrap_or_else(|| "config".to_owned())
+}
+
+fn youngest_age(values: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
+    values.into_iter().flatten().min()
 }
 
 fn format_duration_ms(ms: u64) -> String {
@@ -2217,6 +2222,8 @@ struct ContribRuntimeStatus {
     #[serde(default)]
     media_access_units: MediaRuntime,
     #[serde(default)]
+    mesh_forward: MeshForwardRuntime,
+    #[serde(default)]
     mpeg_ts: MpegTsRuntime,
     #[serde(default)]
     rtmp: RtmpRuntime,
@@ -2250,6 +2257,73 @@ struct MediaRuntime {
     datagrams: u64,
     #[serde(default)]
     last_seen_age_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct MeshForwardRuntime {
+    #[serde(default)]
+    stream_payloads: u64,
+    #[serde(default)]
+    stream_payload_bytes: u64,
+    #[serde(default)]
+    stream_datagrams: u64,
+    #[serde(default)]
+    stream_datagram_bytes: u64,
+    #[serde(default)]
+    stream_errors: u64,
+    #[serde(default)]
+    stream_last_age_ms: Option<u64>,
+    #[serde(default)]
+    media_payloads: u64,
+    #[serde(default)]
+    media_payload_bytes: u64,
+    #[serde(default)]
+    media_datagrams: u64,
+    #[serde(default)]
+    media_datagram_bytes: u64,
+    #[serde(default)]
+    media_errors: u64,
+    #[serde(default)]
+    media_last_age_ms: Option<u64>,
+}
+
+impl MeshForwardRuntime {
+    fn payloads(&self) -> u64 {
+        self.stream_payloads.saturating_add(self.media_payloads)
+    }
+
+    fn datagrams(&self) -> u64 {
+        self.stream_datagrams.saturating_add(self.media_datagrams)
+    }
+
+    fn errors(&self) -> u64 {
+        self.stream_errors.saturating_add(self.media_errors)
+    }
+
+    fn payload_bytes(&self) -> u64 {
+        self.stream_payload_bytes
+            .saturating_add(self.media_payload_bytes)
+    }
+
+    fn datagram_bytes(&self) -> u64 {
+        self.stream_datagram_bytes
+            .saturating_add(self.media_datagram_bytes)
+    }
+
+    fn last_age_ms(&self) -> Option<u64> {
+        youngest_age([self.stream_last_age_ms, self.media_last_age_ms])
+    }
+
+    fn detail_text(&self) -> String {
+        format!(
+            "{} payload / {} wire / {} datagrams / {} errors / {}",
+            format_bytes(self.payload_bytes()),
+            format_bytes(self.datagram_bytes()),
+            self.datagrams(),
+            self.errors(),
+            optional_age(self.last_age_ms())
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
