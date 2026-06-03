@@ -298,6 +298,66 @@ main {
   overflow-wrap: anywhere;
 }
 
+.dashboard-hoses {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+}
+
+.dashboard-hoses-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+}
+
+.dashboard-hoses-head span {
+  color: var(--muted);
+}
+
+.dashboard-hose-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.dashboard-hose-card {
+  display: grid;
+  grid-template-columns: 82px minmax(0, 1fr);
+  gap: 4px 8px;
+  min-height: 84px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 9px 10px;
+  background: #fff;
+}
+
+.dashboard-hose-card.ready {
+  border-left: 4px solid var(--green);
+}
+
+.dashboard-hose-card.warn {
+  border-left: 4px solid var(--amber);
+}
+
+.dashboard-hose-card.error {
+  border-left: 4px solid var(--red);
+}
+
+.dashboard-hose-card.waiting {
+  border-left: 4px solid #94a3b8;
+}
+
+.dashboard-hose-card span,
+.dashboard-hose-card small {
+  overflow-wrap: anywhere;
+}
+
+.dashboard-hose-card small {
+  grid-column: 1 / -1;
+  color: var(--muted);
+}
+
 .workspace {
   display: grid;
   grid-template-columns: minmax(420px, 1.35fr) minmax(340px, 0.9fr);
@@ -1063,6 +1123,7 @@ main {
   .workspace.lower,
   .incident-list,
   .pipeline-grid,
+  .dashboard-hose-grid,
   .metrics {
     grid-template-columns: 1fr;
   }

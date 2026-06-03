@@ -40,8 +40,10 @@ fn App() -> impl IntoView {
     let (status, set_status) = signal(String::from("starting"));
     let (mesh_feed, set_mesh_feed) = signal(String::from("mesh feed starting"));
     let (mesh_events_active, set_mesh_events_active) = signal(false);
+    let (mesh_feed_diag, set_mesh_feed_diag) = signal(FeedDiagnostics::new("mesh"));
     let (contrib_feed, set_contrib_feed) = signal(String::from("contrib feed starting"));
     let (contrib_events_active, set_contrib_events_active) = signal(false);
+    let (contrib_feed_diag, set_contrib_feed_diag) = signal(FeedDiagnostics::new("contrib"));
     let (control_status, set_control_status) = signal(String::from("idle"));
     let (stream_id, set_stream_id) = signal(String::from("1"));
     let (region, set_region) = signal(String::new());
@@ -59,6 +61,12 @@ fn App() -> impl IntoView {
         set_status.set(format!(
             "refreshing / mesh {mesh_feed_mode} / contrib {contrib_feed_mode}"
         ));
+        if poll_mesh {
+            set_mesh_feed_diag.update(|diag| diag.record_polling(&mesh_url));
+        }
+        if poll_contrib {
+            set_contrib_feed_diag.update(|diag| diag.record_polling(&contrib_url));
+        }
         spawn_local(async move {
             let mesh_result = if poll_mesh {
                 Some(fetch_json::<MeshApiSnapshot>(&mesh_url).await)
@@ -82,8 +90,12 @@ fn App() -> impl IntoView {
                         set_mesh,
                     );
                     set_mesh_feed.set(format!("mesh polling {}", short_clock()));
+                    set_mesh_feed_diag.update(FeedDiagnostics::record_poll_ok);
                 }
-                Some(Err(error)) => errors.push(format!("mesh: {error}")),
+                Some(Err(error)) => {
+                    set_mesh_feed_diag.update(|diag| diag.record_poll_error(error.as_str()));
+                    errors.push(format!("mesh: {error}"));
+                }
                 None => {}
             }
             match contrib_result {
@@ -96,8 +108,12 @@ fn App() -> impl IntoView {
                         set_contrib,
                     );
                     set_contrib_feed.set(format!("contrib polling {}", short_clock()));
+                    set_contrib_feed_diag.update(FeedDiagnostics::record_poll_ok);
                 }
-                Some(Err(error)) => errors.push(format!("contrib: {error}")),
+                Some(Err(error)) => {
+                    set_contrib_feed_diag.update(|diag| diag.record_poll_error(error.as_str()));
+                    errors.push(format!("contrib: {error}"));
+                }
                 None => {}
             }
 
@@ -133,11 +149,14 @@ fn App() -> impl IntoView {
             set_mesh_rates.set(MeshRateSnapshot::default());
             set_mesh_events_active.set(false);
             set_mesh_feed.set(format!("mesh events connecting {}", short_clock()));
+            set_mesh_feed_diag.update(|diag| diag.record_event_connecting(&events_url));
 
             let source = match EventSource::new(&events_url) {
                 Ok(source) => source,
                 Err(error) => {
-                    set_mesh_feed.set(format!("mesh polling: {}", js_error_text(error)));
+                    let error = js_error_text(error);
+                    set_mesh_feed_diag.update(|diag| diag.record_event_error(&error));
+                    set_mesh_feed.set(format!("mesh polling: {error}"));
                     return;
                 }
             };
@@ -148,6 +167,8 @@ fn App() -> impl IntoView {
                     let Some(data) = event.data().as_string() else {
                         set_mesh_events_active.set(false);
                         set_mesh_feed.set("mesh events: non-text payload".to_owned());
+                        set_mesh_feed_diag
+                            .update(|diag| diag.record_parse_error("non-text event payload"));
                         return;
                     };
                     match serde_json::from_str::<MeshApiSnapshot>(&data) {
@@ -162,10 +183,13 @@ fn App() -> impl IntoView {
                             set_mesh_events_active.set(true);
                             set_mesh_feed.set(format!("mesh events {}", short_clock()));
                             set_status.set(format!("ok {} / mesh events", short_clock()));
+                            set_mesh_feed_diag.update(FeedDiagnostics::record_event_ok);
                         }
                         Err(error) => {
                             set_mesh_events_active.set(false);
                             set_mesh_feed.set(format!("mesh events parse error: {error}"));
+                            set_mesh_feed_diag
+                                .update(|diag| diag.record_parse_error(error.to_string()));
                         }
                     }
                 }));
@@ -174,12 +198,15 @@ fn App() -> impl IntoView {
                 source.add_event_listener_with_callback("mesh", onmesh.as_ref().unchecked_ref())
             {
                 source.close();
-                set_mesh_feed.set(format!("mesh polling: {}", js_error_text(error)));
+                let error = js_error_text(error);
+                set_mesh_feed_diag.update(|diag| diag.record_event_error(&error));
+                set_mesh_feed.set(format!("mesh polling: {error}"));
                 return;
             }
 
             let onerror = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
                 set_mesh_events_active.set(false);
+                set_mesh_feed_diag.update(|diag| diag.record_event_reconnect(&event_url));
                 set_mesh_feed.set(format!(
                     "mesh events reconnecting {} ({event_url})",
                     short_clock()
@@ -207,11 +234,14 @@ fn App() -> impl IntoView {
             set_contrib_rates.set(ContribRateSnapshot::default());
             set_contrib_events_active.set(false);
             set_contrib_feed.set(format!("contrib events connecting {}", short_clock()));
+            set_contrib_feed_diag.update(|diag| diag.record_event_connecting(&events_url));
 
             let source = match EventSource::new(&events_url) {
                 Ok(source) => source,
                 Err(error) => {
-                    set_contrib_feed.set(format!("contrib polling: {}", js_error_text(error)));
+                    let error = js_error_text(error);
+                    set_contrib_feed_diag.update(|diag| diag.record_event_error(&error));
+                    set_contrib_feed.set(format!("contrib polling: {error}"));
                     return;
                 }
             };
@@ -222,6 +252,8 @@ fn App() -> impl IntoView {
                     let Some(data) = event.data().as_string() else {
                         set_contrib_events_active.set(false);
                         set_contrib_feed.set("contrib events: non-text payload".to_owned());
+                        set_contrib_feed_diag
+                            .update(|diag| diag.record_parse_error("non-text event payload"));
                         return;
                     };
                     match serde_json::from_str::<ContribStatus>(&data) {
@@ -236,10 +268,13 @@ fn App() -> impl IntoView {
                             set_contrib_events_active.set(true);
                             set_contrib_feed.set(format!("contrib events {}", short_clock()));
                             set_status.set(format!("ok {} / contrib events", short_clock()));
+                            set_contrib_feed_diag.update(FeedDiagnostics::record_event_ok);
                         }
                         Err(error) => {
                             set_contrib_events_active.set(false);
                             set_contrib_feed.set(format!("contrib events parse error: {error}"));
+                            set_contrib_feed_diag
+                                .update(|diag| diag.record_parse_error(error.to_string()));
                         }
                     }
                 }));
@@ -248,12 +283,15 @@ fn App() -> impl IntoView {
                 .add_event_listener_with_callback("contrib", oncontrib.as_ref().unchecked_ref())
             {
                 source.close();
-                set_contrib_feed.set(format!("contrib polling: {}", js_error_text(error)));
+                let error = js_error_text(error);
+                set_contrib_feed_diag.update(|diag| diag.record_event_error(&error));
+                set_contrib_feed.set(format!("contrib polling: {error}"));
                 return;
             }
 
             let onerror = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
                 set_contrib_events_active.set(false);
+                set_contrib_feed_diag.update(|diag| diag.record_event_reconnect(&event_url));
                 set_contrib_feed.set(format!(
                     "contrib events reconnecting {} ({event_url})",
                     short_clock()
@@ -381,6 +419,13 @@ fn App() -> impl IntoView {
                     contrib
                     probes=playback_probes
                     started_unix_ms=dashboard_started_unix_ms
+                    mesh_events_active
+                    contrib_events_active
+                />
+
+                <DataHoseDiagnostics
+                    mesh_diag=mesh_feed_diag
+                    contrib_diag=contrib_feed_diag
                     mesh_events_active
                     contrib_events_active
                 />
@@ -642,6 +687,49 @@ fn PipelineReadiness(
                 </For>
             </div>
         </section>
+    }
+}
+
+#[component]
+fn DataHoseDiagnostics(
+    mesh_diag: ReadSignal<FeedDiagnostics>,
+    contrib_diag: ReadSignal<FeedDiagnostics>,
+    mesh_events_active: ReadSignal<bool>,
+    contrib_events_active: ReadSignal<bool>,
+) -> impl IntoView {
+    view! {
+        <section class="band dashboard-hoses">
+            <div class="dashboard-hoses-head">
+                <h2>"Dashboard Data Hoses"</h2>
+                <span>{move || {
+                    let mesh = mesh_diag.get();
+                    let contrib = contrib_diag.get();
+                    format!(
+                        "{} / {}",
+                        mesh.summary_text(mesh_events_active.get()),
+                        contrib.summary_text(contrib_events_active.get())
+                    )
+                }}</span>
+            </div>
+            <div class="dashboard-hose-grid">
+                <FeedDiagnosticCard diag=mesh_diag active=mesh_events_active />
+                <FeedDiagnosticCard diag=contrib_diag active=contrib_events_active />
+            </div>
+        </section>
+    }
+}
+
+#[component]
+fn FeedDiagnosticCard(
+    diag: ReadSignal<FeedDiagnostics>,
+    active: ReadSignal<bool>,
+) -> impl IntoView {
+    view! {
+        <div class=move || diag.get().class_name(active.get())>
+            <strong>{move || diag.get().source}</strong>
+            <span>{move || diag.get().summary_text(active.get())}</span>
+            <small>{move || diag.get().detail_text()}</small>
+        </div>
     }
 }
 
@@ -1953,6 +2041,143 @@ impl DashboardFeedHealth {
 
     fn within_startup_grace(self) -> bool {
         now_unix_ms().saturating_sub(self.started_unix_ms) < DASHBOARD_FEED_MISSING_GRACE_MS
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FeedDiagnostics {
+    source: String,
+    endpoint: String,
+    mode: &'static str,
+    event_messages: u64,
+    poll_successes: u64,
+    reconnects: u64,
+    errors: u64,
+    parse_errors: u64,
+    last_event_unix_ms: Option<u64>,
+    last_poll_unix_ms: Option<u64>,
+    last_error: Option<String>,
+}
+
+impl FeedDiagnostics {
+    fn new(source: &'static str) -> Self {
+        Self {
+            source: source.to_owned(),
+            endpoint: String::new(),
+            mode: "starting",
+            event_messages: 0,
+            poll_successes: 0,
+            reconnects: 0,
+            errors: 0,
+            parse_errors: 0,
+            last_event_unix_ms: None,
+            last_poll_unix_ms: None,
+            last_error: None,
+        }
+    }
+
+    fn record_polling(&mut self, endpoint: &str) {
+        self.endpoint = endpoint.to_owned();
+        self.mode = "polling";
+    }
+
+    fn record_poll_ok(&mut self) {
+        self.mode = "polling";
+        self.poll_successes = self.poll_successes.saturating_add(1);
+        self.last_poll_unix_ms = Some(now_unix_ms());
+        self.last_error = None;
+    }
+
+    fn record_poll_error(&mut self, error: &str) {
+        self.mode = "polling";
+        self.errors = self.errors.saturating_add(1);
+        self.last_error = Some(error.to_owned());
+    }
+
+    fn record_event_connecting(&mut self, endpoint: &str) {
+        self.endpoint = endpoint.to_owned();
+        self.mode = "connecting";
+        self.last_error = None;
+    }
+
+    fn record_event_ok(&mut self) {
+        self.mode = "events";
+        self.event_messages = self.event_messages.saturating_add(1);
+        self.last_event_unix_ms = Some(now_unix_ms());
+        self.last_error = None;
+    }
+
+    fn record_event_reconnect(&mut self, endpoint: &str) {
+        self.endpoint = endpoint.to_owned();
+        self.mode = "reconnecting";
+        self.reconnects = self.reconnects.saturating_add(1);
+        self.last_error = Some("EventSource reconnecting".to_owned());
+    }
+
+    fn record_event_error(&mut self, error: &str) {
+        self.mode = "event error";
+        self.errors = self.errors.saturating_add(1);
+        self.last_error = Some(error.to_owned());
+    }
+
+    fn record_parse_error(&mut self, error: impl Into<String>) {
+        self.mode = "parse error";
+        self.errors = self.errors.saturating_add(1);
+        self.parse_errors = self.parse_errors.saturating_add(1);
+        self.last_error = Some(error.into());
+    }
+
+    fn class_name(&self, active: bool) -> &'static str {
+        if self.last_error.is_some() {
+            "dashboard-hose-card error"
+        } else if active {
+            "dashboard-hose-card ready"
+        } else if self.poll_successes > 0 {
+            "dashboard-hose-card warn"
+        } else {
+            "dashboard-hose-card waiting"
+        }
+    }
+
+    fn summary_text(&self, active: bool) -> String {
+        if active {
+            "events active".to_owned()
+        } else if self.mode == "polling" && self.poll_successes > 0 {
+            "polling fallback".to_owned()
+        } else {
+            self.mode.to_owned()
+        }
+    }
+
+    fn detail_text(&self) -> String {
+        let mut parts = vec![
+            self.endpoint_text(),
+            format!("{} events", self.event_messages),
+            format!("{} polls", self.poll_successes),
+            format!("{} reconnects", self.reconnects),
+            format!("{} errors", self.errors),
+        ];
+        if self.parse_errors > 0 {
+            parts.push(format!("{} parse", self.parse_errors));
+        }
+        if let Some(last_event) = self.last_event_unix_ms {
+            parts.push(format!("event {}", optional_unix_age(Some(last_event))));
+        }
+        if let Some(last_poll) = self.last_poll_unix_ms {
+            parts.push(format!("poll {}", optional_unix_age(Some(last_poll))));
+        }
+        if let Some(error) = &self.last_error {
+            parts.push(error.clone());
+        }
+        parts.join(" / ")
+    }
+
+    fn endpoint_text(&self) -> String {
+        if self.endpoint.is_empty() {
+            "endpoint pending".to_owned()
+        } else {
+            self.endpoint.clone()
+        }
     }
 }
 
