@@ -231,8 +231,16 @@ fn App() -> impl IntoView {
         set_control_status.set(format!("{action} pending"));
         spawn_local(async move {
             let endpoint = mesh_control_url(&mesh_url, action);
-            match post_json(&endpoint, &body).await {
-                Ok(()) => set_control_status.set(format!("{action} accepted {}", short_clock())),
+            match post_json::<ControlCommand>(&endpoint, &body).await {
+                Ok(command) => {
+                    let status = control_status_text(action, &command);
+                    set_mesh.update(move |snapshot| {
+                        if let Some(snapshot) = snapshot {
+                            upsert_recent_command(&mut snapshot.recent_commands, command.clone());
+                        }
+                    });
+                    set_control_status.set(status);
+                }
                 Err(error) => set_control_status.set(format!("{action} failed: {error}")),
             }
         });
@@ -695,7 +703,10 @@ where
         .map_err(|error| error.to_string())
 }
 
-async fn post_json(url: &str, body: &Value) -> Result<(), String> {
+async fn post_json<T>(url: &str, body: &Value) -> Result<T, String>
+where
+    T: DeserializeOwned,
+{
     let response = Request::post(url)
         .header("Accept", "application/json")
         .json(body)
@@ -703,11 +714,34 @@ async fn post_json(url: &str, body: &Value) -> Result<(), String> {
         .send()
         .await
         .map_err(|error| error.to_string())?;
-    if response.ok() {
-        Ok(())
-    } else {
-        Err(format!("HTTP {}", response.status()))
+    if !response.ok() {
+        return Err(format!("HTTP {}", response.status()));
     }
+    response
+        .json::<T>()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn control_status_text(action: &str, command: &ControlCommand) -> String {
+    let command_status = if command.status.is_empty() {
+        "accepted"
+    } else {
+        command.status.as_str()
+    };
+    format!("{action} {command_status} {}", short_clock())
+}
+
+fn upsert_recent_command(commands: &mut Vec<ControlCommand>, command: ControlCommand) {
+    if let Some(existing) = commands
+        .iter_mut()
+        .find(|existing| existing.id == command.id && command.id != 0)
+    {
+        *existing = command;
+    } else {
+        commands.insert(0, command);
+    }
+    commands.truncate(16);
 }
 
 struct DashboardEventHandle {
