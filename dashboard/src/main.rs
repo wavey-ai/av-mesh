@@ -840,6 +840,7 @@ fn ContribView(
                 <RuntimeCell label="errors" value=move || contrib.get().map(|c| c.runtime.fmp4.publish_errors.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} alerts", c.alerts.len())).unwrap_or_default() />
             </div>
             <ContribHlsResponses contrib />
+            <ContribStreamRuntime contrib />
             <ContribIngestSessions contrib />
             <ContribProtocolRuntime contrib rates />
             <div class="listener-list">
@@ -909,6 +910,38 @@ fn ContribProtocolRuntime(
                 }
             </For>
         </div>
+    }
+}
+
+#[component]
+fn ContribStreamRuntime(contrib: ReadSignal<Option<ContribStatus>>) -> impl IntoView {
+    view! {
+        <Show when=move || {
+            contrib
+                .get()
+                .map(|status| !status.runtime.streams.is_empty())
+                .unwrap_or(false)
+        }>
+            <div class="table compact contrib-stream-table">
+                <div class="table-head contrib-stream-row">
+                    <span>"stream"</span><span>"state"</span><span>"input"</span><span>"mesh"</span><span>"fmp4"</span><span>"seen"</span>
+                </div>
+                <For
+                    each=move || contrib.get().map(|c| c.runtime.streams).unwrap_or_default()
+                    key=|stream| stream.stream_id_text.clone()
+                    let(stream)
+                >
+                    <div class=stream.class_name()>
+                        <span>{stream.display_stream_id()}</span>
+                        <span>{stream.state.clone()}</span>
+                        <span>{stream.input_text()}</span>
+                        <span>{stream.mesh_text()}</span>
+                        <span>{stream.fmp4_text()}</span>
+                        <span>{stream.age_text()}</span>
+                    </div>
+                </For>
+            </div>
+        </Show>
     }
 }
 
@@ -4610,6 +4643,8 @@ struct ContribRuntimeStatus {
     #[serde(default)]
     ingest_sessions: IngestSessionsRuntime,
     #[serde(default)]
+    streams: Vec<ContribStreamRuntime>,
+    #[serde(default)]
     protocols: Vec<ProtocolRuntime>,
 }
 
@@ -4824,6 +4859,126 @@ struct IngestSessionsRuntime {
     ended: u64,
     #[serde(default)]
     recent: Vec<IngestSession>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ContribStreamRuntime {
+    #[serde(default)]
+    stream_id_text: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    input_units: u64,
+    #[serde(default)]
+    input_bytes: u64,
+    #[serde(default)]
+    mesh_payloads: u64,
+    #[serde(default)]
+    mesh_payload_bytes: u64,
+    #[serde(default)]
+    mesh_datagrams: u64,
+    #[serde(default)]
+    mesh_datagram_bytes: u64,
+    #[serde(default)]
+    mesh_errors: u64,
+    #[serde(default)]
+    fmp4_parts: u64,
+    #[serde(default)]
+    fmp4_bytes: u64,
+    #[serde(default)]
+    fmp4_init_bytes: u64,
+    #[serde(default)]
+    fmp4_publish_errors: u64,
+    #[serde(default)]
+    latest_fmp4_sequence: Option<u64>,
+    #[serde(default)]
+    video_parts: u64,
+    #[serde(default)]
+    video_access_units: u64,
+    #[serde(default)]
+    audio_parts: u64,
+    #[serde(default)]
+    audio_access_units: u64,
+    #[serde(default)]
+    last_input_age_ms: Option<u64>,
+    #[serde(default)]
+    last_mesh_forward_age_ms: Option<u64>,
+    #[serde(default)]
+    last_fmp4_age_ms: Option<u64>,
+}
+
+impl ContribStreamRuntime {
+    fn class_name(&self) -> &'static str {
+        match self.state.as_str() {
+            "degraded" => "contrib-stream-row degraded",
+            "publishing" => "contrib-stream-row publishing",
+            "forwarding" => "contrib-stream-row forwarding",
+            "ingesting" => "contrib-stream-row ingesting",
+            _ => "contrib-stream-row",
+        }
+    }
+
+    fn display_stream_id(&self) -> String {
+        if self.stream_id_text.is_empty() {
+            "-".to_owned()
+        } else {
+            self.stream_id_text.clone()
+        }
+    }
+
+    fn input_text(&self) -> String {
+        format!(
+            "{} units / {}",
+            self.input_units,
+            format_bytes(self.input_bytes)
+        )
+    }
+
+    fn mesh_text(&self) -> String {
+        let mut parts = vec![
+            format!("{} payloads", self.mesh_payloads),
+            format_bytes(self.mesh_payload_bytes),
+            format!("{} datagrams", self.mesh_datagrams),
+            format!("wire {}", format_bytes(self.mesh_datagram_bytes)),
+        ];
+        if self.mesh_errors > 0 {
+            parts.push(format!("{} errors", self.mesh_errors));
+        }
+        parts.join(" / ")
+    }
+
+    fn fmp4_text(&self) -> String {
+        let mut parts = vec![
+            format!("{} parts", self.fmp4_parts),
+            format_bytes(self.fmp4_bytes),
+            format!("init {}", format_bytes(self.fmp4_init_bytes)),
+        ];
+        if let Some(sequence) = self.latest_fmp4_sequence {
+            parts.push(format!("seq {sequence}"));
+        }
+        if self.video_parts > 0 || self.audio_parts > 0 {
+            parts.push(format!(
+                "{} video parts ({} AU) / {} audio parts ({} AU)",
+                self.video_parts,
+                self.video_access_units,
+                self.audio_parts,
+                self.audio_access_units
+            ));
+        }
+        if self.fmp4_publish_errors > 0 {
+            parts.push(format!("{} errors", self.fmp4_publish_errors));
+        }
+        parts.join(" / ")
+    }
+
+    fn age_text(&self) -> String {
+        format!(
+            "input {} / mesh {} / fmp4 {}",
+            optional_age(self.last_input_age_ms),
+            optional_age(self.last_mesh_forward_age_ms),
+            optional_age(self.last_fmp4_age_ms)
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
