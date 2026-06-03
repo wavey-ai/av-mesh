@@ -3208,6 +3208,7 @@ struct ControlPlane {
 
 impl ControlPlane {
     async fn record(&self, kind: ControlKind, request: ControlRequest) -> ControlCommand {
+        let target_text = control_request_target_text(&request);
         let command = ControlCommand {
             id: now_unix_ms(),
             kind,
@@ -3215,6 +3216,7 @@ impl ControlPlane {
             region: request.region,
             stream_id: request.stream_id,
             stream_id_text: request.stream_id.map(stream_id_text),
+            target_text,
             created_unix_ms: now_unix_ms(),
             status: "accepted".into(),
         };
@@ -3283,6 +3285,24 @@ struct ControlRequest {
     stream_id: Option<u64>,
 }
 
+fn control_request_target_text(request: &ControlRequest) -> String {
+    let mut parts = Vec::new();
+    if let Some(node_id) = request.node_id.as_deref().filter(|value| !value.is_empty()) {
+        parts.push(format!("node {node_id}"));
+    }
+    if let Some(region) = request.region.as_deref().filter(|value| !value.is_empty()) {
+        parts.push(format!("region {region}"));
+    }
+    if let Some(stream_id) = request.stream_id {
+        parts.push(format!("stream {}", stream_id_text(stream_id)));
+    }
+    if parts.is_empty() {
+        "global".to_owned()
+    } else {
+        parts.join(" / ")
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ControlKind {
@@ -3301,6 +3321,7 @@ struct ControlCommand {
     stream_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stream_id_text: Option<String>,
+    target_text: String,
     created_unix_ms: u64,
     status: String,
 }
@@ -7161,6 +7182,13 @@ mod tests {
             .await;
 
         assert!(command.status.contains("published AVMC control"));
+        assert_eq!(command.target_text, "region test-region / stream 91");
+        let command_json = serde_json::to_value(&command).unwrap();
+        assert_eq!(
+            command_json["target_text"],
+            "region test-region / stream 91"
+        );
+        assert!(command_json["created_unix_ms"].as_u64().unwrap() > 0);
         let message = rx.recv().await.unwrap();
         assert_eq!(message.tag(), CONTROL_TAG);
         let envelope: ControlEnvelope = serde_json::from_slice(&message.data()[0]).unwrap();

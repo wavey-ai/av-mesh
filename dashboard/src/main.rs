@@ -4255,6 +4255,10 @@ struct ControlCommand {
     #[serde(default)]
     stream_id_text: Option<String>,
     #[serde(default)]
+    target_text: String,
+    #[serde(default)]
+    created_unix_ms: u64,
+    #[serde(default)]
     status: String,
 }
 
@@ -4285,17 +4289,22 @@ impl ControlCommand {
     }
 
     fn target_text(&self) -> String {
+        if !self.target_text.is_empty() {
+            return self.target_text.clone();
+        }
         let target = [
-            self.node_id.as_deref(),
-            self.region.as_deref(),
-            self.stream_id_text.as_deref(),
+            self.node_id.as_ref().map(|node_id| format!("node {node_id}")),
+            self.region.as_ref().map(|region| format!("region {region}")),
+            self.stream_id_text
+                .as_ref()
+                .map(|stream_id| format!("stream {stream_id}")),
         ]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()
         .join(" / ");
         if target.is_empty() {
-            "all local targets".to_owned()
+            "global".to_owned()
         } else {
             target
         }
@@ -4305,7 +4314,9 @@ impl ControlCommand {
         let mut parts = Vec::new();
         if self.id != 0 {
             parts.push(format!("id {}", self.id));
-            parts.push(optional_unix_age(Some(self.id)));
+        }
+        if self.created_unix_ms != 0 {
+            parts.push(optional_unix_age(Some(self.created_unix_ms)));
         }
         parts.push(self.target_text());
         parts.join(" / ")
