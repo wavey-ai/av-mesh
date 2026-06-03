@@ -814,6 +814,18 @@ fn ContribView(
                 <span>"media fec"</span>
                 <strong>{move || contrib.get().map(|c| c.mesh.media_fec_target).unwrap_or_else(|| "-".to_owned())}</strong>
             </div>
+            <div class="contrib-config-grid">
+                <RuntimeCell
+                    label="ll-hls target"
+                    value=move || contrib.get().map(|c| c.hls.part_target_text()).unwrap_or_else(|| "-".to_owned())
+                    detail=move || contrib.get().map(|c| c.hls.playlist_detail_text()).unwrap_or_else(|| "configured LL-HLS cadence".to_owned())
+                />
+                <RuntimeCell
+                    label="fec target"
+                    value=move || contrib.get().map(|c| c.fec.repair_text()).unwrap_or_else(|| "-".to_owned())
+                    detail=move || contrib.get().map(|c| c.fec.detail_text()).unwrap_or_else(|| "configured mesh FEC".to_owned())
+                />
+            </div>
             <div class="runtime-grid">
                 <RuntimeCell label="health" value=move || contrib.get().map(|c| c.health.state).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| c.health.detail_text()).unwrap_or_default() />
                 <RuntimeCell label="raw http" value=move || contrib.get().map(|c| c.runtime.raw_http.requests.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} / {} datagrams / {}", format_bytes(c.runtime.raw_http.bytes), c.runtime.raw_http.datagrams, optional_age(c.runtime.raw_http.last_seen_age_ms))).unwrap_or_default() />
@@ -4448,6 +4460,10 @@ struct ContribStatus {
     #[serde(default)]
     mesh: ContribMeshStatus,
     #[serde(default)]
+    hls: ContribHlsConfig,
+    #[serde(default)]
+    fec: ContribFecConfig,
+    #[serde(default)]
     listeners: Vec<ListenerStatus>,
     #[serde(default)]
     runtime: ContribRuntimeStatus,
@@ -4509,6 +4525,58 @@ struct ContribMeshStatus {
     byte_fec_target: String,
     #[serde(default)]
     media_fec_target: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ContribHlsConfig {
+    #[serde(default)]
+    part_target_ms: u64,
+    #[serde(default)]
+    segment_target_ms: u64,
+    #[serde(default)]
+    playlist_target_duration_ms: u64,
+    #[serde(default)]
+    playlist_count: usize,
+    #[serde(default)]
+    playlist_buffer_kb: usize,
+}
+
+impl ContribHlsConfig {
+    fn part_target_text(&self) -> String {
+        if self.part_target_ms == 0 {
+            "-".to_owned()
+        } else {
+            format_duration_ms_plain(self.part_target_ms)
+        }
+    }
+
+    fn playlist_detail_text(&self) -> String {
+        format!(
+            "segment {} / playlist target {} / {} playlist(s) / {} KB buffer",
+            format_duration_ms_plain(self.segment_target_ms),
+            format_duration_ms_plain(self.playlist_target_duration_ms),
+            self.playlist_count,
+            self.playlist_buffer_kb
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ContribFecConfig {
+    #[serde(default)]
+    repair_symbols: usize,
+    #[serde(default)]
+    symbol_size: usize,
+}
+
+impl ContribFecConfig {
+    fn repair_text(&self) -> String {
+        format!("{} repair", self.repair_symbols)
+    }
+
+    fn detail_text(&self) -> String {
+        format!("{} byte symbols", self.symbol_size)
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
