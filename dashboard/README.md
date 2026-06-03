@@ -38,3 +38,7 @@ present, and serves the hashed JS/CSS/WASM files from the same directory. Set
 `AV_MESH_DASHBOARD_DIST=/path/to/dist` to point a running node at a different
 dashboard build. If no built dashboard is available, `av-mesh` falls back to the
 embedded legacy `/mesh` page.
+
+The `../av-contrib` `local-obs-stack` binary builds this dist automatically
+unless started with `--no-dashboard-build`, and injects the dist path into both
+local mesh nodes with `AV_MESH_DASHBOARD_DIST`.

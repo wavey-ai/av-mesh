@@ -286,9 +286,10 @@ trust that cert or use an insecure local test client.
 
 ## Rust dashboard
 
-The experimental Rust UI lives in `dashboard/` and uses latest Leptos alpha in
-CSR mode. It consumes `av-mesh` `/api/mesh`, `av-contrib` `/api/status`, and
-the existing `av-mesh` `/api/control/*` commands.
+The experimental Rust UI lives in `dashboard/` and uses the latest published
+Leptos alpha (`0.9.0-alpha`) in CSR mode. It consumes `av-mesh` `/api/mesh`,
+`av-contrib` `/api/status`, and the existing `av-mesh` `/api/control/*`
+commands.
 
 ```bash
 cd dashboard
@@ -307,14 +308,15 @@ Rust supervisor, use the `local-obs-stack` binary owned by `../av-contrib`:
 cargo run --manifest-path ../av-contrib/Cargo.toml --bin local-obs-stack --release
 ```
 
-The supervisor builds release `av-mesh` and `../av-contrib`, uses the local bitneedle
-TLS material from `../tls/local.bitneedle.com`, starts UK and US mesh nodes plus
-one `av-contrib` ingress, and prefixes every child process stdout/stderr line
-into the supervisor stdout. By default it uses stream id `1`, UK egress
+The supervisor builds release `av-mesh`, release `../av-contrib`, and the
+`dashboard/` Leptos dist, then passes that dist to each mesh node with
+`AV_MESH_DASHBOARD_DIST`. It uses the local bitneedle TLS material from
+`../tls/local.bitneedle.com`, starts UK and US mesh nodes plus one `av-contrib`
+ingress, and prefixes every child process stdout/stderr line into the supervisor
+stdout. By default it uses stream id `1`, UK egress
 `https://local.bitneedle.com:19444/live/1/stream.m3u8`, US egress
-`https://local.bitneedle.com:19445/live/1/stream.m3u8`, default playlist aliases
-at `/live/stream.m3u8`, and mesh dashboards at `/mesh` on both ports. OBS can
-publish RTMP to server
+`https://local.bitneedle.com:19445/live/1/stream.m3u8`, and mesh dashboards at
+`/mesh` on both ports. OBS can publish RTMP to server
 `rtmp://local.bitneedle.com:19350/live` with stream key `obs-local`, or SRT to
 `srt://local.bitneedle.com:27001?mode=caller`. RIST is also bound on
 `local.bitneedle.com:27000` with main profile and flow id `0x11223344`. The
@@ -334,6 +336,10 @@ RUST_LOG=av_mesh=trace,av_contrib=trace,rtmp_ingress=debug \
 Use `--cert` and `--key` to point at alternate PEM files. The default hostname
 must resolve to loopback; on this machine `local.bitneedle.com` resolves to
 `127.0.0.1` and `::1`.
+
+Use `--dashboard-dist /path/to/dist` to reuse a specific dashboard build. Use
+`--no-dashboard-build` to skip the Trunk build and let `av-mesh` use an existing
+dist or its fallback page. `--no-build` skips all release and dashboard builds.
 
 The services already use `tracing_subscriber` with `RUST_LOG` env filters. The
 current detailed logs are mostly `info!` and `debug!`; setting `trace` is
