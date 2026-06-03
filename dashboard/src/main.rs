@@ -389,7 +389,7 @@ fn App() -> impl IntoView {
                                 key=|node| node.node_id.clone()
                                 let(node)
                             >
-                                <NodeTile node />
+                                <NodeTile node rates=mesh_rates />
                             </For>
                         </div>
                         <PeerList mesh />
@@ -584,13 +584,15 @@ where
 }
 
 #[component]
-fn NodeTile(node: MeshNode) -> impl IntoView {
+fn NodeTile(node: MeshNode, rates: ReadSignal<MeshRateSnapshot>) -> impl IntoView {
     let storage_pct = percent(node.used_storage_bytes, node.total_storage_bytes);
     let class = if node.draining {
         "node draining"
     } else {
         "node"
     };
+    let rate_node_id = node.node_id.clone();
+    let active_streams = node.active_streams;
     view! {
         <article class=class>
             <div>
@@ -602,9 +604,29 @@ fn NodeTile(node: MeshNode) -> impl IntoView {
                 <span>{format!("{} ingress", node.contributor_streams)}</span>
                 <span>{format_bps(node.egress_capacity_bps)}</span>
             </div>
+            <div class="node-stats node-rate-stats">
+                <span>{move || {
+                    let rate = rates.get().nodes.get(&rate_node_id).copied();
+                    node_rate_text(rate, active_streams)
+                }}</span>
+            </div>
             <div class="bar"><i style=format!("width: {:.1}%", storage_pct)></i></div>
             <small>{format!("{} used", format_bytes(node.used_storage_bytes))}</small>
         </article>
+    }
+}
+
+fn node_rate_text(rate: Option<NodeRateSnapshot>, active_streams: u64) -> String {
+    match rate {
+        Some(rate) if rate.ready => format!(
+            "{} / {} / {} streams / {}",
+            format_bytes_per_sec(true, rate.bytes_per_sec),
+            format_count_per_sec(rate.datagrams_per_sec, "datagrams"),
+            rate.streams,
+            format_rate_window(rate.window_ms)
+        ),
+        _ if active_streams == 0 => "no stream traffic".to_owned(),
+        _ => "stream rate waiting".to_owned(),
     }
 }
 
@@ -2172,6 +2194,7 @@ struct MeshRateSample {
     sampled_unix_ms: u64,
     bytes_received: u64,
     datagrams_received: u64,
+    nodes: HashMap<String, NodeRateCounters>,
     streams: HashMap<String, StreamRateCounters>,
     edges: HashMap<String, EdgeRateCounters>,
     telemetry_peers: HashMap<String, TelemetryPeerRateCounters>,
@@ -2193,6 +2216,7 @@ impl MeshRateSample {
             sampled_unix_ms: nonzero_u64(snapshot.updated_unix_ms).unwrap_or_else(now_unix_ms),
             bytes_received: stream_bytes.max(snapshot.stream.bytes_received),
             datagrams_received: stream_datagrams.max(snapshot.stream.datagrams_received),
+            nodes: node_rate_counters(&snapshot.streams),
             streams: snapshot
                 .streams
                 .iter()
@@ -2239,6 +2263,51 @@ impl MeshRateSample {
                     )
                 })
                 .collect(),
+        }
+    }
+}
+
+fn node_rate_counters(streams: &[StreamTelemetry]) -> HashMap<String, NodeRateCounters> {
+    let mut nodes = HashMap::<String, NodeRateCounters>::new();
+    for stream in streams {
+        let node = nodes.entry(stream.node_id.clone()).or_default();
+        node.streams = node.streams.saturating_add(1);
+        node.bytes_received = node.bytes_received.saturating_add(stream.bytes_received);
+        node.datagrams_received = node
+            .datagrams_received
+            .saturating_add(stream.datagrams_received);
+    }
+    nodes
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct NodeRateCounters {
+    streams: usize,
+    bytes_received: u64,
+    datagrams_received: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct NodeRateSnapshot {
+    ready: bool,
+    window_ms: u64,
+    streams: usize,
+    bytes_per_sec: f64,
+    datagrams_per_sec: f64,
+}
+
+impl NodeRateSnapshot {
+    fn from_delta(previous: NodeRateCounters, current: NodeRateCounters, window_ms: u64) -> Self {
+        Self {
+            ready: window_ms >= 250,
+            window_ms,
+            streams: current.streams,
+            bytes_per_sec: counter_rate(previous.bytes_received, current.bytes_received, window_ms),
+            datagrams_per_sec: counter_rate(
+                previous.datagrams_received,
+                current.datagrams_received,
+                window_ms,
+            ),
         }
     }
 }
@@ -2442,6 +2511,7 @@ struct MeshRateSnapshot {
     window_ms: u64,
     bytes_per_sec: f64,
     datagrams_per_sec: f64,
+    nodes: HashMap<String, NodeRateSnapshot>,
     streams: HashMap<String, StreamRateSnapshot>,
     edges: HashMap<String, EdgeRateSnapshot>,
     telemetry_peers: HashMap<String, TelemetryPeerRateSnapshot>,
@@ -2461,6 +2531,17 @@ impl MeshRateSnapshot {
                 current.datagrams_received,
                 window_ms,
             ),
+            nodes: current
+                .nodes
+                .iter()
+                .map(|(node_id, current)| {
+                    let previous = previous.nodes.get(node_id).copied().unwrap_or_default();
+                    (
+                        node_id.clone(),
+                        NodeRateSnapshot::from_delta(previous, *current, window_ms),
+                    )
+                })
+                .collect(),
             streams: current
                 .streams
                 .iter()
