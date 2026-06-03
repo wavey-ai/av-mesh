@@ -1923,6 +1923,14 @@ struct ProvisionStatus {
     enabled: bool,
     backends: Vec<String>,
     timeout_ms: u64,
+    backend_statuses: Vec<ProvisionBackendStatus>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct ProvisionBackendStatus {
+    name: String,
+    state: &'static str,
+    details: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2573,6 +2581,7 @@ impl MeshApiSnapshot {
             &connections,
             &local.stream,
             &recent_commands,
+            &orchestration.provision,
             &orchestration.telemetry_peers,
         );
         let activity = derive_mesh_activity(&aggregate, &alerts, &recent_commands);
@@ -2604,6 +2613,7 @@ fn derive_mesh_alerts(
     connections: &[ConnectionSnapshot],
     local_stream: &StatsSnapshot,
     recent_commands: &[ControlCommand],
+    provision: &ProvisionStatus,
     telemetry_peers: &[TelemetryPeerStatus],
 ) -> Vec<MeshAlert> {
     let now = now_unix_ms();
@@ -2811,6 +2821,23 @@ fn derive_mesh_alerts(
                 "{unavailable_telemetry_peers} tcp-changes telemetry peer(s) are not connected; latest is {peer} ({state})."
             ),
             count: unavailable_telemetry_peers as u64,
+            last_seen_unix_ms: Some(now),
+            node_id: None,
+            stream_id_text: None,
+        });
+    }
+
+    let blocked_provision_backends = provision
+        .backend_statuses
+        .iter()
+        .filter(|backend| backend.state != "ready")
+        .count();
+    if blocked_provision_backends > 0 {
+        alerts.push(MeshAlert {
+            level: "warn",
+            code: "provision_backend_blocked",
+            message: "One or more configured provision backends are not ready.".into(),
+            count: blocked_provision_backends as u64,
             last_seen_unix_ms: Some(now),
             node_id: None,
             stream_id_text: None,
@@ -3109,17 +3136,25 @@ impl ProvisionExecutor {
 
     fn status(&self) -> ProvisionStatus {
         let mut backends = Vec::new();
+        let mut backend_statuses = Vec::new();
         if self.command.is_some() {
             backends.push("command".to_owned());
+            backend_statuses.push(ProvisionBackendStatus {
+                name: "command".to_owned(),
+                state: "ready",
+                details: vec!["shell command configured".to_owned()],
+            });
         }
         #[cfg(feature = "linode-provisioner")]
-        if self.linode.is_some() {
+        if let Some(config) = &self.linode {
             backends.push("linode".to_owned());
+            backend_statuses.push(config.status());
         }
         ProvisionStatus {
             enabled: !backends.is_empty(),
             backends,
             timeout_ms: self.timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+            backend_statuses,
         }
     }
 
@@ -3336,6 +3371,46 @@ impl LinodeProvisionConfig {
             .cloned()
             .unwrap_or_else(|| mesh_region.to_string())
     }
+
+    fn status(&self) -> ProvisionBackendStatus {
+        let token_present = env_value_present(&self.token_env);
+        let pub_key_present = env_value_present(&self.pub_key_env);
+        let mut details = vec![
+            format!(
+                "token env {} {}",
+                self.token_env,
+                if token_present { "present" } else { "missing" }
+            ),
+            format!(
+                "public key env {} {}",
+                self.pub_key_env,
+                if pub_key_present {
+                    "present"
+                } else {
+                    "missing"
+                }
+            ),
+            format!("image {}", self.image_id),
+            format!("type {}", self.instance_type),
+            format!("domain {}", self.domain_id),
+            format!("private vlan {}", self.vlan_tag),
+        ];
+        if self.region_map.is_empty() {
+            details.push("region map empty".to_owned());
+        } else {
+            details.push(format!("{} region map entries", self.region_map.len()));
+        }
+
+        ProvisionBackendStatus {
+            name: "linode".to_owned(),
+            state: if token_present && pub_key_present {
+                "ready"
+            } else {
+                "blocked"
+            },
+            details,
+        }
+    }
 }
 
 #[cfg(feature = "linode-provisioner")]
@@ -3364,6 +3439,11 @@ fn command_output_detail(stdout: &[u8], stderr: &[u8]) -> String {
         (true, false) => format!("stderr={stderr}"),
         (false, false) => format!("stdout={stdout}; stderr={stderr}"),
     }
+}
+
+#[cfg(feature = "linode-provisioner")]
+fn env_value_present(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| !value.trim().is_empty())
 }
 
 fn truncated_utf8(bytes: &[u8]) -> String {
@@ -6480,6 +6560,7 @@ mod tests {
         assert!(!disabled.orchestration.control_dispatch_ready);
         assert!(!disabled.orchestration.provision.enabled);
         assert!(disabled.orchestration.provision.backends.is_empty());
+        assert!(disabled.orchestration.provision.backend_statuses.is_empty());
 
         let provision = ProvisionExecutor::new(
             Some("printf provision-ready".into()),
@@ -6495,6 +6576,15 @@ mod tests {
         assert!(enabled.orchestration.provision.enabled);
         assert_eq!(enabled.orchestration.provision.backends, vec!["command"]);
         assert_eq!(enabled.orchestration.provision.timeout_ms, 1_500);
+        assert_eq!(enabled.orchestration.provision.backend_statuses.len(), 1);
+        assert_eq!(
+            enabled.orchestration.provision.backend_statuses[0].name,
+            "command"
+        );
+        assert_eq!(
+            enabled.orchestration.provision.backend_statuses[0].state,
+            "ready"
+        );
         mesh.shutdown();
     }
 
@@ -7005,6 +7095,23 @@ mod tests {
         ));
         let router =
             app_router_for_tests_with_provision(Arc::clone(&cache), Arc::clone(&mesh), provision);
+
+        let status = router.mesh_api_snapshot().await.orchestration.provision;
+        assert!(status.enabled);
+        assert_eq!(status.backends, vec!["linode"]);
+        assert_eq!(status.backend_statuses.len(), 1);
+        assert_eq!(status.backend_statuses[0].name, "linode");
+        assert_eq!(status.backend_statuses[0].state, "blocked");
+        assert!(status.backend_statuses[0]
+            .details
+            .iter()
+            .any(|detail| detail.contains("AV_MESH_TEST_MISSING_LINODE_TOKEN missing")));
+        assert!(router
+            .mesh_api_snapshot()
+            .await
+            .alerts
+            .iter()
+            .any(|alert| alert.code == "provision_backend_blocked"));
 
         let command = router
             .execute_control(

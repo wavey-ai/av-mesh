@@ -359,6 +359,7 @@ main {
 
 .listener-list,
 .ingest-session-list,
+.provision-backend-list,
 .commands,
 .alert-list,
 .activity-list,
@@ -393,6 +394,14 @@ main {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
   margin-bottom: 12px;
+}
+
+.provision-backend-list {
+  margin-bottom: 12px;
+}
+
+.provision-backend-list:empty {
+  display: none;
 }
 
 .runtime-cell {
@@ -616,6 +625,38 @@ main {
 }
 
 .command small {
+  grid-column: 1 / -1;
+  color: var(--muted);
+}
+
+.provision-backend {
+  display: grid;
+  grid-template-columns: minmax(118px, 0.7fr) minmax(80px, 0.4fr);
+  gap: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 9px 10px;
+  background: #fff;
+}
+
+.provision-backend.ready {
+  border-left: 4px solid var(--green);
+}
+
+.provision-backend.warn {
+  border-left: 4px solid var(--amber);
+}
+
+.provision-backend.blocked {
+  border-left: 4px solid var(--red);
+}
+
+.provision-backend span,
+.provision-backend small {
+  overflow-wrap: anywhere;
+}
+
+.provision-backend small {
   grid-column: 1 / -1;
   color: var(--muted);
 }

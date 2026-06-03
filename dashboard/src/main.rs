@@ -824,8 +824,28 @@ fn OrchestrationView(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView
                 }).unwrap_or_else(|| "tcp-changes telemetry peers".to_owned())
             />
         </div>
+        <ProvisionBackendList mesh />
         <ControlCommandHealth mesh />
         <TelemetryPeerList mesh />
+    }
+}
+
+#[component]
+fn ProvisionBackendList(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
+    view! {
+        <div class="provision-backend-list">
+            <For
+                each=move || mesh.get().map(|m| m.orchestration.provision.backend_statuses).unwrap_or_default()
+                key=|backend| backend.name.clone()
+                let(backend)
+            >
+                <div class=backend.class_name()>
+                    <strong>{backend.name.clone()}</strong>
+                    <span>{backend.state.clone()}</span>
+                    <small>{backend.details.join(" / ")}</small>
+                </div>
+            </For>
+        </div>
     }
 }
 
@@ -1686,6 +1706,28 @@ struct ProvisionStatus {
     backends: Vec<String>,
     #[serde(default)]
     timeout_ms: u64,
+    #[serde(default)]
+    backend_statuses: Vec<ProvisionBackendStatus>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ProvisionBackendStatus {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    details: Vec<String>,
+}
+
+impl ProvisionBackendStatus {
+    fn class_name(&self) -> &'static str {
+        match self.state.as_str() {
+            "ready" => "provision-backend ready",
+            "blocked" | "error" => "provision-backend blocked",
+            _ => "provision-backend warn",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
