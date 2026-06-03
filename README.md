@@ -14,6 +14,15 @@ RIST/SRT/RTMP input belongs in `../av-contrib`, which terminates those
 protocols, packages OBS-style media as fMP4/CMAF LL-HLS artifacts, and publishes
 only stream-addressed artifact bytes into the mesh FEC socket.
 
+Transport reliability stance: RaptorQ-FEC is the right live mesh hot path for
+bounded packet loss because it can repair without waiting for RTT. It is not a
+general replacement for RIST/SRT ARQ on arbitrary bad WAN paths. If loss exceeds
+the configured repair budget, FEC fails closed; RIST/SRT can still recover later
+by retransmitting from history if the latency budget allows. The mesh should
+therefore stay slot/artifact-native with RaptorQ for live propagation, but needs
+an explicit missing-slot repair/backfill path over TCP, QUIC, or a RIST-like ARQ
+channel before we claim RIST-class eventual reliability.
+
 The first implementation keeps the mesh transport intentionally small:
 
 - `playlists::mesh` provides UDP-FEC cache discovery and slot replication using
