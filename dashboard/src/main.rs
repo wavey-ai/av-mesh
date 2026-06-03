@@ -639,6 +639,7 @@ fn ContribView(contrib: ReadSignal<Option<ContribStatus>>) -> impl IntoView {
             </div>
             <ContribHlsResponses contrib />
             <ContribIngestSessions contrib />
+            <ContribProtocolRuntime contrib />
             <div class="listener-list">
                 <For
                     each=move || contrib.get().map(|c| c.listeners).unwrap_or_default()
@@ -665,6 +666,25 @@ fn ContribView(contrib: ReadSignal<Option<ContribStatus>>) -> impl IntoView {
                     </div>
                 </For>
             </div>
+        </div>
+    }
+}
+
+#[component]
+fn ContribProtocolRuntime(contrib: ReadSignal<Option<ContribStatus>>) -> impl IntoView {
+    view! {
+        <div class="protocol-list">
+            <For
+                each=move || contrib.get().map(|c| c.runtime.protocols).unwrap_or_default()
+                key=|protocol| protocol.protocol.clone()
+                let(protocol)
+            >
+                <div class=protocol.class_name()>
+                    <strong>{protocol.protocol.clone()}</strong>
+                    <span>{protocol.summary_text()}</span>
+                    <small>{protocol.meta_text()}</small>
+                </div>
+            </For>
         </div>
     }
 }
@@ -2967,6 +2987,8 @@ struct ContribRuntimeStatus {
     hls: HlsRuntime,
     #[serde(default)]
     ingest_sessions: IngestSessionsRuntime,
+    #[serde(default)]
+    protocols: Vec<ProtocolRuntime>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -3180,6 +3202,47 @@ struct IngestSessionsRuntime {
     ended: u64,
     #[serde(default)]
     recent: Vec<IngestSession>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ProtocolRuntime {
+    #[serde(default)]
+    protocol: String,
+    #[serde(default)]
+    units: u64,
+    #[serde(default)]
+    bytes: u64,
+    #[serde(default)]
+    active_sessions: usize,
+    #[serde(default)]
+    ended_sessions: usize,
+    #[serde(default)]
+    last_seen_age_ms: Option<u64>,
+}
+
+impl ProtocolRuntime {
+    fn class_name(&self) -> &'static str {
+        if self.active_sessions > 0 {
+            "protocol active"
+        } else if self.units > 0 || self.ended_sessions > 0 {
+            "protocol seen"
+        } else {
+            "protocol idle"
+        }
+    }
+
+    fn summary_text(&self) -> String {
+        format!("{} units / {}", self.units, format_bytes(self.bytes))
+    }
+
+    fn meta_text(&self) -> String {
+        format!(
+            "{} active / {} ended / {}",
+            self.active_sessions,
+            self.ended_sessions,
+            optional_age(self.last_seen_age_ms)
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

@@ -419,6 +419,7 @@ main {
 
 .listener-list,
 .ingest-session-list,
+.protocol-list,
 .provision-backend-list,
 .commands,
 .alert-list,
@@ -497,6 +498,42 @@ main {
 
 .ingest-session-list:empty {
   display: none;
+}
+
+.protocol-list:empty {
+  display: none;
+}
+
+.protocol {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 9px 10px;
+  background: #fff;
+}
+
+.protocol.active {
+  border-left: 4px solid var(--green);
+}
+
+.protocol.seen {
+  border-left: 4px solid var(--blue);
+}
+
+.protocol.idle {
+  border-left: 4px solid #94a3b8;
+}
+
+.protocol span,
+.protocol small {
+  overflow-wrap: anywhere;
+}
+
+.protocol small {
+  grid-column: 1 / -1;
+  color: var(--muted);
 }
 
 .ingest-session {
