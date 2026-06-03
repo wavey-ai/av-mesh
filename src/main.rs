@@ -5529,6 +5529,17 @@ mod tests {
         Bytes::from(out)
     }
 
+    fn deterministic_video_payload(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|index| {
+                let mixed = (index as u32)
+                    .wrapping_mul(1_103_515_245)
+                    .wrapping_add(12_345);
+                (mixed >> 16) as u8
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn playlist_uses_replicated_cache_parts() {
         let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
@@ -8093,6 +8104,308 @@ mod tests {
             unit.serialized.slice(MEDIA_FRAME_HEADER_LEN..),
             Bytes::from_static(b"fec-h264-access-unit")
         );
+
+        let _ = shutdown_tx.send(());
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn media_udp_fec_ingest_recovers_video_access_units_with_lost_datagrams() {
+        use raptorq_datagram_fec::{MediaFecEncoder, MediaFrame, NetworkMetrics};
+        use tokio::time::timeout;
+
+        struct LossyFrame {
+            sequence: u64,
+            pts_ms: u64,
+            payload_len: usize,
+            flags: MediaFrameFlags,
+            dropped_indexes: &'static [usize],
+        }
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind = socket.local_addr().unwrap();
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let task = tokio::spawn(run_udp_media_fec_ingest(
+            socket,
+            Arc::clone(&cache),
+            shutdown_rx,
+        ));
+
+        let mut encoder = MediaFecEncoder::default();
+        encoder
+            .controller_mut()
+            .update_network_metrics(NetworkMetrics {
+                loss_fraction: 0.08,
+                rtt_ms: 70.0,
+                jitter_ms: 25.0,
+                queue_delay_ms: 20.0,
+                available_bitrate_bps: Some(8_000_000),
+            });
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let frames = [
+            LossyFrame {
+                sequence: 10,
+                pts_ms: 1_000,
+                payload_len: 40_000,
+                flags: MediaFrameFlags::keyframe(),
+                dropped_indexes: &[3, 4, 5, 6, 7, 8, 9, 10],
+            },
+            LossyFrame {
+                sequence: 11,
+                pts_ms: 1_016,
+                payload_len: 18_000,
+                flags: MediaFrameFlags::default(),
+                dropped_indexes: &[2, 8, 12],
+            },
+            LossyFrame {
+                sequence: 12,
+                pts_ms: 1_032,
+                payload_len: 18_000,
+                flags: MediaFrameFlags::default(),
+                dropped_indexes: &[1, 5],
+            },
+        ];
+
+        for frame in &frames {
+            let payload = deterministic_video_payload(frame.payload_len);
+            let mut metadata =
+                MediaFrameMetadata::new(66, frame.sequence, frame.pts_ms, MediaCodec::H264);
+            metadata.duration_ms = 16;
+            metadata.flags = frame.flags;
+            let encoded = encoder
+                .encode_frame(MediaFrame {
+                    metadata,
+                    payload: &payload,
+                })
+                .unwrap();
+            assert!(
+                encoded.decision.config.repair_symbols as usize >= frame.dropped_indexes.len(),
+                "test loss must stay inside the repair budget for sequence {}",
+                frame.sequence
+            );
+
+            for (index, datagram) in encoded.datagrams.iter().enumerate() {
+                if frame.dropped_indexes.contains(&index) {
+                    continue;
+                }
+                sender.send_to(datagram, bind).await.unwrap();
+            }
+
+            let unit = timeout(Duration::from_secs(3), async {
+                loop {
+                    if let Some(unit) = cache.get_media_access_unit(66, frame.sequence).await {
+                        break unit;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+
+            assert_eq!(unit.metadata.codec, MediaCodec::H264);
+            assert_eq!(unit.metadata.sequence, frame.sequence);
+            assert_eq!(unit.metadata.pts_ms, frame.pts_ms);
+            assert_eq!(unit.metadata.duration_ms, 16);
+            assert_eq!(
+                &unit.serialized[MEDIA_FRAME_HEADER_LEN..],
+                payload.as_slice()
+            );
+        }
+
+        let _ = shutdown_tx.send(());
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn media_udp_fec_ingest_recovers_multiblock_video_stream_with_reordered_loss() {
+        use raptorq_datagram_fec::{
+            DatagramFecHeader, EncodedMediaFrame, MediaFecEncoder, MediaFrame, NetworkMetrics,
+        };
+        use tokio::time::timeout;
+
+        #[derive(Debug)]
+        struct StreamFrame {
+            sequence: u64,
+            pts_ms: u64,
+            payload_len: usize,
+            flags: MediaFrameFlags,
+            max_loss_per_block: usize,
+        }
+
+        #[derive(Debug)]
+        struct ScheduledDatagram {
+            ordinal: usize,
+            delay_ms: u64,
+            bytes: Vec<u8>,
+        }
+
+        fn bounded_source_loss(
+            encoded: &EncodedMediaFrame,
+            max_loss_per_block: usize,
+        ) -> HashSet<usize> {
+            let mut blocks = BTreeMap::<u32, (u16, Vec<usize>, usize)>::new();
+            for (datagram_index, datagram) in encoded.datagrams.iter().enumerate() {
+                let header =
+                    DatagramFecHeader::decode(datagram).expect("decode FEC datagram header");
+                let entry =
+                    blocks
+                        .entry(header.block_id)
+                        .or_insert((header.source_symbols, Vec::new(), 0));
+                assert_eq!(entry.0, header.source_symbols);
+                if entry.2 < usize::from(header.source_symbols) {
+                    entry.1.push(datagram_index);
+                }
+                entry.2 += 1;
+            }
+
+            let mut dropped = HashSet::new();
+            assert_eq!(blocks.len(), usize::from(encoded.fragment_count));
+            for (_block_id, (source_symbols, source_indices, datagram_count)) in blocks {
+                let source_symbols = usize::from(source_symbols);
+                let repair_symbols = datagram_count.saturating_sub(source_symbols);
+                let drop_count = repair_symbols.min(max_loss_per_block);
+                assert!(drop_count > 0, "test frame should have repair symbols");
+                dropped.extend(source_indices.into_iter().take(drop_count));
+            }
+            dropped
+        }
+
+        fn reorder_delay_ms(ordinal: usize) -> u64 {
+            match ordinal % 11 {
+                0 => 8,
+                3 => 5,
+                7 => 2,
+                _ => 0,
+            }
+        }
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind = socket.local_addr().unwrap();
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 256).await;
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let task = tokio::spawn(run_udp_media_fec_ingest(
+            socket,
+            Arc::clone(&cache),
+            shutdown_rx,
+        ));
+
+        let frames = [
+            StreamFrame {
+                sequence: 100,
+                pts_ms: 2_000,
+                payload_len: 96_000,
+                flags: MediaFrameFlags::keyframe(),
+                max_loss_per_block: 4,
+            },
+            StreamFrame {
+                sequence: 101,
+                pts_ms: 2_016,
+                payload_len: 18_000,
+                flags: MediaFrameFlags::default(),
+                max_loss_per_block: 2,
+            },
+            StreamFrame {
+                sequence: 102,
+                pts_ms: 2_032,
+                payload_len: 40_000,
+                flags: MediaFrameFlags::keyframe(),
+                max_loss_per_block: 3,
+            },
+            StreamFrame {
+                sequence: 103,
+                pts_ms: 2_048,
+                payload_len: 9_000,
+                flags: MediaFrameFlags::default(),
+                max_loss_per_block: 1,
+            },
+        ];
+
+        let mut encoder = MediaFecEncoder::default();
+        encoder
+            .controller_mut()
+            .update_network_metrics(NetworkMetrics {
+                loss_fraction: 0.08,
+                rtt_ms: 70.0,
+                jitter_ms: 25.0,
+                queue_delay_ms: 20.0,
+                available_bitrate_bps: Some(8_000_000),
+            });
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut expected_payloads = BTreeMap::new();
+        let mut scheduled = Vec::new();
+        let mut ordinal = 0usize;
+        let mut dropped_datagrams = 0usize;
+
+        for frame in &frames {
+            let payload = deterministic_video_payload(frame.payload_len);
+            let mut metadata =
+                MediaFrameMetadata::new(66, frame.sequence, frame.pts_ms, MediaCodec::H264);
+            metadata.duration_ms = 16;
+            metadata.flags = frame.flags;
+            let encoded = encoder
+                .encode_frame(MediaFrame {
+                    metadata,
+                    payload: &payload,
+                })
+                .unwrap();
+            assert!(
+                encoded.fragment_count > 1 || frame.payload_len < 64_000,
+                "large access units should exercise multi-block frame reconstruction"
+            );
+            let dropped = bounded_source_loss(&encoded, frame.max_loss_per_block);
+            dropped_datagrams += dropped.len();
+
+            for (index, datagram) in encoded.datagrams.into_iter().enumerate() {
+                if dropped.contains(&index) {
+                    continue;
+                }
+                scheduled.push(ScheduledDatagram {
+                    ordinal,
+                    delay_ms: reorder_delay_ms(ordinal),
+                    bytes: datagram,
+                });
+                ordinal += 1;
+            }
+            expected_payloads.insert(frame.sequence, payload);
+        }
+
+        assert!(
+            dropped_datagrams >= 8,
+            "test should exercise repeated datagram loss"
+        );
+        scheduled.sort_by_key(|datagram| (datagram.delay_ms, datagram.ordinal));
+        for datagram in scheduled {
+            if datagram.delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(datagram.delay_ms)).await;
+            }
+            sender.send_to(&datagram.bytes, bind).await.unwrap();
+        }
+
+        for frame in &frames {
+            let unit = timeout(Duration::from_secs(3), async {
+                loop {
+                    if let Some(unit) = cache.get_media_access_unit(66, frame.sequence).await {
+                        break unit;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let expected_payload = expected_payloads
+                .get(&frame.sequence)
+                .expect("expected payload for frame");
+
+            assert_eq!(unit.metadata.codec, MediaCodec::H264);
+            assert_eq!(unit.metadata.sequence, frame.sequence);
+            assert_eq!(unit.metadata.pts_ms, frame.pts_ms);
+            assert_eq!(unit.metadata.duration_ms, 16);
+            assert_eq!(
+                &unit.serialized[MEDIA_FRAME_HEADER_LEN..],
+                expected_payload.as_slice()
+            );
+        }
 
         let _ = shutdown_tx.send(());
         task.await.unwrap().unwrap();
