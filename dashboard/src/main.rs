@@ -840,7 +840,7 @@ fn ContribView(
                 <RuntimeCell label="errors" value=move || contrib.get().map(|c| c.runtime.fmp4.publish_errors.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} alerts", c.alerts.len())).unwrap_or_default() />
             </div>
             <ContribHlsResponses contrib />
-            <ContribStreamRuntime contrib />
+            <ContribStreamRuntime contrib rates />
             <ContribIngestSessions contrib />
             <ContribProtocolRuntime contrib rates />
             <div class="listener-list">
@@ -914,7 +914,10 @@ fn ContribProtocolRuntime(
 }
 
 #[component]
-fn ContribStreamRuntime(contrib: ReadSignal<Option<ContribStatus>>) -> impl IntoView {
+fn ContribStreamRuntime(
+    contrib: ReadSignal<Option<ContribStatus>>,
+    rates: ReadSignal<ContribRateSnapshot>,
+) -> impl IntoView {
     view! {
         <Show when=move || {
             contrib
@@ -924,21 +927,31 @@ fn ContribStreamRuntime(contrib: ReadSignal<Option<ContribStatus>>) -> impl Into
         }>
             <div class="table compact contrib-stream-table">
                 <div class="table-head contrib-stream-row">
-                    <span>"stream"</span><span>"state"</span><span>"input"</span><span>"mesh"</span><span>"fmp4"</span><span>"seen"</span>
+                    <span>"stream"</span><span>"state"</span><span>"input"</span><span>"mesh"</span><span>"fmp4"</span><span>"rate"</span><span>"seen"</span>
                 </div>
                 <For
                     each=move || contrib.get().map(|c| c.runtime.streams).unwrap_or_default()
                     key=|stream| stream.stream_id_text.clone()
                     let(stream)
                 >
-                    <div class=stream.class_name()>
-                        <span>{stream.display_stream_id()}</span>
-                        <span>{stream.state.clone()}</span>
-                        <span>{stream.input_text()}</span>
-                        <span>{stream.mesh_text()}</span>
-                        <span>{stream.fmp4_text()}</span>
-                        <span>{stream.age_text()}</span>
-                    </div>
+                    {
+                        let rate_key = stream.rate_key();
+                        let rate_stream = stream.clone();
+                        view! {
+                            <div class=stream.class_name()>
+                                <span>{stream.display_stream_id()}</span>
+                                <span>{stream.state.clone()}</span>
+                                <span>{stream.input_text()}</span>
+                                <span>{stream.mesh_text()}</span>
+                                <span>{stream.fmp4_text()}</span>
+                                <span>{move || {
+                                    let rate = rates.get().streams.get(&rate_key).copied();
+                                    rate_stream.rate_text(rate)
+                                }}</span>
+                                <span>{stream.age_text()}</span>
+                            </div>
+                        }
+                    }
                 </For>
             </div>
         </Show>
@@ -3366,6 +3379,7 @@ struct ContribRateSample {
     input_datagrams: u64,
     output_bytes: u64,
     output_parts: u64,
+    streams: HashMap<String, ContribStreamRateCounters>,
     protocols: HashMap<String, ProtocolRateCounters>,
 }
 
@@ -3387,6 +3401,25 @@ impl ContribRateSample {
                 .saturating_add(snapshot.runtime.media_access_units.datagrams),
             output_bytes: snapshot.runtime.fmp4.bytes,
             output_parts: snapshot.runtime.fmp4.parts,
+            streams: snapshot
+                .runtime
+                .streams
+                .iter()
+                .map(|stream| {
+                    (
+                        stream.rate_key(),
+                        ContribStreamRateCounters {
+                            input_units: stream.input_units,
+                            input_bytes: stream.input_bytes,
+                            mesh_payloads: stream.mesh_payloads,
+                            mesh_payload_bytes: stream.mesh_payload_bytes,
+                            mesh_datagram_bytes: stream.mesh_datagram_bytes,
+                            fmp4_parts: stream.fmp4_parts,
+                            fmp4_bytes: stream.fmp4_bytes,
+                        },
+                    )
+                })
+                .collect(),
             protocols: snapshot
                 .runtime
                 .protocols
@@ -3402,6 +3435,88 @@ impl ContribRateSample {
                 })
                 .collect(),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ContribStreamRateCounters {
+    input_units: u64,
+    input_bytes: u64,
+    mesh_payloads: u64,
+    mesh_payload_bytes: u64,
+    mesh_datagram_bytes: u64,
+    fmp4_parts: u64,
+    fmp4_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ContribStreamRateSnapshot {
+    ready: bool,
+    window_ms: u64,
+    input_units_per_sec: f64,
+    input_bytes_per_sec: f64,
+    mesh_payloads_per_sec: f64,
+    mesh_payload_bytes_per_sec: f64,
+    mesh_datagram_bytes_per_sec: f64,
+    fmp4_parts_per_sec: f64,
+    fmp4_bytes_per_sec: f64,
+}
+
+impl ContribStreamRateSnapshot {
+    fn from_delta(
+        previous: ContribStreamRateCounters,
+        current: ContribStreamRateCounters,
+        window_ms: u64,
+    ) -> Self {
+        Self {
+            ready: window_ms >= 250,
+            window_ms,
+            input_units_per_sec: counter_rate(previous.input_units, current.input_units, window_ms),
+            input_bytes_per_sec: counter_rate(previous.input_bytes, current.input_bytes, window_ms),
+            mesh_payloads_per_sec: counter_rate(
+                previous.mesh_payloads,
+                current.mesh_payloads,
+                window_ms,
+            ),
+            mesh_payload_bytes_per_sec: counter_rate(
+                previous.mesh_payload_bytes,
+                current.mesh_payload_bytes,
+                window_ms,
+            ),
+            mesh_datagram_bytes_per_sec: counter_rate(
+                previous.mesh_datagram_bytes,
+                current.mesh_datagram_bytes,
+                window_ms,
+            ),
+            fmp4_parts_per_sec: counter_rate(previous.fmp4_parts, current.fmp4_parts, window_ms),
+            fmp4_bytes_per_sec: counter_rate(previous.fmp4_bytes, current.fmp4_bytes, window_ms),
+        }
+    }
+
+    fn text(&self) -> String {
+        if !self.ready {
+            return "rate waiting".to_owned();
+        }
+        format!(
+            "in {} / mesh {} / fmp4 {} / {}",
+            format_bytes_per_sec(true, self.input_bytes_per_sec),
+            format_bytes_per_sec(true, self.mesh_payload_bytes_per_sec),
+            format_bytes_per_sec(true, self.fmp4_bytes_per_sec),
+            format_rate_window(self.window_ms)
+        )
+    }
+
+    fn detail_text(&self) -> String {
+        if !self.ready {
+            return "waiting for second sample".to_owned();
+        }
+        format!(
+            "{} / {} / {} / wire {}",
+            format_count_per_sec(self.input_units_per_sec, "input units"),
+            format_count_per_sec(self.mesh_payloads_per_sec, "mesh payloads"),
+            format_count_per_sec(self.fmp4_parts_per_sec, "parts"),
+            format_bytes_per_sec(true, self.mesh_datagram_bytes_per_sec)
+        )
     }
 }
 
@@ -3442,6 +3557,7 @@ struct ContribRateSnapshot {
     input_datagrams_per_sec: f64,
     output_bytes_per_sec: f64,
     output_parts_per_sec: f64,
+    streams: HashMap<String, ContribStreamRateSnapshot>,
     protocols: HashMap<String, ProtocolRateSnapshot>,
 }
 
@@ -3469,6 +3585,17 @@ impl ContribRateSnapshot {
                 current.output_parts,
                 window_ms,
             ),
+            streams: current
+                .streams
+                .iter()
+                .map(|(stream, current)| {
+                    let previous = previous.streams.get(stream).copied().unwrap_or_default();
+                    (
+                        stream.clone(),
+                        ContribStreamRateSnapshot::from_delta(previous, *current, window_ms),
+                    )
+                })
+                .collect(),
             protocols: current
                 .protocols
                 .iter()
@@ -4926,6 +5053,10 @@ impl ContribStreamRuntime {
         }
     }
 
+    fn rate_key(&self) -> String {
+        self.stream_id_text.clone()
+    }
+
     fn input_text(&self) -> String {
         format!(
             "{} units / {}",
@@ -4969,6 +5100,19 @@ impl ContribStreamRuntime {
             parts.push(format!("{} errors", self.fmp4_publish_errors));
         }
         parts.join(" / ")
+    }
+
+    fn rate_text(&self, rate: Option<ContribStreamRateSnapshot>) -> String {
+        match rate {
+            Some(rate) => {
+                if rate.ready {
+                    format!("{} / {}", rate.text(), rate.detail_text())
+                } else {
+                    "rate waiting".to_owned()
+                }
+            }
+            None => "rate waiting".to_owned(),
+        }
     }
 
     fn age_text(&self) -> String {
