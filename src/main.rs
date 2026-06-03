@@ -1891,6 +1891,7 @@ struct MeshApiSnapshot {
     activity: Vec<MeshActivity>,
     telemetry: TelemetryHealthSnapshot,
     orchestration: OrchestrationStatus,
+    topology: TopologyConfidenceSnapshot,
     nodes: Vec<MeshNode>,
     edge_services: Vec<EdgeServiceSnapshot>,
     connections: Vec<ConnectionSnapshot>,
@@ -2086,6 +2087,37 @@ struct ConnectionSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     target_node_id: Option<String>,
     state: String,
+    private_target: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct TopologyConfidenceSnapshot {
+    connection_count: usize,
+    resolved_peer_count: usize,
+    unresolved_peer_count: usize,
+    private_peer_count: usize,
+    public_peer_count: usize,
+}
+
+impl TopologyConfidenceSnapshot {
+    fn from_connections(connections: &[ConnectionSnapshot]) -> Self {
+        let connection_count = connections.len();
+        let resolved_peer_count = connections
+            .iter()
+            .filter(|connection| connection.target_node_id.is_some())
+            .count();
+        let private_peer_count = connections
+            .iter()
+            .filter(|connection| connection.private_target)
+            .count();
+        Self {
+            connection_count,
+            resolved_peer_count,
+            unresolved_peer_count: connection_count.saturating_sub(resolved_peer_count),
+            private_peer_count,
+            public_peer_count: connection_count.saturating_sub(private_peer_count),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2766,6 +2798,7 @@ impl MeshApiSnapshot {
                 target_addr: peer.addr.clone(),
                 target_node_id: peer_addr_to_node_id.get(&peer.addr).cloned(),
                 state: peer.state.clone(),
+                private_target: is_private_mesh_target(&peer.addr),
             }));
             if snapshot.streams.is_empty() {
                 streams.push(StreamTelemetry::from_stats(
@@ -2794,6 +2827,7 @@ impl MeshApiSnapshot {
         });
         connections.dedup();
         aggregate.connection_count = connections.len();
+        let topology = TopologyConfidenceSnapshot::from_connections(&connections);
 
         let planned_replicas = planned_replicas
             .into_iter()
@@ -2829,6 +2863,7 @@ impl MeshApiSnapshot {
             activity,
             telemetry,
             orchestration,
+            topology,
             nodes,
             edge_services,
             connections,
@@ -2856,6 +2891,23 @@ fn annotate_stream_lag(streams: &mut [StreamTelemetry]) {
                 .map(|head| head.saturating_sub(part))
         });
     }
+}
+
+fn is_private_mesh_target(target: &str) -> bool {
+    let host = target
+        .rsplit_once('@')
+        .map(|(_, target)| target)
+        .unwrap_or(target)
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(target)
+        .trim_matches(['[', ']']);
+    host.parse::<std::net::IpAddr>()
+        .map(|addr| match addr {
+            std::net::IpAddr::V4(addr) => addr.is_private() || addr.is_loopback(),
+            std::net::IpAddr::V6(addr) => addr.is_loopback() || addr.is_unique_local(),
+        })
+        .unwrap_or(false)
 }
 
 fn derive_mesh_alerts(
@@ -6654,6 +6706,21 @@ mod tests {
 
         assert_eq!(connection.target_addr, "10.0.0.2:9100");
         assert_eq!(connection.target_node_id.as_deref(), Some("us-1"));
+        assert!(connection.private_target);
+        assert_eq!(aggregate.topology.connection_count, 2);
+        assert_eq!(aggregate.topology.resolved_peer_count, 2);
+        assert_eq!(aggregate.topology.unresolved_peer_count, 0);
+        assert_eq!(aggregate.topology.private_peer_count, 2);
+        assert_eq!(aggregate.topology.public_peer_count, 0);
+    }
+
+    #[test]
+    fn mesh_target_scope_classifies_private_addresses() {
+        assert!(is_private_mesh_target("10.0.0.2:9100"));
+        assert!(is_private_mesh_target("127.0.0.1:9100"));
+        assert!(is_private_mesh_target("[fd00::1]:9100"));
+        assert!(!is_private_mesh_target("203.0.113.10:9100"));
+        assert!(!is_private_mesh_target("mesh.example.com:9100"));
     }
 
     #[tokio::test]

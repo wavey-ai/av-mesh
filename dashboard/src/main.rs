@@ -1076,6 +1076,15 @@ fn TopologyTelemetryHealth(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl In
                 <span>{move || mesh.get().map(|snapshot| snapshot.telemetry.summary_text()).unwrap_or_else(|| "waiting".to_owned())}</span>
                 <small>{move || mesh.get().map(|snapshot| snapshot.telemetry.detail_text()).unwrap_or_else(|| "mesh topology telemetry unavailable".to_owned())}</small>
             </div>
+            <div class=move || {
+                mesh.get()
+                    .map(|snapshot| snapshot.topology.class_name())
+                    .unwrap_or("topology-health-card waiting")
+            }>
+                <strong>"links"</strong>
+                <span>{move || mesh.get().map(|snapshot| snapshot.topology.summary_text()).unwrap_or_else(|| "waiting".to_owned())}</span>
+                <small>{move || mesh.get().map(|snapshot| snapshot.topology.detail_text()).unwrap_or_else(|| "mesh links unavailable".to_owned())}</small>
+            </div>
             <For
                 each=move || mesh.get().map(|snapshot| snapshot.telemetry.stale_nodes).unwrap_or_default()
                 key=|node| node.node_id.clone()
@@ -1174,7 +1183,7 @@ fn ConnectionList(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
     view! {
         <div class="table compact">
             <div class="table-head connection-row">
-                <span>"source"</span><span>"target"</span><span>"state"</span>
+                <span>"source"</span><span>"target"</span><span>"scope"</span><span>"state"</span>
             </div>
             <For
                 each=move || mesh.get().map(|m| m.connections).unwrap_or_default()
@@ -1184,6 +1193,7 @@ fn ConnectionList(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
                 <div class="connection-row">
                     <span>{connection.source_node_id}</span>
                     <span>{connection.target_node_id.unwrap_or(connection.target_addr)}</span>
+                    <span>{if connection.private_target { "private" } else { "public" }}</span>
                     <span>{connection.state}</span>
                 </div>
             </For>
@@ -3713,6 +3723,8 @@ struct MeshApiSnapshot {
     #[serde(default)]
     orchestration: OrchestrationStatus,
     #[serde(default)]
+    topology: TopologyConfidence,
+    #[serde(default)]
     nodes: Vec<MeshNode>,
     #[serde(default)]
     edge_services: Vec<EdgeServiceSnapshot>,
@@ -3820,6 +3832,46 @@ impl TelemetryHealth {
         format!(
             "remote telemetry snapshots / stale after {}",
             format_duration_ms_plain(self.stale_after_ms)
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct TopologyConfidence {
+    #[serde(default)]
+    connection_count: usize,
+    #[serde(default)]
+    resolved_peer_count: usize,
+    #[serde(default)]
+    unresolved_peer_count: usize,
+    #[serde(default)]
+    private_peer_count: usize,
+    #[serde(default)]
+    public_peer_count: usize,
+}
+
+impl TopologyConfidence {
+    fn class_name(&self) -> &'static str {
+        if self.connection_count == 0 {
+            "topology-health-card waiting"
+        } else if self.unresolved_peer_count > 0 {
+            "topology-health-card warn"
+        } else {
+            "topology-health-card ready"
+        }
+    }
+
+    fn summary_text(&self) -> String {
+        format!(
+            "{}/{} resolved",
+            self.resolved_peer_count, self.connection_count
+        )
+    }
+
+    fn detail_text(&self) -> String {
+        format!(
+            "{} private / {} public / {} unresolved",
+            self.private_peer_count, self.public_peer_count, self.unresolved_peer_count
         )
     }
 }
@@ -4144,6 +4196,8 @@ struct ConnectionSnapshot {
     target_node_id: Option<String>,
     #[serde(default)]
     state: String,
+    #[serde(default)]
+    private_target: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

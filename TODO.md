@@ -39,8 +39,6 @@ All passed before this TODO was written.
   - Linode private IP/VLAN/DNS details when available
   - bootstrap command status if `--provision-command` is chained after Linode
 - Add explicit topology confidence:
-  - peer address resolved/unresolved counts
-  - private vs public peer address classification
   - stale telemetry node list in the graph, not only summary cards
 - Add contributor-to-mesh path drill-down:
   - map `av-contrib` output stream IDs to mesh stream replicas

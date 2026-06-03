@@ -921,7 +921,7 @@ main {
 }
 
 .connection-row {
-  grid-template-columns: minmax(120px, 1fr) minmax(160px, 1.2fr) 80px;
+  grid-template-columns: minmax(120px, 1fr) minmax(160px, 1.2fr) 70px 80px;
 }
 
 .plan-row {
