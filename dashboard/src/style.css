@@ -915,7 +915,7 @@ main {
 }
 
 .plan-row {
-  grid-template-columns: minmax(120px, 1fr) minmax(160px, 1fr) 80px;
+  grid-template-columns: minmax(120px, 0.8fr) minmax(150px, 1fr) minmax(170px, 1fr) 80px;
 }
 
 .local-stream {

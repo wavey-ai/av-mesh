@@ -1256,7 +1256,7 @@ fn ReplicaPlan(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
     view! {
         <div class="table compact">
             <div class="table-head plan-row">
-                <span>"planned stream"</span><span>"target"</span><span>"score"</span>
+                <span>"planned stream"</span><span>"target"</span><span>"reason"</span><span>"score"</span>
             </div>
             <For
                 each=move || mesh.get().map(|m| m.planned_replicas).unwrap_or_default()
@@ -1264,8 +1264,9 @@ fn ReplicaPlan(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
                 let(replica)
             >
                 <div class="plan-row">
-                    <span>{replica.stream_id_text}</span>
-                    <span>{replica.target_node_id}</span>
+                    <span>{replica.stream_id_text.clone()}</span>
+                    <span>{replica.target_node_id.clone()}</span>
+                    <span>{replica.reason_text()}</span>
                     <span>{format!("{:.2}", replica.score)}</span>
                 </div>
             </For>
@@ -4226,7 +4227,19 @@ struct ReplicaPlacementSnapshot {
     #[serde(default)]
     target_node_id: String,
     #[serde(default)]
+    reason_text: String,
+    #[serde(default)]
     score: f64,
+}
+
+impl ReplicaPlacementSnapshot {
+    fn reason_text(&self) -> String {
+        if self.reason_text.is_empty() {
+            "unspecified".to_owned()
+        } else {
+            self.reason_text.clone()
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

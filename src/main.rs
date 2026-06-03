@@ -1905,18 +1905,32 @@ struct ReplicaPlacementSnapshot {
     stream_id_text: String,
     target_node_id: String,
     reason: ReplicaReason,
+    reason_text: String,
     score: f64,
 }
 
 impl From<ReplicaPlacement> for ReplicaPlacementSnapshot {
     fn from(placement: ReplicaPlacement) -> Self {
+        let reason_text = replica_reason_text(&placement.reason);
         Self {
             stream_id: placement.stream_id,
             stream_id_text: stream_id_text(placement.stream_id),
             target_node_id: placement.target_node_id,
             reason: placement.reason,
+            reason_text,
             score: placement.score,
         }
+    }
+}
+
+fn replica_reason_text(reason: &ReplicaReason) -> String {
+    match reason {
+        ReplicaReason::BaselineRegion { region } => format!("baseline region {region}"),
+        ReplicaReason::BaselineContinent { continent } => {
+            format!("baseline continent {continent}")
+        }
+        ReplicaReason::DemandRegion { region } => format!("demand region {region}"),
+        ReplicaReason::DemandContinent { continent } => format!("demand continent {continent}"),
     }
 }
 
@@ -6822,7 +6836,8 @@ mod tests {
         let planned = json["planned_replicas"].as_array().unwrap();
         assert!(planned.iter().any(|placement| placement["stream_id"] == 1
             && placement["stream_id_text"] == "1"
-            && placement["target_node_id"] == "test-node"));
+            && placement["target_node_id"] == "test-node"
+            && placement["reason_text"] == "baseline continent test-continent"));
         mesh.shutdown();
     }
 
@@ -6866,6 +6881,7 @@ mod tests {
             placement["stream_id"] == 77
                 && placement["stream_id_text"] == "77"
                 && placement["target_node_id"] == "test-node"
+                && placement["reason_text"] == "baseline continent test-continent"
         }));
         assert!(json["streams"].as_array().unwrap().iter().any(|stream| {
             stream["node_id"] == "us-1"
