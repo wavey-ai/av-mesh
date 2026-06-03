@@ -1,9 +1,13 @@
+use std::{cell::RefCell, rc::Rc};
+
 use gloo_net::http::Request;
 use gloo_timers::callback::Interval;
 use leptos::{mount::mount_to_body, prelude::*};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
+use wasm_bindgen::{closure::Closure, JsCast, JsValue};
 use wasm_bindgen_futures::spawn_local;
+use web_sys::{Event, EventSource, MessageEvent};
 
 const DEFAULT_MESH_API: &str = "https://local.bitneedle.com:19444/api/mesh";
 const DEFAULT_CONTRIB_API: &str = "https://local.bitneedle.com:19443/api/status";
@@ -21,30 +25,48 @@ fn App() -> impl IntoView {
     let (mesh, set_mesh) = signal(None::<MeshApiSnapshot>);
     let (contrib, set_contrib) = signal(None::<ContribStatus>);
     let (status, set_status) = signal(String::from("starting"));
+    let (mesh_feed, set_mesh_feed) = signal(String::from("mesh feed starting"));
+    let (mesh_events_active, set_mesh_events_active) = signal(false);
     let (control_status, set_control_status) = signal(String::from("idle"));
     let (stream_id, set_stream_id) = signal(String::from("1"));
     let (region, set_region) = signal(String::new());
     let (node_id, set_node_id) = signal(String::new());
+    let mesh_event_handle = Rc::new(RefCell::new(None::<MeshEventHandle>));
 
     let refresh = move || {
         let mesh_url = mesh_api.get();
         let contrib_url = contrib_api.get();
-        set_status.set("refreshing".to_owned());
+        let poll_mesh = !mesh_events_active.get();
+        let feed = if poll_mesh { "polling" } else { "events" };
+        set_status.set(format!("refreshing / mesh {feed}"));
         spawn_local(async move {
-            let mesh_result = fetch_json::<MeshApiSnapshot>(&mesh_url).await;
+            let mesh_result = if poll_mesh {
+                Some(fetch_json::<MeshApiSnapshot>(&mesh_url).await)
+            } else {
+                None
+            };
             let contrib_result = fetch_json::<ContribStatus>(&contrib_url).await;
 
             match (mesh_result, contrib_result) {
-                (Ok(mesh_snapshot), Ok(contrib_status)) => {
+                (Some(Ok(mesh_snapshot)), Ok(contrib_status)) => {
                     set_mesh.set(Some(mesh_snapshot));
                     set_contrib.set(Some(contrib_status));
-                    set_status.set(format!("ok {}", short_clock()));
+                    set_mesh_feed.set(format!("mesh polling {}", short_clock()));
+                    set_status.set(format!("ok {} / mesh polling", short_clock()));
+                }
+                (None, Ok(contrib_status)) => {
+                    set_contrib.set(Some(contrib_status));
+                    set_status.set(format!("ok {} / mesh events", short_clock()));
                 }
                 (mesh_result, contrib_result) => {
                     let mut errors = Vec::new();
                     match mesh_result {
-                        Ok(mesh_snapshot) => set_mesh.set(Some(mesh_snapshot)),
-                        Err(error) => errors.push(format!("mesh: {error}")),
+                        Some(Ok(mesh_snapshot)) => {
+                            set_mesh.set(Some(mesh_snapshot));
+                            set_mesh_feed.set(format!("mesh polling {}", short_clock()));
+                        }
+                        Some(Err(error)) => errors.push(format!("mesh: {error}")),
+                        None => {}
                     }
                     match contrib_result {
                         Ok(contrib_status) => set_contrib.set(Some(contrib_status)),
@@ -56,6 +78,73 @@ fn App() -> impl IntoView {
         });
     };
 
+    let connect_mesh_events = {
+        let mesh_event_handle = mesh_event_handle.clone();
+        Rc::new(move || {
+            if let Some(handle) = mesh_event_handle.borrow_mut().take() {
+                handle.close();
+            }
+
+            let events_url = mesh_events_url(&mesh_api.get());
+            set_mesh_events_active.set(false);
+            set_mesh_feed.set(format!("mesh events connecting {}", short_clock()));
+
+            let source = match EventSource::new(&events_url) {
+                Ok(source) => source,
+                Err(error) => {
+                    set_mesh_feed.set(format!("mesh polling: {}", js_error_text(error)));
+                    return;
+                }
+            };
+
+            let event_url = events_url.clone();
+            let onmesh =
+                Closure::<dyn FnMut(MessageEvent)>::wrap(Box::new(move |event: MessageEvent| {
+                    let Some(data) = event.data().as_string() else {
+                        set_mesh_events_active.set(false);
+                        set_mesh_feed.set("mesh events: non-text payload".to_owned());
+                        return;
+                    };
+                    match serde_json::from_str::<MeshApiSnapshot>(&data) {
+                        Ok(snapshot) => {
+                            set_mesh.set(Some(snapshot));
+                            set_mesh_events_active.set(true);
+                            set_mesh_feed.set(format!("mesh events {}", short_clock()));
+                            set_status.set(format!("ok {} / mesh events", short_clock()));
+                        }
+                        Err(error) => {
+                            set_mesh_events_active.set(false);
+                            set_mesh_feed.set(format!("mesh events parse error: {error}"));
+                        }
+                    }
+                }));
+
+            if let Err(error) =
+                source.add_event_listener_with_callback("mesh", onmesh.as_ref().unchecked_ref())
+            {
+                source.close();
+                set_mesh_feed.set(format!("mesh polling: {}", js_error_text(error)));
+                return;
+            }
+
+            let onerror = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
+                set_mesh_events_active.set(false);
+                set_mesh_feed.set(format!(
+                    "mesh events reconnecting {} ({event_url})",
+                    short_clock()
+                ));
+            }));
+            source.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+
+            *mesh_event_handle.borrow_mut() = Some(MeshEventHandle {
+                source,
+                _onmesh: onmesh,
+                _onerror: onerror,
+            });
+        })
+    };
+
+    connect_mesh_events();
     refresh();
     Interval::new(2_000, refresh).forget();
 
@@ -78,7 +167,7 @@ fn App() -> impl IntoView {
                     <img class="brand-icon" src="/assets/wavey-goose.png" alt="" />
                     <div>
                         <h1>"av mission control"</h1>
-                        <p>{move || status.get()}</p>
+                        <p>{move || format!("{} / {}", status.get(), mesh_feed.get())}</p>
                     </div>
                 </div>
                 <div class="endpoint-grid">
@@ -96,7 +185,13 @@ fn App() -> impl IntoView {
                             on:input=move |event| set_contrib_api.set(event_target_value(&event))
                         />
                     </label>
-                    <button class="primary" on:click=move |_| refresh()>"Refresh"</button>
+                    <button class="primary" on:click={
+                        let connect_mesh_events = connect_mesh_events.clone();
+                        move |_| {
+                            connect_mesh_events();
+                            refresh();
+                        }
+                    }>"Refresh"</button>
                 </div>
             </header>
 
@@ -352,7 +447,7 @@ fn LocalStream(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
         <div class="local-stream">
             <span>{move || mesh.get().map(|m| format!("local stream {}", m.stream.stream_id_text)).unwrap_or_else(|| "local stream -".to_owned())}</span>
             <strong>{move || mesh.get().map(|m| format_bytes(m.stream.bytes_received)).unwrap_or_else(|| "-".to_owned())}</strong>
-            <em>{move || mesh.get().map(|m| format!("local {} / mesh {} / {} datagrams", optional_u64(m.stream.latest_local_part), optional_u64(m.stream.latest_mesh_part), m.stream.datagrams_received)).unwrap_or_default()}</em>
+            <em>{move || mesh.get().map(|m| format!("local {} / mesh {} / {} datagrams / snapshot {}", optional_u64(m.stream.latest_local_part), optional_u64(m.stream.latest_mesh_part), m.stream.datagrams_received, age_text(m.updated_unix_ms))).unwrap_or_default()}</em>
         </div>
     }
 }
@@ -481,6 +576,26 @@ async fn post_json(url: &str, body: &Value) -> Result<(), String> {
     }
 }
 
+struct MeshEventHandle {
+    source: EventSource,
+    _onmesh: Closure<dyn FnMut(MessageEvent)>,
+    _onerror: Closure<dyn FnMut(Event)>,
+}
+
+impl MeshEventHandle {
+    fn close(self) {
+        self.source.close();
+    }
+}
+
+fn mesh_events_url(mesh_api: &str) -> String {
+    let base = mesh_api
+        .split_once("/api/mesh")
+        .map(|(base, _)| base)
+        .unwrap_or(mesh_api.trim_end_matches('/'));
+    format!("{base}/api/mesh/events")
+}
+
 fn mesh_control_url(mesh_api: &str, action: &str) -> String {
     let base = mesh_api
         .split_once("/api/mesh")
@@ -515,6 +630,12 @@ fn endpoint_from_query(key: &str, fallback: &str) -> String {
                 .find_map(|part| part.strip_prefix(&prefix).map(ToOwned::to_owned))
         })
         .unwrap_or_else(|| fallback.to_owned())
+}
+
+fn js_error_text(value: JsValue) -> String {
+    value
+        .as_string()
+        .unwrap_or_else(|| format!("JavaScript error: {value:?}"))
 }
 
 fn enabled_listener_count(contrib: &ContribStatus) -> usize {
