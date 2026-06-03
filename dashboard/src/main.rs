@@ -422,7 +422,7 @@ fn App() -> impl IntoView {
                             <h2>"Controls"</h2>
                             <span>{move || control_status.get()}</span>
                         </div>
-                        <OrchestrationView mesh />
+                        <OrchestrationView mesh rates=mesh_rates />
                         <div class="control-grid">
                             <label>
                                 <span>"stream"</span>
@@ -987,7 +987,10 @@ fn ReplicaPlan(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
 }
 
 #[component]
-fn OrchestrationView(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
+fn OrchestrationView(
+    mesh: ReadSignal<Option<MeshApiSnapshot>>,
+    rates: ReadSignal<MeshRateSnapshot>,
+) -> impl IntoView {
     view! {
         <div class="orchestration-grid">
             <RuntimeCell
@@ -1023,14 +1026,13 @@ fn OrchestrationView(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView
                     format!("{connected}/{total}")
                 }).unwrap_or_else(|| "-".to_owned())
                 detail=move || mesh.get().map(|m| {
-                    let payloads = m.orchestration.telemetry_peers.iter().map(|peer| peer.payloads).sum::<u64>();
-                    format!("{payloads} tcp-changes payloads")
+                    data_hose_detail_text(&m.orchestration.telemetry_peers, &rates.get())
                 }).unwrap_or_else(|| "tcp-changes telemetry peers".to_owned())
             />
         </div>
         <ProvisionBackendList mesh />
         <ControlCommandHealth mesh />
-        <TelemetryPeerList mesh />
+        <TelemetryPeerList mesh rates />
     }
 }
 
@@ -1072,7 +1074,10 @@ fn ControlCommandHealth(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoV
 }
 
 #[component]
-fn TelemetryPeerList(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
+fn TelemetryPeerList(
+    mesh: ReadSignal<Option<MeshApiSnapshot>>,
+    rates: ReadSignal<MeshRateSnapshot>,
+) -> impl IntoView {
     view! {
         <div class="hose-list">
             <For
@@ -1080,11 +1085,23 @@ fn TelemetryPeerList(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView
                 key=|peer| peer.peer.clone()
                 let(peer)
             >
-                <div class=peer.class_name()>
-                    <strong>{peer.peer.clone()}</strong>
-                    <span>{peer.state.clone()}</span>
-                    <small>{peer.meta_text()}</small>
-                </div>
+                {
+                    let class_name = peer.class_name();
+                    let peer_label = peer.peer.clone();
+                    let peer_state = peer.state.clone();
+                    let peer_key = peer.peer.clone();
+                    let peer_for_meta = peer.clone();
+                    view! {
+                        <div class=class_name>
+                            <strong>{peer_label}</strong>
+                            <span>{peer_state}</span>
+                            <small>{move || {
+                                let rate = rates.get().telemetry_peers.get(&peer_key).copied();
+                                peer_for_meta.meta_text(rate)
+                            }}</small>
+                        </div>
+                    }
+                }
             </For>
         </div>
     }
@@ -2142,6 +2159,7 @@ struct MeshRateSample {
     bytes_received: u64,
     datagrams_received: u64,
     edges: HashMap<String, EdgeRateCounters>,
+    telemetry_peers: HashMap<String, TelemetryPeerRateCounters>,
 }
 
 impl MeshRateSample {
@@ -2173,6 +2191,22 @@ impl MeshRateSample {
                             responses_total: edge.responses_total,
                             response_errors: edge.response_errors,
                             response_not_found: edge.response_not_found,
+                        },
+                    )
+                })
+                .collect(),
+            telemetry_peers: snapshot
+                .orchestration
+                .telemetry_peers
+                .iter()
+                .map(|peer| {
+                    (
+                        peer.peer.clone(),
+                        TelemetryPeerRateCounters {
+                            payloads: peer.payloads,
+                            bytes: peer.bytes,
+                            connect_attempts: peer.connect_attempts,
+                            disconnects: peer.disconnects,
                         },
                     )
                 })
@@ -2268,6 +2302,67 @@ impl EdgeRateSnapshot {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct TelemetryPeerRateCounters {
+    payloads: u64,
+    bytes: u64,
+    connect_attempts: u64,
+    disconnects: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TelemetryPeerRateSnapshot {
+    ready: bool,
+    window_ms: u64,
+    payloads_per_sec: f64,
+    bytes_per_sec: f64,
+    connect_attempts_per_sec: f64,
+    disconnects_per_sec: f64,
+}
+
+impl TelemetryPeerRateSnapshot {
+    fn from_delta(
+        previous: TelemetryPeerRateCounters,
+        current: TelemetryPeerRateCounters,
+        window_ms: u64,
+    ) -> Self {
+        Self {
+            ready: window_ms >= 250,
+            window_ms,
+            payloads_per_sec: counter_rate(previous.payloads, current.payloads, window_ms),
+            bytes_per_sec: counter_rate(previous.bytes, current.bytes, window_ms),
+            connect_attempts_per_sec: counter_rate(
+                previous.connect_attempts,
+                current.connect_attempts,
+                window_ms,
+            ),
+            disconnects_per_sec: counter_rate(previous.disconnects, current.disconnects, window_ms),
+        }
+    }
+
+    fn traffic_text(&self) -> String {
+        if !self.ready {
+            return "rate waiting".to_owned();
+        }
+        format!(
+            "{} / {}",
+            format_bytes_per_sec(true, self.bytes_per_sec),
+            format_count_per_sec(self.payloads_per_sec, "payloads")
+        )
+    }
+
+    fn churn_text(&self) -> String {
+        if !self.ready {
+            return "churn waiting".to_owned();
+        }
+        format!(
+            "{} / {}",
+            format_count_per_sec(self.connect_attempts_per_sec, "connects"),
+            format_count_per_sec(self.disconnects_per_sec, "disconnects")
+        )
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct MeshRateSnapshot {
     ready: bool,
@@ -2275,6 +2370,7 @@ struct MeshRateSnapshot {
     bytes_per_sec: f64,
     datagrams_per_sec: f64,
     edges: HashMap<String, EdgeRateSnapshot>,
+    telemetry_peers: HashMap<String, TelemetryPeerRateSnapshot>,
 }
 
 impl MeshRateSnapshot {
@@ -2299,6 +2395,21 @@ impl MeshRateSnapshot {
                     (
                         node_id.clone(),
                         EdgeRateSnapshot::from_delta(previous, *current, window_ms),
+                    )
+                })
+                .collect(),
+            telemetry_peers: current
+                .telemetry_peers
+                .iter()
+                .map(|(peer, current)| {
+                    let previous = previous
+                        .telemetry_peers
+                        .get(peer)
+                        .copied()
+                        .unwrap_or_default();
+                    (
+                        peer.clone(),
+                        TelemetryPeerRateSnapshot::from_delta(previous, *current, window_ms),
                     )
                 })
                 .collect(),
@@ -2670,13 +2781,18 @@ impl TelemetryPeerStatus {
         }
     }
 
-    fn meta_text(&self) -> String {
+    fn meta_text(&self, rate: Option<TelemetryPeerRateSnapshot>) -> String {
         let mut parts = vec![
             format!("{} attempts", self.connect_attempts),
             format!("{} disconnects", self.disconnects),
             format!("{} payloads", self.payloads),
             format_bytes(self.bytes),
         ];
+        if let Some(rate) = rate.filter(|rate| rate.ready) {
+            parts.push(rate.traffic_text());
+            parts.push(rate.churn_text());
+            parts.push(format_rate_window(rate.window_ms));
+        }
         if self.last_payload_unix_ms.is_some() {
             parts.push(format!(
                 "last payload {}",
@@ -2693,6 +2809,36 @@ impl TelemetryPeerStatus {
         }
         parts.join(" / ")
     }
+}
+
+fn data_hose_detail_text(peers: &[TelemetryPeerStatus], rates: &MeshRateSnapshot) -> String {
+    let payloads = peers.iter().map(|peer| peer.payloads).sum::<u64>();
+    let bytes = peers.iter().map(|peer| peer.bytes).sum::<u64>();
+    if !rates.ready {
+        return format!(
+            "{} tcp-changes payloads / {} / waiting for rates",
+            payloads,
+            format_bytes(bytes)
+        );
+    }
+
+    let mut payloads_per_sec = 0.0;
+    let mut bytes_per_sec = 0.0;
+    let mut disconnects_per_sec = 0.0;
+    for rate in rates.telemetry_peers.values().filter(|rate| rate.ready) {
+        payloads_per_sec += rate.payloads_per_sec;
+        bytes_per_sec += rate.bytes_per_sec;
+        disconnects_per_sec += rate.disconnects_per_sec;
+    }
+
+    format!(
+        "{} tcp-changes payloads / {} / {} / {} / {}",
+        payloads,
+        format_bytes(bytes),
+        format_bytes_per_sec(true, bytes_per_sec),
+        format_count_per_sec(payloads_per_sec, "payloads"),
+        format_count_per_sec(disconnects_per_sec, "disconnects")
+    )
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
