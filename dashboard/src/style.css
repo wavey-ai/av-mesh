@@ -358,6 +358,7 @@ main {
 }
 
 .listener-list,
+.ingest-session-list,
 .commands,
 .alert-list,
 .activity-list,
@@ -416,6 +417,38 @@ main {
 
 .listener.on {
   border-left: 4px solid var(--green);
+}
+
+.ingest-session-list:empty {
+  display: none;
+}
+
+.ingest-session {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  gap: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 9px 10px;
+  background: #fff;
+}
+
+.ingest-session.active {
+  border-left: 4px solid var(--green);
+}
+
+.ingest-session.ended {
+  border-left: 4px solid #94a3b8;
+}
+
+.ingest-session span,
+.ingest-session small {
+  overflow-wrap: anywhere;
+}
+
+.ingest-session small {
+  grid-column: 1 / -1;
+  color: var(--muted);
 }
 
 .alert {

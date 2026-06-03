@@ -502,9 +502,11 @@ fn ContribView(contrib: ReadSignal<Option<ContribStatus>>) -> impl IntoView {
                 <RuntimeCell label="rtmp" value=move || contrib.get().map(|c| c.runtime.rtmp.access_units.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} / {}", format_bytes(c.runtime.rtmp.bytes), optional_age(c.runtime.rtmp.last_seen_age_ms))).unwrap_or_default() />
                 <RuntimeCell label="fmp4" value=move || contrib.get().map(|c| c.runtime.fmp4.parts.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} media / {} init / {}", format_bytes(c.runtime.fmp4.bytes), format_bytes(c.runtime.fmp4.init_bytes), optional_age(c.runtime.fmp4.last_publish_age_ms))).unwrap_or_default() />
                 <RuntimeCell label="hls" value=move || contrib.get().map(|c| c.runtime.hls.responses_total.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} errors / {} 404s / {}", c.runtime.hls.response_errors, c.runtime.hls.response_not_found, optional_age(c.runtime.hls.last_response_age_ms))).unwrap_or_default() />
+                <RuntimeCell label="sessions" value=move || contrib.get().map(|c| c.runtime.ingest_sessions.active.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} started / {} ended", c.runtime.ingest_sessions.started, c.runtime.ingest_sessions.ended)).unwrap_or_default() />
                 <RuntimeCell label="errors" value=move || contrib.get().map(|c| c.runtime.fmp4.publish_errors.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} alerts", c.alerts.len())).unwrap_or_default() />
             </div>
             <ContribHlsResponses contrib />
+            <ContribIngestSessions contrib />
             <div class="listener-list">
                 <For
                     each=move || contrib.get().map(|c| c.listeners).unwrap_or_default()
@@ -531,6 +533,25 @@ fn ContribView(contrib: ReadSignal<Option<ContribStatus>>) -> impl IntoView {
                     </div>
                 </For>
             </div>
+        </div>
+    }
+}
+
+#[component]
+fn ContribIngestSessions(contrib: ReadSignal<Option<ContribStatus>>) -> impl IntoView {
+    view! {
+        <div class="ingest-session-list">
+            <For
+                each=move || contrib.get().map(|c| c.runtime.ingest_sessions.recent).unwrap_or_default()
+                key=|session| session.key()
+                let(session)
+            >
+                <div class=session.class_name()>
+                    <strong>{format!("{} {}", session.protocol, session.state)}</strong>
+                    <span>{session.title_text()}</span>
+                    <small>{session.meta_text()}</small>
+                </div>
+            </For>
         </div>
     }
 }
@@ -2035,6 +2056,8 @@ struct ContribRuntimeStatus {
     fmp4: Fmp4Runtime,
     #[serde(default)]
     hls: HlsRuntime,
+    #[serde(default)]
+    ingest_sessions: IngestSessionsRuntime,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -2107,6 +2130,110 @@ struct HlsRuntime {
     last_response_age_ms: Option<u64>,
     #[serde(default)]
     recent_responses: Vec<ContribHlsResponse>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct IngestSessionsRuntime {
+    #[serde(default)]
+    active: usize,
+    #[serde(default)]
+    started: u64,
+    #[serde(default)]
+    ended: u64,
+    #[serde(default)]
+    recent: Vec<IngestSession>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct IngestSession {
+    #[serde(default)]
+    session_id: u64,
+    #[serde(default)]
+    protocol: String,
+    #[serde(default)]
+    stream_id_text: String,
+    #[serde(default)]
+    output_stream_id_text: Option<String>,
+    #[serde(default)]
+    output_stream_idx: Option<usize>,
+    #[serde(default)]
+    peer: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    started_unix_ms: u64,
+    #[serde(default)]
+    last_seen_unix_ms: u64,
+    #[serde(default)]
+    ended_unix_ms: Option<u64>,
+    #[serde(default)]
+    age_ms: u64,
+    #[serde(default)]
+    body_slots: u64,
+    #[serde(default)]
+    bytes: u64,
+    #[serde(default)]
+    access_units: u64,
+    #[serde(default)]
+    end_reason: Option<String>,
+}
+
+impl IngestSession {
+    fn key(&self) -> String {
+        format!(
+            "{}:{}:{}:{}:{}",
+            self.protocol, self.stream_id_text, self.session_id, self.last_seen_unix_ms, self.state
+        )
+    }
+
+    fn class_name(&self) -> &'static str {
+        if self.state == "active" {
+            "ingest-session active"
+        } else {
+            "ingest-session ended"
+        }
+    }
+
+    fn title_text(&self) -> String {
+        let stream = if let Some(output) = &self.output_stream_id_text {
+            format!("stream {} -> {}", self.stream_id_text, output)
+        } else {
+            format!("stream {}", self.stream_id_text)
+        };
+        match (&self.peer, &self.path) {
+            (Some(peer), Some(path)) => format!("{stream} / {peer} / {path}"),
+            (Some(peer), None) => format!("{stream} / {peer}"),
+            (None, Some(path)) => format!("{stream} / {path}"),
+            (None, None) => stream,
+        }
+    }
+
+    fn meta_text(&self) -> String {
+        let mut parts = vec![
+            format!("{} body slots", self.body_slots),
+            format!("{} access units", self.access_units),
+            format_bytes(self.bytes),
+            optional_age(Some(self.age_ms)),
+        ];
+        if let Some(idx) = self.output_stream_idx {
+            parts.push(format!("idx {idx}"));
+        }
+        if self.started_unix_ms != 0 {
+            parts.push(format!(
+                "started {}",
+                optional_unix_age(Some(self.started_unix_ms))
+            ));
+        }
+        if let Some(ended) = self.ended_unix_ms {
+            parts.push(format!("ended {}", optional_unix_age(Some(ended))));
+        }
+        if let Some(reason) = &self.end_reason {
+            parts.push(reason.clone());
+        }
+        parts.join(" / ")
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
