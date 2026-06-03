@@ -863,11 +863,20 @@ fn ContribView(
                     key=|alert| format!("{}:{}", alert.code, alert.message)
                     let(alert)
                 >
+                    {
+                        let advertised_stream_id = contrib
+                            .get()
+                            .map(|c| c.advertised_hls_stream_id)
+                            .unwrap_or_default();
+                        let meta = alert.meta_text(&advertised_stream_id);
+                        view! {
                     <div class=format!("alert {}", alert.level)>
                         <strong>{alert.code}</strong>
                         <span>{alert.message}</span>
-                        <small>{format!("{} seen / {}", alert.count, optional_unix_age(alert.last_seen_unix_ms))}</small>
+                        <small>{meta}</small>
                     </div>
+                        }
+                    }
                 </For>
             </div>
         </div>
@@ -2646,7 +2655,7 @@ fn build_incidents(
             source: "contrib".to_owned(),
             code: alert.code.clone(),
             message: alert.message.clone(),
-            detail: format!("stream {}", contrib.advertised_hls_stream_id),
+            detail: alert.target_detail_text(&contrib.advertised_hls_stream_id),
             count: alert.count.max(1),
             last_seen_unix_ms: alert.last_seen_unix_ms,
         }));
@@ -5448,4 +5457,35 @@ struct ContribAlert {
     count: u64,
     #[serde(default)]
     last_seen_unix_ms: Option<u64>,
+    #[serde(default)]
+    stream_id_text: Option<String>,
+    #[serde(default)]
+    protocol: Option<String>,
+}
+
+impl ContribAlert {
+    fn target_detail_text(&self, advertised_stream_id: &str) -> String {
+        let mut parts = Vec::new();
+        if let Some(protocol) = &self.protocol {
+            parts.push(format!("protocol {protocol}"));
+        }
+        if let Some(stream_id) = &self.stream_id_text {
+            parts.push(format!("stream {stream_id}"));
+        } else if !advertised_stream_id.is_empty() {
+            parts.push(format!("stream {advertised_stream_id}"));
+        }
+        parts.join(" / ")
+    }
+
+    fn meta_text(&self, advertised_stream_id: &str) -> String {
+        let mut parts = vec![
+            format!("{} seen", self.count),
+            optional_unix_age(self.last_seen_unix_ms),
+        ];
+        let target = self.target_detail_text(advertised_stream_id);
+        if !target.is_empty() {
+            parts.push(target);
+        }
+        parts.join(" / ")
+    }
 }
