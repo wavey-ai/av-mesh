@@ -15,6 +15,8 @@ use web_sys::{Event, EventSource, MessageEvent};
 
 const DEFAULT_MESH_API: &str = "https://local.bitneedle.com:19444/api/mesh";
 const DEFAULT_CONTRIB_API: &str = "https://local.bitneedle.com:19443/api/status";
+const DASHBOARD_FEED_MISSING_GRACE_MS: u64 = 5_000;
+const DASHBOARD_SNAPSHOT_STALE_MS: u64 = 10_000;
 
 fn main() {
     console_error_panic_hook::set_once();
@@ -23,6 +25,7 @@ fn main() {
 
 #[component]
 fn App() -> impl IntoView {
+    let dashboard_started_unix_ms = now_unix_ms();
     let (mesh_api, set_mesh_api) = signal(endpoint_from_query("mesh", DEFAULT_MESH_API));
     let (contrib_api, set_contrib_api) =
         signal(endpoint_from_query("contrib", DEFAULT_CONTRIB_API));
@@ -342,18 +345,35 @@ fn App() -> impl IntoView {
                             let mesh_snapshot = mesh.get();
                             let contrib_status = contrib.get();
                             let probes = playback_probes.get();
-                            incident_count_text(&mesh_snapshot, &contrib_status, &probes)
+                            let feed = DashboardFeedHealth::new(
+                                dashboard_started_unix_ms,
+                                mesh_events_active.get(),
+                                contrib_events_active.get(),
+                            );
+                            incident_count_text(&mesh_snapshot, &contrib_status, &probes, feed)
                         }
                         detail=move || {
                             let mesh_snapshot = mesh.get();
                             let contrib_status = contrib.get();
                             let probes = playback_probes.get();
-                            incident_detail_text(&mesh_snapshot, &contrib_status, &probes)
+                            let feed = DashboardFeedHealth::new(
+                                dashboard_started_unix_ms,
+                                mesh_events_active.get(),
+                                contrib_events_active.get(),
+                            );
+                            incident_detail_text(&mesh_snapshot, &contrib_status, &probes, feed)
                         }
                     />
                 </section>
 
-                <IncidentRollup mesh contrib probes=playback_probes />
+                <IncidentRollup
+                    mesh
+                    contrib
+                    probes=playback_probes
+                    started_unix_ms=dashboard_started_unix_ms
+                    mesh_events_active
+                    contrib_events_active
+                />
 
                 <div class="workspace">
                     <section class="panel map-panel">
@@ -474,6 +494,9 @@ fn IncidentRollup(
     mesh: ReadSignal<Option<MeshApiSnapshot>>,
     contrib: ReadSignal<Option<ContribStatus>>,
     probes: ReadSignal<PlaybackProbeState>,
+    started_unix_ms: u64,
+    mesh_events_active: ReadSignal<bool>,
+    contrib_events_active: ReadSignal<bool>,
 ) -> impl IntoView {
     view! {
         <section class="band incident-rollup">
@@ -483,7 +506,12 @@ fn IncidentRollup(
                     let mesh_snapshot = mesh.get();
                     let contrib_status = contrib.get();
                     let probes = probes.get();
-                    incident_detail_text(&mesh_snapshot, &contrib_status, &probes)
+                    let feed = DashboardFeedHealth::new(
+                        started_unix_ms,
+                        mesh_events_active.get(),
+                        contrib_events_active.get(),
+                    );
+                    incident_detail_text(&mesh_snapshot, &contrib_status, &probes, feed)
                 }}</span>
             </div>
             <div class="incident-list">
@@ -492,7 +520,12 @@ fn IncidentRollup(
                         let mesh_snapshot = mesh.get();
                         let contrib_status = contrib.get();
                         let probes = probes.get();
-                        build_incidents(&mesh_snapshot, &contrib_status, &probes)
+                        let feed = DashboardFeedHealth::new(
+                            started_unix_ms,
+                            mesh_events_active.get(),
+                            contrib_events_active.get(),
+                        );
+                        build_incidents(&mesh_snapshot, &contrib_status, &probes, feed)
                             .into_iter()
                             .take(12)
                             .collect::<Vec<_>>()
@@ -512,13 +545,23 @@ fn IncidentRollup(
                 let mesh_snapshot = mesh.get();
                 let contrib_status = contrib.get();
                 let probes = probes.get();
-                build_incidents(&mesh_snapshot, &contrib_status, &probes).is_empty()
+                let feed = DashboardFeedHealth::new(
+                    started_unix_ms,
+                    mesh_events_active.get(),
+                    contrib_events_active.get(),
+                );
+                build_incidents(&mesh_snapshot, &contrib_status, &probes, feed).is_empty()
             }>
                 <p class="incident-empty">{move || {
                     let mesh_snapshot = mesh.get();
                     let contrib_status = contrib.get();
                     let probes = probes.get();
-                    incident_empty_text(&mesh_snapshot, &contrib_status, &probes)
+                    let feed = DashboardFeedHealth::new(
+                        started_unix_ms,
+                        mesh_events_active.get(),
+                        contrib_events_active.get(),
+                    );
+                    incident_empty_text(&mesh_snapshot, &contrib_status, &probes, feed)
                 }}</p>
             </Show>
         </section>
@@ -1580,6 +1623,23 @@ impl PlaylistProbe {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DashboardFeedHealth {
+    started_unix_ms: u64,
+    mesh_events_active: bool,
+    contrib_events_active: bool,
+}
+
+impl DashboardFeedHealth {
+    fn new(started_unix_ms: u64, mesh_events_active: bool, contrib_events_active: bool) -> Self {
+        Self {
+            started_unix_ms,
+            mesh_events_active,
+            contrib_events_active,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Incident {
     level: String,
@@ -1614,8 +1674,24 @@ fn build_incidents(
     mesh: &Option<MeshApiSnapshot>,
     contrib: &Option<ContribStatus>,
     probes: &PlaybackProbeState,
+    feed: DashboardFeedHealth,
 ) -> Vec<Incident> {
     let mut incidents = Vec::new();
+
+    push_dashboard_feed_incidents(
+        &mut incidents,
+        "mesh",
+        mesh.as_ref().map(|snapshot| snapshot.updated_unix_ms),
+        feed.mesh_events_active,
+        feed.started_unix_ms,
+    );
+    push_dashboard_feed_incidents(
+        &mut incidents,
+        "contrib",
+        contrib.as_ref().map(|snapshot| snapshot.updated_unix_ms),
+        feed.contrib_events_active,
+        feed.started_unix_ms,
+    );
 
     if let Some(mesh) = mesh {
         incidents.extend(mesh.alerts.iter().map(|alert| Incident {
@@ -1676,18 +1752,22 @@ fn incident_count_text(
     mesh: &Option<MeshApiSnapshot>,
     contrib: &Option<ContribStatus>,
     probes: &PlaybackProbeState,
+    feed: DashboardFeedHealth,
 ) -> String {
-    build_incidents(mesh, contrib, probes).len().to_string()
+    build_incidents(mesh, contrib, probes, feed)
+        .len()
+        .to_string()
 }
 
 fn incident_detail_text(
     mesh: &Option<MeshApiSnapshot>,
     contrib: &Option<ContribStatus>,
     probes: &PlaybackProbeState,
+    feed: DashboardFeedHealth,
 ) -> String {
-    let incidents = build_incidents(mesh, contrib, probes);
+    let incidents = build_incidents(mesh, contrib, probes, feed);
     if incidents.is_empty() {
-        return incident_empty_text(mesh, contrib, probes);
+        return incident_empty_text(mesh, contrib, probes, feed);
     }
     let errors = incidents
         .iter()
@@ -1708,11 +1788,71 @@ fn incident_empty_text(
     mesh: &Option<MeshApiSnapshot>,
     contrib: &Option<ContribStatus>,
     probes: &PlaybackProbeState,
+    feed: DashboardFeedHealth,
 ) -> String {
-    if mesh.is_none() && contrib.is_none() && probes.probes.is_empty() {
+    let waiting_for_grace =
+        now_unix_ms().saturating_sub(feed.started_unix_ms) < DASHBOARD_FEED_MISSING_GRACE_MS;
+    if waiting_for_grace && mesh.is_none() && contrib.is_none() && probes.probes.is_empty() {
         "waiting for feeds".to_owned()
     } else {
         "no active incidents".to_owned()
+    }
+}
+
+fn push_dashboard_feed_incidents(
+    incidents: &mut Vec<Incident>,
+    source: &'static str,
+    updated_unix_ms: Option<u64>,
+    events_active: bool,
+    started_unix_ms: u64,
+) {
+    let now = now_unix_ms();
+    let since_start = now.saturating_sub(started_unix_ms);
+    match nonzero_u64(updated_unix_ms.unwrap_or_default()) {
+        Some(updated) => {
+            let age_ms = now.saturating_sub(updated);
+            if age_ms > DASHBOARD_SNAPSHOT_STALE_MS {
+                incidents.push(Incident {
+                    level: "error".to_owned(),
+                    source: source.to_owned(),
+                    code: format!("{source}_feed_stale"),
+                    message: format!(
+                        "{source} status data has not updated for {}.",
+                        format_duration_ms_plain(age_ms)
+                    ),
+                    detail: format!("last snapshot {}", age_text(updated)),
+                    count: 1,
+                    last_seen_unix_ms: Some(updated),
+                });
+            } else if !events_active && since_start > DASHBOARD_FEED_MISSING_GRACE_MS {
+                incidents.push(Incident {
+                    level: "warn".to_owned(),
+                    source: source.to_owned(),
+                    code: format!("{source}_events_inactive"),
+                    message: format!(
+                        "{source} SSE data hose is inactive; dashboard is relying on HTTP polling."
+                    ),
+                    detail: format!("last snapshot {}", age_text(updated)),
+                    count: 1,
+                    last_seen_unix_ms: Some(now),
+                });
+            }
+        }
+        None if since_start > DASHBOARD_FEED_MISSING_GRACE_MS => {
+            incidents.push(Incident {
+                level: "error".to_owned(),
+                source: source.to_owned(),
+                code: format!("{source}_feed_missing"),
+                message: format!("{source} status feed has not delivered an initial snapshot."),
+                detail: format!(
+                    "dashboard waiting {}",
+                    format_duration_ms_plain(since_start)
+                ),
+                count: 1,
+                last_seen_unix_ms: Some(started_unix_ms),
+            });
+        }
+        None => {}
     }
 }
 
