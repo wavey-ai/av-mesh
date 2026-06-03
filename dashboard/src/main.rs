@@ -18,6 +18,7 @@ const DEFAULT_MESH_API: &str = "https://local.bitneedle.com:19444/api/mesh";
 const DEFAULT_CONTRIB_API: &str = "https://local.bitneedle.com:19443/api/status";
 const DASHBOARD_FEED_MISSING_GRACE_MS: u64 = 5_000;
 const DASHBOARD_SNAPSHOT_STALE_MS: u64 = 10_000;
+const MESH_STREAM_LAG_WARN_PARTS: u64 = 6;
 
 fn main() {
     console_error_panic_hook::set_once();
@@ -1219,7 +1220,7 @@ fn StreamTable(
     view! {
         <div class="table">
             <div class="table-head stream-row">
-                <span>"stream"</span><span>"node"</span><span>"state"</span><span>"local"</span><span>"mesh"</span><span>"age"</span><span>"bytes"</span><span>"rate"</span>
+                <span>"stream"</span><span>"node"</span><span>"state"</span><span>"local"</span><span>"mesh"</span><span>"lag"</span><span>"age"</span><span>"bytes"</span><span>"rate"</span>
             </div>
             <For
                 each=move || mesh.get().map(|m| m.streams).unwrap_or_default()
@@ -1237,6 +1238,7 @@ fn StreamTable(
                             <span>{stream.status_text()}</span>
                             <span>{optional_u64(stream.latest_local_part)}</span>
                             <span>{optional_u64(stream.latest_mesh_part)}</span>
+                            <span>{stream.lag_text()}</span>
                             <span>{stream.age_text()}</span>
                             <span>{format_bytes(stream.bytes_received)}</span>
                             <span>{move || {
@@ -4141,6 +4143,8 @@ struct StreamTelemetry {
     #[serde(default)]
     latest_mesh_part: Option<u64>,
     #[serde(default)]
+    mesh_lag_parts: Option<u64>,
+    #[serde(default)]
     bytes_received: u64,
     #[serde(default)]
     datagrams_received: u64,
@@ -4174,9 +4178,16 @@ impl StreamTelemetry {
                 .is_some_and(|age_ms| age_ms > self.stale_threshold_ms.unwrap_or(5_000))
     }
 
+    fn lagging(&self) -> bool {
+        self.mesh_lag_parts
+            .is_some_and(|lag| lag > MESH_STREAM_LAG_WARN_PARTS)
+    }
+
     fn status_text(&self) -> &'static str {
         if self.stale() {
             "stale"
+        } else if self.lagging() {
+            "lagging"
         } else if self.last_ingest_age_ms.is_some() {
             "active"
         } else if self.latest_mesh_part.is_some() {
@@ -4189,9 +4200,18 @@ impl StreamTelemetry {
     fn class_name(&self) -> &'static str {
         match self.status_text() {
             "stale" => "stream-row stale",
+            "lagging" => "stream-row lagging",
             "active" => "stream-row active",
             "mirrored" => "stream-row mirrored",
             _ => "stream-row",
+        }
+    }
+
+    fn lag_text(&self) -> String {
+        match self.mesh_lag_parts {
+            Some(0) => "head".to_owned(),
+            Some(lag) => format!("{lag} parts"),
+            None => "-".to_owned(),
         }
     }
 

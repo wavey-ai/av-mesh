@@ -74,6 +74,7 @@ const RAW_MESH_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MESH_STORAGE_WARN_PCT: u64 = 85;
 const MESH_STORAGE_ERROR_PCT: u64 = 95;
 const MESH_MIN_STALE_INGEST_ALERT_MS: u64 = 5_000;
+const MESH_STREAM_LAG_WARN_PARTS: u64 = 6;
 const MESH_ACTIVITY_LIMIT: usize = 64;
 const EDGE_RECENT_RESPONSE_LIMIT: usize = 32;
 
@@ -1679,6 +1680,7 @@ impl LiveTsCache {
                     default_stats.part_target_ms,
                     default_stats.window_parts,
                 )),
+                mesh_lag_parts: None,
             });
         }
         streams.sort_by_key(|stream| stream.stream_id);
@@ -2248,6 +2250,8 @@ struct StreamTelemetry {
     last_ingest_age_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stale_threshold_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mesh_lag_parts: Option<u64>,
 }
 
 impl StreamTelemetry {
@@ -2268,6 +2272,7 @@ impl StreamTelemetry {
                 stats.part_target_ms,
                 stats.window_parts,
             )),
+            mesh_lag_parts: None,
         }
     }
 
@@ -2283,6 +2288,15 @@ impl StreamTelemetry {
                         .stale_threshold_ms
                         .unwrap_or(MESH_MIN_STALE_INGEST_ALERT_MS)
             })
+    }
+
+    fn latest_observed_part(&self) -> Option<u64> {
+        self.latest_local_part.max(self.latest_mesh_part)
+    }
+
+    fn lagging(&self) -> bool {
+        self.mesh_lag_parts
+            .is_some_and(|lag| lag > MESH_STREAM_LAG_WARN_PARTS)
     }
 }
 
@@ -2702,6 +2716,8 @@ impl MeshApiSnapshot {
             nodes.push(snapshot.node);
         }
 
+        annotate_stream_lag(&mut streams);
+
         connections.sort_by(|left, right| {
             left.source_node_id
                 .cmp(&right.source_node_id)
@@ -2749,6 +2765,27 @@ impl MeshApiSnapshot {
             connections,
             streams,
         }
+    }
+}
+
+fn annotate_stream_lag(streams: &mut [StreamTelemetry]) {
+    let mut heads = HashMap::<u64, u64>::new();
+    for stream in streams.iter() {
+        if let Some(part) = stream.latest_observed_part() {
+            heads
+                .entry(stream.stream_id)
+                .and_modify(|head| *head = (*head).max(part))
+                .or_insert(part);
+        }
+    }
+
+    for stream in streams.iter_mut() {
+        stream.mesh_lag_parts = stream.latest_observed_part().and_then(|part| {
+            heads
+                .get(&stream.stream_id)
+                .copied()
+                .map(|head| head.saturating_sub(part))
+        });
     }
 }
 
@@ -3065,6 +3102,32 @@ fn derive_mesh_alerts(
             ),
             count: stale_streams.len() as u64,
             last_seen_unix_ms: Some(last_seen),
+            node_id: Some(stream.node_id.clone()),
+            stream_id_text: Some(stream.stream_id_text.clone()),
+        });
+    }
+
+    let lagging_streams = streams
+        .iter()
+        .filter(|stream| stream.lagging())
+        .collect::<Vec<_>>();
+    if let Some(stream) = lagging_streams
+        .iter()
+        .max_by_key(|stream| stream.mesh_lag_parts.unwrap_or_default())
+        .copied()
+    {
+        let lag = stream.mesh_lag_parts.unwrap_or_default();
+        alerts.push(MeshAlert {
+            level: "warn",
+            code: "mesh_stream_lagging",
+            message: format!(
+                "{} mesh stream replica(s) are behind the stream head; latest lag is {lag} part(s) for stream {} on {}.",
+                lagging_streams.len(),
+                stream.stream_id_text,
+                stream.node_id
+            ),
+            count: lagging_streams.len() as u64,
+            last_seen_unix_ms: Some(now),
             node_id: Some(stream.node_id.clone()),
             stream_id_text: Some(stream.stream_id_text.clone()),
         });
@@ -6882,6 +6945,7 @@ mod tests {
             datagrams_received: 4,
             last_ingest_age_ms: Some(250),
             stale_threshold_ms: Some(5_000),
+            mesh_lag_parts: None,
         }];
         telemetry.ingest_snapshot(remote).await;
         let router =
@@ -6932,6 +6996,7 @@ mod tests {
             datagrams_received: 4,
             last_ingest_age_ms: Some(6_000),
             stale_threshold_ms: Some(5_000),
+            mesh_lag_parts: None,
         }];
         telemetry.ingest_snapshot(remote).await;
         let router =
@@ -6949,6 +7014,67 @@ mod tests {
                 && stream.stream_id == 77
                 && stream.last_ingest_age_ms == Some(6_000)
                 && stream.stale_threshold_ms == Some(5_000)
+        }));
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn mesh_api_reports_lagging_stream_replicas() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let telemetry = TelemetryAggregator::default();
+        let mut head =
+            telemetry_snapshot_for_tests("us-head", "us-east", "na", 37.4, -78.6, Vec::new(), 1);
+        head.streams = vec![StreamTelemetry {
+            node_id: "us-head".into(),
+            stream_id: 77,
+            stream_id_text: stream_id_text(77),
+            latest_local_part: Some(20),
+            latest_local_part_bytes: Some(4096),
+            latest_local_part_duration_ms: Some(500),
+            latest_local_part_age_ms: Some(250),
+            latest_mesh_part: Some(20),
+            bytes_received: 4096,
+            datagrams_received: 1,
+            last_ingest_age_ms: Some(250),
+            stale_threshold_ms: Some(5_000),
+            mesh_lag_parts: None,
+        }];
+        let mut lagging =
+            telemetry_snapshot_for_tests("eu-lag", "eu-west", "eu", 51.5, -0.1, Vec::new(), 1);
+        lagging.streams = vec![StreamTelemetry {
+            node_id: "eu-lag".into(),
+            stream_id: 77,
+            stream_id_text: stream_id_text(77),
+            latest_local_part: Some(11),
+            latest_local_part_bytes: Some(2048),
+            latest_local_part_duration_ms: Some(500),
+            latest_local_part_age_ms: Some(250),
+            latest_mesh_part: Some(11),
+            bytes_received: 2048,
+            datagrams_received: 1,
+            last_ingest_age_ms: Some(250),
+            stale_threshold_ms: Some(5_000),
+            mesh_lag_parts: None,
+        }];
+        telemetry.ingest_snapshot(head).await;
+        telemetry.ingest_snapshot(lagging).await;
+        let router =
+            app_router_for_tests_with_telemetry(Arc::clone(&cache), Arc::clone(&mesh), telemetry);
+        let snapshot = router.mesh_api_snapshot().await;
+
+        assert!(snapshot.alerts.iter().any(|alert| {
+            alert.code == "mesh_stream_lagging"
+                && alert.node_id.as_deref() == Some("eu-lag")
+                && alert.stream_id_text.as_deref() == Some("77")
+        }));
+        assert!(snapshot.streams.iter().any(|stream| {
+            stream.node_id == "us-head"
+                && stream.stream_id == 77
+                && stream.mesh_lag_parts == Some(0)
+        }));
+        assert!(snapshot.streams.iter().any(|stream| {
+            stream.node_id == "eu-lag" && stream.stream_id == 77 && stream.mesh_lag_parts == Some(9)
         }));
         mesh.shutdown();
     }
@@ -7525,6 +7651,7 @@ mod tests {
             datagrams_received: 128,
             last_ingest_age_ms: Some(250),
             stale_threshold_ms: Some(5_000),
+            mesh_lag_parts: None,
         }];
 
         let mut na_edge =
@@ -7885,6 +8012,7 @@ mod tests {
             datagrams_received: 1,
             last_ingest_age_ms: Some(250),
             stale_threshold_ms: Some(5_000),
+            mesh_lag_parts: None,
         }];
         telemetry.ingest_snapshot(remote).await;
 
