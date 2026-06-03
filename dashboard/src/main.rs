@@ -1,4 +1,8 @@
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 use gloo_net::http::Request;
 use gloo_timers::callback::Interval;
@@ -26,6 +30,7 @@ fn App() -> impl IntoView {
     let (contrib, set_contrib) = signal(None::<ContribStatus>);
     let (mesh_rates, set_mesh_rates) = signal(MeshRateSnapshot::default());
     let (contrib_rates, set_contrib_rates) = signal(ContribRateSnapshot::default());
+    let (playback_probes, set_playback_probes) = signal(PlaybackProbeState::default());
     let (last_mesh_sample, set_last_mesh_sample) = signal(None::<MeshRateSample>);
     let (last_contrib_sample, set_last_contrib_sample) = signal(None::<ContribRateSample>);
     let (status, set_status) = signal(String::from("starting"));
@@ -102,6 +107,13 @@ fn App() -> impl IntoView {
             } else {
                 set_status.set(errors.join(" | "));
             }
+            let probe_targets = playlist_probe_targets(
+                mesh.get().as_ref(),
+                contrib.get().as_ref(),
+                &mesh_url,
+                &contrib_url,
+            );
+            schedule_playlist_probes(probe_targets, set_playback_probes);
         });
     };
 
@@ -323,6 +335,7 @@ fn App() -> impl IntoView {
                     <Metric label="ingest" value=move || contrib.get().map(|c| c.runtime.fmp4.parts.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} listeners / {} publish errors / {}", enabled_listener_count(&c), c.runtime.fmp4.publish_errors, c.health.state)).unwrap_or_default() />
                     <Metric label="mesh rx" value=move || mesh_rates.get().byte_rate_text() detail=move || mesh_rates.get().detail_text() />
                     <Metric label="contrib out" value=move || contrib_rates.get().output_rate_text() detail=move || contrib_rates.get().detail_text() />
+                    <Metric label="playback" value=move || playback_probes.get().summary_text() detail=move || playback_probes.get().detail_text() />
                 </section>
 
                 <div class="workspace">
@@ -361,6 +374,7 @@ fn App() -> impl IntoView {
                             <h2>"Streams"</h2>
                             <span>{move || mesh.get().map(|m| format!("{} observed / {} planned", m.streams.len(), m.planned_replicas.len())).unwrap_or_else(|| "0 observed".to_owned())}</span>
                         </div>
+                        <PlaybackProbeList probes=playback_probes />
                         <LocalStream mesh />
                         <StreamTable mesh />
                         <ReplicaPlan mesh />
@@ -727,6 +741,25 @@ fn ConnectionList(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
 }
 
 #[component]
+fn PlaybackProbeList(probes: ReadSignal<PlaybackProbeState>) -> impl IntoView {
+    view! {
+        <div class="playback-probe-list">
+            <For
+                each=move || probes.get().probes
+                key=|probe| probe.url.clone()
+                let(probe)
+            >
+                <div class=probe.class_name()>
+                    <strong>{probe.label.clone()}</strong>
+                    <span>{probe.status_text()}</span>
+                    <small>{probe.meta_text()}</small>
+                </div>
+            </For>
+        </div>
+    }
+}
+
+#[component]
 fn LocalStream(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
     view! {
         <div class="local-stream">
@@ -1002,6 +1035,65 @@ where
         .map_err(|error| error.to_string())
 }
 
+async fn probe_playlist(target: PlaylistProbeTarget) -> PlaylistProbe {
+    let started = js_sys::Date::now() as u64;
+    let response = Request::get(&target.url)
+        .header("Accept", "application/vnd.apple.mpegurl, */*")
+        .header("Range", "bytes=0-0")
+        .send()
+        .await;
+    let elapsed_ms = (js_sys::Date::now() as u64).saturating_sub(started);
+
+    match response {
+        Ok(response) => {
+            let status = response.status();
+            let headers = response.headers();
+            PlaylistProbe {
+                label: target.label,
+                url: target.url,
+                status: Some(status),
+                ok: status == 200 || status == 206,
+                elapsed_ms,
+                content_length: headers
+                    .get("content-length")
+                    .and_then(|value| value.parse::<u64>().ok()),
+                content_type: headers.get("content-type"),
+                error: None,
+            }
+        }
+        Err(error) => PlaylistProbe {
+            label: target.label,
+            url: target.url,
+            status: None,
+            ok: false,
+            elapsed_ms,
+            content_length: None,
+            content_type: None,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+fn schedule_playlist_probes(
+    targets: Vec<PlaylistProbeTarget>,
+    set_probes: WriteSignal<PlaybackProbeState>,
+) {
+    if targets.is_empty() {
+        set_probes.set(PlaybackProbeState::default());
+        return;
+    }
+    spawn_local(async move {
+        let mut probes = Vec::with_capacity(targets.len());
+        for target in targets {
+            probes.push(probe_playlist(target).await);
+        }
+        set_probes.set(PlaybackProbeState {
+            updated_unix_ms: js_sys::Date::now() as u64,
+            probes,
+        });
+    });
+}
+
 async fn post_json<T>(url: &str, body: &Value) -> Result<T, String>
 where
     T: DeserializeOwned,
@@ -1107,6 +1199,89 @@ fn mesh_control_url(mesh_api: &str, action: &str) -> String {
         .map(|(base, _)| base)
         .unwrap_or(mesh_api.trim_end_matches('/'));
     format!("{base}/api/control/{action}")
+}
+
+fn playlist_probe_targets(
+    mesh: Option<&MeshApiSnapshot>,
+    contrib: Option<&ContribStatus>,
+    mesh_api: &str,
+    contrib_api: &str,
+) -> Vec<PlaylistProbeTarget> {
+    let mut seen = HashSet::new();
+    let mut targets = Vec::new();
+
+    if let Some(contrib) = contrib {
+        if !contrib.advertised_hls_path.is_empty() {
+            push_playlist_probe_target(
+                &mut targets,
+                &mut seen,
+                "contrib".to_owned(),
+                join_url_path(
+                    &api_base(contrib_api, "/api/status"),
+                    &contrib.advertised_hls_path,
+                ),
+            );
+        }
+    }
+
+    if let Some(mesh) = mesh {
+        let stream_id = if mesh.stream.stream_id_text.is_empty() {
+            "1"
+        } else {
+            mesh.stream.stream_id_text.as_str()
+        };
+        for edge in &mesh.edge_services {
+            if let Some(base_url) = &edge.playback_base_url {
+                push_playlist_probe_target(
+                    &mut targets,
+                    &mut seen,
+                    format!("mesh {}", edge.node_id),
+                    join_url_path(base_url, &format!("{stream_id}/stream.m3u8")),
+                );
+            }
+        }
+        if !targets
+            .iter()
+            .any(|target| target.label.starts_with("mesh "))
+        {
+            push_playlist_probe_target(
+                &mut targets,
+                &mut seen,
+                "mesh local".to_owned(),
+                join_url_path(
+                    &join_url_path(&api_base(mesh_api, "/api/mesh"), "live"),
+                    &format!("{stream_id}/stream.m3u8"),
+                ),
+            );
+        }
+    }
+
+    targets
+}
+
+fn push_playlist_probe_target(
+    targets: &mut Vec<PlaylistProbeTarget>,
+    seen: &mut HashSet<String>,
+    label: String,
+    url: String,
+) {
+    if seen.insert(url.clone()) {
+        targets.push(PlaylistProbeTarget { label, url });
+    }
+}
+
+fn api_base(api_url: &str, marker: &str) -> String {
+    api_url
+        .split_once(marker)
+        .map(|(base, _)| base)
+        .unwrap_or(api_url.trim_end_matches('/'))
+        .to_owned()
+}
+
+fn join_url_path(base: &str, path: &str) -> String {
+    let base = base.trim_end_matches('/');
+    let path = path.trim_start_matches('/');
+    format!("{base}/{path}")
 }
 
 fn endpoint_from_query(key: &str, fallback: &str) -> String {
@@ -1251,6 +1426,85 @@ fn short_clock() -> String {
         .to_locale_time_string("en-GB")
         .as_string()
         .unwrap_or_else(|| "now".to_owned())
+}
+
+#[derive(Clone, Debug)]
+struct PlaylistProbeTarget {
+    label: String,
+    url: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PlaybackProbeState {
+    updated_unix_ms: u64,
+    probes: Vec<PlaylistProbe>,
+}
+
+impl PlaybackProbeState {
+    fn ready_count(&self) -> usize {
+        self.probes.iter().filter(|probe| probe.ok).count()
+    }
+
+    fn summary_text(&self) -> String {
+        if self.probes.is_empty() {
+            "-".to_owned()
+        } else {
+            format!("{}/{}", self.ready_count(), self.probes.len())
+        }
+    }
+
+    fn detail_text(&self) -> String {
+        if self.probes.is_empty() {
+            "waiting for playlist targets".to_owned()
+        } else {
+            let failures = self.probes.len().saturating_sub(self.ready_count());
+            format!(
+                "{failures} failing / probed {}",
+                age_text(self.updated_unix_ms)
+            )
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct PlaylistProbe {
+    label: String,
+    url: String,
+    status: Option<u16>,
+    ok: bool,
+    elapsed_ms: u64,
+    content_length: Option<u64>,
+    content_type: Option<String>,
+    error: Option<String>,
+}
+
+impl PlaylistProbe {
+    fn class_name(&self) -> &'static str {
+        if self.ok {
+            "playback-probe ok"
+        } else {
+            "playback-probe error"
+        }
+    }
+
+    fn status_text(&self) -> String {
+        match (self.status, &self.error) {
+            (Some(status), _) => format!("HTTP {status}"),
+            (None, Some(error)) => format!("error: {error}"),
+            (None, None) => "pending".to_owned(),
+        }
+    }
+
+    fn meta_text(&self) -> String {
+        let mut parts = vec![self.url.clone(), format!("{}ms", self.elapsed_ms)];
+        if let Some(length) = self.content_length {
+            parts.push(format_bytes(length));
+        }
+        if let Some(content_type) = &self.content_type {
+            parts.push(content_type.clone());
+        }
+        parts.join(" / ")
+    }
 }
 
 #[derive(Clone, Debug, Default)]
