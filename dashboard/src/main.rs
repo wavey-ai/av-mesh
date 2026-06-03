@@ -320,7 +320,7 @@ fn App() -> impl IntoView {
                     <Metric label="nodes" value=move || mesh.get().map(|m| m.aggregate.node_count.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || mesh.get().map(|m| format!("{} links / {} alerts / local {}", m.aggregate.connection_count, m.alerts.len(), m.node.node_id)).unwrap_or_default() />
                     <Metric label="storage" value=move || mesh.get().map(|m| format_bytes(m.aggregate.used_storage_bytes)).unwrap_or_else(|| "-".to_owned()) detail=move || mesh.get().map(|m| format!("of {}", format_bytes(m.aggregate.total_storage_bytes))).unwrap_or_default() />
                     <Metric label="egress" value=move || mesh.get().map(|m| format_bps(m.aggregate.total_egress_capacity_bps)).unwrap_or_else(|| "-".to_owned()) detail=move || mesh.get().map(|m| format!("{} ingress / {} active", m.aggregate.contributor_streams, m.aggregate.active_streams)).unwrap_or_default() />
-                    <Metric label="ingest" value=move || contrib.get().map(|c| c.runtime.fmp4.parts.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} listeners / {} publish errors", enabled_listener_count(&c), c.runtime.fmp4.publish_errors)).unwrap_or_default() />
+                    <Metric label="ingest" value=move || contrib.get().map(|c| c.runtime.fmp4.parts.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} listeners / {} publish errors / {}", enabled_listener_count(&c), c.runtime.fmp4.publish_errors, c.health.state)).unwrap_or_default() />
                     <Metric label="mesh rx" value=move || mesh_rates.get().byte_rate_text() detail=move || mesh_rates.get().detail_text() />
                     <Metric label="contrib out" value=move || contrib_rates.get().output_rate_text() detail=move || contrib_rates.get().detail_text() />
                 </section>
@@ -494,6 +494,7 @@ fn ContribView(contrib: ReadSignal<Option<ContribStatus>>) -> impl IntoView {
                 <strong>{move || contrib.get().map(|c| c.mesh.media_fec_target).unwrap_or_else(|| "-".to_owned())}</strong>
             </div>
             <div class="runtime-grid">
+                <RuntimeCell label="health" value=move || contrib.get().map(|c| c.health.state).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| c.health.detail_text()).unwrap_or_default() />
                 <RuntimeCell label="raw http" value=move || contrib.get().map(|c| c.runtime.raw_http.requests.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} / {} datagrams / {}", format_bytes(c.runtime.raw_http.bytes), c.runtime.raw_http.datagrams, optional_age(c.runtime.raw_http.last_seen_age_ms))).unwrap_or_default() />
                 <RuntimeCell label="media au" value=move || contrib.get().map(|c| c.runtime.media_access_units.requests.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} / {} datagrams / {}", format_bytes(c.runtime.media_access_units.payload_bytes), c.runtime.media_access_units.datagrams, optional_age(c.runtime.media_access_units.last_seen_age_ms))).unwrap_or_default() />
                 <RuntimeCell label="mpeg-ts" value=move || contrib.get().map(|c| c.runtime.mpeg_ts.slots.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} / {}", format_bytes(c.runtime.mpeg_ts.bytes), optional_age(c.runtime.mpeg_ts.last_seen_age_ms))).unwrap_or_default() />
@@ -977,6 +978,16 @@ fn format_duration_ms(ms: u64) -> String {
         format!("{}s ago", ms / 1_000)
     } else {
         format!("{}m ago", ms / 60_000)
+    }
+}
+
+fn format_duration_ms_plain(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{}s", ms / 1_000)
+    } else {
+        format!("{}m", ms / 60_000)
     }
 }
 
@@ -1517,9 +1528,55 @@ struct ContribStatus {
     #[serde(default)]
     runtime: ContribRuntimeStatus,
     #[serde(default)]
+    health: ContribHealth,
+    #[serde(default)]
     alerts: Vec<ContribAlert>,
     #[serde(default)]
     activity: Vec<ActivityItem>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ContribHealth {
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    stale_threshold_ms: u64,
+    #[serde(default)]
+    input_seen: bool,
+    #[serde(default)]
+    fmp4_input_seen: bool,
+    #[serde(default)]
+    output_seen: bool,
+    #[serde(default)]
+    last_input_age_ms: Option<u64>,
+    #[serde(default)]
+    last_fmp4_input_age_ms: Option<u64>,
+    #[serde(default)]
+    last_output_age_ms: Option<u64>,
+}
+
+impl ContribHealth {
+    fn detail_text(&self) -> String {
+        let input = if self.input_seen {
+            optional_age(self.last_input_age_ms)
+        } else {
+            "no input".to_owned()
+        };
+        let output = if self.output_seen {
+            optional_age(self.last_output_age_ms)
+        } else {
+            "no output".to_owned()
+        };
+        let fmp4_input = if self.fmp4_input_seen {
+            optional_age(self.last_fmp4_input_age_ms)
+        } else {
+            "no fmp4 input".to_owned()
+        };
+        format!(
+            "input {input} / fmp4 input {fmp4_input} / output {output} / stale {}",
+            format_duration_ms_plain(self.stale_threshold_ms)
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
