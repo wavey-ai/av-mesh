@@ -304,6 +304,13 @@ main {
   gap: 8px;
 }
 
+.orchestration-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
 .runtime-cell {
   display: grid;
   gap: 2px;
@@ -468,6 +475,7 @@ main {
 
   .endpoint-grid,
   .control-grid,
+  .orchestration-grid,
   .runtime-grid {
     grid-template-columns: 1fr;
   }

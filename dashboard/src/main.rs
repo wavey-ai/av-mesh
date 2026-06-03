@@ -328,6 +328,7 @@ fn App() -> impl IntoView {
                             <h2>"Controls"</h2>
                             <span>{move || control_status.get()}</span>
                         </div>
+                        <OrchestrationView mesh />
                         <div class="control-grid">
                             <label>
                                 <span>"stream"</span>
@@ -599,6 +600,39 @@ fn ReplicaPlan(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
 }
 
 #[component]
+fn OrchestrationView(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
+    view! {
+        <div class="orchestration-grid">
+            <RuntimeCell
+                label="control bus"
+                value=move || mesh.get().map(|m| {
+                    if m.orchestration.control_dispatch_ready { "connected" } else { "local-only" }.to_owned()
+                }).unwrap_or_else(|| "-".to_owned())
+                detail=move || "AVMC command dispatch".to_owned()
+            />
+            <RuntimeCell
+                label="provision"
+                value=move || mesh.get().map(|m| {
+                    if m.orchestration.provision.enabled { "enabled" } else { "disabled" }.to_owned()
+                }).unwrap_or_else(|| "-".to_owned())
+                detail=move || mesh.get().map(|m| {
+                    if m.orchestration.provision.backends.is_empty() {
+                        "no backend configured".to_owned()
+                    } else {
+                        m.orchestration.provision.backends.join(", ")
+                    }
+                }).unwrap_or_default()
+            />
+            <RuntimeCell
+                label="timeout"
+                value=move || mesh.get().map(|m| format!("{}ms", m.orchestration.provision.timeout_ms)).unwrap_or_else(|| "-".to_owned())
+                detail=move || "provision command budget".to_owned()
+            />
+        </div>
+    }
+}
+
+#[component]
 fn CommandList(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
     view! {
         <div class="commands">
@@ -857,6 +891,8 @@ struct MeshApiSnapshot {
     #[serde(default)]
     alerts: Vec<MeshAlert>,
     #[serde(default)]
+    orchestration: OrchestrationStatus,
+    #[serde(default)]
     nodes: Vec<MeshNode>,
     #[serde(default)]
     edge_services: Vec<EdgeServiceSnapshot>,
@@ -926,6 +962,24 @@ struct AggregateMetrics {
     contributor_streams: u64,
     #[serde(default)]
     active_streams: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct OrchestrationStatus {
+    #[serde(default)]
+    control_dispatch_ready: bool,
+    #[serde(default)]
+    provision: ProvisionStatus,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ProvisionStatus {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    backends: Vec<String>,
+    #[serde(default)]
+    timeout_ms: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

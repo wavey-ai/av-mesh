@@ -1851,6 +1851,7 @@ struct MeshApiSnapshot {
     planned_replicas: Vec<ReplicaPlacementSnapshot>,
     aggregate: AggregateMetrics,
     alerts: Vec<MeshAlert>,
+    orchestration: OrchestrationStatus,
     nodes: Vec<MeshNode>,
     edge_services: Vec<EdgeServiceSnapshot>,
     connections: Vec<ConnectionSnapshot>,
@@ -1887,6 +1888,19 @@ struct AggregateMetrics {
     total_egress_capacity_bps: u64,
     contributor_streams: u64,
     active_streams: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct OrchestrationStatus {
+    control_dispatch_ready: bool,
+    provision: ProvisionStatus,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct ProvisionStatus {
+    enabled: bool,
+    backends: Vec<String>,
+    timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2217,7 +2231,12 @@ impl TelemetryAggregator {
     #[cfg(test)]
     async fn snapshot(&self, local: MeshSnapshot) -> MeshApiSnapshot {
         let snapshots = self.snapshots_with_local(local.clone()).await;
-        MeshApiSnapshot::from_snapshots(local, snapshots, Vec::new())
+        MeshApiSnapshot::from_snapshots(
+            local,
+            snapshots,
+            Vec::new(),
+            OrchestrationStatus::default(),
+        )
     }
 
     async fn snapshots_with_local(&self, local: MeshSnapshot) -> Vec<MeshSnapshot> {
@@ -2249,6 +2268,7 @@ impl MeshApiSnapshot {
         local: MeshSnapshot,
         snapshots: Vec<MeshSnapshot>,
         planned_replicas: Vec<ReplicaPlacement>,
+        orchestration: OrchestrationStatus,
     ) -> Self {
         let mut aggregate = AggregateMetrics::default();
         let mut nodes = Vec::with_capacity(snapshots.len());
@@ -2339,6 +2359,7 @@ impl MeshApiSnapshot {
             planned_replicas,
             aggregate,
             alerts,
+            orchestration,
             nodes,
             edge_services,
             connections,
@@ -2621,6 +2642,10 @@ impl ControlDispatch {
         *self.tx.write().await = Some(tx);
     }
 
+    async fn ready(&self) -> bool {
+        self.tx.read().await.is_some()
+    }
+
     async fn publish(&self, envelope: &ControlEnvelope) -> Result<bool> {
         let Some(tx) = self.tx.read().await.clone() else {
             return Ok(false);
@@ -2694,6 +2719,22 @@ impl ProvisionExecutor {
             timeout: Duration::from_secs(30),
             #[cfg(feature = "linode-provisioner")]
             linode: None,
+        }
+    }
+
+    fn status(&self) -> ProvisionStatus {
+        let mut backends = Vec::new();
+        if self.command.is_some() {
+            backends.push("command".to_owned());
+        }
+        #[cfg(feature = "linode-provisioner")]
+        if self.linode.is_some() {
+            backends.push("linode".to_owned());
+        }
+        ProvisionStatus {
+            enabled: !backends.is_empty(),
+            backends,
+            timeout_ms: self.timeout.as_millis().min(u128::from(u64::MAX)) as u64,
         }
     }
 
@@ -3180,7 +3221,19 @@ impl AppRouter {
         let planned_replicas = self
             .plan_all_active_replicas_from_snapshots(&snapshots)
             .await;
-        MeshApiSnapshot::from_snapshots(local, snapshots, planned_replicas)
+        MeshApiSnapshot::from_snapshots(
+            local,
+            snapshots,
+            planned_replicas,
+            self.orchestration_status().await,
+        )
+    }
+
+    async fn orchestration_status(&self) -> OrchestrationStatus {
+        OrchestrationStatus {
+            control_dispatch_ready: self.dispatch.ready().await,
+            provision: self.provision.status(),
+        }
     }
 
     async fn mesh_protocol_response_from_bytes(&self, bytes: &[u8]) -> MeshProtocolResponse {
@@ -5744,6 +5797,33 @@ mod tests {
         assert!(alert_codes.contains("edge_playback_missing"));
         assert!(alert_codes.contains("storage_exhausted"));
         assert!(alert_codes.contains("control_skipped"));
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn mesh_api_reports_orchestration_status() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let disabled_router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
+        let disabled = disabled_router.mesh_api_snapshot().await;
+        assert!(!disabled.orchestration.control_dispatch_ready);
+        assert!(!disabled.orchestration.provision.enabled);
+        assert!(disabled.orchestration.provision.backends.is_empty());
+
+        let provision = ProvisionExecutor::new(
+            Some("printf provision-ready".into()),
+            Duration::from_millis(1_500),
+        );
+        let router =
+            app_router_for_tests_with_provision(Arc::clone(&cache), Arc::clone(&mesh), provision);
+        let (tx, _rx) = mpsc::channel(1);
+        router.dispatch.set_sender(tx).await;
+        let enabled = router.mesh_api_snapshot().await;
+
+        assert!(enabled.orchestration.control_dispatch_ready);
+        assert!(enabled.orchestration.provision.enabled);
+        assert_eq!(enabled.orchestration.provision.backends, vec!["command"]);
+        assert_eq!(enabled.orchestration.provision.timeout_ms, 1_500);
         mesh.shutdown();
     }
 
