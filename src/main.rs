@@ -27,12 +27,12 @@ use raptorq_datagram_fec::{
 };
 use raptorq_fec_transport::{split_stream_id_prefix, FecDatagramDecoder, STREAM_ID_PREFIX_LEN};
 use serde::{de, Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, Mutex as StdMutex,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tcp_changes::{
@@ -75,6 +75,7 @@ const MESH_STORAGE_WARN_PCT: u64 = 85;
 const MESH_STORAGE_ERROR_PCT: u64 = 95;
 const MESH_MIN_STALE_INGEST_ALERT_MS: u64 = 5_000;
 const MESH_ACTIVITY_LIMIT: usize = 64;
+const EDGE_RECENT_RESPONSE_LIMIT: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LiveMediaKind {
@@ -1952,6 +1953,16 @@ struct EdgeServiceSnapshot {
     requests_served: u64,
     bytes_served: u64,
     llhls_tail_requests: u64,
+    #[serde(default)]
+    responses_total: u64,
+    #[serde(default)]
+    response_errors: u64,
+    #[serde(default)]
+    response_not_found: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_response_unix_ms: Option<u64>,
+    #[serde(default)]
+    recent_responses: Vec<EdgeResponseSnapshot>,
     draining: bool,
 }
 
@@ -1970,6 +1981,11 @@ impl EdgeServiceSnapshot {
             requests_served: load.requests_served,
             bytes_served: load.bytes_served,
             llhls_tail_requests: load.llhls_tail_requests,
+            responses_total: load.responses_total,
+            response_errors: load.response_errors,
+            response_not_found: load.response_not_found,
+            last_response_unix_ms: load.last_response_unix_ms,
+            recent_responses: load.recent_responses,
             draining: node.draining,
         }
     }
@@ -1979,12 +1995,30 @@ impl EdgeServiceSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct EdgeLoadSnapshot {
     active_readers: u64,
     requests_served: u64,
     bytes_served: u64,
     llhls_tail_requests: u64,
+    responses_total: u64,
+    response_errors: u64,
+    response_not_found: u64,
+    last_response_unix_ms: Option<u64>,
+    recent_responses: Vec<EdgeResponseSnapshot>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct EdgeResponseSnapshot {
+    unix_ms: u64,
+    method: String,
+    path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    query: Option<String>,
+    status: u16,
+    bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1998,6 +2032,11 @@ struct EdgeLoadInner {
     requests_served: AtomicU64,
     bytes_served: AtomicU64,
     llhls_tail_requests: AtomicU64,
+    responses_total: AtomicU64,
+    response_errors: AtomicU64,
+    response_not_found: AtomicU64,
+    last_response_unix_ms: AtomicU64,
+    recent_responses: StdMutex<VecDeque<EdgeResponseSnapshot>>,
 }
 
 impl EdgeLoad {
@@ -2016,6 +2055,16 @@ impl EdgeLoad {
     }
 
     fn snapshot(&self, node: &MeshNode, playback_base_url: Option<String>) -> EdgeServiceSnapshot {
+        let recent_responses = self
+            .inner
+            .recent_responses
+            .lock()
+            .map(|responses| responses.iter().cloned().collect())
+            .unwrap_or_default();
+        let last_response_unix_ms = match self.inner.last_response_unix_ms.load(Ordering::Relaxed) {
+            0 => None,
+            value => Some(value),
+        };
         EdgeServiceSnapshot::from_node(
             node,
             playback_base_url,
@@ -2024,8 +2073,56 @@ impl EdgeLoad {
                 requests_served: self.inner.requests_served.load(Ordering::Relaxed),
                 bytes_served: self.inner.bytes_served.load(Ordering::Relaxed),
                 llhls_tail_requests: self.inner.llhls_tail_requests.load(Ordering::Relaxed),
+                responses_total: self.inner.responses_total.load(Ordering::Relaxed),
+                response_errors: self.inner.response_errors.load(Ordering::Relaxed),
+                response_not_found: self.inner.response_not_found.load(Ordering::Relaxed),
+                last_response_unix_ms,
+                recent_responses,
             },
         )
+    }
+
+    fn record_response(
+        &self,
+        method: &Method,
+        path: &str,
+        query: Option<&str>,
+        response: &HandlerResponse,
+    ) {
+        let unix_ms = now_unix_ms();
+        let status = response.status.as_u16();
+        let bytes = response
+            .body
+            .as_ref()
+            .map(|body| body.len() as u64)
+            .unwrap_or(0);
+        self.inner.responses_total.fetch_add(1, Ordering::Relaxed);
+        if response.status.is_client_error() || response.status.is_server_error() {
+            self.inner.response_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        if response.status == StatusCode::NOT_FOUND {
+            self.inner
+                .response_not_found
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.inner
+            .last_response_unix_ms
+            .store(unix_ms, Ordering::Relaxed);
+
+        if let Ok(mut responses) = self.inner.recent_responses.lock() {
+            responses.push_front(EdgeResponseSnapshot {
+                unix_ms,
+                method: method.as_str().into(),
+                path: path.into(),
+                query: query.map(ToOwned::to_owned),
+                status,
+                bytes,
+                content_type: response.content_type.clone(),
+            });
+            while responses.len() > EDGE_RECENT_RESPONSE_LIMIT {
+                responses.pop_back();
+            }
+        }
     }
 }
 
@@ -2463,6 +2560,43 @@ fn derive_mesh_alerts(
             count: playback_missing as u64,
             last_seen_unix_ms: Some(now),
             node_id: None,
+            stream_id_text: None,
+        });
+    }
+
+    let edge_response_errors = edge_services
+        .iter()
+        .map(|edge| edge.response_errors)
+        .sum::<u64>();
+    let edge_recent_errors = edge_services
+        .iter()
+        .flat_map(|edge| {
+            edge.recent_responses
+                .iter()
+                .filter(|response| response.status >= 400)
+                .map(move |response| (edge, response))
+        })
+        .max_by_key(|(_, response)| response.unix_ms);
+    if edge_response_errors > 0 {
+        let (node_id, path, status, last_seen) = edge_recent_errors
+            .map(|(edge, response)| {
+                (
+                    Some(edge.node_id.clone()),
+                    response.path.clone(),
+                    response.status,
+                    Some(response.unix_ms),
+                )
+            })
+            .unwrap_or((None, "unknown edge path".into(), 0, Some(now)));
+        alerts.push(MeshAlert {
+            level: if status >= 500 { "error" } else { "warn" },
+            code: "edge_response_errors",
+            message: format!(
+                "Edge playback/API paths have returned {edge_response_errors} non-success response(s); latest was HTTP {status} for {path}."
+            ),
+            count: edge_response_errors,
+            last_seen_unix_ms: last_seen,
+            node_id,
             stream_id_text: None,
         });
     }
@@ -3333,6 +3467,20 @@ impl AppRouter {
         )
     }
 
+    fn record_edge_response(
+        &self,
+        method: &Method,
+        path: &str,
+        query: Option<&str>,
+        response: HandlerResponse,
+    ) -> HandlerResponse {
+        if path == "/live/stream.m3u8" || path.starts_with("/live/") {
+            self.edge_load
+                .record_response(method, path, query, &response);
+        }
+        response
+    }
+
     async fn orchestration_status(&self) -> OrchestrationStatus {
         OrchestrationStatus {
             control_dispatch_ready: self.dispatch.ready().await,
@@ -3896,15 +4044,21 @@ async fn run_replication_planner(
 #[async_trait]
 impl Router for AppRouter {
     async fn route(&self, req: Request<()>) -> HandlerResult<HandlerResponse> {
+        let method = req.method().clone();
+        let path_owned = req.uri().path().to_owned();
+        let query_owned = req.uri().query().map(ToOwned::to_owned);
+        let path = path_owned.as_str();
+        let query = query_owned.as_deref();
+
         if req.method() == Method::OPTIONS {
-            return Ok(response(StatusCode::NO_CONTENT, None, None));
+            let response = response(StatusCode::NO_CONTENT, None, None);
+            return Ok(self.record_edge_response(&method, path, query, response));
         }
         if req.method() != Method::GET && req.method() != Method::HEAD {
-            return Ok(response(StatusCode::METHOD_NOT_ALLOWED, None, None));
+            let response = response(StatusCode::METHOD_NOT_ALLOWED, None, None);
+            return Ok(self.record_edge_response(&method, path, query, response));
         }
 
-        let path = req.uri().path();
-        let query = req.uri().query();
         match path {
             "/" => Ok(response(
                 StatusCode::OK,
@@ -3935,12 +4089,13 @@ impl Router for AppRouter {
                 self.request_replica_for_stream(self.cache.stream_id, "playlist-demand", None)
                     .await;
                 let playlist = self.cache.playlist().await;
-                Ok(response(
+                let response = response(
                     StatusCode::OK,
                     Some(Bytes::from(playlist)),
                     Some("application/vnd.apple.mpegurl"),
                 )
-                .with_no_store())
+                .with_no_store();
+                Ok(self.record_edge_response(&method, path, query, response))
             }
             "/api/stats" => {
                 let json = serde_json::to_vec(&self.cache.stats(&self.mesh).await)
@@ -3972,12 +4127,13 @@ impl Router for AppRouter {
                     self.request_replica_for_stream(stream_id, "playlist-demand", None)
                         .await;
                     let playlist = self.cache.playlist_for_stream_id(stream_id).await;
-                    return Ok(response(
+                    let response = response(
                         StatusCode::OK,
                         Some(Bytes::from(playlist)),
                         Some("application/vnd.apple.mpegurl"),
                     )
-                    .with_no_store());
+                    .with_no_store();
+                    return Ok(self.record_edge_response(&method, path, query, response));
                 }
 
                 if let Some(stream_id) = parse_llhls_tail_path(path) {
@@ -3991,7 +4147,8 @@ impl Router for AppRouter {
                         .await
                     else {
                         read.finish(0);
-                        return Ok(response(StatusCode::NO_CONTENT, None, None).with_no_store());
+                        let response = response(StatusCode::NO_CONTENT, None, None).with_no_store();
+                        return Ok(self.record_edge_response(&method, path, query, response));
                     };
                     let bytes_len = bytes.len();
                     let media_kind = self
@@ -4010,21 +4167,23 @@ impl Router for AppRouter {
                         .headers
                         .push(("x-av-stream-id".into(), stream_id.to_string()));
                     read.finish(bytes_len);
-                    return Ok(tail_response);
+                    return Ok(self.record_edge_response(&method, path, query, tail_response));
                 }
 
                 if let Some(stream_id) = parse_stream_init_path(path) {
                     self.request_replica_for_stream(stream_id, "playlist-init-demand", None)
                         .await;
                     if let Some(init) = self.cache.get_init_for_stream_id(stream_id).await {
-                        return Ok(response(
+                        let response = response(
                             StatusCode::OK,
                             Some(init),
                             Some(LiveMediaKind::Fmp4.content_type()),
                         )
-                        .with_no_store());
+                        .with_no_store();
+                        return Ok(self.record_edge_response(&method, path, query, response));
                     }
-                    return Ok(response(StatusCode::NOT_FOUND, None, None));
+                    let response = response(StatusCode::NOT_FOUND, None, None);
+                    return Ok(self.record_edge_response(&method, path, query, response));
                 }
 
                 if let Some((stream_id, sequence)) = parse_media_unit_path(path) {
@@ -4032,7 +4191,8 @@ impl Router for AppRouter {
                         .await;
                     let Some(unit) = self.cache.get_media_access_unit(stream_id, sequence).await
                     else {
-                        return Ok(response(StatusCode::NOT_FOUND, None, None));
+                        let response = response(StatusCode::NOT_FOUND, None, None);
+                        return Ok(self.record_edge_response(&method, path, query, response));
                     };
                     let mut media_response = response(
                         StatusCode::OK,
@@ -4061,7 +4221,7 @@ impl Router for AppRouter {
                     media_response
                         .headers
                         .push(("x-av-flags".into(), unit.metadata.flags.bits().to_string()));
-                    return Ok(media_response);
+                    return Ok(self.record_edge_response(&method, path, query, media_response));
                 }
 
                 if let Some((stream_id, seq, requested_kind)) = parse_stream_part_path(path) {
@@ -4075,12 +4235,13 @@ impl Router for AppRouter {
                             .media_kind_hint(stream_id)
                             .await
                             .unwrap_or(requested_kind);
-                        return Ok(
+                        let response =
                             response(StatusCode::OK, Some(bytes), Some(media_kind.content_type()))
-                                .with_etag(hash),
-                        );
+                                .with_etag(hash);
+                        return Ok(self.record_edge_response(&method, path, query, response));
                     }
-                    return Ok(response(StatusCode::NOT_FOUND, None, None));
+                    let response = response(StatusCode::NOT_FOUND, None, None);
+                    return Ok(self.record_edge_response(&method, path, query, response));
                 }
 
                 if let Some((stream_id, segment, requested_kind)) = parse_stream_segment_path(path) {
@@ -4093,13 +4254,15 @@ impl Router for AppRouter {
                             .media_kind_hint(stream_id)
                             .await
                             .unwrap_or(requested_kind);
-                        return Ok(response(
+                        let response = response(
                             StatusCode::OK,
                             Some(bytes),
                             Some(media_kind.content_type()),
-                        ));
+                        );
+                        return Ok(self.record_edge_response(&method, path, query, response));
                     }
-                    return Ok(response(StatusCode::NOT_FOUND, None, None));
+                    let response = response(StatusCode::NOT_FOUND, None, None);
+                    return Ok(self.record_edge_response(&method, path, query, response));
                 }
 
                 if parse_init_path(path) {
@@ -4111,14 +4274,16 @@ impl Router for AppRouter {
                     .await;
                     if let Some(init) = self.cache.get_init_for_stream_id(self.cache.stream_id).await
                     {
-                        return Ok(response(
+                        let response = response(
                             StatusCode::OK,
                             Some(init),
                             Some(LiveMediaKind::Fmp4.content_type()),
                         )
-                        .with_no_store());
+                        .with_no_store();
+                        return Ok(self.record_edge_response(&method, path, query, response));
                     }
-                    return Ok(response(StatusCode::NOT_FOUND, None, None));
+                    let response = response(StatusCode::NOT_FOUND, None, None);
+                    return Ok(self.record_edge_response(&method, path, query, response));
                 }
 
                 if let Some((seq, requested_kind)) = parse_part_path(path) {
@@ -4128,12 +4293,13 @@ impl Router for AppRouter {
                             .media_kind_hint(self.cache.stream_id)
                             .await
                             .unwrap_or(requested_kind);
-                        return Ok(
+                        let response =
                             response(StatusCode::OK, Some(bytes), Some(media_kind.content_type()))
-                                .with_etag(hash),
-                        );
+                                .with_etag(hash);
+                        return Ok(self.record_edge_response(&method, path, query, response));
                     }
-                    return Ok(response(StatusCode::NOT_FOUND, None, None));
+                    let response = response(StatusCode::NOT_FOUND, None, None);
+                    return Ok(self.record_edge_response(&method, path, query, response));
                 }
 
                 if let Some((segment, requested_kind)) = parse_segment_path(path) {
@@ -4143,16 +4309,19 @@ impl Router for AppRouter {
                             .media_kind_hint(self.cache.stream_id)
                             .await
                             .unwrap_or(requested_kind);
-                        return Ok(response(
+                        let response = response(
                             StatusCode::OK,
                             Some(bytes),
                             Some(media_kind.content_type()),
-                        ));
+                        );
+                        return Ok(self.record_edge_response(&method, path, query, response));
                     }
-                    return Ok(response(StatusCode::NOT_FOUND, None, None));
+                    let response = response(StatusCode::NOT_FOUND, None, None);
+                    return Ok(self.record_edge_response(&method, path, query, response));
                 }
 
-                Ok(response(StatusCode::NOT_FOUND, None, None))
+                let response = response(StatusCode::NOT_FOUND, None, None);
+                Ok(self.record_edge_response(&method, path, query, response))
             }
         }
     }
@@ -6025,6 +6194,59 @@ mod tests {
         assert!(activity_codes.contains("mesh_snapshot"));
         assert!(activity_codes.contains("storage_exhausted"));
         assert!(activity_codes.contains("provision_node"));
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn mesh_api_reports_edge_response_errors() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
+
+        let missing_response = router
+            .route(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/live/77/init.mp4")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_response.status, StatusCode::NOT_FOUND);
+
+        let api_response = router
+            .route(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/mesh")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = api_response.body.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let edge = json["edge_services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|edge| edge["node_id"] == "test-node")
+            .unwrap();
+        let alert_codes = json["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|alert| alert["code"].as_str().unwrap())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(api_response.status, StatusCode::OK);
+        assert_eq!(edge["responses_total"], 1);
+        assert_eq!(edge["response_errors"], 1);
+        assert_eq!(edge["response_not_found"], 1);
+        assert_eq!(edge["recent_responses"][0]["path"], "/live/77/init.mp4");
+        assert_eq!(edge["recent_responses"][0]["status"], 404);
+        assert!(alert_codes.contains("edge_response_errors"));
         mesh.shutdown();
     }
 

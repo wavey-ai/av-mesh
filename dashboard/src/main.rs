@@ -800,20 +800,62 @@ fn EdgeGrid(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
                 key=|edge| edge.node_id.clone()
                 let(edge)
             >
-                <article class=if edge.draining { "edge draining" } else { "edge" }>
-                    <div>
-                        <strong>{edge.node_id}</strong>
-                        <span>{format!("{} / {}", edge.region, edge.continent)}</span>
-                    </div>
-                    <p>{edge.playback_base_url.unwrap_or_else(|| "no playback url".to_owned())}</p>
-                    <div class="edge-stats">
-                        <span>{format!("{} readers", edge.active_readers)}</span>
-                        <span>{format!("{} served", format_bytes(edge.bytes_served))}</span>
-                        <span>{format!("{} tails", edge.llhls_tail_requests)}</span>
-                    </div>
-                </article>
+                <EdgeCard edge />
             </For>
         </div>
+    }
+}
+
+#[component]
+fn EdgeCard(edge: EdgeServiceSnapshot) -> impl IntoView {
+    let class = if edge.draining {
+        "edge draining"
+    } else if edge.response_errors > 0 {
+        "edge warn"
+    } else {
+        "edge"
+    };
+    let node_id = edge.node_id.clone();
+    let region = edge.region.clone();
+    let continent = edge.continent.clone();
+    let playback_base_url = edge
+        .playback_base_url
+        .clone()
+        .unwrap_or_else(|| "no playback url".to_owned());
+    let recent_responses = edge.recent_responses.clone();
+    view! {
+        <article class=class>
+            <div>
+                <strong>{node_id}</strong>
+                <span>{format!("{region} / {continent}")}</span>
+            </div>
+            <p>{playback_base_url}</p>
+            <div class="edge-stats">
+                <span>{format!("{} readers", edge.active_readers)}</span>
+                <span>{format!("{} tail reads", edge.requests_served)}</span>
+                <span>{format!("{} tails", edge.llhls_tail_requests)}</span>
+                <span>{format!("{} served", format_bytes(edge.bytes_served))}</span>
+            </div>
+            <div class="edge-stats edge-http-stats">
+                <span>{format!("{} responses", edge.responses_total)}</span>
+                <span>{format!("{} errors", edge.response_errors)}</span>
+                <span>{format!("{} 404s", edge.response_not_found)}</span>
+                <span>{format!("last {}", optional_unix_age(edge.last_response_unix_ms))}</span>
+            </div>
+            <div class="edge-response-list">
+                <For
+                    each=move || recent_responses.clone()
+                    key=|response| response.key()
+                    let(response)
+                >
+                    <div class=response.class_name()>
+                        <strong>{format!("{} {}", response.method, response.status)}</strong>
+                        <span>{response.path_text()}</span>
+                        <small>{response.meta_text()}</small>
+                    </div>
+                </For>
+            </div>
+        </article>
     }
 }
 
@@ -1639,11 +1681,78 @@ struct EdgeServiceSnapshot {
     #[serde(default)]
     active_readers: u64,
     #[serde(default)]
+    requests_served: u64,
+    #[serde(default)]
     bytes_served: u64,
     #[serde(default)]
     llhls_tail_requests: u64,
     #[serde(default)]
+    responses_total: u64,
+    #[serde(default)]
+    response_errors: u64,
+    #[serde(default)]
+    response_not_found: u64,
+    #[serde(default)]
+    last_response_unix_ms: Option<u64>,
+    #[serde(default)]
+    recent_responses: Vec<EdgeResponseSnapshot>,
+    #[serde(default)]
     draining: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct EdgeResponseSnapshot {
+    #[serde(default)]
+    unix_ms: u64,
+    #[serde(default)]
+    method: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    status: u16,
+    #[serde(default)]
+    bytes: u64,
+    #[serde(default)]
+    content_type: Option<String>,
+}
+
+impl EdgeResponseSnapshot {
+    fn key(&self) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            self.unix_ms, self.method, self.path, self.status
+        )
+    }
+
+    fn class_name(&self) -> &'static str {
+        if self.status >= 500 {
+            "edge-response error"
+        } else if self.status >= 400 {
+            "edge-response warn"
+        } else {
+            "edge-response"
+        }
+    }
+
+    fn path_text(&self) -> String {
+        match &self.query {
+            Some(query) if !query.is_empty() => format!("{}?{}", self.path, query),
+            _ => self.path.clone(),
+        }
+    }
+
+    fn meta_text(&self) -> String {
+        let mut parts = vec![optional_unix_age(nonzero_u64(self.unix_ms))];
+        if self.bytes > 0 {
+            parts.push(format_bytes(self.bytes));
+        }
+        if let Some(content_type) = &self.content_type {
+            parts.push(content_type.clone());
+        }
+        parts.join(" / ")
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

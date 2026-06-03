@@ -559,7 +559,7 @@ main {
 }
 
 .edge-grid {
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
 }
 
 .edge {
@@ -568,8 +568,51 @@ main {
   padding: 12px;
 }
 
+.edge.warn {
+  border-left: 4px solid var(--amber);
+}
+
 .edge p {
   overflow-wrap: anywhere;
+}
+
+.edge-http-stats {
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.edge-response-list {
+  display: grid;
+  gap: 6px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.edge-response {
+  display: grid;
+  grid-template-columns: 70px minmax(0, 1fr);
+  gap: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 7px 8px;
+  background: #fff;
+}
+
+.edge-response.warn {
+  border-left: 4px solid var(--amber);
+}
+
+.edge-response.error {
+  border-left: 4px solid var(--red);
+}
+
+.edge-response span {
+  overflow-wrap: anywhere;
+}
+
+.edge-response small {
+  grid-column: 1 / -1;
+  color: var(--muted);
 }
 
 @media (max-width: 980px) {
