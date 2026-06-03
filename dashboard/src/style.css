@@ -180,6 +180,66 @@ main {
   font-style: normal;
 }
 
+.incident-rollup {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+}
+
+.incident-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+}
+
+.incident-head span,
+.incident-empty {
+  color: var(--muted);
+}
+
+.incident-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.incident-list:empty {
+  display: none;
+}
+
+.incident {
+  display: grid;
+  grid-template-columns: 82px minmax(120px, 0.55fr) minmax(0, 1.4fr);
+  gap: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 9px 10px;
+  background: #fff;
+}
+
+.incident.error {
+  border-left: 4px solid var(--red);
+}
+
+.incident.warn {
+  border-left: 4px solid var(--amber);
+}
+
+.incident.info {
+  border-left: 4px solid var(--blue);
+}
+
+.incident p,
+.incident small {
+  overflow-wrap: anywhere;
+}
+
+.incident small {
+  grid-column: 1 / -1;
+  color: var(--muted);
+}
+
 .workspace {
   display: grid;
   grid-template-columns: minmax(420px, 1.35fr) minmax(340px, 0.9fr);
@@ -828,6 +888,7 @@ main {
   .topbar,
   .workspace,
   .workspace.lower,
+  .incident-list,
   .metrics {
     grid-template-columns: 1fr;
   }

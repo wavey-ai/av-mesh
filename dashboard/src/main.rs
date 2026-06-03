@@ -336,7 +336,24 @@ fn App() -> impl IntoView {
                     <Metric label="mesh rx" value=move || mesh_rates.get().byte_rate_text() detail=move || mesh_rates.get().detail_text() />
                     <Metric label="contrib out" value=move || contrib_rates.get().output_rate_text() detail=move || contrib_rates.get().detail_text() />
                     <Metric label="playback" value=move || playback_probes.get().summary_text() detail=move || playback_probes.get().detail_text() />
+                    <Metric
+                        label="incidents"
+                        value=move || {
+                            let mesh_snapshot = mesh.get();
+                            let contrib_status = contrib.get();
+                            let probes = playback_probes.get();
+                            incident_count_text(&mesh_snapshot, &contrib_status, &probes)
+                        }
+                        detail=move || {
+                            let mesh_snapshot = mesh.get();
+                            let contrib_status = contrib.get();
+                            let probes = playback_probes.get();
+                            incident_detail_text(&mesh_snapshot, &contrib_status, &probes)
+                        }
+                    />
                 </section>
+
+                <IncidentRollup mesh contrib probes=playback_probes />
 
                 <div class="workspace">
                     <section class="panel map-panel">
@@ -449,6 +466,62 @@ fn App() -> impl IntoView {
                 </section>
             </main>
         </div>
+    }
+}
+
+#[component]
+fn IncidentRollup(
+    mesh: ReadSignal<Option<MeshApiSnapshot>>,
+    contrib: ReadSignal<Option<ContribStatus>>,
+    probes: ReadSignal<PlaybackProbeState>,
+) -> impl IntoView {
+    view! {
+        <section class="band incident-rollup">
+            <div class="incident-head">
+                <h2>"Incidents"</h2>
+                <span>{move || {
+                    let mesh_snapshot = mesh.get();
+                    let contrib_status = contrib.get();
+                    let probes = probes.get();
+                    incident_detail_text(&mesh_snapshot, &contrib_status, &probes)
+                }}</span>
+            </div>
+            <div class="incident-list">
+                <For
+                    each=move || {
+                        let mesh_snapshot = mesh.get();
+                        let contrib_status = contrib.get();
+                        let probes = probes.get();
+                        build_incidents(&mesh_snapshot, &contrib_status, &probes)
+                            .into_iter()
+                            .take(12)
+                            .collect::<Vec<_>>()
+                    }
+                    key=|incident| incident.key()
+                    let(incident)
+                >
+                    <div class=incident.class_name()>
+                        <strong>{incident.source.clone()}</strong>
+                        <span>{incident.code.clone()}</span>
+                        <p>{incident.message.clone()}</p>
+                        <small>{incident.meta_text()}</small>
+                    </div>
+                </For>
+            </div>
+            <Show when=move || {
+                let mesh_snapshot = mesh.get();
+                let contrib_status = contrib.get();
+                let probes = probes.get();
+                build_incidents(&mesh_snapshot, &contrib_status, &probes).is_empty()
+            }>
+                <p class="incident-empty">{move || {
+                    let mesh_snapshot = mesh.get();
+                    let contrib_status = contrib.get();
+                    let probes = probes.get();
+                    incident_empty_text(&mesh_snapshot, &contrib_status, &probes)
+                }}</p>
+            </Show>
+        </section>
     }
 }
 
@@ -1504,6 +1577,158 @@ impl PlaylistProbe {
             parts.push(content_type.clone());
         }
         parts.join(" / ")
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Incident {
+    level: String,
+    source: String,
+    code: String,
+    message: String,
+    detail: String,
+    count: u64,
+    last_seen_unix_ms: Option<u64>,
+}
+
+impl Incident {
+    fn class_name(&self) -> String {
+        format!("incident {}", self.level)
+    }
+
+    fn key(&self) -> String {
+        format!("{}:{}:{}", self.source, self.code, self.message)
+    }
+
+    fn meta_text(&self) -> String {
+        let mut parts = vec![format!("{} seen", self.count)];
+        parts.push(optional_unix_age(self.last_seen_unix_ms));
+        if !self.detail.is_empty() {
+            parts.push(self.detail.clone());
+        }
+        parts.join(" / ")
+    }
+}
+
+fn build_incidents(
+    mesh: &Option<MeshApiSnapshot>,
+    contrib: &Option<ContribStatus>,
+    probes: &PlaybackProbeState,
+) -> Vec<Incident> {
+    let mut incidents = Vec::new();
+
+    if let Some(mesh) = mesh {
+        incidents.extend(mesh.alerts.iter().map(|alert| Incident {
+            level: normalize_incident_level(&alert.level),
+            source: "mesh".to_owned(),
+            code: alert.code.clone(),
+            message: alert.message.clone(),
+            detail: format!("local {}", mesh.node.node_id),
+            count: alert.count.max(1),
+            last_seen_unix_ms: alert.last_seen_unix_ms,
+        }));
+    }
+
+    if let Some(contrib) = contrib {
+        incidents.extend(contrib.alerts.iter().map(|alert| Incident {
+            level: normalize_incident_level(&alert.level),
+            source: "contrib".to_owned(),
+            code: alert.code.clone(),
+            message: alert.message.clone(),
+            detail: format!("stream {}", contrib.advertised_hls_stream_id),
+            count: alert.count.max(1),
+            last_seen_unix_ms: alert.last_seen_unix_ms,
+        }));
+    }
+
+    incidents.extend(
+        probes
+            .probes
+            .iter()
+            .filter(|probe| !probe.ok)
+            .map(|probe| Incident {
+                level: "error".to_owned(),
+                source: "playback".to_owned(),
+                code: "playlist_probe_failed".to_owned(),
+                message: format!("{} {}", probe.label, probe.status_text()),
+                detail: probe.meta_text(),
+                count: 1,
+                last_seen_unix_ms: nonzero_u64(probes.updated_unix_ms),
+            }),
+    );
+
+    incidents.sort_by(|left, right| {
+        incident_level_rank(&left.level)
+            .cmp(&incident_level_rank(&right.level))
+            .then_with(|| {
+                right
+                    .last_seen_unix_ms
+                    .unwrap_or_default()
+                    .cmp(&left.last_seen_unix_ms.unwrap_or_default())
+            })
+            .then_with(|| left.source.cmp(&right.source))
+            .then_with(|| left.code.cmp(&right.code))
+    });
+    incidents
+}
+
+fn incident_count_text(
+    mesh: &Option<MeshApiSnapshot>,
+    contrib: &Option<ContribStatus>,
+    probes: &PlaybackProbeState,
+) -> String {
+    build_incidents(mesh, contrib, probes).len().to_string()
+}
+
+fn incident_detail_text(
+    mesh: &Option<MeshApiSnapshot>,
+    contrib: &Option<ContribStatus>,
+    probes: &PlaybackProbeState,
+) -> String {
+    let incidents = build_incidents(mesh, contrib, probes);
+    if incidents.is_empty() {
+        return incident_empty_text(mesh, contrib, probes);
+    }
+    let errors = incidents
+        .iter()
+        .filter(|incident| incident.level == "error")
+        .count();
+    let warnings = incidents
+        .iter()
+        .filter(|incident| incident.level == "warn")
+        .count();
+    let info = incidents
+        .len()
+        .saturating_sub(errors)
+        .saturating_sub(warnings);
+    format!("{errors} errors / {warnings} warnings / {info} info")
+}
+
+fn incident_empty_text(
+    mesh: &Option<MeshApiSnapshot>,
+    contrib: &Option<ContribStatus>,
+    probes: &PlaybackProbeState,
+) -> String {
+    if mesh.is_none() && contrib.is_none() && probes.probes.is_empty() {
+        "waiting for feeds".to_owned()
+    } else {
+        "no active incidents".to_owned()
+    }
+}
+
+fn normalize_incident_level(level: &str) -> String {
+    match level {
+        "error" | "warn" | "info" => level.to_owned(),
+        "warning" => "warn".to_owned(),
+        _ => "info".to_owned(),
+    }
+}
+
+fn incident_level_rank(level: &str) -> u8 {
+    match level {
+        "error" => 0,
+        "warn" => 1,
+        _ => 2,
     }
 }
 
