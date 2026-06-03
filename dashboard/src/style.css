@@ -424,6 +424,12 @@ main {
   fill: #fff8ee;
 }
 
+.topology-node.stale circle {
+  stroke: var(--amber);
+  stroke-dasharray: 5 4;
+  fill: #fff8ee;
+}
+
 .topology-node.error circle {
   stroke: var(--red);
   fill: #fff1f1;

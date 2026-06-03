@@ -1130,7 +1130,7 @@ fn TopologyGraph(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
                     </g>
                 </For>
             </svg>
-            <Show when=move || mesh.get().map(|m| m.nodes.is_empty()).unwrap_or(true)>
+            <Show when=move || build_topology_graph(mesh.get()).nodes.is_empty()>
                 <div class="topology-empty">"waiting for mesh topology"</div>
             </Show>
         </div>
@@ -2842,6 +2842,7 @@ struct TopologyGraphNode {
     node_id: String,
     region: String,
     active_streams: u64,
+    stale_age_ms: Option<u64>,
     severity: TopologyNodeSeverity,
     x: f64,
     y: f64,
@@ -2857,7 +2858,11 @@ impl TopologyGraphNode {
     }
 
     fn detail_text(&self) -> String {
-        format!("{} / {} active", self.region, self.active_streams)
+        if let Some(age_ms) = self.stale_age_ms {
+            format!("{} / stale {}", self.region, format_duration_ms_plain(age_ms))
+        } else {
+            format!("{} / {} active", self.region, self.active_streams)
+        }
     }
 
     fn class_name(&self) -> String {
@@ -2869,6 +2874,7 @@ impl TopologyGraphNode {
 enum TopologyNodeSeverity {
     Idle,
     Active,
+    Stale,
     Warn,
     Error,
 }
@@ -2878,6 +2884,7 @@ impl TopologyNodeSeverity {
         match self {
             Self::Idle => "idle",
             Self::Active => "active",
+            Self::Stale => "stale",
             Self::Warn => "warn",
             Self::Error => "error",
         }
@@ -2908,18 +2915,53 @@ fn build_topology_graph(snapshot: Option<MeshApiSnapshot>) -> TopologyGraphData 
     let Some(snapshot) = snapshot else {
         return TopologyGraphData::default();
     };
-    let mut nodes = snapshot.nodes;
-    nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    let live_ids = snapshot
+        .nodes
+        .iter()
+        .map(|node| node.node_id.clone())
+        .collect::<HashSet<_>>();
+    let mut graph_nodes = snapshot
+        .nodes
+        .into_iter()
+        .map(|node| {
+            let severity = topology_node_severity(&node);
+            TopologyGraphNode {
+                node_id: node.node_id,
+                region: node.region,
+                active_streams: node.active_streams,
+                stale_age_ms: None,
+                severity,
+                x: 0.0,
+                y: 0.0,
+            }
+        })
+        .collect::<Vec<_>>();
+    graph_nodes.extend(
+        snapshot
+            .telemetry
+            .stale_nodes
+            .into_iter()
+            .filter(|node| !live_ids.contains(&node.node_id))
+            .map(|node| TopologyGraphNode {
+                node_id: node.node_id,
+                region: node.region,
+                active_streams: 0,
+                stale_age_ms: Some(node.age_ms),
+                severity: TopologyNodeSeverity::Stale,
+                x: 0.0,
+                y: 0.0,
+            }),
+    );
+    graph_nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
 
-    let count = nodes.len().max(1);
+    let count = graph_nodes.len().max(1);
     let center_x = 360.0;
     let center_y = 124.0;
     let radius_x = 270.0;
     let radius_y = 78.0;
-    let mut graph_nodes = Vec::with_capacity(nodes.len());
-    let mut positions = HashMap::with_capacity(nodes.len());
+    let mut positions = HashMap::with_capacity(graph_nodes.len());
 
-    for (index, node) in nodes.into_iter().enumerate() {
+    for (index, node) in graph_nodes.iter_mut().enumerate() {
         let (x, y) = if count == 1 {
             (center_x, center_y)
         } else {
@@ -2930,16 +2972,9 @@ fn build_topology_graph(snapshot: Option<MeshApiSnapshot>) -> TopologyGraphData 
                 center_y + angle.sin() * radius_y,
             )
         };
-        let severity = topology_node_severity(&node);
         positions.insert(node.node_id.clone(), (x, y));
-        graph_nodes.push(TopologyGraphNode {
-            node_id: node.node_id,
-            region: node.region,
-            active_streams: node.active_streams,
-            severity,
-            x,
-            y,
-        });
+        node.x = x;
+        node.y = y;
     }
 
     let links = snapshot
