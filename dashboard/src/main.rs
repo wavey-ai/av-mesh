@@ -373,6 +373,24 @@ fn App() -> impl IntoView {
                     </section>
                 </div>
 
+                <div class="workspace activity-workspace">
+                    <section class="panel">
+                        <div class="panel-head">
+                            <h2>"Mesh Activity"</h2>
+                            <span>{move || mesh.get().map(|m| format!("{} events", m.activity.len())).unwrap_or_else(|| "0 events".to_owned())}</span>
+                        </div>
+                        <MeshActivityList mesh />
+                    </section>
+
+                    <section class="panel">
+                        <div class="panel-head">
+                            <h2>"Contrib Activity"</h2>
+                            <span>{move || contrib.get().map(|c| format!("{} events", c.activity.len())).unwrap_or_else(|| "0 events".to_owned())}</span>
+                        </div>
+                        <ContribActivityList contrib />
+                    </section>
+                </div>
+
                 <section class="panel">
                     <div class="panel-head">
                         <h2>"Edges"</h2>
@@ -524,6 +542,47 @@ fn MeshAlertList(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
                     <small>{format!("{} seen / {}", alert.count, optional_unix_age(alert.last_seen_unix_ms))}</small>
                 </div>
             </For>
+        </div>
+    }
+}
+
+#[component]
+fn MeshActivityList(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
+    view! {
+        <div class="activity-list">
+            <For
+                each=move || mesh.get().map(|m| m.activity).unwrap_or_default()
+                key=|activity| activity.key()
+                let(activity)
+            >
+                <ActivityRow activity />
+            </For>
+        </div>
+    }
+}
+
+#[component]
+fn ContribActivityList(contrib: ReadSignal<Option<ContribStatus>>) -> impl IntoView {
+    view! {
+        <div class="activity-list">
+            <For
+                each=move || contrib.get().map(|c| c.activity).unwrap_or_default()
+                key=|activity| activity.key()
+                let(activity)
+            >
+                <ActivityRow activity />
+            </For>
+        </div>
+    }
+}
+
+#[component]
+fn ActivityRow(activity: ActivityItem) -> impl IntoView {
+    view! {
+        <div class=format!("activity {}", activity.level.clone())>
+            <strong>{activity.code.clone()}</strong>
+            <span>{activity.message.clone()}</span>
+            <small>{activity.meta_text()}</small>
         </div>
     }
 }
@@ -833,6 +892,10 @@ fn optional_u64(value: Option<u64>) -> String {
         .unwrap_or_else(|| "-".to_owned())
 }
 
+fn nonzero_u64(value: u64) -> Option<u64> {
+    (value != 0).then_some(value)
+}
+
 fn optional_age(value: Option<u64>) -> String {
     value
         .map(format_duration_ms)
@@ -924,6 +987,8 @@ struct MeshApiSnapshot {
     aggregate: AggregateMetrics,
     #[serde(default)]
     alerts: Vec<MeshAlert>,
+    #[serde(default)]
+    activity: Vec<ActivityItem>,
     #[serde(default)]
     orchestration: OrchestrationStatus,
     #[serde(default)]
@@ -1028,6 +1093,60 @@ struct MeshAlert {
     count: u64,
     #[serde(default)]
     last_seen_unix_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ActivityItem {
+    #[serde(default)]
+    level: String,
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    count: u64,
+    #[serde(default)]
+    seen_unix_ms: u64,
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    stream_id_text: Option<String>,
+    #[serde(default)]
+    bytes: Option<u64>,
+    #[serde(default)]
+    datagrams: Option<u64>,
+    #[serde(default)]
+    sequence: Option<u64>,
+}
+
+impl ActivityItem {
+    fn key(&self) -> String {
+        format!("{}:{}:{}", self.seen_unix_ms, self.code, self.message)
+    }
+
+    fn meta_text(&self) -> String {
+        let mut parts = Vec::new();
+        parts.push(optional_unix_age(nonzero_u64(self.seen_unix_ms)));
+        if let Some(node_id) = &self.node_id {
+            parts.push(format!("node {node_id}"));
+        }
+        if let Some(stream_id) = &self.stream_id_text {
+            parts.push(format!("stream {stream_id}"));
+        }
+        if let Some(bytes) = self.bytes {
+            parts.push(format_bytes(bytes));
+        }
+        if let Some(datagrams) = self.datagrams {
+            parts.push(format!("{datagrams} datagrams"));
+        }
+        if let Some(sequence) = self.sequence {
+            parts.push(format!("seq {sequence}"));
+        }
+        if self.count > 1 {
+            parts.push(format!("{} seen", self.count));
+        }
+        parts.join(" / ")
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1142,6 +1261,8 @@ struct ContribStatus {
     runtime: ContribRuntimeStatus,
     #[serde(default)]
     alerts: Vec<ContribAlert>,
+    #[serde(default)]
+    activity: Vec<ActivityItem>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

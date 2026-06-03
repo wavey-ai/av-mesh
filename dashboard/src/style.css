@@ -285,6 +285,7 @@ main {
 .listener-list,
 .commands,
 .alert-list,
+.activity-list,
 .edge-grid {
   display: grid;
   gap: 8px;
@@ -365,6 +366,37 @@ main {
 }
 
 .alert small {
+  grid-column: 1 / -1;
+  color: var(--muted);
+}
+
+.activity {
+  display: grid;
+  grid-template-columns: minmax(118px, 0.7fr) minmax(0, 1.5fr);
+  gap: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 9px 10px;
+  background: #fff;
+}
+
+.activity.warn {
+  border-left: 4px solid var(--amber);
+}
+
+.activity.error {
+  border-left: 4px solid var(--red);
+}
+
+.activity.info {
+  border-left: 4px solid var(--blue);
+}
+
+.activity span {
+  overflow-wrap: anywhere;
+}
+
+.activity small {
   grid-column: 1 / -1;
   color: var(--muted);
 }

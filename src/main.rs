@@ -73,6 +73,7 @@ const RAW_MESH_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MESH_STORAGE_WARN_PCT: u64 = 85;
 const MESH_STORAGE_ERROR_PCT: u64 = 95;
 const MESH_MIN_STALE_INGEST_ALERT_MS: u64 = 5_000;
+const MESH_ACTIVITY_LIMIT: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LiveMediaKind {
@@ -1851,6 +1852,7 @@ struct MeshApiSnapshot {
     planned_replicas: Vec<ReplicaPlacementSnapshot>,
     aggregate: AggregateMetrics,
     alerts: Vec<MeshAlert>,
+    activity: Vec<MeshActivity>,
     orchestration: OrchestrationStatus,
     nodes: Vec<MeshNode>,
     edge_services: Vec<EdgeServiceSnapshot>,
@@ -1910,6 +1912,19 @@ struct MeshAlert {
     message: String,
     count: u64,
     last_seen_unix_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_id_text: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct MeshActivity {
+    level: &'static str,
+    code: String,
+    message: String,
+    count: u64,
+    seen_unix_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     node_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2348,6 +2363,7 @@ impl MeshApiSnapshot {
             &local.stream,
             &recent_commands,
         );
+        let activity = derive_mesh_activity(&aggregate, &alerts, &recent_commands);
 
         MeshApiSnapshot {
             updated_unix_ms: now_unix_ms(),
@@ -2359,6 +2375,7 @@ impl MeshApiSnapshot {
             planned_replicas,
             aggregate,
             alerts,
+            activity,
             orchestration,
             nodes,
             edge_services,
@@ -2540,6 +2557,92 @@ fn derive_mesh_alerts(
     }
 
     alerts
+}
+
+fn derive_mesh_activity(
+    aggregate: &AggregateMetrics,
+    alerts: &[MeshAlert],
+    recent_commands: &[ControlCommand],
+) -> Vec<MeshActivity> {
+    let now = now_unix_ms();
+    let mut activity = Vec::with_capacity(1 + alerts.len() + recent_commands.len());
+
+    activity.push(MeshActivity {
+        level: "info",
+        code: "mesh_snapshot".into(),
+        message: format!(
+            "Mesh sees {} node(s), {} link(s), and {} active stream(s).",
+            aggregate.node_count, aggregate.connection_count, aggregate.active_streams
+        ),
+        count: aggregate.node_count as u64,
+        seen_unix_ms: now,
+        node_id: None,
+        stream_id_text: None,
+    });
+
+    activity.extend(alerts.iter().map(|alert| MeshActivity {
+        level: alert.level,
+        code: alert.code.into(),
+        message: alert.message.clone(),
+        count: alert.count,
+        seen_unix_ms: alert.last_seen_unix_ms.unwrap_or(now),
+        node_id: alert.node_id.clone(),
+        stream_id_text: alert.stream_id_text.clone(),
+    }));
+
+    activity.extend(recent_commands.iter().map(|command| {
+        let status = command.status.to_ascii_lowercase();
+        let level = if status.contains("failed")
+            || status.contains("timed out")
+            || status.contains("error")
+        {
+            "error"
+        } else if status.contains("skipped") {
+            "warn"
+        } else {
+            "info"
+        };
+        MeshActivity {
+            level,
+            code: control_kind_code(command.kind).into(),
+            message: format!(
+                "{} command {}.",
+                control_kind_label(command.kind),
+                command.status
+            ),
+            count: 1,
+            seen_unix_ms: command.created_unix_ms,
+            node_id: command.node_id.clone(),
+            stream_id_text: command.stream_id_text.clone(),
+        }
+    }));
+
+    activity.sort_by(|left, right| {
+        right
+            .seen_unix_ms
+            .cmp(&left.seen_unix_ms)
+            .then_with(|| left.code.cmp(&right.code))
+    });
+    activity.truncate(MESH_ACTIVITY_LIMIT);
+    activity
+}
+
+fn control_kind_code(kind: ControlKind) -> &'static str {
+    match kind {
+        ControlKind::ProvisionNode => "provision_node",
+        ControlKind::CloseNode => "close_node",
+        ControlKind::WarmStream => "warm_stream",
+        ControlKind::ReplicaRequest => "replica_request",
+    }
+}
+
+fn control_kind_label(kind: ControlKind) -> &'static str {
+    match kind {
+        ControlKind::ProvisionNode => "Provision node",
+        ControlKind::CloseNode => "Close node",
+        ControlKind::WarmStream => "Warm stream",
+        ControlKind::ReplicaRequest => "Replica request",
+    }
 }
 
 fn storage_percent(node: &MeshNode) -> u64 {
@@ -5791,12 +5894,21 @@ mod tests {
             .iter()
             .map(|alert| alert["code"].as_str().unwrap())
             .collect::<HashSet<_>>();
+        let activity_codes = json["activity"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|activity| activity["code"].as_str().unwrap())
+            .collect::<HashSet<_>>();
 
         assert_eq!(response.status, StatusCode::OK);
         assert!(alert_codes.contains("mesh_unknown_peers"));
         assert!(alert_codes.contains("edge_playback_missing"));
         assert!(alert_codes.contains("storage_exhausted"));
         assert!(alert_codes.contains("control_skipped"));
+        assert!(activity_codes.contains("mesh_snapshot"));
+        assert!(activity_codes.contains("storage_exhausted"));
+        assert!(activity_codes.contains("provision_node"));
         mesh.shutdown();
     }
 
