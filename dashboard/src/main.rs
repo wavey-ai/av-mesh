@@ -401,7 +401,7 @@ fn App() -> impl IntoView {
                             <h2>"Contributor"</h2>
                             <span>{move || contrib.get().map(|c| c.status).unwrap_or_else(|| "waiting".to_owned())}</span>
                         </div>
-                        <ContribView contrib />
+                        <ContribView contrib rates=contrib_rates />
                     </section>
                 </div>
 
@@ -609,7 +609,10 @@ fn NodeTile(node: MeshNode) -> impl IntoView {
 }
 
 #[component]
-fn ContribView(contrib: ReadSignal<Option<ContribStatus>>) -> impl IntoView {
+fn ContribView(
+    contrib: ReadSignal<Option<ContribStatus>>,
+    rates: ReadSignal<ContribRateSnapshot>,
+) -> impl IntoView {
     view! {
         <div class="contrib">
             <div class="kv">
@@ -639,7 +642,7 @@ fn ContribView(contrib: ReadSignal<Option<ContribStatus>>) -> impl IntoView {
             </div>
             <ContribHlsResponses contrib />
             <ContribIngestSessions contrib />
-            <ContribProtocolRuntime contrib />
+            <ContribProtocolRuntime contrib rates />
             <div class="listener-list">
                 <For
                     each=move || contrib.get().map(|c| c.listeners).unwrap_or_default()
@@ -671,7 +674,10 @@ fn ContribView(contrib: ReadSignal<Option<ContribStatus>>) -> impl IntoView {
 }
 
 #[component]
-fn ContribProtocolRuntime(contrib: ReadSignal<Option<ContribStatus>>) -> impl IntoView {
+fn ContribProtocolRuntime(
+    contrib: ReadSignal<Option<ContribStatus>>,
+    rates: ReadSignal<ContribRateSnapshot>,
+) -> impl IntoView {
     view! {
         <div class="protocol-list">
             <For
@@ -679,11 +685,29 @@ fn ContribProtocolRuntime(contrib: ReadSignal<Option<ContribStatus>>) -> impl In
                 key=|protocol| protocol.protocol.clone()
                 let(protocol)
             >
-                <div class=protocol.class_name()>
-                    <strong>{protocol.protocol.clone()}</strong>
-                    <span>{protocol.summary_text()}</span>
-                    <small>{protocol.meta_text()}</small>
-                </div>
+                {
+                    let class_name = protocol.class_name();
+                    let protocol_label = protocol.protocol.clone();
+                    let summary_protocol = protocol.clone();
+                    let meta_protocol = protocol.clone();
+                    view! {
+                        <div class=class_name>
+                            <strong>{protocol_label}</strong>
+                            <span>{move || {
+                                let rate = rates.get().protocols.get(&summary_protocol.protocol).copied();
+                                format!(
+                                    "{} / {}",
+                                    summary_protocol.summary_text(),
+                                    summary_protocol.rate_text(rate)
+                                )
+                            }}</span>
+                            <small>{move || {
+                                let rate = rates.get().protocols.get(&meta_protocol.protocol).copied();
+                                meta_protocol.meta_text(rate)
+                            }}</small>
+                        </div>
+                    }
+                }
             </For>
         </div>
     }
@@ -1307,7 +1331,7 @@ fn accept_contrib_snapshot(
 ) {
     let sample = ContribRateSample::from_snapshot(&snapshot);
     if let Some(previous) = last_sample.get() {
-        set_rates.set(ContribRateSnapshot::from_delta(previous, sample));
+        set_rates.set(ContribRateSnapshot::from_delta(previous, sample.clone()));
     }
     set_last_sample.set(Some(sample));
     set_contrib.set(Some(snapshot));
@@ -2127,13 +2151,14 @@ impl MeshRateSnapshot {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct ContribRateSample {
     sampled_unix_ms: u64,
     input_bytes: u64,
     input_datagrams: u64,
     output_bytes: u64,
     output_parts: u64,
+    protocols: HashMap<String, ProtocolRateCounters>,
 }
 
 impl ContribRateSample {
@@ -2154,11 +2179,54 @@ impl ContribRateSample {
                 .saturating_add(snapshot.runtime.media_access_units.datagrams),
             output_bytes: snapshot.runtime.fmp4.bytes,
             output_parts: snapshot.runtime.fmp4.parts,
+            protocols: snapshot
+                .runtime
+                .protocols
+                .iter()
+                .map(|protocol| {
+                    (
+                        protocol.protocol.clone(),
+                        ProtocolRateCounters {
+                            units: protocol.units,
+                            bytes: protocol.bytes,
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+struct ProtocolRateCounters {
+    units: u64,
+    bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ProtocolRateSnapshot {
+    ready: bool,
+    window_ms: u64,
+    units_per_sec: f64,
+    bytes_per_sec: f64,
+}
+
+impl ProtocolRateSnapshot {
+    fn from_delta(
+        previous: ProtocolRateCounters,
+        current: ProtocolRateCounters,
+        window_ms: u64,
+    ) -> Self {
+        Self {
+            ready: window_ms >= 250,
+            window_ms,
+            units_per_sec: counter_rate(previous.units, current.units, window_ms),
+            bytes_per_sec: counter_rate(previous.bytes, current.bytes, window_ms),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 struct ContribRateSnapshot {
     ready: bool,
     window_ms: u64,
@@ -2166,6 +2234,7 @@ struct ContribRateSnapshot {
     input_datagrams_per_sec: f64,
     output_bytes_per_sec: f64,
     output_parts_per_sec: f64,
+    protocols: HashMap<String, ProtocolRateSnapshot>,
 }
 
 impl ContribRateSnapshot {
@@ -2192,6 +2261,21 @@ impl ContribRateSnapshot {
                 current.output_parts,
                 window_ms,
             ),
+            protocols: current
+                .protocols
+                .iter()
+                .map(|(protocol, current)| {
+                    let previous = previous
+                        .protocols
+                        .get(protocol)
+                        .copied()
+                        .unwrap_or_default();
+                    (
+                        protocol.clone(),
+                        ProtocolRateSnapshot::from_delta(previous, *current, window_ms),
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -3235,13 +3319,30 @@ impl ProtocolRuntime {
         format!("{} units / {}", self.units, format_bytes(self.bytes))
     }
 
-    fn meta_text(&self) -> String {
+    fn rate_text(&self, rate: Option<ProtocolRateSnapshot>) -> String {
+        let Some(rate) = rate else {
+            return "rate waiting".to_owned();
+        };
+        if !rate.ready {
+            return "rate waiting".to_owned();
+        }
         format!(
-            "{} active / {} ended / {}",
-            self.active_sessions,
-            self.ended_sessions,
-            optional_age(self.last_seen_age_ms)
+            "{} / {}",
+            format_bytes_per_sec(true, rate.bytes_per_sec),
+            format_count_per_sec(rate.units_per_sec, "units")
         )
+    }
+
+    fn meta_text(&self, rate: Option<ProtocolRateSnapshot>) -> String {
+        let mut parts = vec![
+            format!("{} active", self.active_sessions),
+            format!("{} ended", self.ended_sessions),
+            optional_age(self.last_seen_age_ms),
+        ];
+        if let Some(rate) = rate.filter(|rate| rate.ready) {
+            parts.push(format_rate_window(rate.window_ms));
+        }
+        parts.join(" / ")
     }
 }
 
