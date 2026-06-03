@@ -105,7 +105,7 @@ fn App() -> impl IntoView {
                     <Metric label="nodes" value=move || mesh.get().map(|m| m.aggregate.node_count.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || mesh.get().map(|m| format!("{} links / local {}", m.aggregate.connection_count, m.node.node_id)).unwrap_or_default() />
                     <Metric label="storage" value=move || mesh.get().map(|m| format_bytes(m.aggregate.used_storage_bytes)).unwrap_or_else(|| "-".to_owned()) detail=move || mesh.get().map(|m| format!("of {}", format_bytes(m.aggregate.total_storage_bytes))).unwrap_or_default() />
                     <Metric label="egress" value=move || mesh.get().map(|m| format_bps(m.aggregate.total_egress_capacity_bps)).unwrap_or_else(|| "-".to_owned()) detail=move || mesh.get().map(|m| format!("{} ingress / {} active", m.aggregate.contributor_streams, m.aggregate.active_streams)).unwrap_or_default() />
-                    <Metric label="ingest" value=move || contrib.get().map(|c| enabled_listener_count(&c).to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("stream {}", c.advertised_hls_stream_id)).unwrap_or_default() />
+                    <Metric label="ingest" value=move || contrib.get().map(|c| c.runtime.fmp4.parts.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} listeners / {} publish errors", enabled_listener_count(&c), c.runtime.fmp4.publish_errors)).unwrap_or_default() />
                 </section>
 
                 <div class="workspace">
@@ -246,7 +246,7 @@ fn ContribView(contrib: ReadSignal<Option<ContribStatus>>) -> impl IntoView {
         <div class="contrib">
             <div class="kv">
                 <span>"advertised hls"</span>
-                <strong>{move || contrib.get().map(|c| c.advertised_hls_path).unwrap_or_else(|| "-".to_owned())}</strong>
+                <strong>{move || contrib.get().map(|c| format!("{} (stream {})", c.advertised_hls_path, c.advertised_hls_stream_id)).unwrap_or_else(|| "-".to_owned())}</strong>
             </div>
             <div class="kv">
                 <span>"byte fec"</span>
@@ -255,6 +255,14 @@ fn ContribView(contrib: ReadSignal<Option<ContribStatus>>) -> impl IntoView {
             <div class="kv">
                 <span>"media fec"</span>
                 <strong>{move || contrib.get().map(|c| c.mesh.media_fec_target).unwrap_or_else(|| "-".to_owned())}</strong>
+            </div>
+            <div class="runtime-grid">
+                <RuntimeCell label="raw http" value=move || contrib.get().map(|c| c.runtime.raw_http.requests.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} / {} datagrams / {}", format_bytes(c.runtime.raw_http.bytes), c.runtime.raw_http.datagrams, optional_age(c.runtime.raw_http.last_seen_age_ms))).unwrap_or_default() />
+                <RuntimeCell label="media au" value=move || contrib.get().map(|c| c.runtime.media_access_units.requests.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} / {} datagrams / {}", format_bytes(c.runtime.media_access_units.payload_bytes), c.runtime.media_access_units.datagrams, optional_age(c.runtime.media_access_units.last_seen_age_ms))).unwrap_or_default() />
+                <RuntimeCell label="mpeg-ts" value=move || contrib.get().map(|c| c.runtime.mpeg_ts.slots.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} / {}", format_bytes(c.runtime.mpeg_ts.bytes), optional_age(c.runtime.mpeg_ts.last_seen_age_ms))).unwrap_or_default() />
+                <RuntimeCell label="rtmp" value=move || contrib.get().map(|c| c.runtime.rtmp.access_units.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} / {}", format_bytes(c.runtime.rtmp.bytes), optional_age(c.runtime.rtmp.last_seen_age_ms))).unwrap_or_default() />
+                <RuntimeCell label="fmp4" value=move || contrib.get().map(|c| c.runtime.fmp4.parts.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} media / {} init / {}", format_bytes(c.runtime.fmp4.bytes), format_bytes(c.runtime.fmp4.init_bytes), optional_age(c.runtime.fmp4.last_publish_age_ms))).unwrap_or_default() />
+                <RuntimeCell label="errors" value=move || contrib.get().map(|c| c.runtime.fmp4.publish_errors.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} alerts", c.alerts.len())).unwrap_or_default() />
             </div>
             <div class="listener-list">
                 <For
@@ -269,6 +277,34 @@ fn ContribView(contrib: ReadSignal<Option<ContribStatus>>) -> impl IntoView {
                     </div>
                 </For>
             </div>
+            <div class="alert-list">
+                <For
+                    each=move || contrib.get().map(|c| c.alerts).unwrap_or_default()
+                    key=|alert| format!("{}:{}", alert.code, alert.message)
+                    let(alert)
+                >
+                    <div class=format!("alert {}", alert.level)>
+                        <strong>{alert.code}</strong>
+                        <span>{alert.message}</span>
+                        <small>{format!("{} seen / {}", alert.count, optional_unix_age(alert.last_seen_unix_ms))}</small>
+                    </div>
+                </For>
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn RuntimeCell<V, D>(label: &'static str, value: V, detail: D) -> impl IntoView
+where
+    V: Fn() -> String + Send + Sync + 'static,
+    D: Fn() -> String + Send + Sync + 'static,
+{
+    view! {
+        <div class="runtime-cell">
+            <span>{label}</span>
+            <strong>{value}</strong>
+            <small>{detail}</small>
         </div>
     }
 }
@@ -498,6 +534,26 @@ fn optional_u64(value: Option<u64>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "-".to_owned())
+}
+
+fn optional_age(value: Option<u64>) -> String {
+    value
+        .map(format_duration_ms)
+        .unwrap_or_else(|| "never".to_owned())
+}
+
+fn optional_unix_age(value: Option<u64>) -> String {
+    value.map(age_text).unwrap_or_else(|| "config".to_owned())
+}
+
+fn format_duration_ms(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{ms}ms ago")
+    } else if ms < 60_000 {
+        format!("{}s ago", ms / 1_000)
+    } else {
+        format!("{}m ago", ms / 60_000)
+    }
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -749,6 +805,10 @@ struct ContribStatus {
     mesh: ContribMeshStatus,
     #[serde(default)]
     listeners: Vec<ListenerStatus>,
+    #[serde(default)]
+    runtime: ContribRuntimeStatus,
+    #[serde(default)]
+    alerts: Vec<ContribAlert>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -769,4 +829,90 @@ struct ListenerStatus {
     bind: Option<String>,
     #[serde(default)]
     output_stream_id: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ContribRuntimeStatus {
+    #[serde(default)]
+    raw_http: RawHttpRuntime,
+    #[serde(default)]
+    media_access_units: MediaRuntime,
+    #[serde(default)]
+    mpeg_ts: MpegTsRuntime,
+    #[serde(default)]
+    rtmp: RtmpRuntime,
+    #[serde(default)]
+    fmp4: Fmp4Runtime,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct RawHttpRuntime {
+    #[serde(default)]
+    requests: u64,
+    #[serde(default)]
+    bytes: u64,
+    #[serde(default)]
+    datagrams: u64,
+    #[serde(default)]
+    last_seen_age_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct MediaRuntime {
+    #[serde(default)]
+    requests: u64,
+    #[serde(default)]
+    payload_bytes: u64,
+    #[serde(default)]
+    datagrams: u64,
+    #[serde(default)]
+    last_seen_age_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct MpegTsRuntime {
+    #[serde(default)]
+    slots: u64,
+    #[serde(default)]
+    bytes: u64,
+    #[serde(default)]
+    last_seen_age_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct RtmpRuntime {
+    #[serde(default)]
+    access_units: u64,
+    #[serde(default)]
+    bytes: u64,
+    #[serde(default)]
+    last_seen_age_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct Fmp4Runtime {
+    #[serde(default)]
+    parts: u64,
+    #[serde(default)]
+    bytes: u64,
+    #[serde(default)]
+    init_bytes: u64,
+    #[serde(default)]
+    publish_errors: u64,
+    #[serde(default)]
+    last_publish_age_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ContribAlert {
+    #[serde(default)]
+    level: String,
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    count: u64,
+    #[serde(default)]
+    last_seen_unix_ms: Option<u64>,
 }

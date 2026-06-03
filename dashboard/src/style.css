@@ -284,9 +284,35 @@ main {
 
 .listener-list,
 .commands,
+.alert-list,
 .edge-grid {
   display: grid;
   gap: 8px;
+}
+
+.runtime-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.runtime-cell {
+  display: grid;
+  gap: 2px;
+  min-height: 72px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 9px 10px;
+  background: #fff;
+}
+
+.runtime-cell span,
+.runtime-cell small {
+  color: var(--muted);
+}
+
+.runtime-cell strong {
+  font-size: 20px;
 }
 
 .listener {
@@ -299,6 +325,33 @@ main {
 
 .listener.on {
   border-left: 4px solid var(--green);
+}
+
+.alert {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.8fr) minmax(0, 1.4fr);
+  gap: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 9px 10px;
+  background: #fff;
+}
+
+.alert.warn {
+  border-left: 4px solid var(--amber);
+}
+
+.alert.error {
+  border-left: 4px solid var(--red);
+}
+
+.alert.info {
+  border-left: 4px solid var(--blue);
+}
+
+.alert small {
+  grid-column: 1 / -1;
+  color: var(--muted);
 }
 
 .table {
@@ -406,7 +459,8 @@ main {
   }
 
   .endpoint-grid,
-  .control-grid {
+  .control-grid,
+  .runtime-grid {
     grid-template-columns: 1fr;
   }
 
