@@ -366,6 +366,15 @@ async fn main() -> Result<()> {
         let executor = executor.with_linode(args.linode_provision_config());
         executor
     };
+    #[cfg(feature = "private-subnet-discovery")]
+    let private_discovery_status = PrivateDiscoveryStatus::from_args(
+        args.private_subnet_discovery,
+        args.private_discovery_broadcast_port,
+        args.private_discovery_mesh_port
+            .unwrap_or_else(|| args.mesh_bind.port()),
+    );
+    #[cfg(not(feature = "private-subnet-discovery"))]
+    let private_discovery_status = PrivateDiscoveryStatus::unavailable();
     let cache = LiveTsCache::new(
         args.stream_id,
         Duration::from_millis(args.part_ms),
@@ -483,6 +492,7 @@ async fn main() -> Result<()> {
         edge_load.clone(),
         provision_executor.clone(),
         telemetry_peer_monitor.clone(),
+        private_discovery_status,
     );
     let telemetry_collector_tasks = start_telemetry_collectors(
         args.telemetry_peers.clone(),
@@ -1968,6 +1978,7 @@ struct OrchestrationStatus {
     control_dispatch_ready: bool,
     provision: ProvisionStatus,
     telemetry_peers: Vec<TelemetryPeerStatus>,
+    private_discovery: PrivateDiscoveryStatus,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -1983,6 +1994,63 @@ struct ProvisionBackendStatus {
     name: String,
     state: &'static str,
     details: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct PrivateDiscoveryStatus {
+    compiled: bool,
+    enabled: bool,
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    broadcast_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mesh_port: Option<u16>,
+    details: Vec<String>,
+}
+
+impl Default for PrivateDiscoveryStatus {
+    fn default() -> Self {
+        Self::unavailable()
+    }
+}
+
+impl PrivateDiscoveryStatus {
+    #[cfg(feature = "private-subnet-discovery")]
+    fn from_args(enabled: bool, broadcast_port: u16, mesh_port: u16) -> Self {
+        if enabled {
+            Self {
+                compiled: true,
+                enabled: true,
+                state: "listening",
+                broadcast_port: Some(broadcast_port),
+                mesh_port: Some(mesh_port),
+                details: vec![
+                    format!("udp-broadcast://0.0.0.0:{broadcast_port}"),
+                    format!("mesh-port={mesh_port}"),
+                ],
+            }
+        } else {
+            Self {
+                compiled: true,
+                enabled: false,
+                state: "available",
+                broadcast_port: None,
+                mesh_port: None,
+                details: vec!["pass --private-subnet-discovery to discover VLAN peers".into()],
+            }
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            compiled: false,
+            enabled: false,
+            state: "unavailable",
+            broadcast_port: None,
+            mesh_port: None,
+            details: vec!["build with --features private-subnet-discovery".into()],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2744,6 +2812,7 @@ impl MeshApiSnapshot {
             &telemetry,
             &orchestration.provision,
             &orchestration.telemetry_peers,
+            &orchestration.private_discovery,
         );
         let activity = derive_mesh_activity(&aggregate, &alerts, &recent_commands);
 
@@ -2801,6 +2870,7 @@ fn derive_mesh_alerts(
     telemetry: &TelemetryHealthSnapshot,
     provision: &ProvisionStatus,
     telemetry_peers: &[TelemetryPeerStatus],
+    private_discovery: &PrivateDiscoveryStatus,
 ) -> Vec<MeshAlert> {
     let now = now_unix_ms();
     let mut alerts = Vec::new();
@@ -2977,6 +3047,18 @@ fn derive_mesh_alerts(
             count: skipped_commands,
             last_seen_unix_ms: last_command_issue,
             node_id: None,
+            stream_id_text: None,
+        });
+    }
+
+    if provision.backends.iter().any(|backend| backend == "linode") && !private_discovery.enabled {
+        alerts.push(MeshAlert {
+            level: "warn",
+            code: "linode_private_discovery_inactive",
+            message: "Linode provisioning is configured, but private-subnet discovery is not active; new VLAN nodes may need explicit seed peers.".into(),
+            count: 1,
+            last_seen_unix_ms: Some(now),
+            node_id: Some(local_node_id.to_owned()),
             stream_id_text: None,
         });
     }
@@ -3933,6 +4015,7 @@ struct AppRouter {
     edge_load: EdgeLoad,
     provision: ProvisionExecutor,
     telemetry_peers: TelemetryPeerMonitor,
+    private_discovery: PrivateDiscoveryStatus,
 }
 
 impl AppRouter {
@@ -3950,6 +4033,7 @@ impl AppRouter {
         edge_load: EdgeLoad,
         provision: ProvisionExecutor,
         telemetry_peers: TelemetryPeerMonitor,
+        private_discovery: PrivateDiscoveryStatus,
     ) -> Self {
         Self {
             cache,
@@ -3965,6 +4049,7 @@ impl AppRouter {
             edge_load,
             provision,
             telemetry_peers,
+            private_discovery,
         }
     }
 
@@ -4020,6 +4105,7 @@ impl AppRouter {
             control_dispatch_ready: self.dispatch.ready().await,
             provision: self.provision.status(),
             telemetry_peers: self.telemetry_peers.snapshot().await,
+            private_discovery: self.private_discovery.clone(),
         }
     }
 
@@ -6861,6 +6947,11 @@ mod tests {
         assert!(!disabled.orchestration.provision.enabled);
         assert!(disabled.orchestration.provision.backends.is_empty());
         assert!(disabled.orchestration.provision.backend_statuses.is_empty());
+        assert!(!disabled.orchestration.private_discovery.enabled);
+        assert_eq!(
+            disabled.orchestration.private_discovery.state,
+            "unavailable"
+        );
 
         let provision = ProvisionExecutor::new(
             Some("printf provision-ready".into()),
@@ -6886,6 +6977,63 @@ mod tests {
             "ready"
         );
         mesh.shutdown();
+    }
+
+    #[test]
+    fn mesh_alerts_when_linode_provisioning_lacks_private_discovery() {
+        let local_stream =
+            telemetry_snapshot_for_tests("uk-local", "uk", "eu", 51.5, -0.1, Vec::new(), 1).stream;
+        let provision = ProvisionStatus {
+            enabled: true,
+            backends: vec!["linode".into()],
+            timeout_ms: 1_000,
+            backend_statuses: Vec::new(),
+        };
+        let private_discovery = PrivateDiscoveryStatus {
+            compiled: true,
+            enabled: false,
+            state: "available",
+            broadcast_port: None,
+            mesh_port: None,
+            details: vec!["pass --private-subnet-discovery".into()],
+        };
+        let alerts = derive_mesh_alerts(
+            &AggregateMetrics {
+                node_count: 2,
+                connection_count: 1,
+                ..AggregateMetrics::default()
+            },
+            &[],
+            &[],
+            &[],
+            &local_stream,
+            "uk-local",
+            &[],
+            &[],
+            &TelemetryHealthSnapshot::default(),
+            &provision,
+            &[],
+            &private_discovery,
+        );
+
+        assert!(alerts.iter().any(|alert| {
+            alert.code == "linode_private_discovery_inactive"
+                && alert.node_id.as_deref() == Some("uk-local")
+        }));
+    }
+
+    #[cfg(feature = "private-subnet-discovery")]
+    #[test]
+    fn private_discovery_status_reports_enabled_ports() {
+        let status = PrivateDiscoveryStatus::from_args(true, 12_345, 9_101);
+
+        assert!(status.compiled);
+        assert!(status.enabled);
+        assert_eq!(status.state, "listening");
+        assert_eq!(status.broadcast_port, Some(12_345));
+        assert_eq!(status.mesh_port, Some(9_101));
+        assert!(status.details.iter().any(|detail| detail.contains("12345")));
+        assert!(status.details.iter().any(|detail| detail.contains("9101")));
     }
 
     #[tokio::test]
@@ -9139,6 +9287,7 @@ mod tests {
             EdgeLoad::default(),
             provision,
             monitor,
+            PrivateDiscoveryStatus::default(),
         )
     }
 

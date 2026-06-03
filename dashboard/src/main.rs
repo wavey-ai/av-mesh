@@ -1321,6 +1321,11 @@ fn OrchestrationView(
                 }).unwrap_or_default()
             />
             <RuntimeCell
+                label="private discovery"
+                value=move || mesh.get().map(|m| m.orchestration.private_discovery.value_text()).unwrap_or_else(|| "-".to_owned())
+                detail=move || mesh.get().map(|m| m.orchestration.private_discovery.detail_text()).unwrap_or_else(|| "private subnet peer discovery".to_owned())
+            />
+            <RuntimeCell
                 label="timeout"
                 value=move || mesh.get().map(|m| format!("{}ms", m.orchestration.provision.timeout_ms)).unwrap_or_else(|| "-".to_owned())
                 detail=move || "provision command budget".to_owned()
@@ -3850,6 +3855,8 @@ struct OrchestrationStatus {
     provision: ProvisionStatus,
     #[serde(default)]
     telemetry_peers: Vec<TelemetryPeerStatus>,
+    #[serde(default)]
+    private_discovery: PrivateDiscoveryStatus,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -3880,6 +3887,58 @@ impl ProvisionBackendStatus {
             "ready" => "provision-backend ready",
             "blocked" | "error" => "provision-backend blocked",
             _ => "provision-backend warn",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct PrivateDiscoveryStatus {
+    #[serde(default)]
+    compiled: bool,
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    broadcast_port: Option<u16>,
+    #[serde(default)]
+    mesh_port: Option<u16>,
+    #[serde(default)]
+    details: Vec<String>,
+}
+
+impl PrivateDiscoveryStatus {
+    fn value_text(&self) -> String {
+        if !self.state.is_empty() {
+            self.state.clone()
+        } else if self.enabled {
+            "listening".to_owned()
+        } else if self.compiled {
+            "available".to_owned()
+        } else {
+            "unavailable".to_owned()
+        }
+    }
+
+    fn detail_text(&self) -> String {
+        if !self.details.is_empty() {
+            return self.details.join(" / ");
+        }
+        let mut parts = Vec::new();
+        if let Some(port) = self.broadcast_port {
+            parts.push(format!("broadcast {port}"));
+        }
+        if let Some(port) = self.mesh_port {
+            parts.push(format!("mesh {port}"));
+        }
+        if parts.is_empty() {
+            if self.compiled {
+                "private subnet discovery compiled".to_owned()
+            } else {
+                "build with private-subnet-discovery".to_owned()
+            }
+        } else {
+            parts.join(" / ")
         }
     }
 }
@@ -4565,21 +4624,28 @@ fn control_provision_preview(
     } else {
         provision.backends.join(", ")
     };
+    let linode_backend = provision.backends.iter().any(|backend| backend == "linode");
+    let discovery_inactive = linode_backend && !mesh.orchestration.private_discovery.enabled;
+    let executor_detail = if linode_backend {
+        format!(
+            "private discovery {}",
+            mesh.orchestration.private_discovery.value_text()
+        )
+    } else {
+        "local executor".to_owned()
+    };
+    let detail = format!("{backends} / {executor_detail} / {request}");
 
     if ready > 0 {
         ControlPreview::new(
-            "ready",
+            if discovery_inactive { "warn" } else { "ready" },
             format!("{ready} ready"),
-            format!("{backends} / local executor / {request}"),
+            detail,
         )
     } else if blocked > 0 {
-        ControlPreview::new(
-            "danger",
-            format!("{blocked} blocked"),
-            format!("{backends} / {request}"),
-        )
+        ControlPreview::new("danger", format!("{blocked} blocked"), detail)
     } else {
-        ControlPreview::new("warn", "not ready", format!("{backends} / {request}"))
+        ControlPreview::new("warn", "not ready", detail)
     }
 }
 
