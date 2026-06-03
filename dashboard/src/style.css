@@ -581,14 +581,16 @@ main {
   border-top: 1px solid var(--line);
 }
 
-.edge-response-list {
+.edge-response-list,
+.hls-response-list {
   display: grid;
   gap: 6px;
   max-height: 220px;
   overflow: auto;
 }
 
-.edge-response {
+.edge-response,
+.hls-response {
   display: grid;
   grid-template-columns: 70px minmax(0, 1fr);
   gap: 3px 8px;
@@ -598,19 +600,23 @@ main {
   background: #fff;
 }
 
-.edge-response.warn {
+.edge-response.warn,
+.hls-response.warn {
   border-left: 4px solid var(--amber);
 }
 
-.edge-response.error {
+.edge-response.error,
+.hls-response.error {
   border-left: 4px solid var(--red);
 }
 
-.edge-response span {
+.edge-response span,
+.hls-response span {
   overflow-wrap: anywhere;
 }
 
-.edge-response small {
+.edge-response small,
+.hls-response small {
   grid-column: 1 / -1;
   color: var(--muted);
 }

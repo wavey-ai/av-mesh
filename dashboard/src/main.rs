@@ -501,8 +501,10 @@ fn ContribView(contrib: ReadSignal<Option<ContribStatus>>) -> impl IntoView {
                 <RuntimeCell label="mpeg-ts" value=move || contrib.get().map(|c| c.runtime.mpeg_ts.slots.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} / {}", format_bytes(c.runtime.mpeg_ts.bytes), optional_age(c.runtime.mpeg_ts.last_seen_age_ms))).unwrap_or_default() />
                 <RuntimeCell label="rtmp" value=move || contrib.get().map(|c| c.runtime.rtmp.access_units.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} / {}", format_bytes(c.runtime.rtmp.bytes), optional_age(c.runtime.rtmp.last_seen_age_ms))).unwrap_or_default() />
                 <RuntimeCell label="fmp4" value=move || contrib.get().map(|c| c.runtime.fmp4.parts.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} media / {} init / {}", format_bytes(c.runtime.fmp4.bytes), format_bytes(c.runtime.fmp4.init_bytes), optional_age(c.runtime.fmp4.last_publish_age_ms))).unwrap_or_default() />
+                <RuntimeCell label="hls" value=move || contrib.get().map(|c| c.runtime.hls.responses_total.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} errors / {} 404s / {}", c.runtime.hls.response_errors, c.runtime.hls.response_not_found, optional_age(c.runtime.hls.last_response_age_ms))).unwrap_or_default() />
                 <RuntimeCell label="errors" value=move || contrib.get().map(|c| c.runtime.fmp4.publish_errors.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} alerts", c.alerts.len())).unwrap_or_default() />
             </div>
+            <ContribHlsResponses contrib />
             <div class="listener-list">
                 <For
                     each=move || contrib.get().map(|c| c.listeners).unwrap_or_default()
@@ -529,6 +531,25 @@ fn ContribView(contrib: ReadSignal<Option<ContribStatus>>) -> impl IntoView {
                     </div>
                 </For>
             </div>
+        </div>
+    }
+}
+
+#[component]
+fn ContribHlsResponses(contrib: ReadSignal<Option<ContribStatus>>) -> impl IntoView {
+    view! {
+        <div class="hls-response-list">
+            <For
+                each=move || contrib.get().map(|c| c.runtime.hls.recent_responses).unwrap_or_default()
+                key=|response| response.key()
+                let(response)
+            >
+                <div class=response.class_name()>
+                    <strong>{format!("{} {}", response.method, response.status)}</strong>
+                    <span>{response.path_text()}</span>
+                    <small>{response.meta_text()}</small>
+                </div>
+            </For>
         </div>
     }
 }
@@ -1921,6 +1942,8 @@ struct ContribRuntimeStatus {
     rtmp: RtmpRuntime,
     #[serde(default)]
     fmp4: Fmp4Runtime,
+    #[serde(default)]
+    hls: HlsRuntime,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1979,6 +2002,75 @@ struct Fmp4Runtime {
     publish_errors: u64,
     #[serde(default)]
     last_publish_age_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct HlsRuntime {
+    #[serde(default)]
+    responses_total: u64,
+    #[serde(default)]
+    response_errors: u64,
+    #[serde(default)]
+    response_not_found: u64,
+    #[serde(default)]
+    last_response_age_ms: Option<u64>,
+    #[serde(default)]
+    recent_responses: Vec<ContribHlsResponse>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ContribHlsResponse {
+    #[serde(default)]
+    unix_ms: u64,
+    #[serde(default)]
+    method: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    status: u16,
+    #[serde(default)]
+    bytes: u64,
+    #[serde(default)]
+    content_type: Option<String>,
+}
+
+impl ContribHlsResponse {
+    fn key(&self) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            self.unix_ms, self.method, self.path, self.status
+        )
+    }
+
+    fn class_name(&self) -> &'static str {
+        if self.status >= 500 {
+            "hls-response error"
+        } else if self.status >= 400 {
+            "hls-response warn"
+        } else {
+            "hls-response"
+        }
+    }
+
+    fn path_text(&self) -> String {
+        match &self.query {
+            Some(query) if !query.is_empty() => format!("{}?{}", self.path, query),
+            _ => self.path.clone(),
+        }
+    }
+
+    fn meta_text(&self) -> String {
+        let mut parts = vec![optional_unix_age(nonzero_u64(self.unix_ms))];
+        if self.bytes > 0 {
+            parts.push(format_bytes(self.bytes));
+        }
+        if let Some(content_type) = &self.content_type {
+            parts.push(content_type.clone());
+        }
+        parts.join(" / ")
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
