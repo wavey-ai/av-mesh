@@ -4293,8 +4293,12 @@ impl ControlCommand {
             return self.target_text.clone();
         }
         let target = [
-            self.node_id.as_ref().map(|node_id| format!("node {node_id}")),
-            self.region.as_ref().map(|region| format!("region {region}")),
+            self.node_id
+                .as_ref()
+                .map(|node_id| format!("node {node_id}")),
+            self.region
+                .as_ref()
+                .map(|region| format!("region {region}")),
             self.stream_id_text
                 .as_ref()
                 .map(|stream_id| format!("stream {stream_id}")),
@@ -5043,9 +5047,17 @@ struct ContribStreamRuntime {
     #[serde(default)]
     latest_fmp4_sequence: Option<u64>,
     #[serde(default)]
+    video_codec: Option<String>,
+    #[serde(default)]
+    video_width: Option<u16>,
+    #[serde(default)]
+    video_height: Option<u16>,
+    #[serde(default)]
     video_parts: u64,
     #[serde(default)]
     video_access_units: u64,
+    #[serde(default)]
+    audio_codec: Option<String>,
     #[serde(default)]
     audio_parts: u64,
     #[serde(default)]
@@ -5108,6 +5120,7 @@ impl ContribStreamRuntime {
             format_bytes(self.fmp4_bytes),
             format!("init {}", format_bytes(self.fmp4_init_bytes)),
         ];
+        parts.push(self.track_text());
         if let Some(sequence) = self.latest_fmp4_sequence {
             parts.push(format!("seq {sequence}"));
         }
@@ -5124,6 +5137,16 @@ impl ContribStreamRuntime {
             parts.push(format!("{} errors", self.fmp4_publish_errors));
         }
         parts.join(" / ")
+    }
+
+    fn track_text(&self) -> String {
+        let video = match (&self.video_codec, self.video_width, self.video_height) {
+            (Some(codec), Some(width), Some(height)) => format!("{codec} {width}x{height}"),
+            (Some(codec), _, _) => codec.clone(),
+            _ => "no video".to_owned(),
+        };
+        let audio = self.audio_codec.as_deref().unwrap_or("no audio");
+        format!("{video} / {audio}")
     }
 
     fn rate_text(&self, rate: Option<ContribStreamRateSnapshot>) -> String {
