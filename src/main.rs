@@ -1649,6 +1649,16 @@ impl LiveTsCache {
                 } else {
                     latest_part_bytes
                 },
+                latest_local_part_duration_ms: if is_default_stream {
+                    default_stats.latest_local_part_duration_ms
+                } else {
+                    None
+                },
+                latest_local_part_age_ms: if is_default_stream {
+                    default_stats.latest_local_part_age_ms
+                } else {
+                    None
+                },
                 latest_mesh_part: Some(latest_part),
                 bytes_received: if is_default_stream {
                     default_stats.bytes_received.max(bytes_received)
@@ -1660,6 +1670,15 @@ impl LiveTsCache {
                 } else {
                     datagrams_received
                 },
+                last_ingest_age_ms: if is_default_stream {
+                    default_stats.last_ingest_age_ms
+                } else {
+                    None
+                },
+                stale_threshold_ms: Some(stream_stale_threshold_ms(
+                    default_stats.part_target_ms,
+                    default_stats.window_parts,
+                )),
             });
         }
         streams.sort_by_key(|stream| stream.stream_id);
@@ -2187,9 +2206,17 @@ struct StreamTelemetry {
     stream_id_text: String,
     latest_local_part: Option<u64>,
     latest_local_part_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_local_part_duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_local_part_age_ms: Option<u64>,
     latest_mesh_part: Option<u64>,
     bytes_received: u64,
     datagrams_received: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_ingest_age_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stale_threshold_ms: Option<u64>,
 }
 
 impl StreamTelemetry {
@@ -2200,15 +2227,38 @@ impl StreamTelemetry {
             stream_id_text: stream_id_text(stats.stream_id),
             latest_local_part: stats.latest_local_part,
             latest_local_part_bytes: stats.latest_local_part_bytes,
+            latest_local_part_duration_ms: stats.latest_local_part_duration_ms,
+            latest_local_part_age_ms: stats.latest_local_part_age_ms,
             latest_mesh_part: stats.latest_mesh_part,
             bytes_received: stats.bytes_received,
             datagrams_received: stats.datagrams_received,
+            last_ingest_age_ms: stats.last_ingest_age_ms,
+            stale_threshold_ms: Some(stream_stale_threshold_ms(
+                stats.part_target_ms,
+                stats.window_parts,
+            )),
         }
     }
 
     fn active(&self) -> bool {
         self.latest_local_part.is_some() || self.latest_mesh_part.is_some()
     }
+
+    fn stale(&self) -> bool {
+        self.active()
+            && self.last_ingest_age_ms.is_some_and(|age_ms| {
+                age_ms
+                    > self
+                        .stale_threshold_ms
+                        .unwrap_or(MESH_MIN_STALE_INGEST_ALERT_MS)
+            })
+    }
+}
+
+fn stream_stale_threshold_ms(part_target_ms: u64, window_parts: usize) -> u64 {
+    part_target_ms
+        .saturating_mul(window_parts as u64)
+        .max(MESH_MIN_STALE_INGEST_ALERT_MS)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2580,6 +2630,8 @@ impl MeshApiSnapshot {
             &edge_services,
             &connections,
             &local.stream,
+            &local.node.node_id,
+            &streams,
             &recent_commands,
             &orchestration.provision,
             &orchestration.telemetry_peers,
@@ -2612,6 +2664,8 @@ fn derive_mesh_alerts(
     edge_services: &[EdgeServiceSnapshot],
     connections: &[ConnectionSnapshot],
     local_stream: &StatsSnapshot,
+    local_node_id: &str,
+    streams: &[StreamTelemetry],
     recent_commands: &[ControlCommand],
     provision: &ProvisionStatus,
     telemetry_peers: &[TelemetryPeerStatus],
@@ -2845,10 +2899,8 @@ fn derive_mesh_alerts(
     }
 
     if let Some(age_ms) = local_stream.last_ingest_age_ms {
-        let stale_threshold_ms = local_stream
-            .part_target_ms
-            .saturating_mul(local_stream.window_parts as u64)
-            .max(MESH_MIN_STALE_INGEST_ALERT_MS);
+        let stale_threshold_ms =
+            stream_stale_threshold_ms(local_stream.part_target_ms, local_stream.window_parts);
         if local_stream.latest_local_part.is_some() && age_ms > stale_threshold_ms {
             alerts.push(MeshAlert {
                 level: "warn",
@@ -2863,6 +2915,36 @@ fn derive_mesh_alerts(
                 stream_id_text: Some(local_stream.stream_id_text.clone()),
             });
         }
+    }
+
+    let stale_streams = streams
+        .iter()
+        .filter(|stream| stream.node_id != local_node_id && stream.stale())
+        .collect::<Vec<_>>();
+    if let Some((stream, last_seen, age_ms)) = stale_streams
+        .iter()
+        .filter_map(|stream| {
+            stream
+                .last_ingest_age_ms
+                .map(|age_ms| (*stream, now.saturating_sub(age_ms), age_ms))
+        })
+        .max_by_key(|(_, last_seen, _)| *last_seen)
+    {
+        alerts.push(MeshAlert {
+            level: "warn",
+            code: "mesh_stream_stale",
+            message: format!(
+                "{} mesh stream(s) are stale; latest stale stream {} on {} has not ingested bytes for {} ms.",
+                stale_streams.len(),
+                stream.stream_id_text,
+                stream.node_id,
+                age_ms
+            ),
+            count: stale_streams.len() as u64,
+            last_seen_unix_ms: Some(last_seen),
+            node_id: Some(stream.node_id.clone()),
+            stream_id_text: Some(stream.stream_id_text.clone()),
+        });
     }
 
     alerts
@@ -6637,9 +6719,13 @@ mod tests {
             stream_id_text: stream_id_text(77),
             latest_local_part: Some(4),
             latest_local_part_bytes: Some(2048),
+            latest_local_part_duration_ms: Some(500),
+            latest_local_part_age_ms: Some(250),
             latest_mesh_part: Some(4),
             bytes_received: 8192,
             datagrams_received: 4,
+            last_ingest_age_ms: Some(250),
+            stale_threshold_ms: Some(5_000),
         }];
         telemetry.ingest_snapshot(remote).await;
         let router =
@@ -6665,6 +6751,47 @@ mod tests {
             stream["node_id"] == "us-1"
                 && stream["stream_id"] == 77
                 && stream["stream_id_text"] == "77"
+        }));
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn mesh_api_alerts_on_stale_remote_streams() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let telemetry = TelemetryAggregator::default();
+        let mut remote =
+            telemetry_snapshot_for_tests("us-1", "us-east", "na", 37.4, -78.6, Vec::new(), 1);
+        remote.streams = vec![StreamTelemetry {
+            node_id: "us-1".into(),
+            stream_id: 77,
+            stream_id_text: stream_id_text(77),
+            latest_local_part: Some(4),
+            latest_local_part_bytes: Some(2048),
+            latest_local_part_duration_ms: Some(500),
+            latest_local_part_age_ms: Some(6_000),
+            latest_mesh_part: Some(4),
+            bytes_received: 8192,
+            datagrams_received: 4,
+            last_ingest_age_ms: Some(6_000),
+            stale_threshold_ms: Some(5_000),
+        }];
+        telemetry.ingest_snapshot(remote).await;
+        let router =
+            app_router_for_tests_with_telemetry(Arc::clone(&cache), Arc::clone(&mesh), telemetry);
+        let snapshot = router.mesh_api_snapshot().await;
+
+        assert!(snapshot
+            .alerts
+            .iter()
+            .any(|alert| alert.code == "mesh_stream_stale"
+                && alert.node_id.as_deref() == Some("us-1")
+                && alert.stream_id_text.as_deref() == Some("77")));
+        assert!(snapshot.streams.iter().any(|stream| {
+            stream.node_id == "us-1"
+                && stream.stream_id == 77
+                && stream.last_ingest_age_ms == Some(6_000)
+                && stream.stale_threshold_ms == Some(5_000)
         }));
         mesh.shutdown();
     }
@@ -7227,9 +7354,13 @@ mod tests {
             stream_id_text: stream_id_text(77),
             latest_local_part: Some(8),
             latest_local_part_bytes: Some(16_384),
+            latest_local_part_duration_ms: Some(500),
+            latest_local_part_age_ms: Some(250),
             latest_mesh_part: Some(8),
             bytes_received: 262_144,
             datagrams_received: 128,
+            last_ingest_age_ms: Some(250),
+            stale_threshold_ms: Some(5_000),
         }];
 
         let mut na_edge =
@@ -7583,9 +7714,13 @@ mod tests {
             stream_id_text: stream_id_text(77),
             latest_local_part: Some(0),
             latest_local_part_bytes: Some(b"baseline-stream-77".len()),
+            latest_local_part_duration_ms: Some(500),
+            latest_local_part_age_ms: Some(250),
             latest_mesh_part: Some(0),
             bytes_received: b"baseline-stream-77".len() as u64,
             datagrams_received: 1,
+            last_ingest_age_ms: Some(250),
+            stale_threshold_ms: Some(5_000),
         }];
         telemetry.ingest_snapshot(remote).await;
 

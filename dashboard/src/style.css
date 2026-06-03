@@ -537,11 +537,30 @@ main {
 
 .stream-row {
   display: grid;
-  grid-template-columns: minmax(110px, 1fr) minmax(120px, 1fr) 80px 80px 110px;
+  grid-template-columns:
+    minmax(90px, 0.8fr) minmax(110px, 1fr) 72px 72px 72px minmax(150px, 1.3fr)
+    110px;
   gap: 10px;
-  min-width: 620px;
+  min-width: 790px;
   padding: 9px 0;
   border-bottom: 1px solid var(--line);
+}
+
+.stream-row.active span:nth-child(3) {
+  color: var(--green);
+}
+
+.stream-row.mirrored span:nth-child(3) {
+  color: var(--blue);
+}
+
+.stream-row.stale {
+  border-left: 3px solid var(--red);
+  padding-left: 8px;
+}
+
+.stream-row.stale span:nth-child(3) {
+  color: var(--red);
 }
 
 .table-head {

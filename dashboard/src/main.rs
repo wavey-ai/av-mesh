@@ -731,7 +731,15 @@ fn LocalStream(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
         <div class="local-stream">
             <span>{move || mesh.get().map(|m| format!("local stream {}", m.stream.stream_id_text)).unwrap_or_else(|| "local stream -".to_owned())}</span>
             <strong>{move || mesh.get().map(|m| format_bytes(m.stream.bytes_received)).unwrap_or_else(|| "-".to_owned())}</strong>
-            <em>{move || mesh.get().map(|m| format!("local {} / mesh {} / {} datagrams / snapshot {}", optional_u64(m.stream.latest_local_part), optional_u64(m.stream.latest_mesh_part), m.stream.datagrams_received, age_text(m.updated_unix_ms))).unwrap_or_default()}</em>
+            <em>{move || mesh.get().map(|m| format!(
+                "local {} / mesh {} / {} datagrams / ingest {} / part {} / snapshot {}",
+                optional_u64(m.stream.latest_local_part),
+                optional_u64(m.stream.latest_mesh_part),
+                m.stream.datagrams_received,
+                optional_age(m.stream.last_ingest_age_ms),
+                optional_age(m.stream.latest_local_part_age_ms),
+                age_text(m.updated_unix_ms)
+            )).unwrap_or_default()}</em>
         </div>
     }
 }
@@ -741,18 +749,20 @@ fn StreamTable(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
     view! {
         <div class="table">
             <div class="table-head stream-row">
-                <span>"stream"</span><span>"node"</span><span>"local"</span><span>"mesh"</span><span>"bytes"</span>
+                <span>"stream"</span><span>"node"</span><span>"state"</span><span>"local"</span><span>"mesh"</span><span>"age"</span><span>"bytes"</span>
             </div>
             <For
                 each=move || mesh.get().map(|m| m.streams).unwrap_or_default()
                 key=|stream| format!("{}:{}", stream.node_id, stream.stream_id_text)
                 let(stream)
             >
-                <div class="stream-row">
+                <div class=stream.class_name()>
                     <span>{stream.display_stream_id()}</span>
-                    <span>{stream.node_id}</span>
+                    <span>{stream.node_id.clone()}</span>
+                    <span>{stream.status_text()}</span>
                     <span>{optional_u64(stream.latest_local_part)}</span>
                     <span>{optional_u64(stream.latest_mesh_part)}</span>
+                    <span>{stream.age_text()}</span>
                     <span>{format_bytes(stream.bytes_received)}</span>
                 </div>
             </For>
@@ -1668,6 +1678,10 @@ struct StatsSnapshot {
     bytes_received: u64,
     #[serde(default)]
     datagrams_received: u64,
+    #[serde(default)]
+    latest_local_part_age_ms: Option<u64>,
+    #[serde(default)]
+    last_ingest_age_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1963,11 +1977,21 @@ struct StreamTelemetry {
     #[serde(default)]
     latest_local_part: Option<u64>,
     #[serde(default)]
+    latest_local_part_bytes: Option<usize>,
+    #[serde(default)]
+    latest_local_part_duration_ms: Option<u64>,
+    #[serde(default)]
+    latest_local_part_age_ms: Option<u64>,
+    #[serde(default)]
     latest_mesh_part: Option<u64>,
     #[serde(default)]
     bytes_received: u64,
     #[serde(default)]
     datagrams_received: u64,
+    #[serde(default)]
+    last_ingest_age_ms: Option<u64>,
+    #[serde(default)]
+    stale_threshold_ms: Option<u64>,
 }
 
 impl StreamTelemetry {
@@ -1977,6 +2001,54 @@ impl StreamTelemetry {
         } else {
             self.stream_id_text.clone()
         }
+    }
+
+    fn active(&self) -> bool {
+        self.latest_local_part.is_some() || self.latest_mesh_part.is_some()
+    }
+
+    fn stale(&self) -> bool {
+        self.active()
+            && self
+                .last_ingest_age_ms
+                .is_some_and(|age_ms| age_ms > self.stale_threshold_ms.unwrap_or(5_000))
+    }
+
+    fn status_text(&self) -> &'static str {
+        if self.stale() {
+            "stale"
+        } else if self.last_ingest_age_ms.is_some() {
+            "active"
+        } else if self.latest_mesh_part.is_some() {
+            "mirrored"
+        } else {
+            "waiting"
+        }
+    }
+
+    fn class_name(&self) -> &'static str {
+        match self.status_text() {
+            "stale" => "stream-row stale",
+            "active" => "stream-row active",
+            "mirrored" => "stream-row mirrored",
+            _ => "stream-row",
+        }
+    }
+
+    fn age_text(&self) -> String {
+        let ingest = self
+            .last_ingest_age_ms
+            .or(self.latest_local_part_age_ms)
+            .map(format_duration_ms)
+            .unwrap_or_else(|| "never".to_owned());
+        let mut detail = vec![format!("ingest {ingest}")];
+        if let Some(duration_ms) = self.latest_local_part_duration_ms {
+            detail.push(format!("part {}", format_duration_ms_plain(duration_ms)));
+        }
+        if let Some(bytes) = self.latest_local_part_bytes {
+            detail.push(format!("part {}", format_bytes(bytes as u64)));
+        }
+        detail.join(" / ")
     }
 }
 
