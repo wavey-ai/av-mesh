@@ -24,6 +24,10 @@ fn App() -> impl IntoView {
         signal(endpoint_from_query("contrib", DEFAULT_CONTRIB_API));
     let (mesh, set_mesh) = signal(None::<MeshApiSnapshot>);
     let (contrib, set_contrib) = signal(None::<ContribStatus>);
+    let (mesh_rates, set_mesh_rates) = signal(MeshRateSnapshot::default());
+    let (contrib_rates, set_contrib_rates) = signal(ContribRateSnapshot::default());
+    let (last_mesh_sample, set_last_mesh_sample) = signal(None::<MeshRateSample>);
+    let (last_contrib_sample, set_last_contrib_sample) = signal(None::<ContribRateSample>);
     let (status, set_status) = signal(String::from("starting"));
     let (mesh_feed, set_mesh_feed) = signal(String::from("mesh feed starting"));
     let (mesh_events_active, set_mesh_events_active) = signal(false);
@@ -61,7 +65,13 @@ fn App() -> impl IntoView {
             let mut errors = Vec::new();
             match mesh_result {
                 Some(Ok(mesh_snapshot)) => {
-                    set_mesh.set(Some(mesh_snapshot));
+                    accept_mesh_snapshot(
+                        mesh_snapshot,
+                        last_mesh_sample,
+                        set_last_mesh_sample,
+                        set_mesh_rates,
+                        set_mesh,
+                    );
                     set_mesh_feed.set(format!("mesh polling {}", short_clock()));
                 }
                 Some(Err(error)) => errors.push(format!("mesh: {error}")),
@@ -69,7 +79,13 @@ fn App() -> impl IntoView {
             }
             match contrib_result {
                 Some(Ok(contrib_status)) => {
-                    set_contrib.set(Some(contrib_status));
+                    accept_contrib_snapshot(
+                        contrib_status,
+                        last_contrib_sample,
+                        set_last_contrib_sample,
+                        set_contrib_rates,
+                        set_contrib,
+                    );
                     set_contrib_feed.set(format!("contrib polling {}", short_clock()));
                 }
                 Some(Err(error)) => errors.push(format!("contrib: {error}")),
@@ -97,6 +113,8 @@ fn App() -> impl IntoView {
             }
 
             let events_url = mesh_events_url(&mesh_api.get());
+            set_last_mesh_sample.set(None);
+            set_mesh_rates.set(MeshRateSnapshot::default());
             set_mesh_events_active.set(false);
             set_mesh_feed.set(format!("mesh events connecting {}", short_clock()));
 
@@ -118,7 +136,13 @@ fn App() -> impl IntoView {
                     };
                     match serde_json::from_str::<MeshApiSnapshot>(&data) {
                         Ok(snapshot) => {
-                            set_mesh.set(Some(snapshot));
+                            accept_mesh_snapshot(
+                                snapshot,
+                                last_mesh_sample,
+                                set_last_mesh_sample,
+                                set_mesh_rates,
+                                set_mesh,
+                            );
                             set_mesh_events_active.set(true);
                             set_mesh_feed.set(format!("mesh events {}", short_clock()));
                             set_status.set(format!("ok {} / mesh events", short_clock()));
@@ -163,6 +187,8 @@ fn App() -> impl IntoView {
             }
 
             let events_url = contrib_events_url(&contrib_api.get());
+            set_last_contrib_sample.set(None);
+            set_contrib_rates.set(ContribRateSnapshot::default());
             set_contrib_events_active.set(false);
             set_contrib_feed.set(format!("contrib events connecting {}", short_clock()));
 
@@ -184,7 +210,13 @@ fn App() -> impl IntoView {
                     };
                     match serde_json::from_str::<ContribStatus>(&data) {
                         Ok(snapshot) => {
-                            set_contrib.set(Some(snapshot));
+                            accept_contrib_snapshot(
+                                snapshot,
+                                last_contrib_sample,
+                                set_last_contrib_sample,
+                                set_contrib_rates,
+                                set_contrib,
+                            );
                             set_contrib_events_active.set(true);
                             set_contrib_feed.set(format!("contrib events {}", short_clock()));
                             set_status.set(format!("ok {} / contrib events", short_clock()));
@@ -289,6 +321,8 @@ fn App() -> impl IntoView {
                     <Metric label="storage" value=move || mesh.get().map(|m| format_bytes(m.aggregate.used_storage_bytes)).unwrap_or_else(|| "-".to_owned()) detail=move || mesh.get().map(|m| format!("of {}", format_bytes(m.aggregate.total_storage_bytes))).unwrap_or_default() />
                     <Metric label="egress" value=move || mesh.get().map(|m| format_bps(m.aggregate.total_egress_capacity_bps)).unwrap_or_else(|| "-".to_owned()) detail=move || mesh.get().map(|m| format!("{} ingress / {} active", m.aggregate.contributor_streams, m.aggregate.active_streams)).unwrap_or_default() />
                     <Metric label="ingest" value=move || contrib.get().map(|c| c.runtime.fmp4.parts.to_string()).unwrap_or_else(|| "-".to_owned()) detail=move || contrib.get().map(|c| format!("{} listeners / {} publish errors", enabled_listener_count(&c), c.runtime.fmp4.publish_errors)).unwrap_or_default() />
+                    <Metric label="mesh rx" value=move || mesh_rates.get().byte_rate_text() detail=move || mesh_rates.get().detail_text() />
+                    <Metric label="contrib out" value=move || contrib_rates.get().output_rate_text() detail=move || contrib_rates.get().detail_text() />
                 </section>
 
                 <div class="workspace">
@@ -815,6 +849,36 @@ impl DashboardEventHandle {
     }
 }
 
+fn accept_mesh_snapshot(
+    snapshot: MeshApiSnapshot,
+    last_sample: ReadSignal<Option<MeshRateSample>>,
+    set_last_sample: WriteSignal<Option<MeshRateSample>>,
+    set_rates: WriteSignal<MeshRateSnapshot>,
+    set_mesh: WriteSignal<Option<MeshApiSnapshot>>,
+) {
+    let sample = MeshRateSample::from_snapshot(&snapshot);
+    if let Some(previous) = last_sample.get() {
+        set_rates.set(MeshRateSnapshot::from_delta(previous, sample));
+    }
+    set_last_sample.set(Some(sample));
+    set_mesh.set(Some(snapshot));
+}
+
+fn accept_contrib_snapshot(
+    snapshot: ContribStatus,
+    last_sample: ReadSignal<Option<ContribRateSample>>,
+    set_last_sample: WriteSignal<Option<ContribRateSample>>,
+    set_rates: WriteSignal<ContribRateSnapshot>,
+    set_contrib: WriteSignal<Option<ContribStatus>>,
+) {
+    let sample = ContribRateSample::from_snapshot(&snapshot);
+    if let Some(previous) = last_sample.get() {
+        set_rates.set(ContribRateSnapshot::from_delta(previous, sample));
+    }
+    set_last_sample.set(Some(sample));
+    set_contrib.set(Some(snapshot));
+}
+
 fn mesh_events_url(mesh_api: &str) -> String {
     let base = mesh_api
         .split_once("/api/mesh")
@@ -967,6 +1031,195 @@ fn short_clock() -> String {
         .to_locale_time_string("en-GB")
         .as_string()
         .unwrap_or_else(|| "now".to_owned())
+}
+
+fn now_unix_ms() -> u64 {
+    js_sys::Date::now() as u64
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MeshRateSample {
+    sampled_unix_ms: u64,
+    bytes_received: u64,
+    datagrams_received: u64,
+}
+
+impl MeshRateSample {
+    fn from_snapshot(snapshot: &MeshApiSnapshot) -> Self {
+        let stream_bytes = snapshot
+            .streams
+            .iter()
+            .map(|stream| stream.bytes_received)
+            .sum::<u64>();
+        let stream_datagrams = snapshot
+            .streams
+            .iter()
+            .map(|stream| stream.datagrams_received)
+            .sum::<u64>();
+        Self {
+            sampled_unix_ms: nonzero_u64(snapshot.updated_unix_ms).unwrap_or_else(now_unix_ms),
+            bytes_received: stream_bytes.max(snapshot.stream.bytes_received),
+            datagrams_received: stream_datagrams.max(snapshot.stream.datagrams_received),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MeshRateSnapshot {
+    ready: bool,
+    window_ms: u64,
+    bytes_per_sec: f64,
+    datagrams_per_sec: f64,
+}
+
+impl MeshRateSnapshot {
+    fn from_delta(previous: MeshRateSample, current: MeshRateSample) -> Self {
+        let window_ms = current
+            .sampled_unix_ms
+            .saturating_sub(previous.sampled_unix_ms);
+        Self {
+            ready: window_ms >= 250,
+            window_ms,
+            bytes_per_sec: counter_rate(previous.bytes_received, current.bytes_received, window_ms),
+            datagrams_per_sec: counter_rate(
+                previous.datagrams_received,
+                current.datagrams_received,
+                window_ms,
+            ),
+        }
+    }
+
+    fn byte_rate_text(&self) -> String {
+        format_bytes_per_sec(self.ready, self.bytes_per_sec)
+    }
+
+    fn detail_text(&self) -> String {
+        if !self.ready {
+            return "waiting for second sample".to_owned();
+        }
+        format!(
+            "{} / {}",
+            format_count_per_sec(self.datagrams_per_sec, "datagrams"),
+            format_rate_window(self.window_ms)
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ContribRateSample {
+    sampled_unix_ms: u64,
+    input_bytes: u64,
+    input_datagrams: u64,
+    output_bytes: u64,
+    output_parts: u64,
+}
+
+impl ContribRateSample {
+    fn from_snapshot(snapshot: &ContribStatus) -> Self {
+        Self {
+            sampled_unix_ms: nonzero_u64(snapshot.updated_unix_ms).unwrap_or_else(now_unix_ms),
+            input_bytes: snapshot
+                .runtime
+                .raw_http
+                .bytes
+                .saturating_add(snapshot.runtime.media_access_units.payload_bytes)
+                .saturating_add(snapshot.runtime.mpeg_ts.bytes)
+                .saturating_add(snapshot.runtime.rtmp.bytes),
+            input_datagrams: snapshot
+                .runtime
+                .raw_http
+                .datagrams
+                .saturating_add(snapshot.runtime.media_access_units.datagrams),
+            output_bytes: snapshot.runtime.fmp4.bytes,
+            output_parts: snapshot.runtime.fmp4.parts,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ContribRateSnapshot {
+    ready: bool,
+    window_ms: u64,
+    input_bytes_per_sec: f64,
+    input_datagrams_per_sec: f64,
+    output_bytes_per_sec: f64,
+    output_parts_per_sec: f64,
+}
+
+impl ContribRateSnapshot {
+    fn from_delta(previous: ContribRateSample, current: ContribRateSample) -> Self {
+        let window_ms = current
+            .sampled_unix_ms
+            .saturating_sub(previous.sampled_unix_ms);
+        Self {
+            ready: window_ms >= 250,
+            window_ms,
+            input_bytes_per_sec: counter_rate(previous.input_bytes, current.input_bytes, window_ms),
+            input_datagrams_per_sec: counter_rate(
+                previous.input_datagrams,
+                current.input_datagrams,
+                window_ms,
+            ),
+            output_bytes_per_sec: counter_rate(
+                previous.output_bytes,
+                current.output_bytes,
+                window_ms,
+            ),
+            output_parts_per_sec: counter_rate(
+                previous.output_parts,
+                current.output_parts,
+                window_ms,
+            ),
+        }
+    }
+
+    fn output_rate_text(&self) -> String {
+        format_bytes_per_sec(self.ready, self.output_bytes_per_sec)
+    }
+
+    fn detail_text(&self) -> String {
+        if !self.ready {
+            return "waiting for second sample".to_owned();
+        }
+        format!(
+            "input {} / {} / {} / {}",
+            format_bytes_per_sec(true, self.input_bytes_per_sec),
+            format_count_per_sec(self.output_parts_per_sec, "parts"),
+            format_count_per_sec(self.input_datagrams_per_sec, "datagrams"),
+            format_rate_window(self.window_ms)
+        )
+    }
+}
+
+fn counter_rate(previous: u64, current: u64, window_ms: u64) -> f64 {
+    if window_ms == 0 || current < previous {
+        return 0.0;
+    }
+    (current - previous) as f64 / (window_ms as f64 / 1_000.0)
+}
+
+fn format_bytes_per_sec(ready: bool, bytes_per_sec: f64) -> String {
+    if !ready {
+        "-".to_owned()
+    } else {
+        format!("{}/s", format_bytes(bytes_per_sec.max(0.0).round() as u64))
+    }
+}
+
+fn format_count_per_sec(count_per_sec: f64, unit: &str) -> String {
+    if count_per_sec >= 1_000.0 {
+        format!("{:.1}k {unit}/s", count_per_sec / 1_000.0)
+    } else {
+        format!("{count_per_sec:.1} {unit}/s")
+    }
+}
+
+fn format_rate_window(window_ms: u64) -> String {
+    if window_ms < 1_000 {
+        format!("{window_ms}ms window")
+    } else {
+        format!("{:.1}s window", window_ms as f64 / 1_000.0)
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1193,6 +1446,8 @@ struct StreamTelemetry {
     latest_mesh_part: Option<u64>,
     #[serde(default)]
     bytes_received: u64,
+    #[serde(default)]
+    datagrams_received: u64,
 }
 
 impl StreamTelemetry {
@@ -1247,6 +1502,8 @@ impl ControlCommand {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct ContribStatus {
+    #[serde(default)]
+    updated_unix_ms: u64,
     #[serde(default)]
     status: String,
     #[serde(default)]
