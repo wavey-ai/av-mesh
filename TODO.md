@@ -1,22 +1,19 @@
 # TODO
 
-## Mission Control Pause Point
+## Mission Control Current Status
 
-Current uncommitted work in this repo:
+Recent committed dashboard/API work:
 
-- `src/main.rs`
-  - Adds `PrivateDiscoveryStatus` to `OrchestrationStatus` in `/api/mesh`.
-  - Reports whether private-subnet discovery is compiled, enabled, listening,
-    and which broadcast/mesh ports it uses.
-  - Raises `linode_private_discovery_inactive` when Linode provisioning is
-    configured but private-subnet discovery is not active.
-- `dashboard/src/main.rs`
-  - Deserializes `private_discovery` from the mesh API.
-  - Shows private discovery in the Leptos orchestration grid.
-  - Marks the provision preview as warning when Linode provisioning is ready
-    but private discovery is inactive.
+- `/api/mesh` exposes `PrivateDiscoveryStatus` under
+  `orchestration.private_discovery`.
+- Mission Control shows private discovery state and warns when Linode
+  provisioning is configured without active private-subnet discovery.
+- Topology confidence is exposed and rendered, including resolved/unresolved
+  peer counts and private/public target scope.
+- Stale telemetry nodes remain visible in the topology graph as stale warning
+  nodes instead of disappearing silently.
 
-Verification already run for this pause point:
+Verification already run for the recent mission-control work:
 
 ```sh
 cargo fmt
@@ -28,11 +25,22 @@ cargo test --locked --features private-subnet-discovery private_discovery_status
 cargo check --locked --target wasm32-unknown-unknown
 ```
 
-All passed before this TODO was written.
+Additional dashboard verification was run for the topology-confidence and stale
+topology updates:
+
+```sh
+cargo fmt
+git diff --check
+cargo test --locked telemetry_aggregator_resolves_peer_addresses_to_node_ids
+cargo test --locked mesh_target_scope_classifies_private_addresses
+cargo test --locked mesh_api_reports_operational_alerts
+cargo check --locked --target wasm32-unknown-unknown
+env -u NO_COLOR trunk build --release --dist /tmp/av-mesh-dashboard-topology-confidence-check
+env -u NO_COLOR trunk build --release --dist /tmp/av-mesh-dashboard-stale-topology-check
+```
 
 ## Mission Control Remaining Gaps
 
-- Commit and push the private-discovery status work once reviewed.
 - Add a richer provisioning detail view:
   - backend readiness per provider
   - last provision result
@@ -57,7 +65,7 @@ All passed before this TODO was written.
 Run the local OBS stack from `../av-contrib`:
 
 ```sh
-cargo run --manifest-path ../av-contrib/Cargo.toml --bin local-obs-stack --release
+RUST_LOG=info cargo run --manifest-path ../av-contrib/Cargo.toml --bin local-obs-stack --release
 ```
 
 Build just the dashboard:

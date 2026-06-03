@@ -320,11 +320,14 @@ stdout. By default it uses stream id `1`, UK egress
 `rtmp://local.bitneedle.com:19350/live` with stream key `obs-local`, or SRT to
 `srt://local.bitneedle.com:27001?mode=caller`. RIST is also bound on
 `local.bitneedle.com:27000` with main profile and flow id `0x11223344`. The
-supervisor shells out to `curl` for local health checks.
+supervisor defaults the LL-HLS part target to 50 ms, accepts
+`AV_LL_HLS_PART_MS` or `--part-ms` overrides, and shells out to `curl` for local
+health checks.
 
 Useful overrides:
 
 ```bash
+AV_LL_HLS_PART_MS=67 \
 RUST_LOG=av_mesh=trace,av_contrib=trace,rtmp_ingress=debug \
   cargo run --manifest-path ../av-contrib/Cargo.toml --bin local-obs-stack --release -- \
     --stream-id 4294967351 \

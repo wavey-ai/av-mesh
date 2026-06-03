@@ -41,4 +41,6 @@ embedded legacy `/mesh` page.
 
 The `../av-contrib` `local-obs-stack` binary builds this dist automatically
 unless started with `--no-dashboard-build`, and injects the dist path into both
-local mesh nodes with `AV_MESH_DASHBOARD_DIST`.
+local mesh nodes with `AV_MESH_DASHBOARD_DIST`. The supervisor defaults LL-HLS
+parts to 50 ms and accepts `AV_LL_HLS_PART_MS` or `--part-ms` to test a
+different part target.
