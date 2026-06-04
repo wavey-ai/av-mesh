@@ -8,7 +8,7 @@ use std::{
 use gloo_net::http::Request;
 use gloo_timers::callback::Interval;
 use leptos::{mount::mount_to_body, prelude::*};
-use serde::{de::DeserializeOwned, Deserialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use wasm_bindgen::{closure::Closure, JsCast, JsValue};
 use wasm_bindgen_futures::spawn_local;
@@ -18,6 +18,7 @@ const DEFAULT_MESH_API: &str = "https://local.bitneedle.com:19444/api/mesh";
 const DEFAULT_CONTRIB_API: &str = "https://local.bitneedle.com:19443/api/status";
 const DASHBOARD_FEED_MISSING_GRACE_MS: u64 = 5_000;
 const DASHBOARD_SNAPSHOT_STALE_MS: u64 = 10_000;
+const INCIDENT_DISPOSITIONS_STORAGE_KEY: &str = "av-mesh-dashboard-incident-dispositions-v1";
 const MESH_STREAM_LAG_WARN_PARTS: u64 = 6;
 
 fn main() {
@@ -36,6 +37,7 @@ fn App() -> impl IntoView {
     let (mesh_rates, set_mesh_rates) = signal(MeshRateSnapshot::default());
     let (contrib_rates, set_contrib_rates) = signal(ContribRateSnapshot::default());
     let (playback_probes, set_playback_probes) = signal(PlaybackProbeState::default());
+    let (incident_dispositions, set_incident_dispositions) = signal(load_incident_dispositions());
     let (last_mesh_sample, set_last_mesh_sample) = signal(None::<MeshRateSample>);
     let (last_contrib_sample, set_last_contrib_sample) = signal(None::<ContribRateSample>);
     let (status, set_status) = signal(String::from("starting"));
@@ -205,9 +207,12 @@ fn App() -> impl IntoView {
                 return;
             }
 
+            let error_source = source.clone();
             let onerror = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
                 set_mesh_events_active.set(false);
-                set_mesh_feed_diag.update(|diag| diag.record_event_reconnect(&event_url));
+                set_mesh_feed_diag.update(|diag| {
+                    diag.record_event_reconnect(&event_url, error_source.ready_state())
+                });
                 set_mesh_feed.set(format!(
                     "mesh events reconnecting {} ({event_url})",
                     short_clock()
@@ -290,9 +295,12 @@ fn App() -> impl IntoView {
                 return;
             }
 
+            let error_source = source.clone();
             let onerror = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
                 set_contrib_events_active.set(false);
-                set_contrib_feed_diag.update(|diag| diag.record_event_reconnect(&event_url));
+                set_contrib_feed_diag.update(|diag| {
+                    diag.record_event_reconnect(&event_url, error_source.ready_state())
+                });
                 set_contrib_feed.set(format!(
                     "contrib events reconnecting {} ({event_url})",
                     short_clock()
@@ -385,23 +393,37 @@ fn App() -> impl IntoView {
                             let mesh_snapshot = mesh.get();
                             let contrib_status = contrib.get();
                             let probes = playback_probes.get();
+                            let dispositions = incident_dispositions.get();
                             let feed = DashboardFeedHealth::new(
                                 dashboard_started_unix_ms,
                                 mesh_events_active.get(),
                                 contrib_events_active.get(),
                             );
-                            incident_count_text(&mesh_snapshot, &contrib_status, &probes, feed)
+                            incident_count_text(
+                                &mesh_snapshot,
+                                &contrib_status,
+                                &probes,
+                                feed,
+                                &dispositions,
+                            )
                         }
                         detail=move || {
                             let mesh_snapshot = mesh.get();
                             let contrib_status = contrib.get();
                             let probes = playback_probes.get();
+                            let dispositions = incident_dispositions.get();
                             let feed = DashboardFeedHealth::new(
                                 dashboard_started_unix_ms,
                                 mesh_events_active.get(),
                                 contrib_events_active.get(),
                             );
-                            incident_detail_text(&mesh_snapshot, &contrib_status, &probes, feed)
+                            incident_detail_text(
+                                &mesh_snapshot,
+                                &contrib_status,
+                                &probes,
+                                feed,
+                                &dispositions,
+                            )
                         }
                     />
                 </section>
@@ -413,6 +435,8 @@ fn App() -> impl IntoView {
                     started_unix_ms=dashboard_started_unix_ms
                     mesh_events_active
                     contrib_events_active
+                    dispositions=incident_dispositions
+                    set_dispositions=set_incident_dispositions
                 />
 
                 <PipelineReadiness
@@ -429,6 +453,14 @@ fn App() -> impl IntoView {
                     contrib_diag=contrib_feed_diag
                     mesh_events_active
                     contrib_events_active
+                />
+
+                <ContributorMeshPaths
+                    contrib
+                    mesh
+                    probes=playback_probes
+                    contrib_rates
+                    mesh_rates
                 />
 
                 <div class="workspace">
@@ -555,22 +587,69 @@ fn IncidentRollup(
     started_unix_ms: u64,
     mesh_events_active: ReadSignal<bool>,
     contrib_events_active: ReadSignal<bool>,
+    dispositions: ReadSignal<IncidentDispositions>,
+    set_dispositions: WriteSignal<IncidentDispositions>,
 ) -> impl IntoView {
     view! {
         <section class="band incident-rollup">
             <div class="incident-head">
                 <h2>"Incidents"</h2>
-                <span>{move || {
-                    let mesh_snapshot = mesh.get();
-                    let contrib_status = contrib.get();
-                    let probes = probes.get();
-                    let feed = DashboardFeedHealth::new(
-                        started_unix_ms,
-                        mesh_events_active.get(),
-                        contrib_events_active.get(),
-                    );
-                    incident_detail_text(&mesh_snapshot, &contrib_status, &probes, feed)
-                }}</span>
+                <div class="incident-head-actions">
+                    <span>{move || {
+                        let mesh_snapshot = mesh.get();
+                        let contrib_status = contrib.get();
+                        let probes = probes.get();
+                        let dispositions = dispositions.get();
+                        let feed = DashboardFeedHealth::new(
+                            started_unix_ms,
+                            mesh_events_active.get(),
+                            contrib_events_active.get(),
+                        );
+                        incident_detail_text(&mesh_snapshot, &contrib_status, &probes, feed, &dispositions)
+                    }}</span>
+                    <button on:click=move |_| {
+                        set_dispositions.update(|dispositions| {
+                            dispositions.clear();
+                            persist_incident_dispositions(dispositions);
+                        });
+                    }>"Reset"</button>
+                </div>
+            </div>
+            <div class="incident-severity-rollups">
+                <For
+                    each=move || {
+                        let mesh_snapshot = mesh.get();
+                        let contrib_status = contrib.get();
+                        let probes = probes.get();
+                        let dispositions = dispositions.get();
+                        let feed = DashboardFeedHealth::new(
+                            started_unix_ms,
+                            mesh_events_active.get(),
+                            contrib_events_active.get(),
+                        );
+                        let incidents = build_incidents(&mesh_snapshot, &contrib_status, &probes, feed);
+                        incident_severity_rollups(&incidents, &dispositions)
+                            .into_iter()
+                            .take(9)
+                            .collect::<Vec<_>>()
+                    }
+                    key=|rollup| rollup.key()
+                    let(rollup)
+                >
+                    {
+                        let class_name = rollup.class_name();
+                        let title = rollup.title_text();
+                        let severity = rollup.severity_text();
+                        let disposition = rollup.disposition_text();
+                        view! {
+                            <div class=class_name>
+                                <strong>{title}</strong>
+                                <span>{severity}</span>
+                                <small>{disposition}</small>
+                            </div>
+                        }
+                    }
+                </For>
             </div>
             <div class="incident-list">
                 <For
@@ -578,12 +657,13 @@ fn IncidentRollup(
                         let mesh_snapshot = mesh.get();
                         let contrib_status = contrib.get();
                         let probes = probes.get();
+                        let dispositions = dispositions.get();
                         let feed = DashboardFeedHealth::new(
                             started_unix_ms,
                             mesh_events_active.get(),
                             contrib_events_active.get(),
                         );
-                        build_incidents(&mesh_snapshot, &contrib_status, &probes, feed)
+                        visible_incidents(&mesh_snapshot, &contrib_status, &probes, feed, &dispositions)
                             .into_iter()
                             .take(12)
                             .collect::<Vec<_>>()
@@ -591,35 +671,72 @@ fn IncidentRollup(
                     key=|incident| incident.key()
                     let(incident)
                 >
-                    <div class=incident.class_name()>
-                        <strong>{incident.source.clone()}</strong>
-                        <span>{incident.code.clone()}</span>
-                        <p>{incident.message.clone()}</p>
-                        <small>{incident.meta_text()}</small>
-                    </div>
+                    {
+                        let class_incident = incident.clone();
+                        let class_id = incident.id.clone();
+                        let source = incident.source.clone();
+                        let code = incident.code.clone();
+                        let message = incident.message.clone();
+                        let meta = incident.meta_text();
+                        let ack_id = incident.id.clone();
+                        let ack_label_id = incident.id.clone();
+                        let suppress_id = incident.id.clone();
+                        view! {
+                            <div class=move || class_incident.class_name(dispositions.get().is_acknowledged(&class_id))>
+                                <strong>{source}</strong>
+                                <span>{code}</span>
+                                <p>{message}</p>
+                                <div class="incident-actions">
+                                    <button on:click=move |_| {
+                                        let id = ack_id.clone();
+                                        set_dispositions.update(|dispositions| {
+                                            dispositions.toggle_acknowledged(id);
+                                            persist_incident_dispositions(dispositions);
+                                        });
+                                    }>
+                                        {move || if dispositions.get().is_acknowledged(&ack_label_id) {
+                                            "Unack"
+                                        } else {
+                                            "Ack"
+                                        }}
+                                    </button>
+                                    <button class="danger" on:click=move |_| {
+                                        let id = suppress_id.clone();
+                                        set_dispositions.update(|dispositions| {
+                                            dispositions.suppress(id);
+                                            persist_incident_dispositions(dispositions);
+                                        });
+                                    }>"Suppress"</button>
+                                </div>
+                                <small>{meta}</small>
+                            </div>
+                        }
+                    }
                 </For>
             </div>
             <Show when=move || {
                 let mesh_snapshot = mesh.get();
                 let contrib_status = contrib.get();
                 let probes = probes.get();
+                let dispositions = dispositions.get();
                 let feed = DashboardFeedHealth::new(
                     started_unix_ms,
                     mesh_events_active.get(),
                     contrib_events_active.get(),
                 );
-                build_incidents(&mesh_snapshot, &contrib_status, &probes, feed).is_empty()
+                visible_incidents(&mesh_snapshot, &contrib_status, &probes, feed, &dispositions).is_empty()
             }>
                 <p class="incident-empty">{move || {
                     let mesh_snapshot = mesh.get();
                     let contrib_status = contrib.get();
                     let probes = probes.get();
+                    let dispositions = dispositions.get();
                     let feed = DashboardFeedHealth::new(
                         started_unix_ms,
                         mesh_events_active.get(),
                         contrib_events_active.get(),
                     );
-                    incident_empty_text(&mesh_snapshot, &contrib_status, &probes, feed)
+                    incident_empty_text(&mesh_snapshot, &contrib_status, &probes, feed, &dispositions)
                 }}</p>
             </Show>
         </section>
@@ -721,6 +838,76 @@ fn DataHoseDiagnostics(
 }
 
 #[component]
+fn ContributorMeshPaths(
+    contrib: ReadSignal<Option<ContribStatus>>,
+    mesh: ReadSignal<Option<MeshApiSnapshot>>,
+    probes: ReadSignal<PlaybackProbeState>,
+    contrib_rates: ReadSignal<ContribRateSnapshot>,
+    mesh_rates: ReadSignal<MeshRateSnapshot>,
+) -> impl IntoView {
+    view! {
+        <section class="band path-drilldown">
+            <div class="path-head">
+                <h2>"Contributor To Mesh Paths"</h2>
+                <span>{move || contributor_mesh_path_summary(&contrib.get(), &mesh.get())}</span>
+            </div>
+            <Show when=move || contributor_mesh_path_rows(
+                &contrib.get(),
+                &mesh.get(),
+                &probes.get(),
+                &contrib_rates.get(),
+                &mesh_rates.get()
+            ).is_empty()>
+                <div class="path-empty">"waiting for contributor and mesh stream telemetry"</div>
+            </Show>
+            <div class="table compact path-table">
+                <div class="table-head path-row">
+                    <span>"stream"</span>
+                    <span>"status"</span>
+                    <span>"contrib ingest"</span>
+                    <span>"contrib output"</span>
+                    <span>"mesh replicas"</span>
+                    <span>"parts"</span>
+                    <span>"lag"</span>
+                    <span>"playback"</span>
+                    <span>"rate"</span>
+                    <span>"detail"</span>
+                </div>
+                <For
+                    each=move || contributor_mesh_path_rows(
+                        &contrib.get(),
+                        &mesh.get(),
+                        &probes.get(),
+                        &contrib_rates.get(),
+                        &mesh_rates.get()
+                    )
+                    key=|row| row.key()
+                    let(row)
+                >
+                    {
+                        let class_name = row.class_name();
+                        view! {
+                            <div class=class_name>
+                                <span>{row.stream_id}</span>
+                                <span>{row.status}</span>
+                                <span>{row.contrib_ingest}</span>
+                                <span>{row.contrib_output}</span>
+                                <span>{row.mesh_replicas}</span>
+                                <span>{row.parts}</span>
+                                <span>{row.lag}</span>
+                                <span>{row.playback}</span>
+                                <span>{row.rate}</span>
+                                <span>{row.detail}</span>
+                            </div>
+                        }
+                    }
+                </For>
+            </div>
+        </section>
+    }
+}
+
+#[component]
 fn FeedDiagnosticCard(
     diag: ReadSignal<FeedDiagnostics>,
     active: ReadSignal<bool>,
@@ -729,7 +916,12 @@ fn FeedDiagnosticCard(
         <div class=move || diag.get().class_name(active.get())>
             <strong>{move || diag.get().source}</strong>
             <span>{move || diag.get().summary_text(active.get())}</span>
-            <small>{move || diag.get().detail_text()}</small>
+            <div class="dashboard-hose-detail">
+                <small>{move || diag.get().endpoint_text()}</small>
+                <small>{move || diag.get().poll_detail_text()}</small>
+                <small>{move || diag.get().event_detail_text()}</small>
+                <small>{move || diag.get().error_detail_text()}</small>
+            </div>
         </div>
     }
 }
@@ -1352,16 +1544,16 @@ fn OrchestrationView(
                 }).unwrap_or_else(|| "tcp-changes telemetry peers".to_owned())
             />
         </div>
-        <ProvisionBackendList mesh />
+        <ProvisionDetailView mesh />
         <ControlCommandHealth mesh />
         <TelemetryPeerList mesh rates />
     }
 }
 
 #[component]
-fn ProvisionBackendList(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
+fn ProvisionDetailView(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoView {
     view! {
-        <div class="provision-backend-list">
+        <div class="provision-detail-grid">
             <For
                 each=move || mesh.get().map(|m| m.orchestration.provision.backend_statuses).unwrap_or_default()
                 key=|backend| backend.name.clone()
@@ -1373,6 +1565,21 @@ fn ProvisionBackendList(mesh: ReadSignal<Option<MeshApiSnapshot>>) -> impl IntoV
                     <small>{backend.details.join(" / ")}</small>
                 </div>
             </For>
+            <div class=move || provision_latest_class(mesh.get().as_ref())>
+                <strong>"last provision"</strong>
+                <span>{move || provision_latest_value(mesh.get().as_ref())}</span>
+                <small>{move || provision_latest_detail(mesh.get().as_ref())}</small>
+            </div>
+            <div class=move || provision_linode_class(mesh.get().as_ref())>
+                <strong>"linode network"</strong>
+                <span>{move || provision_linode_value(mesh.get().as_ref())}</span>
+                <small>{move || provision_linode_detail(mesh.get().as_ref())}</small>
+            </div>
+            <div class=move || provision_bootstrap_class(mesh.get().as_ref())>
+                <strong>"bootstrap"</strong>
+                <span>{move || provision_bootstrap_value(mesh.get().as_ref())}</span>
+                <small>{move || provision_bootstrap_detail(mesh.get().as_ref())}</small>
+            </div>
         </div>
     }
 }
@@ -2143,13 +2350,22 @@ struct FeedDiagnostics {
     endpoint: String,
     mode: &'static str,
     event_messages: u64,
+    event_errors: u64,
     poll_successes: u64,
+    poll_attempts: u64,
+    poll_errors: u64,
     reconnects: u64,
-    errors: u64,
+    consecutive_reconnects: u64,
     parse_errors: u64,
+    event_ready_state: Option<u16>,
     last_event_unix_ms: Option<u64>,
-    last_poll_unix_ms: Option<u64>,
-    last_error: Option<String>,
+    last_event_error_unix_ms: Option<u64>,
+    last_reconnect_unix_ms: Option<u64>,
+    last_poll_attempt_unix_ms: Option<u64>,
+    last_poll_ok_unix_ms: Option<u64>,
+    last_poll_error_unix_ms: Option<u64>,
+    last_poll_error: Option<String>,
+    last_event_error: Option<String>,
 }
 
 impl FeedDiagnostics {
@@ -2159,72 +2375,96 @@ impl FeedDiagnostics {
             endpoint: String::new(),
             mode: "starting",
             event_messages: 0,
+            event_errors: 0,
             poll_successes: 0,
+            poll_attempts: 0,
+            poll_errors: 0,
             reconnects: 0,
-            errors: 0,
+            consecutive_reconnects: 0,
             parse_errors: 0,
+            event_ready_state: None,
             last_event_unix_ms: None,
-            last_poll_unix_ms: None,
-            last_error: None,
+            last_event_error_unix_ms: None,
+            last_reconnect_unix_ms: None,
+            last_poll_attempt_unix_ms: None,
+            last_poll_ok_unix_ms: None,
+            last_poll_error_unix_ms: None,
+            last_poll_error: None,
+            last_event_error: None,
         }
     }
 
     fn record_polling(&mut self, endpoint: &str) {
         self.endpoint = endpoint.to_owned();
         self.mode = "polling";
+        self.poll_attempts = self.poll_attempts.saturating_add(1);
+        self.last_poll_attempt_unix_ms = Some(now_unix_ms());
     }
 
     fn record_poll_ok(&mut self) {
         self.mode = "polling";
         self.poll_successes = self.poll_successes.saturating_add(1);
-        self.last_poll_unix_ms = Some(now_unix_ms());
-        self.last_error = None;
+        self.last_poll_ok_unix_ms = Some(now_unix_ms());
+        self.last_poll_error = None;
     }
 
     fn record_poll_error(&mut self, error: &str) {
         self.mode = "polling";
-        self.errors = self.errors.saturating_add(1);
-        self.last_error = Some(error.to_owned());
+        self.poll_errors = self.poll_errors.saturating_add(1);
+        self.last_poll_error_unix_ms = Some(now_unix_ms());
+        self.last_poll_error = Some(error.to_owned());
     }
 
     fn record_event_connecting(&mut self, endpoint: &str) {
         self.endpoint = endpoint.to_owned();
         self.mode = "connecting";
-        self.last_error = None;
+        self.event_ready_state = Some(EventSource::CONNECTING);
+        self.last_event_error = None;
+        self.consecutive_reconnects = 0;
     }
 
     fn record_event_ok(&mut self) {
         self.mode = "events";
         self.event_messages = self.event_messages.saturating_add(1);
         self.last_event_unix_ms = Some(now_unix_ms());
-        self.last_error = None;
+        self.event_ready_state = Some(EventSource::OPEN);
+        self.consecutive_reconnects = 0;
+        self.last_event_error = None;
     }
 
-    fn record_event_reconnect(&mut self, endpoint: &str) {
+    fn record_event_reconnect(&mut self, endpoint: &str, ready_state: u16) {
         self.endpoint = endpoint.to_owned();
         self.mode = "reconnecting";
         self.reconnects = self.reconnects.saturating_add(1);
-        self.last_error = Some("EventSource reconnecting".to_owned());
+        self.consecutive_reconnects = self.consecutive_reconnects.saturating_add(1);
+        self.event_ready_state = Some(ready_state);
+        self.last_reconnect_unix_ms = Some(now_unix_ms());
+        self.last_event_error = Some("EventSource reconnecting".to_owned());
+        self.last_event_error_unix_ms = Some(now_unix_ms());
     }
 
     fn record_event_error(&mut self, error: &str) {
         self.mode = "event error";
-        self.errors = self.errors.saturating_add(1);
-        self.last_error = Some(error.to_owned());
+        self.event_errors = self.event_errors.saturating_add(1);
+        self.last_event_error_unix_ms = Some(now_unix_ms());
+        self.last_event_error = Some(error.to_owned());
     }
 
     fn record_parse_error(&mut self, error: impl Into<String>) {
         self.mode = "parse error";
-        self.errors = self.errors.saturating_add(1);
+        self.event_errors = self.event_errors.saturating_add(1);
         self.parse_errors = self.parse_errors.saturating_add(1);
-        self.last_error = Some(error.into());
+        self.last_event_error_unix_ms = Some(now_unix_ms());
+        self.last_event_error = Some(error.into());
     }
 
     fn class_name(&self, active: bool) -> &'static str {
-        if self.last_error.is_some() {
-            "dashboard-hose-card error"
-        } else if active {
+        if active {
             "dashboard-hose-card ready"
+        } else if self.poll_fallback_ready() {
+            "dashboard-hose-card warn"
+        } else if self.current_poll_error() || self.last_event_error.is_some() {
+            "dashboard-hose-card error"
         } else if self.poll_successes > 0 {
             "dashboard-hose-card warn"
         } else {
@@ -2237,32 +2477,108 @@ impl FeedDiagnostics {
             "events active".to_owned()
         } else if self.mode == "polling" && self.poll_successes > 0 {
             "polling fallback".to_owned()
+        } else if self.mode == "reconnecting" && self.poll_successes > 0 {
+            "polling fallback".to_owned()
         } else {
             self.mode.to_owned()
         }
     }
 
-    fn detail_text(&self) -> String {
+    fn poll_detail_text(&self) -> String {
         let mut parts = vec![
-            self.endpoint_text(),
-            format!("{} events", self.event_messages),
-            format!("{} polls", self.poll_successes),
-            format!("{} reconnects", self.reconnects),
-            format!("{} errors", self.errors),
+            format!("JSON poll {}", self.poll_state_text()),
+            format!("{} attempts", self.poll_attempts),
+            format!("{} ok", self.poll_successes),
+            format!("{} errors", self.poll_errors),
+            format!(
+                "last attempt {}",
+                dashboard_age_text(self.last_poll_attempt_unix_ms)
+            ),
+            format!("last ok {}", dashboard_age_text(self.last_poll_ok_unix_ms)),
         ];
+        if self.last_poll_error.is_some() {
+            parts.push(format!(
+                "last error {}",
+                dashboard_age_text(self.last_poll_error_unix_ms)
+            ));
+        }
+        parts.join(" / ")
+    }
+
+    fn event_detail_text(&self) -> String {
+        let mut parts = vec![
+            format!("SSE {}", self.event_state_text()),
+            format!("{} messages", self.event_messages),
+            format!("{} reconnects", self.reconnects),
+            format!("last event {}", dashboard_age_text(self.last_event_unix_ms)),
+            self.event_backoff_text(),
+        ];
+        if self.last_reconnect_unix_ms.is_some() {
+            parts.push(format!(
+                "last reconnect {}",
+                dashboard_age_text(self.last_reconnect_unix_ms)
+            ));
+        }
+        parts.join(" / ")
+    }
+
+    fn error_detail_text(&self) -> String {
+        let mut parts = vec![format!(
+            "errors {} poll / {} sse",
+            self.poll_errors, self.event_errors
+        )];
         if self.parse_errors > 0 {
             parts.push(format!("{} parse", self.parse_errors));
         }
-        if let Some(last_event) = self.last_event_unix_ms {
-            parts.push(format!("event {}", optional_unix_age(Some(last_event))));
+        if let Some(error) = &self.last_poll_error {
+            parts.push(format!("last poll {error}"));
         }
-        if let Some(last_poll) = self.last_poll_unix_ms {
-            parts.push(format!("poll {}", optional_unix_age(Some(last_poll))));
-        }
-        if let Some(error) = &self.last_error {
-            parts.push(error.clone());
+        if let Some(error) = &self.last_event_error {
+            parts.push(format!("last sse {error}"));
         }
         parts.join(" / ")
+    }
+
+    fn poll_state_text(&self) -> &'static str {
+        if self.current_poll_error() {
+            "failing"
+        } else if self.poll_successes > 0 {
+            "ok"
+        } else if self.poll_attempts > 0 {
+            "pending"
+        } else {
+            "idle"
+        }
+    }
+
+    fn event_state_text(&self) -> &'static str {
+        match self.event_ready_state {
+            Some(EventSource::CONNECTING) if self.consecutive_reconnects > 0 => "reconnecting",
+            Some(EventSource::CONNECTING) => "connecting",
+            Some(EventSource::OPEN) => "open",
+            Some(EventSource::CLOSED) => "closed",
+            Some(_) => "unknown",
+            None => "idle",
+        }
+    }
+
+    fn event_backoff_text(&self) -> String {
+        if self.consecutive_reconnects > 0 {
+            format!(
+                "backoff browser-managed / {} consecutive",
+                self.consecutive_reconnects
+            )
+        } else {
+            "backoff idle".to_owned()
+        }
+    }
+
+    fn current_poll_error(&self) -> bool {
+        self.last_poll_error.is_some()
+    }
+
+    fn poll_fallback_ready(&self) -> bool {
+        !self.current_poll_error() && self.poll_successes > 0
     }
 
     fn endpoint_text(&self) -> String {
@@ -2272,6 +2588,544 @@ impl FeedDiagnostics {
             self.endpoint.clone()
         }
     }
+}
+
+fn dashboard_age_text(value: Option<u64>) -> String {
+    value.map(age_text).unwrap_or_else(|| "never".to_owned())
+}
+
+#[derive(Clone, Debug)]
+struct ContributorMeshPathRow {
+    stream_id: String,
+    status: String,
+    severity: &'static str,
+    contrib_ingest: String,
+    contrib_output: String,
+    mesh_replicas: String,
+    parts: String,
+    lag: String,
+    playback: String,
+    rate: String,
+    detail: String,
+}
+
+impl ContributorMeshPathRow {
+    fn key(&self) -> String {
+        self.stream_id.clone()
+    }
+
+    fn class_name(&self) -> &'static str {
+        match self.severity {
+            "ready" => "path-row ready",
+            "warn" => "path-row warn",
+            "error" => "path-row error",
+            _ => "path-row waiting",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MeshPathRate {
+    ready: bool,
+    window_ms: u64,
+    bytes_per_sec: f64,
+    datagrams_per_sec: f64,
+}
+
+fn contributor_mesh_path_rows(
+    contrib: &Option<ContribStatus>,
+    mesh: &Option<MeshApiSnapshot>,
+    probes: &PlaybackProbeState,
+    contrib_rates: &ContribRateSnapshot,
+    mesh_rates: &MeshRateSnapshot,
+) -> Vec<ContributorMeshPathRow> {
+    contributor_mesh_stream_ids(contrib, mesh)
+        .into_iter()
+        .map(|stream_id| {
+            contributor_mesh_path_row(stream_id, contrib, mesh, probes, contrib_rates, mesh_rates)
+        })
+        .collect()
+}
+
+fn contributor_mesh_path_summary(
+    contrib: &Option<ContribStatus>,
+    mesh: &Option<MeshApiSnapshot>,
+) -> String {
+    let path_count = contributor_mesh_stream_ids(contrib, mesh).len();
+    let contrib_count = contrib
+        .as_ref()
+        .map(|status| status.runtime.streams.len())
+        .unwrap_or_default();
+    let mesh_count = mesh
+        .as_ref()
+        .map(|snapshot| snapshot.streams.len())
+        .unwrap_or_default();
+    format!("{path_count} paths / {contrib_count} contrib streams / {mesh_count} mesh replicas")
+}
+
+fn contributor_mesh_stream_ids(
+    contrib: &Option<ContribStatus>,
+    mesh: &Option<MeshApiSnapshot>,
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    if let Some(status) = contrib {
+        for stream in &status.runtime.streams {
+            push_path_stream_id(&mut ids, &stream.stream_id_text);
+        }
+        push_path_stream_id(&mut ids, &status.advertised_hls_stream_id);
+    }
+    if let Some(snapshot) = mesh {
+        push_path_stream_id(&mut ids, &snapshot.stream.stream_id_text);
+        for stream in &snapshot.streams {
+            push_path_stream_id(&mut ids, &stream.stream_id_text);
+        }
+        for replica in &snapshot.planned_replicas {
+            push_path_stream_id(&mut ids, &replica.stream_id_text);
+        }
+    }
+    ids
+}
+
+fn push_path_stream_id(ids: &mut Vec<String>, stream_id: &str) {
+    let stream_id = stream_id.trim();
+    if stream_id.is_empty() || ids.iter().any(|existing| existing == stream_id) {
+        return;
+    }
+    ids.push(stream_id.to_owned());
+}
+
+fn contributor_mesh_path_row(
+    stream_id: String,
+    contrib: &Option<ContribStatus>,
+    mesh: &Option<MeshApiSnapshot>,
+    probes: &PlaybackProbeState,
+    contrib_rates: &ContribRateSnapshot,
+    mesh_rates: &MeshRateSnapshot,
+) -> ContributorMeshPathRow {
+    let contrib_stream = contrib.as_ref().and_then(|status| {
+        status
+            .runtime
+            .streams
+            .iter()
+            .find(|stream| stream.stream_id_text == stream_id)
+    });
+    let mesh_streams = mesh
+        .as_ref()
+        .map(|snapshot| {
+            snapshot
+                .streams
+                .iter()
+                .filter(|stream| stream.stream_id_text == stream_id)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let playback = path_playback_snapshot(&stream_id, &mesh_streams, probes);
+    let planned_replicas = mesh
+        .as_ref()
+        .map(|snapshot| {
+            snapshot
+                .planned_replicas
+                .iter()
+                .filter(|replica| replica.stream_id_text == stream_id)
+                .count()
+        })
+        .unwrap_or_default();
+    let severity = contributor_mesh_path_severity(contrib_stream, &mesh_streams, &playback);
+    let status = contributor_mesh_path_status(contrib_stream, &mesh_streams, &playback);
+    let contrib_rate = contrib_rates.streams.get(&stream_id).copied();
+    let mesh_rate = aggregate_mesh_path_rate(&mesh_streams, mesh_rates);
+
+    ContributorMeshPathRow {
+        stream_id,
+        status,
+        severity,
+        contrib_ingest: path_contrib_ingest_text(contrib_stream, contrib.is_some()),
+        contrib_output: path_contrib_output_text(contrib_stream),
+        mesh_replicas: path_mesh_replicas_text(&mesh_streams, planned_replicas, mesh.is_some()),
+        parts: path_parts_text(contrib_stream, &mesh_streams),
+        lag: path_lag_text(&mesh_streams),
+        playback: path_playback_text(contrib_stream, &playback),
+        rate: path_rate_text(contrib_stream, contrib_rate, &mesh_streams, mesh_rate),
+        detail: path_detail_text(contrib_stream, &mesh_streams, &playback, planned_replicas),
+    }
+}
+
+fn contributor_mesh_path_severity(
+    contrib_stream: Option<&ContribStreamRuntime>,
+    mesh_streams: &[&StreamTelemetry],
+    playback: &PathPlaybackSnapshot,
+) -> &'static str {
+    if contrib_stream.is_some_and(|stream| {
+        stream.state == "degraded" || stream.mesh_errors > 0 || stream.fmp4_publish_errors > 0
+    }) || mesh_streams.iter().any(|stream| stream.stale())
+        || playback.all_probes_failed()
+    {
+        "error"
+    } else if contrib_stream.is_none()
+        || mesh_streams.is_empty()
+        || mesh_streams.iter().any(|stream| stream.lagging())
+    {
+        "warn"
+    } else if contrib_stream.is_some() {
+        "ready"
+    } else {
+        "waiting"
+    }
+}
+
+fn contributor_mesh_path_status(
+    contrib_stream: Option<&ContribStreamRuntime>,
+    mesh_streams: &[&StreamTelemetry],
+    playback: &PathPlaybackSnapshot,
+) -> String {
+    if let Some(stream) = contrib_stream {
+        if stream.state == "degraded" || stream.mesh_errors > 0 || stream.fmp4_publish_errors > 0 {
+            return "degraded".to_owned();
+        }
+    }
+    if playback.all_probes_failed() {
+        "playback down".to_owned()
+    } else if mesh_streams.iter().any(|stream| stream.stale()) {
+        "stale".to_owned()
+    } else if mesh_streams.iter().any(|stream| stream.lagging()) {
+        "lagging".to_owned()
+    } else if contrib_stream.is_some() && !mesh_streams.is_empty() {
+        "linked".to_owned()
+    } else if contrib_stream.is_some() {
+        "mesh missing".to_owned()
+    } else if !mesh_streams.is_empty() {
+        "mesh only".to_owned()
+    } else {
+        "waiting".to_owned()
+    }
+}
+
+fn path_contrib_ingest_text(
+    contrib_stream: Option<&ContribStreamRuntime>,
+    has_contrib_snapshot: bool,
+) -> String {
+    match contrib_stream {
+        Some(stream) => format!(
+            "{} units / {} / input {}",
+            stream.input_units,
+            format_bytes(stream.input_bytes),
+            optional_age(stream.last_input_age_ms)
+        ),
+        None if has_contrib_snapshot => "not reported by contrib".to_owned(),
+        None => "contrib waiting".to_owned(),
+    }
+}
+
+fn path_contrib_output_text(contrib_stream: Option<&ContribStreamRuntime>) -> String {
+    let Some(stream) = contrib_stream else {
+        return "-".to_owned();
+    };
+    let mut parts = vec![
+        format!("fMP4 {}", optional_age(stream.last_fmp4_age_ms)),
+        format!("{} parts", stream.fmp4_parts),
+        format!("mesh {}", optional_age(stream.last_mesh_forward_age_ms)),
+    ];
+    if let Some(sequence) = stream.latest_fmp4_sequence {
+        parts.push(format!("seq {sequence}"));
+    }
+    if stream.fmp4_publish_errors > 0 {
+        parts.push(format!("{} publish errors", stream.fmp4_publish_errors));
+    }
+    parts.join(" / ")
+}
+
+fn path_mesh_replicas_text(
+    mesh_streams: &[&StreamTelemetry],
+    planned_replicas: usize,
+    has_mesh_snapshot: bool,
+) -> String {
+    if !mesh_streams.is_empty() {
+        let mut parts = vec![format!("{} observed", mesh_streams.len())];
+        if planned_replicas > 0 {
+            parts.push(format!("{planned_replicas} planned"));
+        }
+        parts.push(path_node_summary(mesh_streams));
+        return parts.join(" / ");
+    }
+    if planned_replicas > 0 {
+        format!("0 observed / {planned_replicas} planned")
+    } else if has_mesh_snapshot {
+        "none observed".to_owned()
+    } else {
+        "mesh waiting".to_owned()
+    }
+}
+
+fn path_node_summary(mesh_streams: &[&StreamTelemetry]) -> String {
+    let mut nodes = mesh_streams
+        .iter()
+        .map(|stream| {
+            format!(
+                "{} {} local {} mesh {} lag {}",
+                stream.node_id,
+                stream.status_text(),
+                optional_u64(stream.latest_local_part),
+                optional_u64(stream.latest_mesh_part),
+                stream.lag_text()
+            )
+        })
+        .collect::<Vec<_>>();
+    nodes.sort();
+    let hidden = nodes.len().saturating_sub(4);
+    nodes.truncate(4);
+    if hidden > 0 {
+        nodes.push(format!("+{hidden} more"));
+    }
+    nodes.join(", ")
+}
+
+fn path_parts_text(
+    contrib_stream: Option<&ContribStreamRuntime>,
+    mesh_streams: &[&StreamTelemetry],
+) -> String {
+    let fmp4_sequence = contrib_stream.and_then(|stream| stream.latest_fmp4_sequence);
+    let latest_mesh_part = mesh_streams
+        .iter()
+        .filter_map(|stream| stream.latest_mesh_part)
+        .max();
+    let latest_local_part = mesh_streams
+        .iter()
+        .filter_map(|stream| stream.latest_local_part)
+        .max();
+    format!(
+        "fMP4 {} / mesh {} / local {}",
+        optional_u64(fmp4_sequence),
+        optional_u64(latest_mesh_part),
+        optional_u64(latest_local_part)
+    )
+}
+
+fn path_lag_text(mesh_streams: &[&StreamTelemetry]) -> String {
+    if mesh_streams.is_empty() {
+        return "-".to_owned();
+    }
+    let worst_lag = mesh_streams
+        .iter()
+        .filter_map(|stream| stream.mesh_lag_parts)
+        .max();
+    let stale = mesh_streams.iter().filter(|stream| stream.stale()).count();
+    let mut parts = vec![match worst_lag {
+        Some(0) => "head".to_owned(),
+        Some(lag) => format!("worst {lag} parts"),
+        None => "lag waiting".to_owned(),
+    }];
+    if stale > 0 {
+        parts.push(format!("{stale} stale"));
+    }
+    parts.join(" / ")
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PathPlaybackSnapshot {
+    probes: usize,
+    ready: usize,
+    fastest_probe_ms: Option<u64>,
+    freshest_edge_part_age_ms: Option<u64>,
+}
+
+impl PathPlaybackSnapshot {
+    fn all_probes_failed(&self) -> bool {
+        self.probes > 0 && self.ready == 0
+    }
+}
+
+fn path_playback_snapshot(
+    stream_id: &str,
+    mesh_streams: &[&StreamTelemetry],
+    probes: &PlaybackProbeState,
+) -> PathPlaybackSnapshot {
+    let mut matching_probes = probes
+        .probes
+        .iter()
+        .filter(|probe| {
+            probe.label.starts_with("mesh ")
+                && playlist_probe_stream_id(probe).as_deref() == Some(stream_id)
+        })
+        .collect::<Vec<_>>();
+    if matching_probes.is_empty() {
+        matching_probes = probes
+            .probes
+            .iter()
+            .filter(|probe| playlist_probe_stream_id(probe).as_deref() == Some(stream_id))
+            .collect();
+    }
+
+    let probes = matching_probes.len();
+    let ready = matching_probes.iter().filter(|probe| probe.ok).count();
+    let fastest_probe_ms = matching_probes
+        .iter()
+        .filter(|probe| probe.ok)
+        .map(|probe| probe.elapsed_ms)
+        .min();
+    let freshest_edge_part_age_ms = mesh_streams
+        .iter()
+        .filter_map(|stream| {
+            stream
+                .latest_local_part_age_ms
+                .or(stream.last_ingest_age_ms)
+        })
+        .min();
+
+    PathPlaybackSnapshot {
+        probes,
+        ready,
+        fastest_probe_ms,
+        freshest_edge_part_age_ms,
+    }
+}
+
+fn playlist_probe_stream_id(probe: &PlaylistProbe) -> Option<String> {
+    let path = probe
+        .url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(probe.url.as_str());
+    let segments = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    segments.windows(2).find_map(|window| {
+        (window[1] == "stream.m3u8" && !window[0].is_empty()).then(|| window[0].to_owned())
+    })
+}
+
+fn path_playback_text(
+    contrib_stream: Option<&ContribStreamRuntime>,
+    playback: &PathPlaybackSnapshot,
+) -> String {
+    let mut parts = Vec::new();
+    if playback.probes > 0 {
+        parts.push(format!("edge {}/{}", playback.ready, playback.probes));
+    } else {
+        parts.push("edge probe waiting".to_owned());
+    }
+
+    if let Some(edge_age_ms) = playback.freshest_edge_part_age_ms {
+        let e2e_ms = edge_age_ms.saturating_add(playback.fastest_probe_ms.unwrap_or_default());
+        parts.push(format!("e2e ~{}", format_duration_ms_plain(e2e_ms)));
+        if let Some(probe_ms) = playback.fastest_probe_ms {
+            parts.push(format!("probe {}", format_duration_ms_plain(probe_ms)));
+        }
+        if let Some(input_age_ms) = contrib_stream.and_then(|stream| stream.last_input_age_ms) {
+            if edge_age_ms > input_age_ms {
+                parts.push(format!(
+                    "edge behind {}",
+                    format_duration_ms_plain(edge_age_ms - input_age_ms)
+                ));
+            } else {
+                parts.push("edge at ingest head".to_owned());
+            }
+        }
+    } else if playback.all_probes_failed() {
+        parts.push("playback failing".to_owned());
+    } else if contrib_stream.is_some() {
+        parts.push("edge part waiting".to_owned());
+    } else {
+        parts.push("playback waiting".to_owned());
+    }
+
+    parts.join(" / ")
+}
+
+fn path_rate_text(
+    contrib_stream: Option<&ContribStreamRuntime>,
+    contrib_rate: Option<ContribStreamRateSnapshot>,
+    mesh_streams: &[&StreamTelemetry],
+    mesh_rate: MeshPathRate,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(rate) = contrib_rate {
+        if rate.ready {
+            parts.push(format!(
+                "contrib mesh {}",
+                format_bytes_per_sec(true, rate.mesh_payload_bytes_per_sec)
+            ));
+        } else {
+            parts.push("contrib rate waiting".to_owned());
+        }
+    } else if contrib_stream.is_some() {
+        parts.push("contrib rate waiting".to_owned());
+    }
+    if mesh_rate.ready {
+        parts.push(format!(
+            "mesh rx {} / {} / {}",
+            format_bytes_per_sec(true, mesh_rate.bytes_per_sec),
+            format_count_per_sec(mesh_rate.datagrams_per_sec, "datagrams"),
+            format_rate_window(mesh_rate.window_ms)
+        ));
+    } else if !mesh_streams.is_empty() {
+        parts.push("mesh rate waiting".to_owned());
+    }
+    if parts.is_empty() {
+        "rate waiting".to_owned()
+    } else {
+        parts.join(" / ")
+    }
+}
+
+fn aggregate_mesh_path_rate(
+    mesh_streams: &[&StreamTelemetry],
+    mesh_rates: &MeshRateSnapshot,
+) -> MeshPathRate {
+    let mut aggregate = MeshPathRate::default();
+    for stream in mesh_streams {
+        let Some(rate) = mesh_rates
+            .streams
+            .get(&stream.rate_key())
+            .filter(|rate| rate.ready)
+        else {
+            continue;
+        };
+        aggregate.ready = true;
+        aggregate.window_ms = aggregate.window_ms.max(rate.window_ms);
+        aggregate.bytes_per_sec += rate.bytes_per_sec;
+        aggregate.datagrams_per_sec += rate.datagrams_per_sec;
+    }
+    aggregate
+}
+
+fn path_detail_text(
+    contrib_stream: Option<&ContribStreamRuntime>,
+    mesh_streams: &[&StreamTelemetry],
+    playback: &PathPlaybackSnapshot,
+    planned_replicas: usize,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(stream) = contrib_stream {
+        parts.push(stream.track_text());
+        if stream.mesh_errors > 0 {
+            parts.push(format!("{} mesh errors", stream.mesh_errors));
+        }
+    } else {
+        parts.push("contrib stream absent".to_owned());
+    }
+    if mesh_streams.is_empty() {
+        parts.push("mesh telemetry absent".to_owned());
+    }
+    if planned_replicas > mesh_streams.len() {
+        parts.push(format!(
+            "{} planned replica(s) not observed",
+            planned_replicas - mesh_streams.len()
+        ));
+    }
+    if mesh_streams.iter().any(|stream| stream.lagging()) {
+        parts.push("mesh lag above warning threshold".to_owned());
+    }
+    if mesh_streams.iter().any(|stream| stream.stale()) {
+        parts.push("mesh ingest stale".to_owned());
+    }
+    if playback.all_probes_failed() {
+        parts.push(format!(
+            "{} edge playback probe(s) failing",
+            playback.probes
+        ));
+    }
+    parts.join(" / ")
 }
 
 #[derive(Clone, Debug)]
@@ -2601,6 +3455,7 @@ fn contrib_health_age_is_fresh(seen: bool, age_ms: Option<u64>, health: &Contrib
 
 #[derive(Clone, Debug)]
 struct Incident {
+    id: String,
     level: String,
     source: String,
     code: String,
@@ -2608,24 +3463,259 @@ struct Incident {
     detail: String,
     count: u64,
     last_seen_unix_ms: Option<u64>,
+    target_node: Option<String>,
+    target_stream: Option<String>,
+    target_protocol: Option<String>,
 }
 
 impl Incident {
-    fn class_name(&self) -> String {
-        format!("incident {}", self.level)
+    fn class_name(&self, acknowledged: bool) -> String {
+        if acknowledged {
+            format!("incident {} acknowledged", self.level)
+        } else {
+            format!("incident {}", self.level)
+        }
     }
 
     fn key(&self) -> String {
-        format!("{}:{}:{}", self.source, self.code, self.message)
+        self.id.clone()
     }
 
     fn meta_text(&self) -> String {
-        let mut parts = vec![format!("{} seen", self.count)];
+        let mut parts = vec![format!("id {}", self.id), format!("{} seen", self.count)];
         parts.push(optional_unix_age(self.last_seen_unix_ms));
         if !self.detail.is_empty() {
             parts.push(self.detail.clone());
         }
         parts.join(" / ")
+    }
+}
+
+#[derive(Clone, Debug)]
+struct IncidentSeverityRollup {
+    scope: &'static str,
+    target: String,
+    errors: usize,
+    warnings: usize,
+    info: usize,
+    acknowledged: usize,
+    suppressed: usize,
+}
+
+impl IncidentSeverityRollup {
+    fn new(scope: &'static str, target: &str) -> Self {
+        Self {
+            scope,
+            target: target.to_owned(),
+            errors: 0,
+            warnings: 0,
+            info: 0,
+            acknowledged: 0,
+            suppressed: 0,
+        }
+    }
+
+    fn key(&self) -> String {
+        format!("{}:{}", self.scope, self.target)
+    }
+
+    fn class_name(&self) -> &'static str {
+        if self.errors > 0 {
+            "incident-severity-rollup error"
+        } else if self.warnings > 0 {
+            "incident-severity-rollup warn"
+        } else if self.info > 0 {
+            "incident-severity-rollup info"
+        } else {
+            "incident-severity-rollup suppressed"
+        }
+    }
+
+    fn title_text(&self) -> String {
+        format!("{} {}", self.scope, self.target)
+    }
+
+    fn severity_text(&self) -> String {
+        format!(
+            "{} err / {} warn / {} info",
+            self.errors, self.warnings, self.info
+        )
+    }
+
+    fn disposition_text(&self) -> String {
+        format!(
+            "{} active / {} ack / {} suppressed",
+            self.active_count(),
+            self.acknowledged,
+            self.suppressed
+        )
+    }
+
+    fn active_count(&self) -> usize {
+        self.errors + self.warnings + self.info
+    }
+
+    fn record(&mut self, incident: &Incident, dispositions: &IncidentDispositions) {
+        if dispositions.is_suppressed(&incident.id) {
+            self.suppressed += 1;
+            return;
+        }
+        if dispositions.is_acknowledged(&incident.id) {
+            self.acknowledged += 1;
+        }
+        match incident.level.as_str() {
+            "error" => self.errors += 1,
+            "warn" => self.warnings += 1,
+            _ => self.info += 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct IncidentDispositions {
+    acknowledged: HashSet<String>,
+    suppressed: HashSet<String>,
+}
+
+impl IncidentDispositions {
+    fn is_acknowledged(&self, id: &str) -> bool {
+        self.acknowledged.contains(id)
+    }
+
+    fn is_suppressed(&self, id: &str) -> bool {
+        self.suppressed.contains(id)
+    }
+
+    fn toggle_acknowledged(&mut self, id: String) {
+        self.suppressed.remove(&id);
+        if !self.acknowledged.insert(id.clone()) {
+            self.acknowledged.remove(&id);
+        }
+    }
+
+    fn suppress(&mut self, id: String) {
+        self.acknowledged.remove(&id);
+        self.suppressed.insert(id);
+    }
+
+    fn clear(&mut self) {
+        self.acknowledged.clear();
+        self.suppressed.clear();
+    }
+
+    fn from_stored(stored: StoredIncidentDispositions) -> Self {
+        Self {
+            acknowledged: stored.acknowledged.into_iter().collect(),
+            suppressed: stored.suppressed.into_iter().collect(),
+        }
+    }
+
+    fn to_stored(&self) -> StoredIncidentDispositions {
+        let mut acknowledged = self.acknowledged.iter().cloned().collect::<Vec<_>>();
+        let mut suppressed = self.suppressed.iter().cloned().collect::<Vec<_>>();
+        acknowledged.sort();
+        suppressed.sort();
+        StoredIncidentDispositions {
+            acknowledged,
+            suppressed,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct StoredIncidentDispositions {
+    #[serde(default)]
+    acknowledged: Vec<String>,
+    #[serde(default)]
+    suppressed: Vec<String>,
+}
+
+fn load_incident_dispositions() -> IncidentDispositions {
+    let Some(storage) = browser_local_storage() else {
+        return IncidentDispositions::default();
+    };
+    storage
+        .get_item(INCIDENT_DISPOSITIONS_STORAGE_KEY)
+        .ok()
+        .flatten()
+        .and_then(|json| serde_json::from_str::<StoredIncidentDispositions>(&json).ok())
+        .map(IncidentDispositions::from_stored)
+        .unwrap_or_default()
+}
+
+fn persist_incident_dispositions(dispositions: &IncidentDispositions) {
+    let Some(storage) = browser_local_storage() else {
+        return;
+    };
+    if dispositions.acknowledged.is_empty() && dispositions.suppressed.is_empty() {
+        let _ = storage.remove_item(INCIDENT_DISPOSITIONS_STORAGE_KEY);
+        return;
+    }
+    if let Ok(json) = serde_json::to_string(&dispositions.to_stored()) {
+        let _ = storage.set_item(INCIDENT_DISPOSITIONS_STORAGE_KEY, &json);
+    }
+}
+
+fn browser_local_storage() -> Option<web_sys::Storage> {
+    web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+}
+
+fn incident_severity_rollups(
+    incidents: &[Incident],
+    dispositions: &IncidentDispositions,
+) -> Vec<IncidentSeverityRollup> {
+    let mut rollups = HashMap::<String, IncidentSeverityRollup>::new();
+    for incident in incidents {
+        if let Some(target) = &incident.target_node {
+            record_incident_rollup(&mut rollups, "node", target, incident, dispositions);
+        }
+        if let Some(target) = &incident.target_stream {
+            record_incident_rollup(&mut rollups, "stream", target, incident, dispositions);
+        }
+        if let Some(target) = &incident.target_protocol {
+            record_incident_rollup(&mut rollups, "protocol", target, incident, dispositions);
+        }
+    }
+
+    let mut rollups = rollups.into_values().collect::<Vec<_>>();
+    rollups.sort_by(|left, right| {
+        right
+            .errors
+            .cmp(&left.errors)
+            .then_with(|| right.warnings.cmp(&left.warnings))
+            .then_with(|| right.info.cmp(&left.info))
+            .then_with(|| right.active_count().cmp(&left.active_count()))
+            .then_with(|| right.suppressed.cmp(&left.suppressed))
+            .then_with(|| {
+                incident_rollup_scope_rank(left.scope).cmp(&incident_rollup_scope_rank(right.scope))
+            })
+            .then_with(|| left.target.cmp(&right.target))
+    });
+    rollups
+}
+
+fn record_incident_rollup(
+    rollups: &mut HashMap<String, IncidentSeverityRollup>,
+    scope: &'static str,
+    target: &str,
+    incident: &Incident,
+    dispositions: &IncidentDispositions,
+) {
+    let Some(target) = incident_target(target) else {
+        return;
+    };
+    rollups
+        .entry(format!("{scope}:{target}"))
+        .or_insert_with(|| IncidentSeverityRollup::new(scope, &target))
+        .record(incident, dispositions);
+}
+
+fn incident_rollup_scope_rank(scope: &str) -> u8 {
+    match scope {
+        "node" => 0,
+        "stream" => 1,
+        "protocol" => 2,
+        _ => 3,
     }
 }
 
@@ -2653,35 +3743,63 @@ fn build_incidents(
     );
 
     if let Some(mesh) = mesh {
-        incidents.extend(mesh.alerts.iter().map(|alert| Incident {
-            level: normalize_incident_level(&alert.level),
-            source: "mesh".to_owned(),
-            code: alert.code.clone(),
-            message: alert.message.clone(),
-            detail: alert.target_detail_text(&mesh.node.node_id),
-            count: alert.count.max(1),
-            last_seen_unix_ms: alert.last_seen_unix_ms,
+        incidents.extend(mesh.alerts.iter().map(|alert| {
+            let detail = alert.target_detail_text(&mesh.node.node_id);
+            let target_node = alert
+                .node_id
+                .as_deref()
+                .and_then(incident_target)
+                .or_else(|| incident_target(&mesh.node.node_id));
+            let target_stream = alert.stream_id_text.as_deref().and_then(incident_target);
+            Incident {
+                id: stable_incident_id("mesh", &alert.code, &detail),
+                level: normalize_incident_level(&alert.level),
+                source: "mesh".to_owned(),
+                code: alert.code.clone(),
+                message: alert.message.clone(),
+                detail,
+                count: alert.count.max(1),
+                last_seen_unix_ms: alert.last_seen_unix_ms,
+                target_node,
+                target_stream,
+                target_protocol: None,
+            }
         }));
     }
 
     if let Some(contrib) = contrib {
-        incidents.extend(contrib.alerts.iter().map(|alert| Incident {
-            level: normalize_incident_level(&alert.level),
-            source: "contrib".to_owned(),
-            code: alert.code.clone(),
-            message: alert.message.clone(),
-            detail: alert.target_detail_text(&contrib.advertised_hls_stream_id),
-            count: alert.count.max(1),
-            last_seen_unix_ms: alert.last_seen_unix_ms,
+        incidents.extend(contrib.alerts.iter().map(|alert| {
+            let detail = alert.target_detail_text(&contrib.advertised_hls_stream_id);
+            let target_stream = alert
+                .stream_id_text
+                .as_deref()
+                .and_then(incident_target)
+                .or_else(|| incident_target(&contrib.advertised_hls_stream_id));
+            let target_protocol = alert.protocol.as_deref().and_then(incident_target);
+            Incident {
+                id: stable_incident_id("contrib", &alert.code, &detail),
+                level: normalize_incident_level(&alert.level),
+                source: "contrib".to_owned(),
+                code: alert.code.clone(),
+                message: alert.message.clone(),
+                detail,
+                count: alert.count.max(1),
+                last_seen_unix_ms: alert.last_seen_unix_ms,
+                target_node: None,
+                target_stream,
+                target_protocol,
+            }
         }));
     }
 
+    let local_node_id = mesh.as_ref().map(|mesh| mesh.node.node_id.as_str());
     incidents.extend(
         probes
             .probes
             .iter()
             .filter(|probe| !probe.ok)
             .map(|probe| Incident {
+                id: stable_incident_id("playback", "playlist_probe_failed", &probe.url),
                 level: "error".to_owned(),
                 source: "playback".to_owned(),
                 code: "playlist_probe_failed".to_owned(),
@@ -2689,6 +3807,9 @@ fn build_incidents(
                 detail: probe.meta_text(),
                 count: 1,
                 last_seen_unix_ms: nonzero_u64(probes.updated_unix_ms),
+                target_node: playlist_probe_node_id(probe, local_node_id),
+                target_stream: playlist_probe_stream_id(probe),
+                target_protocol: Some("ll-hls".to_owned()),
             }),
     );
 
@@ -2707,13 +3828,27 @@ fn build_incidents(
     incidents
 }
 
+fn visible_incidents(
+    mesh: &Option<MeshApiSnapshot>,
+    contrib: &Option<ContribStatus>,
+    probes: &PlaybackProbeState,
+    feed: DashboardFeedHealth,
+    dispositions: &IncidentDispositions,
+) -> Vec<Incident> {
+    build_incidents(mesh, contrib, probes, feed)
+        .into_iter()
+        .filter(|incident| !dispositions.is_suppressed(&incident.id))
+        .collect()
+}
+
 fn incident_count_text(
     mesh: &Option<MeshApiSnapshot>,
     contrib: &Option<ContribStatus>,
     probes: &PlaybackProbeState,
     feed: DashboardFeedHealth,
+    dispositions: &IncidentDispositions,
 ) -> String {
-    build_incidents(mesh, contrib, probes, feed)
+    visible_incidents(mesh, contrib, probes, feed, dispositions)
         .len()
         .to_string()
 }
@@ -2723,10 +3858,11 @@ fn incident_detail_text(
     contrib: &Option<ContribStatus>,
     probes: &PlaybackProbeState,
     feed: DashboardFeedHealth,
+    dispositions: &IncidentDispositions,
 ) -> String {
-    let incidents = build_incidents(mesh, contrib, probes, feed);
+    let incidents = visible_incidents(mesh, contrib, probes, feed, dispositions);
     if incidents.is_empty() {
-        return incident_empty_text(mesh, contrib, probes, feed);
+        return incident_empty_text(mesh, contrib, probes, feed, dispositions);
     }
     let errors = incidents
         .iter()
@@ -2740,7 +3876,15 @@ fn incident_detail_text(
         .len()
         .saturating_sub(errors)
         .saturating_sub(warnings);
-    format!("{errors} errors / {warnings} warnings / {info} info")
+    let acknowledged = incidents
+        .iter()
+        .filter(|incident| dispositions.is_acknowledged(&incident.id))
+        .count();
+    let suppressed = build_incidents(mesh, contrib, probes, feed)
+        .iter()
+        .filter(|incident| dispositions.is_suppressed(&incident.id))
+        .count();
+    format!("{errors} errors / {warnings} warnings / {info} info / {acknowledged} ack / {suppressed} suppressed")
 }
 
 fn incident_empty_text(
@@ -2748,11 +3892,23 @@ fn incident_empty_text(
     contrib: &Option<ContribStatus>,
     probes: &PlaybackProbeState,
     feed: DashboardFeedHealth,
+    dispositions: &IncidentDispositions,
 ) -> String {
     let waiting_for_grace =
         now_unix_ms().saturating_sub(feed.started_unix_ms) < DASHBOARD_FEED_MISSING_GRACE_MS;
+    let incidents = build_incidents(mesh, contrib, probes, feed);
+    let visible = incidents
+        .iter()
+        .filter(|incident| !dispositions.is_suppressed(&incident.id))
+        .count();
+    let suppressed = incidents
+        .iter()
+        .filter(|incident| dispositions.is_suppressed(&incident.id))
+        .count();
     if waiting_for_grace && mesh.is_none() && contrib.is_none() && probes.probes.is_empty() {
         "waiting for feeds".to_owned()
+    } else if visible == 0 && suppressed > 0 {
+        "all active incidents suppressed".to_owned()
     } else {
         "no active incidents".to_owned()
     }
@@ -2771,10 +3927,12 @@ fn push_dashboard_feed_incidents(
         Some(updated) => {
             let age_ms = now.saturating_sub(updated);
             if age_ms > DASHBOARD_SNAPSHOT_STALE_MS {
+                let code = format!("{source}_feed_stale");
                 incidents.push(Incident {
+                    id: stable_incident_id(source, &code, ""),
                     level: "error".to_owned(),
                     source: source.to_owned(),
-                    code: format!("{source}_feed_stale"),
+                    code,
                     message: format!(
                         "{source} status data has not updated for {}.",
                         format_duration_ms_plain(age_ms)
@@ -2782,26 +3940,36 @@ fn push_dashboard_feed_incidents(
                     detail: format!("last snapshot {}", age_text(updated)),
                     count: 1,
                     last_seen_unix_ms: Some(updated),
+                    target_node: None,
+                    target_stream: None,
+                    target_protocol: Some("dashboard-feed".to_owned()),
                 });
             } else if !events_active && since_start > DASHBOARD_FEED_MISSING_GRACE_MS {
+                let code = format!("{source}_events_inactive");
                 incidents.push(Incident {
+                    id: stable_incident_id(source, &code, ""),
                     level: "warn".to_owned(),
                     source: source.to_owned(),
-                    code: format!("{source}_events_inactive"),
+                    code,
                     message: format!(
                         "{source} SSE data hose is inactive; dashboard is relying on HTTP polling."
                     ),
                     detail: format!("last snapshot {}", age_text(updated)),
                     count: 1,
                     last_seen_unix_ms: Some(now),
+                    target_node: None,
+                    target_stream: None,
+                    target_protocol: Some("dashboard-feed".to_owned()),
                 });
             }
         }
         None if since_start > DASHBOARD_FEED_MISSING_GRACE_MS => {
+            let code = format!("{source}_feed_missing");
             incidents.push(Incident {
+                id: stable_incident_id(source, &code, ""),
                 level: "error".to_owned(),
                 source: source.to_owned(),
-                code: format!("{source}_feed_missing"),
+                code,
                 message: format!("{source} status feed has not delivered an initial snapshot."),
                 detail: format!(
                     "dashboard waiting {}",
@@ -2809,10 +3977,54 @@ fn push_dashboard_feed_incidents(
                 ),
                 count: 1,
                 last_seen_unix_ms: Some(started_unix_ms),
+                target_node: None,
+                target_stream: None,
+                target_protocol: Some("dashboard-feed".to_owned()),
             });
         }
         None => {}
     }
+}
+
+fn incident_target(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn playlist_probe_node_id(probe: &PlaylistProbe, local_node_id: Option<&str>) -> Option<String> {
+    let mesh_node = probe.label.strip_prefix("mesh ")?;
+    if mesh_node == "local" {
+        local_node_id
+            .and_then(incident_target)
+            .or_else(|| incident_target("mesh local"))
+    } else {
+        incident_target(mesh_node)
+    }
+}
+
+fn stable_incident_id(source: &str, code: &str, target: &str) -> String {
+    let target = stable_incident_fragment(target);
+    if target.is_empty() {
+        format!("{source}:{code}")
+    } else {
+        format!("{source}:{code}:{target}")
+    }
+}
+
+fn stable_incident_fragment(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, ':' | '.' | '-' | '_') {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_owned()
 }
 
 fn normalize_incident_level(level: &str) -> String {
@@ -2859,7 +4071,11 @@ impl TopologyGraphNode {
 
     fn detail_text(&self) -> String {
         if let Some(age_ms) = self.stale_age_ms {
-            format!("{} / stale {}", self.region, format_duration_ms_plain(age_ms))
+            format!(
+                "{} / stale {}",
+                self.region,
+                format_duration_ms_plain(age_ms)
+            )
         } else {
             format!("{} / {} active", self.region, self.active_streams)
         }
@@ -4605,6 +5821,211 @@ fn latest_command_meta(commands: &[ControlCommand], kind: &str) -> String {
         .find(|command| command_kind_matches(&command.kind, kind))
         .map(|command| command.meta_text())
         .unwrap_or_else(|| "no provision commands".to_owned())
+}
+
+fn latest_provision_command(mesh: Option<&MeshApiSnapshot>) -> Option<&ControlCommand> {
+    mesh?
+        .recent_commands
+        .iter()
+        .find(|command| command_kind_matches(&command.kind, "provision_node"))
+}
+
+fn provision_backend<'a>(
+    mesh: Option<&'a MeshApiSnapshot>,
+    name: &str,
+) -> Option<&'a ProvisionBackendStatus> {
+    mesh?
+        .orchestration
+        .provision
+        .backend_statuses
+        .iter()
+        .find(|backend| backend.name == name)
+}
+
+fn provision_backend_configured(mesh: Option<&MeshApiSnapshot>, name: &str) -> bool {
+    mesh.is_some_and(|mesh| {
+        mesh.orchestration
+            .provision
+            .backends
+            .iter()
+            .any(|backend| backend == name)
+    })
+}
+
+fn provision_latest_class(mesh: Option<&MeshApiSnapshot>) -> &'static str {
+    match latest_provision_command(mesh).map(ControlCommand::status_kind) {
+        Some(CommandStatusKind::Ok) => "provision-detail-card ready",
+        Some(CommandStatusKind::Error) => "provision-detail-card blocked",
+        Some(CommandStatusKind::Warn) => "provision-detail-card warn",
+        Some(CommandStatusKind::Running) => "provision-detail-card warn",
+        None => "provision-detail-card warn",
+    }
+}
+
+fn provision_latest_value(mesh: Option<&MeshApiSnapshot>) -> String {
+    latest_provision_command(mesh)
+        .map(|command| match command.status_kind() {
+            CommandStatusKind::Running => "running",
+            CommandStatusKind::Ok => "ok",
+            CommandStatusKind::Warn => "skipped",
+            CommandStatusKind::Error => "failed",
+        })
+        .unwrap_or("none")
+        .to_owned()
+}
+
+fn provision_latest_detail(mesh: Option<&MeshApiSnapshot>) -> String {
+    latest_provision_command(mesh)
+        .map(|command| {
+            format!(
+                "{} / {} / {}",
+                command.meta_text(),
+                command.kind_label(),
+                command.status_text()
+            )
+        })
+        .unwrap_or_else(|| "no provision commands".to_owned())
+}
+
+fn provision_linode_class(mesh: Option<&MeshApiSnapshot>) -> &'static str {
+    if provision_linode_facts(mesh).is_some() {
+        return "provision-detail-card ready";
+    }
+    if let Some(command) = latest_provision_command(mesh) {
+        if command.status_kind() == CommandStatusKind::Error && command.status.contains("linode") {
+            return "provision-detail-card blocked";
+        }
+    }
+    match provision_backend(mesh, "linode").map(|backend| backend.state.as_str()) {
+        Some("ready") => "provision-detail-card ready",
+        Some("blocked") | Some("error") => "provision-detail-card blocked",
+        Some(_) => "provision-detail-card warn",
+        None => "provision-detail-card warn",
+    }
+}
+
+fn provision_linode_value(mesh: Option<&MeshApiSnapshot>) -> String {
+    if let Some(facts) = provision_linode_facts(mesh) {
+        if let Some(private_ipam) = facts.get("private_ipam") {
+            return private_ipam.clone();
+        }
+        return "provisioned".to_owned();
+    }
+    if let Some(backend) = provision_backend(mesh, "linode") {
+        return backend.state.clone();
+    }
+    "not configured".to_owned()
+}
+
+fn provision_linode_detail(mesh: Option<&MeshApiSnapshot>) -> String {
+    if let Some(facts) = provision_linode_facts(mesh) {
+        let detail = [
+            facts.get("vlan").map(|value| format!("vlan {value}")),
+            facts
+                .get("dns")
+                .filter(|value| value.as_str() != "none")
+                .map(|value| format!("dns {value}")),
+            facts
+                .get("public_ipv4")
+                .map(|value| format!("public {value}")),
+            facts
+                .get("instance_id")
+                .map(|value| format!("instance {value}")),
+            facts
+                .get("linode_region")
+                .map(|value| format!("region {value}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" / ");
+        if !detail.is_empty() {
+            return detail;
+        }
+    }
+    provision_backend(mesh, "linode")
+        .map(|backend| backend.details.join(" / "))
+        .unwrap_or_else(|| "Linode backend disabled".to_owned())
+}
+
+fn provision_bootstrap_class(mesh: Option<&MeshApiSnapshot>) -> &'static str {
+    if let Some(command) = latest_provision_command(mesh) {
+        let segment = provision_bootstrap_segment(&command.status);
+        if segment.contains("failed") || segment.contains("timed out") {
+            return "provision-detail-card blocked";
+        }
+        if segment.contains("executed") {
+            return "provision-detail-card ready";
+        }
+        if segment.contains("skipped") || !segment.is_empty() {
+            return "provision-detail-card warn";
+        }
+    }
+    match provision_backend(mesh, "command").map(|backend| backend.state.as_str()) {
+        Some("ready") => "provision-detail-card ready",
+        Some("blocked") | Some("error") => "provision-detail-card blocked",
+        Some(_) => "provision-detail-card warn",
+        None => "provision-detail-card warn",
+    }
+}
+
+fn provision_bootstrap_value(mesh: Option<&MeshApiSnapshot>) -> String {
+    if let Some(command) = latest_provision_command(mesh) {
+        let segment = provision_bootstrap_segment(&command.status);
+        if segment.contains("executed") {
+            return "executed".to_owned();
+        }
+        if segment.contains("failed") || segment.contains("timed out") {
+            return "failed".to_owned();
+        }
+        if segment.contains("skipped") {
+            return "skipped".to_owned();
+        }
+    }
+    if provision_backend_configured(mesh, "command") {
+        "configured".to_owned()
+    } else {
+        "not configured".to_owned()
+    }
+}
+
+fn provision_bootstrap_detail(mesh: Option<&MeshApiSnapshot>) -> String {
+    if let Some(command) = latest_provision_command(mesh) {
+        let segment = provision_bootstrap_segment(&command.status);
+        if !segment.is_empty() {
+            return segment;
+        }
+    }
+    provision_backend(mesh, "command")
+        .map(|backend| backend.details.join(" / "))
+        .unwrap_or_else(|| "no chained provision command".to_owned())
+}
+
+fn provision_linode_facts(mesh: Option<&MeshApiSnapshot>) -> Option<HashMap<String, String>> {
+    let command = latest_provision_command(mesh)?;
+    let status = command.status.split(';').find(|segment| {
+        let segment = segment.trim();
+        segment.starts_with("local linode provisioned:")
+    })?;
+    let mut facts = HashMap::new();
+    for token in status
+        .trim_start_matches("local linode provisioned:")
+        .split_whitespace()
+    {
+        if let Some((key, value)) = token.split_once('=') {
+            facts.insert(key.to_owned(), value.trim_matches(',').to_owned());
+        }
+    }
+    (!facts.is_empty()).then_some(facts)
+}
+
+fn provision_bootstrap_segment(status: &str) -> String {
+    status
+        .split(';')
+        .map(str::trim)
+        .find(|segment| segment.starts_with("local provision "))
+        .unwrap_or("")
+        .to_owned()
 }
 
 #[derive(Clone, Debug)]

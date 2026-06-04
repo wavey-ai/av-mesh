@@ -193,6 +193,13 @@ main {
   align-items: baseline;
 }
 
+.incident-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
 .incident-head span,
 .incident-empty {
   color: var(--muted);
@@ -208,14 +215,64 @@ main {
   display: none;
 }
 
+.incident-severity-rollups {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.incident-severity-rollups:empty {
+  display: none;
+}
+
+.incident-severity-rollup {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: #fff;
+}
+
+.incident-severity-rollup.error {
+  border-left: 4px solid var(--red);
+}
+
+.incident-severity-rollup.warn {
+  border-left: 4px solid var(--amber);
+}
+
+.incident-severity-rollup.info {
+  border-left: 4px solid var(--blue);
+}
+
+.incident-severity-rollup.suppressed {
+  border-left: 4px solid var(--muted);
+}
+
+.incident-severity-rollup strong,
+.incident-severity-rollup span,
+.incident-severity-rollup small {
+  overflow-wrap: anywhere;
+}
+
+.incident-severity-rollup small {
+  color: var(--muted);
+}
+
 .incident {
   display: grid;
-  grid-template-columns: 82px minmax(120px, 0.55fr) minmax(0, 1.4fr);
+  grid-template-columns: 82px minmax(120px, 0.55fr) minmax(0, 1.4fr) auto;
   gap: 4px 10px;
   border: 1px solid var(--line);
   border-radius: 6px;
   padding: 9px 10px;
   background: #fff;
+}
+
+.incident.acknowledged {
+  opacity: 0.68;
 }
 
 .incident.error {
@@ -233,6 +290,19 @@ main {
 .incident p,
 .incident small {
   overflow-wrap: anywhere;
+}
+
+.incident-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.incident-actions button,
+.incident-head-actions button {
+  min-height: 28px;
+  padding: 0 8px;
+  font-size: 12px;
 }
 
 .incident small {
@@ -353,8 +423,74 @@ main {
   overflow-wrap: anywhere;
 }
 
-.dashboard-hose-card small {
+.dashboard-hose-detail {
   grid-column: 1 / -1;
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.dashboard-hose-card small {
+  color: var(--muted);
+}
+
+.path-drilldown {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+}
+
+.path-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+}
+
+.path-head span,
+.path-empty {
+  color: var(--muted);
+}
+
+.path-row {
+  display: grid;
+  grid-template-columns:
+    minmax(90px, 0.6fr) 96px minmax(150px, 1.1fr) minmax(180px, 1.2fr)
+    minmax(190px, 1.3fr) minmax(170px, 1fr) minmax(110px, 0.8fr)
+    minmax(190px, 1.2fr) minmax(220px, 1.4fr) minmax(220px, 1.4fr);
+  gap: 10px;
+  min-width: 1500px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.path-row.ready span:nth-child(2) {
+  color: var(--green);
+}
+
+.path-row.warn {
+  border-left: 3px solid var(--amber);
+  padding-left: 8px;
+}
+
+.path-row.warn span:nth-child(2),
+.path-row.warn span:nth-child(7),
+.path-row.warn span:nth-child(8) {
+  color: var(--amber);
+}
+
+.path-row.error {
+  border-left: 3px solid var(--red);
+  padding-left: 8px;
+}
+
+.path-row.error span:nth-child(2),
+.path-row.error span:nth-child(7),
+.path-row.error span:nth-child(8) {
+  color: var(--red);
+}
+
+.path-row.waiting span:nth-child(2) {
   color: var(--muted);
 }
 
@@ -626,11 +762,14 @@ main {
   margin-bottom: 12px;
 }
 
-.provision-backend-list {
+.provision-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
   margin-bottom: 12px;
 }
 
-.provision-backend-list:empty {
+.provision-detail-grid:empty {
   display: none;
 }
 
@@ -1067,6 +1206,38 @@ main {
   color: var(--muted);
 }
 
+.provision-detail-card {
+  display: grid;
+  grid-template-columns: minmax(118px, 0.7fr) minmax(80px, 0.4fr);
+  gap: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 9px 10px;
+  background: #fff;
+}
+
+.provision-detail-card.ready {
+  border-left: 4px solid var(--green);
+}
+
+.provision-detail-card.warn {
+  border-left: 4px solid var(--amber);
+}
+
+.provision-detail-card.blocked {
+  border-left: 4px solid var(--red);
+}
+
+.provision-detail-card span,
+.provision-detail-card small {
+  overflow-wrap: anywhere;
+}
+
+.provision-detail-card small {
+  grid-column: 1 / -1;
+  color: var(--muted);
+}
+
 .hose-list {
   display: grid;
   gap: 8px;
@@ -1176,6 +1347,7 @@ main {
   .topbar,
   .workspace,
   .workspace.lower,
+  .incident-severity-rollups,
   .incident-list,
   .pipeline-grid,
   .dashboard-hose-grid,
@@ -1189,6 +1361,7 @@ main {
   .command-health-grid,
   .contrib-config-grid,
   .orchestration-grid,
+  .provision-detail-grid,
   .runtime-grid {
     grid-template-columns: 1fr;
   }

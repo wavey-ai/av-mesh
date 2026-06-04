@@ -173,7 +173,7 @@ struct Args {
     mesh_bind: SocketAddr,
 
     #[arg(long = "peer")]
-    peers: Vec<SocketAddr>,
+    peers: Vec<String>,
 
     #[cfg(feature = "private-subnet-discovery")]
     #[arg(long)]
@@ -260,7 +260,7 @@ struct Args {
     telemetry_bind: Option<SocketAddr>,
 
     #[arg(long = "telemetry-peer")]
-    telemetry_peers: Vec<SocketAddr>,
+    telemetry_peers: Vec<String>,
 
     #[arg(long, default_value = "local.wavey.ai")]
     telemetry_dns_name: String,
@@ -326,6 +326,8 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse().normalized()?;
+    let mesh_peers = resolve_socket_addr_args("peer", &args.peers).await?;
+    let telemetry_peers = resolve_socket_addr_args("telemetry-peer", &args.telemetry_peers).await?;
     let node_id = args.node_id.clone().unwrap_or_else(|| args.region.clone());
     let node_profile = MeshNode {
         node_id: node_id.clone(),
@@ -351,7 +353,7 @@ async fn main() -> Result<()> {
     let demand_tracker = DemandTracker::default();
     let lifecycle = NodeLifecycle::default();
     let telemetry_aggregator = TelemetryAggregator::new(args.telemetry_stale_ms);
-    let telemetry_peer_monitor = TelemetryPeerMonitor::new(&args.telemetry_peers);
+    let telemetry_peer_monitor = TelemetryPeerMonitor::new(&telemetry_peers);
     let playback_base_url = args
         .playback_base_url
         .as_deref()
@@ -385,7 +387,7 @@ async fn main() -> Result<()> {
     .await;
 
     let mesh_config = CacheMeshConfig::new(node_id.clone(), args.region.clone(), args.mesh_bind)
-        .with_peers(args.peers.clone());
+        .with_peers(mesh_peers);
     let mesh_handle = Arc::new(
         CacheMesh::new(Arc::clone(&cache.chunk_cache), mesh_config)
             .start()
@@ -495,7 +497,7 @@ async fn main() -> Result<()> {
         private_discovery_status,
     );
     let telemetry_collector_tasks = start_telemetry_collectors(
-        args.telemetry_peers.clone(),
+        telemetry_peers.clone(),
         args.telemetry_dns_name.clone(),
         cert.clone(),
         router.clone(),
@@ -553,8 +555,8 @@ async fn main() -> Result<()> {
     if let Some(runtime) = &telemetry_runtime {
         println!("telemetry: tcp+tls://{}", runtime.local_addr);
     }
-    if !args.telemetry_peers.is_empty() {
-        println!("telemetry-peers: {}", args.telemetry_peers.len());
+    if !telemetry_peers.is_empty() {
+        println!("telemetry-peers: {}", telemetry_peers.len());
     }
     if let Some(raw_tcp_port) = args.raw_tcp_port {
         println!(
@@ -666,6 +668,23 @@ fn parse_key_value(value: &str) -> std::result::Result<(String, String), String>
         return Err("expected non-empty KEY=VALUE".to_string());
     }
     Ok((key.to_string(), val.to_string()))
+}
+
+async fn resolve_socket_addr_args(kind: &str, values: &[String]) -> Result<Vec<SocketAddr>> {
+    let mut resolved = Vec::new();
+    for value in values {
+        let addrs = tokio::net::lookup_host(value)
+            .await
+            .with_context(|| format!("failed to resolve --{kind} {value}"))?
+            .collect::<Vec<_>>();
+        if addrs.is_empty() {
+            bail!("--{kind} {value} resolved no socket addresses");
+        }
+        resolved.extend(addrs);
+    }
+    resolved.sort();
+    resolved.dedup();
+    Ok(resolved)
 }
 
 fn load_tls(args: &Args) -> Result<(String, String)> {
@@ -1704,14 +1723,25 @@ impl LiveTsCache {
         let Some(last) = self.chunk_cache.last(stream_idx) else {
             return 0;
         };
-        for seq in (0..=last).rev().take(self.window_parts) {
-            if let Some((bytes, hash)) = self.chunk_cache.get(stream_idx, seq).await {
-                if hash != 0 || !bytes.is_empty() {
-                    return seq.saturating_add(1);
-                }
+
+        let retained_start = self.chunk_cache.retained_start(last);
+        let mut latest_present = None;
+        for seq in retained_start..=last {
+            let present = self
+                .chunk_cache
+                .get(stream_idx, seq)
+                .await
+                .map(|(bytes, hash)| hash != 0 || !bytes.is_empty())
+                .unwrap_or(false);
+            if present {
+                latest_present = Some(seq);
+            } else {
+                return seq;
             }
         }
-        0
+        latest_present
+            .map(|seq| seq.saturating_add(1))
+            .unwrap_or(retained_start)
     }
 
     async fn mesh_snapshot(
@@ -6219,6 +6249,29 @@ mod tests {
         assert_eq!(args.raw_tcp_port, Some(19000));
     }
 
+    #[test]
+    fn parses_dns_peer_targets_for_orchestrated_deployments() {
+        let args = Args::try_parse_from([
+            "av-mesh",
+            "--peer",
+            "av-mesh-us.av-mesh.svc.cluster.local:9101",
+            "--telemetry-peer",
+            "av-mesh-us.av-mesh.svc.cluster.local:7300",
+        ])
+        .unwrap()
+        .normalized()
+        .unwrap();
+
+        assert_eq!(
+            args.peers,
+            vec!["av-mesh-us.av-mesh.svc.cluster.local:9101"]
+        );
+        assert_eq!(
+            args.telemetry_peers,
+            vec!["av-mesh-us.av-mesh.svc.cluster.local:7300"]
+        );
+    }
+
     #[cfg(feature = "linode-provisioner")]
     #[test]
     fn parses_linode_provision_flags_and_region_maps() {
@@ -8734,6 +8787,80 @@ mod tests {
         assert!(commands
             .iter()
             .any(|command| command.kind == ControlKind::ReplicaRequest));
+        mesh_a.shutdown();
+        mesh_b.shutdown();
+    }
+
+    #[tokio::test]
+    async fn replica_request_backfills_missing_retained_stream_slot() {
+        use playlists::mesh::{CacheMesh, CacheMeshConfig};
+        use tokio::time::timeout;
+
+        let mesh_a_addr = unused_loopback_addr();
+        let mesh_b_addr = unused_loopback_addr();
+        let cache_a = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let cache_b = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+
+        let mut config_a =
+            CacheMeshConfig::new("uk-backfill", "uk", mesh_a_addr).with_peer(mesh_b_addr);
+        config_a.sync_interval = Duration::from_secs(60);
+        let mut config_b =
+            CacheMeshConfig::new("us-backfill", "us", mesh_b_addr).with_peer(mesh_a_addr);
+        config_b.sync_interval = Duration::from_secs(60);
+
+        let mesh_a = CacheMesh::new(Arc::clone(&cache_a.chunk_cache), config_a)
+            .start()
+            .await
+            .unwrap();
+        let mesh_b = CacheMesh::new(Arc::clone(&cache_b.chunk_cache), config_b)
+            .start()
+            .await
+            .unwrap();
+
+        cache_a
+            .chunk_cache
+            .add_for_stream_id(77, 0, Bytes::from_static(b"backfill-part-0"))
+            .await
+            .unwrap();
+        cache_a
+            .chunk_cache
+            .add_for_stream_id(77, 1, Bytes::from_static(b"backfill-part-1"))
+            .await
+            .unwrap();
+        cache_a
+            .chunk_cache
+            .add_for_stream_id(77, 2, Bytes::from_static(b"backfill-part-2"))
+            .await
+            .unwrap();
+        cache_b
+            .chunk_cache
+            .add_for_stream_id(77, 0, Bytes::from_static(b"backfill-part-0"))
+            .await
+            .unwrap();
+        cache_b
+            .chunk_cache
+            .add_for_stream_id(77, 2, Bytes::from_static(b"backfill-part-2"))
+            .await
+            .unwrap();
+
+        let from_slot = cache_b.replica_request_from_slot(77).await;
+        assert_eq!(from_slot, 1);
+        assert_eq!(mesh_b.request_replica(77, from_slot).await.unwrap(), 1);
+
+        let bytes = timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some((bytes, hash)) = cache_b.chunk_cache.get_for_stream_id(77, 1).await {
+                    if hash != 0 || !bytes.is_empty() {
+                        break bytes;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(bytes, Bytes::from_static(b"backfill-part-1"));
         mesh_a.shutdown();
         mesh_b.shutdown();
     }

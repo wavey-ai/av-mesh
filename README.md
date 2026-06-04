@@ -35,6 +35,9 @@ The first implementation keeps the mesh transport intentionally small:
   for Linode VLAN deployments provisioned by the sibling `linode` project.
 - Playlist reads and warm-stream controls send mesh replica requests, so a node
   with local demand can ask peers for a stream immediately.
+- Replica requests begin at the earliest missing retained slot for the requested
+  stream, which gives live playlist/tail/media demand a retained-window
+  backfill path without changing the FEC datagram wire format.
 - `web-service` serves the operator/UI edge over HTTPS/TCP: HLS playlists,
   parts, segments, health checks, JSON mesh snapshots, server-sent mesh events,
   and HTTP `POST /api/control/*` commands. This is not the mesh transport.
@@ -350,6 +353,44 @@ Use `--dashboard-dist /path/to/dist` to reuse a specific dashboard build. Use
 `--no-dashboard-build` to skip the Trunk build and let `av-mesh` use an existing
 dist or its fallback page. `--no-build` skips all release and dashboard builds.
 Run `make help` for direct mesh service and dashboard tasks.
+
+## Local k3d deployment
+
+Use k3d for the local orchestration smoke path. It runs k3s nodes in Docker,
+which keeps the test close to edge Kubernetes while still being disposable on a
+developer machine.
+
+Prerequisites:
+
+```bash
+brew install k3d kubectl
+# Docker Desktop, Colima, or another Docker-compatible runtime must be running.
+```
+
+Build the local image, create a two-node k3d cluster, deploy UK/US mesh nodes,
+and start port-forwards:
+
+```bash
+make k3d-up
+```
+
+The smoke script builds `deploy/k3d/Dockerfile`, imports `av-mesh:local` into
+the cluster, generates a short-lived TLS secret, applies
+`deploy/k3d/av-mesh.yaml`, waits for both deployments, and checks `/up`,
+`/api/mesh`, and `/mesh` through local port-forwards.
+
+Mission Control URLs after `make k3d-up`:
+
+- UK: `https://127.0.0.1:19444/mesh`
+- US: `https://127.0.0.1:19445/mesh`
+
+Useful follow-up commands:
+
+```bash
+make k3d-check
+kubectl -n av-mesh get pods,svc
+make k3d-down
+```
 
 The services already use `tracing_subscriber` with `RUST_LOG` env filters. The
 current detailed logs are mostly `info!` and `debug!`; setting `trace` is

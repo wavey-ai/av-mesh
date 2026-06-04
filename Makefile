@@ -20,7 +20,7 @@ STACK_ARGS ?=
 
 .PHONY: help service service-release uk us dashboard-build dashboard-serve \
 	dashboard-check dashboard-clean local-stack local-stack-debug local-stack-fast \
-	build build-release fmt test check
+	k3d-up k3d-check k3d-down build build-release fmt test check
 
 help:
 	@printf '%s\n' 'av-mesh tasks'
@@ -33,6 +33,9 @@ help:
 	@printf '%s\n' '  make dashboard-serve   Serve the Leptos dashboard with Trunk'
 	@printf '%s\n' '  make local-stack       Run release local OBS stack via ../av-contrib'
 	@printf '%s\n' '  make local-stack-fast  Run existing release stack binaries via ../av-contrib'
+	@printf '%s\n' '  make k3d-up           Build and run a two-node local k3d mesh'
+	@printf '%s\n' '  make k3d-check        Probe the k3d mesh port-forwards'
+	@printf '%s\n' '  make k3d-down         Delete the local k3d mesh cluster'
 	@printf '%s\n' '  make test              Run cargo test --locked'
 	@printf '%s\n' ''
 	@printf '%s\n' 'Common overrides: STREAM_ID=1 PART_MS=50 RUST_LOG=info HOST=local.bitneedle.com'
@@ -81,6 +84,15 @@ local-stack-debug:
 
 local-stack-fast:
 	$(MAKE) -C ../av-contrib stack-fast HOST=$(HOST) STREAM_ID=$(STREAM_ID) PART_MS=$(PART_MS) RUST_LOG=$(RUST_LOG) STACK_ARGS="$(STACK_ARGS)"
+
+k3d-up:
+	./scripts/k3d-smoke.sh up
+
+k3d-check:
+	./scripts/k3d-smoke.sh check
+
+k3d-down:
+	./scripts/k3d-smoke.sh down
 
 build:
 	$(CARGO) build --locked
