@@ -39,14 +39,15 @@ use raptorq_datagram_fec::{
 };
 use raptorq_fec_transport::{split_stream_id_prefix, FecDatagramDecoder, STREAM_ID_PREFIX_LEN};
 use relay_session::{
-    CarrierIdentity, CarrierKind, NodeId, ParentPath, SubscriptionId, TopologyGeneration, TrustMode,
+    CarrierIdentity, CarrierKind, FailoverForwardMode, FailoverLeaseCommand, NodeId, ParentPath,
+    SubscriptionId, TopologyGeneration, TrustMode, FAILOVER_CONTROL_WIRE_LEN,
 };
 use serde::{de, Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex as StdMutex, RwLock as StdRwLock,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -70,6 +71,11 @@ const DEFAULT_MESH_FEC_MAX_REPAIR_SYMBOLS: u32 = 32;
 const DEFAULT_MESH_FEC_SYMBOL_SIZE: u16 = 1316;
 const DEFAULT_MESH_SYNC_INTERVAL_MS: u64 = 20;
 const DEFAULT_MAX_RELAY_DOWNSTREAM_CHILDREN: usize = 4;
+const DEFAULT_RELAY_PRIMARY_SILENCE_MS: u64 = 250;
+const DEFAULT_RELAY_PRIMARY_RECOVERY_MS: u64 = 2_000;
+const DEFAULT_RELAY_SECONDARY_WARM_MS: u64 = 750;
+const DEFAULT_RELAY_FAILOVER_HEARTBEAT_MS: u64 = 100;
+const DEFAULT_RELAY_FAILOVER_LEASE_MS: u64 = 1_000;
 // The reliable subscription/catalog lane will supply this for late joins. The
 // local transition path starts each canonical stream at object zero.
 const LOCAL_RELAY_SUBSCRIPTION_BASE_OBJECT: usize = 0;
@@ -343,6 +349,41 @@ struct Args {
     #[arg(long = "relay-forward", value_parser = parse_relay_forward_endpoint)]
     relay_forwards: Vec<RelayForwardEndpoint>,
 
+    /// Controlled-private qualification listener for leased warm-secondary
+    /// promotion. Repeat as `BIND=CONTROLLER_PEER,FORWARD_TARGET`. Public
+    /// deployments carry the same command on an authenticated control stream.
+    #[arg(
+        long = "relay-failover-listener",
+        value_parser = parse_relay_failover_listener_endpoint
+    )]
+    relay_failover_listeners: Vec<RelayFailoverListenerEndpoint>,
+
+    /// Edge-side controlled-private failover controller as `BIND=TARGET`.
+    #[arg(
+        long = "relay-failover-controller",
+        value_parser = parse_relay_failover_controller_endpoint
+    )]
+    relay_failover_controller: Option<RelayFailoverControllerEndpoint>,
+
+    /// Promote the warm secondary after this much primary-source silence.
+    #[arg(long, default_value_t = DEFAULT_RELAY_PRIMARY_SILENCE_MS)]
+    relay_primary_silence_ms: u64,
+
+    /// Keep both source paths active for this continuous primary recovery
+    /// window before demoting the warm secondary.
+    #[arg(long, default_value_t = DEFAULT_RELAY_PRIMARY_RECOVERY_MS)]
+    relay_primary_recovery_ms: u64,
+
+    /// Maximum age of a repair symbol that proves the secondary is warm.
+    #[arg(long, default_value_t = DEFAULT_RELAY_SECONDARY_WARM_MS)]
+    relay_secondary_warm_ms: u64,
+
+    #[arg(long, default_value_t = DEFAULT_RELAY_FAILOVER_HEARTBEAT_MS)]
+    relay_failover_heartbeat_ms: u64,
+
+    #[arg(long, default_value_t = DEFAULT_RELAY_FAILOVER_LEASE_MS)]
+    relay_failover_lease_ms: u64,
+
     /// Hard fanout bound for explicitly compiled downstream subscriptions.
     #[arg(
         long,
@@ -615,10 +656,30 @@ async fn main() -> Result<()> {
     };
     let relay_dispatch = configured_relay_udp_dispatch(&args, &node_id)?;
     let relay_forwarder = RelayDownstreamForwarder::bind(&args.relay_forwards).await?;
-    cache.update_relay_forward(relay_forwarder.as_ref().map_or_else(
-        RelayForwardSnapshot::default,
-        RelayDownstreamForwarder::snapshot,
-    ));
+    cache.update_relay_forward(
+        relay_forwarder
+            .as_ref()
+            .map_or_else(RelayForwardSnapshot::default, |forwarder| {
+                forwarder.snapshot()
+            }),
+    );
+    let relay_failover_listener_tasks = start_relay_failover_listeners(
+        &args.relay_failover_listeners,
+        relay_forwarder.as_ref(),
+        TopologyGeneration::new(args.relay_topology_generation)?,
+        SubscriptionId::new(args.relay_subscription_id)?,
+        &cache,
+        ingest_shutdown_rx.clone(),
+    )
+    .await?;
+    let relay_failover_controller = RelayFailoverController::bind(&args).await?;
+    cache.update_relay_failover_controller(
+        relay_failover_controller
+            .as_ref()
+            .map_or_else(RelayFailoverControllerSnapshot::default, |controller| {
+                controller.snapshot()
+            }),
+    );
     let fec_ingest_task = tokio::spawn(run_udp_fec_ingest(
         fec_socket,
         Arc::clone(&cache),
@@ -626,6 +687,8 @@ async fn main() -> Result<()> {
         relay_dispatch,
         relay_secondary_socket,
         relay_forwarder,
+        relay_failover_controller,
+        Duration::from_millis(args.relay_failover_heartbeat_ms),
     ));
 
     let (audio_epoch_tx, _) = broadcast::channel(AUDIO_EPOCH_BROADCAST_CAPACITY);
@@ -780,6 +843,9 @@ async fn main() -> Result<()> {
     let _ = handle.shutdown_tx.send(());
     let _ = handle.finished_rx.await;
     let _ = fec_ingest_task.await;
+    for task in relay_failover_listener_tasks {
+        let _ = task.await;
+    }
     let _ = media_fec_ingest_task.await;
     let _ = replication_planner_task.await;
     if let Some(runtime) = telemetry_runtime {
@@ -891,6 +957,77 @@ impl Args {
                 bail!("duplicate RelaySession forward target {}", forward.target);
             }
         }
+        if self.relay_failover_controller.is_some() {
+            if !self.relay_controlled_local {
+                bail!("--relay-failover-controller requires --relay-controlled-local");
+            }
+            if self.relay_secondary_peer.is_none() || !self.relay_secondary_promoted {
+                bail!(
+                    "--relay-failover-controller requires a seeded --relay-secondary-peer with --relay-secondary-promoted"
+                );
+            }
+        }
+        if !self.relay_failover_listeners.is_empty() && !self.relay_controlled_local {
+            bail!("--relay-failover-listener requires --relay-controlled-local");
+        }
+        let mut control_binds = HashSet::with_capacity(self.relay_failover_listeners.len() + 1);
+        let mut controlled_targets = HashSet::with_capacity(self.relay_failover_listeners.len());
+        for listener in &self.relay_failover_listeners {
+            let Some(forward) = self
+                .relay_forwards
+                .iter()
+                .find(|forward| forward.target == listener.forward_target)
+            else {
+                bail!(
+                    "failover listener target {} is not a compiled --relay-forward target",
+                    listener.forward_target
+                );
+            };
+            if forward.role != RelayForwardRole::Repair {
+                bail!(
+                    "failover listener target {} must select a repair-only warm forward",
+                    listener.forward_target
+                );
+            }
+            if listener.bind == listener.peer || listener.bind.ip().is_unspecified() {
+                bail!(
+                    "failover listener requires a distinct, explicit local bind and controller peer"
+                );
+            }
+            if !control_binds.insert(listener.bind) {
+                bail!("duplicate failover control bind {}", listener.bind);
+            }
+            if !controlled_targets.insert(listener.forward_target) {
+                bail!(
+                    "duplicate failover control target {}",
+                    listener.forward_target
+                );
+            }
+        }
+        if let Some(controller) = self.relay_failover_controller {
+            if controller.bind == controller.target || controller.bind.ip().is_unspecified() {
+                bail!("failover controller requires a distinct, explicit local bind and target");
+            }
+            if !control_binds.insert(controller.bind) {
+                bail!("duplicate failover control bind {}", controller.bind);
+            }
+        }
+        if self.relay_primary_silence_ms == 0
+            || self.relay_primary_recovery_ms < self.relay_primary_silence_ms
+            || self.relay_secondary_warm_ms < self.relay_primary_silence_ms
+        {
+            bail!(
+                "relay failover windows require positive silence and recovery/warm windows at least as large as silence"
+            );
+        }
+        if self.relay_failover_heartbeat_ms == 0
+            || self.relay_failover_lease_ms < self.relay_failover_heartbeat_ms.saturating_mul(3)
+            || self.relay_failover_lease_ms > 60_000
+        {
+            bail!(
+                "relay failover lease must be at most 60000ms and at least three heartbeat intervals"
+            );
+        }
         TopologyGeneration::new(self.relay_topology_generation)
             .context("--relay-topology-generation must be positive")?;
         SubscriptionId::new(self.relay_subscription_id)
@@ -949,6 +1086,19 @@ struct RelayForwardEndpoint {
     role: RelayForwardRole,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RelayFailoverListenerEndpoint {
+    bind: SocketAddr,
+    peer: SocketAddr,
+    forward_target: SocketAddr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RelayFailoverControllerEndpoint {
+    bind: SocketAddr,
+    target: SocketAddr,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 enum RelayForwardRole {
     #[default]
@@ -989,6 +1139,44 @@ fn parse_relay_forward_endpoint(value: &str) -> std::result::Result<RelayForward
         .parse::<SocketAddr>()
         .map_err(|error| format!("invalid relay forward target {target}: {error}"))?;
     Ok(RelayForwardEndpoint { bind, target, role })
+}
+
+fn parse_relay_failover_listener_endpoint(
+    value: &str,
+) -> std::result::Result<RelayFailoverListenerEndpoint, String> {
+    let (bind, peer_and_target) = value
+        .split_once('=')
+        .ok_or_else(|| "expected BIND=CONTROLLER_PEER,FORWARD_TARGET".to_owned())?;
+    let (peer, forward_target) = peer_and_target
+        .split_once(',')
+        .ok_or_else(|| "expected BIND=CONTROLLER_PEER,FORWARD_TARGET".to_owned())?;
+    Ok(RelayFailoverListenerEndpoint {
+        bind: bind
+            .parse()
+            .map_err(|error| format!("invalid failover listener bind {bind}: {error}"))?,
+        peer: peer
+            .parse()
+            .map_err(|error| format!("invalid failover controller peer {peer}: {error}"))?,
+        forward_target: forward_target.parse().map_err(|error| {
+            format!("invalid failover forward target {forward_target}: {error}")
+        })?,
+    })
+}
+
+fn parse_relay_failover_controller_endpoint(
+    value: &str,
+) -> std::result::Result<RelayFailoverControllerEndpoint, String> {
+    let (bind, target) = value
+        .split_once('=')
+        .ok_or_else(|| "expected BIND=TARGET".to_owned())?;
+    Ok(RelayFailoverControllerEndpoint {
+        bind: bind
+            .parse()
+            .map_err(|error| format!("invalid failover controller bind {bind}: {error}"))?,
+        target: target
+            .parse()
+            .map_err(|error| format!("invalid failover controller target {target}: {error}"))?,
+    })
 }
 
 #[cfg(feature = "linode-provisioner")]
@@ -1168,12 +1356,21 @@ struct RelayForwardSnapshot {
     duration_sum_us: u64,
     duration_max_us: u64,
     duration_buckets: [u64; EDGE_RESPONSE_DURATION_BUCKETS_US.len()],
+    failover_listeners: u64,
+    failover_promoted_children: u64,
+    failover_commands_received: u64,
+    failover_commands_rejected: u64,
+    failover_lease_expirations: u64,
+    failover_promotions_applied: u64,
+    failover_demotions_applied: u64,
+    failover_last_transition_unix_ms: u64,
 }
 
 struct RelayForwardPath {
     socket: UdpSocket,
     target: SocketAddr,
     role: RelayForwardRole,
+    promoted: AtomicBool,
 }
 
 struct RelayDownstreamForwarder {
@@ -1187,10 +1384,17 @@ struct RelayDownstreamForwarder {
     duration_sum_us: AtomicU64,
     duration_max_us: AtomicU64,
     duration_buckets: [AtomicU64; EDGE_RESPONSE_DURATION_BUCKETS_US.len()],
+    failover_listeners: AtomicU64,
+    failover_commands_received: AtomicU64,
+    failover_commands_rejected: AtomicU64,
+    failover_lease_expirations: AtomicU64,
+    failover_promotions_applied: AtomicU64,
+    failover_demotions_applied: AtomicU64,
+    failover_last_transition_unix_ms: AtomicU64,
 }
 
 impl RelayDownstreamForwarder {
-    async fn bind(endpoints: &[RelayForwardEndpoint]) -> Result<Option<Self>> {
+    async fn bind(endpoints: &[RelayForwardEndpoint]) -> Result<Option<Arc<Self>>> {
         if endpoints.is_empty() {
             return Ok(None);
         }
@@ -1212,9 +1416,10 @@ impl RelayDownstreamForwarder {
                 socket,
                 target: endpoint.target,
                 role: endpoint.role,
+                promoted: AtomicBool::new(false),
             });
         }
-        Ok(Some(Self {
+        Ok(Some(Arc::new(Self {
             paths,
             source_datagrams: AtomicU64::new(0),
             repair_datagrams: AtomicU64::new(0),
@@ -1225,12 +1430,24 @@ impl RelayDownstreamForwarder {
             duration_sum_us: AtomicU64::new(0),
             duration_max_us: AtomicU64::new(0),
             duration_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
-        }))
+            failover_listeners: AtomicU64::new(0),
+            failover_commands_received: AtomicU64::new(0),
+            failover_commands_rejected: AtomicU64::new(0),
+            failover_lease_expirations: AtomicU64::new(0),
+            failover_promotions_applied: AtomicU64::new(0),
+            failover_demotions_applied: AtomicU64::new(0),
+            failover_last_transition_unix_ms: AtomicU64::new(0),
+        })))
     }
 
     async fn forward(&self, datagram: &[u8], role: MediaDatagramRole) {
         for path in &self.paths {
-            if !path.role.permits(role) {
+            let promoted = path.promoted.load(Ordering::Relaxed);
+            if !path.role.permits(role)
+                && !(promoted
+                    && path.role == RelayForwardRole::Repair
+                    && matches!(role, MediaDatagramRole::Source))
+            {
                 self.filtered_datagrams.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -1269,6 +1486,59 @@ impl RelayDownstreamForwarder {
         }
     }
 
+    fn register_failover_listener(&self) {
+        self.failover_listeners.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_failover_command_rejected(&self) {
+        self.failover_commands_rejected
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn apply_failover_mode(
+        &self,
+        target: SocketAddr,
+        mode: FailoverForwardMode,
+        lease_expired: bool,
+    ) -> bool {
+        let Some(path) = self.paths.iter().find(|path| path.target == target) else {
+            self.record_failover_command_rejected();
+            return false;
+        };
+        if path.role != RelayForwardRole::Repair {
+            self.record_failover_command_rejected();
+            return false;
+        }
+        if !lease_expired {
+            self.failover_commands_received
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let promoted = mode == FailoverForwardMode::SourceAndRepair;
+        let previous = path.promoted.swap(promoted, Ordering::Relaxed);
+        if previous != promoted {
+            if promoted {
+                self.failover_promotions_applied
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.failover_demotions_applied
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if lease_expired {
+                self.failover_lease_expirations
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            self.failover_last_transition_unix_ms
+                .store(now_unix_ms(), Ordering::Relaxed);
+            info!(
+                %target,
+                ?mode,
+                lease_expired,
+                "RelaySession warm-secondary forwarding mode changed"
+            );
+        }
+        true
+    }
+
     fn observe_duration(&self, duration: Duration) {
         let duration_us = duration.as_micros().min(u128::from(u64::MAX)) as u64;
         self.duration_count.fetch_add(1, Ordering::Relaxed);
@@ -1297,6 +1567,449 @@ impl RelayDownstreamForwarder {
             duration_buckets: std::array::from_fn(|index| {
                 self.duration_buckets[index].load(Ordering::Relaxed)
             }),
+            failover_listeners: self.failover_listeners.load(Ordering::Relaxed),
+            failover_promoted_children: self
+                .paths
+                .iter()
+                .filter(|path| path.promoted.load(Ordering::Relaxed))
+                .count() as u64,
+            failover_commands_received: self.failover_commands_received.load(Ordering::Relaxed),
+            failover_commands_rejected: self.failover_commands_rejected.load(Ordering::Relaxed),
+            failover_lease_expirations: self.failover_lease_expirations.load(Ordering::Relaxed),
+            failover_promotions_applied: self.failover_promotions_applied.load(Ordering::Relaxed),
+            failover_demotions_applied: self.failover_demotions_applied.load(Ordering::Relaxed),
+            failover_last_transition_unix_ms: self
+                .failover_last_transition_unix_ms
+                .load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RelayFailoverControllerState {
+    #[default]
+    Disabled,
+    Arming,
+    Healthy,
+    Promoted,
+    Recovering,
+    SecondaryUnavailable,
+}
+
+impl RelayFailoverControllerState {
+    const ALL: [Self; 6] = [
+        Self::Disabled,
+        Self::Arming,
+        Self::Healthy,
+        Self::Promoted,
+        Self::Recovering,
+        Self::SecondaryUnavailable,
+    ];
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Arming => "arming",
+            Self::Healthy => "healthy",
+            Self::Promoted => "promoted",
+            Self::Recovering => "recovering",
+            Self::SecondaryUnavailable => "secondary_unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RelayFailoverControllerSnapshot {
+    state: RelayFailoverControllerState,
+    enabled: u64,
+    commands_sent: u64,
+    command_send_errors: u64,
+    promotions: u64,
+    demotions: u64,
+    secondary_unavailable_events: u64,
+    primary_source_age_ms: u64,
+    secondary_repair_age_ms: u64,
+    last_detection_us: u64,
+    last_promotion_to_source_us: u64,
+    last_media_gap_us: u64,
+    max_media_gap_us: u64,
+    last_transition_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayIngressParentPath {
+    Primary,
+    Secondary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RelayDatagramObservation {
+    role: MediaDatagramRole,
+    decoded: bool,
+}
+
+struct RelayFailoverController {
+    socket: UdpSocket,
+    target: SocketAddr,
+    generation: TopologyGeneration,
+    subscription_id: SubscriptionId,
+    silence: Duration,
+    recovery: Duration,
+    secondary_warm: Duration,
+    lease_duration_us: u64,
+    state: RelayFailoverControllerState,
+    desired_mode: FailoverForwardMode,
+    transition_id: u64,
+    last_primary_source: Option<Instant>,
+    last_secondary_repair: Option<Instant>,
+    recovered_since: Option<Instant>,
+    last_decoded: Option<Instant>,
+    promotion_gap_base: Option<Instant>,
+    promotion_sent_at: Option<Instant>,
+    awaiting_secondary_source: bool,
+    awaiting_post_promotion_object: bool,
+    snapshot: RelayFailoverControllerSnapshot,
+}
+
+impl RelayFailoverController {
+    async fn bind(args: &Args) -> Result<Option<Self>> {
+        let Some(endpoint) = args.relay_failover_controller else {
+            return Ok(None);
+        };
+        let socket = UdpSocket::bind(endpoint.bind).await.with_context(|| {
+            format!(
+                "failed to bind RelaySession failover controller on {}",
+                endpoint.bind
+            )
+        })?;
+        info!(
+            bind = %socket.local_addr()?,
+            target = %endpoint.target,
+            "RelaySession warm-secondary failover controller ready"
+        );
+        let transition_id = now_unix_us().max(1);
+        Ok(Some(Self {
+            socket,
+            target: endpoint.target,
+            generation: TopologyGeneration::new(args.relay_topology_generation)?,
+            subscription_id: SubscriptionId::new(args.relay_subscription_id)?,
+            silence: Duration::from_millis(args.relay_primary_silence_ms),
+            recovery: Duration::from_millis(args.relay_primary_recovery_ms),
+            secondary_warm: Duration::from_millis(args.relay_secondary_warm_ms),
+            lease_duration_us: args.relay_failover_lease_ms.saturating_mul(1_000),
+            state: RelayFailoverControllerState::Arming,
+            desired_mode: FailoverForwardMode::RepairOnly,
+            transition_id,
+            last_primary_source: None,
+            last_secondary_repair: None,
+            recovered_since: None,
+            last_decoded: None,
+            promotion_gap_base: None,
+            promotion_sent_at: None,
+            awaiting_secondary_source: false,
+            awaiting_post_promotion_object: false,
+            snapshot: RelayFailoverControllerSnapshot {
+                state: RelayFailoverControllerState::Arming,
+                enabled: 1,
+                last_transition_unix_ms: now_unix_ms(),
+                ..RelayFailoverControllerSnapshot::default()
+            },
+        }))
+    }
+
+    fn observe(
+        &mut self,
+        path: RelayIngressParentPath,
+        observation: RelayDatagramObservation,
+        now: Instant,
+    ) {
+        match (path, observation.role) {
+            (RelayIngressParentPath::Primary, MediaDatagramRole::Source) => {
+                self.last_primary_source = Some(now);
+            }
+            (RelayIngressParentPath::Secondary, MediaDatagramRole::Repair) => {
+                self.last_secondary_repair = Some(now);
+            }
+            (RelayIngressParentPath::Secondary, MediaDatagramRole::Source)
+                if self.awaiting_secondary_source =>
+            {
+                if let Some(sent_at) = self.promotion_sent_at {
+                    self.snapshot.last_promotion_to_source_us =
+                        duration_us(now.saturating_duration_since(sent_at));
+                }
+                self.awaiting_secondary_source = false;
+            }
+            _ => {}
+        }
+        if observation.decoded {
+            if self.awaiting_post_promotion_object {
+                if let Some(base) = self.promotion_gap_base {
+                    let gap_us = duration_us(now.saturating_duration_since(base));
+                    self.snapshot.last_media_gap_us = gap_us;
+                    self.snapshot.max_media_gap_us = self.snapshot.max_media_gap_us.max(gap_us);
+                }
+                self.awaiting_post_promotion_object = false;
+            }
+            self.last_decoded = Some(now);
+        }
+    }
+
+    async fn tick(&mut self, now: Instant) {
+        let primary_recent = self
+            .last_primary_source
+            .is_some_and(|seen| now.saturating_duration_since(seen) < self.silence);
+        let secondary_recent = self
+            .last_secondary_repair
+            .is_some_and(|seen| now.saturating_duration_since(seen) < self.secondary_warm);
+
+        match self.state {
+            RelayFailoverControllerState::Disabled => {}
+            RelayFailoverControllerState::Arming => {
+                if primary_recent && secondary_recent {
+                    self.set_state(RelayFailoverControllerState::Healthy);
+                } else if self.last_primary_source.is_some() && !primary_recent {
+                    if secondary_recent {
+                        self.promote(now);
+                    } else {
+                        self.secondary_unavailable();
+                    }
+                }
+            }
+            RelayFailoverControllerState::Healthy => {
+                if !primary_recent {
+                    if secondary_recent {
+                        self.promote(now);
+                    } else {
+                        self.secondary_unavailable();
+                    }
+                }
+            }
+            RelayFailoverControllerState::SecondaryUnavailable => {
+                if primary_recent {
+                    self.set_state(RelayFailoverControllerState::Healthy);
+                } else if secondary_recent && self.last_primary_source.is_some() {
+                    self.promote(now);
+                }
+            }
+            RelayFailoverControllerState::Promoted | RelayFailoverControllerState::Recovering => {
+                if primary_recent {
+                    let recovered_since = *self.recovered_since.get_or_insert(now);
+                    self.set_state(RelayFailoverControllerState::Recovering);
+                    if now.saturating_duration_since(recovered_since) >= self.recovery {
+                        self.demote();
+                    }
+                } else {
+                    self.recovered_since = None;
+                    self.set_state(RelayFailoverControllerState::Promoted);
+                }
+            }
+        }
+        self.refresh_ages(now);
+        self.send_desired().await;
+    }
+
+    fn promote(&mut self, now: Instant) {
+        self.desired_mode = FailoverForwardMode::SourceAndRepair;
+        self.advance_transition();
+        self.snapshot.promotions = self.snapshot.promotions.saturating_add(1);
+        self.snapshot.last_detection_us = self
+            .last_primary_source
+            .map_or(0, |seen| duration_us(now.saturating_duration_since(seen)));
+        self.promotion_sent_at = Some(now);
+        self.promotion_gap_base = self.last_decoded;
+        self.awaiting_secondary_source = true;
+        self.awaiting_post_promotion_object = true;
+        self.recovered_since = None;
+        self.set_state(RelayFailoverControllerState::Promoted);
+    }
+
+    fn demote(&mut self) {
+        self.desired_mode = FailoverForwardMode::RepairOnly;
+        self.advance_transition();
+        self.snapshot.demotions = self.snapshot.demotions.saturating_add(1);
+        self.recovered_since = None;
+        self.awaiting_secondary_source = false;
+        self.set_state(RelayFailoverControllerState::Healthy);
+    }
+
+    fn secondary_unavailable(&mut self) {
+        if self.state != RelayFailoverControllerState::SecondaryUnavailable {
+            self.snapshot.secondary_unavailable_events =
+                self.snapshot.secondary_unavailable_events.saturating_add(1);
+        }
+        self.set_state(RelayFailoverControllerState::SecondaryUnavailable);
+    }
+
+    fn set_state(&mut self, state: RelayFailoverControllerState) {
+        if self.state != state {
+            self.state = state;
+            self.snapshot.state = state;
+            self.snapshot.last_transition_unix_ms = now_unix_ms();
+        }
+    }
+
+    fn advance_transition(&mut self) {
+        self.transition_id = now_unix_us().max(self.transition_id.saturating_add(1));
+    }
+
+    fn refresh_ages(&mut self, now: Instant) {
+        self.snapshot.primary_source_age_ms = self
+            .last_primary_source
+            .map_or(0, |seen| duration_ms(now.saturating_duration_since(seen)));
+        self.snapshot.secondary_repair_age_ms = self
+            .last_secondary_repair
+            .map_or(0, |seen| duration_ms(now.saturating_duration_since(seen)));
+    }
+
+    async fn send_desired(&mut self) {
+        let issued_at = now_unix_us().max(1);
+        let Ok(command) = FailoverLeaseCommand::new(
+            self.generation,
+            self.subscription_id,
+            self.transition_id,
+            issued_at,
+            self.lease_duration_us,
+            self.desired_mode,
+        ) else {
+            self.snapshot.command_send_errors = self.snapshot.command_send_errors.saturating_add(1);
+            return;
+        };
+        match self.socket.send_to(&command.encode(), self.target).await {
+            Ok(sent) if sent == FAILOVER_CONTROL_WIRE_LEN => {
+                self.snapshot.commands_sent = self.snapshot.commands_sent.saturating_add(1);
+            }
+            Ok(_) | Err(_) => {
+                self.snapshot.command_send_errors =
+                    self.snapshot.command_send_errors.saturating_add(1);
+            }
+        }
+    }
+
+    const fn snapshot(&self) -> RelayFailoverControllerSnapshot {
+        self.snapshot
+    }
+}
+
+fn duration_us(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+async fn start_relay_failover_listeners(
+    endpoints: &[RelayFailoverListenerEndpoint],
+    forwarder: Option<&Arc<RelayDownstreamForwarder>>,
+    generation: TopologyGeneration,
+    subscription_id: SubscriptionId,
+    cache: &Arc<LiveTsCache>,
+    shutdown_rx: watch::Receiver<()>,
+) -> Result<Vec<tokio::task::JoinHandle<()>>> {
+    if endpoints.is_empty() {
+        return Ok(Vec::new());
+    }
+    let forwarder = forwarder.context("failover listeners require a downstream forwarder")?;
+    let mut bound = Vec::with_capacity(endpoints.len());
+    for endpoint in endpoints {
+        let socket = UdpSocket::bind(endpoint.bind).await.with_context(|| {
+            format!(
+                "failed to bind RelaySession failover listener on {}",
+                endpoint.bind
+            )
+        })?;
+        info!(
+            bind = %socket.local_addr()?,
+            peer = %endpoint.peer,
+            forward_target = %endpoint.forward_target,
+            "RelaySession warm-secondary failover listener ready"
+        );
+        bound.push((*endpoint, socket));
+    }
+    let mut tasks = Vec::with_capacity(bound.len());
+    for (endpoint, socket) in bound {
+        forwarder.register_failover_listener();
+        cache.update_relay_forward(forwarder.snapshot());
+        tasks.push(tokio::spawn(run_relay_failover_listener(
+            socket,
+            endpoint,
+            generation,
+            subscription_id,
+            Arc::clone(forwarder),
+            Arc::clone(cache),
+            shutdown_rx.clone(),
+        )));
+    }
+    Ok(tasks)
+}
+
+async fn run_relay_failover_listener(
+    socket: UdpSocket,
+    endpoint: RelayFailoverListenerEndpoint,
+    generation: TopologyGeneration,
+    subscription_id: SubscriptionId,
+    forwarder: Arc<RelayDownstreamForwarder>,
+    cache: Arc<LiveTsCache>,
+    mut shutdown_rx: watch::Receiver<()>,
+) {
+    let mut buffer = [0_u8; FAILOVER_CONTROL_WIRE_LEN + 1];
+    let mut transition_id = 0_u64;
+    let mut transition_mode = FailoverForwardMode::RepairOnly;
+    let mut lease_deadline: Option<Instant> = None;
+    let mut lease_tick = interval(Duration::from_millis(25));
+    lease_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => return,
+            _ = lease_tick.tick() => {
+                if lease_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    forwarder.apply_failover_mode(
+                        endpoint.forward_target,
+                        FailoverForwardMode::RepairOnly,
+                        true,
+                    );
+                    cache.update_relay_forward(forwarder.snapshot());
+                    lease_deadline = None;
+                    transition_mode = FailoverForwardMode::RepairOnly;
+                }
+            }
+            received = socket.recv_from(&mut buffer) => {
+                let Ok((len, peer)) = received else {
+                    forwarder.record_failover_command_rejected();
+                    cache.update_relay_forward(forwarder.snapshot());
+                    continue;
+                };
+                let command = if peer == endpoint.peer {
+                    FailoverLeaseCommand::decode(&buffer[..len])
+                } else {
+                    Err(relay_session::Error::InvalidField {
+                        field: "failover_controller_peer",
+                        reason: "command arrived from an unassigned controller",
+                    })
+                };
+                let Ok(command) = command else {
+                    forwarder.record_failover_command_rejected();
+                    cache.update_relay_forward(forwarder.snapshot());
+                    continue;
+                };
+                let stale = command.generation != generation
+                    || command.subscription_id != subscription_id
+                    || command.transition_id < transition_id
+                    || (command.transition_id == transition_id && command.mode != transition_mode);
+                if stale {
+                    forwarder.record_failover_command_rejected();
+                    cache.update_relay_forward(forwarder.snapshot());
+                    continue;
+                }
+                transition_id = command.transition_id;
+                transition_mode = command.mode;
+                if forwarder.apply_failover_mode(endpoint.forward_target, command.mode, false) {
+                    lease_deadline = (command.mode == FailoverForwardMode::SourceAndRepair)
+                        .then(|| Instant::now() + Duration::from_micros(command.lease_duration_us));
+                }
+                cache.update_relay_forward(forwarder.snapshot());
+            }
         }
     }
 }
@@ -1307,7 +2020,9 @@ async fn run_udp_fec_ingest(
     mut shutdown_rx: watch::Receiver<()>,
     mut relay_dispatch: RelayUdpDispatch,
     relay_secondary_socket: Option<UdpSocket>,
-    relay_forwarder: Option<RelayDownstreamForwarder>,
+    relay_forwarder: Option<Arc<RelayDownstreamForwarder>>,
+    mut relay_failover_controller: Option<RelayFailoverController>,
+    failover_heartbeat: Duration,
 ) -> Result<()> {
     let mut receiver = UdpFecReceiver::new();
     cache.update_relay_ingress(relay_dispatch.receiver().snapshot());
@@ -1317,6 +2032,8 @@ async fn run_udp_fec_ingest(
     rotate.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut expire_fec = interval(Duration::from_secs(1));
     expire_fec.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut failover_tick = interval(failover_heartbeat);
+    failover_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -1350,27 +2067,45 @@ async fn run_udp_fec_ingest(
                     );
                 }
             }
+            _ = failover_tick.tick(), if relay_failover_controller.is_some() => {
+                if let Some(controller) = relay_failover_controller.as_mut() {
+                    controller.tick(Instant::now()).await;
+                    cache.update_relay_failover_controller(controller.snapshot());
+                }
+            }
             received = socket.recv_from(&mut buf) => {
                 let (len, peer) = received?;
-                process_udp_fec_ingest_datagram(
+                let observation = process_udp_fec_ingest_datagram(
                     peer,
                     &buf[..len],
                     &cache,
                     &mut receiver,
                     &mut relay_dispatch,
-                    relay_forwarder.as_ref(),
+                    relay_forwarder.as_deref(),
                 ).await?;
+                if let (Some(controller), Some(observation)) =
+                    (relay_failover_controller.as_mut(), observation)
+                {
+                    controller.observe(RelayIngressParentPath::Primary, observation, Instant::now());
+                    cache.update_relay_failover_controller(controller.snapshot());
+                }
             }
             received = recv_optional_udp(&relay_secondary_socket, &mut relay_secondary_buf) => {
                 let (len, peer) = received?;
-                process_udp_fec_ingest_datagram(
+                let observation = process_udp_fec_ingest_datagram(
                     peer,
                     &relay_secondary_buf[..len],
                     &cache,
                     &mut receiver,
                     &mut relay_dispatch,
-                    relay_forwarder.as_ref(),
+                    relay_forwarder.as_deref(),
                 ).await?;
+                if let (Some(controller), Some(observation)) =
+                    (relay_failover_controller.as_mut(), observation)
+                {
+                    controller.observe(RelayIngressParentPath::Secondary, observation, Instant::now());
+                    cache.update_relay_failover_controller(controller.snapshot());
+                }
             }
         }
     }
@@ -1393,7 +2128,7 @@ async fn process_udp_fec_ingest_datagram(
     receiver: &mut UdpFecReceiver,
     relay_dispatch: &mut RelayUdpDispatch,
     relay_forwarder: Option<&RelayDownstreamForwarder>,
-) -> Result<()> {
+) -> Result<Option<RelayDatagramObservation>> {
     debug!(
         peer = %peer,
         datagram_bytes = datagram.len(),
@@ -1415,7 +2150,10 @@ async fn process_udp_fec_ingest_datagram(
                 ?role,
                 "RelaySession RaptorQ symbol buffered"
             );
-            return Ok(());
+            return Ok(Some(RelayDatagramObservation {
+                role,
+                decoded: false,
+            }));
         }
         Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Decoded {
             object,
@@ -1431,7 +2169,7 @@ async fn process_udp_fec_ingest_datagram(
             let stream = object.key().stream().to_owned();
             let sequence = object.key().object();
             let availability = relay_availability_observation(&object, now_unix_us());
-            match commit_relay_object(cache, *object).await {
+            let decoded = match commit_relay_object(cache, *object).await {
                 Ok(_) => {
                     if let Some(observation) = availability {
                         cache.record_relay_availability(observation);
@@ -1444,16 +2182,20 @@ async fn process_udp_fec_ingest_datagram(
                         accepted_datagrams,
                         "committed canonical RelaySession RaptorQ object"
                     );
+                    true
                 }
-                Err(error) => warn!(
-                    peer = %peer,
-                    stream,
-                    sequence,
-                    error = %error,
-                    "failed to cache canonical RelaySession object"
-                ),
-            }
-            return Ok(());
+                Err(error) => {
+                    warn!(
+                        peer = %peer,
+                        stream,
+                        sequence,
+                        error = %error,
+                        "failed to cache canonical RelaySession object"
+                    );
+                    false
+                }
+            };
+            return Ok(Some(RelayDatagramObservation { role, decoded }));
         }
         Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Duplicate { key, role })) => {
             if let Some(forwarder) = relay_forwarder {
@@ -1467,7 +2209,10 @@ async fn process_udp_fec_ingest_datagram(
                 ?role,
                 "authenticated duplicate RelaySession symbol admitted for downstream forwarding"
             );
-            return Ok(());
+            return Ok(Some(RelayDatagramObservation {
+                role,
+                decoded: false,
+            }));
         }
         Err(error) => {
             warn!(
@@ -1476,7 +2221,7 @@ async fn process_udp_fec_ingest_datagram(
                 error = %error,
                 "RelaySession datagram rejected at configured dispatch seam"
             );
-            return Ok(());
+            return Ok(None);
         }
     }
 
@@ -1547,7 +2292,7 @@ async fn process_udp_fec_ingest_datagram(
             );
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 async fn commit_relay_object(cache: &LiveTsCache, object: MediaObject) -> Result<u64> {
@@ -1793,6 +2538,7 @@ struct LiveTsCache {
     state: RwLock<LiveState>,
     playlist_cache: Vec<StdRwLock<Option<CachedPlaylist>>>,
     relay_ingress: StdRwLock<RelaySessionIngressSnapshot>,
+    relay_failover_controller: StdRwLock<RelayFailoverControllerSnapshot>,
     relay_availability: RelayAvailabilityTelemetry,
 }
 
@@ -1826,6 +2572,7 @@ impl LiveTsCache {
             state: RwLock::new(LiveState::new()),
             playlist_cache,
             relay_ingress: StdRwLock::new(RelaySessionIngressSnapshot::default()),
+            relay_failover_controller: StdRwLock::new(RelayFailoverControllerSnapshot::default()),
             relay_availability: RelayAvailabilityTelemetry::default(),
         })
     }
@@ -1848,11 +2595,24 @@ impl LiveTsCache {
         current.apply_forward_snapshot(snapshot);
     }
 
+    fn update_relay_failover_controller(&self, snapshot: RelayFailoverControllerSnapshot) {
+        *self
+            .relay_failover_controller
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = snapshot;
+    }
+
     fn relay_ingress_snapshot(&self) -> RelaySessionIngressSnapshot {
         let mut snapshot = *self
             .relay_ingress
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        snapshot.apply_failover_controller_snapshot(
+            *self
+                .relay_failover_controller
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
         self.relay_availability.apply_to(&mut snapshot);
         snapshot
     }
@@ -2970,6 +3730,28 @@ struct RelaySessionIngressSnapshot {
     publication_to_available_buckets: [u64; PUBLICATION_AVAILABILITY_BUCKETS_US.len()],
     publication_clock_error_max_us: u64,
     publication_clock_unusable_objects: u64,
+    failover_controller_state: RelayFailoverControllerState,
+    failover_controller_enabled: u64,
+    failover_commands_sent: u64,
+    failover_command_send_errors: u64,
+    failover_promotions: u64,
+    failover_demotions: u64,
+    failover_secondary_unavailable_events: u64,
+    failover_primary_source_age_ms: u64,
+    failover_secondary_repair_age_ms: u64,
+    failover_last_detection_us: u64,
+    failover_last_promotion_to_source_us: u64,
+    failover_last_media_gap_us: u64,
+    failover_max_media_gap_us: u64,
+    failover_controller_last_transition_unix_ms: u64,
+    failover_listeners: u64,
+    failover_promoted_children: u64,
+    failover_commands_received: u64,
+    failover_commands_rejected: u64,
+    failover_lease_expirations: u64,
+    failover_promotions_applied: u64,
+    failover_demotions_applied: u64,
+    failover_listener_last_transition_unix_ms: u64,
 }
 
 impl RelaySessionIngressSnapshot {
@@ -2985,6 +3767,14 @@ impl RelaySessionIngressSnapshot {
             duration_sum_us: self.forward_duration_sum_us,
             duration_max_us: self.forward_duration_max_us,
             duration_buckets: self.forward_duration_buckets,
+            failover_listeners: self.failover_listeners,
+            failover_promoted_children: self.failover_promoted_children,
+            failover_commands_received: self.failover_commands_received,
+            failover_commands_rejected: self.failover_commands_rejected,
+            failover_lease_expirations: self.failover_lease_expirations,
+            failover_promotions_applied: self.failover_promotions_applied,
+            failover_demotions_applied: self.failover_demotions_applied,
+            failover_last_transition_unix_ms: self.failover_listener_last_transition_unix_ms,
         }
     }
 
@@ -2999,6 +3789,31 @@ impl RelaySessionIngressSnapshot {
         self.forward_duration_sum_us = snapshot.duration_sum_us;
         self.forward_duration_max_us = snapshot.duration_max_us;
         self.forward_duration_buckets = snapshot.duration_buckets;
+        self.failover_listeners = snapshot.failover_listeners;
+        self.failover_promoted_children = snapshot.failover_promoted_children;
+        self.failover_commands_received = snapshot.failover_commands_received;
+        self.failover_commands_rejected = snapshot.failover_commands_rejected;
+        self.failover_lease_expirations = snapshot.failover_lease_expirations;
+        self.failover_promotions_applied = snapshot.failover_promotions_applied;
+        self.failover_demotions_applied = snapshot.failover_demotions_applied;
+        self.failover_listener_last_transition_unix_ms = snapshot.failover_last_transition_unix_ms;
+    }
+
+    fn apply_failover_controller_snapshot(&mut self, snapshot: RelayFailoverControllerSnapshot) {
+        self.failover_controller_state = snapshot.state;
+        self.failover_controller_enabled = snapshot.enabled;
+        self.failover_commands_sent = snapshot.commands_sent;
+        self.failover_command_send_errors = snapshot.command_send_errors;
+        self.failover_promotions = snapshot.promotions;
+        self.failover_demotions = snapshot.demotions;
+        self.failover_secondary_unavailable_events = snapshot.secondary_unavailable_events;
+        self.failover_primary_source_age_ms = snapshot.primary_source_age_ms;
+        self.failover_secondary_repair_age_ms = snapshot.secondary_repair_age_ms;
+        self.failover_last_detection_us = snapshot.last_detection_us;
+        self.failover_last_promotion_to_source_us = snapshot.last_promotion_to_source_us;
+        self.failover_last_media_gap_us = snapshot.last_media_gap_us;
+        self.failover_max_media_gap_us = snapshot.max_media_gap_us;
+        self.failover_controller_last_transition_unix_ms = snapshot.last_transition_unix_ms;
     }
 }
 
@@ -4715,6 +5530,163 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
         "av_mesh_relay_session_publication_clock_unusable_objects_total {}\n",
         snapshot.relay_session.publication_clock_unusable_objects
     ));
+
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_relay_failover_state",
+        "One-hot edge failover controller state for the compiled warm-secondary relationship.",
+        "gauge",
+    );
+    for state in RelayFailoverControllerState::ALL {
+        output.push_str(&format!(
+            "av_mesh_relay_failover_state{{state=\"{}\"}} {}\n",
+            state.as_str(),
+            u8::from(snapshot.relay_session.failover_controller_state == state)
+        ));
+    }
+    for (name, help, value) in [
+        (
+            "av_mesh_relay_failover_controller_enabled",
+            "Whether this node actively detects primary silence and controls a warm secondary.",
+            snapshot.relay_session.failover_controller_enabled,
+        ),
+        (
+            "av_mesh_relay_failover_listeners",
+            "Compiled warm-secondary child control listeners on this node.",
+            snapshot.relay_session.failover_listeners,
+        ),
+        (
+            "av_mesh_relay_failover_promoted_children",
+            "Warm-secondary children currently receiving source plus repair symbols.",
+            snapshot.relay_session.failover_promoted_children,
+        ),
+        (
+            "av_mesh_relay_failover_primary_source_age_ms",
+            "Age of the newest admitted primary source symbol at the edge.",
+            snapshot.relay_session.failover_primary_source_age_ms,
+        ),
+        (
+            "av_mesh_relay_failover_secondary_repair_age_ms",
+            "Age of the newest admitted secondary repair symbol at the edge.",
+            snapshot.relay_session.failover_secondary_repair_age_ms,
+        ),
+        (
+            "av_mesh_relay_failover_last_detection_us",
+            "Primary source silence measured when the latest promotion began.",
+            snapshot.relay_session.failover_last_detection_us,
+        ),
+        (
+            "av_mesh_relay_failover_last_promotion_to_source_us",
+            "Time from the latest promotion command to the first admitted secondary source symbol.",
+            snapshot.relay_session.failover_last_promotion_to_source_us,
+        ),
+        (
+            "av_mesh_relay_failover_last_media_gap_us",
+            "Cache completion gap spanning the latest primary failure and promotion.",
+            snapshot.relay_session.failover_last_media_gap_us,
+        ),
+        (
+            "av_mesh_relay_failover_max_media_gap_us",
+            "Largest cache completion gap observed across automatic failovers.",
+            snapshot.relay_session.failover_max_media_gap_us,
+        ),
+        (
+            "av_mesh_relay_failover_controller_last_transition_unix_ms",
+            "Wall-clock time of the edge controller's latest state transition.",
+            snapshot
+                .relay_session
+                .failover_controller_last_transition_unix_ms,
+        ),
+        (
+            "av_mesh_relay_failover_listener_last_transition_unix_ms",
+            "Wall-clock time of the warm forwarder's latest applied mode transition.",
+            snapshot
+                .relay_session
+                .failover_listener_last_transition_unix_ms,
+        ),
+    ] {
+        push_prometheus_metric_header(&mut output, name, help, "gauge");
+        output.push_str(&format!("{name} {value}\n"));
+    }
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_relay_failover_commands_total",
+        "Leased failover control commands by endpoint direction and outcome.",
+        "counter",
+    );
+    for (direction, outcome, value) in [
+        (
+            "sent",
+            "success",
+            snapshot.relay_session.failover_commands_sent,
+        ),
+        (
+            "sent",
+            "error",
+            snapshot.relay_session.failover_command_send_errors,
+        ),
+        (
+            "received",
+            "accepted",
+            snapshot.relay_session.failover_commands_received,
+        ),
+        (
+            "received",
+            "rejected",
+            snapshot.relay_session.failover_commands_rejected,
+        ),
+    ] {
+        output.push_str(&format!(
+            "av_mesh_relay_failover_commands_total{{direction=\"{direction}\",outcome=\"{outcome}\"}} {value}\n"
+        ));
+    }
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_relay_failover_transitions_total",
+        "Warm-secondary promotion and make-before-break demotion transitions by endpoint side.",
+        "counter",
+    );
+    for (side, transition, value) in [
+        (
+            "controller",
+            "promotion",
+            snapshot.relay_session.failover_promotions,
+        ),
+        (
+            "controller",
+            "demotion",
+            snapshot.relay_session.failover_demotions,
+        ),
+        (
+            "forwarder",
+            "promotion",
+            snapshot.relay_session.failover_promotions_applied,
+        ),
+        (
+            "forwarder",
+            "demotion",
+            snapshot.relay_session.failover_demotions_applied,
+        ),
+    ] {
+        output.push_str(&format!(
+            "av_mesh_relay_failover_transitions_total{{side=\"{side}\",transition=\"{transition}\"}} {value}\n"
+        ));
+    }
+    for (name, help, value) in [
+        (
+            "av_mesh_relay_failover_secondary_unavailable_total",
+            "Primary failures where the secondary did not have a recent repair heartbeat.",
+            snapshot.relay_session.failover_secondary_unavailable_events,
+        ),
+        (
+            "av_mesh_relay_failover_lease_expirations_total",
+            "Promoted forwarders returned to repair-only after their controller lease expired.",
+            snapshot.relay_session.failover_lease_expirations,
+        ),
+    ] {
+        push_prometheus_metric_header(&mut output, name, help, "counter");
+        output.push_str(&format!("{name} {value}\n"));
+    }
 
     push_prometheus_metric_header(
         &mut output,
@@ -11056,6 +12028,8 @@ mod tests {
             empty_relay_udp_dispatch(),
             None,
             None,
+            None,
+            Duration::from_millis(100),
         ));
         let mut sender = UdpFecSender::new(bind).await.unwrap();
 
@@ -11135,6 +12109,173 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn leased_failover_promotes_one_warm_child_and_expires_to_repair_only() {
+        use tokio::time::timeout;
+
+        let child = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let forward_target = child.local_addr().unwrap();
+        let forwarder = RelayDownstreamForwarder::bind(&[RelayForwardEndpoint {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            target: forward_target,
+            role: RelayForwardRole::Repair,
+        }])
+        .await
+        .unwrap()
+        .unwrap();
+        let controller = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listener_bind = unused_loopback_addr();
+        let cache = LiveTsCache::new(1, Duration::from_millis(50), 2, 6, 64).await;
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let generation = TopologyGeneration::new(7).unwrap();
+        let subscription = SubscriptionId::new(9).unwrap();
+        let tasks = start_relay_failover_listeners(
+            &[RelayFailoverListenerEndpoint {
+                bind: listener_bind,
+                peer: controller.local_addr().unwrap(),
+                forward_target,
+            }],
+            Some(&forwarder),
+            generation,
+            subscription,
+            &cache,
+            shutdown_rx,
+        )
+        .await
+        .unwrap();
+
+        let command = FailoverLeaseCommand::new(
+            generation,
+            subscription,
+            11,
+            now_unix_us(),
+            75_000,
+            FailoverForwardMode::SourceAndRepair,
+        )
+        .unwrap();
+        controller
+            .send_to(&command.encode(), listener_bind)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if forwarder.snapshot().failover_promoted_children == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        forwarder
+            .forward(b"promoted-source", MediaDatagramRole::Source)
+            .await;
+        let mut received = [0_u8; 64];
+        let (len, _) = timeout(Duration::from_secs(1), child.recv_from(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&received[..len], b"promoted-source");
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = forwarder.snapshot();
+                if snapshot.failover_promoted_children == 0
+                    && snapshot.failover_lease_expirations == 1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let snapshot = forwarder.snapshot();
+        assert_eq!(snapshot.failover_commands_received, 1);
+        assert_eq!(snapshot.failover_promotions_applied, 1);
+        assert_eq!(snapshot.failover_demotions_applied, 1);
+
+        let _ = shutdown_tx.send(());
+        for task in tasks {
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn failover_controller_detects_promotes_and_demotes_make_before_break() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let base = Instant::now();
+        let mut controller = RelayFailoverController {
+            socket: sender,
+            target: receiver.local_addr().unwrap(),
+            generation: TopologyGeneration::new(7).unwrap(),
+            subscription_id: SubscriptionId::new(9).unwrap(),
+            silence: Duration::from_millis(100),
+            recovery: Duration::from_millis(40),
+            secondary_warm: Duration::from_millis(250),
+            lease_duration_us: 1_000_000,
+            state: RelayFailoverControllerState::Arming,
+            desired_mode: FailoverForwardMode::RepairOnly,
+            transition_id: 1,
+            last_primary_source: None,
+            last_secondary_repair: None,
+            recovered_since: None,
+            last_decoded: None,
+            promotion_gap_base: None,
+            promotion_sent_at: None,
+            awaiting_secondary_source: false,
+            awaiting_post_promotion_object: false,
+            snapshot: RelayFailoverControllerSnapshot {
+                state: RelayFailoverControllerState::Arming,
+                enabled: 1,
+                ..RelayFailoverControllerSnapshot::default()
+            },
+        };
+        let source = RelayDatagramObservation {
+            role: MediaDatagramRole::Source,
+            decoded: true,
+        };
+        let repair = RelayDatagramObservation {
+            role: MediaDatagramRole::Repair,
+            decoded: false,
+        };
+        controller.observe(RelayIngressParentPath::Primary, source, base);
+        controller.observe(RelayIngressParentPath::Secondary, repair, base);
+        controller.tick(base).await;
+        assert_eq!(
+            controller.snapshot().state,
+            RelayFailoverControllerState::Healthy
+        );
+
+        let failed_at = base + Duration::from_millis(101);
+        controller.observe(RelayIngressParentPath::Secondary, repair, failed_at);
+        controller.tick(failed_at).await;
+        assert_eq!(
+            controller.snapshot().state,
+            RelayFailoverControllerState::Promoted
+        );
+        assert_eq!(controller.snapshot().promotions, 1);
+        assert!(controller.snapshot().last_detection_us >= 100_000);
+
+        let recovery_started = failed_at + Duration::from_millis(10);
+        controller.observe(RelayIngressParentPath::Primary, source, recovery_started);
+        controller.tick(recovery_started).await;
+        assert_eq!(
+            controller.snapshot().state,
+            RelayFailoverControllerState::Recovering
+        );
+        let recovered = recovery_started + Duration::from_millis(41);
+        controller.observe(RelayIngressParentPath::Primary, source, recovered);
+        controller.tick(recovered).await;
+        assert_eq!(
+            controller.snapshot().state,
+            RelayFailoverControllerState::Healthy
+        );
+        assert_eq!(controller.snapshot().demotions, 1);
+    }
+
+    #[tokio::test]
     async fn udp_fec_ingest_commits_one_exact_canonical_object_after_loss_and_reordering() {
         use raptorq_datagram_fec::DatagramFecEncoder;
         use tokio::time::timeout;
@@ -11150,6 +12291,8 @@ mod tests {
             empty_relay_udp_dispatch(),
             None,
             None,
+            None,
+            Duration::from_millis(100),
         ));
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let stream_id = 77u64;
@@ -11267,6 +12410,8 @@ mod tests {
             dispatch,
             Some(secondary_ingest),
             None,
+            None,
+            Duration::from_millis(100),
         ));
 
         let stream_id = 77u64;
