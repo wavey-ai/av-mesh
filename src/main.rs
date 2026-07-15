@@ -684,11 +684,13 @@ async fn main() -> Result<()> {
         fec_socket,
         Arc::clone(&cache),
         ingest_shutdown_rx.clone(),
-        relay_dispatch,
-        relay_secondary_socket,
-        relay_forwarder,
-        relay_failover_controller,
-        Duration::from_millis(args.relay_failover_heartbeat_ms),
+        RelayIngestRuntime {
+            dispatch: relay_dispatch,
+            secondary_socket: relay_secondary_socket,
+            forwarder: relay_forwarder,
+            failover_controller: relay_failover_controller,
+            failover_heartbeat: Duration::from_millis(args.relay_failover_heartbeat_ms),
+        },
     ));
 
     let (audio_epoch_tx, _) = broadcast::channel(AUDIO_EPOCH_BROADCAST_CAPACITY);
@@ -1443,11 +1445,10 @@ impl RelayDownstreamForwarder {
     async fn forward(&self, datagram: &[u8], role: MediaDatagramRole) {
         for path in &self.paths {
             let promoted = path.promoted.load(Ordering::Relaxed);
-            if !path.role.permits(role)
-                && !(promoted
-                    && path.role == RelayForwardRole::Repair
-                    && matches!(role, MediaDatagramRole::Source))
-            {
+            let failover_source = promoted
+                && path.role == RelayForwardRole::Repair
+                && matches!(role, MediaDatagramRole::Source);
+            if !(path.role.permits(role) || failover_source) {
                 self.filtered_datagrams.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -2014,16 +2015,27 @@ async fn run_relay_failover_listener(
     }
 }
 
+struct RelayIngestRuntime {
+    dispatch: RelayUdpDispatch,
+    secondary_socket: Option<UdpSocket>,
+    forwarder: Option<Arc<RelayDownstreamForwarder>>,
+    failover_controller: Option<RelayFailoverController>,
+    failover_heartbeat: Duration,
+}
+
 async fn run_udp_fec_ingest(
     socket: UdpSocket,
     cache: Arc<LiveTsCache>,
     mut shutdown_rx: watch::Receiver<()>,
-    mut relay_dispatch: RelayUdpDispatch,
-    relay_secondary_socket: Option<UdpSocket>,
-    relay_forwarder: Option<Arc<RelayDownstreamForwarder>>,
-    mut relay_failover_controller: Option<RelayFailoverController>,
-    failover_heartbeat: Duration,
+    runtime: RelayIngestRuntime,
 ) -> Result<()> {
+    let RelayIngestRuntime {
+        dispatch: mut relay_dispatch,
+        secondary_socket: relay_secondary_socket,
+        forwarder: relay_forwarder,
+        failover_controller: mut relay_failover_controller,
+        failover_heartbeat,
+    } = runtime;
     let mut receiver = UdpFecReceiver::new();
     cache.update_relay_ingress(relay_dispatch.receiver().snapshot());
     let mut buf = vec![0u8; 65_536];
@@ -9636,6 +9648,28 @@ mod tests {
             publication_to_available_buckets: [9; PUBLICATION_AVAILABILITY_BUCKETS_US.len()],
             publication_clock_error_max_us: 5_000,
             publication_clock_unusable_objects: 1,
+            failover_controller_state: RelayFailoverControllerState::Promoted,
+            failover_controller_enabled: 1,
+            failover_commands_sent: 7,
+            failover_command_send_errors: 1,
+            failover_promotions: 2,
+            failover_demotions: 1,
+            failover_secondary_unavailable_events: 3,
+            failover_primary_source_age_ms: 351,
+            failover_secondary_repair_age_ms: 24,
+            failover_last_detection_us: 351_000,
+            failover_last_promotion_to_source_us: 88_000,
+            failover_last_media_gap_us: 103_000,
+            failover_max_media_gap_us: 119_000,
+            failover_controller_last_transition_unix_ms: 1_784_102_400_123,
+            failover_listeners: 1,
+            failover_promoted_children: 1,
+            failover_commands_received: 6,
+            failover_commands_rejected: 2,
+            failover_lease_expirations: 1,
+            failover_promotions_applied: 2,
+            failover_demotions_applied: 2,
+            failover_listener_last_transition_unix_ms: 1_784_102_400_456,
             ..RelaySessionIngressSnapshot::default()
         };
 
@@ -9673,6 +9707,31 @@ mod tests {
         assert!(
             metrics.contains("av_mesh_relay_session_publication_clock_unusable_objects_total 1\n")
         );
+        assert!(metrics.contains("av_mesh_relay_failover_state{state=\"promoted\"} 1\n"));
+        assert!(metrics.contains("av_mesh_relay_failover_state{state=\"healthy\"} 0\n"));
+        assert!(metrics.contains("av_mesh_relay_failover_controller_enabled 1\n"));
+        assert!(metrics.contains("av_mesh_relay_failover_listeners 1\n"));
+        assert!(metrics.contains("av_mesh_relay_failover_promoted_children 1\n"));
+        assert!(metrics.contains("av_mesh_relay_failover_primary_source_age_ms 351\n"));
+        assert!(metrics.contains("av_mesh_relay_failover_secondary_repair_age_ms 24\n"));
+        assert!(metrics.contains("av_mesh_relay_failover_last_detection_us 351000\n"));
+        assert!(metrics.contains("av_mesh_relay_failover_last_promotion_to_source_us 88000\n"));
+        assert!(metrics.contains("av_mesh_relay_failover_last_media_gap_us 103000\n"));
+        assert!(metrics.contains("av_mesh_relay_failover_max_media_gap_us 119000\n"));
+        assert!(metrics.contains(
+            "av_mesh_relay_failover_commands_total{direction=\"sent\",outcome=\"success\"} 7\n"
+        ));
+        assert!(metrics.contains(
+            "av_mesh_relay_failover_commands_total{direction=\"received\",outcome=\"rejected\"} 2\n"
+        ));
+        assert!(metrics.contains(
+            "av_mesh_relay_failover_transitions_total{side=\"controller\",transition=\"promotion\"} 2\n"
+        ));
+        assert!(metrics.contains(
+            "av_mesh_relay_failover_transitions_total{side=\"forwarder\",transition=\"demotion\"} 2\n"
+        ));
+        assert!(metrics.contains("av_mesh_relay_failover_secondary_unavailable_total 3\n"));
+        assert!(metrics.contains("av_mesh_relay_failover_lease_expirations_total 1\n"));
         assert!(metrics.contains("av_mesh_edge_active_readers{node_id=\"uk-1\",region=\"uk\"} 2\n"));
         assert!(metrics.contains(
             "av_mesh_stream_bytes_received_total{node_id=\"uk-1\",stream_id=\"77\"} 20000\n"
@@ -12025,11 +12084,13 @@ mod tests {
             socket,
             Arc::clone(&cache),
             shutdown_rx,
-            empty_relay_udp_dispatch(),
-            None,
-            None,
-            None,
-            Duration::from_millis(100),
+            RelayIngestRuntime {
+                dispatch: empty_relay_udp_dispatch(),
+                secondary_socket: None,
+                forwarder: None,
+                failover_controller: None,
+                failover_heartbeat: Duration::from_millis(100),
+            },
         ));
         let mut sender = UdpFecSender::new(bind).await.unwrap();
 
@@ -12064,6 +12125,34 @@ mod tests {
         );
         assert!(parse_relay_forward_endpoint("127.0.0.1:24001").is_err());
         assert!(parse_relay_forward_endpoint("invalid=127.0.0.1:25001").is_err());
+    }
+
+    #[test]
+    fn relay_failover_endpoints_bind_control_to_an_exact_peer_and_child() {
+        assert_eq!(
+            parse_relay_failover_listener_endpoint(
+                "127.0.0.1:22502=127.0.0.1:22501,127.0.0.1:22004"
+            )
+            .unwrap(),
+            RelayFailoverListenerEndpoint {
+                bind: "127.0.0.1:22502".parse().unwrap(),
+                peer: "127.0.0.1:22501".parse().unwrap(),
+                forward_target: "127.0.0.1:22004".parse().unwrap(),
+            }
+        );
+        assert_eq!(
+            parse_relay_failover_controller_endpoint("127.0.0.1:22501=127.0.0.1:22502").unwrap(),
+            RelayFailoverControllerEndpoint {
+                bind: "127.0.0.1:22501".parse().unwrap(),
+                target: "127.0.0.1:22502".parse().unwrap(),
+            }
+        );
+        assert!(parse_relay_failover_listener_endpoint("127.0.0.1:22502=127.0.0.1:22501").is_err());
+        assert!(
+            parse_relay_failover_listener_endpoint("127.0.0.1:22502=invalid,127.0.0.1:22004")
+                .is_err()
+        );
+        assert!(parse_relay_failover_controller_endpoint("127.0.0.1:22501").is_err());
     }
 
     #[tokio::test]
@@ -12288,11 +12377,13 @@ mod tests {
             socket,
             Arc::clone(&cache),
             shutdown_rx,
-            empty_relay_udp_dispatch(),
-            None,
-            None,
-            None,
-            Duration::from_millis(100),
+            RelayIngestRuntime {
+                dispatch: empty_relay_udp_dispatch(),
+                secondary_socket: None,
+                forwarder: None,
+                failover_controller: None,
+                failover_heartbeat: Duration::from_millis(100),
+            },
         ));
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let stream_id = 77u64;
@@ -12407,11 +12498,13 @@ mod tests {
             primary_ingest,
             Arc::clone(&cache),
             shutdown_rx,
-            dispatch,
-            Some(secondary_ingest),
-            None,
-            None,
-            Duration::from_millis(100),
+            RelayIngestRuntime {
+                dispatch,
+                secondary_socket: Some(secondary_ingest),
+                forwarder: None,
+                failover_controller: None,
+                failover_heartbeat: Duration::from_millis(100),
+            },
         ));
 
         let stream_id = 77u64;
