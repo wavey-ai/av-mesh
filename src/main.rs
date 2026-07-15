@@ -78,7 +78,6 @@ const DEFAULT_RELAY_FAILOVER_HEARTBEAT_MS: u64 = 100;
 const DEFAULT_RELAY_FAILOVER_LEASE_MS: u64 = 1_000;
 // The reliable subscription/catalog lane will supply this for late joins. The
 // local transition path starts each canonical stream at object zero.
-const LOCAL_RELAY_SUBSCRIPTION_BASE_OBJECT: usize = 0;
 const PART_WAIT_MS: u64 = 3_000;
 const REPLICA_REQUEST_MIN_INTERVAL_MS: u64 = 1_000;
 const MESH_EVENTS_PATH: &str = "/api/mesh/events";
@@ -2727,7 +2726,7 @@ impl LiveTsCache {
             };
             let now_ms = now_unix_ms();
 
-            {
+            let subscription_base_object = {
                 let mut state = self.state.write().await;
                 state.datagrams_received = state.datagrams_received.saturating_add(1);
                 state.bytes_received = state.bytes_received.saturating_add(bytes as u64);
@@ -2742,7 +2741,19 @@ impl LiveTsCache {
                         .stream_inits
                         .insert(stream_id, Bytes::copy_from_slice(object.payload()));
                 }
-            }
+                (kind == ObjectKind::Media).then(|| {
+                    let base = *state
+                        .stream_subscription_base_object
+                        .entry(stream_id)
+                        .or_insert(seq);
+                    state
+                        .stream_latest_canonical_object
+                        .entry(stream_id)
+                        .and_modify(|head| *head = (*head).max(seq))
+                        .or_insert(seq);
+                    base
+                })
+            };
 
             if matches!(
                 kind,
@@ -2766,12 +2777,16 @@ impl LiveTsCache {
             }
 
             let slot_id = usize::try_from(seq).context("stream slot sequence too large")?;
+            let subscription_base_object = usize::try_from(
+                subscription_base_object.context("media object subscription base missing")?,
+            )
+            .context("stream subscription base object is too large")?;
             let write_result = self
                 .chunk_cache
                 .put_if_absent_contiguous_for_stream_id(
                     stream_id,
                     slot_id,
-                    LOCAL_RELAY_SUBSCRIPTION_BASE_OBJECT,
+                    subscription_base_object,
                     payload,
                 )
                 .await
@@ -3288,6 +3303,14 @@ impl LiveTsCache {
         let latest_local_part = state.last_committed_seq;
         let latest_local_part_bytes = state.last_committed_bytes;
         let latest_local_part_duration_ms = state.last_committed_duration_ms;
+        let subscription_base_object = state
+            .stream_subscription_base_object
+            .get(&self.stream_id)
+            .copied();
+        let head_object = state
+            .stream_latest_canonical_object
+            .get(&self.stream_id)
+            .copied();
         let latest_local_part_age_ms = state
             .last_committed_unix_ms
             .map(|last| now_ms.saturating_sub(last));
@@ -3311,6 +3334,10 @@ impl LiveTsCache {
             }
             None => None,
         };
+        let contiguous_object = latest_mesh_part;
+        let gap_count = self
+            .canonical_gap_count(self.stream_id, subscription_base_object, head_object)
+            .await;
 
         StatsSnapshot {
             stream_id: self.stream_id,
@@ -3325,6 +3352,9 @@ impl LiveTsCache {
             latest_local_part_bytes,
             latest_local_part_duration_ms,
             latest_mesh_part,
+            contiguous_object,
+            head_object,
+            gap_count,
             mesh_peers: mesh
                 .peers()
                 .await
@@ -3334,6 +3364,31 @@ impl LiveTsCache {
             latest_local_part_age_ms,
             last_ingest_age_ms,
         }
+    }
+
+    async fn canonical_gap_count(
+        &self,
+        stream_id: u64,
+        subscription_base_object: Option<u64>,
+        head_object: Option<u64>,
+    ) -> Option<u64> {
+        let base = subscription_base_object?;
+        let head = head_object?;
+        let retained_start = head
+            .saturating_sub(self.window_parts.saturating_sub(1) as u64)
+            .max(base);
+        let mut gaps = 0_u64;
+        for object in retained_start..=head {
+            if self
+                .chunk_cache
+                .get_for_stream_id(stream_id, usize::try_from(object).ok()?)
+                .await
+                .is_none()
+            {
+                gaps = gaps.saturating_add(1);
+            }
+        }
+        Some(gaps)
     }
 
     async fn estimated_storage_bytes(&self) -> u64 {
@@ -3397,6 +3452,13 @@ impl LiveTsCache {
         default_stats: &StatsSnapshot,
     ) -> Vec<StreamTelemetry> {
         let mut streams = Vec::new();
+        let (subscription_bases, canonical_heads) = {
+            let state = self.state.read().await;
+            (
+                state.stream_subscription_base_object.clone(),
+                state.stream_latest_canonical_object.clone(),
+            )
+        };
         for (stream_id, stream_idx) in self.chunk_cache.stream_ids().await {
             let Some(last) = self.chunk_cache.last(stream_idx) else {
                 continue;
@@ -3422,6 +3484,26 @@ impl LiveTsCache {
                 continue;
             };
             let is_default_stream = stream_id == self.stream_id;
+            let contiguous_object = if is_default_stream {
+                default_stats.contiguous_object.or(Some(latest_part))
+            } else {
+                Some(latest_part)
+            };
+            let head_object = if is_default_stream {
+                default_stats.head_object
+            } else {
+                canonical_heads.get(&stream_id).copied()
+            };
+            let gap_count = if is_default_stream {
+                default_stats.gap_count
+            } else {
+                self.canonical_gap_count(
+                    stream_id,
+                    subscription_bases.get(&stream_id).copied(),
+                    head_object,
+                )
+                .await
+            };
             streams.push(StreamTelemetry {
                 node_id: node_id.to_string(),
                 stream_id,
@@ -3447,6 +3529,9 @@ impl LiveTsCache {
                     None
                 },
                 latest_mesh_part: Some(latest_part),
+                contiguous_object,
+                head_object,
+                gap_count,
                 bytes_received: if is_default_stream {
                     default_stats.bytes_received.max(bytes_received)
                 } else {
@@ -3555,6 +3640,8 @@ struct LiveState {
     last_committed_bytes: Option<usize>,
     last_committed_duration_ms: Option<u64>,
     stream_next_seq: HashMap<u64, u64>,
+    stream_subscription_base_object: HashMap<u64, u64>,
+    stream_latest_canonical_object: HashMap<u64, u64>,
     stream_inits: HashMap<u64, Bytes>,
     stream_media_kinds: HashMap<u64, LiveMediaKind>,
 }
@@ -3575,6 +3662,8 @@ impl LiveState {
             last_committed_bytes: None,
             last_committed_duration_ms: None,
             stream_next_seq: HashMap::new(),
+            stream_subscription_base_object: HashMap::new(),
+            stream_latest_canonical_object: HashMap::new(),
             stream_inits: HashMap::new(),
             stream_media_kinds: HashMap::new(),
         }
@@ -3643,6 +3732,12 @@ struct StatsSnapshot {
     latest_local_part_bytes: Option<usize>,
     latest_local_part_duration_ms: Option<u64>,
     latest_mesh_part: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    contiguous_object: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    head_object: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gap_count: Option<u64>,
     mesh_peers: Vec<String>,
     latest_local_part_age_ms: Option<u64>,
     last_ingest_age_ms: Option<u64>,
@@ -4540,6 +4635,12 @@ struct StreamTelemetry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     latest_local_part_age_ms: Option<u64>,
     latest_mesh_part: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    contiguous_object: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    head_object: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gap_count: Option<u64>,
     bytes_received: u64,
     datagrams_received: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4561,6 +4662,9 @@ impl StreamTelemetry {
             latest_local_part_duration_ms: stats.latest_local_part_duration_ms,
             latest_local_part_age_ms: stats.latest_local_part_age_ms,
             latest_mesh_part: stats.latest_mesh_part,
+            contiguous_object: stats.contiguous_object,
+            head_object: stats.head_object,
+            gap_count: stats.gap_count,
             bytes_received: stats.bytes_received,
             datagrams_received: stats.datagrams_received,
             last_ingest_age_ms: stats.last_ingest_age_ms,
@@ -4573,7 +4677,9 @@ impl StreamTelemetry {
     }
 
     fn active(&self) -> bool {
-        self.latest_local_part.is_some() || self.latest_mesh_part.is_some()
+        self.latest_local_part.is_some()
+            || self.latest_mesh_part.is_some()
+            || self.head_object.is_some()
     }
 
     fn stale(&self) -> bool {
@@ -4586,8 +4692,8 @@ impl StreamTelemetry {
             })
     }
 
-    fn latest_observed_part(&self) -> Option<u64> {
-        self.latest_local_part.max(self.latest_mesh_part)
+    fn latest_comparable_object(&self) -> Option<u64> {
+        self.contiguous_object.or(self.latest_mesh_part)
     }
 
     fn lagging(&self) -> bool {
@@ -5904,6 +6010,21 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
             "gauge",
         ),
         (
+            "av_mesh_stream_canonical_head_object",
+            "Latest canonical media-object identity received by node and stream.",
+            "gauge",
+        ),
+        (
+            "av_mesh_stream_contiguous_object",
+            "Highest canonical media object available through the contiguous publication prefix.",
+            "gauge",
+        ),
+        (
+            "av_mesh_stream_known_gap_count",
+            "Known missing canonical objects in the retained live window.",
+            "gauge",
+        ),
+        (
             "av_mesh_stream_last_ingest_age_seconds",
             "Age of the latest mesh ingest by node and stream.",
             "gauge",
@@ -5915,7 +6036,7 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
         ),
         (
             "av_mesh_stream_lag_parts",
-            "Part lag behind the freshest observed replica by node and stream.",
+            "Canonical contiguous-object lag behind the freshest comparable node by stream.",
             "gauge",
         ),
     ] {
@@ -5941,6 +6062,21 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
         if let Some(part) = stream.latest_mesh_part {
             output.push_str(&format!(
                 "av_mesh_stream_latest_part{{{labels},source=\"mesh\"}} {part}\n"
+            ));
+        }
+        if let Some(object) = stream.head_object {
+            output.push_str(&format!(
+                "av_mesh_stream_canonical_head_object{{{labels}}} {object}\n"
+            ));
+        }
+        if let Some(object) = stream.contiguous_object {
+            output.push_str(&format!(
+                "av_mesh_stream_contiguous_object{{{labels}}} {object}\n"
+            ));
+        }
+        if let Some(gaps) = stream.gap_count {
+            output.push_str(&format!(
+                "av_mesh_stream_known_gap_count{{{labels}}} {gaps}\n"
             ));
         }
         if let Some(age_ms) = stream.last_ingest_age_ms {
@@ -5983,7 +6119,7 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
 fn annotate_stream_lag(streams: &mut [StreamTelemetry]) {
     let mut heads = HashMap::<u64, u64>::new();
     for stream in streams.iter() {
-        if let Some(part) = stream.latest_observed_part() {
+        if let Some(part) = stream.latest_comparable_object() {
             heads
                 .entry(stream.stream_id)
                 .and_modify(|head| *head = (*head).max(part))
@@ -5992,7 +6128,7 @@ fn annotate_stream_lag(streams: &mut [StreamTelemetry]) {
     }
 
     for stream in streams.iter_mut() {
-        stream.mesh_lag_parts = stream.latest_observed_part().and_then(|part| {
+        stream.mesh_lag_parts = stream.latest_comparable_object().and_then(|part| {
             heads
                 .get(&stream.stream_id)
                 .copied()
@@ -10425,6 +10561,9 @@ mod tests {
             latest_local_part_duration_ms: Some(500),
             latest_local_part_age_ms: Some(250),
             latest_mesh_part: Some(4),
+            contiguous_object: Some(4),
+            head_object: Some(4),
+            gap_count: Some(0),
             bytes_received: 8192,
             datagrams_received: 4,
             last_ingest_age_ms: Some(250),
@@ -10476,6 +10615,9 @@ mod tests {
             latest_local_part_duration_ms: Some(500),
             latest_local_part_age_ms: Some(6_000),
             latest_mesh_part: Some(4),
+            contiguous_object: Some(4),
+            head_object: Some(4),
+            gap_count: Some(0),
             bytes_received: 8192,
             datagrams_received: 4,
             last_ingest_age_ms: Some(6_000),
@@ -10518,6 +10660,9 @@ mod tests {
             latest_local_part_duration_ms: Some(500),
             latest_local_part_age_ms: Some(250),
             latest_mesh_part: Some(20),
+            contiguous_object: Some(20),
+            head_object: Some(20),
+            gap_count: Some(0),
             bytes_received: 4096,
             datagrams_received: 1,
             last_ingest_age_ms: Some(250),
@@ -10535,6 +10680,9 @@ mod tests {
             latest_local_part_duration_ms: Some(500),
             latest_local_part_age_ms: Some(250),
             latest_mesh_part: Some(11),
+            contiguous_object: Some(11),
+            head_object: Some(11),
+            gap_count: Some(0),
             bytes_received: 2048,
             datagrams_received: 1,
             last_ingest_age_ms: Some(250),
@@ -10564,7 +10712,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mesh_api_does_not_compare_controlled_relay_sequence_domains_as_replicas() {
+    async fn mesh_api_compares_canonical_objects_instead_of_process_local_counters() {
         let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
         let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
         let telemetry = TelemetryAggregator::default();
@@ -10585,7 +10733,10 @@ mod tests {
             latest_local_part_bytes: Some(4_096),
             latest_local_part_duration_ms: Some(500),
             latest_local_part_age_ms: Some(20),
-            latest_mesh_part: None,
+            latest_mesh_part: Some(500),
+            contiguous_object: Some(500),
+            head_object: Some(500),
+            gap_count: Some(0),
             bytes_received: 4_096,
             datagrams_received: 1,
             last_ingest_age_ms: Some(20),
@@ -10610,7 +10761,10 @@ mod tests {
             latest_local_part_bytes: Some(4_096),
             latest_local_part_duration_ms: Some(500),
             latest_local_part_age_ms: Some(20),
-            latest_mesh_part: None,
+            latest_mesh_part: Some(500),
+            contiguous_object: Some(500),
+            head_object: Some(500),
+            gap_count: Some(0),
             bytes_received: 4_096,
             datagrams_received: 1,
             last_ingest_age_ms: Some(20),
@@ -10624,7 +10778,9 @@ mod tests {
         let snapshot = router.mesh_api_snapshot().await;
 
         assert!(snapshot.streams.iter().any(|stream| {
-            stream.node_id == "relay-primary" && stream.mesh_lag_parts == Some(19_800)
+            stream.node_id == "relay-primary"
+                && stream.contiguous_object == Some(500)
+                && stream.mesh_lag_parts == Some(0)
         }));
         assert!(!snapshot.alerts.iter().any(|alert| {
             alert.code == "mesh_stream_lagging" && alert.node_id.as_deref() == Some("relay-primary")
@@ -11200,6 +11356,9 @@ mod tests {
             latest_local_part_duration_ms: Some(500),
             latest_local_part_age_ms: Some(250),
             latest_mesh_part: Some(8),
+            contiguous_object: Some(8),
+            head_object: Some(8),
+            gap_count: Some(0),
             bytes_received: 262_144,
             datagrams_received: 128,
             last_ingest_age_ms: Some(250),
@@ -11561,6 +11720,9 @@ mod tests {
             latest_local_part_duration_ms: Some(500),
             latest_local_part_age_ms: Some(250),
             latest_mesh_part: Some(0),
+            contiguous_object: Some(0),
+            head_object: Some(0),
+            gap_count: Some(0),
             bytes_received: b"baseline-stream-77".len() as u64,
             datagrams_received: 1,
             last_ingest_age_ms: Some(250),
@@ -12508,10 +12670,16 @@ mod tests {
             cache.get_init_for_stream_id(stream_id).await.unwrap(),
             Bytes::from_static(b"ftypmoov-loss-test")
         );
-        // The recovered object remains addressable, while contiguous playlist
-        // publication waits for the local subscription base rather than
-        // advertising a head across the 0..sequence gap.
-        assert!(cache.stream_position_for_id(stream_id).await.is_none());
+        // A fresh live subscriber begins its contiguous publication domain at
+        // the first canonical media object it observes, so a relay restart can
+        // resume current LL-HLS publication without backfilling object zero.
+        assert_eq!(
+            cache.stream_position_for_id(stream_id).await,
+            Some((
+                cache.chunk_cache.get_stream_idx(stream_id).await.unwrap(),
+                sequence as usize
+            ))
+        );
         assert!(cache
             .get_part_for_stream_id(stream_id, sequence - 1)
             .await
@@ -13341,6 +13509,9 @@ mod tests {
                 latest_local_part_bytes: Some(1024),
                 latest_local_part_duration_ms: Some(500),
                 latest_mesh_part: Some(1),
+                contiguous_object: Some(1),
+                head_object: Some(1),
+                gap_count: Some(0),
                 mesh_peers: Vec::new(),
                 latest_local_part_age_ms: Some(10),
                 last_ingest_age_ms: Some(10),
