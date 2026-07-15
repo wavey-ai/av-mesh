@@ -90,6 +90,11 @@ spec:
       labels:
         app.kubernetes.io/name: av-mesh
         app.kubernetes.io/instance: uk
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/scheme: https
+        prometheus.io/path: /metrics
+        prometheus.io/port: "9444"
     spec:
       containers:
         - name: av-mesh
@@ -187,6 +192,11 @@ spec:
       labels:
         app.kubernetes.io/name: av-mesh
         app.kubernetes.io/instance: us
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/scheme: https
+        prometheus.io/path: /metrics
+        prometheus.io/port: "9444"
     spec:
       containers:
         - name: av-mesh

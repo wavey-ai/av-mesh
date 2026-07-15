@@ -134,7 +134,6 @@ check_mesh() {
   for base in "https://127.0.0.1:${UK_PORT}" "https://127.0.0.1:${US_PORT}"; do
     curl -kfsS "${base}/up" >/dev/null
     curl -kfsS "${base}/api/mesh" >/dev/null
-    curl -kfsS "${base}/mesh" >/dev/null
     echo "ok ${base}"
   done
 }
@@ -149,11 +148,6 @@ up() {
   start_forwards
   check_mesh
   cat <<EOF
-
-Mission Control:
-  UK: https://127.0.0.1:${UK_PORT}/mesh
-  US: https://127.0.0.1:${US_PORT}/mesh
-
 Stop and delete the local cluster with:
   $0 down
 EOF

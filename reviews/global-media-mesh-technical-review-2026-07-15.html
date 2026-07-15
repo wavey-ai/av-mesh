@@ -1,0 +1,696 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>YL Global Media Mesh — Technical Review</title>
+  <style>
+    :root {
+      --paper: #f4f2ec;
+      --panel: #fffefa;
+      --ink: #11130f;
+      --muted: #62655e;
+      --line: #d9d7ce;
+      --green: #087a5b;
+      --green-soft: #ddf2e8;
+      --amber: #ad6500;
+      --amber-soft: #fff0ce;
+      --red: #a12620;
+      --red-soft: #f9dfdb;
+      --blue: #175fa3;
+      --blue-soft: #e0edf9;
+      --black: #151714;
+      --radius: 17px;
+      --shadow: 0 18px 45px rgba(30, 32, 25, .07);
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 16px;
+      line-height: 1.58;
+    }
+    a { color: var(--blue); text-underline-offset: 3px; }
+    code, .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: .91em;
+    }
+    code { background: #eeece5; border-radius: 5px; padding: .1em .32em; }
+    header {
+      color: #f9f8f3;
+      background:
+        radial-gradient(circle at 80% 20%, rgba(58, 202, 148, .2), transparent 28rem),
+        linear-gradient(145deg, #101310, #20251f);
+      padding: 24px clamp(22px, 5vw, 76px) 72px;
+    }
+    .topbar, .hero, main, footer { max-width: 1240px; margin: 0 auto; }
+    .topbar { display: flex; justify-content: space-between; align-items: center; gap: 20px; }
+    .brand { font-weight: 860; font-size: 1.2rem; letter-spacing: -.04em; }
+    .topmeta { color: #bfc6bd; font: 12px/1.4 ui-monospace, monospace; text-align: right; }
+    .hero { padding-top: 72px; display: grid; grid-template-columns: 1.55fr .75fr; gap: 56px; align-items: end; }
+    .eyebrow { margin: 0 0 14px; color: #76dfb8; font: 700 12px/1.4 ui-monospace, monospace; letter-spacing: .12em; text-transform: uppercase; }
+    h1 { margin: 0; max-width: 920px; font-size: clamp(3rem, 7vw, 6.3rem); line-height: .92; letter-spacing: -.075em; font-weight: 900; }
+    .dek { max-width: 760px; margin: 28px 0 0; color: #d4d8d2; font-size: clamp(1.05rem, 2vw, 1.3rem); line-height: 1.48; }
+    .verdict-stamp { border-left: 3px solid #69dbaf; padding: 5px 0 5px 22px; }
+    .verdict-stamp span { display: block; color: #aeb6ac; font: 700 11px/1.4 ui-monospace, monospace; letter-spacing: .1em; text-transform: uppercase; }
+    .verdict-stamp strong { display: block; margin-top: 7px; font-size: 1.45rem; line-height: 1.25; letter-spacing: -.025em; }
+    main { padding: 0 clamp(18px, 4vw, 54px) 100px; }
+    nav {
+      position: sticky; top: 0; z-index: 5; overflow-x: auto; margin: 0 calc(clamp(18px, 4vw, 54px) * -1) 38px;
+      padding: 13px clamp(18px, 4vw, 54px); white-space: nowrap; background: rgba(244, 242, 236, .94); border-bottom: 1px solid var(--line); backdrop-filter: blur(14px);
+    }
+    nav a { margin-right: 23px; color: #41453e; font: 700 12px/1.4 ui-monospace, monospace; text-decoration: none; }
+    nav a:hover { color: var(--green); }
+    section { scroll-margin-top: 70px; margin: 72px 0; }
+    .intro-grid { display: grid; grid-template-columns: 1.28fr .72fr; gap: 22px; margin-top: -38px; }
+    .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); padding: clamp(24px, 4vw, 42px); }
+    .card.flat { box-shadow: none; }
+    .verdict-card { border-top: 5px solid var(--green); }
+    .verdict-card h2 { margin-top: 0; font-size: clamp(1.7rem, 3vw, 2.7rem); }
+    .verdict-card p { font-size: 1.11rem; }
+    .callout { border-left: 4px solid var(--amber); background: var(--amber-soft); padding: 15px 18px; border-radius: 0 10px 10px 0; }
+    .callout strong { display: block; margin-bottom: 3px; }
+    .score { display: grid; gap: 13px; }
+    .score-row { display: grid; grid-template-columns: 1fr auto; gap: 11px; align-items: center; }
+    .score-row span { font-size: .88rem; font-weight: 700; }
+    .meter { grid-column: 1 / -1; height: 7px; background: #e5e3dc; border-radius: 20px; overflow: hidden; }
+    .meter i { display: block; height: 100%; width: var(--w); background: var(--c, var(--green)); border-radius: inherit; }
+    h2 { margin: 0 0 20px; font-size: clamp(2rem, 4vw, 3.4rem); line-height: 1.04; letter-spacing: -.055em; }
+    h3 { margin: 0 0 10px; font-size: 1.22rem; line-height: 1.3; letter-spacing: -.02em; }
+    h4 { margin: 0 0 7px; font-size: 1rem; }
+    p { margin: 0 0 1em; }
+    p:last-child { margin-bottom: 0; }
+    .section-lead { max-width: 790px; margin: -7px 0 30px; color: var(--muted); font-size: 1.12rem; }
+    .kicker { color: var(--green); font: 800 11px/1.4 ui-monospace, monospace; letter-spacing: .12em; text-transform: uppercase; margin-bottom: 10px; }
+    .grid-2, .grid-3, .grid-4 { display: grid; gap: 18px; }
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .mini { padding: 23px; }
+    .mini p, .mini li { color: #4f534c; font-size: .93rem; }
+    .tag { display: inline-block; border-radius: 30px; padding: 4px 9px; margin-bottom: 12px; font: 800 10px/1.3 ui-monospace, monospace; letter-spacing: .08em; text-transform: uppercase; }
+    .tag.keep { color: #075f48; background: var(--green-soft); }
+    .tag.change { color: #864c00; background: var(--amber-soft); }
+    .tag.stop { color: #8c211d; background: var(--red-soft); }
+    .tag.watch { color: #16548b; background: var(--blue-soft); }
+    .architecture { padding: 32px; background: var(--black); color: #f2f2ed; border-radius: var(--radius); overflow: hidden; }
+    .arch-flow { display: grid; grid-template-columns: 1fr 34px 1.15fr 34px 1fr 34px 1.05fr; gap: 8px; align-items: stretch; }
+    .node { min-height: 124px; display: flex; flex-direction: column; justify-content: space-between; background: #232723; border: 1px solid #3b423b; border-radius: 12px; padding: 17px; }
+    .node.accent { background: #103d31; border-color: #26775d; }
+    .node small { color: #9eaaa0; }
+    .arrow { display: grid; place-items: center; color: #6f7b70; font-size: 1.5rem; }
+    .architecture .legend { margin: 22px 0 0; color: #b3bcb4; font-size: .88rem; }
+    table { width: 100%; border-collapse: separate; border-spacing: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+    th, td { padding: 15px 17px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }
+    th { background: #ebe9e2; font: 800 11px/1.35 ui-monospace, monospace; letter-spacing: .06em; text-transform: uppercase; }
+    tr:last-child td { border-bottom: 0; }
+    td { font-size: .93rem; }
+    td:first-child { font-weight: 750; }
+    .status { white-space: nowrap; font-weight: 800; }
+    .status.good { color: var(--green); }
+    .status.risk { color: var(--amber); }
+    .status.bad { color: var(--red); }
+    .finding { display: grid; grid-template-columns: 52px 1fr; gap: 16px; padding: 24px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); }
+    .finding + .finding { margin-top: 13px; }
+    .sev { width: 43px; height: 43px; display: grid; place-items: center; border-radius: 50%; font: 900 12px/1 ui-monospace, monospace; }
+    .sev.p0 { background: var(--red-soft); color: var(--red); }
+    .sev.p1 { background: var(--amber-soft); color: var(--amber); }
+    .sev.p2 { background: var(--blue-soft); color: var(--blue); }
+    .evidence { margin-top: 9px; color: var(--muted); font-size: .85rem; }
+    ul { margin: 9px 0 0; padding-left: 1.2em; }
+    li + li { margin-top: 6px; }
+    .topology-grid { display: grid; grid-template-columns: repeat(5, minmax(150px, 1fr)); gap: 12px; overflow-x: auto; padding-bottom: 4px; }
+    .topology { min-width: 150px; padding: 18px; background: var(--panel); border: 1px solid var(--line); border-radius: 13px; }
+    .topology.recommended { border: 2px solid var(--green); background: #f7fffb; }
+    .dots { height: 78px; position: relative; margin: 10px 0 15px; border-radius: 8px; background: #eeece5; overflow: hidden; }
+    .dots svg { width: 100%; height: 100%; }
+    .topology p { color: var(--muted); font-size: .82rem; }
+    .math { margin: 25px 0; display: grid; grid-template-columns: repeat(3, 1fr); border: 1px solid var(--line); border-radius: 13px; overflow: hidden; }
+    .math div { padding: 20px; background: var(--panel); border-right: 1px solid var(--line); }
+    .math div:last-child { border-right: 0; }
+    .math strong { display: block; font-size: 1.35rem; }
+    .math span { color: var(--muted); font-size: .83rem; }
+    .lane { display: grid; grid-template-columns: 150px 1fr 120px; gap: 15px; align-items: center; padding: 17px 0; border-bottom: 1px solid var(--line); }
+    .lane:last-child { border-bottom: 0; }
+    .lane strong { line-height: 1.25; }
+    .lane .bar { position: relative; height: 13px; border-radius: 20px; background: #e3e1da; }
+    .lane .bar::after { content: ""; position: absolute; inset: 0 auto 0 0; width: var(--w); background: var(--c); border-radius: inherit; }
+    .lane em { font-style: normal; color: var(--muted); font: 700 11px/1.3 ui-monospace, monospace; text-align: right; }
+    .roadmap { position: relative; margin-left: 14px; padding-left: 38px; border-left: 2px solid #c9c7bf; }
+    .phase { position: relative; padding: 0 0 43px; }
+    .phase:last-child { padding-bottom: 0; }
+    .phase::before { content: ""; position: absolute; left: -47px; top: 2px; width: 16px; height: 16px; border-radius: 50%; background: var(--panel); border: 4px solid var(--green); }
+    .phase-head { display: grid; grid-template-columns: 130px 1fr; gap: 17px; margin-bottom: 13px; }
+    .phase-time { color: var(--green); font: 800 12px/1.4 ui-monospace, monospace; letter-spacing: .05em; text-transform: uppercase; }
+    .phase h3 { font-size: 1.45rem; }
+    .phase-content { display: grid; grid-template-columns: 1.4fr .9fr; gap: 18px; }
+    .gate { padding: 18px; border-radius: 12px; background: var(--green-soft); }
+    .gate h4 { color: #075f48; }
+    .gate li { font-size: .88rem; }
+    .source-list { columns: 2; column-gap: 28px; }
+    .source { break-inside: avoid; padding: 13px 0; border-bottom: 1px solid var(--line); }
+    .source a { font-weight: 760; }
+    .source small { display: block; color: var(--muted); margin-top: 3px; }
+    .footnote { color: var(--muted); font-size: .85rem; }
+    footer { padding: 30px clamp(18px, 4vw, 54px) 60px; color: #6e716b; border-top: 1px solid var(--line); font-size: .85rem; }
+    @media (max-width: 900px) {
+      .hero, .intro-grid, .grid-3, .grid-4, .phase-content { grid-template-columns: 1fr; }
+      .grid-2 { grid-template-columns: 1fr; }
+      .hero { gap: 35px; }
+      .arch-flow { grid-template-columns: 1fr; }
+      .arrow { transform: rotate(90deg); min-height: 26px; }
+      .math { grid-template-columns: 1fr; }
+      .math div { border-right: 0; border-bottom: 1px solid var(--line); }
+      .math div:last-child { border-bottom: 0; }
+      .source-list { columns: 1; }
+    }
+    @media (max-width: 600px) {
+      header { padding-bottom: 55px; }
+      .topmeta { display: none; }
+      .lane { grid-template-columns: 1fr; gap: 8px; }
+      .lane em { text-align: left; }
+      .phase-head { grid-template-columns: 1fr; gap: 5px; }
+      table { display: block; overflow-x: auto; }
+      .card { padding: 22px; }
+    }
+    @media print {
+      body { background: white; font-size: 11pt; }
+      header { background: #171917 !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+      nav { display: none; }
+      .card { box-shadow: none; }
+      section { break-inside: avoid-page; }
+      a { color: inherit; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="topbar">
+      <div class="brand">YL / systems review</div>
+      <div class="topmeta">CODE + STANDARDS REVIEW<br>15 JULY 2026 · LONDON</div>
+    </div>
+    <div class="hero">
+      <div>
+        <p class="eyebrow">Global media delivery architecture</p>
+        <h1>Build a relay fabric, not a complete graph.</h1>
+        <p class="dek">A technical review of <strong>av-contrib</strong>, <strong>av-mesh</strong>, the cache/FEC layer, and the associated discovery, telemetry, and provisioning crates—benchmarked against the current low-latency media transport landscape.</p>
+      </div>
+      <div class="verdict-stamp">
+        <span>Executive verdict</span>
+        <strong>Right media primitives.<br>Wrong global transport envelope.</strong>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <nav aria-label="Report sections">
+      <a href="#verdict">Verdict</a><a href="#system">System</a><a href="#topology">Topology</a><a href="#findings">Findings</a><a href="#state-of-art">State of art</a><a href="#raptorq">RaptorQ</a><a href="#target">Target</a><a href="#roadmap">Roadmap</a><a href="#gates">Gates</a><a href="#sources">Sources</a>
+    </nav>
+
+    <section id="verdict" class="intro-grid">
+      <article class="card verdict-card">
+        <p class="kicker">The answer</p>
+        <h2>Yes on the media architecture. No on the present network architecture.</h2>
+        <p>The project has a credible nucleus: contribution protocols terminate at a regional edge; media is normalized into stream-addressed fMP4/CMAF-like artifacts; cache slots are format-agnostic; RaptorQ recovery is real; and the telemetry/qualification effort is unusually serious for this stage.</p>
+        <p>But the mechanism currently called the mesh is a small-cluster prototype. It gossips peers over unauthenticated UDP, sends locally produced slots to every known peer, does not forward remote slots, and broadcasts demand requests. That makes a publisher’s egress grow with every replica while providing no routed path through the “mesh.” It also lacks the congestion control, pacing, workload identity, authorization, durable desired state, and repair semantics required on the public Internet.</p>
+        <div class="callout">
+          <strong>Strategic recommendation</strong>
+          Preserve the media engine. Introduce a secure QUIC session substrate and reshape distribution into an interest-driven, bounded-degree, dual-parent relay DAG. Use reliable streams for control and backfill, datagrams for deadline-bound media, and RaptorQ as an adaptive repair tool inside that session—not as the session, topology, or security model.
+        </div>
+      </article>
+      <aside class="card">
+        <p class="kicker">Maturity snapshot</p>
+        <div class="score" aria-label="Qualitative maturity scores">
+          <div class="score-row"><span>Media boundary</span><b>8 / 10</b><div class="meter"><i style="--w:80%"></i></div></div>
+          <div class="score-row"><span>Contribution ingest</span><b>7 / 10</b><div class="meter"><i style="--w:70%"></i></div></div>
+          <div class="score-row"><span>FEC &amp; repair primitives</span><b>7 / 10</b><div class="meter"><i style="--w:70%"></i></div></div>
+          <div class="score-row"><span>Observability &amp; tests</span><b>6 / 10</b><div class="meter"><i style="--w:60%;--c:#175fa3"></i></div></div>
+          <div class="score-row"><span>Topology &amp; routing</span><b>3 / 10</b><div class="meter"><i style="--w:30%;--c:#ad6500"></i></div></div>
+          <div class="score-row"><span>Orchestration</span><b>3 / 10</b><div class="meter"><i style="--w:30%;--c:#ad6500"></i></div></div>
+          <div class="score-row"><span>Congestion safety</span><b>2 / 10</b><div class="meter"><i style="--w:20%;--c:#a12620"></i></div></div>
+          <div class="score-row"><span>Security boundary</span><b>1 / 10</b><div class="meter"><i style="--w:10%;--c:#a12620"></i></div></div>
+        </div>
+        <p class="footnote" style="margin-top:22px">Scores are directional engineering judgments, not benchmark results. “Production readiness” is constrained by the lowest safety-critical layer.</p>
+      </aside>
+    </section>
+
+    <section>
+      <p class="kicker">Preserve / evolve / retire</p>
+      <h2>The shortest decision log</h2>
+      <div class="grid-3">
+        <article class="card mini"><span class="tag keep">Keep</span><h3>The artifact boundary</h3><p>Contribution adapters producing opaque, immutable media objects for a cache/relay layer is the right separation. Formalize object identity and lifecycle, but do not collapse protocol parsing into the core.</p></article>
+        <article class="card mini"><span class="tag keep">Keep, reposition</span><h3>RaptorQ</h3><p>Use it selectively when repair-by-retransmission would miss an object deadline. Drive parity from measured loss, RTT, deadline, and queue state; always retain a reliable fetch/backfill lane.</p></article>
+        <article class="card mini"><span class="tag keep">Keep</span><h3>SRT / RIST / RTMP edge</h3><p>They are useful contribution compatibility adapters. Add WHIP for browser/native WebRTC ingest and make protocol termination region-local.</p></article>
+        <article class="card mini"><span class="tag change">Replace</span><h3>Full-fanout UDP cache mesh</h3><p>Replace the public-network path with authenticated QUIC sessions, explicit subscriptions, small peer degree, forwarding relays, paced queues, and reliable repair.</p></article>
+        <article class="card mini"><span class="tag change">Evolve</span><h3>LL-HLS</h3><p>Keep it as the high-scale compatibility lane. Its part duration should reflect measured client RTT and Apple’s LL-HLS rules; 50 ms is not a sensible global default.</p></article>
+        <article class="card mini"><span class="tag stop">Do not promote</span><h3>Prototype orchestration as authority</h3><p><code>tcp-changes</code>, VLAN broadcast discovery, and provider scripts can bootstrap labs. They should not become the authoritative global control plane.</p></article>
+      </div>
+    </section>
+
+    <section id="system">
+      <p class="kicker">Code review</p>
+      <h2>What exists today</h2>
+      <p class="section-lead">The repository already expresses a useful separation of responsibilities. The problem is less “start again” than “put a production network and control envelope around the useful core.”</p>
+      <div class="architecture" role="img" aria-label="Current architecture from contribution protocols through cache mesh to playback">
+        <div class="arch-flow">
+          <div class="node"><strong>Contribution protocols</strong><small>SRT · RIST · RTMP · HTTP access units · DAW UDP</small></div>
+          <div class="arrow">→</div>
+          <div class="node accent"><strong>av-contrib</strong><small>demux · H.264/AAC normalization · fMP4 bridge · local LL-HLS · FEC forwarder</small></div>
+          <div class="arrow">→</div>
+          <div class="node"><strong>playlists + RaptorQ</strong><small>fixed cache rings · slots · manifests · UDP object recovery</small></div>
+          <div class="arrow">→</div>
+          <div class="node"><strong>av-mesh</strong><small>peer gossip · replication · LL-HLS · H2/H3 · optional WS/WebTransport · telemetry/control</small></div>
+        </div>
+        <p class="legend">Current hot path, simplified. The public data path and operator/control surfaces presently share one very large node process.</p>
+      </div>
+
+      <div class="grid-2" style="margin-top:20px">
+        <article class="card flat mini">
+          <span class="tag keep">Strong foundation</span>
+          <h3>Concrete strengths</h3>
+          <ul>
+            <li><code>av-contrib</code> keeps SRT/RIST/RTMP parsing out of the mesh and emits stream-addressed fMP4 or access-unit data.</li>
+            <li><code>ChunkCache</code> uses fixed rings, per-slot locking, atomics, and opaque bytes—appropriate primitives for a hot cache.</li>
+            <li>The RaptorQ crates include loss/reordering tests, multiblock recovery, adaptive policy, scheduling, and backfill primitives.</li>
+            <li>Prometheus metrics, Grafana/Alertmanager assets, staged latency histograms, qualification scripts, and netem tooling show good operational instincts.</li>
+            <li>The replica planner already models region, continent, capacity, demand, and draining state.</li>
+          </ul>
+        </article>
+        <article class="card flat mini">
+          <span class="tag watch">Evidence level</span>
+          <h3>What was validated</h3>
+          <ul>
+            <li><code>av-mesh cargo test --locked</code>: 72 tests passed, including replication, demand/backfill, FEC loss/reorder, telemetry, control, HLS, WebSocket/WebTransport, and netem tests.</li>
+            <li><code>av-contrib cargo test --locked</code>: 28 tests passed, covering fMP4/H.264 handling, ingest status, metrics, wire IDs, and FEC forwarding.</li>
+            <li>The contribution status notes successful 360p, 720p, and 1080p SRT/native-RIST-to-HLS paths; 2160p and the regional soak remain unqualified.</li>
+            <li>The review inspected the live working trees, including uncommitted work. Line references are therefore a dated snapshot, not a permanent API contract.</li>
+          </ul>
+        </article>
+      </div>
+
+      <div class="callout" style="margin-top:20px;border-left-color:var(--green);background:var(--green-soft)">
+        <strong>Deployment finding: Kubernetes is not in the current runtime—and is not required</strong>
+        The repository contains a local k3d smoke-test path, now delegated from <code>av-mesh</code> to <code>needletail</code>. The project notes that the cluster smoke was not run, and no active local k3d cluster was found during this review. The target architecture in this report uses ordinary VMs, a native Rust node agent/controller, and service-manager/provider adapters. It does not require Kubernetes, k3s, Helm, or an operator.
+      </div>
+
+      <div style="margin-top:22px;overflow-x:auto">
+        <table>
+          <thead><tr><th>Component</th><th>Current role</th><th>Assessment</th><th>Next role</th></tr></thead>
+          <tbody>
+            <tr><td>av-contrib</td><td>Protocol termination, demux/normalization, fMP4 bridge, mesh forwarding</td><td><span class="status good">Good direction</span>; codec breadth, auth, quotas, clocking, and ABR are incomplete</td><td>Stateless regional ingress adapters publishing a canonical media object model</td></tr>
+            <tr><td>av-mesh</td><td>Cache node, peer data plane, playback edge, APIs, telemetry, control, provisioning</td><td><span class="status risk">Too many failure domains</span> in a 10.6k-line main module</td><td>Split relay agent, playback edge, node agent, and control-plane services</td></tr>
+            <tr><td>playlists</td><td>Cache rings, manifests, UDP peer mesh</td><td><span class="status good">Cache useful</span>; <span class="status bad">mesh protocol unsuitable globally</span></td><td>Retain storage API; move replication behind a transport/session trait</td></tr>
+            <tr><td>raptor-fec</td><td>RaptorQ encoding/decoding, repair policy, scheduling, backfill</td><td><span class="status good">Strategic asset</span>; richer APIs are not wired into the production hot path</td><td>Deadline-aware optional repair layer over QUIC datagrams/private lanes</td></tr>
+            <tr><td>tcp-changes</td><td>TLS telemetry/control feed with in-process channels</td><td><span class="status risk">Lab-grade feed</span>; no client identity, durable log, ACK, or bounded frame allocation</td><td>Telemetry exporter only, or replace with authenticated durable desired-state/watch API</td></tr>
+            <tr><td>discovery</td><td>Private IPv4 broadcast/DNS discovery</td><td><span class="status risk">Useful bootstrap</span>; accepts unauthenticated IP announcements</td><td>Local dev only; production uses attested service registry and signed node records</td></tr>
+            <tr><td>linode</td><td>Provider API, DNS, VLAN allocation, scale up/down</td><td><span class="status risk">Useful adapter</span>; not a reconcile loop and provider-specific</td><td>Provider adapter under a durable idempotent controller</td></tr>
+            <tr><td>message-packetizer</td><td>Framing and HMAC envelope support</td><td><span class="status good">Reusable primitive</span>; operational mesh control currently reassembles unsigned demo envelopes</td><td>Use signed/versioned/idempotent commands only where QUIC mTLS is insufficient</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="topology">
+      <p class="kicker">Low-latency topology research</p>
+      <h2>Choose the graph for the traffic pattern</h2>
+      <p class="section-lead">Live media is one-to-many, deadline-sensitive, and heavily skewed by popularity. A complete peer graph spends origin bandwidth to avoid relay hops; a pure tree minimizes transmissions but is fragile. The production sweet spot is a measured, interest-driven relay DAG with two failure-independent parents for important streams.</p>
+
+      <div class="topology-grid">
+        <article class="topology">
+          <h3>Full mesh</h3>
+          <div class="dots"><svg viewBox="0 0 150 78" aria-hidden="true"><g stroke="#b45a52" stroke-width="1"><path d="M20 39L75 12L130 39L100 67L48 67Z M20 39L130 39M75 12L100 67M75 12L48 67M20 39L100 67M130 39L48 67"/></g><g fill="#a12620"><circle cx="20" cy="39" r="5"/><circle cx="75" cy="12" r="5"/><circle cx="130" cy="39" r="5"/><circle cx="100" cy="67" r="5"/><circle cx="48" cy="67" r="5"/></g></svg></div>
+          <p><strong>Do not use globally.</strong> Direct paths, but peer state and links trend toward O(N²); source fanout is unbounded for a replicated stream.</p>
+        </article>
+        <article class="topology">
+          <h3>Single tree</h3>
+          <div class="dots"><svg viewBox="0 0 150 78" aria-hidden="true"><g stroke="#87793c" stroke-width="2"><path d="M75 10L45 35M75 10L105 35M45 35L23 67M45 35L58 67M105 35L92 67M105 35L127 67"/></g><g fill="#ad6500"><circle cx="75" cy="10" r="5"/><circle cx="45" cy="35" r="5"/><circle cx="105" cy="35" r="5"/><circle cx="23" cy="67" r="5"/><circle cx="58" cy="67" r="5"/><circle cx="92" cy="67" r="5"/><circle cx="127" cy="67" r="5"/></g></svg></div>
+          <p><strong>Efficient but brittle.</strong> O(N) object transmissions and bounded source load, but a parent or path failure cuts an entire subtree.</p>
+        </article>
+        <article class="topology recommended">
+          <span class="tag keep">Recommended</span>
+          <h3>Dual-parent DAG</h3>
+          <div class="dots"><svg viewBox="0 0 150 78" aria-hidden="true"><g stroke="#168266" stroke-width="2"><path d="M75 8L35 31M75 8L115 31M35 31L18 66M35 31L62 66M115 31L88 66M115 31L132 66M35 31L88 66M115 31L62 66"/></g><g fill="#087a5b"><circle cx="75" cy="8" r="5"/><circle cx="35" cy="31" r="5"/><circle cx="115" cy="31" r="5"/><circle cx="18" cy="66" r="5"/><circle cx="62" cy="66" r="5"/><circle cx="88" cy="66" r="5"/><circle cx="132" cy="66" r="5"/></g></svg></div>
+          <p><strong>Best core overlay.</strong> Small bounded degree, alternate parent, relay caching, path diversity, and interest-driven construction.</p>
+        </article>
+        <article class="topology">
+          <h3>DHT / rendezvous</h3>
+          <div class="dots"><svg viewBox="0 0 150 78" aria-hidden="true"><ellipse cx="75" cy="39" rx="56" ry="29" fill="none" stroke="#4377a5" stroke-width="2"/><g fill="#175fa3"><circle cx="75" cy="10" r="5"/><circle cx="124" cy="25" r="5"/><circle cx="113" cy="60" r="5"/><circle cx="37" cy="61" r="5"/><circle cx="22" cy="28" r="5"/></g><path d="M75 10L113 60M124 25L37 61" stroke="#4377a5" stroke-width="1.5"/></svg></div>
+          <p><strong>Use for lookup, not media paths.</strong> Consistent hashing can assign stream anchors/catalog shards; latency-oblivious overlays are poor forwarding routes.</p>
+        </article>
+        <article class="topology">
+          <h3>Anycast + edge</h3>
+          <div class="dots"><svg viewBox="0 0 150 78" aria-hidden="true"><g fill="none" stroke="#696d67"><path d="M20 20Q75 65 130 20M20 58Q75 13 130 58"/></g><g fill="#20231f"><circle cx="20" cy="20" r="5"/><circle cx="130" cy="20" r="5"/><circle cx="20" cy="58" r="5"/><circle cx="130" cy="58" r="5"/><circle cx="75" cy="39" r="7"/></g></svg></div>
+          <p><strong>Use for client entry.</strong> Anycast/GeoDNS/content steering finds an edge; it does not replace the relay overlay or per-stream placement.</p>
+        </article>
+      </div>
+
+      <div class="math">
+        <div><strong>N − 1</strong><span>minimum transmissions per object to reach N nodes in any tree</span></div>
+        <div><strong>≈ 2N</strong><span>edges for a sparse dual-parent overlay, versus N(N−1)/2 in a complete graph</span></div>
+        <div><strong>3–6</strong><span>recommended steady-state peer degree per relay, adjusted by role and capacity</span></div>
+      </div>
+      <p class="footnote">The degree target is a design recommendation to validate, not an Internet standard. Select parents using active RTT/loss/jitter/goodput, provider/ASN/region diversity, cost, capacity, and object-deadline performance—not latitude/longitude alone.</p>
+    </section>
+
+    <section id="findings">
+      <p class="kicker">Gap assessment</p>
+      <h2>The issues that define readiness</h2>
+      <p class="section-lead">These are ordered by ability to cause compromise, congestion collapse, silent corruption, or a failed global rollout—not by implementation convenience.</p>
+
+      <article class="finding">
+        <div class="sev p0">P0</div>
+        <div><h3>The mesh wire protocol has no security boundary</h3><p>Peer hello, cache objects, replica requests, node identity, and discovery are accepted over UDP without cryptographic peer identity, confidentiality, authorization, or replay protection. CRC protects against accidental bit errors, not malicious modification. The HTTP control routes can provision infrastructure, drain nodes, and warm streams without an authentication guard; contribution ingest surfaces likewise lack token enforcement and quotas.</p><p class="evidence">Evidence: <code>playlists/src/mesh.rs</code> peer/packet handling; <code>av-mesh/src/main.rs</code> control routes; <code>av-contrib/src/bin/av-contrib.rs</code> ingest routes; <code>discovery/src/vlan.rs</code> four-byte IP announcements.</p></div>
+      </article>
+      <article class="finding">
+        <div class="sev p0">P0</div>
+        <div><h3>Raw UDP sends have no congestion controller or pacer</h3><p>The sender encodes an object, then emits its source and repair packets in a loop for each peer. There is no congestion window, pacing clock, acknowledged delivery signal, deadline queue, or fairness response. On real Internet paths, bursts create the loss that FEC then tries to repair, while competing unfairly with other traffic. QUIC datagrams explicitly solve the missing session/security/congestion envelope while retaining unreliable delivery.</p><p class="evidence">Evidence: RaptorQ send loops in the current cache and contribution forwarders; compare <a href="https://www.rfc-editor.org/rfc/rfc9221.html">RFC 9221</a> and <a href="https://www.rfc-editor.org/rfc/rfc9002.html">RFC 9002</a>.</p></div>
+      </article>
+      <article class="finding">
+        <div class="sev p0">P0</div>
+        <div><h3>Full fanout is labeled as a mesh but does not route</h3><p>Every local slot is sent to every peer; remotely received slots are marked replicated and are not forwarded. Demand requests are broadcast. The source must therefore be directly connected to every selected replica. Gossip carries a capped peer list every 500 ms, and sync scans streams every 20 ms. This is reasonable for a lab cluster and fundamentally wrong for hundreds of global nodes.</p><p class="evidence">Evidence: <code>FRAME_MAGIC = PLMESH1</code>, hello/sync intervals, peer cap, <code>request_replica</code>, and replication flags in <code>playlists/src/mesh.rs</code>.</p></div>
+      </article>
+      <article class="finding">
+        <div class="sev p0">P0</div>
+        <div><h3>There is no authoritative, durable control loop</h3><p>Placement decisions are computed from transient self-reported telemetry and acted on by broadcast requests. There is no durable desired-state record, generation number, lease/fencing model, idempotent command status, rollback, or leader election. The Linode crate performs useful imperative operations, but provisioning, DNS, private-IP selection, and application readiness are not one reconciled transaction.</p><p class="evidence">Evidence: <code>av-mesh/src/replication.rs</code>, <code>tcp-changes</code> in-memory channels, and <code>linode/src/lib.rs</code>. These coordination semantics should live in a small native controller; they do not require a container orchestrator.</p></div>
+      </article>
+      <article class="finding">
+        <div class="sev p1">P1</div>
+        <div><h3>RaptorQ is overextended from repair mechanism to transport strategy</h3><p>RaptorQ is an excellent object-level erasure code. It does not supply sessions, identity, congestion response, routing, prioritization, or reliable recovery after a deadline prediction is wrong. The codebase already contains adaptive policy, scheduling, and backfill ideas; the main hot paths currently use a fixed small repair policy instead. Integrate those richer primitives behind per-path feedback.</p><p class="evidence">RaptorQ is specified for object delivery in <a href="https://www.rfc-editor.org/rfc/rfc6330.html">RFC 6330</a>. The recommendation to combine it with QUIC is an architectural inference from the two protocols’ complementary properties.</p></div>
+      </article>
+      <article class="finding">
+        <div class="sev p1">P1</div>
+        <div><h3>Placement is geographic, not network-aware</h3><p>Latitude/longitude, continent, static capacity, and demand are a useful bootstrap. They are not enough to optimize tail latency or resilience. The scheduler needs active path telemetry, delivery-deadline misses, egress cost, provider/ASN/failure-domain diversity, hysteresis, and penalties for route churn. An edge’s nearest region is not necessarily its best Internet path.</p><p class="evidence">Evidence: geographic scoring in <code>av-mesh/src/replication.rs</code>. <a href="https://datatracker.ietf.org/doc/html/rfc9275">ALTO Path Vector (RFC 9275)</a> is a useful model for representing measured path/cost properties; it need not be adopted literally.</p></div>
+      </article>
+      <article class="finding">
+        <div class="sev p1">P1</div>
+        <div><h3>LL-HLS tuning is too aggressive for a global default</h3><p>A 50 ms part target increases request and scheduling overhead and is below the RTT of many global clients. Apple requires Part Target to be at least the 95th-percentile round-trip time, recommends at least three times that RTT, and recommends one second. Keep a lower experimental profile for controlled paths, but choose a standards-compliant measured default for public playback.</p><p class="evidence">Source: <a href="https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices/">Apple HLS Authoring Specification</a>. Also audit blocking reload, delta updates, preload hints, rendition reports, and hold-back.</p></div>
+      </article>
+      <article class="finding">
+        <div class="sev p1">P1</div>
+        <div><h3>Ingress needs product-grade admission and a broader object model</h3><p><code>av-contrib</code> is promising but currently centers on H.264/AAC and listener-configured streams. It needs authenticated stream admission, tenant quotas, bounded bodies, rate limits, publisher failover, timestamp provenance, discontinuity handling, codec configuration epochs, and an ABR/keyframe-aligned ladder. Add WHIP as the standards-track WebRTC ingest surface.</p><p class="evidence"><a href="https://www.rfc-editor.org/rfc/rfc9725.html">WHIP is RFC 9725</a> and includes bearer-token authorization behavior. WHEP remains an expired Internet-Draft, so treat it as an experimental egress compatibility lane.</p></div>
+      </article>
+      <article class="finding">
+        <div class="sev p2">P2</div>
+        <div><h3>Process boundaries and supervision need hardening</h3><p>The mesh main module combines data plane, edge serving, metrics, operator UI, control, provisioning, multiple transports, and format logic. Spawned mesh tasks are not consistently surfaced to a supervisor. Split the system into crates/process roles with explicit health, restart, bounded queues, cancellation, and overload behavior. A playback bug must not be able to provision or drain infrastructure.</p><p class="evidence">Evidence: <code>av-mesh/src/main.rs</code> (~10.6k lines) and <code>av-contrib/src/bin/av-contrib.rs</code> (~4.9k lines) in the reviewed snapshot.</p></div>
+      </article>
+    </section>
+
+    <section id="state-of-art">
+      <p class="kicker">2026 standards position</p>
+      <h2>Use stable foundations; isolate moving targets</h2>
+      <p class="section-lead">The current state of the art is converging on QUIC as the secure congestion-controlled substrate, object-oriented media semantics above it, and relays as first-class participants. The application protocol layer is still moving, so interoperability belongs behind versioned adapters.</p>
+      <div style="overflow-x:auto">
+        <table>
+          <thead><tr><th>Technology</th><th>Status in July 2026</th><th>What it contributes</th><th>Recommendation for YL</th></tr></thead>
+          <tbody>
+            <tr><td>QUIC streams + datagrams</td><td>Stable RFCs</td><td>TLS identity/confidentiality, multiplexed reliable streams, unreliable datagrams, shared congestion control and pacing</td><td><span class="status good">Adopt now</span> as the relay session substrate</td></tr>
+            <tr><td>Media over QUIC Transport (MOQT)</td><td>Active IETF draft, not yet an RFC</td><td>Publish/subscribe tracks, groups/objects, priorities, partial reliability, caches and relays</td><td><span class="status risk">Align semantics</span>; implement through a versioned adapter, do not freeze the draft into storage</td></tr>
+            <tr><td>WebTransport</td><td>W3C Working Draft</td><td>Browser-accessible streams/datagrams over HTTP/3</td><td><span class="status risk">Experimental client lane</span>; keep LL-HLS fallback</td></tr>
+            <tr><td>LL-HLS + Content Steering</td><td>Deployed Apple specifications</td><td>Large-scale HTTP delivery, blocking reload, partial segments, multi-pathway steering</td><td><span class="status good">Keep</span> as compatibility/scale egress, tune to RTT</td></tr>
+            <tr><td>WHIP</td><td>RFC 9725 (2025)</td><td>Standardized WebRTC HTTP ingest</td><td><span class="status good">Add</span> to contribution edge</td></tr>
+            <tr><td>WHEP</td><td>Expired Internet-Draft</td><td>WebRTC HTTP egress convention</td><td><span class="status risk">Compatibility only</span>, not a strategic dependency</td></tr>
+            <tr><td>RaptorQ</td><td>RFC 6330</td><td>Application-layer fountain code for object recovery</td><td><span class="status good">Retain</span> as adaptive deadline repair</td></tr>
+            <tr><td>SRT / RIST</td><td>Widely used contribution technologies; RIST profiles maintained by VSF</td><td>ARQ-based contribution over impaired paths; encryption/profile interoperability</td><td><span class="status good">Retain at ingress</span>, terminate regionally</td></tr>
+            <tr><td>Multipath QUIC</td><td>Standards-track work in progress</td><td>Multiple paths inside one QUIC connection; application scheduling remains important</td><td><span class="status watch">Experiment later</span>, do not block core fabric</td></tr>
+            <tr><td>L4S</td><td>Experimental RFC architecture</td><td>Low-queueing scalable congestion control with ECN/AQM support</td><td><span class="status watch">Controlled trials</span> after standard congestion behavior is correct</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="raptorq">
+      <p class="kicker">RaptorQ decision</p>
+      <h2>RaptorQ is a good choice—with a precise job description</h2>
+      <p class="section-lead">This review does <strong>not</strong> recommend removing RaptorQ. It recommends protecting its value by using it as deadline-aware object repair inside a complete transport system. The local implementation, recovery tests, adaptive policy, scheduling, and backfill work are strategic assets.</p>
+
+      <div class="grid-2">
+        <article class="card mini">
+          <span class="tag keep">Where it wins</span>
+          <h3>Repair before a retransmission can arrive</h3>
+          <ul>
+            <li>A media object has a known playout deadline and the remaining time is near or below a path RTT.</li>
+            <li>Bursty or reordered loss makes a small amount of proactive repair cheaper than waiting for a NACK/ARQ round trip.</li>
+            <li>The same object feeds multiple receivers or caches, so encoding work can be amortized and extra repair symbols can be generated as needed.</li>
+            <li>Objects are naturally bounded—CMAF chunks, access units, or MOQT-like objects—with explicit identity and dependency.</li>
+            <li>A relay can combine initial source symbols, modest proactive parity, and on-demand additional symbols without regenerating the media.</li>
+          </ul>
+        </article>
+        <article class="card mini">
+          <span class="tag stop">Where it loses</span>
+          <h3>When parity replaces transport fundamentals</h3>
+          <ul>
+            <li>On a clean, low-RTT path, fixed proactive parity wastes bandwidth compared with a cheap reliable repair.</li>
+            <li>If packets are emitted in an unpaced burst, the sender can create its own loss; adding parity can make that congestion worse.</li>
+            <li>A receiver may need enough symbols to decode a block, adding CPU, memory, and completion delay for very small/urgent objects.</li>
+            <li>One fixed repair ratio cannot fit peers with different RTT, loss bursts, queues, bandwidth, and deadlines.</li>
+            <li>FEC cannot authenticate a sender, hide content, select a route, enforce fairness, or guarantee recovery after the object’s deadline.</li>
+          </ul>
+        </article>
+      </div>
+
+      <div style="margin-top:20px;overflow-x:auto">
+        <table>
+          <thead><tr><th>Observed path/object condition</th><th>Preferred action</th><th>Reason</th></tr></thead>
+          <tbody>
+            <tr><td>Healthy path; repair RTT fits comfortably before deadline</td><td>Source symbols + reliable FETCH/ARQ</td><td>Avoid spending parity that is unlikely to be used</td></tr>
+            <tr><td>Deadline is within roughly one repair RTT</td><td>Small proactive RaptorQ budget</td><td>Waiting for loss detection and retransmission is likely to be too late</td></tr>
+            <tr><td>Measured burst loss or recent deadline misses</td><td>Increase paced repair symbols within a bandwidth cap</td><td>Rateless repair can bridge correlated loss without retransmitting exact packets</td></tr>
+            <tr><td>Congestion queue is growing</td><td>Reduce total send rate; drop expired repair first</td><td>FEC overhead must remain inside the congestion controller’s budget</td></tr>
+            <tr><td>Late join or gap in retained history</td><td>Reliable object fetch/backfill</td><td>This is a completeness problem, not a live loss gamble</td></tr>
+            <tr><td>One object fans out to heterogeneous peers</td><td>Choose policy per peer/path, reuse encoded symbols where practical</td><td>A global fixed ratio overprotects good paths and underprotects bad ones</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout" style="margin-top:20px">
+        <strong>The rule</strong>
+        RaptorQ overhead is part of the congestion budget, not an exemption from it. Let measured loss, remaining object deadline, repair RTT, queue state, and object importance choose the number of symbols. Keep reliable fetch as the correctness path. This makes RaptorQ a competitive advantage rather than a source of uncontrolled overhead.
+      </div>
+    </section>
+
+    <section id="target">
+      <p class="kicker">North-star architecture</p>
+      <h2>A secure, object-native relay fabric</h2>
+      <p class="section-lead">One canonical object graph, three delivery lanes, and a control plane that describes desired state rather than broadcasting imperative hope.</p>
+
+      <div class="architecture" role="img" aria-label="Target architecture from contribution ingress through relay DAG to delivery lanes">
+        <div class="arch-flow">
+          <div class="node"><strong>Regional contribution edge</strong><small>SRT · RIST · RTMP · WHIP<br>auth · quotas · timestamping</small></div>
+          <div class="arrow">→</div>
+          <div class="node accent"><strong>Canonical media objects</strong><small>namespace · track · group · object · epoch · deadline · hash<br>CMAF payloads and codec metadata</small></div>
+          <div class="arrow">→</div>
+          <div class="node"><strong>QUIC relay DAG</strong><small>mTLS workload identity · subscriptions · 2 parents · paced datagrams · reliable fetch · adaptive RaptorQ</small></div>
+          <div class="arrow">→</div>
+          <div class="node"><strong>Regional playback edge</strong><small>MoQ/WebTransport · WebRTC lane · LL-HLS/H3 · content steering</small></div>
+        </div>
+        <p class="legend">Below the data plane: a separate desired-state controller, node agents, service registry, placement engine, path measurement, and durable audit/event log.</p>
+      </div>
+
+      <div class="grid-2" style="margin-top:20px">
+        <article class="card mini">
+          <span class="tag keep">Data plane</span>
+          <h3>Every relay session has two lanes</h3>
+          <ul>
+            <li><strong>Deadline lane:</strong> QUIC datagrams carrying object fragments, paced and congestion-controlled; optional RaptorQ parity chosen per object/path.</li>
+            <li><strong>Certainty lane:</strong> QUIC streams for subscriptions, catalogs, control messages, initialization objects, and object FETCH/backfill.</li>
+            <li><strong>Priority:</strong> init/config and current keyframe group outrank audio, current delta frames, parity, then stale backfill.</li>
+            <li><strong>Overload:</strong> shed expired/stale objects before growing queues. Never let a delayed frame make newer frames late.</li>
+          </ul>
+        </article>
+        <article class="card mini">
+          <span class="tag watch">Control plane</span>
+          <h3>Desired state, identity, and measurement</h3>
+          <ul>
+            <li>A durable controller owns node membership, stream placement, relay parent sets, epochs, drain state, and rollout generation.</li>
+            <li>Node agents reconcile versioned desired state and report observed state with command IDs, ACKs, and failure reasons.</li>
+            <li>Relays run as single-purpose services on ordinary VMs under the host service manager. No Kubernetes control plane is required.</li>
+            <li>SPIFFE/SPIRE-style short-lived workload identities authenticate mTLS; per-role authorization limits publish, subscribe, control, and provision rights.</li>
+            <li>Placement consumes active path probes and observed object delivery, plus provider/ASN/zone diversity, capacity, and egress cost.</li>
+          </ul>
+        </article>
+      </div>
+
+      <div class="card flat" style="margin-top:20px">
+        <h3>Three product latency lanes</h3>
+        <p class="footnote">Treat latency as an explicit product contract. Exact SLOs must be established by multi-region measurement; these are target bands for engineering and capacity planning.</p>
+        <div class="lane"><strong>Interactive</strong><div class="bar" style="--w:22%;--c:#087a5b"></div><em>≈ 150–500 ms</em></div>
+        <div class="lane"><strong>Low-latency broadcast</strong><div class="bar" style="--w:58%;--c:#175fa3"></div><em>≈ 1.5–3 s</em></div>
+        <div class="lane"><strong>Resilient contribution</strong><div class="bar" style="--w:38%;--c:#ad6500"></div><em>buffer from path RTT/loss</em></div>
+        <p class="footnote" style="margin-top:14px">Do not promise one latency number across SRT/RIST ingest, transcode, global relay, LL-HLS, and interactive playback. They have different recovery and scale trade-offs.</p>
+      </div>
+
+      <div class="grid-3" style="margin-top:20px">
+        <article class="card mini"><h3>Canonical key</h3><p class="mono">tenant / stream / track / epoch / group / object / version / hash</p><p>Immutable, idempotent writes. Explicit init objects, discontinuities, deadlines, dependencies, and codec configuration epochs.</p></article>
+        <article class="card mini"><h3>Parent selection</h3><p>Score measured p95 RTT, loss bursts, jitter, goodput, deadline misses, load, cost, and failure-domain diversity. Add hysteresis and minimum tenure to avoid route flapping.</p></article>
+        <article class="card mini"><h3>Join and repair</h3><p>Subscribe at a decodable group boundary, fetch init/keyframe reliably, receive live objects via datagrams, and request precise missing objects before their usefulness deadline.</p></article>
+      </div>
+    </section>
+
+    <section id="roadmap">
+      <p class="kicker">Path forward</p>
+      <h2>From strong prototype to global fabric</h2>
+      <p class="section-lead">This sequence minimizes throwaway work. Security and measurement come first because every topology and FEC optimization depends on trusted path feedback and honest end-to-end latency data.</p>
+
+      <div class="roadmap">
+        <article class="phase">
+          <div class="phase-head"><div class="phase-time">Now → 30 days</div><h3>Make the system safe and measurable</h3></div>
+          <div class="phase-content">
+            <div><ul>
+              <li>Threat-model all ingress, peer, playback, metrics, dashboard, control, and provisioning surfaces. Default-deny public exposure.</li>
+              <li>Put the current UDP mesh on a private encrypted network immediately; add node allowlists while QUIC identity is built.</li>
+              <li>Add authentication/authorization, bounded request bodies, quotas, timeouts, and rate limits. Remove unauthenticated provisioning/drain/warm actions.</li>
+              <li>Define a versioned canonical object envelope and end-to-end capture/ingest/package/relay/edge/player timestamps.</li>
+              <li>Split transport, cache, object model, relay, node-agent, and edge-serving interfaces into crates without changing behavior.</li>
+              <li>Run the existing two-/three-region qualification and a seven-day soak; record baseline latency, loss, bandwidth, parity, and recovery cost.</li>
+            </ul></div>
+            <aside class="gate"><h4>Exit gate</h4><ul><li>No unauthenticated write/control surface</li><li>No unbounded network allocation</li><li>Traceable glass-to-glass latency</li><li>Seven-day regional baseline published</li></ul></aside>
+          </div>
+        </article>
+
+        <article class="phase">
+          <div class="phase-head"><div class="phase-time">30 → 90 days</div><h3>Build the relay session substrate</h3></div>
+          <div class="phase-content">
+            <div><ul>
+              <li>Create a <code>RelaySession</code> abstraction backed by QUIC: reliable bidirectional control/fetch streams plus datagrams.</li>
+              <li>Use short-lived workload certificates and role-based authorization. Bind node ID and topology claims to the authenticated identity.</li>
+              <li>Add per-peer pacing, bounded priority queues, object deadlines, PMTU handling, qlog, ACK/loss feedback, and overload shedding.</li>
+              <li>Wire the existing adaptive FEC/scheduler/backfill primitives into per-path policy; compare no-FEC, fixed-FEC, adaptive-FEC, and reliable repair.</li>
+              <li>Replace “send every local slot to every peer” with explicit track subscriptions and a two-node origin→relay integration path.</li>
+              <li>Add WHIP ingest with token admission and publisher session lifecycle.</li>
+            </ul></div>
+            <aside class="gate"><h4>Exit gate</h4><ul><li>All inter-node traffic authenticated and encrypted</li><li>Fair congestion response under shared bottleneck tests</li><li>Reliable repair closes every retained-object gap</li><li>Protocol/fuzz tests reject spoof/replay/oversize input</li></ul></aside>
+          </div>
+        </article>
+
+        <article class="phase">
+          <div class="phase-head"><div class="phase-time">3 → 6 months</div><h3>Turn sessions into a relay fabric</h3></div>
+          <div class="phase-content">
+            <div><ul>
+              <li>Implement interest-driven relay trees with dual parents for priority streams; cap steady-state degree and origin fanout.</li>
+              <li>Create a durable placement controller and node agent with generations, leases, fencing, reconcile status, and rollback.</li>
+              <li>Run relays as native services on ordinary VMs. Let the Rust node agent/controller own lifecycle and failure-domain spreading; keep provider APIs behind idempotent adapters.</li>
+              <li>Add active path measurement and observed delivery quality to placement. Enforce zone, region, provider, and ASN diversity.</li>
+              <li>Align the object/subscription adapter with the current MOQT model while keeping wire/storage versioned and replaceable.</li>
+              <li>Add ABR ladder generation, rendition alignment, codec-config epochs, audio/video sync, and LL-HLS compliance tests.</li>
+            </ul></div>
+            <aside class="gate"><h4>Exit gate</h4><ul><li>Five regions, two providers</li><li>Origin egress bounded as edges increase</li><li>Parent failure recovers within target without discontinuity</li><li>Placement survives controller restart and duplicate commands</li></ul></aside>
+          </div>
+        </article>
+
+        <article class="phase">
+          <div class="phase-head"><div class="phase-time">6 → 12 months</div><h3>Earn “global”</h3></div>
+          <div class="phase-content">
+            <div><ul>
+              <li>Deploy eight or more measured regions across at least two providers with anycast/GeoDNS entry and HLS Content Steering.</li>
+              <li>Offer an experimental MoQ/WebTransport delivery lane and retain LL-HLS as the broad compatibility path.</li>
+              <li>Automate region/provider evacuation, hot-stream prepositioning, cost-aware placement, and capacity prediction.</li>
+              <li>Run continual chaos: burst loss, reorder, MTU black holes, NAT rebinding, asymmetric paths, clock error, process/host/zone/provider failure.</li>
+              <li>Experiment with Multipath QUIC and L4S only after the single-path controller and instrumentation are demonstrably correct.</li>
+              <li>Commission an external protocol/security review and publish an interoperability/performance profile.</li>
+            </ul></div>
+            <aside class="gate"><h4>Exit gate</h4><ul><li>Quarterly failure drill passes</li><li>Latency and rebuffer SLOs met by lane</li><li>No single provider/control-plane dependency</li><li>Capacity and cost per delivered GB are predictable</li></ul></aside>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section id="gates">
+      <p class="kicker">Definition of greatness</p>
+      <h2>Measure outcomes, not packet cleverness</h2>
+      <div class="grid-2">
+        <article class="card mini">
+          <h3>Release-blocking invariants</h3>
+          <ul>
+            <li>No object or command is accepted without an authenticated principal and authorized role.</li>
+            <li>No unbounded queue, frame, object, body, peer list, or in-flight repair set is reachable from the network.</li>
+            <li>No stream can make origin egress grow linearly with the number of playback edges.</li>
+            <li>No repair strategy can bypass congestion control on the public Internet.</li>
+            <li>No node placement or drain command can execute twice with a different result.</li>
+            <li>No stale media object may delay a newer decodable group.</li>
+          </ul>
+        </article>
+        <article class="card mini">
+          <h3>Proposed SLO scorecard</h3>
+          <ul>
+            <li>Availability and successful start by delivery lane, region, ASN, device, and codec.</li>
+            <li>Glass-to-glass p50/p95/p99, plus capture→ingress, package, relay, edge, and player-buffer stages.</li>
+            <li>Deadline hit rate, stale-object discard rate, repair success before deadline, parity efficiency, and goodput.</li>
+            <li>Rebuffer ratio, startup time, live-edge distance, rendition switch time, and A/V sync error.</li>
+            <li>Parent churn, failover interruption, route stretch, relay degree, origin fanout, and control reconciliation lag.</li>
+            <li>CPU, memory, bandwidth, and egress cost per contributed and delivered media minute.</li>
+          </ul>
+        </article>
+      </div>
+      <div class="callout" style="margin-top:20px">
+        <strong>Global rollout stop condition</strong>
+        Do not expand the current UDP gossip/fanout protocol onto the public Internet. Expansion should wait until peer identity, encryption, authorization, pacing/congestion control, bounded queues, explicit subscriptions, and reliable object repair are present in the same end-to-end path.
+      </div>
+    </section>
+
+    <section>
+      <p class="kicker">Immediate engineering backlog</p>
+      <h2>The first twelve tickets</h2>
+      <div class="grid-3">
+        <article class="card mini"><span class="tag stop">Security</span><h3>1. Close public writes</h3><p>Auth middleware, role policy, token lifecycle, request limits, rate limits, and private-by-default metrics/operator routes.</p></article>
+        <article class="card mini"><span class="tag stop">Security</span><h3>2. Peer identity</h3><p>Certificate-bound node IDs, allowlisted roles, replay-resistant session establishment, and signed topology records.</p></article>
+        <article class="card mini"><span class="tag stop">Safety</span><h3>3. Bound framing</h3><p>Maximum frame/object/body/peer counts across TCP, HTTP, UDP recovery, catalog, and control paths.</p></article>
+        <article class="card mini"><span class="tag watch">Model</span><h3>4. Media object v1</h3><p>Document canonical IDs, epochs, dependencies, hash, deadlines, init/config objects, and idempotency.</p></article>
+        <article class="card mini"><span class="tag watch">Measurement</span><h3>5. Trace the frame</h3><p>Carry capture and stage timestamps to the player; publish p50/p95/p99 and clock-confidence metadata.</p></article>
+        <article class="card mini"><span class="tag watch">Transport</span><h3>6. RelaySession trait</h3><p>Streams, datagrams, subscribe, announce, fetch, feedback, close, health, and bounded priority queues.</p></article>
+        <article class="card mini"><span class="tag change">Transport</span><h3>7. QUIC proof path</h3><p>One publisher, two relays, datagram live path, reliable init/backfill, qlog, and forced loss/reorder.</p></article>
+        <article class="card mini"><span class="tag change">FEC</span><h3>8. Adaptive repair</h3><p>Wire RTT/loss/deadline feedback into existing policy; benchmark parity versus retransmit and hybrid recovery.</p></article>
+        <article class="card mini"><span class="tag change">Topology</span><h3>9. Subscription routing</h3><p>Stop global slot scan/fanout; establish on-demand upstream interest and bounded downstream children.</p></article>
+        <article class="card mini"><span class="tag change">Control</span><h3>10. Desired state</h3><p>Generations, observed state, leases, idempotency keys, ACKs, audit log, drain, rollback, and controller failover.</p></article>
+        <article class="card mini"><span class="tag keep">Ingress</span><h3>11. WHIP adapter</h3><p>Authenticated publisher lifecycle, simulcast/SVC metadata mapping, and region-local WebRTC termination.</p></article>
+        <article class="card mini"><span class="tag keep">Qualification</span><h3>12. Five-region lab</h3><p>Real WAN plus netem; compare fanout, tree, dual-parent DAG, FEC policies, parent loss, and provider failure.</p></article>
+      </div>
+    </section>
+
+    <section id="sources">
+      <p class="kicker">Research basis</p>
+      <h2>Primary sources</h2>
+      <p class="section-lead">Standards status and protocol behavior were checked against official specifications and project documentation on 15 July 2026. Drafts are explicitly labeled because their wire details can change.</p>
+      <div class="source-list">
+        <div class="source"><a href="https://datatracker.ietf.org/doc/draft-ietf-moq-transport/">IETF Media over QUIC Transport</a><small>Active MOQT Internet-Draft: object pub/sub, priorities, relays, caches, streams and datagrams.</small></div>
+        <div class="source"><a href="https://datatracker.ietf.org/wg/moq/">IETF MoQ Working Group</a><small>Current documents and milestone status, including CMAF, authentication, and secure-object work.</small></div>
+        <div class="source"><a href="https://www.rfc-editor.org/rfc/rfc9221.html">RFC 9221 — QUIC DATAGRAM</a><small>Unreliable datagrams inside QUIC’s secure, congestion-controlled connection.</small></div>
+        <div class="source"><a href="https://www.rfc-editor.org/rfc/rfc9002.html">RFC 9002 — QUIC Loss Detection and Congestion Control</a><small>Reference loss detection, congestion control, and pacing behavior.</small></div>
+        <div class="source"><a href="https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/">IETF Multipath QUIC</a><small>Standards-track work for concurrent paths; still a moving dependency.</small></div>
+        <div class="source"><a href="https://www.w3.org/TR/webtransport/">W3C WebTransport</a><small>Browser streams/datagrams API; Working Draft status.</small></div>
+        <div class="source"><a href="https://developer.apple.com/documentation/http-live-streaming/enabling-low-latency-http-live-streaming-hls">Apple — Enabling Low-Latency HLS</a><small>Partial segments, delta updates, blocking reload, preload hints, and rendition reports.</small></div>
+        <div class="source"><a href="https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices/">Apple HLS Authoring Specification</a><small>Part Target and hold-back requirements relative to measured client RTT.</small></div>
+        <div class="source"><a href="https://developer.apple.com/streaming/HLSContentSteeringSpecification.pdf">HLS Content Steering Specification</a><small>Pathway selection and reload behavior for multi-CDN/edge delivery.</small></div>
+        <div class="source"><a href="https://www.rfc-editor.org/rfc/rfc9725.html">RFC 9725 — WHIP</a><small>WebRTC-HTTP ingestion protocol and authorization behavior.</small></div>
+        <div class="source"><a href="https://datatracker.ietf.org/doc/html/draft-ietf-wish-whep">IETF WHEP Internet-Draft</a><small>Expired egress draft; useful context, not a stable foundation.</small></div>
+        <div class="source"><a href="https://www.rfc-editor.org/rfc/rfc6330.html">RFC 6330 — RaptorQ</a><small>Object-level fountain code specification.</small></div>
+        <div class="source"><a href="https://github.com/Haivision/srt">Haivision SRT</a><small>Official implementation and protocol documentation for secure reliable contribution transport.</small></div>
+        <div class="source"><a href="https://doc.haivision.com/SRT/1.5.3/Haivision/latency">Haivision SRT latency guidance</a><small>Latency buffer trade-offs relative to path RTT.</small></div>
+        <div class="source"><a href="https://vsf.tv/technical-recommendations/">Video Services Forum RIST recommendations</a><small>Official TR-06 Simple/Main/Advanced Profile documents.</small></div>
+        <div class="source"><a href="https://www.rfc-editor.org/rfc/rfc8888.html">RFC 8888 — RTP Congestion Control Feedback</a><small>Standardized media congestion feedback context.</small></div>
+        <div class="source"><a href="https://www.rfc-editor.org/rfc/rfc8834.html">RFC 8834 — WebRTC Media Transport</a><small>WebRTC media transport and congestion-feedback requirements.</small></div>
+        <div class="source"><a href="https://www.rfc-editor.org/rfc/rfc9330.html">RFC 9330 — L4S Architecture</a><small>Experimental low-latency congestion-control/AQM architecture.</small></div>
+        <div class="source"><a href="https://datatracker.ietf.org/doc/html/rfc9275">RFC 9275 — ALTO Path Vector</a><small>Representation of abstract network paths and properties for traffic optimization.</small></div>
+        <div class="source"><a href="https://spiffe.io/docs/latest/spiffe-specs/spiffe_workload_api/">SPIFFE Workload API</a><small>Portable workload identities and short-lived X.509/JWT SVID delivery.</small></div>
+        <div class="source"><a href="https://spiffe.io/docs/latest/spire-about/use-cases/">SPIRE mTLS use case</a><small>Workload/node attestation and automatically rotated mTLS credentials.</small></div>
+      </div>
+    </section>
+
+    <section class="card flat">
+      <p class="kicker">Method and limits</p>
+      <h2 style="font-size:2rem">Review scope</h2>
+      <p>This is an architecture and code-path review, not a penetration test, formal protocol proof, production capacity test, or compliance certification. It covered <code>av-contrib</code>, <code>av-mesh</code>, <code>playlists</code>, <code>raptor-fec</code>, <code>tcp-changes</code>, <code>discovery</code>, <code>linode</code>, <code>message-packetizer</code>, operational scripts/status notes, and current primary standards sources. The working trees contained active uncommitted changes and were not modified except for this report.</p>
+      <p>Before committing to numeric SLOs, run synchronized multi-region tests on representative access networks and publish raw distributions. Before public launch, perform a focused threat model, parser fuzzing campaign, dependency review, external security assessment, and abuse/cost-amplification test.</p>
+    </section>
+  </main>
+
+  <footer>
+    <strong>YL Global Media Mesh Technical Review</strong><br>
+    Prepared from the local code snapshot and primary standards sources · 15 July 2026<br>
+    Report path: <span class="mono">av-mesh/reviews/global-media-mesh-technical-review-2026-07-15.html</span>
+  </footer>
+</body>
+</html>

@@ -173,22 +173,20 @@ impl ReplicationPolicy {
                 existing_replicas,
                 &selected_ids,
                 Scope::Region(region),
+            ) && self.fill_scope(
+                stream,
+                nodes,
+                existing_replicas,
+                &mut selected_ids,
+                &mut selected,
+                Scope::Region(region),
+                1,
+                ReplicaReason::DemandRegion {
+                    region: region.to_string(),
+                },
+                &existing,
             ) {
-                if self.fill_scope(
-                    stream,
-                    nodes,
-                    existing_replicas,
-                    &mut selected_ids,
-                    &mut selected,
-                    Scope::Region(region),
-                    1,
-                    ReplicaReason::DemandRegion {
-                        region: region.to_string(),
-                    },
-                    &existing,
-                ) {
-                    continue;
-                }
+                continue;
             }
 
             if !has_replica_in_scope(

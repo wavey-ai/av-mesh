@@ -38,6 +38,9 @@ The first implementation keeps the mesh transport intentionally small:
 - Replica requests begin at the earliest missing retained slot for the requested
   stream, which gives live playlist/tail/media demand a retained-window
   backfill path without changing the FEC datagram wire format.
+- LL-HLS playlist rendering is cached by stream and `ChunkCache` content
+  version. Slot writes and stream reuse invalidate the derived manifest, while
+  unchanged requests avoid repeatedly taking every retained-slot read lock.
 - `web-service` serves the operator/UI edge over HTTPS/TCP: HLS playlists,
   parts, segments, health checks, JSON mesh snapshots, server-sent mesh events,
   and HTTP `POST /api/control/*` commands. This is not the mesh transport.
@@ -62,8 +65,11 @@ The first implementation keeps the mesh transport intentionally small:
   non-TS media access-unit query parsing and uses `raptorq-datagram-fec` for
   serialized access-unit decoding, so those edge formats are no longer defined
   inside the mesh binary.
-- `/mesh` serves an operator UI for node topology, capacity, throughput,
-  contributor streams, active streams, and provision/close/warm control intents.
+- `/mesh` serves Needletail Mission Control assets supplied by the product
+  supervisor. Mission Control presents service/feed health, compiled delivery
+  programs, independent primary-source and warm-secondary-repair lanes,
+  RaptorQ recovery, deadline health, publication continuity, and realtime
+  latency.
 - Optional `--telemetry-bind` publishes JSON mesh snapshots to a TCP changes feed
   with the `AVMT` tag for central aggregation without scraping stdout. Snapshots
   include the node's mesh socket address so `/api/mesh` can resolve peer
@@ -91,7 +97,7 @@ The first implementation keeps the mesh transport intentionally small:
   capacity, and anti-affinity for nearby nodes. Telemetry includes all active
   cache stream ids, so baseline staging can pull non-default media/access-unit
   streams as well as the default playlist stream, and `/api/mesh` exposes
-  planned replicas across those stream ids for the operator UI.
+  planned replicas across those stream ids for the control API.
 - `/api/mesh` exposes stream ids as browser-safe decimal strings in
   `stream_id_text` fields wherever a numeric `stream_id` appears, including the
   local stream stats, active stream telemetry, planned replicas, and recent
@@ -100,9 +106,28 @@ The first implementation keeps the mesh transport intentionally small:
   ids.
 - `/api/mesh` also exposes `edge_services` with each node's advertised
   `playback_base_url`, active reader count, served request/byte counters, and
-  LLHLS tail poll count. Player-facing services such as `av-llhls` should use
-  one or more seed nodes only to discover candidates, then score those
-  candidates locally instead of routing all playback through a central service.
+  LLHLS tail poll count. It also carries cumulative LL-HLS handler latency
+  histograms and p95 latency so operators can separate origin freshness from
+  edge response-generation time. Player-facing services such as `av-llhls`
+  should use one or more seed nodes only to discover candidates, then score
+  those candidates locally instead of routing all playback through a central
+  service.
+- `/api/mesh` exposes the active cache-mesh transport policy: replication scan
+  interval, FEC symbol size, minimum repair symbols, proportional repair ratio,
+  and maximum repair symbols. The default one-symbol floor plus 3% proportional
+  repair avoids paying a fixed high redundancy cost for small parts while
+  protecting larger high-throughput parts from multi-packet loss.
+- `/api/mesh` also exposes `mesh_fec` runtime outcomes: source and repair
+  datagrams, protected and wire bytes, decoded objects, objects and source
+  symbols actually recovered through repair data, late source arrivals,
+  repaired sources still absent after a bounded observation window,
+  incomplete/expired objects, and encode/decode errors. RelaySession ingress
+  exposes the product recovery counters consumed by Mission Control.
+- `/metrics` exposes Prometheus text metrics for topology, telemetry freshness,
+  node capacity, edge traffic/errors, per-stream ingest/replica lag, current
+  alerts, active mesh transport configuration, cache-mesh FEC traffic and
+  recovery outcomes, and per-node LL-HLS response latency histograms. Scrapes
+  render from the same bounded telemetry snapshot used by `/api/mesh`.
 
 ## Local two-region prototype
 
@@ -293,41 +318,136 @@ not have the stream yet, the first tail polls create mesh demand and return
 `204` until replicated bytes arrive. It remains `av-llhls`'s responsibility to
 choose a playlist id whose bytestream is compatible with its decoder.
 
-The server uses the local TLS material from `web-services`; clients will need to
+The server uses the local TLS material from `av-service`; clients will need to
 trust that cert or use an insecure local test client.
 
-## Rust dashboard
+## Realtime performance gate
 
-The experimental Rust UI lives in `dashboard/` and uses the latest published
-Leptos alpha (`0.9.0-alpha`) in CSR mode. It consumes `av-mesh` `/api/mesh`,
-`av-contrib` `/api/status`, and the existing `av-mesh` `/api/control/*`
-commands.
+With a local or deployed contributor-plus-mesh stack already running, collect
+repeatable client and service latency measurements with:
+
+```sh
+make realtime-benchmark
+```
+
+The benchmark sends raw contributor payloads and reads each configured mesh
+playlist at configurable concurrency. It prefers persistent HTTP/2 sessions
+through `h2load`, falls back to parallel curl processes, and reports
+client-observed p50/p95/p99, mean, max, and effective request rate. Duration
+mode (`DURATION_SECONDS`) sustains load instead of stopping at a request count.
+`PROPAGATION_PROBES` posts unique canaries and concurrently measures when the
+exact bytes become fetchable from each edge. Before/after Prometheus snapshots
+produce service histogram count and p95 deltas rather than merely checking
+that metrics exist. Contributor results also attribute interval p95 to bounded
+`encode_wait`, `encode`, `send`, and `telemetry` stages, both in the terminal
+and in `RESULT_JSON`, so a forwarding regression identifies its hot path.
+`RESULT_JSON` persists machine-readable evidence. Override
+topology and load through `CONTRIB_URL`, comma-separated `MESH_URLS`,
+`CONCURRENCY`, `H2_STREAMS_PER_CLIENT`, `PAYLOAD_BYTES`, and `LOAD_CLIENT`.
+Set `PARALLEL_ENDPOINTS=1` to load the contributor and every edge at the same
+time. `CONTRIB_METRICS_URL` and `MESH_METRICS_URLS` can point service histogram
+scrapes at private monitoring endpoints while client load uses public origins.
+
+Budgets are explicit and opt-in so a laptop result is not presented as a global
+SLO. For example:
+
+```sh
+INGEST_P95_BUDGET_MS=15 PLAYLIST_P95_BUDGET_MS=10 \
+  SAMPLES=1000 CONCURRENCY=32 make realtime-benchmark
+```
+
+Any unexpected HTTP status, missing metrics surface, or p95 budget violation
+fails the command.
+
+For the repeatable two-region qualification, including real packet impairment:
+
+```sh
+make realtime-qualification
+```
+
+This runs baseline and impaired phases against the same release stack. The
+default impaired profile applies 35±5 ms one-way mesh delay with 1% loss and
+10±2 ms contributor-FEC delay with 1% loss through the unprivileged
+`udp-netem` binary. It verifies that both links carried and dropped packets,
+rejects emulator overflow/send errors, checks client and service p95 budgets,
+requires the impaired mesh phase to demonstrate actual source-symbol recovery
+without FEC decode errors, and writes baseline, impaired, link-stat, recovery,
+and combined qualification artifacts under `target/realtime-qualification/`.
+Default gates are 15 ms contributor ingest/forwarding p95, 5 ms playlist p95,
+1 ms edge-handler p95, 200 ms ingest-to-edge propagation p95, and a 3x
+impaired/baseline p95 ratio. All profile and latency-budget values are
+environment-overridable.
+
+For an authorized deployed canary, run repeated simultaneous windows and
+preserve round-level plus whole-soak evidence with:
+
+```sh
+CONTRIB_URL=https://contrib-canary.example \
+MESH_URLS=https://uk-canary.example,https://us-canary.example \
+SOAK_SECONDS=3600 ROUND_SECONDS=60 \
+  make realtime-soak
+```
+
+The soak defaults to verified TLS, 8 HTTP/2 connections × 4 streams per
+endpoint, exact-byte propagation probes, and the provisional local latency
+gates. It fails on any bad round, counter reset, new contributor/mesh pipeline
+error, MPEG-TS continuity error, or expired FEC object unless the corresponding
+limit is explicitly overridden. Each run writes raw metric snapshots, per-round
+logs/JSON, counter deltas, cross-round percentiles, and `soak.json` under
+`target/realtime-soak/`. Use a dedicated canary stream and explicitly scoped
+hosts; the script never deploys or changes servers.
+
+## Persistent observability
+
+`observability/` contains a runnable Prometheus, Alertmanager, and Grafana
+bundle. It persists the metrics exposed by `av-contrib` and `av-mesh`, records
+forwarding-stage and mesh-handler p95s, charts FEC recovery and wire overhead,
+and evaluates bounded-label alerts with diagnosis guidance.
+
+```sh
+make observability-check
+docker compose -f observability/compose.yml up -d
+```
+
+Grafana is served at `http://127.0.0.1:3000/d/wavey-realtime`, Prometheus at
+`http://127.0.0.1:9090`, and Alertmanager at `http://127.0.0.1:9093`. The local
+scrape configuration trusts the development certificates insecurely; deployed
+scrapers must use the deployment CA. Alert thresholds are labeled
+`slo: provisional` until a hardware-, geography-, bitrate-, and load-qualified
+regional soak establishes production SLOs. See `observability/README.md` for
+deployment and notification-routing notes.
+
+## Needletail Mission Control
+
+The product UI lives in `../needletail/mission-control`. Its Leptos/WASM app
+consumes `av-mesh` `/api/mesh` and `av-contrib` `/api/status` using bounded,
+Serde-default snapshot models.
 
 ```bash
-cd dashboard
-cargo install trunk --locked
-trunk serve --address 127.0.0.1 --port 5188
+make mission-control-check
+make mission-control-build
+make mission-control-serve
 ```
 
 By default it points at the local OBS stack endpoints:
 `https://local.bitneedle.com:19444/api/mesh` and
 `https://local.bitneedle.com:19443/api/status`.
 
-For local OBS testing with both mesh nodes and the contributor ingress under one
-Rust supervisor, use the `local-obs-stack` binary owned by `../av-contrib`:
+For local OBS testing with both playback edges and the contributor ingress under
+one Rust supervisor, use Needletail:
 
 ```bash
 make local-stack
 ```
 
-The supervisor builds release `av-mesh`, release `../av-contrib`, and the
-`dashboard/` Leptos dist, then passes that dist to each mesh node with
-`AV_MESH_DASHBOARD_DIST`. It uses the local bitneedle TLS material from
+The supervisor builds release `av-mesh`, release `../av-contrib`, and
+Needletail Mission Control, then passes the product assets to each playback edge
+with `NEEDLETAIL_MISSION_CONTROL_DIST`. It uses the local bitneedle TLS material from
 `../tls/local.bitneedle.com`, starts UK and US mesh nodes plus one `av-contrib`
 ingress, and prefixes every child process stdout/stderr line into the supervisor
 stdout. By default it uses stream id `1`, UK egress
 `https://local.bitneedle.com:19444/live/1/stream.m3u8`, US egress
-`https://local.bitneedle.com:19445/live/1/stream.m3u8`, and mesh dashboards at
+`https://local.bitneedle.com:19445/live/1/stream.m3u8`, and Mission Control at
 `/mesh` on both ports. OBS can publish RTMP to server
 `rtmp://local.bitneedle.com:19350/live` with stream key `obs-local`, or SRT to
 `srt://local.bitneedle.com:27001?mode=caller`. RIST is also bound on
@@ -349,10 +469,11 @@ Use `--cert` and `--key` to point at alternate PEM files. The default hostname
 must resolve to loopback; on this machine `local.bitneedle.com` resolves to
 `127.0.0.1` and `::1`.
 
-Use `--dashboard-dist /path/to/dist` to reuse a specific dashboard build. Use
-`--no-dashboard-build` to skip the Trunk build and let `av-mesh` use an existing
-dist or its fallback page. `--no-build` skips all release and dashboard builds.
-Run `make help` for direct mesh service and dashboard tasks.
+Use `--mission-control-dist /path/to/dist` to reuse specific product assets.
+Use `--no-mission-control-build` with an existing build; `/mesh` returns concise
+setup guidance while the asset path is being prepared. `--no-build` reuses the
+component release binaries. Run `make help` for direct playback-edge and Mission
+Control tasks.
 
 ## Local k3d deployment
 
@@ -376,13 +497,8 @@ make k3d-up
 
 The smoke script builds `deploy/k3d/Dockerfile`, imports `av-mesh:local` into
 the cluster, generates a short-lived TLS secret, applies
-`deploy/k3d/av-mesh.yaml`, waits for both deployments, and checks `/up`,
-`/api/mesh`, and `/mesh` through local port-forwards.
-
-Mission Control URLs after `make k3d-up`:
-
-- UK: `https://127.0.0.1:19444/mesh`
-- US: `https://127.0.0.1:19445/mesh`
+`deploy/k3d/av-mesh.yaml`, waits for both deployments, and checks `/up` and
+`/api/mesh` through local port-forwards.
 
 Useful follow-up commands:
 

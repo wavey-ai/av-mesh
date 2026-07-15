@@ -2,12 +2,22 @@ mod control;
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
+use av_mesh::relay_ingress::{
+    ControlledRelayParentSession, RelayIngressOutcome, RelayIngressSnapshot, RelayObjectReceiver,
+    RelayObjectReceiverConfig, RelayUdpDispatch, RelayUdpDispatchOutcome,
+};
 use av_mesh::replication::{
     DemandSignal, MeshNode, ReplicaPlacement, ReplicaReason, ReplicationPolicy, StreamInfo,
 };
-use av_mesh::udp_fec::UdpFecReceiver;
+use av_mesh::udp_fec::{UdpFecPushOutcome, UdpFecReceiver};
+use av_web_service::{
+    load_default_tls_base64, load_tls_base64_from_paths, read_length_prefixed_frame,
+    write_length_prefixed_frame, BodyStream, H2H3Server, HandlerResponse, HandlerResult,
+    RawTcpHandler, Router, Server, ServerBuilder, ServerError, StreamWriter, WebSocketHandler,
+    WebTransportHandler,
+};
 use bytes::{BufMut, Bytes, BytesMut};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use control::{
     packetize_control_message, reassemble_unsigned_control_packets, MeshControlEvent,
     MeshControlMessage,
@@ -18,21 +28,26 @@ use http::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 #[cfg(feature = "linode-provisioner")]
 use linode::{regions::REGIONS as LINODE_REGIONS, LinodeClient};
-use playlists::chunk_cache::ChunkCache;
-use playlists::mesh::{CacheMesh, CacheMeshConfig, CacheMeshHandle};
+use media_object::{MediaObject, ObjectKind, WIRE_MAGIC};
+use playlists::chunk_cache::{ChunkCache, PutIfAbsentResult};
+use playlists::mesh::{CacheMesh, CacheMeshConfig, CacheMeshFecStats, CacheMeshHandle};
 use playlists::Options as CacheOptions;
 use raptorq_datagram_fec::{
-    decode_serialized_media_access_unit, DecodedMediaFrame, MediaCodec, MediaFecDecoder,
-    MediaFragmentHeader, MediaFrameMetadata, DATAGRAM_MAGIC, MEDIA_FRAME_HEADER_LEN,
+    decode_serialized_media_access_unit, DecodedMediaFrame, MediaCodec, MediaDatagramRole,
+    MediaFecDecoder, MediaFragmentHeader, MediaFrameMetadata, DATAGRAM_MAGIC,
+    MEDIA_FRAME_HEADER_LEN,
 };
 use raptorq_fec_transport::{split_stream_id_prefix, FecDatagramDecoder, STREAM_ID_PREFIX_LEN};
+use relay_session::{
+    CarrierIdentity, CarrierKind, NodeId, ParentPath, SubscriptionId, TopologyGeneration, TrustMode,
+};
 use serde::{de, Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, Mutex as StdMutex,
+    Arc, Mutex as StdMutex, RwLock as StdRwLock,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tcp_changes::{
@@ -42,31 +57,37 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::{
     net::UdpSocket,
-    sync::{mpsc, watch, RwLock},
+    sync::{broadcast, mpsc, watch, RwLock},
     time::{interval, sleep, MissedTickBehavior},
 };
 use tokio_tungstenite::{tungstenite::Message as WebSocketMessage, WebSocketStream};
 use tracing::{debug, info, warn};
-use web_service::{
-    load_default_tls_base64, load_tls_base64_from_paths, read_length_prefixed_frame,
-    write_length_prefixed_frame, BodyStream, H2H3Server, HandlerResponse, HandlerResult,
-    RawTcpHandler, Router, Server, ServerBuilder, ServerError, StreamWriter, WebSocketHandler,
-    WebTransportHandler,
-};
 
 const DEFAULT_STREAM_ID: u64 = 1;
+const DEFAULT_MESH_FEC_REPAIR_SYMBOLS: u32 = 1;
+const DEFAULT_MESH_FEC_REPAIR_RATIO: f32 = 0.03;
+const DEFAULT_MESH_FEC_MAX_REPAIR_SYMBOLS: u32 = 32;
+const DEFAULT_MESH_FEC_SYMBOL_SIZE: u16 = 1316;
+const DEFAULT_MESH_SYNC_INTERVAL_MS: u64 = 20;
+const DEFAULT_MAX_RELAY_DOWNSTREAM_CHILDREN: usize = 4;
+// The reliable subscription/catalog lane will supply this for late joins. The
+// local transition path starts each canonical stream at object zero.
+const LOCAL_RELAY_SUBSCRIPTION_BASE_OBJECT: usize = 0;
 const PART_WAIT_MS: u64 = 3_000;
 const REPLICA_REQUEST_MIN_INTERVAL_MS: u64 = 1_000;
 const MESH_EVENTS_PATH: &str = "/api/mesh/events";
 const MESH_WEBSOCKET_PATH: &str = "/ws/mesh";
-const DASHBOARD_DIST_ENV: &str = "AV_MESH_DASHBOARD_DIST";
+const MISSION_CONTROL_DIST_ENV: &str = "NEEDLETAIL_MISSION_CONTROL_DIST";
+const MESH_METRICS_PATH: &str = "/metrics";
+const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 const MEDIA_ACCESS_UNIT_CONTENT_TYPE: &str = "application/vnd.wavey.media-access-unit";
 const LIVE_FMP4_CONTENT_TYPE: &str = "video/mp4";
 const LIVE_TS_CONTENT_TYPE: &str = "video/mp2t";
+const AUDIO_EPOCH_SUBSCRIPTION: &[u8] = b"WAVEY-AUDIO-EPOCH/1";
+const AUDIO_EPOCH_BROADCAST_CAPACITY: usize = 2048;
+const MULTICHANNEL_AUDIO_TRANSPORT_MAGIC: &[u8] = b"AEP1";
 const MESH_FMP4_SLOT_MAGIC: &[u8; 8] = b"AVFMP4S1";
 const MESH_FMP4_SLOT_HEADER_LEN: usize = 16;
-const WAVEY_GOOSE_ASSET_PATH: &str = "/assets/wavey-goose.png";
-const WAVEY_GOOSE_PNG: &[u8] = include_bytes!("../assets/wavey-goose.png");
 const TELEMETRY_TAG: [u8; 4] = *b"AVMT";
 const CONTROL_TAG: [u8; 4] = *b"AVMC";
 const DEFAULT_TELEMETRY_STALE_MS: u64 = 30_000;
@@ -77,6 +98,10 @@ const MESH_MIN_STALE_INGEST_ALERT_MS: u64 = 5_000;
 const MESH_STREAM_LAG_WARN_PARTS: u64 = 6;
 const MESH_ACTIVITY_LIMIT: usize = 64;
 const EDGE_RECENT_RESPONSE_LIMIT: usize = 32;
+const EDGE_RESPONSE_DURATION_BUCKETS_US: [u64; 13] = [
+    100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
+    1_000_000,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LiveMediaKind {
@@ -100,48 +125,96 @@ impl LiveMediaKind {
     }
 }
 
+fn is_multichannel_audio_transport_datagram(datagram: &[u8]) -> bool {
+    datagram.starts_with(MULTICHANNEL_AUDIO_TRANSPORT_MAGIC)
+}
+
 enum LiveSlotPayload {
     Fmp4 { init: Option<Bytes>, media: Bytes },
     Opaque(Bytes),
+    Invalid,
 }
 
 impl LiveSlotPayload {
     fn decode(payload: Bytes) -> Self {
-        if payload.len() < MESH_FMP4_SLOT_HEADER_LEN {
-            return Self::Opaque(payload);
+        Self::decode_inner(payload, None)
+    }
+
+    fn decode_for_stream(payload: Bytes, stream_id: u64) -> Self {
+        Self::decode_inner(payload, Some(stream_id))
+    }
+
+    fn decode_inner(payload: Bytes, expected_stream_id: Option<u64>) -> Self {
+        if payload.starts_with(&WIRE_MAGIC) {
+            let Ok(object) = media_object::decode(&payload) else {
+                return Self::Invalid;
+            };
+            if expected_stream_id
+                .is_some_and(|stream_id| object.key().stream() != stream_id.to_string())
+            {
+                return Self::Invalid;
+            }
+            let is_fmp4 = object
+                .metadata()
+                .get("container")
+                .is_some_and(|container| container.as_slice() == b"fmp4");
+            let is_fmp4_slot = object
+                .metadata()
+                .get("payload-format")
+                .is_some_and(|format| format.as_slice() == b"fmp4-slot-v1");
+            let object_payload = Bytes::copy_from_slice(object.payload());
+            return match object.kind() {
+                ObjectKind::Media if is_fmp4 && is_fmp4_slot => {
+                    Self::decode_fmp4_slot(object_payload).unwrap_or(Self::Invalid)
+                }
+                ObjectKind::Media if is_fmp4 => Self::Fmp4 {
+                    init: None,
+                    media: object_payload,
+                },
+                ObjectKind::Media => Self::Opaque(object_payload),
+                ObjectKind::Initialization | ObjectKind::CodecConfiguration if is_fmp4 => {
+                    Self::Fmp4 {
+                        init: Some(object_payload),
+                        media: Bytes::new(),
+                    }
+                }
+                ObjectKind::Initialization
+                | ObjectKind::CodecConfiguration
+                | ObjectKind::Discontinuity => Self::Invalid,
+            };
         }
-        if !payload.starts_with(MESH_FMP4_SLOT_MAGIC) {
-            return Self::Opaque(payload);
+        Self::decode_fmp4_slot(payload.clone()).unwrap_or(Self::Opaque(payload))
+    }
+
+    fn decode_fmp4_slot(payload: Bytes) -> Option<Self> {
+        if payload.len() < MESH_FMP4_SLOT_HEADER_LEN || !payload.starts_with(MESH_FMP4_SLOT_MAGIC) {
+            return None;
         }
 
         let init_len = u32::from_be_bytes(payload[8..12].try_into().unwrap()) as usize;
         let media_len = u32::from_be_bytes(payload[12..16].try_into().unwrap()) as usize;
-        let Some(init_end) = MESH_FMP4_SLOT_HEADER_LEN.checked_add(init_len) else {
-            return Self::Opaque(payload);
-        };
-        let Some(media_end) = init_end.checked_add(media_len) else {
-            return Self::Opaque(payload);
-        };
+        let init_end = MESH_FMP4_SLOT_HEADER_LEN.checked_add(init_len)?;
+        let media_end = init_end.checked_add(media_len)?;
         if media_end != payload.len() {
-            return Self::Opaque(payload);
+            return None;
         }
 
         let init = (init_len > 0).then(|| payload.slice(MESH_FMP4_SLOT_HEADER_LEN..init_end));
         let media = payload.slice(init_end..media_end);
-        Self::Fmp4 { init, media }
+        Some(Self::Fmp4 { init, media })
     }
 
     fn media_kind(&self) -> LiveMediaKind {
         match self {
             Self::Fmp4 { .. } => LiveMediaKind::Fmp4,
-            Self::Opaque(_) => LiveMediaKind::Ts,
+            Self::Opaque(_) | Self::Invalid => LiveMediaKind::Ts,
         }
     }
 
     fn init(&self) -> Option<Bytes> {
         match self {
             Self::Fmp4 { init, .. } => init.clone(),
-            Self::Opaque(_) => None,
+            Self::Opaque(_) | Self::Invalid => None,
         }
     }
 
@@ -149,6 +222,7 @@ impl LiveSlotPayload {
         match self {
             Self::Fmp4 { media, .. } => media.clone(),
             Self::Opaque(payload) => payload.clone(),
+            Self::Invalid => Bytes::new(),
         }
     }
 
@@ -156,8 +230,18 @@ impl LiveSlotPayload {
         match self {
             Self::Fmp4 { media, .. } => !media.is_empty(),
             Self::Opaque(payload) => !payload.is_empty(),
+            Self::Invalid => false,
         }
     }
+}
+
+fn decode_canonical_stream_object(payload: &[u8]) -> Result<Option<MediaObject>> {
+    if !payload.starts_with(&WIRE_MAGIC) {
+        return Ok(None);
+    }
+    media_object::decode(payload)
+        .map(Some)
+        .context("invalid canonical media-object envelope")
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -175,6 +259,21 @@ struct Args {
     #[arg(long = "peer")]
     peers: Vec<String>,
 
+    #[arg(long, default_value_t = DEFAULT_MESH_SYNC_INTERVAL_MS)]
+    mesh_sync_interval_ms: u64,
+
+    #[arg(long, default_value_t = DEFAULT_MESH_FEC_REPAIR_SYMBOLS)]
+    mesh_repair_symbols: u32,
+
+    #[arg(long, default_value_t = DEFAULT_MESH_FEC_REPAIR_RATIO)]
+    mesh_repair_ratio: f32,
+
+    #[arg(long, default_value_t = DEFAULT_MESH_FEC_MAX_REPAIR_SYMBOLS)]
+    mesh_max_repair_symbols: u32,
+
+    #[arg(long, default_value_t = DEFAULT_MESH_FEC_SYMBOL_SIZE)]
+    mesh_symbol_size: u16,
+
     #[cfg(feature = "private-subnet-discovery")]
     #[arg(long)]
     private_subnet_discovery: bool,
@@ -189,6 +288,63 @@ struct Args {
 
     #[arg(long, default_value = "127.0.0.1:12001")]
     fec_bind: SocketAddr,
+
+    /// Enable deterministic direct-UDP RelaySession qualification. The peer
+    /// address bindings below identify controlled endpoints and derive bounded
+    /// object announcements from the first validated symbol.
+    #[arg(long)]
+    relay_controlled_local: bool,
+
+    #[arg(long)]
+    relay_primary_peer: Option<SocketAddr>,
+
+    /// Primary RelaySession receive socket. During the transition this equals
+    /// `--fec-bind`, so RLS1 and legacy RQD2 coexist on the first socket.
+    #[arg(long)]
+    relay_primary_bind: Option<SocketAddr>,
+
+    #[arg(long)]
+    relay_secondary_peer: Option<SocketAddr>,
+
+    /// Independent secondary repair-lane receive socket owned by the same
+    /// object assembler and LL-HLS cache.
+    #[arg(long)]
+    relay_secondary_bind: Option<SocketAddr>,
+
+    #[arg(long, default_value = "av-contrib-primary")]
+    relay_primary_id: String,
+
+    /// Admit source plus repair intent on a fully seeded primary relationship.
+    /// This is used by a warm backbone relay that can be activated immediately.
+    #[arg(long)]
+    relay_primary_promoted: bool,
+
+    #[arg(long, default_value = "av-contrib-secondary")]
+    relay_secondary_id: String,
+
+    /// Admit both source and repair intent on the warm secondary carrier while
+    /// it is fully seeded for immediate promotion.
+    #[arg(long)]
+    relay_secondary_promoted: bool,
+
+    #[arg(long, default_value_t = 1)]
+    relay_topology_generation: u64,
+
+    #[arg(long, default_value_t = 1)]
+    relay_subscription_id: u64,
+
+    /// Forward newly admitted RelaySession symbols to one subscribed child.
+    /// Repeat as `BIND=TARGET,ROLE`, where ROLE is source, repair, or all. Each
+    /// child gets a stable source socket and an explicit compiled symbol lane.
+    #[arg(long = "relay-forward", value_parser = parse_relay_forward_endpoint)]
+    relay_forwards: Vec<RelayForwardEndpoint>,
+
+    /// Hard fanout bound for explicitly compiled downstream subscriptions.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MAX_RELAY_DOWNSTREAM_CHILDREN
+    )]
+    relay_max_downstream_children: usize,
 
     #[arg(long, default_value = "127.0.0.1:12101")]
     media_fec_bind: SocketAddr,
@@ -321,7 +477,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "av_mesh=info,playlists=info,web_service=info".into()),
+                .unwrap_or_else(|_| "av_mesh=info,playlists=info,av_web_service=info".into()),
         )
         .init();
 
@@ -386,8 +542,21 @@ async fn main() -> Result<()> {
     )
     .await;
 
-    let mesh_config = CacheMeshConfig::new(node_id.clone(), args.region.clone(), args.mesh_bind)
-        .with_peers(mesh_peers);
+    let mesh_transport = MeshTransportConfigSnapshot {
+        sync_interval_ms: args.mesh_sync_interval_ms,
+        min_repair_symbols: args.mesh_repair_symbols,
+        repair_ratio: args.mesh_repair_ratio,
+        max_repair_symbols: args.mesh_max_repair_symbols,
+        symbol_size: args.mesh_symbol_size,
+    };
+    let mut mesh_config =
+        CacheMeshConfig::new(node_id.clone(), args.region.clone(), args.mesh_bind)
+            .with_peers(mesh_peers);
+    mesh_config.sync_interval = Duration::from_millis(args.mesh_sync_interval_ms);
+    mesh_config.repair_symbols = args.mesh_repair_symbols;
+    mesh_config.repair_ratio = args.mesh_repair_ratio;
+    mesh_config.max_repair_symbols = args.mesh_max_repair_symbols;
+    mesh_config.symbol_size = args.mesh_symbol_size;
     let mesh_handle = Arc::new(
         CacheMesh::new(Arc::clone(&cache.chunk_cache), mesh_config)
             .start()
@@ -431,12 +600,31 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("failed to bind UDP-FEC ingest on {}", args.fec_bind))?;
     info!(bind = %fec_socket.local_addr()?, "UDP-FEC mesh byte ingest listening");
+    let relay_secondary_socket = if let Some(bind) = args.relay_secondary_bind {
+        let socket = UdpSocket::bind(bind)
+            .await
+            .with_context(|| format!("failed to bind secondary RelaySession ingest on {bind}"))?;
+        info!(bind = %socket.local_addr()?, "secondary RelaySession repair ingest listening");
+        Some(socket)
+    } else {
+        None
+    };
+    let relay_dispatch = configured_relay_udp_dispatch(&args, &node_id)?;
+    let relay_forwarder = RelayDownstreamForwarder::bind(&args.relay_forwards).await?;
+    cache.update_relay_forward(relay_forwarder.as_ref().map_or_else(
+        RelayForwardSnapshot::default,
+        RelayDownstreamForwarder::snapshot,
+    ));
     let fec_ingest_task = tokio::spawn(run_udp_fec_ingest(
         fec_socket,
         Arc::clone(&cache),
         ingest_shutdown_rx.clone(),
+        relay_dispatch,
+        relay_secondary_socket,
+        relay_forwarder,
     ));
 
+    let (audio_epoch_tx, _) = broadcast::channel(AUDIO_EPOCH_BROADCAST_CAPACITY);
     let media_fec_socket = UdpSocket::bind(args.media_fec_bind)
         .await
         .with_context(|| {
@@ -452,6 +640,7 @@ async fn main() -> Result<()> {
     let media_fec_ingest_task = tokio::spawn(run_udp_media_fec_ingest(
         media_fec_socket,
         Arc::clone(&cache),
+        audio_epoch_tx.clone(),
         ingest_shutdown_rx.clone(),
     ));
 
@@ -483,6 +672,8 @@ async fn main() -> Result<()> {
     let router = AppRouter::new(
         Arc::clone(&cache),
         Arc::clone(&mesh_handle),
+        audio_epoch_tx.clone(),
+        mesh_transport,
         node_profile.clone(),
         replication_policy.clone(),
         control_plane.clone(),
@@ -539,7 +730,10 @@ async fn main() -> Result<()> {
         "hls-default: https://127.0.0.1:{}/live/stream.m3u8",
         args.http_port
     );
-    println!("mesh-ui: https://127.0.0.1:{}/mesh", args.http_port);
+    println!(
+        "needletail-mission-control: https://127.0.0.1:{}/mesh",
+        args.http_port
+    );
     if args.edge_websocket {
         println!(
             "edge-ws: wss://127.0.0.1:{}{}",
@@ -610,6 +804,93 @@ impl Args {
         self.slot_kb = self.slot_kb.max(64);
         self.storage_bytes = self.storage_bytes.max((self.slot_kb as u64) * 1024);
         self.egress_capacity_bps = self.egress_capacity_bps.max(1);
+        self.mesh_sync_interval_ms = self.mesh_sync_interval_ms.max(1);
+        self.mesh_symbol_size = self.mesh_symbol_size.max(1);
+        self.mesh_max_repair_symbols = self.mesh_max_repair_symbols.max(self.mesh_repair_symbols);
+        if !self.mesh_repair_ratio.is_finite() || self.mesh_repair_ratio < 0.0 {
+            bail!("--mesh-repair-ratio must be a finite non-negative number");
+        }
+        if (self.relay_primary_peer.is_some() || self.relay_secondary_peer.is_some())
+            && !self.relay_controlled_local
+        {
+            bail!("--relay-primary-peer/--relay-secondary-peer require --relay-controlled-local");
+        }
+        if self.relay_primary_bind.is_some() && self.relay_primary_peer.is_none() {
+            bail!("--relay-primary-bind requires --relay-primary-peer");
+        }
+        if self.relay_secondary_bind.is_some() && self.relay_secondary_peer.is_none() {
+            bail!("--relay-secondary-bind requires --relay-secondary-peer");
+        }
+        if self.relay_primary_peer.is_some() && self.relay_primary_bind.is_none() {
+            self.relay_primary_bind = Some(self.fec_bind);
+        }
+        if self
+            .relay_primary_bind
+            .is_some_and(|bind| bind != self.fec_bind)
+        {
+            bail!("--relay-primary-bind currently shares the --fec-bind socket");
+        }
+        if self.relay_secondary_peer.is_some() && self.relay_secondary_bind.is_none() {
+            bail!("--relay-secondary-peer requires --relay-secondary-bind");
+        }
+        if self.relay_secondary_promoted && self.relay_secondary_peer.is_none() {
+            bail!("--relay-secondary-promoted requires --relay-secondary-peer");
+        }
+        if self.relay_primary_promoted && self.relay_primary_peer.is_none() {
+            bail!("--relay-primary-promoted requires --relay-primary-peer");
+        }
+        if self
+            .relay_secondary_bind
+            .is_some_and(|bind| bind == self.fec_bind)
+        {
+            bail!("--relay-secondary-bind must differ from --fec-bind");
+        }
+        if self.relay_controlled_local
+            && self.relay_primary_peer.is_none()
+            && self.relay_secondary_peer.is_none()
+        {
+            bail!("--relay-controlled-local requires at least one configured relay peer");
+        }
+        if self.relay_primary_peer.is_some() && self.relay_primary_peer == self.relay_secondary_peer
+        {
+            bail!("primary and secondary relay peer addresses must differ");
+        }
+        if self.relay_max_downstream_children == 0 {
+            bail!("--relay-max-downstream-children must be positive");
+        }
+        if self.relay_forwards.len() > self.relay_max_downstream_children {
+            bail!(
+                "{} --relay-forward subscriptions exceed the configured child limit {}",
+                self.relay_forwards.len(),
+                self.relay_max_downstream_children
+            );
+        }
+        let mut relay_forward_binds = HashSet::with_capacity(self.relay_forwards.len());
+        let mut relay_forward_targets = HashSet::with_capacity(self.relay_forwards.len());
+        for forward in &self.relay_forwards {
+            if forward.bind == forward.target {
+                bail!(
+                    "RelaySession forward bind and target require distinct sockets; both resolve to {}",
+                    forward.bind
+                );
+            }
+            if forward.bind == self.fec_bind || Some(forward.bind) == self.relay_secondary_bind {
+                bail!(
+                    "RelaySession forward bind {} conflicts with a RelaySession receive socket",
+                    forward.bind
+                );
+            }
+            if !relay_forward_binds.insert(forward.bind) {
+                bail!("duplicate RelaySession forward bind {}", forward.bind);
+            }
+            if !relay_forward_targets.insert(forward.target) {
+                bail!("duplicate RelaySession forward target {}", forward.target);
+            }
+        }
+        TopologyGeneration::new(self.relay_topology_generation)
+            .context("--relay-topology-generation must be positive")?;
+        SubscriptionId::new(self.relay_subscription_id)
+            .context("--relay-subscription-id must be positive")?;
         self.telemetry_interval_ms = self.telemetry_interval_ms.max(100);
         self.replication_plan_interval_ms = self.replication_plan_interval_ms.max(100);
         self.provision_timeout_ms = self.provision_timeout_ms.max(100);
@@ -657,6 +938,55 @@ impl Args {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RelayForwardEndpoint {
+    bind: SocketAddr,
+    target: SocketAddr,
+    role: RelayForwardRole,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+enum RelayForwardRole {
+    #[default]
+    All,
+    Source,
+    Repair,
+}
+
+impl RelayForwardRole {
+    const fn permits(self, role: MediaDatagramRole) -> bool {
+        match self {
+            Self::All => true,
+            Self::Source => matches!(role, MediaDatagramRole::Source),
+            Self::Repair => matches!(role, MediaDatagramRole::Repair),
+        }
+    }
+}
+
+fn parse_relay_forward_endpoint(value: &str) -> std::result::Result<RelayForwardEndpoint, String> {
+    let (bind, target_and_role) = value
+        .split_once('=')
+        .ok_or_else(|| "expected BIND=TARGET,ROLE".to_owned())?;
+    let (target, role) = match target_and_role.rsplit_once(',') {
+        Some((target, "all")) => (target, RelayForwardRole::All),
+        Some((target, "source")) => (target, RelayForwardRole::Source),
+        Some((target, "repair")) => (target, RelayForwardRole::Repair),
+        Some((_target, role)) => {
+            return Err(format!(
+                "invalid relay forward role {role}; expected source, repair, or all"
+            ));
+        }
+        None => (target_and_role, RelayForwardRole::All),
+    };
+    let bind = bind
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("invalid relay forward bind {bind}: {error}"))?;
+    let target = target
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("invalid relay forward target {target}: {error}"))?;
+    Ok(RelayForwardEndpoint { bind, target, role })
+}
+
 #[cfg(feature = "linode-provisioner")]
 fn parse_key_value(value: &str) -> std::result::Result<(String, String), String> {
     let (key, val) = value
@@ -697,7 +1027,7 @@ fn load_tls(args: &Args) -> Result<(String, String)> {
             )
         }),
         (None, None) => {
-            load_default_tls_base64().context("failed to load default TLS files from web-services")
+            load_default_tls_base64().context("failed to load default TLS files from av-service")
         }
         _ => bail!("--cert and --key must be provided together"),
     }
@@ -757,15 +1087,232 @@ async fn start_private_subnet_discovery(
     })
 }
 
+fn configured_relay_udp_dispatch(args: &Args, node_id: &str) -> Result<RelayUdpDispatch> {
+    let receiver = RelayObjectReceiver::new(RelayObjectReceiverConfig::default())
+        .context("invalid RelaySession receive limits")?;
+    let mut dispatch = RelayUdpDispatch::new(receiver);
+    if !args.relay_controlled_local {
+        return Ok(dispatch);
+    }
+
+    let local = NodeId::new(node_id).context("invalid local RelaySession node identity")?;
+    let generation = TopologyGeneration::new(args.relay_topology_generation)
+        .context("invalid RelaySession topology generation")?;
+    let subscription_id = SubscriptionId::new(args.relay_subscription_id)
+        .context("invalid RelaySession subscription id")?;
+    for (session_id, peer, peer_node_id, path) in [
+        (
+            1,
+            args.relay_primary_peer,
+            args.relay_primary_id.as_str(),
+            if args.relay_primary_promoted {
+                ParentPath::PromotedSecondary
+            } else {
+                ParentPath::Primary
+            },
+        ),
+        (
+            2,
+            args.relay_secondary_peer,
+            args.relay_secondary_id.as_str(),
+            if args.relay_secondary_promoted {
+                ParentPath::PromotedSecondary
+            } else {
+                ParentPath::Secondary
+            },
+        ),
+    ] {
+        let Some(peer) = peer else {
+            continue;
+        };
+        let session = ControlledRelayParentSession::new(
+            session_id,
+            CarrierIdentity {
+                local: local.clone(),
+                peer: NodeId::new(peer_node_id).with_context(|| {
+                    format!("invalid relay parent node identity {peer_node_id}")
+                })?,
+                kind: CarrierKind::PrivateUdp,
+                trust_mode: TrustMode::ControlledPrivateNetwork,
+            },
+            generation,
+            subscription_id,
+            path,
+        )?;
+        dispatch.bind_controlled_peer(peer, session)?;
+    }
+    Ok(dispatch)
+}
+
+#[cfg(test)]
+fn empty_relay_udp_dispatch() -> RelayUdpDispatch {
+    RelayUdpDispatch::new(
+        RelayObjectReceiver::new(RelayObjectReceiverConfig::default())
+            .expect("default RelaySession receive limits are valid"),
+    )
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RelayForwardSnapshot {
+    downstream_children: u64,
+    source_datagrams: u64,
+    repair_datagrams: u64,
+    bytes: u64,
+    errors: u64,
+    filtered_datagrams: u64,
+    duration_count: u64,
+    duration_sum_us: u64,
+    duration_max_us: u64,
+    duration_buckets: [u64; EDGE_RESPONSE_DURATION_BUCKETS_US.len()],
+}
+
+struct RelayForwardPath {
+    socket: UdpSocket,
+    target: SocketAddr,
+    role: RelayForwardRole,
+}
+
+struct RelayDownstreamForwarder {
+    paths: Vec<RelayForwardPath>,
+    source_datagrams: AtomicU64,
+    repair_datagrams: AtomicU64,
+    bytes: AtomicU64,
+    errors: AtomicU64,
+    filtered_datagrams: AtomicU64,
+    duration_count: AtomicU64,
+    duration_sum_us: AtomicU64,
+    duration_max_us: AtomicU64,
+    duration_buckets: [AtomicU64; EDGE_RESPONSE_DURATION_BUCKETS_US.len()],
+}
+
+impl RelayDownstreamForwarder {
+    async fn bind(endpoints: &[RelayForwardEndpoint]) -> Result<Option<Self>> {
+        if endpoints.is_empty() {
+            return Ok(None);
+        }
+        let mut paths = Vec::with_capacity(endpoints.len());
+        for endpoint in endpoints {
+            let socket = UdpSocket::bind(endpoint.bind).await.with_context(|| {
+                format!(
+                    "failed to bind RelaySession downstream source {} for {}",
+                    endpoint.bind, endpoint.target
+                )
+            })?;
+            info!(
+                bind = %socket.local_addr()?,
+                target = %endpoint.target,
+                role = ?endpoint.role,
+                "RelaySession subscribed downstream forwarding path ready"
+            );
+            paths.push(RelayForwardPath {
+                socket,
+                target: endpoint.target,
+                role: endpoint.role,
+            });
+        }
+        Ok(Some(Self {
+            paths,
+            source_datagrams: AtomicU64::new(0),
+            repair_datagrams: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+            filtered_datagrams: AtomicU64::new(0),
+            duration_count: AtomicU64::new(0),
+            duration_sum_us: AtomicU64::new(0),
+            duration_max_us: AtomicU64::new(0),
+            duration_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+        }))
+    }
+
+    async fn forward(&self, datagram: &[u8], role: MediaDatagramRole) {
+        for path in &self.paths {
+            if !path.role.permits(role) {
+                self.filtered_datagrams.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let started = Instant::now();
+            match path.socket.send_to(datagram, path.target).await {
+                Ok(sent) if sent == datagram.len() => {
+                    match role {
+                        MediaDatagramRole::Source => {
+                            self.source_datagrams.fetch_add(1, Ordering::Relaxed);
+                        }
+                        MediaDatagramRole::Repair => {
+                            self.repair_datagrams.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    self.bytes.fetch_add(sent as u64, Ordering::Relaxed);
+                    self.observe_duration(started.elapsed());
+                }
+                Ok(sent) => {
+                    self.errors.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        target = %path.target,
+                        expected_bytes = datagram.len(),
+                        sent_bytes = sent,
+                        "RelaySession downstream forwarding sent a partial datagram"
+                    );
+                }
+                Err(error) => {
+                    self.errors.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        target = %path.target,
+                        error = %error,
+                        "RelaySession downstream forwarding failed"
+                    );
+                }
+            }
+        }
+    }
+
+    fn observe_duration(&self, duration: Duration) {
+        let duration_us = duration.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.duration_count.fetch_add(1, Ordering::Relaxed);
+        self.duration_sum_us
+            .fetch_add(duration_us, Ordering::Relaxed);
+        self.duration_max_us
+            .fetch_max(duration_us, Ordering::Relaxed);
+        for (index, upper_bound_us) in EDGE_RESPONSE_DURATION_BUCKETS_US.iter().enumerate() {
+            if duration_us <= *upper_bound_us {
+                self.duration_buckets[index].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> RelayForwardSnapshot {
+        RelayForwardSnapshot {
+            downstream_children: self.paths.len() as u64,
+            source_datagrams: self.source_datagrams.load(Ordering::Relaxed),
+            repair_datagrams: self.repair_datagrams.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+            errors: self.errors.load(Ordering::Relaxed),
+            filtered_datagrams: self.filtered_datagrams.load(Ordering::Relaxed),
+            duration_count: self.duration_count.load(Ordering::Relaxed),
+            duration_sum_us: self.duration_sum_us.load(Ordering::Relaxed),
+            duration_max_us: self.duration_max_us.load(Ordering::Relaxed),
+            duration_buckets: std::array::from_fn(|index| {
+                self.duration_buckets[index].load(Ordering::Relaxed)
+            }),
+        }
+    }
+}
+
 async fn run_udp_fec_ingest(
     socket: UdpSocket,
     cache: Arc<LiveTsCache>,
     mut shutdown_rx: watch::Receiver<()>,
+    mut relay_dispatch: RelayUdpDispatch,
+    relay_secondary_socket: Option<UdpSocket>,
+    relay_forwarder: Option<RelayDownstreamForwarder>,
 ) -> Result<()> {
     let mut receiver = UdpFecReceiver::new();
+    cache.update_relay_ingress(relay_dispatch.receiver().snapshot());
     let mut buf = vec![0u8; 65_536];
+    let mut relay_secondary_buf = vec![0u8; 65_536];
     let mut rotate = interval(Duration::from_millis(10));
     rotate.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut expire_fec = interval(Duration::from_secs(1));
+    expire_fec.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -777,57 +1324,233 @@ async fn run_udp_fec_ingest(
             _ = rotate.tick() => {
                 cache.rotate_if_due(false).await?;
             }
-            received = socket.recv_from(&mut buf) => {
-                let (len, peer) = received?;
-                debug!(
-                    peer = %peer,
-                    datagram_bytes = len,
-                    "UDP-FEC mesh datagram received"
-                );
-                if let Some(decoded) = receiver.push_payload(peer, &buf[..len]) {
-                    let payload_bytes = decoded.payload.len();
-                    if let Some(stream_id) = decoded.stream_id {
-                        match cache
-                            .commit_stream_payload(stream_id, decoded.payload)
-                            .await
-                        {
-                            Ok(sequence) => {
-                                debug!(
-                                    peer = %peer,
-                                    stream_id,
-                                    sequence,
-                                    payload_bytes,
-                                    "cached stream-prefixed UDP-FEC mesh byte payload"
-                                );
-                            }
-                            Err(error) => {
-                                warn!(peer = %peer, stream_id, error = %error, "failed to cache stream-prefixed UDP-FEC mesh byte payload");
-                            }
-                        }
-                    } else if let Err(error) = cache.push_payload(&decoded.payload).await {
-                        warn!(peer = %peer, error = %error, "failed to cache UDP-FEC mesh byte payload");
-                    } else {
-                        debug!(
-                            peer = %peer,
-                            payload_bytes,
-                            "cached UDP-FEC mesh byte payload"
-                        );
-                    }
-                } else {
+            _ = expire_fec.tick() => {
+                let expired = receiver.expire_inactive();
+                if expired.objects > 0 || expired.flows > 0 {
                     debug!(
-                        peer = %peer,
-                        datagram_bytes = len,
-                        "UDP-FEC mesh datagram buffered awaiting repair/source symbols"
+                        expired_objects = expired.objects,
+                        expired_flows = expired.flows,
+                        released_object_bytes = expired.released_object_bytes,
+                        released_datagrams = expired.released_datagrams,
+                        "expired inactive UDP-FEC receive state"
                     );
                 }
+                let relay_expired = relay_dispatch.receiver_mut().expire(now_unix_us());
+                cache.update_relay_ingress(relay_dispatch.receiver().snapshot());
+                if relay_expired.objects > 0 {
+                    debug!(
+                        expired_objects = relay_expired.objects,
+                        released_object_bytes = relay_expired.released_object_bytes,
+                        released_datagrams = relay_expired.released_datagrams,
+                        "expired deadline-bound RelaySession receive state"
+                    );
+                }
+            }
+            received = socket.recv_from(&mut buf) => {
+                let (len, peer) = received?;
+                process_udp_fec_ingest_datagram(
+                    peer,
+                    &buf[..len],
+                    &cache,
+                    &mut receiver,
+                    &mut relay_dispatch,
+                    relay_forwarder.as_ref(),
+                ).await?;
+            }
+            received = recv_optional_udp(&relay_secondary_socket, &mut relay_secondary_buf) => {
+                let (len, peer) = received?;
+                process_udp_fec_ingest_datagram(
+                    peer,
+                    &relay_secondary_buf[..len],
+                    &cache,
+                    &mut receiver,
+                    &mut relay_dispatch,
+                    relay_forwarder.as_ref(),
+                ).await?;
             }
         }
     }
 }
 
+async fn recv_optional_udp(
+    socket: &Option<UdpSocket>,
+    buffer: &mut [u8],
+) -> std::io::Result<(usize, SocketAddr)> {
+    match socket {
+        Some(socket) => socket.recv_from(buffer).await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn process_udp_fec_ingest_datagram(
+    peer: SocketAddr,
+    datagram: &[u8],
+    cache: &LiveTsCache,
+    receiver: &mut UdpFecReceiver,
+    relay_dispatch: &mut RelayUdpDispatch,
+    relay_forwarder: Option<&RelayDownstreamForwarder>,
+) -> Result<()> {
+    debug!(
+        peer = %peer,
+        datagram_bytes = datagram.len(),
+        "UDP-FEC mesh datagram received"
+    );
+    let relay_result = relay_dispatch.push(peer, datagram, now_unix_us());
+    cache.update_relay_ingress(relay_dispatch.receiver().snapshot());
+    match relay_result {
+        Ok(RelayUdpDispatchOutcome::Legacy) => {}
+        Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Buffered { key, role })) => {
+            if let Some(forwarder) = relay_forwarder {
+                forwarder.forward(datagram, role).await;
+                cache.update_relay_forward(forwarder.snapshot());
+            }
+            debug!(
+                peer = %peer,
+                stream = key.stream(),
+                object = key.object(),
+                ?role,
+                "RelaySession RaptorQ symbol buffered"
+            );
+            return Ok(());
+        }
+        Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Decoded {
+            object,
+            role,
+            parent_count,
+            accepted_datagrams,
+            ..
+        })) => {
+            if let Some(forwarder) = relay_forwarder {
+                forwarder.forward(datagram, role).await;
+                cache.update_relay_forward(forwarder.snapshot());
+            }
+            let stream = object.key().stream().to_owned();
+            let sequence = object.key().object();
+            match commit_relay_object(cache, *object).await {
+                Ok(_) => debug!(
+                    peer = %peer,
+                    stream,
+                    sequence,
+                    parent_count,
+                    accepted_datagrams,
+                    "committed canonical RelaySession RaptorQ object"
+                ),
+                Err(error) => warn!(
+                    peer = %peer,
+                    stream,
+                    sequence,
+                    error = %error,
+                    "failed to cache canonical RelaySession object"
+                ),
+            }
+            return Ok(());
+        }
+        Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Duplicate { key })) => {
+            debug!(
+                peer = %peer,
+                stream = key.stream(),
+                object = key.object(),
+                "duplicate completed RelaySession object ignored"
+            );
+            return Ok(());
+        }
+        Err(error) => {
+            warn!(
+                peer = %peer,
+                datagram_bytes = datagram.len(),
+                error = %error,
+                "RelaySession datagram rejected at configured dispatch seam"
+            );
+            return Ok(());
+        }
+    }
+
+    match receiver.try_push_payload(peer, datagram) {
+        Ok(UdpFecPushOutcome::Decoded {
+            block_id,
+            payload: decoded,
+        }) => {
+            let payload_bytes = decoded.payload.len();
+            if let Some(stream_id) = decoded.stream_id {
+                match cache
+                    .commit_stream_payload(stream_id, decoded.payload)
+                    .await
+                {
+                    Ok(sequence) => {
+                        debug!(
+                            peer = %peer,
+                            stream_id,
+                            block_id,
+                            sequence,
+                            payload_bytes,
+                            "cached stream-prefixed UDP-FEC mesh byte payload"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(peer = %peer, stream_id, block_id, error = %error, "failed to cache stream-prefixed UDP-FEC mesh byte payload");
+                    }
+                }
+            } else if let Err(error) = cache.push_payload(&decoded.payload).await {
+                warn!(peer = %peer, block_id, error = %error, "failed to cache UDP-FEC mesh byte payload");
+            } else {
+                debug!(
+                    peer = %peer,
+                    block_id,
+                    payload_bytes,
+                    "cached UDP-FEC mesh byte payload"
+                );
+            }
+        }
+        Ok(UdpFecPushOutcome::Buffered {
+            stream_id,
+            block_id,
+        }) => {
+            debug!(
+                peer = %peer,
+                ?stream_id,
+                block_id,
+                "UDP-FEC symbols buffered awaiting repair/source symbols"
+            );
+        }
+        Ok(UdpFecPushOutcome::Duplicate {
+            stream_id,
+            block_id,
+        }) => {
+            debug!(
+                peer = %peer,
+                ?stream_id,
+                block_id,
+                "duplicate completed UDP-FEC object ignored"
+            );
+        }
+        Err(error) => {
+            warn!(
+                peer = %peer,
+                datagram_bytes = datagram.len(),
+                error = %error,
+                "UDP-FEC datagram rejected"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn commit_relay_object(cache: &LiveTsCache, object: MediaObject) -> Result<u64> {
+    let stream_id = object
+        .key()
+        .stream()
+        .parse::<u64>()
+        .context("RelaySession object stream identity must map to a local numeric stream")?;
+    let envelope = media_object::encode(&object).context("failed to encode canonical object")?;
+    cache
+        .commit_stream_payload(stream_id, Bytes::from(envelope))
+        .await
+}
+
 async fn run_udp_media_fec_ingest(
     socket: UdpSocket,
     cache: Arc<LiveTsCache>,
+    audio_epochs: broadcast::Sender<Bytes>,
     mut shutdown_rx: watch::Receiver<()>,
 ) -> Result<()> {
     let mut decoder = MediaFecDecoder::new();
@@ -846,6 +1569,17 @@ async fn run_udp_media_fec_ingest(
                     datagram_bytes = len,
                     "media UDP-FEC datagram received"
                 );
+                if is_multichannel_audio_transport_datagram(&buf[..len]) {
+                    let receivers = audio_epochs.receiver_count();
+                    let _ = audio_epochs.send(Bytes::copy_from_slice(&buf[..len]));
+                    debug!(
+                        peer = %peer,
+                        datagram_bytes = len,
+                        receivers,
+                        "broadcast media UDP-FEC multichannel audio epoch datagram"
+                    );
+                    continue;
+                }
                 match decoder.push_datagram(&buf[..len]) {
                     Ok(Some(frame)) => {
                         let stream_id = frame.metadata.stream_id;
@@ -933,10 +1667,7 @@ impl WebTransportMediaDecoder {
 
         if let Some((stream_id, payload)) = split_stream_id_prefix(datagram) {
             if payload.starts_with(&DATAGRAM_MAGIC) {
-                let decoder = self
-                    .prefixed_by_stream
-                    .entry(stream_id)
-                    .or_insert_with(MediaFecDecoder::new);
+                let decoder = self.prefixed_by_stream.entry(stream_id).or_default();
                 let transport = FecDatagramDecoder::webtransport_with_stream_prefix(stream_id);
                 let decoded = transport
                     .push_media_datagram(decoder, datagram)
@@ -990,6 +1721,13 @@ impl MediaAccessUnitResponse {
     }
 }
 
+#[derive(Debug, Clone)]
+struct CachedPlaylist {
+    stream_id: u64,
+    version: u64,
+    body: String,
+}
+
 struct LiveTsCache {
     chunk_cache: Arc<ChunkCache>,
     stream_id: u64,
@@ -998,6 +1736,8 @@ struct LiveTsCache {
     window_parts: usize,
     max_part_bytes: usize,
     state: RwLock<LiveState>,
+    playlist_cache: Vec<StdRwLock<Option<CachedPlaylist>>>,
+    relay_ingress: StdRwLock<RelaySessionIngressSnapshot>,
 }
 
 impl LiveTsCache {
@@ -1008,11 +1748,16 @@ impl LiveTsCache {
         window_parts: usize,
         slot_kb: usize,
     ) -> Arc<Self> {
-        let mut options = CacheOptions::default();
-        options.num_playlists = 16;
-        options.max_segments = 1;
-        options.max_parts_per_segment = window_parts.saturating_mul(4).max(32);
-        options.buffer_size_kb = slot_kb;
+        let options = CacheOptions {
+            num_playlists: 16,
+            max_segments: 1,
+            max_parts_per_segment: window_parts.saturating_mul(4).max(32),
+            buffer_size_kb: slot_kb,
+            ..CacheOptions::default()
+        };
+        let playlist_cache = (0..options.num_playlists)
+            .map(|_| StdRwLock::new(None))
+            .collect();
         let chunk_cache = Arc::new(ChunkCache::new(options));
         let _ = chunk_cache.get_or_create_stream_idx(stream_id).await;
         Arc::new(Self {
@@ -1023,7 +1768,34 @@ impl LiveTsCache {
             window_parts,
             max_part_bytes: slot_kb * 1024,
             state: RwLock::new(LiveState::new()),
+            playlist_cache,
+            relay_ingress: StdRwLock::new(RelaySessionIngressSnapshot::default()),
         })
+    }
+
+    fn update_relay_ingress(&self, snapshot: RelayIngressSnapshot) {
+        let mut current = self
+            .relay_ingress
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let forward = current.forward_snapshot();
+        *current = snapshot.into();
+        current.apply_forward_snapshot(forward);
+    }
+
+    fn update_relay_forward(&self, snapshot: RelayForwardSnapshot) {
+        let mut current = self
+            .relay_ingress
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        current.apply_forward_snapshot(snapshot);
+    }
+
+    fn relay_ingress_snapshot(&self) -> RelaySessionIngressSnapshot {
+        *self
+            .relay_ingress
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     async fn push_payload(&self, payload: &[u8]) -> Result<()> {
@@ -1097,6 +1869,104 @@ impl LiveTsCache {
 
     async fn commit_stream_payload(&self, stream_id: u64, payload: Bytes) -> Result<u64> {
         let bytes = payload.len();
+        if let Some(object) = decode_canonical_stream_object(&payload)? {
+            let expected_stream = stream_id.to_string();
+            if object.key().stream() != expected_stream {
+                bail!(
+                    "canonical media-object stream {} does not match carrier stream {stream_id}",
+                    object.key().stream()
+                );
+            }
+
+            let seq = object.key().object();
+            let kind = object.kind();
+            let media_bytes = object.payload().len();
+            let is_fmp4 = object
+                .metadata()
+                .get("container")
+                .is_some_and(|container| container.as_slice() == b"fmp4");
+            let media_kind = if is_fmp4 {
+                LiveMediaKind::Fmp4
+            } else {
+                LiveMediaKind::Ts
+            };
+            let now_ms = now_unix_ms();
+
+            {
+                let mut state = self.state.write().await;
+                state.datagrams_received = state.datagrams_received.saturating_add(1);
+                state.bytes_received = state.bytes_received.saturating_add(bytes as u64);
+                state.last_ingest_unix_ms = Some(now_ms);
+                state.observe_stream_seq(stream_id, seq);
+                state.stream_media_kinds.insert(stream_id, media_kind);
+                if matches!(
+                    kind,
+                    ObjectKind::Initialization | ObjectKind::CodecConfiguration
+                ) {
+                    state
+                        .stream_inits
+                        .insert(stream_id, Bytes::copy_from_slice(object.payload()));
+                }
+            }
+
+            if matches!(
+                kind,
+                ObjectKind::Initialization | ObjectKind::CodecConfiguration
+            ) {
+                self.chunk_cache
+                    .set_stream_initialization(stream_id, Bytes::copy_from_slice(object.payload()))
+                    .await
+                    .map_err(|err| anyhow!("stream initialization cache write failed: {err}"))?;
+            }
+
+            if kind != ObjectKind::Media {
+                debug!(
+                    stream_id,
+                    sequence = seq,
+                    object_kind = ?kind,
+                    bytes = media_bytes,
+                    "accepted canonical stream metadata object"
+                );
+                return Ok(seq);
+            }
+
+            let slot_id = usize::try_from(seq).context("stream slot sequence too large")?;
+            let write_result = self
+                .chunk_cache
+                .put_if_absent_contiguous_for_stream_id(
+                    stream_id,
+                    slot_id,
+                    LOCAL_RELAY_SUBSCRIPTION_BASE_OBJECT,
+                    payload,
+                )
+                .await
+                .map_err(|err| anyhow!("canonical stream cache write failed: {err}"))?;
+            if write_result == PutIfAbsentResult::HashConflict {
+                bail!(
+                    "canonical media-object identity conflict for stream {stream_id} sequence {seq}"
+                );
+            }
+
+            let mut state = self.state.write().await;
+            state.last_committed_seq =
+                Some(state.last_committed_seq.map_or(seq, |last| last.max(seq)));
+            state.last_committed_unix_ms = Some(now_ms);
+            state.last_committed_bytes = Some(media_bytes);
+            state.last_committed_duration_ms = None;
+            debug!(
+                stream_id,
+                sequence = seq,
+                slot_id,
+                bytes,
+                media_bytes,
+                media_kind = ?media_kind,
+                cache_write = ?write_result,
+                keyframe = object.is_keyframe(),
+                "committed canonical RaptorQ media object"
+            );
+            return Ok(seq);
+        }
+
         let decoded = LiveSlotPayload::decode(payload.clone());
         let media_bytes = decoded.media().len();
         let media_kind = decoded.media_kind();
@@ -1108,11 +1978,17 @@ impl LiveTsCache {
             state.bytes_received = state.bytes_received.saturating_add(bytes as u64);
             state.last_ingest_unix_ms = Some(now_ms);
             state.stream_media_kinds.insert(stream_id, media_kind);
-            if let Some(init) = init {
+            if let Some(init) = init.clone() {
                 state.stream_inits.insert(stream_id, init);
             }
             state.next_stream_seq(stream_id)
         };
+        if let Some(init) = init {
+            self.chunk_cache
+                .set_stream_initialization(stream_id, init)
+                .await
+                .map_err(|err| anyhow!("stream initialization cache write failed: {err}"))?;
+        }
         let slot_id = usize::try_from(seq).context("stream slot sequence too large")?;
         self.chunk_cache
             .add_for_stream_id(stream_id, slot_id, payload)
@@ -1120,7 +1996,7 @@ impl LiveTsCache {
             .map_err(|err| anyhow!("stream-prefixed chunk cache write failed: {err}"))?;
 
         let mut state = self.state.write().await;
-        state.last_committed_seq = Some(seq);
+        state.last_committed_seq = Some(state.last_committed_seq.map_or(seq, |last| last.max(seq)));
         state.last_committed_unix_ms = Some(now_ms);
         state.last_committed_bytes = Some(media_bytes);
         state.last_committed_duration_ms = None;
@@ -1245,15 +2121,19 @@ impl LiveTsCache {
                 && self.get_init_for_stream_id(stream_id).await.is_some();
             return self.empty_playlist(0, media_kind, include_map);
         };
+        let version = self.chunk_cache.version(stream_idx).unwrap_or_default();
+        if let Some(playlist) = self.cached_playlist(stream_id, stream_idx, version) {
+            return playlist;
+        }
         let first = last.saturating_sub(self.window_parts.saturating_sub(1));
         let mut available = Vec::new();
         let mut saw_fmp4 = false;
         let mut saw_ts = false;
         let mut discovered_init = None;
         for seq in first..=last {
-            if let Some((bytes, hash)) = self.chunk_cache.get(stream_idx, seq).await {
-                let slot = LiveSlotPayload::decode(bytes);
-                if hash != 0 || slot.has_media() {
+            if let Some((bytes, _hash)) = self.chunk_cache.get(stream_idx, seq).await {
+                let slot = LiveSlotPayload::decode_for_stream(bytes, stream_id);
+                if slot.has_media() {
                     match slot.media_kind() {
                         LiveMediaKind::Fmp4 => saw_fmp4 = true,
                         LiveMediaKind::Ts => saw_ts = true,
@@ -1272,7 +2152,8 @@ impl LiveTsCache {
                 .unwrap_or(LiveMediaKind::Fmp4);
             let include_map = media_kind == LiveMediaKind::Fmp4
                 && self.get_init_for_stream_id(stream_id).await.is_some();
-            return self.empty_playlist(last, media_kind, include_map);
+            let playlist = self.empty_playlist(last, media_kind, include_map);
+            return self.cache_playlist(stream_id, stream_idx, version, playlist);
         }
         if let Some(init) = discovered_init {
             self.remember_stream_init(stream_id, init).await;
@@ -1349,7 +2230,37 @@ impl LiveTsCache {
         out.push_str(&format!(
             "#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part{next_part}.{extension}\"\n"
         ));
-        out
+        self.cache_playlist(stream_id, stream_idx, version, out)
+    }
+
+    fn cached_playlist(&self, stream_id: u64, stream_idx: usize, version: u64) -> Option<String> {
+        let cached = self.playlist_cache.get(stream_idx)?.read().ok()?;
+        cached
+            .as_ref()
+            .filter(|cached| cached.stream_id == stream_id && cached.version == version)
+            .map(|cached| cached.body.clone())
+    }
+
+    fn cache_playlist(
+        &self,
+        stream_id: u64,
+        stream_idx: usize,
+        version: u64,
+        body: String,
+    ) -> String {
+        if self.chunk_cache.version(stream_idx) != Some(version) {
+            return body;
+        }
+        if let Some(cache) = self.playlist_cache.get(stream_idx) {
+            if let Ok(mut cached) = cache.write() {
+                *cached = Some(CachedPlaylist {
+                    stream_id,
+                    version,
+                    body: body.clone(),
+                });
+            }
+        }
+        body
     }
 
     fn empty_playlist(
@@ -1386,8 +2297,17 @@ impl LiveTsCache {
     }
 
     async fn remember_stream_init(&self, stream_id: u64, init: Bytes) {
-        let mut state = self.state.write().await;
-        state.stream_inits.insert(stream_id, init);
+        {
+            let mut state = self.state.write().await;
+            state.stream_inits.insert(stream_id, init.clone());
+        }
+        if let Err(error) = self
+            .chunk_cache
+            .set_stream_initialization(stream_id, init)
+            .await
+        {
+            warn!(stream_id, error, "failed to retain stream initialization");
+        }
     }
 
     async fn get_init_for_stream_id(&self, stream_id: u64) -> Option<Bytes> {
@@ -1397,6 +2317,10 @@ impl LiveTsCache {
                 return Some(init.clone());
             }
         }
+        if let Some(init) = self.chunk_cache.stream_initialization(stream_id) {
+            self.remember_stream_init(stream_id, init.clone()).await;
+            return Some(init);
+        }
 
         let (stream_idx, last) = self.stream_position_for_id(stream_id).await?;
         let first = self.chunk_cache.retained_start(last);
@@ -1404,7 +2328,7 @@ impl LiveTsCache {
             let Some((bytes, _hash)) = self.chunk_cache.get(stream_idx, seq).await else {
                 continue;
             };
-            let slot = LiveSlotPayload::decode(bytes);
+            let slot = LiveSlotPayload::decode_for_stream(bytes, stream_id);
             if let Some(init) = slot.init() {
                 self.remember_stream_init(stream_id, init.clone()).await;
                 return Some(init);
@@ -1428,8 +2352,8 @@ impl LiveTsCache {
             .chunk_cache
             .get_for_stream_id(stream_id, seq as usize)
             .await?;
-        let slot = LiveSlotPayload::decode(bytes);
-        if hash != 0 || slot.has_media() {
+        let slot = LiveSlotPayload::decode_for_stream(bytes, stream_id);
+        if slot.has_media() {
             if let Some(init) = slot.init() {
                 self.remember_stream_init(stream_id, init).await;
             }
@@ -1452,8 +2376,8 @@ impl LiveTsCache {
             }
             for seq in start as usize..=last {
                 if let Some((bytes, hash)) = self.chunk_cache.get(stream_idx, seq).await {
-                    let slot = LiveSlotPayload::decode(bytes);
-                    if hash != 0 || slot.has_media() {
+                    let slot = LiveSlotPayload::decode_for_stream(bytes, stream_id);
+                    if slot.has_media() {
                         if let Some(init) = slot.init() {
                             self.remember_stream_init(stream_id, init).await;
                         }
@@ -1468,8 +2392,8 @@ impl LiveTsCache {
         let first = last.saturating_sub(self.window_parts.saturating_sub(1));
         for seq in (first..=last).rev() {
             if let Some((bytes, hash)) = self.chunk_cache.get(stream_idx, seq).await {
-                let slot = LiveSlotPayload::decode(bytes);
-                if hash != 0 || slot.has_media() {
+                let slot = LiveSlotPayload::decode_for_stream(bytes, stream_id);
+                if slot.has_media() {
                     if let Some(init) = slot.init() {
                         self.remember_stream_init(stream_id, init).await;
                     }
@@ -1496,9 +2420,7 @@ impl LiveTsCache {
             if let Some((bytes, hash)) = self.get_part_for_stream_id(stream_id, seq).await {
                 return Some((bytes, hash));
             }
-            let Some((_, last)) = self.stream_position_for_id(stream_id).await else {
-                return None;
-            };
+            let (_, last) = self.stream_position_for_id(stream_id).await?;
             if seq as usize > last || Instant::now() >= deadline {
                 return None;
             }
@@ -1768,6 +2690,7 @@ impl LiveTsCache {
             node,
             mesh_addr: Some(mesh.local_addr().to_string()),
             edge_service: None,
+            relay_session: self.relay_ingress_snapshot(),
             peers: stats
                 .mesh_peers
                 .iter()
@@ -1827,6 +2750,11 @@ impl LiveState {
         let seq = *next;
         *next = next.saturating_add(1);
         seq
+    }
+
+    fn observe_stream_seq(&mut self, stream_id: u64, sequence: u64) {
+        let next = self.stream_next_seq.entry(stream_id).or_insert(0);
+        *next = (*next).max(sequence.saturating_add(1));
     }
 
     fn take_current(&mut self, now: Instant, now_ms: u64) -> Option<PendingPart> {
@@ -1893,6 +2821,8 @@ struct MeshSnapshot {
     mesh_addr: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     edge_service: Option<EdgeServiceSnapshot>,
+    #[serde(default)]
+    relay_session: RelaySessionIngressSnapshot,
     peers: Vec<PeerSnapshot>,
     stream: StatsSnapshot,
     #[serde(default)]
@@ -1911,6 +2841,9 @@ struct PeerSnapshot {
 struct MeshApiSnapshot {
     updated_unix_ms: u64,
     node: MeshNode,
+    mesh_transport: MeshTransportConfigSnapshot,
+    mesh_fec: MeshFecRuntimeSnapshot,
+    relay_session: RelaySessionIngressSnapshot,
     peers: Vec<PeerSnapshot>,
     stream: StatsSnapshot,
     replication_policy: ReplicationPolicy,
@@ -1926,6 +2859,167 @@ struct MeshApiSnapshot {
     edge_services: Vec<EdgeServiceSnapshot>,
     connections: Vec<ConnectionSnapshot>,
     streams: Vec<StreamTelemetry>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+struct RelaySessionIngressSnapshot {
+    primary_sessions: u64,
+    secondary_sessions: u64,
+    authenticated_sessions: u64,
+    controlled_sessions: u64,
+    active_objects: u64,
+    completed_objects: u64,
+    active_object_bytes: u64,
+    buffered_datagrams: u64,
+    datagrams_received: u64,
+    datagrams_rejected: u64,
+    source_datagrams: u64,
+    repair_datagrams: u64,
+    duplicate_datagrams: u64,
+    decoded_objects: u64,
+    repaired_objects: u64,
+    expired_objects: u64,
+    conflict_drops: u64,
+    authentication_drops: u64,
+    deadline_drops: u64,
+    downstream_children: u64,
+    forwarded_source_datagrams: u64,
+    forwarded_repair_datagrams: u64,
+    forwarded_bytes: u64,
+    forward_errors: u64,
+    forward_filtered_datagrams: u64,
+    forward_duration_count: u64,
+    forward_duration_sum_us: u64,
+    forward_duration_max_us: u64,
+    forward_duration_buckets: [u64; EDGE_RESPONSE_DURATION_BUCKETS_US.len()],
+}
+
+impl RelaySessionIngressSnapshot {
+    fn forward_snapshot(self) -> RelayForwardSnapshot {
+        RelayForwardSnapshot {
+            downstream_children: self.downstream_children,
+            source_datagrams: self.forwarded_source_datagrams,
+            repair_datagrams: self.forwarded_repair_datagrams,
+            bytes: self.forwarded_bytes,
+            errors: self.forward_errors,
+            filtered_datagrams: self.forward_filtered_datagrams,
+            duration_count: self.forward_duration_count,
+            duration_sum_us: self.forward_duration_sum_us,
+            duration_max_us: self.forward_duration_max_us,
+            duration_buckets: self.forward_duration_buckets,
+        }
+    }
+
+    fn apply_forward_snapshot(&mut self, snapshot: RelayForwardSnapshot) {
+        self.downstream_children = snapshot.downstream_children;
+        self.forwarded_source_datagrams = snapshot.source_datagrams;
+        self.forwarded_repair_datagrams = snapshot.repair_datagrams;
+        self.forwarded_bytes = snapshot.bytes;
+        self.forward_errors = snapshot.errors;
+        self.forward_filtered_datagrams = snapshot.filtered_datagrams;
+        self.forward_duration_count = snapshot.duration_count;
+        self.forward_duration_sum_us = snapshot.duration_sum_us;
+        self.forward_duration_max_us = snapshot.duration_max_us;
+        self.forward_duration_buckets = snapshot.duration_buckets;
+    }
+}
+
+impl From<RelayIngressSnapshot> for RelaySessionIngressSnapshot {
+    fn from(snapshot: RelayIngressSnapshot) -> Self {
+        Self {
+            primary_sessions: snapshot.primary_sessions as u64,
+            secondary_sessions: snapshot.secondary_sessions as u64,
+            authenticated_sessions: snapshot.authenticated_sessions as u64,
+            controlled_sessions: snapshot.controlled_sessions as u64,
+            active_objects: snapshot.active_objects as u64,
+            completed_objects: snapshot.completed_objects as u64,
+            active_object_bytes: snapshot.active_object_bytes as u64,
+            buffered_datagrams: snapshot.buffered_datagrams as u64,
+            datagrams_received: snapshot.counters.datagrams_received,
+            datagrams_rejected: snapshot.counters.datagrams_rejected,
+            source_datagrams: snapshot.counters.source_datagrams,
+            repair_datagrams: snapshot.counters.repair_datagrams,
+            duplicate_datagrams: snapshot.counters.duplicate_datagrams,
+            decoded_objects: snapshot.counters.decoded_objects,
+            repaired_objects: snapshot.counters.repaired_objects,
+            expired_objects: snapshot.counters.expired_objects,
+            conflict_drops: snapshot.counters.conflict_drops,
+            authentication_drops: snapshot.counters.authentication_drops,
+            deadline_drops: snapshot.counters.deadline_drops,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+struct MeshFecRuntimeSnapshot {
+    tx_objects: u64,
+    tx_protected_bytes: u64,
+    tx_source_datagrams: u64,
+    tx_repair_datagrams: u64,
+    tx_wire_bytes: u64,
+    tx_errors: u64,
+    rx_wire_datagrams: u64,
+    rx_wire_bytes: u64,
+    rx_source_datagrams: u64,
+    rx_repair_datagrams: u64,
+    rx_decoded_objects: u64,
+    rx_decoded_bytes: u64,
+    rx_repaired_objects: u64,
+    rx_repaired_source_datagrams: u64,
+    rx_late_source_datagrams: u64,
+    rx_presumed_lost_source_datagrams: u64,
+    rx_decode_errors: u64,
+    rx_expired_objects: u64,
+    rx_inflight_objects: u64,
+}
+
+impl From<CacheMeshFecStats> for MeshFecRuntimeSnapshot {
+    fn from(stats: CacheMeshFecStats) -> Self {
+        Self {
+            tx_objects: stats.tx_objects,
+            tx_protected_bytes: stats.tx_protected_bytes,
+            tx_source_datagrams: stats.tx_source_datagrams,
+            tx_repair_datagrams: stats.tx_repair_datagrams,
+            tx_wire_bytes: stats.tx_wire_bytes,
+            tx_errors: stats.tx_errors,
+            rx_wire_datagrams: stats.rx_wire_datagrams,
+            rx_wire_bytes: stats.rx_wire_bytes,
+            rx_source_datagrams: stats.rx_source_datagrams,
+            rx_repair_datagrams: stats.rx_repair_datagrams,
+            rx_decoded_objects: stats.rx_decoded_objects,
+            rx_decoded_bytes: stats.rx_decoded_bytes,
+            rx_repaired_objects: stats.rx_repaired_objects,
+            rx_repaired_source_datagrams: stats.rx_repaired_source_datagrams,
+            rx_late_source_datagrams: stats.rx_late_source_datagrams,
+            rx_presumed_lost_source_datagrams: stats.rx_presumed_lost_source_datagrams,
+            rx_decode_errors: stats.rx_decode_errors,
+            rx_expired_objects: stats.rx_expired_objects,
+            rx_inflight_objects: stats.rx_inflight_objects,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct MeshTransportConfigSnapshot {
+    sync_interval_ms: u64,
+    min_repair_symbols: u32,
+    repair_ratio: f32,
+    max_repair_symbols: u32,
+    symbol_size: u16,
+}
+
+impl Default for MeshTransportConfigSnapshot {
+    fn default() -> Self {
+        Self {
+            sync_interval_ms: DEFAULT_MESH_SYNC_INTERVAL_MS,
+            min_repair_symbols: DEFAULT_MESH_FEC_REPAIR_SYMBOLS,
+            repair_ratio: DEFAULT_MESH_FEC_REPAIR_RATIO,
+            max_repair_symbols: DEFAULT_MESH_FEC_MAX_REPAIR_SYMBOLS,
+            symbol_size: DEFAULT_MESH_FEC_SYMBOL_SIZE,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -2170,6 +3264,14 @@ struct EdgeServiceSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_response_unix_ms: Option<u64>,
     #[serde(default)]
+    response_duration_count: u64,
+    #[serde(default)]
+    response_duration_sum_us: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    response_duration_p95_us: Option<u64>,
+    #[serde(default)]
+    response_duration_buckets: Vec<u64>,
+    #[serde(default)]
     recent_responses: Vec<EdgeResponseSnapshot>,
     draining: bool,
 }
@@ -2193,6 +3295,10 @@ impl EdgeServiceSnapshot {
             response_errors: load.response_errors,
             response_not_found: load.response_not_found,
             last_response_unix_ms: load.last_response_unix_ms,
+            response_duration_count: load.response_duration_count,
+            response_duration_sum_us: load.response_duration_sum_us,
+            response_duration_p95_us: load.response_duration_p95_us,
+            response_duration_buckets: load.response_duration_buckets,
             recent_responses: load.recent_responses,
             draining: node.draining,
         }
@@ -2213,6 +3319,10 @@ struct EdgeLoadSnapshot {
     response_errors: u64,
     response_not_found: u64,
     last_response_unix_ms: Option<u64>,
+    response_duration_count: u64,
+    response_duration_sum_us: u64,
+    response_duration_p95_us: Option<u64>,
+    response_duration_buckets: Vec<u64>,
     recent_responses: Vec<EdgeResponseSnapshot>,
 }
 
@@ -2225,6 +3335,8 @@ struct EdgeResponseSnapshot {
     query: Option<String>,
     status: u16,
     bytes: u64,
+    #[serde(default)]
+    duration_us: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     content_type: Option<String>,
 }
@@ -2244,7 +3356,60 @@ struct EdgeLoadInner {
     response_errors: AtomicU64,
     response_not_found: AtomicU64,
     last_response_unix_ms: AtomicU64,
+    response_duration: AtomicDurationHistogram,
     recent_responses: StdMutex<VecDeque<EdgeResponseSnapshot>>,
+}
+
+#[derive(Debug)]
+struct AtomicDurationHistogram {
+    count: AtomicU64,
+    sum_us: AtomicU64,
+    max_us: AtomicU64,
+    buckets: [AtomicU64; EDGE_RESPONSE_DURATION_BUCKETS_US.len()],
+}
+
+impl Default for AtomicDurationHistogram {
+    fn default() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            sum_us: AtomicU64::new(0),
+            max_us: AtomicU64::new(0),
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+impl AtomicDurationHistogram {
+    fn record(&self, duration: Duration) -> u64 {
+        let duration_us = duration.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_us.fetch_add(duration_us, Ordering::Relaxed);
+        self.max_us.fetch_max(duration_us, Ordering::Relaxed);
+        for (index, upper_bound_us) in EDGE_RESPONSE_DURATION_BUCKETS_US.iter().enumerate() {
+            if duration_us <= *upper_bound_us {
+                self.buckets[index].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        duration_us
+    }
+}
+
+fn histogram_percentile_upper_bound_us(
+    count: u64,
+    buckets: &[u64],
+    percentile: u64,
+    max_us: u64,
+) -> Option<u64> {
+    if count == 0 {
+        return None;
+    }
+    let rank = count.saturating_mul(percentile).saturating_add(99) / 100;
+    buckets
+        .iter()
+        .enumerate()
+        .find(|(_, bucket_count)| **bucket_count >= rank)
+        .map(|(index, _)| EDGE_RESPONSE_DURATION_BUCKETS_US[index])
+        .or(Some(max_us))
 }
 
 impl EdgeLoad {
@@ -2273,6 +3438,20 @@ impl EdgeLoad {
             0 => None,
             value => Some(value),
         };
+        let response_duration_count = self.inner.response_duration.count.load(Ordering::Relaxed);
+        let response_duration_buckets = self
+            .inner
+            .response_duration
+            .buckets
+            .iter()
+            .map(|bucket| bucket.load(Ordering::Relaxed))
+            .collect::<Vec<_>>();
+        let response_duration_p95_us = histogram_percentile_upper_bound_us(
+            response_duration_count,
+            &response_duration_buckets,
+            95,
+            self.inner.response_duration.max_us.load(Ordering::Relaxed),
+        );
         EdgeServiceSnapshot::from_node(
             node,
             playback_base_url,
@@ -2285,6 +3464,14 @@ impl EdgeLoad {
                 response_errors: self.inner.response_errors.load(Ordering::Relaxed),
                 response_not_found: self.inner.response_not_found.load(Ordering::Relaxed),
                 last_response_unix_ms,
+                response_duration_count,
+                response_duration_sum_us: self
+                    .inner
+                    .response_duration
+                    .sum_us
+                    .load(Ordering::Relaxed),
+                response_duration_p95_us,
+                response_duration_buckets,
                 recent_responses,
             },
         )
@@ -2296,6 +3483,7 @@ impl EdgeLoad {
         path: &str,
         query: Option<&str>,
         response: &HandlerResponse,
+        duration: Duration,
     ) {
         let unix_ms = now_unix_ms();
         let status = response.status.as_u16();
@@ -2304,6 +3492,7 @@ impl EdgeLoad {
             .as_ref()
             .map(|body| body.len() as u64)
             .unwrap_or(0);
+        let duration_us = self.inner.response_duration.record(duration);
         self.inner.responses_total.fetch_add(1, Ordering::Relaxed);
         if response.status.is_client_error() || response.status.is_server_error() {
             self.inner.response_errors.fetch_add(1, Ordering::Relaxed);
@@ -2325,6 +3514,7 @@ impl EdgeLoad {
                 query: query.map(ToOwned::to_owned),
                 status,
                 bytes,
+                duration_us,
                 content_type: response.content_type.clone(),
             });
             while responses.len() > EDGE_RECENT_RESPONSE_LIMIT {
@@ -2790,6 +3980,7 @@ impl MeshApiSnapshot {
         planned_replicas: Vec<ReplicaPlacement>,
         orchestration: OrchestrationStatus,
     ) -> Self {
+        let relay_session = local.relay_session;
         let mut aggregate = AggregateMetrics::default();
         let mut nodes = Vec::with_capacity(snapshots.len());
         let mut edge_services = Vec::with_capacity(snapshots.len());
@@ -2883,6 +4074,9 @@ impl MeshApiSnapshot {
         MeshApiSnapshot {
             updated_unix_ms: now_unix_ms(),
             node: local.node,
+            mesh_transport: MeshTransportConfigSnapshot::default(),
+            mesh_fec: MeshFecRuntimeSnapshot::default(),
+            relay_session,
             peers: local.peers,
             stream: local.stream,
             replication_policy: local.replication_policy,
@@ -2900,6 +4094,690 @@ impl MeshApiSnapshot {
             streams,
         }
     }
+}
+
+fn prometheus_label_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('"', "\\\"")
+}
+
+fn push_prometheus_metric_header(output: &mut String, name: &str, help: &str, metric_type: &str) {
+    output.push_str("# HELP ");
+    output.push_str(name);
+    output.push(' ');
+    output.push_str(help);
+    output.push('\n');
+    output.push_str("# TYPE ");
+    output.push_str(name);
+    output.push(' ');
+    output.push_str(metric_type);
+    output.push('\n');
+}
+
+fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
+    let aggregate = &snapshot.aggregate;
+    let mut output = String::with_capacity(16 * 1024);
+
+    for (name, help, value) in [
+        (
+            "av_mesh_nodes",
+            "Mesh nodes currently visible in telemetry.",
+            aggregate.node_count as u64,
+        ),
+        (
+            "av_mesh_connections",
+            "Directed mesh connections currently visible in telemetry.",
+            aggregate.connection_count as u64,
+        ),
+        (
+            "av_mesh_storage_bytes",
+            "Total storage capacity visible across the mesh.",
+            aggregate.total_storage_bytes,
+        ),
+        (
+            "av_mesh_storage_used_bytes",
+            "Storage currently used across the mesh.",
+            aggregate.used_storage_bytes,
+        ),
+        (
+            "av_mesh_egress_capacity_bps",
+            "Advertised aggregate mesh egress capacity in bits per second.",
+            aggregate.total_egress_capacity_bps,
+        ),
+        (
+            "av_mesh_contributor_streams",
+            "Contributor streams currently visible across the mesh.",
+            aggregate.contributor_streams,
+        ),
+        (
+            "av_mesh_active_streams",
+            "Active streams currently visible across the mesh.",
+            aggregate.active_streams,
+        ),
+        (
+            "av_mesh_planned_replicas",
+            "Replica placements currently requested by mesh policy.",
+            snapshot.planned_replicas.len() as u64,
+        ),
+    ] {
+        push_prometheus_metric_header(&mut output, name, help, "gauge");
+        output.push_str(&format!("{name} {value}\n"));
+    }
+
+    for (name, help, value) in [
+        (
+            "av_mesh_transport_sync_interval_seconds",
+            "Configured cache-mesh replication scan interval in seconds.",
+            snapshot.mesh_transport.sync_interval_ms as f64 / 1_000.0,
+        ),
+        (
+            "av_mesh_transport_fec_repair_ratio",
+            "Configured proportional cache-mesh FEC repair ratio.",
+            ((snapshot.mesh_transport.repair_ratio as f64) * 1_000_000.0).round() / 1_000_000.0,
+        ),
+        (
+            "av_mesh_transport_fec_min_repair_symbols",
+            "Configured minimum cache-mesh FEC repair symbols per object.",
+            snapshot.mesh_transport.min_repair_symbols as f64,
+        ),
+        (
+            "av_mesh_transport_fec_max_repair_symbols",
+            "Configured maximum cache-mesh FEC repair symbols per object.",
+            snapshot.mesh_transport.max_repair_symbols as f64,
+        ),
+        (
+            "av_mesh_transport_fec_symbol_bytes",
+            "Configured cache-mesh FEC symbol size in bytes.",
+            snapshot.mesh_transport.symbol_size as f64,
+        ),
+    ] {
+        push_prometheus_metric_header(&mut output, name, help, "gauge");
+        output.push_str(&format!("{name} {value}\n"));
+    }
+
+    for (name, help, value) in [
+        (
+            "av_mesh_fec_tx_objects_total",
+            "Cache-mesh objects encoded and offered to a peer.",
+            snapshot.mesh_fec.tx_objects,
+        ),
+        (
+            "av_mesh_fec_tx_protected_bytes_total",
+            "Application bytes protected by cache-mesh FEC.",
+            snapshot.mesh_fec.tx_protected_bytes,
+        ),
+        (
+            "av_mesh_fec_tx_wire_bytes_total",
+            "Cache-mesh FEC datagram bytes sent on the wire.",
+            snapshot.mesh_fec.tx_wire_bytes,
+        ),
+        (
+            "av_mesh_fec_tx_errors_total",
+            "Cache-mesh FEC encode or datagram send errors.",
+            snapshot.mesh_fec.tx_errors,
+        ),
+        (
+            "av_mesh_fec_rx_wire_datagrams_total",
+            "Cache-mesh UDP datagrams received, including malformed datagrams.",
+            snapshot.mesh_fec.rx_wire_datagrams,
+        ),
+        (
+            "av_mesh_fec_rx_wire_bytes_total",
+            "Cache-mesh UDP datagram bytes received on the wire.",
+            snapshot.mesh_fec.rx_wire_bytes,
+        ),
+        (
+            "av_mesh_fec_rx_decoded_bytes_total",
+            "Application bytes successfully decoded from cache-mesh FEC.",
+            snapshot.mesh_fec.rx_decoded_bytes,
+        ),
+        (
+            "av_mesh_fec_rx_repaired_source_datagrams_total",
+            "Cache-mesh source symbols absent when successful FEC decoding completed.",
+            snapshot.mesh_fec.rx_repaired_source_datagrams,
+        ),
+        (
+            "av_mesh_fec_rx_late_source_datagrams_total",
+            "Source symbols that arrived after repair data had already completed cache-mesh decoding.",
+            snapshot.mesh_fec.rx_late_source_datagrams,
+        ),
+        (
+            "av_mesh_fec_rx_presumed_lost_source_datagrams_total",
+            "FEC-repaired source symbols that remained absent through the bounded late-arrival window.",
+            snapshot.mesh_fec.rx_presumed_lost_source_datagrams,
+        ),
+        (
+            "av_mesh_fec_rx_decode_errors_total",
+            "Cache-mesh FEC datagrams rejected during decode.",
+            snapshot.mesh_fec.rx_decode_errors,
+        ),
+    ] {
+        push_prometheus_metric_header(&mut output, name, help, "counter");
+        output.push_str(&format!("{name} {value}\n"));
+    }
+
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_fec_tx_datagrams_total",
+        "Cache-mesh FEC datagrams sent by symbol kind.",
+        "counter",
+    );
+    output.push_str(&format!(
+        "av_mesh_fec_tx_datagrams_total{{kind=\"source\"}} {}\n",
+        snapshot.mesh_fec.tx_source_datagrams
+    ));
+    output.push_str(&format!(
+        "av_mesh_fec_tx_datagrams_total{{kind=\"repair\"}} {}\n",
+        snapshot.mesh_fec.tx_repair_datagrams
+    ));
+
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_fec_rx_datagrams_total",
+        "Structurally valid cache-mesh FEC datagrams received by symbol kind.",
+        "counter",
+    );
+    output.push_str(&format!(
+        "av_mesh_fec_rx_datagrams_total{{kind=\"source\"}} {}\n",
+        snapshot.mesh_fec.rx_source_datagrams
+    ));
+    output.push_str(&format!(
+        "av_mesh_fec_rx_datagrams_total{{kind=\"repair\"}} {}\n",
+        snapshot.mesh_fec.rx_repair_datagrams
+    ));
+
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_fec_rx_objects_total",
+        "Cache-mesh FEC object outcomes; repaired objects are a subset of decoded objects.",
+        "counter",
+    );
+    for (outcome, value) in [
+        ("decoded", snapshot.mesh_fec.rx_decoded_objects),
+        ("repaired", snapshot.mesh_fec.rx_repaired_objects),
+        ("expired", snapshot.mesh_fec.rx_expired_objects),
+    ] {
+        output.push_str(&format!(
+            "av_mesh_fec_rx_objects_total{{outcome=\"{outcome}\"}} {value}\n"
+        ));
+    }
+
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_fec_rx_inflight_objects",
+        "Incomplete cache-mesh FEC objects currently observed.",
+        "gauge",
+    );
+    output.push_str(&format!(
+        "av_mesh_fec_rx_inflight_objects {}\n",
+        snapshot.mesh_fec.rx_inflight_objects
+    ));
+
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_relay_session_parent_sessions",
+        "Configured RelaySession parent sessions by assigned path role.",
+        "gauge",
+    );
+    output.push_str(&format!(
+        "av_mesh_relay_session_parent_sessions{{role=\"primary\"}} {}\n",
+        snapshot.relay_session.primary_sessions
+    ));
+    output.push_str(&format!(
+        "av_mesh_relay_session_parent_sessions{{role=\"secondary\"}} {}\n",
+        snapshot.relay_session.secondary_sessions
+    ));
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_relay_session_security_sessions",
+        "RelaySession carrier bindings by established trust boundary.",
+        "gauge",
+    );
+    output.push_str(&format!(
+        "av_mesh_relay_session_security_sessions{{mode=\"authenticated\"}} {}\n",
+        snapshot.relay_session.authenticated_sessions
+    ));
+    output.push_str(&format!(
+        "av_mesh_relay_session_security_sessions{{mode=\"controlled_qualification\"}} {}\n",
+        snapshot.relay_session.controlled_sessions
+    ));
+    for (name, help, value) in [
+        (
+            "av_mesh_relay_session_active_objects",
+            "Canonical RelaySession objects currently awaiting RaptorQ completion.",
+            snapshot.relay_session.active_objects,
+        ),
+        (
+            "av_mesh_relay_session_completed_objects",
+            "Completed RelaySession object identities retained for bounded deduplication.",
+            snapshot.relay_session.completed_objects,
+        ),
+        (
+            "av_mesh_relay_session_active_object_bytes",
+            "Declared transfer bytes reserved by active RelaySession objects.",
+            snapshot.relay_session.active_object_bytes,
+        ),
+        (
+            "av_mesh_relay_session_buffered_datagrams",
+            "Accepted RelaySession datagrams owned by incomplete objects.",
+            snapshot.relay_session.buffered_datagrams,
+        ),
+    ] {
+        push_prometheus_metric_header(&mut output, name, help, "gauge");
+        output.push_str(&format!("{name} {value}\n"));
+    }
+
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_relay_session_datagrams_total",
+        "RelaySession datagram outcomes and accepted RaptorQ symbol roles.",
+        "counter",
+    );
+    for (outcome, value) in [
+        ("received", snapshot.relay_session.datagrams_received),
+        ("rejected", snapshot.relay_session.datagrams_rejected),
+        ("source", snapshot.relay_session.source_datagrams),
+        ("repair", snapshot.relay_session.repair_datagrams),
+        ("duplicate", snapshot.relay_session.duplicate_datagrams),
+    ] {
+        output.push_str(&format!(
+            "av_mesh_relay_session_datagrams_total{{outcome=\"{outcome}\"}} {value}\n"
+        ));
+    }
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_relay_session_objects_total",
+        "RelaySession canonical object outcomes; repaired is a subset of decoded.",
+        "counter",
+    );
+    for (outcome, value) in [
+        ("decoded", snapshot.relay_session.decoded_objects),
+        ("repaired", snapshot.relay_session.repaired_objects),
+        ("expired", snapshot.relay_session.expired_objects),
+    ] {
+        output.push_str(&format!(
+            "av_mesh_relay_session_objects_total{{outcome=\"{outcome}\"}} {value}\n"
+        ));
+    }
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_relay_session_drops_total",
+        "RelaySession datagrams dropped by bounded low-cardinality reason.",
+        "counter",
+    );
+    for (reason, value) in [
+        ("conflict", snapshot.relay_session.conflict_drops),
+        (
+            "authentication",
+            snapshot.relay_session.authentication_drops,
+        ),
+        ("deadline", snapshot.relay_session.deadline_drops),
+    ] {
+        output.push_str(&format!(
+            "av_mesh_relay_session_drops_total{{reason=\"{reason}\"}} {value}\n"
+        ));
+    }
+
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_relay_session_downstream_children",
+        "Explicit subscribed RelaySession children served by this relay.",
+        "gauge",
+    );
+    output.push_str(&format!(
+        "av_mesh_relay_session_downstream_children {}\n",
+        snapshot.relay_session.downstream_children
+    ));
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_relay_session_forwarded_datagrams_total",
+        "Admitted RaptorQ datagrams forwarded to subscribed children by symbol role.",
+        "counter",
+    );
+    for (role, value) in [
+        ("source", snapshot.relay_session.forwarded_source_datagrams),
+        ("repair", snapshot.relay_session.forwarded_repair_datagrams),
+    ] {
+        output.push_str(&format!(
+            "av_mesh_relay_session_forwarded_datagrams_total{{role=\"{role}\"}} {value}\n"
+        ));
+    }
+    for (name, help, value) in [
+        (
+            "av_mesh_relay_session_forwarded_bytes_total",
+            "RelaySession wire bytes forwarded to subscribed children.",
+            snapshot.relay_session.forwarded_bytes,
+        ),
+        (
+            "av_mesh_relay_session_forward_errors_total",
+            "RelaySession downstream carrier send errors.",
+            snapshot.relay_session.forward_errors,
+        ),
+        (
+            "av_mesh_relay_session_forward_filtered_datagrams_total",
+            "Admitted RelaySession symbols intentionally retained by lane policy rather than forwarded.",
+            snapshot.relay_session.forward_filtered_datagrams,
+        ),
+    ] {
+        push_prometheus_metric_header(&mut output, name, help, "counter");
+        output.push_str(&format!("{name} {value}\n"));
+    }
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_relay_session_forward_duration_us",
+        "Time to submit one admitted RelaySession datagram to one downstream child in microseconds.",
+        "histogram",
+    );
+    for (upper_bound_us, count) in EDGE_RESPONSE_DURATION_BUCKETS_US
+        .iter()
+        .zip(snapshot.relay_session.forward_duration_buckets)
+    {
+        output.push_str(&format!(
+            "av_mesh_relay_session_forward_duration_us_bucket{{le=\"{upper_bound_us}\"}} {count}\n"
+        ));
+    }
+    output.push_str(&format!(
+        "av_mesh_relay_session_forward_duration_us_bucket{{le=\"+Inf\"}} {}\n",
+        snapshot.relay_session.forward_duration_count
+    ));
+    output.push_str(&format!(
+        "av_mesh_relay_session_forward_duration_us_sum {}\n",
+        snapshot.relay_session.forward_duration_sum_us
+    ));
+    output.push_str(&format!(
+        "av_mesh_relay_session_forward_duration_us_count {}\n",
+        snapshot.relay_session.forward_duration_count
+    ));
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_relay_session_forward_duration_max_us",
+        "Largest observed downstream RelaySession carrier submission time in microseconds.",
+        "gauge",
+    );
+    output.push_str(&format!(
+        "av_mesh_relay_session_forward_duration_max_us {}\n",
+        snapshot.relay_session.forward_duration_max_us
+    ));
+
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_topology_peers",
+        "Mesh peers by topology resolution and address scope.",
+        "gauge",
+    );
+    for (kind, value) in [
+        ("resolved", snapshot.topology.resolved_peer_count),
+        ("unresolved", snapshot.topology.unresolved_peer_count),
+        ("private", snapshot.topology.private_peer_count),
+        ("public", snapshot.topology.public_peer_count),
+    ] {
+        output.push_str(&format!(
+            "av_mesh_topology_peers{{kind=\"{kind}\"}} {value}\n"
+        ));
+    }
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_telemetry_nodes",
+        "Remote mesh nodes by telemetry freshness.",
+        "gauge",
+    );
+    output.push_str(&format!(
+        "av_mesh_telemetry_nodes{{state=\"fresh\"}} {}\n",
+        snapshot.telemetry.fresh_remote_count
+    ));
+    output.push_str(&format!(
+        "av_mesh_telemetry_nodes{{state=\"stale\"}} {}\n",
+        snapshot.telemetry.stale_remote_count
+    ));
+
+    for (name, help, metric_type) in [
+        (
+            "av_mesh_node_draining",
+            "Whether a mesh node is draining.",
+            "gauge",
+        ),
+        (
+            "av_mesh_node_storage_bytes",
+            "Storage capacity by mesh node.",
+            "gauge",
+        ),
+        (
+            "av_mesh_node_storage_used_bytes",
+            "Storage used by mesh node.",
+            "gauge",
+        ),
+        (
+            "av_mesh_node_egress_capacity_bps",
+            "Advertised egress capacity by mesh node.",
+            "gauge",
+        ),
+        (
+            "av_mesh_node_streams",
+            "Streams by mesh node and kind.",
+            "gauge",
+        ),
+    ] {
+        push_prometheus_metric_header(&mut output, name, help, metric_type);
+    }
+    for node in &snapshot.nodes {
+        let node_id = prometheus_label_value(&node.node_id);
+        let region = prometheus_label_value(&node.region);
+        let continent = prometheus_label_value(&node.continent);
+        let labels = format!("node_id=\"{node_id}\",region=\"{region}\",continent=\"{continent}\"");
+        output.push_str(&format!(
+            "av_mesh_node_draining{{{labels}}} {}\n",
+            u8::from(node.draining)
+        ));
+        output.push_str(&format!(
+            "av_mesh_node_storage_bytes{{{labels}}} {}\n",
+            node.total_storage_bytes
+        ));
+        output.push_str(&format!(
+            "av_mesh_node_storage_used_bytes{{{labels}}} {}\n",
+            node.used_storage_bytes
+        ));
+        output.push_str(&format!(
+            "av_mesh_node_egress_capacity_bps{{{labels}}} {}\n",
+            node.egress_capacity_bps
+        ));
+        output.push_str(&format!(
+            "av_mesh_node_streams{{{labels},kind=\"contributor\"}} {}\n",
+            node.contributor_streams
+        ));
+        output.push_str(&format!(
+            "av_mesh_node_streams{{{labels},kind=\"active\"}} {}\n",
+            node.active_streams
+        ));
+    }
+
+    for (name, help, metric_type) in [
+        (
+            "av_mesh_edge_active_readers",
+            "Current edge readers by mesh node.",
+            "gauge",
+        ),
+        (
+            "av_mesh_edge_requests_total",
+            "Edge media read requests by mesh node.",
+            "counter",
+        ),
+        (
+            "av_mesh_edge_bytes_total",
+            "Edge media bytes served by mesh node.",
+            "counter",
+        ),
+        (
+            "av_mesh_edge_llhls_tail_requests_total",
+            "LL-HLS tail requests by mesh node.",
+            "counter",
+        ),
+        (
+            "av_mesh_edge_responses_total",
+            "Recorded LL-HLS responses by mesh node and outcome.",
+            "counter",
+        ),
+    ] {
+        push_prometheus_metric_header(&mut output, name, help, metric_type);
+    }
+    for edge in &snapshot.edge_services {
+        let node_id = prometheus_label_value(&edge.node_id);
+        let region = prometheus_label_value(&edge.region);
+        let labels = format!("node_id=\"{node_id}\",region=\"{region}\"");
+        output.push_str(&format!(
+            "av_mesh_edge_active_readers{{{labels}}} {}\n",
+            edge.active_readers
+        ));
+        output.push_str(&format!(
+            "av_mesh_edge_requests_total{{{labels}}} {}\n",
+            edge.requests_served
+        ));
+        output.push_str(&format!(
+            "av_mesh_edge_bytes_total{{{labels}}} {}\n",
+            edge.bytes_served
+        ));
+        output.push_str(&format!(
+            "av_mesh_edge_llhls_tail_requests_total{{{labels}}} {}\n",
+            edge.llhls_tail_requests
+        ));
+        for (outcome, value) in [
+            ("all", edge.responses_total),
+            ("error", edge.response_errors),
+            ("not_found", edge.response_not_found),
+        ] {
+            output.push_str(&format!(
+                "av_mesh_edge_responses_total{{{labels},outcome=\"{outcome}\"}} {value}\n"
+            ));
+        }
+    }
+
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_edge_response_duration_seconds",
+        "Time spent producing an LL-HLS edge response.",
+        "histogram",
+    );
+    for edge in &snapshot.edge_services {
+        let node_id = prometheus_label_value(&edge.node_id);
+        let region = prometheus_label_value(&edge.region);
+        let labels = format!("node_id=\"{node_id}\",region=\"{region}\"");
+        for (index, upper_bound_us) in EDGE_RESPONSE_DURATION_BUCKETS_US.iter().enumerate() {
+            let count = edge
+                .response_duration_buckets
+                .get(index)
+                .copied()
+                .unwrap_or(0);
+            output.push_str(&format!(
+                "av_mesh_edge_response_duration_seconds_bucket{{{labels},le=\"{}\"}} {count}\n",
+                *upper_bound_us as f64 / 1_000_000.0
+            ));
+        }
+        output.push_str(&format!(
+            "av_mesh_edge_response_duration_seconds_bucket{{{labels},le=\"+Inf\"}} {}\n",
+            edge.response_duration_count
+        ));
+        output.push_str(&format!(
+            "av_mesh_edge_response_duration_seconds_sum{{{labels}}} {}\n",
+            edge.response_duration_sum_us as f64 / 1_000_000.0
+        ));
+        output.push_str(&format!(
+            "av_mesh_edge_response_duration_seconds_count{{{labels}}} {}\n",
+            edge.response_duration_count
+        ));
+    }
+
+    for (name, help, metric_type) in [
+        (
+            "av_mesh_stream_bytes_received_total",
+            "Mesh ingest bytes received by node and stream.",
+            "counter",
+        ),
+        (
+            "av_mesh_stream_datagrams_received_total",
+            "Mesh ingest datagrams received by node and stream.",
+            "counter",
+        ),
+        (
+            "av_mesh_stream_latest_part",
+            "Latest part sequence by node, stream, and source.",
+            "gauge",
+        ),
+        (
+            "av_mesh_stream_last_ingest_age_seconds",
+            "Age of the latest mesh ingest by node and stream.",
+            "gauge",
+        ),
+        (
+            "av_mesh_stream_latest_local_part_age_seconds",
+            "Age of the latest locally committed LL-HLS part by node and stream.",
+            "gauge",
+        ),
+        (
+            "av_mesh_stream_lag_parts",
+            "Part lag behind the freshest observed replica by node and stream.",
+            "gauge",
+        ),
+    ] {
+        push_prometheus_metric_header(&mut output, name, help, metric_type);
+    }
+    for stream in &snapshot.streams {
+        let node_id = prometheus_label_value(&stream.node_id);
+        let stream_id = prometheus_label_value(&stream.stream_id_text);
+        let labels = format!("node_id=\"{node_id}\",stream_id=\"{stream_id}\"");
+        output.push_str(&format!(
+            "av_mesh_stream_bytes_received_total{{{labels}}} {}\n",
+            stream.bytes_received
+        ));
+        output.push_str(&format!(
+            "av_mesh_stream_datagrams_received_total{{{labels}}} {}\n",
+            stream.datagrams_received
+        ));
+        if let Some(part) = stream.latest_local_part {
+            output.push_str(&format!(
+                "av_mesh_stream_latest_part{{{labels},source=\"local\"}} {part}\n"
+            ));
+        }
+        if let Some(part) = stream.latest_mesh_part {
+            output.push_str(&format!(
+                "av_mesh_stream_latest_part{{{labels},source=\"mesh\"}} {part}\n"
+            ));
+        }
+        if let Some(age_ms) = stream.last_ingest_age_ms {
+            output.push_str(&format!(
+                "av_mesh_stream_last_ingest_age_seconds{{{labels}}} {}\n",
+                age_ms as f64 / 1_000.0
+            ));
+        }
+        if let Some(age_ms) = stream.latest_local_part_age_ms {
+            output.push_str(&format!(
+                "av_mesh_stream_latest_local_part_age_seconds{{{labels}}} {}\n",
+                age_ms as f64 / 1_000.0
+            ));
+        }
+        if let Some(lag) = stream.mesh_lag_parts {
+            output.push_str(&format!("av_mesh_stream_lag_parts{{{labels}}} {lag}\n"));
+        }
+    }
+
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_alerts",
+        "Current mesh alert counts by severity and stable alert code.",
+        "gauge",
+    );
+    for alert in &snapshot.alerts {
+        let level = prometheus_label_value(alert.level);
+        let code = prometheus_label_value(alert.code);
+        let node_id = prometheus_label_value(alert.node_id.as_deref().unwrap_or(""));
+        let stream_id = prometheus_label_value(alert.stream_id_text.as_deref().unwrap_or(""));
+        output.push_str(&format!(
+            "av_mesh_alerts{{level=\"{level}\",code=\"{code}\",node_id=\"{node_id}\",stream_id=\"{stream_id}\"}} {}\n",
+            alert.count
+        ));
+    }
+
+    output
 }
 
 fn annotate_stream_lag(streams: &mut [StreamTelemetry]) {
@@ -2940,6 +4818,7 @@ fn is_private_mesh_target(target: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn derive_mesh_alerts(
     aggregate: &AggregateMetrics,
     nodes: &[MeshNode],
@@ -4086,6 +5965,8 @@ async fn connect_telemetry_peer(
 struct AppRouter {
     cache: Arc<LiveTsCache>,
     mesh: Arc<CacheMeshHandle>,
+    audio_epochs: broadcast::Sender<Bytes>,
+    mesh_transport: MeshTransportConfigSnapshot,
     node: MeshNode,
     replication_policy: ReplicationPolicy,
     control: ControlPlane,
@@ -4101,9 +5982,12 @@ struct AppRouter {
 }
 
 impl AppRouter {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         cache: Arc<LiveTsCache>,
         mesh: Arc<CacheMeshHandle>,
+        audio_epochs: broadcast::Sender<Bytes>,
+        mesh_transport: MeshTransportConfigSnapshot,
         node: MeshNode,
         replication_policy: ReplicationPolicy,
         control: ControlPlane,
@@ -4120,6 +6004,8 @@ impl AppRouter {
         Self {
             cache,
             mesh,
+            audio_epochs,
+            mesh_transport,
             node,
             replication_policy,
             control,
@@ -4159,13 +6045,22 @@ impl AppRouter {
         let planned_replicas = self
             .plan_all_active_replicas_from_snapshots(&snapshots)
             .await;
-        MeshApiSnapshot::from_snapshots(
+        let mut snapshot = MeshApiSnapshot::from_snapshots(
             local,
             snapshots,
             telemetry,
             planned_replicas,
             self.orchestration_status().await,
-        )
+        );
+        snapshot.mesh_transport = self.mesh_transport.clone();
+        snapshot.mesh_fec = self.mesh.fec_stats().into();
+        snapshot
+    }
+
+    async fn prometheus_metrics(&self) -> Bytes {
+        Bytes::from(render_mesh_prometheus_metrics(
+            &self.mesh_api_snapshot().await,
+        ))
     }
 
     fn record_edge_response(
@@ -4174,10 +6069,11 @@ impl AppRouter {
         path: &str,
         query: Option<&str>,
         response: HandlerResponse,
+        started: Instant,
     ) -> HandlerResponse {
         if path == "/live/stream.m3u8" || path.starts_with("/live/") {
             self.edge_load
-                .record_response(method, path, query, &response);
+                .record_response(method, path, query, &response, started.elapsed());
         }
         response
     }
@@ -4747,6 +6643,7 @@ async fn run_replication_planner(
 #[async_trait]
 impl Router for AppRouter {
     async fn route(&self, req: Request<()>) -> HandlerResult<HandlerResponse> {
+        let started = Instant::now();
         let method = req.method().clone();
         let path_owned = req.uri().path().to_owned();
         let query_owned = req.uri().query().map(ToOwned::to_owned);
@@ -4755,34 +6652,24 @@ impl Router for AppRouter {
 
         if req.method() == Method::OPTIONS {
             let response = response(StatusCode::NO_CONTENT, None, None);
-            return Ok(self.record_edge_response(&method, path, query, response));
+            return Ok(self.record_edge_response(&method, path, query, response, started));
         }
         if req.method() != Method::GET && req.method() != Method::HEAD {
             let response = response(StatusCode::METHOD_NOT_ALLOWED, None, None);
-            return Ok(self.record_edge_response(&method, path, query, response));
+            return Ok(self.record_edge_response(&method, path, query, response, started));
         }
 
         match path {
             "/" => Ok(response(
                 StatusCode::OK,
                 Some(Bytes::from_static(
-                    b"av-mesh node\n\nMesh UI: /mesh\nHLS: /live/stream.m3u8\nHealth: /up\nStats: /api/stats\n",
+                    b"av-mesh playback edge\n\nNeedletail Mission Control: /mesh\nHLS: /live/stream.m3u8\nHealth: /up\nStats: /api/stats\nMetrics: /metrics\n",
                 )),
                 Some("text/plain; charset=utf-8"),
             )),
-            "/mesh" => Ok(dashboard_dist_response(path).unwrap_or_else(|| {
-                response(
-                    StatusCode::OK,
-                    Some(Bytes::from_static(MESH_DASHBOARD_HTML.as_bytes())),
-                    Some("text/html; charset=utf-8"),
-                )
-                .with_no_store()
+            "/mesh" => Ok(mission_control_asset_response(path).unwrap_or_else(|| {
+                mission_control_setup_response()
             })),
-            WAVEY_GOOSE_ASSET_PATH => Ok(response(
-                StatusCode::OK,
-                Some(Bytes::from_static(WAVEY_GOOSE_PNG)),
-                Some("image/png"),
-            )),
             "/up" => Ok(response(
                 StatusCode::OK,
                 Some(Bytes::from_static(b"OK")),
@@ -4798,7 +6685,7 @@ impl Router for AppRouter {
                     Some("application/vnd.apple.mpegurl"),
                 )
                 .with_no_store();
-                Ok(self.record_edge_response(&method, path, query, response))
+                Ok(self.record_edge_response(&method, path, query, response, started))
             }
             "/api/stats" => {
                 let json = serde_json::to_vec(&self.cache.stats(&self.mesh).await)
@@ -4821,9 +6708,15 @@ impl Router for AppRouter {
                 )
                 .with_no_store())
             }
+            MESH_METRICS_PATH => Ok(response(
+                StatusCode::OK,
+                Some(self.prometheus_metrics().await),
+                Some(PROMETHEUS_CONTENT_TYPE),
+            )
+            .with_no_store()),
             _ => {
-                if let Some(dashboard_asset) = dashboard_dist_response(path) {
-                    return Ok(dashboard_asset);
+                if let Some(mission_control_asset) = mission_control_asset_response(path) {
+                    return Ok(mission_control_asset);
                 }
 
                 if let Some(stream_id) = parse_stream_playlist_path(path) {
@@ -4836,7 +6729,7 @@ impl Router for AppRouter {
                         Some("application/vnd.apple.mpegurl"),
                     )
                     .with_no_store();
-                    return Ok(self.record_edge_response(&method, path, query, response));
+            return Ok(self.record_edge_response(&method, path, query, response, started));
                 }
 
                 if let Some(stream_id) = parse_llhls_tail_path(path) {
@@ -4851,7 +6744,7 @@ impl Router for AppRouter {
                     else {
                         read.finish(0);
                         let response = response(StatusCode::NO_CONTENT, None, None).with_no_store();
-                        return Ok(self.record_edge_response(&method, path, query, response));
+            return Ok(self.record_edge_response(&method, path, query, response, started));
                     };
                     let bytes_len = bytes.len();
                     let media_kind = self
@@ -4870,7 +6763,7 @@ impl Router for AppRouter {
                         .headers
                         .push(("x-av-stream-id".into(), stream_id.to_string()));
                     read.finish(bytes_len);
-                    return Ok(self.record_edge_response(&method, path, query, tail_response));
+                    return Ok(self.record_edge_response(&method, path, query, tail_response, started));
                 }
 
                 if let Some(stream_id) = parse_stream_init_path(path) {
@@ -4883,10 +6776,10 @@ impl Router for AppRouter {
                             Some(LiveMediaKind::Fmp4.content_type()),
                         )
                         .with_no_store();
-                        return Ok(self.record_edge_response(&method, path, query, response));
+            return Ok(self.record_edge_response(&method, path, query, response, started));
                     }
                     let response = response(StatusCode::NOT_FOUND, None, None);
-                    return Ok(self.record_edge_response(&method, path, query, response));
+            return Ok(self.record_edge_response(&method, path, query, response, started));
                 }
 
                 if let Some((stream_id, sequence)) = parse_media_unit_path(path) {
@@ -4895,7 +6788,7 @@ impl Router for AppRouter {
                     let Some(unit) = self.cache.get_media_access_unit(stream_id, sequence).await
                     else {
                         let response = response(StatusCode::NOT_FOUND, None, None);
-                        return Ok(self.record_edge_response(&method, path, query, response));
+            return Ok(self.record_edge_response(&method, path, query, response, started));
                     };
                     let mut media_response = response(
                         StatusCode::OK,
@@ -4924,7 +6817,7 @@ impl Router for AppRouter {
                     media_response
                         .headers
                         .push(("x-av-flags".into(), unit.metadata.flags.bits().to_string()));
-                    return Ok(self.record_edge_response(&method, path, query, media_response));
+                    return Ok(self.record_edge_response(&method, path, query, media_response, started));
                 }
 
                 if let Some((stream_id, seq, requested_kind)) = parse_stream_part_path(path) {
@@ -4941,10 +6834,10 @@ impl Router for AppRouter {
                         let response =
                             response(StatusCode::OK, Some(bytes), Some(media_kind.content_type()))
                                 .with_etag(hash);
-                        return Ok(self.record_edge_response(&method, path, query, response));
+            return Ok(self.record_edge_response(&method, path, query, response, started));
                     }
                     let response = response(StatusCode::NOT_FOUND, None, None);
-                    return Ok(self.record_edge_response(&method, path, query, response));
+            return Ok(self.record_edge_response(&method, path, query, response, started));
                 }
 
                 if let Some((stream_id, segment, requested_kind)) = parse_stream_segment_path(path) {
@@ -4962,10 +6855,10 @@ impl Router for AppRouter {
                             Some(bytes),
                             Some(media_kind.content_type()),
                         );
-                        return Ok(self.record_edge_response(&method, path, query, response));
+            return Ok(self.record_edge_response(&method, path, query, response, started));
                     }
                     let response = response(StatusCode::NOT_FOUND, None, None);
-                    return Ok(self.record_edge_response(&method, path, query, response));
+            return Ok(self.record_edge_response(&method, path, query, response, started));
                 }
 
                 if parse_init_path(path) {
@@ -4983,10 +6876,10 @@ impl Router for AppRouter {
                             Some(LiveMediaKind::Fmp4.content_type()),
                         )
                         .with_no_store();
-                        return Ok(self.record_edge_response(&method, path, query, response));
+            return Ok(self.record_edge_response(&method, path, query, response, started));
                     }
                     let response = response(StatusCode::NOT_FOUND, None, None);
-                    return Ok(self.record_edge_response(&method, path, query, response));
+            return Ok(self.record_edge_response(&method, path, query, response, started));
                 }
 
                 if let Some((seq, requested_kind)) = parse_part_path(path) {
@@ -4999,10 +6892,10 @@ impl Router for AppRouter {
                         let response =
                             response(StatusCode::OK, Some(bytes), Some(media_kind.content_type()))
                                 .with_etag(hash);
-                        return Ok(self.record_edge_response(&method, path, query, response));
+            return Ok(self.record_edge_response(&method, path, query, response, started));
                     }
                     let response = response(StatusCode::NOT_FOUND, None, None);
-                    return Ok(self.record_edge_response(&method, path, query, response));
+            return Ok(self.record_edge_response(&method, path, query, response, started));
                 }
 
                 if let Some((segment, requested_kind)) = parse_segment_path(path) {
@@ -5017,14 +6910,14 @@ impl Router for AppRouter {
                             Some(bytes),
                             Some(media_kind.content_type()),
                         );
-                        return Ok(self.record_edge_response(&method, path, query, response));
+            return Ok(self.record_edge_response(&method, path, query, response, started));
                     }
                     let response = response(StatusCode::NOT_FOUND, None, None);
-                    return Ok(self.record_edge_response(&method, path, query, response));
+            return Ok(self.record_edge_response(&method, path, query, response, started));
                 }
 
                 let response = response(StatusCode::NOT_FOUND, None, None);
-                Ok(self.record_edge_response(&method, path, query, response))
+                Ok(self.record_edge_response(&method, path, query, response, started))
             }
         }
     }
@@ -5225,6 +7118,28 @@ impl WebTransportHandler for AppRouter {
                     let datagram = datagram
                         .map_err(|err| ServerError::Config(format!("read WebTransport datagram: {err}")))?;
                     let payload = datagram.into_payload();
+                    if payload.as_ref() == AUDIO_EPOCH_SUBSCRIPTION {
+                        let mut audio_epochs = self.audio_epochs.subscribe();
+                        info!("WebTransport multichannel audio epoch session started");
+                        loop {
+                            match audio_epochs.recv().await {
+                                Ok(datagram) => {
+                                    if let Err(error) = datagram_sender.send_datagram(datagram) {
+                                        debug!("WebTransport audio epoch session closed: {:?}", error);
+                                        break;
+                                    }
+                                }
+                                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                    debug!(
+                                        skipped,
+                                        "WebTransport audio epoch receiver skipped stale datagrams"
+                                    );
+                                }
+                                Err(broadcast::error::RecvError::Closed) => break,
+                            }
+                        }
+                        return Ok(());
+                    }
                     match media_decoder.push_datagram(&payload) {
                         Ok(Some(frame)) => {
                             let unit = self
@@ -5265,7 +7180,7 @@ impl WebTransportHandler for AppRouter {
 impl RawTcpHandler for AppRouter {
     async fn handle_stream(
         &self,
-        mut stream: Box<dyn web_service::traits::RawStream>,
+        mut stream: Box<dyn av_web_service::traits::RawStream>,
         _is_tls: bool,
     ) -> HandlerResult<()> {
         loop {
@@ -5318,28 +7233,37 @@ fn response(
     }
 }
 
-fn dashboard_dist_response(path: &str) -> Option<HandlerResponse> {
-    let dist_dir = std::env::var_os(DASHBOARD_DIST_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("dashboard/dist"));
-    dashboard_dist_response_from_dir(&dist_dir, path)
+fn mission_control_asset_response(path: &str) -> Option<HandlerResponse> {
+    let dist_dir = std::env::var_os(MISSION_CONTROL_DIST_ENV).map(PathBuf::from)?;
+    mission_control_asset_response_from_dir(&dist_dir, path)
 }
 
-fn dashboard_dist_response_from_dir(dist_dir: &Path, path: &str) -> Option<HandlerResponse> {
-    let relative_path = dashboard_dist_relative_path(path)?;
+fn mission_control_setup_response() -> HandlerResponse {
+    response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        Some(Bytes::from_static(
+            b"Needletail Mission Control setup: configure NEEDLETAIL_MISSION_CONTROL_DIST with the built asset directory.\n",
+        )),
+        Some("text/plain; charset=utf-8"),
+    )
+    .with_no_store()
+}
+
+fn mission_control_asset_response_from_dir(dist_dir: &Path, path: &str) -> Option<HandlerResponse> {
+    let relative_path = mission_control_asset_relative_path(path)?;
     let full_path = dist_dir.join(relative_path);
     let bytes = std::fs::read(full_path).ok()?;
     Some(
         response(
             StatusCode::OK,
             Some(Bytes::from(bytes)),
-            dashboard_dist_content_type(relative_path),
+            mission_control_asset_content_type(relative_path),
         )
         .with_no_store(),
     )
 }
 
-fn dashboard_dist_relative_path(path: &str) -> Option<&str> {
+fn mission_control_asset_relative_path(path: &str) -> Option<&str> {
     match path {
         "/mesh" | "/mesh/" => Some("index.html"),
         _ => {
@@ -5347,7 +7271,7 @@ fn dashboard_dist_relative_path(path: &str) -> Option<&str> {
             if candidate.is_empty()
                 || candidate.contains('/')
                 || candidate.contains("..")
-                || !dashboard_dist_asset_extension_allowed(candidate)
+                || !mission_control_asset_extension_allowed(candidate)
             {
                 return None;
             }
@@ -5356,14 +7280,14 @@ fn dashboard_dist_relative_path(path: &str) -> Option<&str> {
     }
 }
 
-fn dashboard_dist_asset_extension_allowed(path: &str) -> bool {
+fn mission_control_asset_extension_allowed(path: &str) -> bool {
     path.ends_with(".js")
         || path.ends_with(".wasm")
         || path.ends_with(".css")
         || path.ends_with(".ico")
 }
 
-fn dashboard_dist_content_type(path: &str) -> Option<&'static str> {
+fn mission_control_asset_content_type(path: &str) -> Option<&'static str> {
     if path.ends_with(".html") {
         Some("text/html; charset=utf-8")
     } else if path.ends_with(".js") {
@@ -5569,480 +7493,14 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-const MESH_DASHBOARD_HTML: &str = r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>av-mesh</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --bg: #f6f7f9;
-      --panel: #ffffff;
-      --line: #d9dee7;
-      --text: #17202f;
-      --muted: #647084;
-      --blue: #2667ff;
-      --green: #168a5b;
-      --red: #b42318;
-      --amber: #b7791f;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      background: var(--bg);
-      color: var(--text);
-      font: 14px/1.4 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    }
-    header {
-      height: 56px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0 20px;
-      border-bottom: 1px solid var(--line);
-      background: var(--panel);
-    }
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      min-width: 0;
-    }
-    .brand-icon {
-      width: 32px;
-      height: 32px;
-      image-rendering: pixelated;
-      flex: 0 0 auto;
-    }
-    h1 {
-      margin: 0;
-      font-size: 18px;
-      font-weight: 650;
-      letter-spacing: 0;
-    }
-    main {
-      max-width: 1360px;
-      margin: 0 auto;
-      padding: 18px;
-      display: grid;
-      grid-template-columns: minmax(360px, 1.45fr) minmax(320px, 0.85fr);
-      gap: 16px;
-    }
-    section, aside {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      overflow: hidden;
-    }
-    .section-head {
-      height: 44px;
-      padding: 0 14px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      border-bottom: 1px solid var(--line);
-      color: var(--muted);
-      font-size: 12px;
-      text-transform: uppercase;
-    }
-    #map {
-      display: block;
-      width: 100%;
-      height: 430px;
-      background: #fbfcfe;
-    }
-    .metrics {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(120px, 1fr));
-      gap: 1px;
-      background: var(--line);
-      border-top: 1px solid var(--line);
-    }
-    .metric {
-      background: var(--panel);
-      padding: 14px;
-      min-height: 86px;
-    }
-    .metric span {
-      display: block;
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .metric strong {
-      display: block;
-      margin-top: 6px;
-      font-size: 22px;
-      font-weight: 680;
-      letter-spacing: 0;
-      overflow-wrap: anywhere;
-    }
-    .bar {
-      height: 8px;
-      background: #e9edf4;
-      border-radius: 4px;
-      overflow: hidden;
-      margin-top: 10px;
-    }
-    .bar div {
-      height: 100%;
-      background: var(--green);
-      width: 0;
-    }
-    .side {
-      display: grid;
-      gap: 16px;
-    }
-    .wide {
-      grid-column: 1 / -1;
-    }
-    .rows {
-      display: grid;
-      gap: 1px;
-      background: var(--line);
-    }
-    .row {
-      background: var(--panel);
-      display: grid;
-      grid-template-columns: 1fr auto;
-      gap: 12px;
-      padding: 12px 14px;
-      align-items: center;
-    }
-    .row small {
-      display: block;
-      color: var(--muted);
-      margin-top: 2px;
-    }
-    .node-row {
-      grid-template-columns: minmax(160px, 1.3fr) minmax(110px, 0.75fr) minmax(110px, 0.8fr) minmax(110px, 0.7fr) minmax(100px, 0.7fr);
-    }
-    .connection-row {
-      grid-template-columns: minmax(180px, 1.2fr) minmax(180px, 1fr) auto;
-    }
-    .pill {
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      padding: 4px 8px;
-      font-size: 12px;
-      color: var(--muted);
-      white-space: nowrap;
-    }
-    form {
-      display: grid;
-      grid-template-columns: 1fr 1fr auto;
-      gap: 8px;
-      padding: 14px;
-      border-top: 1px solid var(--line);
-    }
-    input {
-      min-width: 0;
-      height: 34px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      padding: 0 9px;
-      font: inherit;
-      background: #fff;
-    }
-    button {
-      height: 34px;
-      border: 1px solid #1f54d9;
-      background: var(--blue);
-      color: #fff;
-      border-radius: 6px;
-      padding: 0 12px;
-      font: inherit;
-      font-weight: 600;
-      cursor: pointer;
-    }
-    button.secondary {
-      background: #fff;
-      color: var(--text);
-      border-color: var(--line);
-    }
-    @media (max-width: 900px) {
-      main { grid-template-columns: 1fr; padding: 12px; }
-      .metrics { grid-template-columns: repeat(2, minmax(130px, 1fr)); }
-      form { grid-template-columns: 1fr; }
-      .node-row, .connection-row { grid-template-columns: 1fr; }
-      #map { height: 340px; }
-    }
-  </style>
-</head>
-<body>
-  <header>
-    <div class="brand">
-      <img class="brand-icon" src="/assets/wavey-goose.png" width="32" height="32" alt="Wavey goose">
-      <h1>av-mesh</h1>
-    </div>
-    <div id="updated" class="pill">loading</div>
-  </header>
-  <main>
-    <section>
-      <div class="section-head"><span>Topology</span><span id="nodeLabel"></span></div>
-      <canvas id="map" width="900" height="430"></canvas>
-      <div class="metrics">
-        <div class="metric"><span>Capacity</span><strong id="capacity">0%</strong><div class="bar"><div id="capacityBar"></div></div></div>
-        <div class="metric"><span>Throughput</span><strong id="throughput">0 bps</strong></div>
-        <div class="metric"><span>Contributor Streams</span><strong id="contributors">0</strong></div>
-        <div class="metric"><span>Active Streams</span><strong id="active">0</strong></div>
-      </div>
-    </section>
-    <div class="side">
-      <aside>
-        <div class="section-head"><span>Streams</span><span id="streamId"></span></div>
-        <div class="rows" id="streamRows"></div>
-      </aside>
-      <aside>
-        <div class="section-head"><span>Controls</span><span id="commandStatus"></span></div>
-        <form data-action="provision-node">
-          <input name="node_id" placeholder="node id">
-          <input name="region" placeholder="region">
-          <button type="submit">Provision</button>
-        </form>
-        <form data-action="close-node">
-          <input name="node_id" placeholder="node id">
-          <input name="region" placeholder="region">
-          <button class="secondary" type="submit">Close</button>
-        </form>
-        <form data-action="warm-stream">
-          <input name="stream_id" placeholder="stream id">
-          <input name="region" placeholder="region">
-          <button type="submit">Warm</button>
-        </form>
-        <div class="rows" id="commands"></div>
-      </aside>
-    </div>
-    <section class="wide">
-      <div class="section-head"><span>Nodes</span><span id="nodeCount">0 nodes</span></div>
-      <div class="rows" id="nodeRows"></div>
-    </section>
-    <section class="wide">
-      <div class="section-head"><span>Connections</span><span id="connectionCount">0 connections</span></div>
-      <div class="rows" id="connectionRows"></div>
-    </section>
-  </main>
-  <script>
-    const state = { snapshot: null, previousThroughput: null, events: false };
-    const number = new Intl.NumberFormat();
-    const fmtBytes = value => {
-      if (!value) return '0 B';
-      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-      let n = value;
-      let i = 0;
-      while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
-      return `${n.toFixed(n >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
-    };
-    const fmtBps = value => {
-      if (!value) return '0 bps';
-      const units = ['bps', 'Kbps', 'Mbps', 'Gbps', 'Tbps'];
-      let n = value;
-      let i = 0;
-      while (n >= 1000 && i < units.length - 1) { n /= 1000; i++; }
-      return `${n.toFixed(n >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
-    };
-    const storagePct = node => {
-      const total = node.total_storage_bytes || 1;
-      return Math.min(100, Math.round(((node.used_storage_bytes || 0) / total) * 100));
-    };
-    const streamIdText = item => item?.stream_id_text || (item?.stream_id === undefined ? '' : String(item.stream_id));
-    function streamBytes(snapshot) {
-      const streams = snapshot.streams && snapshot.streams.length ? snapshot.streams : [snapshot.stream];
-      return streams.reduce((total, stream) => total + (stream.bytes_received || 0), 0);
-    }
-    function observedThroughput(snapshot) {
-      const updated = snapshot.updated_unix_ms || Date.now();
-      const bytes = streamBytes(snapshot);
-      let bps = 0;
-      if (state.previousThroughput && updated > state.previousThroughput.updated && bytes >= state.previousThroughput.bytes) {
-        bps = ((bytes - state.previousThroughput.bytes) * 8000) / (updated - state.previousThroughput.updated);
-      }
-      state.previousThroughput = { updated, bytes };
-      return bps;
-    }
-    async function load() {
-      const res = await fetch('/api/mesh', { cache: 'no-store' });
-      if (!res.ok) throw new Error(`mesh api ${res.status}`);
-      state.snapshot = await res.json();
-      render();
-    }
-    function render() {
-      const s = state.snapshot;
-      const node = s.node;
-      const aggregate = s.aggregate || {};
-      const nodes = s.nodes && s.nodes.length ? s.nodes : [node];
-      const streams = s.streams || [];
-      const streamIds = [...new Set(streams.map(streamIdText).filter(Boolean))].sort((a, b) => a.localeCompare(b));
-      const used = aggregate.used_storage_bytes ?? node.used_storage_bytes ?? 0;
-      const total = aggregate.total_storage_bytes ?? node.total_storage_bytes ?? 1;
-      const pct = Math.min(100, Math.round((used / total) * 100));
-      const ingressBps = observedThroughput(s);
-      const egressCapacity = aggregate.total_egress_capacity_bps ?? node.egress_capacity_bps ?? 0;
-      document.getElementById('updated').textContent = new Date(s.updated_unix_ms).toLocaleTimeString();
-      document.getElementById('nodeLabel').textContent = `${nodes.length} nodes / ${node.region} / ${node.continent}`;
-      document.getElementById('capacity').textContent = `${pct}%`;
-      document.getElementById('capacityBar').style.width = `${pct}%`;
-      document.getElementById('throughput').textContent = `${fmtBps(ingressBps)} / ${fmtBps(egressCapacity)} cap`;
-      document.getElementById('contributors').textContent = aggregate.contributor_streams ?? node.contributor_streams ?? 0;
-      document.getElementById('active').textContent = aggregate.active_streams ?? node.active_streams ?? 0;
-      document.getElementById('streamId').textContent = `${streamIds.length || 1} streams`;
-      document.getElementById('streamRows').innerHTML = [
-        row('Stream ids', streamIds.length || 1, streamIds.slice(0, 8).join(', ') || streamIdText(s.stream)),
-        row('Latest local part', s.stream.latest_local_part ?? 'none', fmtBytes(s.stream.latest_local_part_bytes || 0)),
-        row('Latest mesh part', s.stream.latest_mesh_part ?? 'none', `${s.stream.mesh_peers.length} peers`),
-        row('Nodes', aggregate.node_count ?? nodes.length, `${aggregate.connection_count ?? 0} connections`),
-        row('Ingest', fmtBytes(s.stream.bytes_received), `${s.stream.datagrams_received} datagrams`),
-        row('Policy', `${s.replication_policy.baseline_per_continent}/continent`, `${s.replication_policy.baseline_per_region}/region`),
-        row('Replica plan', (s.planned_replicas || []).length, (s.planned_replicas || []).slice(0, 3).map(p => `${streamIdText(p)}:${p.target_node_id}`).join(', ') || 'none')
-      ].join('');
-      renderNodes(nodes);
-      renderConnections(s.connections || []);
-      document.getElementById('commands').innerHTML = (s.recent_commands || []).map(cmd =>
-        row(cmd.kind, cmd.node_id || cmd.region || `stream ${streamIdText(cmd)}`, cmd.status)
-      ).join('') || row('No commands', 'ready', '');
-      drawMap(s);
-    }
-    function row(label, value, sub) {
-      return `<div class="row"><div><strong>${escapeHtml(String(label))}</strong><small>${escapeHtml(String(sub || ''))}</small></div><span class="pill">${escapeHtml(String(value))}</span></div>`;
-    }
-    function renderNodes(nodes) {
-      document.getElementById('nodeCount').textContent = `${nodes.length} nodes`;
-      document.getElementById('nodeRows').innerHTML = nodes.map(node => {
-        const nodeState = node.draining ? 'draining' : `${node.region} / ${node.continent}`;
-        return `<div class="row node-row">
-          <div><strong>${escapeHtml(node.node_id)}</strong><small>${escapeHtml(nodeState)}</small></div>
-          <span class="pill">${storagePct(node)}% storage</span>
-          <span class="pill">${fmtBps(node.egress_capacity_bps || 0)}</span>
-          <span class="pill">${number.format(node.contributor_streams || 0)} contributors</span>
-          <span class="pill">${number.format(node.active_streams || 0)} active</span>
-        </div>`;
-      }).join('') || row('No nodes', 'waiting for telemetry', '');
-    }
-    function renderConnections(connections) {
-      document.getElementById('connectionCount').textContent = `${connections.length} connections`;
-      document.getElementById('connectionRows').innerHTML = connections.map(conn => {
-        const target = conn.target_node_id || conn.target_addr;
-        return `<div class="row connection-row">
-          <div><strong>${escapeHtml(conn.source_node_id)}</strong><small>source</small></div>
-          <div><strong>${escapeHtml(target)}</strong><small>${escapeHtml(conn.target_addr)}</small></div>
-          <span class="pill">${escapeHtml(conn.state)}</span>
-        </div>`;
-      }).join('') || row('No connections', 'waiting for peer gossip', '');
-    }
-    function drawMap(s) {
-      const canvas = document.getElementById('map');
-      const rect = canvas.getBoundingClientRect();
-      const scale = window.devicePixelRatio || 1;
-      canvas.width = Math.max(1, Math.floor(rect.width * scale));
-      canvas.height = Math.max(1, Math.floor(rect.height * scale));
-      const ctx = canvas.getContext('2d');
-      ctx.scale(scale, scale);
-      const w = rect.width;
-      const h = rect.height;
-      ctx.clearRect(0, 0, w, h);
-      ctx.strokeStyle = '#e2e7ef';
-      ctx.lineWidth = 1;
-      for (let x = 80; x < w; x += 120) { line(ctx, x, 0, x, h); }
-      for (let y = 70; y < h; y += 90) { line(ctx, 0, y, w, y); }
-      const cx = w / 2;
-      const cy = h / 2;
-      const nodes = s.nodes && s.nodes.length ? s.nodes : [s.node];
-      const positions = new Map();
-      nodes.forEach((node, i) => {
-        positions.set(node.node_id, nodePoint(node, i, nodes.length, w, h, cx, cy));
-      });
-      (s.connections || []).forEach(conn => {
-        const from = positions.get(conn.source_node_id);
-        if (!from) return;
-        const target = positions.get(conn.target_node_id) || positions.get(conn.target_addr) || hashPoint(conn.target_addr, w, h);
-        ctx.strokeStyle = conn.target_node_id ? '#7e98c0' : '#c3ccd9';
-        ctx.lineWidth = 1.5;
-        line(ctx, from.x, from.y, target.x, target.y);
-      });
-      nodes.forEach(node => {
-        const pos = positions.get(node.node_id);
-        const local = node.node_id === s.node.node_id;
-        dot(ctx, pos.x, pos.y, local ? 13 : 9, local ? '#2667ff' : '#ffffff', local ? '#173a91' : '#2667ff');
-        label(ctx, node.node_id, pos.x + 14, pos.y + 5, '#17202f');
-      });
-    }
-    function line(ctx, x1, y1, x2, y2) { ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke(); }
-    function dot(ctx, x, y, r, fill, stroke) { ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fillStyle = fill; ctx.fill(); ctx.strokeStyle = stroke; ctx.lineWidth = 2; ctx.stroke(); }
-    function label(ctx, text, x, y, color) { ctx.fillStyle = color; ctx.font = '12px system-ui, sans-serif'; ctx.fillText(text, x, y); }
-    function nodePoint(node, i, count, w, h, cx, cy) {
-      const lat = Number(node.latitude);
-      const lon = Number(node.longitude);
-      if (Number.isFinite(lat) && Number.isFinite(lon)) {
-        const pad = 36;
-        const x = pad + ((lon + 180) / 360) * Math.max(1, w - pad * 2);
-        const y = pad + ((90 - lat) / 180) * Math.max(1, h - pad * 2);
-        return { x, y };
-      }
-      const angle = count === 1 ? 0 : (Math.PI * 2 * i) / count;
-      const radius = count === 1 ? 0 : Math.min(w, h) * 0.34;
-      return { x: cx + Math.cos(angle) * radius, y: cy + Math.sin(angle) * radius };
-    }
-    function hashPoint(text, w, h) {
-      let hash = 0;
-      for (let i = 0; i < text.length; i++) hash = ((hash << 5) - hash + text.charCodeAt(i)) | 0;
-      const x = 40 + (Math.abs(hash) % Math.max(1, Math.floor(w - 80)));
-      const y = 40 + (Math.abs(hash >> 8) % Math.max(1, Math.floor(h - 80)));
-      return { x, y };
-    }
-    function escapeHtml(value) {
-      return value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-    }
-    document.querySelectorAll('form[data-action]').forEach(form => {
-      form.addEventListener('submit', async event => {
-        event.preventDefault();
-        const data = new FormData(form);
-        const body = {};
-        for (const [key, value] of data.entries()) {
-          if (!value) continue;
-          body[key] = key === 'stream_id' ? String(value).trim() : value;
-        }
-        const action = form.getAttribute('data-action');
-        const status = document.getElementById('commandStatus');
-        try {
-          status.textContent = 'sending';
-          const res = await fetch(`/api/control/${action}`, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify(body)
-          });
-          const command = await res.json().catch(() => null);
-          if (!res.ok) throw new Error(command?.error || `control ${res.status}`);
-          status.textContent = command?.status || 'accepted';
-          form.reset();
-          await load();
-        } catch (err) {
-          status.textContent = err.message;
-        }
-      });
-    });
-    function connectEvents() {
-      if (!('EventSource' in window)) return false;
-      const source = new EventSource('/api/mesh/events');
-      source.addEventListener('mesh', event => {
-        state.events = true;
-        state.snapshot = JSON.parse(event.data);
-        render();
-      });
-      source.onerror = () => {
-        document.getElementById('updated').textContent = state.snapshot ? 'reconnecting' : 'loading';
-      };
-      return true;
-    }
-    const eventBacked = connectEvents();
-    load().catch(err => { document.getElementById('updated').textContent = err.message; });
-    setInterval(() => {
-      if (!eventBacked || !state.events) load().catch(() => {});
-    }, 1000);
-    if (eventBacked) setInterval(() => load().catch(() => {}), 10000);
-  </script>
-</body>
-</html>"#;
+fn now_unix_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
 
 #[cfg(test)]
 mod tests {
@@ -6065,6 +7523,63 @@ mod tests {
         out.extend_from_slice(init);
         out.extend_from_slice(media);
         Bytes::from(out)
+    }
+
+    fn encode_test_canonical_fmp4_object(
+        stream_id: u64,
+        sequence: u64,
+        kind: ObjectKind,
+        keyframe: bool,
+        payload: &[u8],
+    ) -> Bytes {
+        let track = match kind {
+            ObjectKind::Initialization | ObjectKind::CodecConfiguration => "muxed-fmp4-init",
+            ObjectKind::Media | ObjectKind::Discontinuity => "muxed-fmp4",
+        };
+        let key = media_object::ObjectKey::for_payload(
+            "default",
+            stream_id.to_string(),
+            track,
+            0,
+            0,
+            sequence,
+            1,
+            payload,
+        )
+        .unwrap();
+        let object = MediaObject::builder(key, kind, payload.to_vec())
+            .with_keyframe(keyframe)
+            .with_metadata("container", b"fmp4".to_vec())
+            .build()
+            .unwrap();
+        Bytes::from(media_object::encode(&object).unwrap())
+    }
+
+    fn encode_test_canonical_fmp4_bundle(
+        stream_id: u64,
+        sequence: u64,
+        init: Option<&[u8]>,
+        media: &[u8],
+    ) -> Bytes {
+        let payload = encode_test_fmp4_slot(init, media);
+        let key = media_object::ObjectKey::for_payload(
+            "default",
+            stream_id.to_string(),
+            "muxed-fmp4",
+            0,
+            0,
+            sequence,
+            1,
+            &payload,
+        )
+        .unwrap();
+        let object = MediaObject::builder(key, ObjectKind::Media, payload.to_vec())
+            .with_keyframe(true)
+            .with_metadata("container", b"fmp4".to_vec())
+            .with_metadata("payload-format", b"fmp4-slot-v1".to_vec())
+            .build()
+            .unwrap();
+        Bytes::from(media_object::encode(&object).unwrap())
     }
 
     fn deterministic_video_payload(len: usize) -> Vec<u8> {
@@ -6105,6 +7620,28 @@ mod tests {
         let playlist = cache.playlist_for_stream_id(77).await;
         assert!(playlist.contains("part0.ts"));
         assert!(playlist.contains("#EXT-X-PRELOAD-HINT"));
+    }
+
+    #[tokio::test]
+    async fn cached_playlist_invalidates_when_a_stream_slot_changes() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        cache
+            .chunk_cache
+            .add_for_stream_id(1, 0, Bytes::from_static(b"part0"))
+            .await
+            .unwrap();
+        let first = cache.playlist().await;
+        assert!(first.contains("part0.ts"));
+        assert!(!first.contains("#EXT-X-PART:DURATION=0.500,URI=\"part1.ts\""));
+
+        cache
+            .chunk_cache
+            .add_for_stream_id(1, 1, Bytes::from_static(b"part1"))
+            .await
+            .unwrap();
+        let second = cache.playlist().await;
+        assert!(second.contains("#EXT-X-PART:DURATION=0.500,URI=\"part1.ts\""));
+        assert!(second.contains("seg0.ts"));
     }
 
     #[tokio::test]
@@ -6163,6 +7700,185 @@ mod tests {
         );
 
         mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn canonical_rq_objects_commit_by_source_sequence_under_reordering() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let stream_id = 77;
+        let initialization = encode_test_canonical_fmp4_object(
+            stream_id,
+            0,
+            ObjectKind::Initialization,
+            false,
+            b"ftypmoov",
+        );
+        cache
+            .commit_stream_payload(stream_id, initialization)
+            .await
+            .unwrap();
+
+        let part_one = encode_test_canonical_fmp4_object(
+            stream_id,
+            1,
+            ObjectKind::Media,
+            false,
+            b"moofmdat-one",
+        );
+        let part_zero = encode_test_canonical_fmp4_object(
+            stream_id,
+            0,
+            ObjectKind::Media,
+            true,
+            b"moofmdat-zero",
+        );
+        assert_eq!(
+            cache
+                .commit_stream_payload(stream_id, part_one.clone())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            cache
+                .commit_stream_payload(stream_id, part_zero.clone())
+                .await
+                .unwrap(),
+            0
+        );
+
+        assert_eq!(
+            cache.get_init_for_stream_id(stream_id).await.unwrap(),
+            Bytes::from_static(b"ftypmoov")
+        );
+        assert_eq!(
+            cache.get_part_for_stream_id(stream_id, 0).await.unwrap().0,
+            Bytes::from_static(b"moofmdat-zero")
+        );
+        assert_eq!(
+            cache.get_part_for_stream_id(stream_id, 1).await.unwrap().0,
+            Bytes::from_static(b"moofmdat-one")
+        );
+        let stream_idx = cache.chunk_cache.get_stream_idx(stream_id).await.unwrap();
+        assert_eq!(cache.chunk_cache.last(stream_idx), Some(1));
+
+        let version = cache.chunk_cache.version(stream_idx).unwrap();
+        cache
+            .commit_stream_payload(stream_id, part_zero)
+            .await
+            .unwrap();
+        assert_eq!(cache.chunk_cache.version(stream_idx), Some(version));
+
+        let conflicting_zero = encode_test_canonical_fmp4_object(
+            stream_id,
+            0,
+            ObjectKind::Media,
+            true,
+            b"different-object-at-zero",
+        );
+        assert!(cache
+            .commit_stream_payload(stream_id, conflicting_zero)
+            .await
+            .is_err());
+        assert_eq!(
+            cache.get_part_for_stream_id(stream_id, 0).await.unwrap().0,
+            Bytes::from_static(b"moofmdat-zero")
+        );
+
+        let cross_stream = encode_test_canonical_fmp4_object(
+            stream_id + 1,
+            2,
+            ObjectKind::Media,
+            false,
+            b"cross-stream-object",
+        );
+        assert!(cache
+            .commit_stream_payload(stream_id, cross_stream.clone())
+            .await
+            .is_err());
+        cache
+            .chunk_cache
+            .add_for_stream_id(stream_id, 2, cross_stream)
+            .await
+            .unwrap();
+        assert!(cache.get_part_for_stream_id(stream_id, 2).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn canonical_initialization_survives_the_rolling_media_window() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(50), 2, 4, 64).await;
+        let stream_id = 91;
+        cache
+            .commit_stream_payload(
+                stream_id,
+                encode_test_canonical_fmp4_object(
+                    stream_id,
+                    0,
+                    ObjectKind::Initialization,
+                    false,
+                    b"ftyp-moov-durable",
+                ),
+            )
+            .await
+            .unwrap();
+
+        for sequence in 0..40 {
+            cache
+                .commit_stream_payload(
+                    stream_id,
+                    encode_test_canonical_fmp4_object(
+                        stream_id,
+                        sequence,
+                        ObjectKind::Media,
+                        sequence == 0,
+                        format!("moof-mdat-{sequence}").as_bytes(),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+
+        assert!(cache.get_part_for_stream_id(stream_id, 0).await.is_none());
+        assert_eq!(
+            cache.get_init_for_stream_id(stream_id).await.unwrap(),
+            Bytes::from_static(b"ftyp-moov-durable")
+        );
+        assert!(cache
+            .playlist_for_stream_id(stream_id)
+            .await
+            .contains("#EXT-X-MAP:URI=\"init.mp4\""));
+    }
+
+    #[tokio::test]
+    async fn canonical_fmp4_bundle_preserves_init_across_cache_replication() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let stream_id = 88;
+        let sequence = 7;
+        let envelope = encode_test_canonical_fmp4_bundle(
+            stream_id,
+            sequence,
+            Some(b"ftypmoov-replicated"),
+            b"moofmdat-replicated",
+        );
+
+        cache
+            .chunk_cache
+            .add_for_stream_id(stream_id, sequence as usize, envelope)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            cache
+                .get_part_for_stream_id(stream_id, sequence)
+                .await
+                .unwrap()
+                .0,
+            Bytes::from_static(b"moofmdat-replicated")
+        );
+        assert_eq!(
+            cache.get_init_for_stream_id(stream_id).await.unwrap(),
+            Bytes::from_static(b"ftypmoov-replicated")
+        );
     }
 
     #[test]
@@ -6229,6 +7945,11 @@ mod tests {
         assert!(!args.edge_webtransport);
         assert!(args.raw_tcp_port.is_none());
         assert_eq!(args.telemetry_dns_name, "local.wavey.ai");
+        assert_eq!(args.mesh_sync_interval_ms, 20);
+        assert_eq!(args.mesh_repair_symbols, 1);
+        assert_eq!(args.mesh_repair_ratio, 0.03);
+        assert_eq!(args.mesh_max_repair_symbols, 32);
+        assert_eq!(args.mesh_symbol_size, 1316);
     }
 
     #[test]
@@ -6247,6 +7968,58 @@ mod tests {
         assert!(args.edge_websocket);
         assert!(args.edge_webtransport);
         assert_eq!(args.raw_tcp_port, Some(19000));
+    }
+
+    #[test]
+    fn controlled_relay_cli_binds_two_parent_lanes_to_one_receiver() {
+        let args = Args::try_parse_from([
+            "av-mesh",
+            "--node-id",
+            "edge-london",
+            "--fec-bind",
+            "127.0.0.1:12001",
+            "--relay-controlled-local",
+            "--relay-primary-bind",
+            "127.0.0.1:12001",
+            "--relay-primary-peer",
+            "127.0.0.1:13001",
+            "--relay-primary-id",
+            "contrib-primary",
+            "--relay-secondary-bind",
+            "127.0.0.1:12002",
+            "--relay-secondary-peer",
+            "127.0.0.1:13002",
+            "--relay-secondary-id",
+            "contrib-secondary",
+            "--relay-topology-generation",
+            "7",
+            "--relay-subscription-id",
+            "19",
+        ])
+        .unwrap()
+        .normalized()
+        .unwrap();
+        let dispatch = configured_relay_udp_dispatch(&args, "edge-london").unwrap();
+        let snapshot = dispatch.receiver().snapshot();
+
+        assert_eq!(args.relay_primary_bind, Some(args.fec_bind));
+        assert_eq!(
+            args.relay_secondary_bind,
+            Some("127.0.0.1:12002".parse().unwrap())
+        );
+        assert_eq!(snapshot.primary_sessions, 1);
+        assert_eq!(snapshot.secondary_sessions, 1);
+        assert_eq!(snapshot.controlled_sessions, 2);
+        assert_eq!(snapshot.authenticated_sessions, 0);
+    }
+
+    #[test]
+    fn relay_peer_configuration_requires_explicit_controlled_mode() {
+        let error = Args::try_parse_from(["av-mesh", "--relay-primary-peer", "127.0.0.1:13001"])
+            .unwrap()
+            .normalized()
+            .unwrap_err();
+        assert!(error.to_string().contains("--relay-controlled-local"));
     }
 
     #[test]
@@ -6516,7 +8289,7 @@ mod tests {
         let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
         let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
         let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
-        cache.push_payload(b"mesh-ui-part").await.unwrap();
+        cache.push_payload(b"mission-control-part").await.unwrap();
         cache.rotate_if_due(true).await.unwrap();
         let req = Request::builder()
             .method(Method::GET)
@@ -6544,77 +8317,187 @@ mod tests {
             "https://test-node.local/live"
         );
         assert_eq!(json["edge_services"][0]["active_readers"], 0);
+        assert_eq!(json["relay_session"]["active_objects"], 0);
+        assert_eq!(json["relay_session"]["source_datagrams"], 0);
+        assert_eq!(json["relay_session"]["authentication_drops"], 0);
         mesh.shutdown();
     }
 
     #[tokio::test]
-    async fn mesh_ui_serves_topology_inventory_and_operator_controls() {
-        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+    async fn mesh_prometheus_metrics_expose_topology_edge_and_stream_health() {
+        let mut local = telemetry_snapshot_for_tests(
+            "uk-1",
+            "uk",
+            "eu",
+            51.5,
+            -0.1,
+            vec![PeerSnapshot {
+                addr: "us-1".into(),
+                state: "discovered".into(),
+            }],
+            77,
+        );
+        local.edge_service = Some(EdgeServiceSnapshot {
+            node_id: "uk-1".into(),
+            region: "uk".into(),
+            continent: "eu".into(),
+            playback_base_url: Some("https://uk.example/live".into()),
+            active_readers: 2,
+            requests_served: 10,
+            bytes_served: 20_000,
+            llhls_tail_requests: 5,
+            responses_total: 12,
+            response_errors: 1,
+            response_not_found: 1,
+            last_response_unix_ms: Some(now_unix_ms()),
+            response_duration_count: 12,
+            response_duration_sum_us: 18_000,
+            response_duration_p95_us: Some(2_500),
+            response_duration_buckets: EDGE_RESPONSE_DURATION_BUCKETS_US
+                .iter()
+                .map(|upper_bound| u64::from(*upper_bound >= 2_500) * 12)
+                .collect(),
+            recent_responses: Vec::new(),
+            draining: false,
+        });
+        let mut snapshot = TelemetryAggregator::default().snapshot(local).await;
+        snapshot.mesh_fec = MeshFecRuntimeSnapshot {
+            tx_objects: 8,
+            tx_source_datagrams: 16,
+            tx_repair_datagrams: 4,
+            rx_decoded_objects: 7,
+            rx_repaired_objects: 2,
+            rx_repaired_source_datagrams: 3,
+            rx_late_source_datagrams: 1,
+            rx_presumed_lost_source_datagrams: 2,
+            rx_inflight_objects: 1,
+            ..MeshFecRuntimeSnapshot::default()
+        };
+        snapshot.relay_session = RelaySessionIngressSnapshot {
+            primary_sessions: 1,
+            secondary_sessions: 1,
+            authenticated_sessions: 2,
+            active_objects: 3,
+            active_object_bytes: 24_000,
+            source_datagrams: 40,
+            repair_datagrams: 8,
+            decoded_objects: 9,
+            repaired_objects: 4,
+            expired_objects: 2,
+            conflict_drops: 1,
+            authentication_drops: 2,
+            deadline_drops: 3,
+            downstream_children: 1,
+            forwarded_source_datagrams: 20,
+            forwarded_repair_datagrams: 4,
+            forwarded_bytes: 32_000,
+            forward_errors: 2,
+            forward_duration_count: 24,
+            forward_duration_sum_us: 2_400,
+            forward_duration_max_us: 240,
+            forward_duration_buckets: [24; EDGE_RESPONSE_DURATION_BUCKETS_US.len()],
+            ..RelaySessionIngressSnapshot::default()
+        };
+
+        let metrics = render_mesh_prometheus_metrics(&snapshot);
+
+        assert!(metrics.contains("# TYPE av_mesh_nodes gauge\n"));
+        assert!(metrics.contains("av_mesh_nodes 1\n"));
+        assert!(metrics.contains("av_mesh_transport_sync_interval_seconds 0.02\n"));
+        assert!(metrics.contains("av_mesh_transport_fec_repair_ratio 0.03\n"));
+        assert!(metrics.contains("av_mesh_transport_fec_min_repair_symbols 1\n"));
+        assert!(metrics.contains("av_mesh_transport_fec_max_repair_symbols 32\n"));
+        assert!(metrics.contains("av_mesh_fec_tx_objects_total 8\n"));
+        assert!(metrics.contains("av_mesh_fec_tx_datagrams_total{kind=\"source\"} 16\n"));
+        assert!(metrics.contains("av_mesh_fec_tx_datagrams_total{kind=\"repair\"} 4\n"));
+        assert!(metrics.contains("av_mesh_fec_rx_objects_total{outcome=\"repaired\"} 2\n"));
+        assert!(metrics.contains("av_mesh_fec_rx_repaired_source_datagrams_total 3\n"));
+        assert!(metrics.contains("av_mesh_fec_rx_late_source_datagrams_total 1\n"));
+        assert!(metrics.contains("av_mesh_fec_rx_presumed_lost_source_datagrams_total 2\n"));
+        assert!(metrics.contains("av_mesh_fec_rx_inflight_objects 1\n"));
+        assert!(metrics.contains("av_mesh_relay_session_parent_sessions{role=\"primary\"} 1\n"));
+        assert!(metrics.contains("av_mesh_relay_session_active_object_bytes 24000\n"));
+        assert!(metrics.contains("av_mesh_relay_session_datagrams_total{outcome=\"repair\"} 8\n"));
+        assert!(metrics.contains("av_mesh_relay_session_objects_total{outcome=\"repaired\"} 4\n"));
+        assert!(metrics.contains("av_mesh_relay_session_drops_total{reason=\"deadline\"} 3\n"));
+        assert!(metrics.contains("av_mesh_relay_session_downstream_children 1\n"));
+        assert!(metrics
+            .contains("av_mesh_relay_session_forwarded_datagrams_total{role=\"source\"} 20\n"));
+        assert!(metrics.contains("av_mesh_relay_session_forwarded_bytes_total 32000\n"));
+        assert!(metrics.contains("av_mesh_relay_session_forward_errors_total 2\n"));
+        assert!(metrics.contains("av_mesh_relay_session_forward_duration_us_count 24\n"));
+        assert!(metrics.contains("av_mesh_relay_session_forward_duration_max_us 240\n"));
+        assert!(metrics.contains("av_mesh_edge_active_readers{node_id=\"uk-1\",region=\"uk\"} 2\n"));
+        assert!(metrics.contains(
+            "av_mesh_stream_bytes_received_total{node_id=\"uk-1\",stream_id=\"77\"} 20000\n"
+        ));
+        assert!(metrics.contains("av_mesh_stream_lag_parts{node_id=\"uk-1\",stream_id=\"77\"} 0\n"));
+        assert!(metrics.contains(
+            "av_mesh_edge_response_duration_seconds_count{node_id=\"uk-1\",region=\"uk\"} 12\n"
+        ));
+        assert_eq!(prometheus_label_value("node\\\"\n"), "node\\\\\\\"\\n");
+    }
+
+    #[tokio::test]
+    async fn mesh_metrics_route_serves_prometheus_exposition_and_edge_latency() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(50), 2, 6, 64).await;
         let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
         let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
-        let req = Request::builder()
+        cache.push_payload(b"latency-metric-part").await.unwrap();
+        cache.rotate_if_due(true).await.unwrap();
+
+        let playlist_req = Request::builder()
             .method(Method::GET)
-            .uri("/mesh")
+            .uri("/live/stream.m3u8")
             .body(())
             .unwrap();
+        assert_eq!(
+            router.route(playlist_req).await.unwrap().status,
+            StatusCode::OK
+        );
 
-        let response = router.route(req).await.unwrap();
+        let metrics_req = Request::builder()
+            .method(Method::GET)
+            .uri(MESH_METRICS_PATH)
+            .body(())
+            .unwrap();
+        let response = router.route(metrics_req).await.unwrap();
 
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(
             response.content_type.as_deref(),
-            Some("text/html; charset=utf-8")
+            Some(PROMETHEUS_CONTENT_TYPE)
         );
-        let body = String::from_utf8(response.body.unwrap().to_vec()).unwrap();
-        if body.contains("av mission control") {
-            for expected in ["av mission control", "type=\"module\"", "av-mesh-dashboard"] {
-                assert!(
-                    body.contains(expected),
-                    "Leptos dashboard missing expected fragment: {expected}"
-                );
-            }
-        } else {
-            for expected in [
-                "id=\"map\"",
-                "id=\"nodeRows\"",
-                "id=\"connectionRows\"",
-                "id=\"capacity\"",
-                "id=\"throughput\"",
-                "id=\"contributors\"",
-                "id=\"active\"",
-                "class=\"brand-icon\"",
-                "src=\"/assets/wavey-goose.png\"",
-                "data-action=\"provision-node\"",
-                "data-action=\"close-node\"",
-                "data-action=\"warm-stream\"",
-                "new EventSource('/api/mesh/events')",
-                "renderNodes(nodes)",
-                "renderConnections(s.connections || [])",
-            ] {
-                assert!(
-                    body.contains(expected),
-                    "legacy dashboard missing expected fragment: {expected}"
-                );
-            }
-        }
+        let metrics = String::from_utf8(response.body.unwrap().to_vec()).unwrap();
+        assert!(metrics.contains("av_mesh_nodes 1\n"));
+        assert!(metrics.contains(
+            "av_mesh_edge_response_duration_seconds_count{node_id=\"test-node\",region=\"test-region\"} 1\n"
+        ));
 
-        let icon_req = Request::builder()
-            .method(Method::GET)
-            .uri("/assets/wavey-goose.png")
-            .body(())
-            .unwrap();
-        let icon_response = router.route(icon_req).await.unwrap();
-        assert_eq!(icon_response.status, StatusCode::OK);
-        assert_eq!(icon_response.content_type.as_deref(), Some("image/png"));
-        let icon = icon_response.body.unwrap();
-        assert!(icon.starts_with(b"\x89PNG\r\n\x1a\n"));
         mesh.shutdown();
     }
 
     #[test]
-    fn dashboard_dist_response_serves_leptos_assets_when_present() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("av-mesh-dashboard-dist-test-{}", now_unix_ms()));
+    fn mission_control_setup_response_is_concise_and_actionable() {
+        let response = mission_control_setup_response();
+        assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.content_type.as_deref(),
+            Some("text/plain; charset=utf-8")
+        );
+        let body = String::from_utf8(response.body.unwrap().to_vec()).unwrap();
+        assert_eq!(
+            body,
+            "Needletail Mission Control setup: configure NEEDLETAIL_MISSION_CONTROL_DIST with the built asset directory.\n"
+        );
+    }
+
+    #[test]
+    fn mission_control_asset_response_serves_leptos_assets_when_present() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "needletail-mission-control-dist-test-{}",
+            now_unix_ms()
+        ));
         std::fs::create_dir_all(&temp_dir).unwrap();
         std::fs::write(
             temp_dir.join("index.html"),
@@ -6624,7 +8507,7 @@ mod tests {
         std::fs::write(temp_dir.join("app.js"), "export default {};").unwrap();
         std::fs::write(temp_dir.join("app_bg.wasm"), b"\0asm").unwrap();
 
-        let index = dashboard_dist_response_from_dir(&temp_dir, "/mesh").unwrap();
+        let index = mission_control_asset_response_from_dir(&temp_dir, "/mesh").unwrap();
         assert_eq!(index.status, StatusCode::OK);
         assert_eq!(
             index.content_type.as_deref(),
@@ -6638,14 +8521,14 @@ mod tests {
             .iter()
             .any(|(name, value)| name == "cache-control" && value.contains("no-store")));
 
-        let js = dashboard_dist_response_from_dir(&temp_dir, "/app.js").unwrap();
+        let js = mission_control_asset_response_from_dir(&temp_dir, "/app.js").unwrap();
         assert_eq!(
             js.content_type.as_deref(),
             Some("text/javascript; charset=utf-8")
         );
-        let wasm = dashboard_dist_response_from_dir(&temp_dir, "/app_bg.wasm").unwrap();
+        let wasm = mission_control_asset_response_from_dir(&temp_dir, "/app_bg.wasm").unwrap();
         assert_eq!(wasm.content_type.as_deref(), Some("application/wasm"));
-        assert!(dashboard_dist_response_from_dir(&temp_dir, "/live/stream.m3u8").is_none());
+        assert!(mission_control_asset_response_from_dir(&temp_dir, "/live/stream.m3u8").is_none());
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
@@ -8874,7 +10757,14 @@ mod tests {
         let bind = socket.local_addr().unwrap();
         let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
         let (shutdown_tx, shutdown_rx) = watch::channel(());
-        let task = tokio::spawn(run_udp_fec_ingest(socket, Arc::clone(&cache), shutdown_rx));
+        let task = tokio::spawn(run_udp_fec_ingest(
+            socket,
+            Arc::clone(&cache),
+            shutdown_rx,
+            empty_relay_udp_dispatch(),
+            None,
+            None,
+        ));
         let mut sender = UdpFecSender::new(bind).await.unwrap();
 
         sender.send(b"fec-part-0").await.unwrap();
@@ -8896,27 +10786,110 @@ mod tests {
         assert_eq!(bytes, Bytes::from_static(b"fec-part-0"));
     }
 
+    #[test]
+    fn relay_forward_endpoint_requires_explicit_bind_and_target() {
+        assert_eq!(
+            parse_relay_forward_endpoint("127.0.0.1:24001=127.0.0.1:25001,source").unwrap(),
+            RelayForwardEndpoint {
+                bind: "127.0.0.1:24001".parse().unwrap(),
+                target: "127.0.0.1:25001".parse().unwrap(),
+                role: RelayForwardRole::Source,
+            }
+        );
+        assert!(parse_relay_forward_endpoint("127.0.0.1:24001").is_err());
+        assert!(parse_relay_forward_endpoint("invalid=127.0.0.1:25001").is_err());
+    }
+
     #[tokio::test]
-    async fn udp_fec_ingest_writes_stream_prefixed_slots() {
-        use raptorq_fec_transport::FecDatagramEncoder;
+    async fn relay_forwarder_preserves_exact_raptorq_wire_datagram_and_role_metrics() {
+        use tokio::time::timeout;
+
+        let child = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = RelayForwardEndpoint {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            target: child.local_addr().unwrap(),
+            role: RelayForwardRole::Repair,
+        };
+        let forwarder = RelayDownstreamForwarder::bind(&[endpoint])
+            .await
+            .unwrap()
+            .unwrap();
+        let expected = b"RLS1-exact-canonical-symbol";
+        forwarder
+            .forward(b"RLS1-warm-source-state", MediaDatagramRole::Source)
+            .await;
+        assert!(timeout(Duration::from_millis(20), async {
+            let mut discarded = [0u8; 64];
+            child.recv_from(&mut discarded).await
+        })
+        .await
+        .is_err());
+        forwarder.forward(expected, MediaDatagramRole::Repair).await;
+
+        let mut received = [0u8; 64];
+        let (len, _) = timeout(Duration::from_secs(1), child.recv_from(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&received[..len], expected);
+        let snapshot = forwarder.snapshot();
+        assert_eq!(snapshot.downstream_children, 1);
+        assert_eq!(snapshot.source_datagrams, 0);
+        assert_eq!(snapshot.repair_datagrams, 1);
+        assert_eq!(snapshot.bytes, expected.len() as u64);
+        assert_eq!(snapshot.errors, 0);
+        assert_eq!(snapshot.filtered_datagrams, 1);
+        assert_eq!(snapshot.duration_count, 1);
+    }
+
+    #[tokio::test]
+    async fn udp_fec_ingest_commits_one_exact_canonical_object_after_loss_and_reordering() {
+        use raptorq_datagram_fec::DatagramFecEncoder;
         use tokio::time::timeout;
 
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let bind = socket.local_addr().unwrap();
         let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
         let (shutdown_tx, shutdown_rx) = watch::channel(());
-        let task = tokio::spawn(run_udp_fec_ingest(socket, Arc::clone(&cache), shutdown_rx));
+        let task = tokio::spawn(run_udp_fec_ingest(
+            socket,
+            Arc::clone(&cache),
+            shutdown_rx,
+            empty_relay_udp_dispatch(),
+            None,
+            None,
+        ));
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let stream_id = 77;
-        let mut encoder = FecDatagramEncoder::webtransport_with_stream_prefix(stream_id);
+        let stream_id = 77u64;
+        let payload = (0..6_001)
+            .map(|index| ((index * 31 + 17) % 251) as u8)
+            .collect::<Vec<_>>();
+        let sequence = 42;
+        let envelope = encode_test_canonical_fmp4_bundle(
+            stream_id,
+            sequence,
+            Some(b"ftypmoov-loss-test"),
+            &payload,
+        );
+        let mut encoder = DatagramFecEncoder::new().with_symbol_size(1_316);
+        let datagrams = encoder
+            .encode_object_with_repair_symbols(&envelope, 3)
+            .unwrap();
+        assert_eq!(encoder.block_id(), 1);
+        assert_eq!(datagrams.len(), 8);
 
-        for datagram in encoder.encode_payload(b"prefixed-fmp4-or-bytes").unwrap() {
-            sender.send_to(&datagram, bind).await.unwrap();
+        for datagram in datagrams.into_iter().skip(1).rev() {
+            let mut framed = Vec::with_capacity(8 + datagram.len());
+            framed.extend_from_slice(&stream_id.to_be_bytes());
+            framed.extend_from_slice(&datagram);
+            sender.send_to(&framed, bind).await.unwrap();
         }
 
         let bytes = timeout(Duration::from_secs(3), async {
             loop {
-                if let Some((bytes, _hash)) = cache.get_part_for_stream_id(stream_id, 0).await {
+                if let Some((bytes, _hash)) =
+                    cache.get_part_for_stream_id(stream_id, sequence).await
+                {
                     break bytes;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -8925,7 +10898,181 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(bytes, Bytes::from_static(b"prefixed-fmp4-or-bytes"));
+        assert_eq!(bytes.as_ref(), payload.as_slice());
+        assert_eq!(
+            cache.get_init_for_stream_id(stream_id).await.unwrap(),
+            Bytes::from_static(b"ftypmoov-loss-test")
+        );
+        // The recovered object remains addressable, while contiguous playlist
+        // publication waits for the local subscription base rather than
+        // advertising a head across the 0..sequence gap.
+        assert!(cache.stream_position_for_id(stream_id).await.is_none());
+        assert!(cache
+            .get_part_for_stream_id(stream_id, sequence - 1)
+            .await
+            .is_none());
+        let _ = shutdown_tx.send(());
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_session_two_socket_ingest_combines_primary_source_and_secondary_repair() {
+        use relay_session::{
+            encode_datagram, AdaptiveFecController, AdaptiveFecPolicy, CongestionConfig,
+            MediaDeadline, MediaPriority, RaptorQObjectEncoder, RelayLimits, RepairRequest,
+            RequestId, SecondaryRepairResponder,
+        };
+        use tokio::time::timeout;
+
+        let primary_ingest = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let primary_target = primary_ingest.local_addr().unwrap();
+        let secondary_ingest = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let secondary_target = secondary_ingest.local_addr().unwrap();
+        let primary_sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let secondary_sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let primary_peer = primary_sender.local_addr().unwrap();
+        let secondary_peer = secondary_sender.local_addr().unwrap();
+        let generation = TopologyGeneration::new(7).unwrap();
+        let subscription_id = SubscriptionId::new(19).unwrap();
+
+        let receiver = RelayObjectReceiver::new(RelayObjectReceiverConfig::default()).unwrap();
+        let mut dispatch = RelayUdpDispatch::new(receiver);
+        for (session_id, peer, peer_id, path) in [
+            (1, primary_peer, "contrib-primary", ParentPath::Primary),
+            (
+                2,
+                secondary_peer,
+                "contrib-secondary",
+                ParentPath::Secondary,
+            ),
+        ] {
+            dispatch
+                .bind_controlled_peer(
+                    peer,
+                    ControlledRelayParentSession::new(
+                        session_id,
+                        CarrierIdentity {
+                            local: NodeId::new("edge-london").unwrap(),
+                            peer: NodeId::new(peer_id).unwrap(),
+                            kind: CarrierKind::PrivateUdp,
+                            trust_mode: TrustMode::ControlledPrivateNetwork,
+                        },
+                        generation,
+                        subscription_id,
+                        path,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let task = tokio::spawn(run_udp_fec_ingest(
+            primary_ingest,
+            Arc::clone(&cache),
+            shutdown_rx,
+            dispatch,
+            Some(secondary_ingest),
+            None,
+        ));
+
+        let stream_id = 77u64;
+        let media = (0..12_001)
+            .map(|index| ((index * 31 + 17) % 251) as u8)
+            .collect::<Vec<_>>();
+        let envelope = encode_test_canonical_fmp4_bundle(
+            stream_id,
+            0,
+            Some(b"ftypmoov-relay-session"),
+            &media,
+        );
+        let object = media_object::decode(&envelope).unwrap();
+        let policy = AdaptiveFecPolicy {
+            min_repair_symbols: 1,
+            max_repair_symbols: 1,
+            min_repair_ratio: 0.0,
+            max_repair_ratio: 0.0,
+            symbol_size: 400,
+            ..AdaptiveFecPolicy::default()
+        };
+        let mut encoder = RaptorQObjectEncoder::new(
+            AdaptiveFecController::new(policy, CongestionConfig::default()),
+            RelayLimits::default(),
+        )
+        .unwrap();
+        let encoded = encoder
+            .encode_object(
+                &object,
+                generation,
+                subscription_id,
+                MediaDeadline::from_micros(now_unix_us().saturating_add(5_000_000)),
+                MediaPriority::VideoKey,
+            )
+            .unwrap();
+        let mut responder = SecondaryRepairResponder::new(
+            &object,
+            encoded.announcement.clone(),
+            RelayLimits::default(),
+        )
+        .unwrap();
+        let repairs = responder
+            .fulfill(
+                &RepairRequest {
+                    request_id: RequestId::new(1).unwrap(),
+                    generation,
+                    subscription_id,
+                    key: object.key().clone(),
+                    block_id: encoded.announcement.coding.block_id(),
+                    next_repair_ordinal: encoded.announcement.initial_repair_symbols,
+                    additional_symbols: 7,
+                    deadline: encoded.announcement.deadline,
+                },
+                now_unix_us(),
+            )
+            .unwrap();
+
+        for (index, symbol) in encoded.source_symbols.iter().enumerate() {
+            if matches!(index, 1 | 5 | 9 | 13 | 17) {
+                continue;
+            }
+            let wire = encode_datagram(symbol, RelayLimits::default()).unwrap();
+            primary_sender.send_to(&wire, primary_target).await.unwrap();
+        }
+        for symbol in repairs {
+            let wire = encode_datagram(&symbol, RelayLimits::default()).unwrap();
+            secondary_sender
+                .send_to(&wire, secondary_target)
+                .await
+                .unwrap();
+        }
+
+        let recovered = timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some((bytes, _)) = cache.get_part_for_stream_id(stream_id, 0).await {
+                    break bytes;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(recovered.as_ref(), media.as_slice());
+        assert_eq!(
+            cache.get_init_for_stream_id(stream_id).await.unwrap(),
+            Bytes::from_static(b"ftypmoov-relay-session")
+        );
+        let playlist = cache.playlist_for_stream_id(stream_id).await;
+        assert!(playlist.contains("#EXT-X-MAP:URI=\"init.mp4\""));
+        assert!(playlist.contains("part0.mp4"));
+        let relay = cache.relay_ingress_snapshot();
+        assert_eq!(relay.primary_sessions, 1);
+        assert_eq!(relay.secondary_sessions, 1);
+        assert_eq!(relay.controlled_sessions, 2);
+        assert_eq!(relay.decoded_objects, 1);
+        assert_eq!(relay.repaired_objects, 1);
+        assert!(relay.source_datagrams > 0);
+        assert!(relay.repair_datagrams > 0);
         let _ = shutdown_tx.send(());
         task.await.unwrap().unwrap();
     }
@@ -8942,6 +11089,7 @@ mod tests {
         let task = tokio::spawn(run_udp_media_fec_ingest(
             socket,
             Arc::clone(&cache),
+            broadcast::channel(AUDIO_EPOCH_BROADCAST_CAPACITY).0,
             shutdown_rx,
         ));
 
@@ -8986,6 +11134,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn media_udp_fec_ingest_broadcasts_audio_epoch_datagrams() {
+        use tokio::time::timeout;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind = socket.local_addr().unwrap();
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let (audio_epoch_tx, mut audio_epoch_rx) = broadcast::channel(8);
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let task = tokio::spawn(run_udp_media_fec_ingest(
+            socket,
+            Arc::clone(&cache),
+            audio_epoch_tx,
+            shutdown_rx,
+        ));
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let epoch_datagram = Bytes::from_static(b"AEP1source-or-repair-shard");
+        assert!(is_multichannel_audio_transport_datagram(&epoch_datagram));
+        sender.send_to(&epoch_datagram, bind).await.unwrap();
+
+        let received = timeout(Duration::from_secs(3), audio_epoch_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, epoch_datagram);
+        assert!(cache.get_media_access_unit(1, 0).await.is_none());
+
+        let _ = shutdown_tx.send(());
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn media_udp_fec_ingest_recovers_video_access_units_with_lost_datagrams() {
         use raptorq_datagram_fec::{MediaFecEncoder, MediaFrame, NetworkMetrics};
         use tokio::time::timeout;
@@ -9005,6 +11185,7 @@ mod tests {
         let task = tokio::spawn(run_udp_media_fec_ingest(
             socket,
             Arc::clone(&cache),
+            broadcast::channel(AUDIO_EPOCH_BROADCAST_CAPACITY).0,
             shutdown_rx,
         ));
 
@@ -9163,6 +11344,7 @@ mod tests {
         let task = tokio::spawn(run_udp_media_fec_ingest(
             socket,
             Arc::clone(&cache),
+            broadcast::channel(AUDIO_EPOCH_BROADCAST_CAPACITY).0,
             shutdown_rx,
         ));
 
@@ -9470,6 +11652,8 @@ mod tests {
         AppRouter::new(
             cache,
             mesh,
+            broadcast::channel(AUDIO_EPOCH_BROADCAST_CAPACITY).0,
+            MeshTransportConfigSnapshot::default(),
             node,
             replication_policy,
             ControlPlane::default(),
@@ -9533,6 +11717,7 @@ mod tests {
             },
             mesh_addr: Some(node_id.into()),
             edge_service: None,
+            relay_session: RelaySessionIngressSnapshot::default(),
             peers,
             stream: StatsSnapshot {
                 stream_id,

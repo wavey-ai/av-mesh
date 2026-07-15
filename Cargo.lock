@@ -148,6 +148,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "av-web-service",
  "base64 0.22.1",
  "bytes",
  "clap 4.6.1",
@@ -159,11 +160,13 @@ dependencies = [
  "hyper 1.10.1",
  "hyper-util",
  "linode",
+ "media-object",
  "message-packetizer 0.1.0 (git+https://github.com/wavey-ai/message-packetizer.git)",
  "playlists",
  "raptorq-datagram-fec",
  "raptorq-fec-transport",
  "rcgen",
+ "relay-session",
  "serde",
  "serde_json",
  "tcp-changes",
@@ -171,7 +174,49 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
- "web-service",
+]
+
+[[package]]
+name = "av-web-service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "dotenvy",
+ "env_logger",
+ "futures-util",
+ "gen-id 0.3.0 (git+https://github.com/wavey-ai/gen-id.git)",
+ "h2 0.4.14",
+ "h3",
+ "h3-datagram",
+ "h3-quinn",
+ "h3-webtransport",
+ "http 1.4.1",
+ "http-body-util",
+ "http-pack",
+ "hyper 1.10.1",
+ "hyper-rustls",
+ "hyper-util",
+ "playlists",
+ "quinn",
+ "regex",
+ "rustls 0.23.40",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "structopt",
+ "thiserror 2.0.18",
+ "tls-helpers 0.2.0 (git+https://github.com/wavey-ai/tls-helpers.git)",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "webpki-roots 1.0.7",
+ "xmpegts",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -1095,7 +1140,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "system-configuration",
  "tokio",
  "tower-layer",
@@ -1401,6 +1446,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2532096657941c2fea9c289d370a250971c689d4f143798ff67113ec042024a5"
 
 [[package]]
+name = "media-object"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1649,7 +1701,6 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 [[package]]
 name = "playlists"
 version = "0.1.3"
-source = "git+https://github.com/wavey-ai/playlists.git#c18b6440ebfacd7f11e47facbae3340849d9dc94"
 dependencies = [
  "access-unit",
  "bytes",
@@ -1760,7 +1811,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.40",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -1797,7 +1848,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -1922,8 +1973,7 @@ checksum = "4d4215fb79ef19442a0c71616aabb0715a386e6a16ed9031775ee3e3f20e7502"
 
 [[package]]
 name = "raptorq-datagram-fec"
-version = "0.1.2"
-source = "git+https://github.com/wavey-ai/raptor-fec.git#99470906ea0f608057b440b481dcac53ab169691"
+version = "0.1.3"
 dependencies = [
  "bytes",
  "raptorq",
@@ -1933,7 +1983,6 @@ dependencies = [
 [[package]]
 name = "raptorq-fec-transport"
 version = "0.1.2"
-source = "git+https://github.com/wavey-ai/raptor-fec.git#99470906ea0f608057b440b481dcac53ab169691"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1999,6 +2048,17 @@ name = "regex-syntax"
 version = "0.8.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
+
+[[package]]
+name = "relay-session"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "media-object",
+ "raptorq-datagram-fec",
+ "thiserror 2.0.18",
+ "tokio",
+]
 
 [[package]]
 name = "reqwest"
@@ -2752,9 +2812,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-tungstenite"
-version = "0.27.0"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "489a59b6730eda1b0171fcfda8b121f4bee2b35cba8645ca35c5f7ba3eb736c1"
+checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
 dependencies = [
  "futures-util",
  "log",
@@ -2920,9 +2980,9 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tungstenite"
-version = "0.27.0"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eadc29d668c91fcc564941132e17b28a7ceb2f3ebf0b9dae3e03fd7a6748eb0d"
+checksum = "6c01152af293afb9c7c2a57e4b559c5620b421f6d133261c60dd2d0cdb38e6b8"
 dependencies = [
  "bytes",
  "data-encoding",
@@ -2934,7 +2994,6 @@ dependencies = [
  "rustls-pki-types",
  "sha1",
  "thiserror 2.0.18",
- "utf-8",
 ]
 
 [[package]]
@@ -3012,12 +3071,6 @@ dependencies = [
  "serde",
  "serde_derive",
 ]
-
-[[package]]
-name = "utf-8"
-version = "0.7.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09cc8ee72d2a9becf2f2febe0205bbed8fc6615b7cb429ad062dc7b7ddd036a9"
 
 [[package]]
 name = "utf8_iter"
@@ -3126,50 +3179,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a929b2c61f11ba3e9bc35b50c1f25cb38e0e892c0c231ae2b8cf78d5dad4437"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "web-service"
-version = "0.1.0"
-source = "git+https://github.com/wavey-ai/web-services.git#39da362892a65a738d6ce52e94056a7cdc74ef95"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "bytes",
- "dotenvy",
- "env_logger",
- "futures-util",
- "gen-id 0.3.0 (git+https://github.com/wavey-ai/gen-id.git)",
- "h2 0.4.14",
- "h3",
- "h3-datagram",
- "h3-quinn",
- "h3-webtransport",
- "http 1.4.1",
- "http-body-util",
- "http-pack",
- "hyper 1.10.1",
- "hyper-rustls",
- "hyper-util",
- "playlists",
- "quinn",
- "regex",
- "rustls 0.23.40",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "structopt",
- "thiserror 2.0.18",
- "tls-helpers 0.2.0 (git+https://github.com/wavey-ai/tls-helpers.git)",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "tracing-subscriber",
- "url",
- "webpki-roots 0.26.11",
- "xmpegts",
- "xxhash-rust",
 ]
 
 [[package]]

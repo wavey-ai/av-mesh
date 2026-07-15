@@ -27,18 +27,27 @@ hyper = { version = "1.6", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 linode = { git = "https://github.com/wavey-ai/linode.git", optional = true }
 message-packetizer = { git = "https://github.com/wavey-ai/message-packetizer.git" }
-playlists = { git = "https://github.com/wavey-ai/playlists.git" }
-raptorq-datagram-fec = { git = "https://github.com/wavey-ai/raptor-fec.git" }
-raptorq-fec-transport = { git = "https://github.com/wavey-ai/raptor-fec.git" }
+media-object = { path = "../media-object" }
+playlists = { path = "../playlists" }
+raptorq-datagram-fec = { path = "../raptor-fec/crates/raptorq-datagram-fec" }
+raptorq-fec-transport = { path = "../raptor-fec/crates/raptorq-fec-transport" }
+relay-session = { path = "../relay-session", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tcp-changes = { git = "https://github.com/wavey-ai/tcp-changes.git" }
 tokio = { version = "1.45", features = ["full"] }
-tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-web-service = { git = "https://github.com/wavey-ai/web-services.git" }
+av-web-service = { path = "../av-service/av-web-service" }
 
 [dev-dependencies]
 base64 = "0.22"
 rcgen = "0.13"
+
+[patch."https://github.com/wavey-ai/playlists.git"]
+playlists = { path = "../playlists" }
+
+[patch."https://github.com/wavey-ai/raptor-fec.git"]
+raptorq-datagram-fec = { path = "../raptor-fec/crates/raptorq-datagram-fec" }
+raptorq-fec-transport = { path = "../raptor-fec/crates/raptorq-fec-transport" }
