@@ -5047,6 +5047,7 @@ impl MeshApiSnapshot {
             &local.stream,
             &local.node.node_id,
             &streams,
+            &relay_nodes,
             &recent_commands,
             &telemetry,
             &relay_session,
@@ -6026,6 +6027,7 @@ fn derive_mesh_alerts(
     local_stream: &StatsSnapshot,
     local_node_id: &str,
     streams: &[StreamTelemetry],
+    relay_nodes: &[RelayNodeSessionSnapshot],
     recent_commands: &[ControlCommand],
     telemetry: &TelemetryHealthSnapshot,
     relay_session: &RelaySessionIngressSnapshot,
@@ -6353,9 +6355,16 @@ fn derive_mesh_alerts(
         });
     }
 
+    let controlled_relay_node_ids = relay_nodes
+        .iter()
+        .filter(|node| node.relay_session.controlled_sessions > 0)
+        .map(|node| node.node_id.as_str())
+        .collect::<HashSet<_>>();
     let lagging_streams = streams
         .iter()
-        .filter(|stream| stream.lagging())
+        .filter(|stream| {
+            stream.lagging() && !controlled_relay_node_ids.contains(stream.node_id.as_str())
+        })
         .collect::<Vec<_>>();
     if let Some(stream) = lagging_streams
         .iter()
@@ -10335,6 +10344,7 @@ mod tests {
             "uk-local",
             &[],
             &[],
+            &[],
             &TelemetryHealthSnapshot::default(),
             &RelaySessionIngressSnapshot::default(),
             &provision,
@@ -10549,6 +10559,75 @@ mod tests {
         }));
         assert!(snapshot.streams.iter().any(|stream| {
             stream.node_id == "eu-lag" && stream.stream_id == 77 && stream.mesh_lag_parts == Some(9)
+        }));
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn mesh_api_does_not_compare_controlled_relay_sequence_domains_as_replicas() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let telemetry = TelemetryAggregator::default();
+        let mut head = telemetry_snapshot_for_tests(
+            "edge-head",
+            "ap-east",
+            "apac",
+            35.7,
+            139.7,
+            Vec::new(),
+            77,
+        );
+        head.streams = vec![StreamTelemetry {
+            node_id: "edge-head".into(),
+            stream_id: 77,
+            stream_id_text: stream_id_text(77),
+            latest_local_part: Some(20_000),
+            latest_local_part_bytes: Some(4_096),
+            latest_local_part_duration_ms: Some(500),
+            latest_local_part_age_ms: Some(20),
+            latest_mesh_part: None,
+            bytes_received: 4_096,
+            datagrams_received: 1,
+            last_ingest_age_ms: Some(20),
+            stale_threshold_ms: Some(5_000),
+            mesh_lag_parts: None,
+        }];
+        let mut restarted_relay = telemetry_snapshot_for_tests(
+            "relay-primary",
+            "eu-west",
+            "eu",
+            52.3,
+            4.9,
+            Vec::new(),
+            77,
+        );
+        restarted_relay.relay_session.controlled_sessions = 1;
+        restarted_relay.streams = vec![StreamTelemetry {
+            node_id: "relay-primary".into(),
+            stream_id: 77,
+            stream_id_text: stream_id_text(77),
+            latest_local_part: Some(200),
+            latest_local_part_bytes: Some(4_096),
+            latest_local_part_duration_ms: Some(500),
+            latest_local_part_age_ms: Some(20),
+            latest_mesh_part: None,
+            bytes_received: 4_096,
+            datagrams_received: 1,
+            last_ingest_age_ms: Some(20),
+            stale_threshold_ms: Some(5_000),
+            mesh_lag_parts: None,
+        }];
+        telemetry.ingest_snapshot(head).await;
+        telemetry.ingest_snapshot(restarted_relay).await;
+        let router =
+            app_router_for_tests_with_telemetry(Arc::clone(&cache), Arc::clone(&mesh), telemetry);
+        let snapshot = router.mesh_api_snapshot().await;
+
+        assert!(snapshot.streams.iter().any(|stream| {
+            stream.node_id == "relay-primary" && stream.mesh_lag_parts == Some(19_800)
+        }));
+        assert!(!snapshot.alerts.iter().any(|alert| {
+            alert.code == "mesh_stream_lagging" && alert.node_id.as_deref() == Some("relay-primary")
         }));
         mesh.shutdown();
     }
