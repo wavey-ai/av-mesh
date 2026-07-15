@@ -58,7 +58,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::{
     net::UdpSocket,
-    sync::{broadcast, mpsc, watch, RwLock},
+    sync::{broadcast, mpsc, watch, Mutex as AsyncMutex, RwLock},
     time::{interval, sleep, MissedTickBehavior},
 };
 use tokio_tungstenite::{tungstenite::Message as WebSocketMessage, WebSocketStream};
@@ -2547,6 +2547,7 @@ struct LiveTsCache {
     window_parts: usize,
     max_part_bytes: usize,
     state: RwLock<LiveState>,
+    canonical_commit_locks: StdMutex<HashMap<u64, Arc<AsyncMutex<()>>>>,
     playlist_cache: Vec<StdRwLock<Option<CachedPlaylist>>>,
     relay_ingress: StdRwLock<RelaySessionIngressSnapshot>,
     relay_failover_controller: StdRwLock<RelayFailoverControllerSnapshot>,
@@ -2581,6 +2582,7 @@ impl LiveTsCache {
             window_parts,
             max_part_bytes: slot_kb * 1024,
             state: RwLock::new(LiveState::new()),
+            canonical_commit_locks: StdMutex::new(HashMap::new()),
             playlist_cache,
             relay_ingress: StdRwLock::new(RelaySessionIngressSnapshot::default()),
             relay_failover_controller: StdRwLock::new(RelayFailoverControllerSnapshot::default()),
@@ -2630,6 +2632,18 @@ impl LiveTsCache {
 
     fn record_relay_availability(&self, observation: RelayAvailabilityObservation) {
         self.relay_availability.record(observation);
+    }
+
+    fn canonical_commit_lock(&self, stream_id: u64) -> Arc<AsyncMutex<()>> {
+        let mut locks = self
+            .canonical_commit_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            locks
+                .entry(stream_id)
+                .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+        )
     }
 
     async fn push_payload(&self, payload: &[u8]) -> Result<()> {
@@ -2712,6 +2726,50 @@ impl LiveTsCache {
                 );
             }
 
+            // A source incarnation owns one monotonically increasing object
+            // sequence. Serialize commits per stream so an epoch transition,
+            // cache reset, and first publication are atomic with respect to
+            // path-diverse duplicate delivery.
+            let commit_lock = self.canonical_commit_lock(stream_id);
+            let _commit_guard = commit_lock.lock().await;
+            let source_epoch = object.key().epoch();
+            let previous_epoch = self
+                .state
+                .read()
+                .await
+                .stream_canonical_epoch
+                .get(&stream_id)
+                .copied();
+            if let Some(previous) = previous_epoch {
+                if source_epoch < previous {
+                    bail!(
+                        "stale canonical source epoch {source_epoch} for stream {stream_id}; current epoch is {previous}"
+                    );
+                }
+            }
+            if previous_epoch != Some(source_epoch) {
+                self.chunk_cache.zero_stream_id(stream_id).await;
+                let mut state = self.state.write().await;
+                state.stream_canonical_epoch.insert(stream_id, source_epoch);
+                state.stream_subscription_base_object.remove(&stream_id);
+                state.stream_latest_canonical_object.remove(&stream_id);
+                state.stream_next_seq.remove(&stream_id);
+                state.stream_inits.remove(&stream_id);
+                state.stream_media_kinds.remove(&stream_id);
+                if stream_id == self.stream_id {
+                    state.last_committed_seq = None;
+                    state.last_committed_unix_ms = None;
+                    state.last_committed_bytes = None;
+                    state.last_committed_duration_ms = None;
+                }
+                info!(
+                    stream_id,
+                    source_epoch,
+                    ?previous_epoch,
+                    "activated canonical media source epoch"
+                );
+            }
+
             let seq = object.key().object();
             let kind = object.kind();
             let media_bytes = object.payload().len();
@@ -2726,7 +2784,7 @@ impl LiveTsCache {
             };
             let now_ms = now_unix_ms();
 
-            let subscription_base_object = {
+            {
                 let mut state = self.state.write().await;
                 state.datagrams_received = state.datagrams_received.saturating_add(1);
                 state.bytes_received = state.bytes_received.saturating_add(bytes as u64);
@@ -2741,19 +2799,7 @@ impl LiveTsCache {
                         .stream_inits
                         .insert(stream_id, Bytes::copy_from_slice(object.payload()));
                 }
-                (kind == ObjectKind::Media).then(|| {
-                    let base = *state
-                        .stream_subscription_base_object
-                        .entry(stream_id)
-                        .or_insert(seq);
-                    state
-                        .stream_latest_canonical_object
-                        .entry(stream_id)
-                        .and_modify(|head| *head = (*head).max(seq))
-                        .or_insert(seq);
-                    base
-                })
-            };
+            }
 
             if matches!(
                 kind,
@@ -2768,6 +2814,7 @@ impl LiveTsCache {
             if kind != ObjectKind::Media {
                 debug!(
                     stream_id,
+                    source_epoch,
                     sequence = seq,
                     object_kind = ?kind,
                     bytes = media_bytes,
@@ -2777,10 +2824,16 @@ impl LiveTsCache {
             }
 
             let slot_id = usize::try_from(seq).context("stream slot sequence too large")?;
-            let subscription_base_object = usize::try_from(
-                subscription_base_object.context("media object subscription base missing")?,
-            )
-            .context("stream subscription base object is too large")?;
+            let subscription_base_object = self
+                .state
+                .read()
+                .await
+                .stream_subscription_base_object
+                .get(&stream_id)
+                .copied()
+                .unwrap_or(seq);
+            let subscription_base_object = usize::try_from(subscription_base_object)
+                .context("stream subscription base object is too large")?;
             let write_result = self
                 .chunk_cache
                 .put_if_absent_contiguous_for_stream_id(
@@ -2798,6 +2851,15 @@ impl LiveTsCache {
             }
 
             let mut state = self.state.write().await;
+            state
+                .stream_subscription_base_object
+                .entry(stream_id)
+                .or_insert(seq);
+            state
+                .stream_latest_canonical_object
+                .entry(stream_id)
+                .and_modify(|head| *head = (*head).max(seq))
+                .or_insert(seq);
             state.last_committed_seq =
                 Some(state.last_committed_seq.map_or(seq, |last| last.max(seq)));
             state.last_committed_unix_ms = Some(now_ms);
@@ -2805,6 +2867,7 @@ impl LiveTsCache {
             state.last_committed_duration_ms = None;
             debug!(
                 stream_id,
+                source_epoch,
                 sequence = seq,
                 slot_id,
                 bytes,
@@ -3307,6 +3370,7 @@ impl LiveTsCache {
             .stream_subscription_base_object
             .get(&self.stream_id)
             .copied();
+        let canonical_epoch = state.stream_canonical_epoch.get(&self.stream_id).copied();
         let head_object = state
             .stream_latest_canonical_object
             .get(&self.stream_id)
@@ -3352,6 +3416,7 @@ impl LiveTsCache {
             latest_local_part_bytes,
             latest_local_part_duration_ms,
             latest_mesh_part,
+            canonical_epoch,
             contiguous_object,
             head_object,
             gap_count,
@@ -3452,9 +3517,10 @@ impl LiveTsCache {
         default_stats: &StatsSnapshot,
     ) -> Vec<StreamTelemetry> {
         let mut streams = Vec::new();
-        let (subscription_bases, canonical_heads) = {
+        let (canonical_epochs, subscription_bases, canonical_heads) = {
             let state = self.state.read().await;
             (
+                state.stream_canonical_epoch.clone(),
                 state.stream_subscription_base_object.clone(),
                 state.stream_latest_canonical_object.clone(),
             )
@@ -3485,9 +3551,14 @@ impl LiveTsCache {
             };
             let is_default_stream = stream_id == self.stream_id;
             let contiguous_object = if is_default_stream {
-                default_stats.contiguous_object.or(Some(latest_part))
+                default_stats.contiguous_object
             } else {
                 Some(latest_part)
+            };
+            let canonical_epoch = if is_default_stream {
+                default_stats.canonical_epoch
+            } else {
+                canonical_epochs.get(&stream_id).copied()
             };
             let head_object = if is_default_stream {
                 default_stats.head_object
@@ -3529,6 +3600,7 @@ impl LiveTsCache {
                     None
                 },
                 latest_mesh_part: Some(latest_part),
+                canonical_epoch,
                 contiguous_object,
                 head_object,
                 gap_count,
@@ -3640,6 +3712,7 @@ struct LiveState {
     last_committed_bytes: Option<usize>,
     last_committed_duration_ms: Option<u64>,
     stream_next_seq: HashMap<u64, u64>,
+    stream_canonical_epoch: HashMap<u64, u64>,
     stream_subscription_base_object: HashMap<u64, u64>,
     stream_latest_canonical_object: HashMap<u64, u64>,
     stream_inits: HashMap<u64, Bytes>,
@@ -3662,6 +3735,7 @@ impl LiveState {
             last_committed_bytes: None,
             last_committed_duration_ms: None,
             stream_next_seq: HashMap::new(),
+            stream_canonical_epoch: HashMap::new(),
             stream_subscription_base_object: HashMap::new(),
             stream_latest_canonical_object: HashMap::new(),
             stream_inits: HashMap::new(),
@@ -3732,6 +3806,8 @@ struct StatsSnapshot {
     latest_local_part_bytes: Option<usize>,
     latest_local_part_duration_ms: Option<u64>,
     latest_mesh_part: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    canonical_epoch: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     contiguous_object: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4636,6 +4712,8 @@ struct StreamTelemetry {
     latest_local_part_age_ms: Option<u64>,
     latest_mesh_part: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    canonical_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     contiguous_object: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     head_object: Option<u64>,
@@ -4662,6 +4740,7 @@ impl StreamTelemetry {
             latest_local_part_duration_ms: stats.latest_local_part_duration_ms,
             latest_local_part_age_ms: stats.latest_local_part_age_ms,
             latest_mesh_part: stats.latest_mesh_part,
+            canonical_epoch: stats.canonical_epoch,
             contiguous_object: stats.contiguous_object,
             head_object: stats.head_object,
             gap_count: stats.gap_count,
@@ -5838,6 +5917,17 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
         snapshot.telemetry.stale_remote_count
     ));
 
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_canonical_epoch_divergent_streams",
+        "Streams whose visible relay nodes disagree on the active canonical source epoch.",
+        "gauge",
+    );
+    output.push_str(&format!(
+        "av_mesh_canonical_epoch_divergent_streams {}\n",
+        canonical_epoch_divergent_stream_count(&snapshot.streams)
+    ));
+
     for (name, help, metric_type) in [
         (
             "av_mesh_node_draining",
@@ -6010,6 +6100,11 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
             "gauge",
         ),
         (
+            "av_mesh_stream_canonical_epoch",
+            "Active canonical media-object source incarnation epoch by node and stream.",
+            "gauge",
+        ),
+        (
             "av_mesh_stream_canonical_head_object",
             "Latest canonical media-object identity received by node and stream.",
             "gauge",
@@ -6062,6 +6157,11 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
         if let Some(part) = stream.latest_mesh_part {
             output.push_str(&format!(
                 "av_mesh_stream_latest_part{{{labels},source=\"mesh\"}} {part}\n"
+            ));
+        }
+        if let Some(epoch) = stream.canonical_epoch {
+            output.push_str(&format!(
+                "av_mesh_stream_canonical_epoch{{{labels}}} {epoch}\n"
             ));
         }
         if let Some(object) = stream.head_object {
@@ -6117,11 +6217,11 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
 }
 
 fn annotate_stream_lag(streams: &mut [StreamTelemetry]) {
-    let mut heads = HashMap::<u64, u64>::new();
+    let mut heads = HashMap::<(u64, Option<u64>), u64>::new();
     for stream in streams.iter() {
         if let Some(part) = stream.latest_comparable_object() {
             heads
-                .entry(stream.stream_id)
+                .entry((stream.stream_id, stream.canonical_epoch))
                 .and_modify(|head| *head = (*head).max(part))
                 .or_insert(part);
         }
@@ -6130,11 +6230,27 @@ fn annotate_stream_lag(streams: &mut [StreamTelemetry]) {
     for stream in streams.iter_mut() {
         stream.mesh_lag_parts = stream.latest_comparable_object().and_then(|part| {
             heads
-                .get(&stream.stream_id)
+                .get(&(stream.stream_id, stream.canonical_epoch))
                 .copied()
                 .map(|head| head.saturating_sub(part))
         });
     }
+}
+
+fn canonical_epoch_divergent_stream_count(streams: &[StreamTelemetry]) -> usize {
+    let mut stream_epochs = HashMap::<u64, HashSet<u64>>::new();
+    for stream in streams {
+        if let Some(epoch) = stream.canonical_epoch {
+            stream_epochs
+                .entry(stream.stream_id)
+                .or_default()
+                .insert(epoch);
+        }
+    }
+    stream_epochs
+        .values()
+        .filter(|epochs| epochs.len() > 1)
+        .count()
 }
 
 fn is_private_mesh_target(target: &str) -> bool {
@@ -6488,6 +6604,56 @@ fn derive_mesh_alerts(
             last_seen_unix_ms: Some(last_seen),
             node_id: Some(stream.node_id.clone()),
             stream_id_text: Some(stream.stream_id_text.clone()),
+        });
+    }
+
+    let streams_with_gaps = streams
+        .iter()
+        .filter(|stream| stream.gap_count.unwrap_or_default() > 0)
+        .collect::<Vec<_>>();
+    if let Some(stream) = streams_with_gaps
+        .iter()
+        .max_by_key(|stream| stream.gap_count.unwrap_or_default())
+        .copied()
+    {
+        let gaps = stream.gap_count.unwrap_or_default();
+        alerts.push(MeshAlert {
+            level: "warn",
+            code: "canonical_publication_gap",
+            message: format!(
+                "{} stream publication(s) have retained canonical gaps; stream {} on {} has {gaps} missing object(s).",
+                streams_with_gaps.len(),
+                stream.stream_id_text,
+                stream.node_id
+            ),
+            count: streams_with_gaps.len() as u64,
+            last_seen_unix_ms: Some(now),
+            node_id: Some(stream.node_id.clone()),
+            stream_id_text: Some(stream.stream_id_text.clone()),
+        });
+    }
+
+    let mut stream_epochs = HashMap::<u64, HashSet<u64>>::new();
+    for stream in streams {
+        if let Some(epoch) = stream.canonical_epoch {
+            stream_epochs
+                .entry(stream.stream_id)
+                .or_default()
+                .insert(epoch);
+        }
+    }
+    if let Some((stream_id, epochs)) = stream_epochs.iter().find(|(_, epochs)| epochs.len() > 1) {
+        alerts.push(MeshAlert {
+            level: "warn",
+            code: "canonical_epoch_divergence",
+            message: format!(
+                "Stream {stream_id} is split across {} canonical source epochs during publication convergence.",
+                epochs.len()
+            ),
+            count: epochs.len() as u64,
+            last_seen_unix_ms: Some(now),
+            node_id: None,
+            stream_id_text: Some(stream_id_text(*stream_id)),
         });
     }
 
@@ -8923,6 +9089,19 @@ mod tests {
         keyframe: bool,
         payload: &[u8],
     ) -> Bytes {
+        encode_test_canonical_fmp4_object_with_epoch(
+            stream_id, 0, sequence, kind, keyframe, payload,
+        )
+    }
+
+    fn encode_test_canonical_fmp4_object_with_epoch(
+        stream_id: u64,
+        source_epoch: u64,
+        sequence: u64,
+        kind: ObjectKind,
+        keyframe: bool,
+        payload: &[u8],
+    ) -> Bytes {
         let track = match kind {
             ObjectKind::Initialization | ObjectKind::CodecConfiguration => "muxed-fmp4-init",
             ObjectKind::Media | ObjectKind::Discontinuity => "muxed-fmp4",
@@ -8931,7 +9110,7 @@ mod tests {
             "default",
             stream_id.to_string(),
             track,
-            0,
+            source_epoch,
             0,
             sequence,
             1,
@@ -9193,6 +9372,145 @@ mod tests {
             .await
             .unwrap();
         assert!(cache.get_part_for_stream_id(stream_id, 2).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn canonical_source_epoch_switch_resets_only_the_stream_and_rejects_stale_objects() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(50), 2, 6, 64).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let stream_id = 1;
+
+        for sequence in 0..=1 {
+            cache
+                .commit_stream_payload(
+                    stream_id,
+                    encode_test_canonical_fmp4_object_with_epoch(
+                        stream_id,
+                        41,
+                        sequence,
+                        ObjectKind::Media,
+                        sequence == 0,
+                        format!("epoch-41-{sequence}").as_bytes(),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            cache.stats(&mesh).await.contiguous_object,
+            Some(1),
+            "the first source incarnation should publish contiguously"
+        );
+
+        cache
+            .commit_stream_payload(
+                stream_id,
+                encode_test_canonical_fmp4_object_with_epoch(
+                    stream_id,
+                    42,
+                    0,
+                    ObjectKind::Initialization,
+                    false,
+                    b"epoch-42-init",
+                ),
+            )
+            .await
+            .unwrap();
+        cache
+            .commit_stream_payload(
+                stream_id,
+                encode_test_canonical_fmp4_object_with_epoch(
+                    stream_id,
+                    42,
+                    0,
+                    ObjectKind::Media,
+                    true,
+                    b"epoch-42-0",
+                ),
+            )
+            .await
+            .unwrap();
+
+        let stats = cache.stats(&mesh).await;
+        assert_eq!(stats.canonical_epoch, Some(42));
+        assert_eq!(stats.head_object, Some(0));
+        assert_eq!(stats.contiguous_object, Some(0));
+        assert_eq!(stats.gap_count, Some(0));
+        assert!(cache.get_part_for_stream_id(stream_id, 1).await.is_none());
+
+        let stale = encode_test_canonical_fmp4_object_with_epoch(
+            stream_id,
+            41,
+            2,
+            ObjectKind::Media,
+            false,
+            b"stale-epoch-41-2",
+        );
+        assert!(cache
+            .commit_stream_payload(stream_id, stale)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("stale canonical source epoch"));
+        assert_eq!(cache.stats(&mesh).await.canonical_epoch, Some(42));
+
+        cache
+            .commit_stream_payload(
+                stream_id,
+                encode_test_canonical_fmp4_object_with_epoch(
+                    stream_id,
+                    42,
+                    1,
+                    ObjectKind::Media,
+                    false,
+                    b"epoch-42-1",
+                ),
+            )
+            .await
+            .unwrap();
+        let recovered = cache.stats(&mesh).await;
+        assert_eq!(recovered.contiguous_object, Some(1));
+        assert_eq!(recovered.head_object, Some(1));
+        assert_eq!(recovered.gap_count, Some(0));
+
+        cache
+            .commit_stream_payload(
+                stream_id,
+                encode_test_canonical_fmp4_object_with_epoch(
+                    stream_id,
+                    42,
+                    3,
+                    ObjectKind::Media,
+                    false,
+                    b"epoch-42-3",
+                ),
+            )
+            .await
+            .unwrap();
+        let gapped = cache.stats(&mesh).await;
+        assert_eq!(gapped.contiguous_object, Some(1));
+        assert_eq!(gapped.head_object, Some(3));
+        assert_eq!(gapped.gap_count, Some(1));
+
+        cache
+            .commit_stream_payload(
+                stream_id,
+                encode_test_canonical_fmp4_object_with_epoch(
+                    stream_id,
+                    42,
+                    2,
+                    ObjectKind::Media,
+                    false,
+                    b"epoch-42-2",
+                ),
+            )
+            .await
+            .unwrap();
+        let filled = cache.stats(&mesh).await;
+        assert_eq!(filled.contiguous_object, Some(3));
+        assert_eq!(filled.head_object, Some(3));
+        assert_eq!(filled.gap_count, Some(0));
+        mesh.shutdown();
     }
 
     #[tokio::test]
@@ -9822,6 +10140,7 @@ mod tests {
 
         assert!(metrics.contains("# TYPE av_mesh_nodes gauge\n"));
         assert!(metrics.contains("av_mesh_nodes 1\n"));
+        assert!(metrics.contains("av_mesh_canonical_epoch_divergent_streams 0\n"));
         assert!(metrics.contains("av_mesh_transport_sync_interval_seconds 0.02\n"));
         assert!(metrics.contains("av_mesh_transport_fec_repair_ratio 0.03\n"));
         assert!(metrics.contains("av_mesh_transport_fec_min_repair_symbols 1\n"));
@@ -9881,6 +10200,12 @@ mod tests {
         assert!(metrics.contains(
             "av_mesh_stream_bytes_received_total{node_id=\"uk-1\",stream_id=\"77\"} 20000\n"
         ));
+        assert!(metrics
+            .contains("av_mesh_stream_canonical_epoch{node_id=\"uk-1\",stream_id=\"77\"} 1\n"));
+        assert!(metrics
+            .contains("av_mesh_stream_contiguous_object{node_id=\"uk-1\",stream_id=\"77\"} 1\n"));
+        assert!(metrics
+            .contains("av_mesh_stream_known_gap_count{node_id=\"uk-1\",stream_id=\"77\"} 0\n"));
         assert!(metrics.contains("av_mesh_stream_lag_parts{node_id=\"uk-1\",stream_id=\"77\"} 0\n"));
         assert!(metrics.contains(
             "av_mesh_edge_response_duration_seconds_count{node_id=\"uk-1\",region=\"uk\"} 12\n"
@@ -10561,6 +10886,7 @@ mod tests {
             latest_local_part_duration_ms: Some(500),
             latest_local_part_age_ms: Some(250),
             latest_mesh_part: Some(4),
+            canonical_epoch: Some(1),
             contiguous_object: Some(4),
             head_object: Some(4),
             gap_count: Some(0),
@@ -10615,6 +10941,7 @@ mod tests {
             latest_local_part_duration_ms: Some(500),
             latest_local_part_age_ms: Some(6_000),
             latest_mesh_part: Some(4),
+            canonical_epoch: Some(1),
             contiguous_object: Some(4),
             head_object: Some(4),
             gap_count: Some(0),
@@ -10660,6 +10987,7 @@ mod tests {
             latest_local_part_duration_ms: Some(500),
             latest_local_part_age_ms: Some(250),
             latest_mesh_part: Some(20),
+            canonical_epoch: Some(1),
             contiguous_object: Some(20),
             head_object: Some(20),
             gap_count: Some(0),
@@ -10680,6 +11008,7 @@ mod tests {
             latest_local_part_duration_ms: Some(500),
             latest_local_part_age_ms: Some(250),
             latest_mesh_part: Some(11),
+            canonical_epoch: Some(1),
             contiguous_object: Some(11),
             head_object: Some(11),
             gap_count: Some(0),
@@ -10712,6 +11041,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mesh_api_reports_canonical_epoch_divergence_and_publication_gaps() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let telemetry = TelemetryAggregator::default();
+
+        for (node_id, epoch, gaps) in [("relay-a", 8, 0), ("relay-b", 9, 2)] {
+            let mut remote = telemetry_snapshot_for_tests(
+                node_id,
+                "test-region",
+                "test-continent",
+                1.0,
+                2.0,
+                Vec::new(),
+                77,
+            );
+            remote.streams = vec![StreamTelemetry {
+                node_id: node_id.into(),
+                stream_id: 77,
+                stream_id_text: stream_id_text(77),
+                latest_local_part: Some(4),
+                latest_local_part_bytes: Some(2_048),
+                latest_local_part_duration_ms: Some(500),
+                latest_local_part_age_ms: Some(10),
+                latest_mesh_part: Some(4),
+                canonical_epoch: Some(epoch),
+                contiguous_object: Some(4),
+                head_object: Some(4 + gaps),
+                gap_count: Some(gaps),
+                bytes_received: 8_192,
+                datagrams_received: 4,
+                last_ingest_age_ms: Some(10),
+                stale_threshold_ms: Some(5_000),
+                mesh_lag_parts: None,
+            }];
+            telemetry.ingest_snapshot(remote).await;
+        }
+
+        let router =
+            app_router_for_tests_with_telemetry(Arc::clone(&cache), Arc::clone(&mesh), telemetry);
+        let snapshot = router.mesh_api_snapshot().await;
+
+        assert!(snapshot
+            .alerts
+            .iter()
+            .any(|alert| alert.code == "canonical_epoch_divergence"));
+        assert!(snapshot.alerts.iter().any(|alert| {
+            alert.code == "canonical_publication_gap"
+                && alert.node_id.as_deref() == Some("relay-b")
+                && alert.stream_id_text.as_deref() == Some("77")
+        }));
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
     async fn mesh_api_compares_canonical_objects_instead_of_process_local_counters() {
         let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
         let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
@@ -10734,6 +11117,7 @@ mod tests {
             latest_local_part_duration_ms: Some(500),
             latest_local_part_age_ms: Some(20),
             latest_mesh_part: Some(500),
+            canonical_epoch: Some(9),
             contiguous_object: Some(500),
             head_object: Some(500),
             gap_count: Some(0),
@@ -10762,6 +11146,7 @@ mod tests {
             latest_local_part_duration_ms: Some(500),
             latest_local_part_age_ms: Some(20),
             latest_mesh_part: Some(500),
+            canonical_epoch: Some(9),
             contiguous_object: Some(500),
             head_object: Some(500),
             gap_count: Some(0),
@@ -11356,6 +11741,7 @@ mod tests {
             latest_local_part_duration_ms: Some(500),
             latest_local_part_age_ms: Some(250),
             latest_mesh_part: Some(8),
+            canonical_epoch: Some(1),
             contiguous_object: Some(8),
             head_object: Some(8),
             gap_count: Some(0),
@@ -11720,6 +12106,7 @@ mod tests {
             latest_local_part_duration_ms: Some(500),
             latest_local_part_age_ms: Some(250),
             latest_mesh_part: Some(0),
+            canonical_epoch: Some(1),
             contiguous_object: Some(0),
             head_object: Some(0),
             gap_count: Some(0),
@@ -13509,6 +13896,7 @@ mod tests {
                 latest_local_part_bytes: Some(1024),
                 latest_local_part_duration_ms: Some(500),
                 latest_mesh_part: Some(1),
+                canonical_epoch: Some(1),
                 contiguous_object: Some(1),
                 head_object: Some(1),
                 gap_count: Some(0),
