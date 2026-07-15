@@ -101,6 +101,7 @@ const MESH_STORAGE_WARN_PCT: u64 = 85;
 const MESH_STORAGE_ERROR_PCT: u64 = 95;
 const MESH_MIN_STALE_INGEST_ALERT_MS: u64 = 5_000;
 const MESH_STREAM_LAG_WARN_PARTS: u64 = 6;
+const CANONICAL_EPOCH_ACTIVATION_WARN_US: u64 = 10_000_000;
 const MESH_ACTIVITY_LIMIT: usize = 64;
 const EDGE_RECENT_RESPONSE_LIMIT: usize = 32;
 const EDGE_RESPONSE_DURATION_BUCKETS_US: [u64; 13] = [
@@ -2733,13 +2734,13 @@ impl LiveTsCache {
             let commit_lock = self.canonical_commit_lock(stream_id);
             let _commit_guard = commit_lock.lock().await;
             let source_epoch = object.key().epoch();
-            let previous_epoch = self
-                .state
-                .read()
-                .await
-                .stream_canonical_epoch
-                .get(&stream_id)
-                .copied();
+            let (previous_epoch, process_started_unix_us) = {
+                let state = self.state.read().await;
+                (
+                    state.stream_canonical_epoch.get(&stream_id).copied(),
+                    state.process_started_unix_us,
+                )
+            };
             if let Some(previous) = previous_epoch {
                 if source_epoch < previous {
                     bail!(
@@ -2749,8 +2750,25 @@ impl LiveTsCache {
             }
             if previous_epoch != Some(source_epoch) {
                 self.chunk_cache.zero_stream_id(stream_id).await;
+                // A relay may restart and inherit an epoch that has already
+                // been active for minutes or hours. Its source age is not an
+                // epoch-activation delay. Measure only epochs observed after
+                // this process began, or genuine transitions from a previous
+                // epoch already active in this process.
+                let activation_delay_us = (previous_epoch.is_some()
+                    || source_epoch >= process_started_unix_us)
+                    .then(|| now_unix_us().checked_sub(source_epoch))
+                    .flatten();
                 let mut state = self.state.write().await;
                 state.stream_canonical_epoch.insert(stream_id, source_epoch);
+                state
+                    .stream_canonical_epoch_activation_delay_us
+                    .remove(&stream_id);
+                if let Some(activation_delay_us) = activation_delay_us {
+                    state
+                        .stream_canonical_epoch_activation_delay_us
+                        .insert(stream_id, activation_delay_us);
+                }
                 state.stream_subscription_base_object.remove(&stream_id);
                 state.stream_latest_canonical_object.remove(&stream_id);
                 state.stream_next_seq.remove(&stream_id);
@@ -2765,6 +2783,7 @@ impl LiveTsCache {
                 info!(
                     stream_id,
                     source_epoch,
+                    ?activation_delay_us,
                     ?previous_epoch,
                     "activated canonical media source epoch"
                 );
@@ -3371,6 +3390,10 @@ impl LiveTsCache {
             .get(&self.stream_id)
             .copied();
         let canonical_epoch = state.stream_canonical_epoch.get(&self.stream_id).copied();
+        let canonical_epoch_activation_delay_us = state
+            .stream_canonical_epoch_activation_delay_us
+            .get(&self.stream_id)
+            .copied();
         let head_object = state
             .stream_latest_canonical_object
             .get(&self.stream_id)
@@ -3417,6 +3440,7 @@ impl LiveTsCache {
             latest_local_part_duration_ms,
             latest_mesh_part,
             canonical_epoch,
+            canonical_epoch_activation_delay_us,
             contiguous_object,
             head_object,
             gap_count,
@@ -3517,10 +3541,16 @@ impl LiveTsCache {
         default_stats: &StatsSnapshot,
     ) -> Vec<StreamTelemetry> {
         let mut streams = Vec::new();
-        let (canonical_epochs, subscription_bases, canonical_heads) = {
+        let (
+            canonical_epochs,
+            canonical_epoch_activation_delays_us,
+            subscription_bases,
+            canonical_heads,
+        ) = {
             let state = self.state.read().await;
             (
                 state.stream_canonical_epoch.clone(),
+                state.stream_canonical_epoch_activation_delay_us.clone(),
                 state.stream_subscription_base_object.clone(),
                 state.stream_latest_canonical_object.clone(),
             )
@@ -3559,6 +3589,13 @@ impl LiveTsCache {
                 default_stats.canonical_epoch
             } else {
                 canonical_epochs.get(&stream_id).copied()
+            };
+            let canonical_epoch_activation_delay_us = if is_default_stream {
+                default_stats.canonical_epoch_activation_delay_us
+            } else {
+                canonical_epoch_activation_delays_us
+                    .get(&stream_id)
+                    .copied()
             };
             let head_object = if is_default_stream {
                 default_stats.head_object
@@ -3601,6 +3638,7 @@ impl LiveTsCache {
                 },
                 latest_mesh_part: Some(latest_part),
                 canonical_epoch,
+                canonical_epoch_activation_delay_us,
                 contiguous_object,
                 head_object,
                 gap_count,
@@ -3700,6 +3738,7 @@ impl LiveTsCache {
 }
 
 struct LiveState {
+    process_started_unix_us: u64,
     current: Vec<u8>,
     current_started: Instant,
     current_started_unix_ms: u64,
@@ -3713,6 +3752,7 @@ struct LiveState {
     last_committed_duration_ms: Option<u64>,
     stream_next_seq: HashMap<u64, u64>,
     stream_canonical_epoch: HashMap<u64, u64>,
+    stream_canonical_epoch_activation_delay_us: HashMap<u64, u64>,
     stream_subscription_base_object: HashMap<u64, u64>,
     stream_latest_canonical_object: HashMap<u64, u64>,
     stream_inits: HashMap<u64, Bytes>,
@@ -3723,6 +3763,7 @@ impl LiveState {
     fn new() -> Self {
         let now = Instant::now();
         Self {
+            process_started_unix_us: now_unix_us(),
             current: Vec::new(),
             current_started: now,
             current_started_unix_ms: now_unix_ms(),
@@ -3736,6 +3777,7 @@ impl LiveState {
             last_committed_duration_ms: None,
             stream_next_seq: HashMap::new(),
             stream_canonical_epoch: HashMap::new(),
+            stream_canonical_epoch_activation_delay_us: HashMap::new(),
             stream_subscription_base_object: HashMap::new(),
             stream_latest_canonical_object: HashMap::new(),
             stream_inits: HashMap::new(),
@@ -3808,6 +3850,8 @@ struct StatsSnapshot {
     latest_mesh_part: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     canonical_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    canonical_epoch_activation_delay_us: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     contiguous_object: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4714,6 +4758,8 @@ struct StreamTelemetry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     canonical_epoch: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    canonical_epoch_activation_delay_us: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     contiguous_object: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     head_object: Option<u64>,
@@ -4741,6 +4787,7 @@ impl StreamTelemetry {
             latest_local_part_age_ms: stats.latest_local_part_age_ms,
             latest_mesh_part: stats.latest_mesh_part,
             canonical_epoch: stats.canonical_epoch,
+            canonical_epoch_activation_delay_us: stats.canonical_epoch_activation_delay_us,
             contiguous_object: stats.contiguous_object,
             head_object: stats.head_object,
             gap_count: stats.gap_count,
@@ -5927,6 +5974,22 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
         "av_mesh_canonical_epoch_divergent_streams {}\n",
         canonical_epoch_divergent_stream_count(&snapshot.streams)
     ));
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_canonical_epoch_activation_delay_max_seconds",
+        "Maximum observed delay from contributor source-epoch creation to first canonical object activation across visible nodes and streams.",
+        "gauge",
+    );
+    let canonical_epoch_activation_delay_max_us = snapshot
+        .streams
+        .iter()
+        .filter_map(|stream| stream.canonical_epoch_activation_delay_us)
+        .max()
+        .unwrap_or(0);
+    output.push_str(&format!(
+        "av_mesh_canonical_epoch_activation_delay_max_seconds {}\n",
+        canonical_epoch_activation_delay_max_us as f64 / 1_000_000.0
+    ));
 
     for (name, help, metric_type) in [
         (
@@ -6105,6 +6168,11 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
             "gauge",
         ),
         (
+            "av_mesh_stream_canonical_epoch_activation_delay_seconds",
+            "Delay from contributor source-epoch creation to first canonical object activation by node and stream.",
+            "gauge",
+        ),
+        (
             "av_mesh_stream_canonical_head_object",
             "Latest canonical media-object identity received by node and stream.",
             "gauge",
@@ -6162,6 +6230,12 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
         if let Some(epoch) = stream.canonical_epoch {
             output.push_str(&format!(
                 "av_mesh_stream_canonical_epoch{{{labels}}} {epoch}\n"
+            ));
+        }
+        if let Some(delay_us) = stream.canonical_epoch_activation_delay_us {
+            output.push_str(&format!(
+                "av_mesh_stream_canonical_epoch_activation_delay_seconds{{{labels}}} {}\n",
+                delay_us as f64 / 1_000_000.0
             ));
         }
         if let Some(object) = stream.head_object {
@@ -6627,6 +6701,42 @@ fn derive_mesh_alerts(
                 stream.node_id
             ),
             count: streams_with_gaps.len() as u64,
+            last_seen_unix_ms: Some(now),
+            node_id: Some(stream.node_id.clone()),
+            stream_id_text: Some(stream.stream_id_text.clone()),
+        });
+    }
+
+    let slow_epoch_activations = streams
+        .iter()
+        .filter(|stream| {
+            stream
+                .canonical_epoch_activation_delay_us
+                .is_some_and(|delay| delay > CANONICAL_EPOCH_ACTIVATION_WARN_US)
+        })
+        .collect::<Vec<_>>();
+    if let Some(stream) = slow_epoch_activations
+        .iter()
+        .max_by_key(|stream| {
+            stream
+                .canonical_epoch_activation_delay_us
+                .unwrap_or_default()
+        })
+        .copied()
+    {
+        let delay_us = stream
+            .canonical_epoch_activation_delay_us
+            .unwrap_or_default();
+        alerts.push(MeshAlert {
+            level: "warn",
+            code: "canonical_epoch_activation_slow",
+            message: format!(
+                "{} stream publication(s) exceeded the source-epoch activation target; stream {} on {} took {delay_us} us to accept its first canonical object.",
+                slow_epoch_activations.len(),
+                stream.stream_id_text,
+                stream.node_id
+            ),
+            count: slow_epoch_activations.len() as u64,
             last_seen_unix_ms: Some(now),
             node_id: Some(stream.node_id.clone()),
             stream_id_text: Some(stream.stream_id_text.clone()),
@@ -9396,10 +9506,16 @@ mod tests {
                 .await
                 .unwrap();
         }
+        let inherited = cache.stats(&mesh).await;
         assert_eq!(
-            cache.stats(&mesh).await.contiguous_object,
+            inherited.contiguous_object,
             Some(1),
             "the first source incarnation should publish contiguously"
+        );
+        assert_eq!(inherited.canonical_epoch, Some(41));
+        assert_eq!(
+            inherited.canonical_epoch_activation_delay_us, None,
+            "an epoch inherited by a newly started relay has no activation measurement"
         );
 
         cache
@@ -9433,6 +9549,7 @@ mod tests {
 
         let stats = cache.stats(&mesh).await;
         assert_eq!(stats.canonical_epoch, Some(42));
+        assert!(stats.canonical_epoch_activation_delay_us.is_some());
         assert_eq!(stats.head_object, Some(0));
         assert_eq!(stats.contiguous_object, Some(0));
         assert_eq!(stats.gap_count, Some(0));
@@ -10141,6 +10258,7 @@ mod tests {
         assert!(metrics.contains("# TYPE av_mesh_nodes gauge\n"));
         assert!(metrics.contains("av_mesh_nodes 1\n"));
         assert!(metrics.contains("av_mesh_canonical_epoch_divergent_streams 0\n"));
+        assert!(metrics.contains("av_mesh_canonical_epoch_activation_delay_max_seconds 0.25\n"));
         assert!(metrics.contains("av_mesh_transport_sync_interval_seconds 0.02\n"));
         assert!(metrics.contains("av_mesh_transport_fec_repair_ratio 0.03\n"));
         assert!(metrics.contains("av_mesh_transport_fec_min_repair_symbols 1\n"));
@@ -10202,6 +10320,9 @@ mod tests {
         ));
         assert!(metrics
             .contains("av_mesh_stream_canonical_epoch{node_id=\"uk-1\",stream_id=\"77\"} 1\n"));
+        assert!(metrics.contains(
+            "av_mesh_stream_canonical_epoch_activation_delay_seconds{node_id=\"uk-1\",stream_id=\"77\"} 0.25\n"
+        ));
         assert!(metrics
             .contains("av_mesh_stream_contiguous_object{node_id=\"uk-1\",stream_id=\"77\"} 1\n"));
         assert!(metrics
@@ -10887,6 +11008,7 @@ mod tests {
             latest_local_part_age_ms: Some(250),
             latest_mesh_part: Some(4),
             canonical_epoch: Some(1),
+            canonical_epoch_activation_delay_us: None,
             contiguous_object: Some(4),
             head_object: Some(4),
             gap_count: Some(0),
@@ -10942,6 +11064,7 @@ mod tests {
             latest_local_part_age_ms: Some(6_000),
             latest_mesh_part: Some(4),
             canonical_epoch: Some(1),
+            canonical_epoch_activation_delay_us: None,
             contiguous_object: Some(4),
             head_object: Some(4),
             gap_count: Some(0),
@@ -10988,6 +11111,7 @@ mod tests {
             latest_local_part_age_ms: Some(250),
             latest_mesh_part: Some(20),
             canonical_epoch: Some(1),
+            canonical_epoch_activation_delay_us: None,
             contiguous_object: Some(20),
             head_object: Some(20),
             gap_count: Some(0),
@@ -11009,6 +11133,7 @@ mod tests {
             latest_local_part_age_ms: Some(250),
             latest_mesh_part: Some(11),
             canonical_epoch: Some(1),
+            canonical_epoch_activation_delay_us: None,
             contiguous_object: Some(11),
             head_object: Some(11),
             gap_count: Some(0),
@@ -11066,6 +11191,11 @@ mod tests {
                 latest_local_part_age_ms: Some(10),
                 latest_mesh_part: Some(4),
                 canonical_epoch: Some(epoch),
+                canonical_epoch_activation_delay_us: Some(if node_id == "relay-b" {
+                    CANONICAL_EPOCH_ACTIVATION_WARN_US + 1
+                } else {
+                    250_000
+                }),
                 contiguous_object: Some(4),
                 head_object: Some(4 + gaps),
                 gap_count: Some(gaps),
@@ -11086,6 +11216,10 @@ mod tests {
             .alerts
             .iter()
             .any(|alert| alert.code == "canonical_epoch_divergence"));
+        assert!(snapshot
+            .alerts
+            .iter()
+            .any(|alert| alert.code == "canonical_epoch_activation_slow"));
         assert!(snapshot.alerts.iter().any(|alert| {
             alert.code == "canonical_publication_gap"
                 && alert.node_id.as_deref() == Some("relay-b")
@@ -11118,6 +11252,7 @@ mod tests {
             latest_local_part_age_ms: Some(20),
             latest_mesh_part: Some(500),
             canonical_epoch: Some(9),
+            canonical_epoch_activation_delay_us: None,
             contiguous_object: Some(500),
             head_object: Some(500),
             gap_count: Some(0),
@@ -11147,6 +11282,7 @@ mod tests {
             latest_local_part_age_ms: Some(20),
             latest_mesh_part: Some(500),
             canonical_epoch: Some(9),
+            canonical_epoch_activation_delay_us: None,
             contiguous_object: Some(500),
             head_object: Some(500),
             gap_count: Some(0),
@@ -11742,6 +11878,7 @@ mod tests {
             latest_local_part_age_ms: Some(250),
             latest_mesh_part: Some(8),
             canonical_epoch: Some(1),
+            canonical_epoch_activation_delay_us: None,
             contiguous_object: Some(8),
             head_object: Some(8),
             gap_count: Some(0),
@@ -12107,6 +12244,7 @@ mod tests {
             latest_local_part_age_ms: Some(250),
             latest_mesh_part: Some(0),
             canonical_epoch: Some(1),
+            canonical_epoch_activation_delay_us: None,
             contiguous_object: Some(0),
             head_object: Some(0),
             gap_count: Some(0),
@@ -13897,6 +14035,7 @@ mod tests {
                 latest_local_part_duration_ms: Some(500),
                 latest_mesh_part: Some(1),
                 canonical_epoch: Some(1),
+                canonical_epoch_activation_delay_us: Some(250_000),
                 contiguous_object: Some(1),
                 head_object: Some(1),
                 gap_count: Some(0),
