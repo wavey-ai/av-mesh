@@ -28,7 +28,7 @@ use http::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 #[cfg(feature = "linode-provisioner")]
 use linode::{regions::REGIONS as LINODE_REGIONS, LinodeClient};
-use media_object::{MediaObject, ObjectKind, WIRE_MAGIC};
+use media_object::{MediaObject, ObjectKind, Stage, WIRE_MAGIC};
 use playlists::chunk_cache::{ChunkCache, PutIfAbsentResult};
 use playlists::mesh::{CacheMesh, CacheMeshConfig, CacheMeshFecStats, CacheMeshHandle};
 use playlists::Options as CacheOptions;
@@ -101,6 +101,10 @@ const EDGE_RECENT_RESPONSE_LIMIT: usize = 32;
 const EDGE_RESPONSE_DURATION_BUCKETS_US: [u64; 13] = [
     100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
     1_000_000,
+];
+const PUBLICATION_AVAILABILITY_BUCKETS_US: [u64; 16] = [
+    1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 75_000, 100_000, 125_000, 150_000, 175_000,
+    200_000, 250_000, 500_000, 1_000_000, 2_000_000,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1426,15 +1430,21 @@ async fn process_udp_fec_ingest_datagram(
             }
             let stream = object.key().stream().to_owned();
             let sequence = object.key().object();
+            let availability = relay_availability_observation(&object, now_unix_us());
             match commit_relay_object(cache, *object).await {
-                Ok(_) => debug!(
-                    peer = %peer,
-                    stream,
-                    sequence,
-                    parent_count,
-                    accepted_datagrams,
-                    "committed canonical RelaySession RaptorQ object"
-                ),
+                Ok(_) => {
+                    if let Some(observation) = availability {
+                        cache.record_relay_availability(observation);
+                    }
+                    debug!(
+                        peer = %peer,
+                        stream,
+                        sequence,
+                        parent_count,
+                        accepted_datagrams,
+                        "committed canonical RelaySession RaptorQ object"
+                    );
+                }
                 Err(error) => warn!(
                     peer = %peer,
                     stream,
@@ -1631,6 +1641,46 @@ async fn run_udp_media_fec_ingest(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayAvailabilityObservation {
+    Measured {
+        duration_us: u64,
+        clock_error_us: u64,
+    },
+    UnusableClock,
+}
+
+fn relay_availability_observation(
+    object: &MediaObject,
+    available_at_us: u64,
+) -> Option<RelayAvailabilityObservation> {
+    if object.kind() != ObjectKind::Media {
+        return None;
+    }
+    let Some(published) = object
+        .stage_timestamps()
+        .iter()
+        .find(|timestamp| timestamp.stage() == Stage::Published)
+        .map(|timestamp| timestamp.timestamp())
+    else {
+        return Some(RelayAvailabilityObservation::UnusableClock);
+    };
+    let Ok(published_ns) = u64::try_from(published.unix_time_ns()) else {
+        return Some(RelayAvailabilityObservation::UnusableClock);
+    };
+    let Some(clock_error_ns) = published.confidence().maximum_error_ns() else {
+        return Some(RelayAvailabilityObservation::UnusableClock);
+    };
+    let published_us = published_ns.div_ceil(1_000);
+    let Some(duration_us) = available_at_us.checked_sub(published_us) else {
+        return Some(RelayAvailabilityObservation::UnusableClock);
+    };
+    Some(RelayAvailabilityObservation::Measured {
+        duration_us,
+        clock_error_us: clock_error_ns.div_ceil(1_000),
+    })
+}
+
 #[derive(Debug, Clone)]
 struct CachedMediaAccessUnit {
     metadata: MediaFrameMetadata,
@@ -1743,6 +1793,7 @@ struct LiveTsCache {
     state: RwLock<LiveState>,
     playlist_cache: Vec<StdRwLock<Option<CachedPlaylist>>>,
     relay_ingress: StdRwLock<RelaySessionIngressSnapshot>,
+    relay_availability: RelayAvailabilityTelemetry,
 }
 
 impl LiveTsCache {
@@ -1775,6 +1826,7 @@ impl LiveTsCache {
             state: RwLock::new(LiveState::new()),
             playlist_cache,
             relay_ingress: StdRwLock::new(RelaySessionIngressSnapshot::default()),
+            relay_availability: RelayAvailabilityTelemetry::default(),
         })
     }
 
@@ -1797,10 +1849,16 @@ impl LiveTsCache {
     }
 
     fn relay_ingress_snapshot(&self) -> RelaySessionIngressSnapshot {
-        *self
+        let mut snapshot = *self
             .relay_ingress
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.relay_availability.apply_to(&mut snapshot);
+        snapshot
+    }
+
+    fn record_relay_availability(&self, observation: RelayAvailabilityObservation) {
+        self.relay_availability.record(observation);
     }
 
     async fn push_payload(&self, payload: &[u8]) -> Result<()> {
@@ -2906,6 +2964,12 @@ struct RelaySessionIngressSnapshot {
     forward_duration_sum_us: u64,
     forward_duration_max_us: u64,
     forward_duration_buckets: [u64; EDGE_RESPONSE_DURATION_BUCKETS_US.len()],
+    publication_to_available_count: u64,
+    publication_to_available_sum_us: u64,
+    publication_to_available_max_us: u64,
+    publication_to_available_buckets: [u64; PUBLICATION_AVAILABILITY_BUCKETS_US.len()],
+    publication_clock_error_max_us: u64,
+    publication_clock_unusable_objects: u64,
 }
 
 impl RelaySessionIngressSnapshot {
@@ -3395,6 +3459,11 @@ impl Default for AtomicDurationHistogram {
 impl AtomicDurationHistogram {
     fn record(&self, duration: Duration) -> u64 {
         let duration_us = duration.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.record_us(duration_us);
+        duration_us
+    }
+
+    fn record_us(&self, duration_us: u64) {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.sum_us.fetch_add(duration_us, Ordering::Relaxed);
         self.max_us.fetch_max(duration_us, Ordering::Relaxed);
@@ -3403,7 +3472,74 @@ impl AtomicDurationHistogram {
                 self.buckets[index].fetch_add(1, Ordering::Relaxed);
             }
         }
-        duration_us
+    }
+}
+
+#[derive(Debug, Default)]
+struct RelayAvailabilityTelemetry {
+    duration: AtomicPublicationDurationHistogram,
+    clock_error_max_us: AtomicU64,
+    unusable_clock_objects: AtomicU64,
+}
+
+#[derive(Debug)]
+struct AtomicPublicationDurationHistogram {
+    count: AtomicU64,
+    sum_us: AtomicU64,
+    max_us: AtomicU64,
+    buckets: [AtomicU64; PUBLICATION_AVAILABILITY_BUCKETS_US.len()],
+}
+
+impl Default for AtomicPublicationDurationHistogram {
+    fn default() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            sum_us: AtomicU64::new(0),
+            max_us: AtomicU64::new(0),
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+impl AtomicPublicationDurationHistogram {
+    fn record_us(&self, duration_us: u64) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_us.fetch_add(duration_us, Ordering::Relaxed);
+        self.max_us.fetch_max(duration_us, Ordering::Relaxed);
+        for (index, upper_bound_us) in PUBLICATION_AVAILABILITY_BUCKETS_US.iter().enumerate() {
+            if duration_us <= *upper_bound_us {
+                self.buckets[index].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+impl RelayAvailabilityTelemetry {
+    fn record(&self, observation: RelayAvailabilityObservation) {
+        match observation {
+            RelayAvailabilityObservation::Measured {
+                duration_us,
+                clock_error_us,
+            } => {
+                self.duration.record_us(duration_us);
+                self.clock_error_max_us
+                    .fetch_max(clock_error_us, Ordering::Relaxed);
+            }
+            RelayAvailabilityObservation::UnusableClock => {
+                self.unusable_clock_objects.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn apply_to(&self, snapshot: &mut RelaySessionIngressSnapshot) {
+        snapshot.publication_to_available_count = self.duration.count.load(Ordering::Relaxed);
+        snapshot.publication_to_available_sum_us = self.duration.sum_us.load(Ordering::Relaxed);
+        snapshot.publication_to_available_max_us = self.duration.max_us.load(Ordering::Relaxed);
+        snapshot.publication_to_available_buckets =
+            std::array::from_fn(|index| self.duration.buckets[index].load(Ordering::Relaxed));
+        snapshot.publication_clock_error_max_us = self.clock_error_max_us.load(Ordering::Relaxed);
+        snapshot.publication_clock_unusable_objects =
+            self.unusable_clock_objects.load(Ordering::Relaxed);
     }
 }
 
@@ -4522,6 +4658,62 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
     output.push_str(&format!(
         "av_mesh_relay_session_forward_duration_max_us {}\n",
         snapshot.relay_session.forward_duration_max_us
+    ));
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_relay_session_publication_to_available_us",
+        "Canonical media time from contributor publication to verified local cache availability in microseconds.",
+        "histogram",
+    );
+    for (upper_bound_us, count) in PUBLICATION_AVAILABILITY_BUCKETS_US
+        .iter()
+        .zip(snapshot.relay_session.publication_to_available_buckets)
+    {
+        output.push_str(&format!(
+            "av_mesh_relay_session_publication_to_available_us_bucket{{le=\"{upper_bound_us}\"}} {count}\n"
+        ));
+    }
+    output.push_str(&format!(
+        "av_mesh_relay_session_publication_to_available_us_bucket{{le=\"+Inf\"}} {}\n",
+        snapshot.relay_session.publication_to_available_count
+    ));
+    output.push_str(&format!(
+        "av_mesh_relay_session_publication_to_available_us_sum {}\n",
+        snapshot.relay_session.publication_to_available_sum_us
+    ));
+    output.push_str(&format!(
+        "av_mesh_relay_session_publication_to_available_us_count {}\n",
+        snapshot.relay_session.publication_to_available_count
+    ));
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_relay_session_publication_to_available_max_us",
+        "Largest observed contributor-publication to local-availability time in microseconds.",
+        "gauge",
+    );
+    output.push_str(&format!(
+        "av_mesh_relay_session_publication_to_available_max_us {}\n",
+        snapshot.relay_session.publication_to_available_max_us
+    ));
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_relay_session_publication_clock_error_max_us",
+        "Largest source-clock error bound attached to publication latency samples in microseconds.",
+        "gauge",
+    );
+    output.push_str(&format!(
+        "av_mesh_relay_session_publication_clock_error_max_us {}\n",
+        snapshot.relay_session.publication_clock_error_max_us
+    ));
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_relay_session_publication_clock_unusable_objects_total",
+        "Canonical media objects omitted from publication latency because their source clock was missing or unusable.",
+        "counter",
+    );
+    output.push_str(&format!(
+        "av_mesh_relay_session_publication_clock_unusable_objects_total {}\n",
+        snapshot.relay_session.publication_clock_unusable_objects
     ));
 
     push_prometheus_metric_header(
@@ -7552,6 +7744,49 @@ mod tests {
         Bytes::from(out)
     }
 
+    #[test]
+    fn relay_availability_uses_published_clock_and_preserves_error_bound() {
+        let payload = b"published-object";
+        let key =
+            media_object::ObjectKey::for_payload("default", "1", "muxed-fmp4", 0, 0, 1, 1, payload)
+                .unwrap();
+        let published = media_object::ClockTimestamp::new(
+            1_000_000_000,
+            "source-clock",
+            media_object::ClockConfidence::estimated(5_000_000),
+        )
+        .unwrap();
+        let object = MediaObject::builder(key, ObjectKind::Media, payload.to_vec())
+            .with_stage_timestamp(media_object::StageTimestamp::new(
+                Stage::Published,
+                published,
+            ))
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            relay_availability_observation(&object, 1_250_000),
+            Some(RelayAvailabilityObservation::Measured {
+                duration_us: 250_000,
+                clock_error_us: 5_000,
+            })
+        );
+
+        let telemetry = RelayAvailabilityTelemetry::default();
+        telemetry.record(RelayAvailabilityObservation::Measured {
+            duration_us: 250_000,
+            clock_error_us: 5_000,
+        });
+        telemetry.record(RelayAvailabilityObservation::UnusableClock);
+        let mut snapshot = RelaySessionIngressSnapshot::default();
+        telemetry.apply_to(&mut snapshot);
+        assert_eq!(snapshot.publication_to_available_count, 1);
+        assert_eq!(snapshot.publication_to_available_sum_us, 250_000);
+        assert_eq!(snapshot.publication_to_available_max_us, 250_000);
+        assert_eq!(snapshot.publication_clock_error_max_us, 5_000);
+        assert_eq!(snapshot.publication_clock_unusable_objects, 1);
+    }
+
     fn encode_test_canonical_fmp4_object(
         stream_id: u64,
         sequence: u64,
@@ -8423,6 +8658,12 @@ mod tests {
             forward_duration_sum_us: 2_400,
             forward_duration_max_us: 240,
             forward_duration_buckets: [24; EDGE_RESPONSE_DURATION_BUCKETS_US.len()],
+            publication_to_available_count: 9,
+            publication_to_available_sum_us: 2_250_000,
+            publication_to_available_max_us: 280_000,
+            publication_to_available_buckets: [9; PUBLICATION_AVAILABILITY_BUCKETS_US.len()],
+            publication_clock_error_max_us: 5_000,
+            publication_clock_unusable_objects: 1,
             ..RelaySessionIngressSnapshot::default()
         };
 
@@ -8454,6 +8695,12 @@ mod tests {
         assert!(metrics.contains("av_mesh_relay_session_forward_errors_total 2\n"));
         assert!(metrics.contains("av_mesh_relay_session_forward_duration_us_count 24\n"));
         assert!(metrics.contains("av_mesh_relay_session_forward_duration_max_us 240\n"));
+        assert!(metrics.contains("av_mesh_relay_session_publication_to_available_us_count 9\n"));
+        assert!(metrics.contains("av_mesh_relay_session_publication_to_available_max_us 280000\n"));
+        assert!(metrics.contains("av_mesh_relay_session_publication_clock_error_max_us 5000\n"));
+        assert!(
+            metrics.contains("av_mesh_relay_session_publication_clock_unusable_objects_total 1\n")
+        );
         assert!(metrics.contains("av_mesh_edge_active_readers{node_id=\"uk-1\",region=\"uk\"} 2\n"));
         assert!(metrics.contains(
             "av_mesh_stream_bytes_received_total{node_id=\"uk-1\",stream_id=\"77\"} 20000\n"
