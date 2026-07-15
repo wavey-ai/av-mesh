@@ -1445,12 +1445,17 @@ async fn process_udp_fec_ingest_datagram(
             }
             return Ok(());
         }
-        Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Duplicate { key })) => {
+        Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Duplicate { key, role })) => {
+            if let Some(forwarder) = relay_forwarder {
+                forwarder.forward(datagram, role).await;
+                cache.update_relay_forward(forwarder.snapshot());
+            }
             debug!(
                 peer = %peer,
                 stream = key.stream(),
                 object = key.object(),
-                "duplicate completed RelaySession object ignored"
+                ?role,
+                "authenticated duplicate RelaySession symbol admitted for downstream forwarding"
             );
             return Ok(());
         }
@@ -2844,6 +2849,7 @@ struct MeshApiSnapshot {
     mesh_transport: MeshTransportConfigSnapshot,
     mesh_fec: MeshFecRuntimeSnapshot,
     relay_session: RelaySessionIngressSnapshot,
+    relay_nodes: Vec<RelayNodeSessionSnapshot>,
     peers: Vec<PeerSnapshot>,
     stream: StatsSnapshot,
     replication_policy: ReplicationPolicy,
@@ -2859,6 +2865,13 @@ struct MeshApiSnapshot {
     edge_services: Vec<EdgeServiceSnapshot>,
     connections: Vec<ConnectionSnapshot>,
     streams: Vec<StreamTelemetry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RelayNodeSessionSnapshot {
+    node_id: String,
+    region: String,
+    relay_session: RelaySessionIngressSnapshot,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3984,6 +3997,7 @@ impl MeshApiSnapshot {
         let mut aggregate = AggregateMetrics::default();
         let mut nodes = Vec::with_capacity(snapshots.len());
         let mut edge_services = Vec::with_capacity(snapshots.len());
+        let mut relay_nodes = Vec::with_capacity(snapshots.len());
         let mut connections = Vec::new();
         let mut streams = Vec::with_capacity(snapshots.len());
         let mut peer_addr_to_node_id = HashMap::with_capacity(snapshots.len() * 2);
@@ -4013,6 +4027,12 @@ impl MeshApiSnapshot {
             aggregate.active_streams = aggregate
                 .active_streams
                 .saturating_add(snapshot.node.active_streams);
+
+            relay_nodes.push(RelayNodeSessionSnapshot {
+                node_id: snapshot.node.node_id.clone(),
+                region: snapshot.node.region.clone(),
+                relay_session: snapshot.relay_session,
+            });
 
             connections.extend(snapshot.peers.iter().map(|peer| ConnectionSnapshot {
                 source_node_id: snapshot.node.node_id.clone(),
@@ -4047,6 +4067,7 @@ impl MeshApiSnapshot {
                 .then_with(|| left.target_node_id.cmp(&right.target_node_id))
         });
         connections.dedup();
+        relay_nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
         aggregate.connection_count = connections.len();
         let topology = TopologyConfidenceSnapshot::from_connections(&connections);
 
@@ -4065,6 +4086,7 @@ impl MeshApiSnapshot {
             &streams,
             &recent_commands,
             &telemetry,
+            &relay_session,
             &orchestration.provision,
             &orchestration.telemetry_peers,
             &orchestration.private_discovery,
@@ -4077,6 +4099,7 @@ impl MeshApiSnapshot {
             mesh_transport: MeshTransportConfigSnapshot::default(),
             mesh_fec: MeshFecRuntimeSnapshot::default(),
             relay_session,
+            relay_nodes,
             peers: local.peers,
             stream: local.stream,
             replication_policy: local.replication_policy,
@@ -4829,6 +4852,7 @@ fn derive_mesh_alerts(
     streams: &[StreamTelemetry],
     recent_commands: &[ControlCommand],
     telemetry: &TelemetryHealthSnapshot,
+    relay_session: &RelaySessionIngressSnapshot,
     provision: &ProvisionStatus,
     telemetry_peers: &[TelemetryPeerStatus],
     private_discovery: &PrivateDiscoveryStatus,
@@ -4848,7 +4872,10 @@ fn derive_mesh_alerts(
             node_id: None,
             stream_id_text: None,
         });
-    } else if aggregate.connection_count == 0 {
+    } else if aggregate.connection_count == 0
+        && relay_session.controlled_sessions == 0
+        && relay_session.authenticated_sessions == 0
+    {
         alerts.push(MeshAlert {
             level: "error",
             code: "mesh_no_links",
@@ -8548,7 +8575,7 @@ mod tests {
             }],
             1,
         );
-        let us = telemetry_snapshot_for_tests(
+        let mut us = telemetry_snapshot_for_tests(
             "us-1",
             "us-east",
             "na",
@@ -8560,6 +8587,15 @@ mod tests {
             }],
             2,
         );
+        us.relay_session = RelaySessionIngressSnapshot {
+            primary_sessions: 1,
+            controlled_sessions: 1,
+            downstream_children: 1,
+            forwarded_source_datagrams: 144,
+            forward_duration_count: 144,
+            forward_duration_max_us: 73,
+            ..RelaySessionIngressSnapshot::default()
+        };
         let apac = telemetry_snapshot_for_tests(
             "jp-1",
             "jp-east",
@@ -8594,6 +8630,14 @@ mod tests {
         assert_eq!(aggregate.aggregate.connection_count, 3);
         assert_eq!(aggregate.aggregate.active_streams, 3);
         assert!(aggregate.nodes.iter().any(|node| node.node_id == "jp-1"));
+        let us_relay = aggregate
+            .relay_nodes
+            .iter()
+            .find(|relay| relay.node_id == "us-1")
+            .expect("remote relay telemetry");
+        assert_eq!(us_relay.relay_session.downstream_children, 1);
+        assert_eq!(us_relay.relay_session.forwarded_source_datagrams, 144);
+        assert_eq!(us_relay.relay_session.forward_duration_max_us, 73);
         assert!(aggregate
             .connections
             .iter()
@@ -9014,6 +9058,7 @@ mod tests {
             &[],
             &[],
             &TelemetryHealthSnapshot::default(),
+            &RelaySessionIngressSnapshot::default(),
             &provision,
             &[],
             &private_discovery,

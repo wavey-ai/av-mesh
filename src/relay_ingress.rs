@@ -292,6 +292,11 @@ pub enum RelayIngressOutcome {
     },
     Duplicate {
         key: ObjectKey,
+        /// The authenticated symbol remains useful to a downstream child even
+        /// when this relay has already completed the object. Preserving the
+        /// role lets a warm relay forward late repair without reopening local
+        /// decoder state.
+        role: MediaDatagramRole,
     },
 }
 
@@ -809,8 +814,19 @@ impl RelayObjectReceiver {
         if let Some(completed) = self.completed.get(&symbol.object_key) {
             validate_completed_symbol(completed, &session, &symbol)?;
             self.counters.duplicate_datagrams = self.counters.duplicate_datagrams.saturating_add(1);
+            match symbol.role {
+                MediaDatagramRole::Source => {
+                    self.counters.source_datagrams =
+                        self.counters.source_datagrams.saturating_add(1);
+                }
+                MediaDatagramRole::Repair => {
+                    self.counters.repair_datagrams =
+                        self.counters.repair_datagrams.saturating_add(1);
+                }
+            }
             return Ok(RelayIngressOutcome::Duplicate {
                 key: symbol.object_key,
+                role: symbol.role,
             });
         }
 
@@ -843,8 +859,19 @@ impl RelayObjectReceiver {
             return if existing == &fingerprint {
                 self.counters.duplicate_datagrams =
                     self.counters.duplicate_datagrams.saturating_add(1);
+                match symbol.role {
+                    MediaDatagramRole::Source => {
+                        self.counters.source_datagrams =
+                            self.counters.source_datagrams.saturating_add(1);
+                    }
+                    MediaDatagramRole::Repair => {
+                        self.counters.repair_datagrams =
+                            self.counters.repair_datagrams.saturating_add(1);
+                    }
+                }
                 Ok(RelayIngressOutcome::Duplicate {
                     key: symbol.object_key,
+                    role: symbol.role,
                 })
             } else {
                 Err(RelayIngressError::SymbolReplayConflict)
@@ -1503,8 +1530,8 @@ mod tests {
                 dispatch
                     .push(secondary_peer, &wire, 2_000_001)
                     .expect("late controlled secondary repair"),
-                RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Duplicate { ref key })
-                    if key == object.key()
+                RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Duplicate { ref key, role })
+                    if key == object.key() && role == MediaDatagramRole::Repair
             ));
         }
 
@@ -1519,7 +1546,10 @@ mod tests {
             snapshot.counters.source_datagrams,
             encoded.source_symbols.len() as u64
         );
-        assert_eq!(snapshot.counters.repair_datagrams, 0);
+        assert_eq!(
+            snapshot.counters.repair_datagrams,
+            encoded.repair_symbols.len() as u64
+        );
         assert_eq!(
             snapshot.counters.duplicate_datagrams,
             encoded.repair_symbols.len() as u64
