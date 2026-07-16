@@ -76,6 +76,9 @@ const DEFAULT_RELAY_PRIMARY_RECOVERY_MS: u64 = 2_000;
 const DEFAULT_RELAY_SECONDARY_WARM_MS: u64 = 750;
 const DEFAULT_RELAY_FAILOVER_HEARTBEAT_MS: u64 = 100;
 const DEFAULT_RELAY_FAILOVER_LEASE_MS: u64 = 1_000;
+const RELAY_WARM_SOURCE_REPLAY_MAX_OBJECTS_PER_CHILD: usize = 4;
+const RELAY_WARM_SOURCE_REPLAY_MAX_DATAGRAMS_PER_CHILD: usize = 2_048;
+const RELAY_WARM_SOURCE_REPLAY_MAX_BYTES_PER_CHILD: usize = 4 * 1024 * 1024;
 // The reliable subscription/catalog lane will supply this for late joins. The
 // local transition path starts each canonical stream at object zero.
 const PART_WAIT_MS: u64 = 3_000;
@@ -1354,6 +1357,13 @@ struct RelayForwardSnapshot {
     bytes: u64,
     errors: u64,
     filtered_datagrams: u64,
+    warm_source_buffered_datagrams: u64,
+    warm_source_buffered_bytes: u64,
+    warm_source_replayed_datagrams: u64,
+    warm_source_replayed_bytes: u64,
+    warm_source_expired_datagrams: u64,
+    warm_source_retired_datagrams: u64,
+    warm_source_evicted_datagrams: u64,
     duration_count: u64,
     duration_sum_us: u64,
     duration_max_us: u64,
@@ -1368,11 +1378,151 @@ struct RelayForwardSnapshot {
     failover_last_transition_unix_ms: u64,
 }
 
+#[derive(Debug)]
+struct WarmSourceDatagram {
+    object_key: media_object::ObjectKey,
+    expires_at_us: u64,
+    wire: Bytes,
+}
+
+#[derive(Debug, Default)]
+struct WarmSourceReplayBuffer {
+    datagrams: VecDeque<WarmSourceDatagram>,
+    object_order: VecDeque<media_object::ObjectKey>,
+    bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct WarmSourceBufferMutation {
+    added_datagrams: usize,
+    added_bytes: usize,
+    expired_datagrams: usize,
+    expired_bytes: usize,
+    retired_datagrams: usize,
+    retired_bytes: usize,
+    evicted_datagrams: usize,
+    evicted_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct WarmSourceReplayBatch {
+    datagrams: Vec<Bytes>,
+    bytes: usize,
+    expired_datagrams: usize,
+    expired_bytes: usize,
+}
+
+impl WarmSourceReplayBuffer {
+    fn push(
+        &mut self,
+        object_key: &media_object::ObjectKey,
+        expires_at_us: u64,
+        wire: &[u8],
+        now_us: u64,
+    ) -> WarmSourceBufferMutation {
+        let mut mutation = WarmSourceBufferMutation::default();
+        self.remove_expired(now_us, &mut mutation);
+        if expires_at_us <= now_us || wire.len() > RELAY_WARM_SOURCE_REPLAY_MAX_BYTES_PER_CHILD {
+            return mutation;
+        }
+
+        if !self.object_order.contains(object_key) {
+            self.object_order.push_back(object_key.clone());
+        }
+        self.bytes = self.bytes.saturating_add(wire.len());
+        self.datagrams.push_back(WarmSourceDatagram {
+            object_key: object_key.clone(),
+            expires_at_us,
+            wire: Bytes::copy_from_slice(wire),
+        });
+        mutation.added_datagrams = 1;
+        mutation.added_bytes = wire.len();
+
+        while self.object_order.len() > RELAY_WARM_SOURCE_REPLAY_MAX_OBJECTS_PER_CHILD {
+            if let Some(oldest) = self.object_order.pop_front() {
+                self.remove_object(&oldest, &mut mutation);
+            }
+        }
+        while self.datagrams.len() > RELAY_WARM_SOURCE_REPLAY_MAX_DATAGRAMS_PER_CHILD
+            || self.bytes > RELAY_WARM_SOURCE_REPLAY_MAX_BYTES_PER_CHILD
+        {
+            let Some(evicted) = self.datagrams.pop_front() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(evicted.wire.len());
+            mutation.evicted_datagrams = mutation.evicted_datagrams.saturating_add(1);
+            mutation.evicted_bytes = mutation.evicted_bytes.saturating_add(evicted.wire.len());
+            if !self
+                .datagrams
+                .iter()
+                .any(|entry| entry.object_key == evicted.object_key)
+            {
+                self.object_order.retain(|key| key != &evicted.object_key);
+            }
+        }
+        mutation
+    }
+
+    fn take_live(&mut self, now_us: u64) -> WarmSourceReplayBatch {
+        let mut batch = WarmSourceReplayBatch::default();
+        for datagram in self.datagrams.drain(..) {
+            if datagram.expires_at_us <= now_us {
+                batch.expired_datagrams = batch.expired_datagrams.saturating_add(1);
+                batch.expired_bytes = batch.expired_bytes.saturating_add(datagram.wire.len());
+            } else {
+                batch.bytes = batch.bytes.saturating_add(datagram.wire.len());
+                batch.datagrams.push(datagram.wire);
+            }
+        }
+        self.object_order.clear();
+        self.bytes = 0;
+        batch
+    }
+
+    fn remove_expired(&mut self, now_us: u64, mutation: &mut WarmSourceBufferMutation) {
+        let mut retained = VecDeque::with_capacity(self.datagrams.len());
+        while let Some(datagram) = self.datagrams.pop_front() {
+            if datagram.expires_at_us <= now_us {
+                self.bytes = self.bytes.saturating_sub(datagram.wire.len());
+                mutation.expired_datagrams = mutation.expired_datagrams.saturating_add(1);
+                mutation.expired_bytes = mutation.expired_bytes.saturating_add(datagram.wire.len());
+            } else {
+                retained.push_back(datagram);
+            }
+        }
+        self.datagrams = retained;
+        self.object_order.retain(|key| {
+            self.datagrams
+                .iter()
+                .any(|datagram| &datagram.object_key == key)
+        });
+    }
+
+    fn remove_object(
+        &mut self,
+        object_key: &media_object::ObjectKey,
+        mutation: &mut WarmSourceBufferMutation,
+    ) {
+        let mut retained = VecDeque::with_capacity(self.datagrams.len());
+        while let Some(datagram) = self.datagrams.pop_front() {
+            if &datagram.object_key == object_key {
+                self.bytes = self.bytes.saturating_sub(datagram.wire.len());
+                mutation.retired_datagrams = mutation.retired_datagrams.saturating_add(1);
+                mutation.retired_bytes = mutation.retired_bytes.saturating_add(datagram.wire.len());
+            } else {
+                retained.push_back(datagram);
+            }
+        }
+        self.datagrams = retained;
+    }
+}
+
 struct RelayForwardPath {
     socket: UdpSocket,
     target: SocketAddr,
     role: RelayForwardRole,
     promoted: AtomicBool,
+    warm_sources: StdMutex<WarmSourceReplayBuffer>,
 }
 
 struct RelayDownstreamForwarder {
@@ -1382,6 +1532,13 @@ struct RelayDownstreamForwarder {
     bytes: AtomicU64,
     errors: AtomicU64,
     filtered_datagrams: AtomicU64,
+    warm_source_buffered_datagrams: AtomicU64,
+    warm_source_buffered_bytes: AtomicU64,
+    warm_source_replayed_datagrams: AtomicU64,
+    warm_source_replayed_bytes: AtomicU64,
+    warm_source_expired_datagrams: AtomicU64,
+    warm_source_retired_datagrams: AtomicU64,
+    warm_source_evicted_datagrams: AtomicU64,
     duration_count: AtomicU64,
     duration_sum_us: AtomicU64,
     duration_max_us: AtomicU64,
@@ -1419,6 +1576,7 @@ impl RelayDownstreamForwarder {
                 target: endpoint.target,
                 role: endpoint.role,
                 promoted: AtomicBool::new(false),
+                warm_sources: StdMutex::new(WarmSourceReplayBuffer::default()),
             });
         }
         Ok(Some(Arc::new(Self {
@@ -1428,6 +1586,13 @@ impl RelayDownstreamForwarder {
             bytes: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             filtered_datagrams: AtomicU64::new(0),
+            warm_source_buffered_datagrams: AtomicU64::new(0),
+            warm_source_buffered_bytes: AtomicU64::new(0),
+            warm_source_replayed_datagrams: AtomicU64::new(0),
+            warm_source_replayed_bytes: AtomicU64::new(0),
+            warm_source_expired_datagrams: AtomicU64::new(0),
+            warm_source_retired_datagrams: AtomicU64::new(0),
+            warm_source_evicted_datagrams: AtomicU64::new(0),
             duration_count: AtomicU64::new(0),
             duration_sum_us: AtomicU64::new(0),
             duration_max_us: AtomicU64::new(0),
@@ -1442,29 +1607,39 @@ impl RelayDownstreamForwarder {
         })))
     }
 
-    async fn forward(&self, datagram: &[u8], role: MediaDatagramRole) {
+    async fn forward(
+        &self,
+        datagram: &[u8],
+        role: MediaDatagramRole,
+        object_key: Option<&media_object::ObjectKey>,
+        expires_at_us: Option<u64>,
+    ) {
         for path in &self.paths {
             let promoted = path.promoted.load(Ordering::Relaxed);
             let failover_source = promoted
                 && path.role == RelayForwardRole::Repair
                 && matches!(role, MediaDatagramRole::Source);
             if !(path.role.permits(role) || failover_source) {
+                if path.role == RelayForwardRole::Repair
+                    && matches!(role, MediaDatagramRole::Source)
+                {
+                    if let (Some(object_key), Some(expires_at_us)) = (object_key, expires_at_us) {
+                        self.buffer_warm_source(
+                            path,
+                            object_key,
+                            expires_at_us,
+                            datagram,
+                            now_unix_us(),
+                        );
+                    }
+                }
                 self.filtered_datagrams.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             let started = Instant::now();
             match path.socket.send_to(datagram, path.target).await {
                 Ok(sent) if sent == datagram.len() => {
-                    match role {
-                        MediaDatagramRole::Source => {
-                            self.source_datagrams.fetch_add(1, Ordering::Relaxed);
-                        }
-                        MediaDatagramRole::Repair => {
-                            self.repair_datagrams.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    self.bytes.fetch_add(sent as u64, Ordering::Relaxed);
-                    self.observe_duration(started.elapsed());
+                    self.record_forward_success(role, sent, started.elapsed());
                 }
                 Ok(sent) => {
                     self.errors.fetch_add(1, Ordering::Relaxed);
@@ -1487,6 +1662,111 @@ impl RelayDownstreamForwarder {
         }
     }
 
+    fn buffer_warm_source(
+        &self,
+        path: &RelayForwardPath,
+        object_key: &media_object::ObjectKey,
+        expires_at_us: u64,
+        datagram: &[u8],
+        now_us: u64,
+    ) {
+        let mutation = path
+            .warm_sources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(object_key, expires_at_us, datagram, now_us);
+        self.warm_source_buffered_datagrams
+            .fetch_add(mutation.added_datagrams as u64, Ordering::Relaxed);
+        self.warm_source_buffered_bytes
+            .fetch_add(mutation.added_bytes as u64, Ordering::Relaxed);
+        atomic_saturating_sub(
+            &self.warm_source_buffered_datagrams,
+            mutation
+                .expired_datagrams
+                .saturating_add(mutation.retired_datagrams)
+                .saturating_add(mutation.evicted_datagrams) as u64,
+        );
+        atomic_saturating_sub(
+            &self.warm_source_buffered_bytes,
+            mutation
+                .expired_bytes
+                .saturating_add(mutation.retired_bytes)
+                .saturating_add(mutation.evicted_bytes) as u64,
+        );
+        self.warm_source_expired_datagrams
+            .fetch_add(mutation.expired_datagrams as u64, Ordering::Relaxed);
+        self.warm_source_retired_datagrams
+            .fetch_add(mutation.retired_datagrams as u64, Ordering::Relaxed);
+        self.warm_source_evicted_datagrams
+            .fetch_add(mutation.evicted_datagrams as u64, Ordering::Relaxed);
+    }
+
+    async fn replay_warm_sources(&self, target: SocketAddr) {
+        let Some(path) = self.paths.iter().find(|path| path.target == target) else {
+            return;
+        };
+        let batch = path
+            .warm_sources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_live(now_unix_us());
+        let removed_datagrams = batch
+            .datagrams
+            .len()
+            .saturating_add(batch.expired_datagrams);
+        let removed_bytes = batch.bytes.saturating_add(batch.expired_bytes);
+        atomic_saturating_sub(
+            &self.warm_source_buffered_datagrams,
+            removed_datagrams as u64,
+        );
+        atomic_saturating_sub(&self.warm_source_buffered_bytes, removed_bytes as u64);
+        self.warm_source_expired_datagrams
+            .fetch_add(batch.expired_datagrams as u64, Ordering::Relaxed);
+
+        for datagram in batch.datagrams {
+            let started = Instant::now();
+            match path.socket.send_to(&datagram, path.target).await {
+                Ok(sent) if sent == datagram.len() => {
+                    self.record_forward_success(MediaDatagramRole::Source, sent, started.elapsed());
+                    self.warm_source_replayed_datagrams
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.warm_source_replayed_bytes
+                        .fetch_add(sent as u64, Ordering::Relaxed);
+                }
+                Ok(sent) => {
+                    self.errors.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        %target,
+                        expected_bytes = datagram.len(),
+                        sent_bytes = sent,
+                        "RelaySession warm-source replay sent a partial datagram"
+                    );
+                }
+                Err(error) => {
+                    self.errors.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        %target,
+                        error = %error,
+                        "RelaySession warm-source replay failed"
+                    );
+                }
+            }
+        }
+    }
+
+    fn record_forward_success(&self, role: MediaDatagramRole, sent: usize, duration: Duration) {
+        match role {
+            MediaDatagramRole::Source => {
+                self.source_datagrams.fetch_add(1, Ordering::Relaxed);
+            }
+            MediaDatagramRole::Repair => {
+                self.repair_datagrams.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.bytes.fetch_add(sent as u64, Ordering::Relaxed);
+        self.observe_duration(duration);
+    }
+
     fn register_failover_listener(&self) {
         self.failover_listeners.fetch_add(1, Ordering::Relaxed);
     }
@@ -1501,14 +1781,14 @@ impl RelayDownstreamForwarder {
         target: SocketAddr,
         mode: FailoverForwardMode,
         lease_expired: bool,
-    ) -> bool {
+    ) -> Option<bool> {
         let Some(path) = self.paths.iter().find(|path| path.target == target) else {
             self.record_failover_command_rejected();
-            return false;
+            return None;
         };
         if path.role != RelayForwardRole::Repair {
             self.record_failover_command_rejected();
-            return false;
+            return None;
         }
         if !lease_expired {
             self.failover_commands_received
@@ -1537,7 +1817,7 @@ impl RelayDownstreamForwarder {
                 "RelaySession warm-secondary forwarding mode changed"
             );
         }
-        true
+        Some(!previous && promoted)
     }
 
     fn observe_duration(&self, duration: Duration) {
@@ -1562,6 +1842,23 @@ impl RelayDownstreamForwarder {
             bytes: self.bytes.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
             filtered_datagrams: self.filtered_datagrams.load(Ordering::Relaxed),
+            warm_source_buffered_datagrams: self
+                .warm_source_buffered_datagrams
+                .load(Ordering::Relaxed),
+            warm_source_buffered_bytes: self.warm_source_buffered_bytes.load(Ordering::Relaxed),
+            warm_source_replayed_datagrams: self
+                .warm_source_replayed_datagrams
+                .load(Ordering::Relaxed),
+            warm_source_replayed_bytes: self.warm_source_replayed_bytes.load(Ordering::Relaxed),
+            warm_source_expired_datagrams: self
+                .warm_source_expired_datagrams
+                .load(Ordering::Relaxed),
+            warm_source_retired_datagrams: self
+                .warm_source_retired_datagrams
+                .load(Ordering::Relaxed),
+            warm_source_evicted_datagrams: self
+                .warm_source_evicted_datagrams
+                .load(Ordering::Relaxed),
             duration_count: self.duration_count.load(Ordering::Relaxed),
             duration_sum_us: self.duration_sum_us.load(Ordering::Relaxed),
             duration_max_us: self.duration_max_us.load(Ordering::Relaxed),
@@ -1900,6 +2197,12 @@ fn duration_ms(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+fn atomic_saturating_sub(value: &AtomicU64, amount: u64) {
+    let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(amount))
+    });
+}
+
 async fn start_relay_failover_listeners(
     endpoints: &[RelayFailoverListenerEndpoint],
     forwarder: Option<&Arc<RelayDownstreamForwarder>>,
@@ -1965,7 +2268,7 @@ async fn run_relay_failover_listener(
             _ = shutdown_rx.changed() => return,
             _ = lease_tick.tick() => {
                 if lease_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    forwarder.apply_failover_mode(
+                    let _ = forwarder.apply_failover_mode(
                         endpoint.forward_target,
                         FailoverForwardMode::RepairOnly,
                         true,
@@ -2005,9 +2308,14 @@ async fn run_relay_failover_listener(
                 }
                 transition_id = command.transition_id;
                 transition_mode = command.mode;
-                if forwarder.apply_failover_mode(endpoint.forward_target, command.mode, false) {
+                if let Some(promoted_now) =
+                    forwarder.apply_failover_mode(endpoint.forward_target, command.mode, false)
+                {
                     lease_deadline = (command.mode == FailoverForwardMode::SourceAndRepair)
                         .then(|| Instant::now() + Duration::from_micros(command.lease_duration_us));
+                    if promoted_now {
+                        forwarder.replay_warm_sources(endpoint.forward_target).await;
+                    }
                 }
                 cache.update_relay_forward(forwarder.snapshot());
             }
@@ -2150,9 +2458,15 @@ async fn process_udp_fec_ingest_datagram(
     cache.update_relay_ingress(relay_dispatch.receiver().snapshot());
     match relay_result {
         Ok(RelayUdpDispatchOutcome::Legacy) => {}
-        Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Buffered { key, role })) => {
+        Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Buffered {
+            key,
+            role,
+            deadline,
+        })) => {
             if let Some(forwarder) = relay_forwarder {
-                forwarder.forward(datagram, role).await;
+                forwarder
+                    .forward(datagram, role, Some(&key), Some(deadline.expires_at_us))
+                    .await;
                 cache.update_relay_forward(forwarder.snapshot());
             }
             debug!(
@@ -2170,12 +2484,20 @@ async fn process_udp_fec_ingest_datagram(
         Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Decoded {
             object,
             role,
+            deadline,
             parent_count,
             accepted_datagrams,
             ..
         })) => {
             if let Some(forwarder) = relay_forwarder {
-                forwarder.forward(datagram, role).await;
+                forwarder
+                    .forward(
+                        datagram,
+                        role,
+                        Some(object.key()),
+                        Some(deadline.expires_at_us),
+                    )
+                    .await;
                 cache.update_relay_forward(forwarder.snapshot());
             }
             let stream = object.key().stream().to_owned();
@@ -2209,9 +2531,15 @@ async fn process_udp_fec_ingest_datagram(
             };
             return Ok(Some(RelayDatagramObservation { role, decoded }));
         }
-        Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Duplicate { key, role })) => {
+        Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Duplicate {
+            key,
+            role,
+            deadline,
+        })) => {
             if let Some(forwarder) = relay_forwarder {
-                forwarder.forward(datagram, role).await;
+                forwarder
+                    .forward(datagram, role, Some(&key), Some(deadline.expires_at_us))
+                    .await;
                 cache.update_relay_forward(forwarder.snapshot());
             }
             debug!(
@@ -3936,7 +4264,10 @@ struct RelaySessionIngressSnapshot {
     repair_datagrams: u64,
     duplicate_datagrams: u64,
     decoded_objects: u64,
-    repaired_objects: u64,
+    #[serde(alias = "repaired_objects")]
+    repair_assisted_objects: u64,
+    fec_recovered_objects: u64,
+    fec_recovered_source_symbols: u64,
     expired_objects: u64,
     conflict_drops: u64,
     authentication_drops: u64,
@@ -3947,6 +4278,13 @@ struct RelaySessionIngressSnapshot {
     forwarded_bytes: u64,
     forward_errors: u64,
     forward_filtered_datagrams: u64,
+    warm_source_buffered_datagrams: u64,
+    warm_source_buffered_bytes: u64,
+    warm_source_replayed_datagrams: u64,
+    warm_source_replayed_bytes: u64,
+    warm_source_expired_datagrams: u64,
+    warm_source_retired_datagrams: u64,
+    warm_source_evicted_datagrams: u64,
     forward_duration_count: u64,
     forward_duration_sum_us: u64,
     forward_duration_max_us: u64,
@@ -3990,6 +4328,13 @@ impl RelaySessionIngressSnapshot {
             bytes: self.forwarded_bytes,
             errors: self.forward_errors,
             filtered_datagrams: self.forward_filtered_datagrams,
+            warm_source_buffered_datagrams: self.warm_source_buffered_datagrams,
+            warm_source_buffered_bytes: self.warm_source_buffered_bytes,
+            warm_source_replayed_datagrams: self.warm_source_replayed_datagrams,
+            warm_source_replayed_bytes: self.warm_source_replayed_bytes,
+            warm_source_expired_datagrams: self.warm_source_expired_datagrams,
+            warm_source_retired_datagrams: self.warm_source_retired_datagrams,
+            warm_source_evicted_datagrams: self.warm_source_evicted_datagrams,
             duration_count: self.forward_duration_count,
             duration_sum_us: self.forward_duration_sum_us,
             duration_max_us: self.forward_duration_max_us,
@@ -4012,6 +4357,13 @@ impl RelaySessionIngressSnapshot {
         self.forwarded_bytes = snapshot.bytes;
         self.forward_errors = snapshot.errors;
         self.forward_filtered_datagrams = snapshot.filtered_datagrams;
+        self.warm_source_buffered_datagrams = snapshot.warm_source_buffered_datagrams;
+        self.warm_source_buffered_bytes = snapshot.warm_source_buffered_bytes;
+        self.warm_source_replayed_datagrams = snapshot.warm_source_replayed_datagrams;
+        self.warm_source_replayed_bytes = snapshot.warm_source_replayed_bytes;
+        self.warm_source_expired_datagrams = snapshot.warm_source_expired_datagrams;
+        self.warm_source_retired_datagrams = snapshot.warm_source_retired_datagrams;
+        self.warm_source_evicted_datagrams = snapshot.warm_source_evicted_datagrams;
         self.forward_duration_count = snapshot.duration_count;
         self.forward_duration_sum_us = snapshot.duration_sum_us;
         self.forward_duration_max_us = snapshot.duration_max_us;
@@ -4061,7 +4413,9 @@ impl From<RelayIngressSnapshot> for RelaySessionIngressSnapshot {
             repair_datagrams: snapshot.counters.repair_datagrams,
             duplicate_datagrams: snapshot.counters.duplicate_datagrams,
             decoded_objects: snapshot.counters.decoded_objects,
-            repaired_objects: snapshot.counters.repaired_objects,
+            repair_assisted_objects: snapshot.counters.repair_assisted_objects,
+            fec_recovered_objects: snapshot.counters.fec_recovered_objects,
+            fec_recovered_source_symbols: snapshot.counters.fec_recovered_source_symbols,
             expired_objects: snapshot.counters.expired_objects,
             conflict_drops: snapshot.counters.conflict_drops,
             authentication_drops: snapshot.counters.authentication_drops,
@@ -5608,18 +5962,35 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
     push_prometheus_metric_header(
         &mut output,
         "av_mesh_relay_session_objects_total",
-        "RelaySession canonical object outcomes; repaired is a subset of decoded.",
+        "RelaySession canonical object outcomes; repair_assisted records symbol use while fec_recovered proves missing source reconstruction.",
         "counter",
     );
     for (outcome, value) in [
         ("decoded", snapshot.relay_session.decoded_objects),
-        ("repaired", snapshot.relay_session.repaired_objects),
+        (
+            "repair_assisted",
+            snapshot.relay_session.repair_assisted_objects,
+        ),
+        (
+            "fec_recovered",
+            snapshot.relay_session.fec_recovered_objects,
+        ),
         ("expired", snapshot.relay_session.expired_objects),
     ] {
         output.push_str(&format!(
             "av_mesh_relay_session_objects_total{{outcome=\"{outcome}\"}} {value}\n"
         ));
     }
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_relay_session_fec_recovered_source_symbols_total",
+        "Missing source symbols reconstructed by RaptorQ before object decode.",
+        "counter",
+    );
+    output.push_str(&format!(
+        "av_mesh_relay_session_fec_recovered_source_symbols_total {}\n",
+        snapshot.relay_session.fec_recovered_source_symbols
+    ));
     push_prometheus_metric_header(
         &mut output,
         "av_mesh_relay_session_drops_total",
@@ -5678,6 +6049,51 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
             "av_mesh_relay_session_forward_filtered_datagrams_total",
             "Admitted RelaySession symbols intentionally retained by lane policy rather than forwarded.",
             snapshot.relay_session.forward_filtered_datagrams,
+        ),
+    ] {
+        push_prometheus_metric_header(&mut output, name, help, "counter");
+        output.push_str(&format!("{name} {value}\n"));
+    }
+    for (name, help, value) in [
+        (
+            "av_mesh_relay_warm_source_buffered_datagrams",
+            "Unexpired source datagrams retained for immediate warm-secondary promotion.",
+            snapshot.relay_session.warm_source_buffered_datagrams,
+        ),
+        (
+            "av_mesh_relay_warm_source_buffered_bytes",
+            "Wire bytes retained in the bounded warm-secondary source replay buffer.",
+            snapshot.relay_session.warm_source_buffered_bytes,
+        ),
+    ] {
+        push_prometheus_metric_header(&mut output, name, help, "gauge");
+        output.push_str(&format!("{name} {value}\n"));
+    }
+    for (name, help, value) in [
+        (
+            "av_mesh_relay_warm_source_replayed_datagrams_total",
+            "Retained source datagrams replayed immediately after secondary promotion.",
+            snapshot.relay_session.warm_source_replayed_datagrams,
+        ),
+        (
+            "av_mesh_relay_warm_source_replayed_bytes_total",
+            "Retained source bytes replayed immediately after secondary promotion.",
+            snapshot.relay_session.warm_source_replayed_bytes,
+        ),
+        (
+            "av_mesh_relay_warm_source_expired_datagrams_total",
+            "Retained source datagrams discarded because their object deadline elapsed.",
+            snapshot.relay_session.warm_source_expired_datagrams,
+        ),
+        (
+            "av_mesh_relay_warm_source_retired_datagrams_total",
+            "Retained source datagrams removed as completed objects leave the four-object replay window.",
+            snapshot.relay_session.warm_source_retired_datagrams,
+        ),
+        (
+            "av_mesh_relay_warm_source_evicted_datagrams_total",
+            "Retained source datagrams evicted by the fixed object, datagram, or byte bounds.",
+            snapshot.relay_session.warm_source_evicted_datagrams,
         ),
     ] {
         push_prometheus_metric_header(&mut output, name, help, "counter");
@@ -10145,6 +10561,10 @@ mod tests {
         assert_eq!(json["edge_services"][0]["active_readers"], 0);
         assert_eq!(json["relay_session"]["active_objects"], 0);
         assert_eq!(json["relay_session"]["source_datagrams"], 0);
+        assert_eq!(json["relay_session"]["repair_assisted_objects"], 0);
+        assert_eq!(json["relay_session"]["fec_recovered_objects"], 0);
+        assert_eq!(json["relay_session"]["fec_recovered_source_symbols"], 0);
+        assert!(json["relay_session"].get("repaired_objects").is_none());
         assert_eq!(json["relay_session"]["authentication_drops"], 0);
         mesh.shutdown();
     }
@@ -10208,7 +10628,9 @@ mod tests {
             source_datagrams: 40,
             repair_datagrams: 8,
             decoded_objects: 9,
-            repaired_objects: 4,
+            repair_assisted_objects: 4,
+            fec_recovered_objects: 3,
+            fec_recovered_source_symbols: 7,
             expired_objects: 2,
             conflict_drops: 1,
             authentication_drops: 2,
@@ -10218,6 +10640,13 @@ mod tests {
             forwarded_repair_datagrams: 4,
             forwarded_bytes: 32_000,
             forward_errors: 2,
+            warm_source_buffered_datagrams: 12,
+            warm_source_buffered_bytes: 18_000,
+            warm_source_replayed_datagrams: 9,
+            warm_source_replayed_bytes: 13_500,
+            warm_source_expired_datagrams: 2,
+            warm_source_retired_datagrams: 8,
+            warm_source_evicted_datagrams: 1,
             forward_duration_count: 24,
             forward_duration_sum_us: 2_400,
             forward_duration_max_us: 240,
@@ -10274,13 +10703,25 @@ mod tests {
         assert!(metrics.contains("av_mesh_relay_session_parent_sessions{role=\"primary\"} 1\n"));
         assert!(metrics.contains("av_mesh_relay_session_active_object_bytes 24000\n"));
         assert!(metrics.contains("av_mesh_relay_session_datagrams_total{outcome=\"repair\"} 8\n"));
-        assert!(metrics.contains("av_mesh_relay_session_objects_total{outcome=\"repaired\"} 4\n"));
+        assert!(metrics
+            .contains("av_mesh_relay_session_objects_total{outcome=\"repair_assisted\"} 4\n"));
+        assert!(
+            metrics.contains("av_mesh_relay_session_objects_total{outcome=\"fec_recovered\"} 3\n")
+        );
+        assert!(metrics.contains("av_mesh_relay_session_fec_recovered_source_symbols_total 7\n"));
         assert!(metrics.contains("av_mesh_relay_session_drops_total{reason=\"deadline\"} 3\n"));
         assert!(metrics.contains("av_mesh_relay_session_downstream_children 1\n"));
         assert!(metrics
             .contains("av_mesh_relay_session_forwarded_datagrams_total{role=\"source\"} 20\n"));
         assert!(metrics.contains("av_mesh_relay_session_forwarded_bytes_total 32000\n"));
         assert!(metrics.contains("av_mesh_relay_session_forward_errors_total 2\n"));
+        assert!(metrics.contains("av_mesh_relay_warm_source_buffered_datagrams 12\n"));
+        assert!(metrics.contains("av_mesh_relay_warm_source_buffered_bytes 18000\n"));
+        assert!(metrics.contains("av_mesh_relay_warm_source_replayed_datagrams_total 9\n"));
+        assert!(metrics.contains("av_mesh_relay_warm_source_replayed_bytes_total 13500\n"));
+        assert!(metrics.contains("av_mesh_relay_warm_source_expired_datagrams_total 2\n"));
+        assert!(metrics.contains("av_mesh_relay_warm_source_retired_datagrams_total 8\n"));
+        assert!(metrics.contains("av_mesh_relay_warm_source_evicted_datagrams_total 1\n"));
         assert!(metrics.contains("av_mesh_relay_session_forward_duration_us_count 24\n"));
         assert!(metrics.contains("av_mesh_relay_session_forward_duration_max_us 240\n"));
         assert!(metrics.contains("av_mesh_relay_session_publication_to_available_us_count 9\n"));
@@ -12937,7 +13378,12 @@ mod tests {
             .unwrap();
         let expected = b"RLS1-exact-canonical-symbol";
         forwarder
-            .forward(b"RLS1-warm-source-state", MediaDatagramRole::Source)
+            .forward(
+                b"RLS1-warm-source-state",
+                MediaDatagramRole::Source,
+                None,
+                None,
+            )
             .await;
         assert!(timeout(Duration::from_millis(20), async {
             let mut discarded = [0u8; 64];
@@ -12945,7 +13391,9 @@ mod tests {
         })
         .await
         .is_err());
-        forwarder.forward(expected, MediaDatagramRole::Repair).await;
+        forwarder
+            .forward(expected, MediaDatagramRole::Repair, None, None)
+            .await;
 
         let mut received = [0u8; 64];
         let (len, _) = timeout(Duration::from_secs(1), child.recv_from(&mut received))
@@ -12961,6 +13409,45 @@ mod tests {
         assert_eq!(snapshot.errors, 0);
         assert_eq!(snapshot.filtered_datagrams, 1);
         assert_eq!(snapshot.duration_count, 1);
+    }
+
+    #[test]
+    fn warm_source_replay_buffer_retains_only_latest_bounded_objects() {
+        let mut buffer = WarmSourceReplayBuffer::default();
+        let now_us = 1_000_000;
+        let mut retired = 0;
+        for sequence in 0..=RELAY_WARM_SOURCE_REPLAY_MAX_OBJECTS_PER_CHILD {
+            let payload = sequence.to_be_bytes();
+            let key = media_object::ObjectKey::for_payload(
+                "default",
+                "1",
+                "muxed-fmp4",
+                1,
+                0,
+                sequence as u64,
+                1,
+                &payload,
+            )
+            .unwrap();
+            let mutation = buffer.push(&key, now_us + 1_000_000, &payload, now_us);
+            retired += mutation.retired_datagrams;
+        }
+
+        assert_eq!(
+            buffer.object_order.len(),
+            RELAY_WARM_SOURCE_REPLAY_MAX_OBJECTS_PER_CHILD
+        );
+        assert_eq!(
+            buffer.datagrams.len(),
+            RELAY_WARM_SOURCE_REPLAY_MAX_OBJECTS_PER_CHILD
+        );
+        assert_eq!(retired, 1);
+        let batch = buffer.take_live(now_us);
+        assert_eq!(
+            batch.datagrams.len(),
+            RELAY_WARM_SOURCE_REPLAY_MAX_OBJECTS_PER_CHILD
+        );
+        assert_eq!(buffer.bytes, 0);
     }
 
     #[tokio::test]
@@ -12998,6 +13485,28 @@ mod tests {
         .await
         .unwrap();
 
+        let buffered_source = b"source-buffered-before-promotion";
+        let buffered_key = media_object::ObjectKey::for_payload(
+            "default",
+            "1",
+            "muxed-fmp4",
+            1,
+            0,
+            1,
+            1,
+            buffered_source,
+        )
+        .unwrap();
+        forwarder
+            .forward(
+                buffered_source,
+                MediaDatagramRole::Source,
+                Some(&buffered_key),
+                Some(now_unix_us() + 1_000_000),
+            )
+            .await;
+        assert_eq!(forwarder.snapshot().warm_source_buffered_datagrams, 1);
+
         let command = FailoverLeaseCommand::new(
             generation,
             subscription,
@@ -13022,10 +13531,16 @@ mod tests {
         .await
         .unwrap();
 
-        forwarder
-            .forward(b"promoted-source", MediaDatagramRole::Source)
-            .await;
         let mut received = [0_u8; 64];
+        let (len, _) = timeout(Duration::from_secs(1), child.recv_from(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&received[..len], buffered_source);
+
+        forwarder
+            .forward(b"promoted-source", MediaDatagramRole::Source, None, None)
+            .await;
         let (len, _) = timeout(Duration::from_secs(1), child.recv_from(&mut received))
             .await
             .unwrap()
@@ -13049,6 +13564,12 @@ mod tests {
         assert_eq!(snapshot.failover_commands_received, 1);
         assert_eq!(snapshot.failover_promotions_applied, 1);
         assert_eq!(snapshot.failover_demotions_applied, 1);
+        assert_eq!(snapshot.warm_source_buffered_datagrams, 0);
+        assert_eq!(snapshot.warm_source_replayed_datagrams, 1);
+        assert_eq!(
+            snapshot.warm_source_replayed_bytes,
+            buffered_source.len() as u64
+        );
 
         let _ = shutdown_tx.send(());
         for task in tasks {
@@ -13372,7 +13893,9 @@ mod tests {
         assert_eq!(relay.secondary_sessions, 1);
         assert_eq!(relay.controlled_sessions, 2);
         assert_eq!(relay.decoded_objects, 1);
-        assert_eq!(relay.repaired_objects, 1);
+        assert_eq!(relay.repair_assisted_objects, 1);
+        assert_eq!(relay.fec_recovered_objects, 1);
+        assert!(relay.fec_recovered_source_symbols > 0);
         assert!(relay.source_datagrams > 0);
         assert!(relay.repair_datagrams > 0);
         let _ = shutdown_tx.send(());

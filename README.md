@@ -65,8 +65,8 @@ The first implementation keeps the mesh transport intentionally small:
   non-TS media access-unit query parsing and uses `raptorq-datagram-fec` for
   serialized access-unit decoding, so those edge formats are no longer defined
   inside the mesh binary.
-- `/mesh` serves Needletail Mission Control assets supplied by the product
-  supervisor. Mission Control presents service/feed health, compiled delivery
+- `/mesh` serves the Needletail operations dashboard supplied by the product
+  supervisor. The dashboard presents service/feed health, compiled delivery
   programs, independent primary-source and warm-secondary-repair lanes,
   RaptorQ recovery, deadline health, publication continuity, and realtime
   latency.
@@ -122,7 +122,10 @@ The first implementation keeps the mesh transport intentionally small:
   symbols actually recovered through repair data, late source arrivals,
   repaired sources still absent after a bounded observation window,
   incomplete/expired objects, and encode/decode errors. RelaySession ingress
-  exposes the product recovery counters consumed by Mission Control.
+  separately reports repair-assisted decodes, exact FEC-recovered objects, and
+  the exact number of missing source symbols reconstructed by RaptorQ. Warm
+  relays retain at most four objects, 2,048 datagrams, and 4 MiB per child;
+  promotion replays only source datagrams whose object deadlines remain valid.
 - `/metrics` exposes Prometheus text metrics for topology, telemetry freshness,
   node capacity, edge traffic/errors, per-stream ingest/replica lag, current
   alerts, active mesh transport configuration, cache-mesh FEC traffic and

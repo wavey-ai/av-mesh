@@ -11,7 +11,7 @@ use std::fmt;
 use std::net::SocketAddr;
 
 use media_object::{MediaObject, ObjectKey, ObjectKind, PayloadHash};
-use raptorq_datagram_fec::{DatagramFecHeader, MediaDatagramRole, MediaObjectKind};
+use raptorq_datagram_fec::{DatagramFecHeader, MediaDatagramRole, MediaDeadline, MediaObjectKind};
 use relay_session::{
     decode_datagram, CarrierIdentity, CarrierKind, ObjectAnnouncement, ObjectAssembler, ParentPath,
     RelayLimits, SubscriptionId, TopologyGeneration, TrustMode,
@@ -276,6 +276,7 @@ pub enum RelayIngressOutcome {
     Buffered {
         key: ObjectKey,
         role: MediaDatagramRole,
+        deadline: MediaDeadline,
     },
     Decoded {
         object: Box<MediaObject>,
@@ -283,6 +284,7 @@ pub enum RelayIngressOutcome {
         /// this to preserve source/repair observability while forwarding the
         /// admitted wire datagram without changing its coding geometry.
         role: MediaDatagramRole,
+        deadline: MediaDeadline,
         parent_count: usize,
         accepted_datagrams: usize,
         /// SHA-256 over the exact canonical envelope reconstructed by RaptorQ.
@@ -297,6 +299,7 @@ pub enum RelayIngressOutcome {
         /// role lets a warm relay forward late repair without reopening local
         /// decoder state.
         role: MediaDatagramRole,
+        deadline: MediaDeadline,
     },
 }
 
@@ -320,7 +323,15 @@ pub struct RelayIngressCounters {
     pub repair_datagrams: u64,
     pub duplicate_datagrams: u64,
     pub decoded_objects: u64,
-    pub repaired_objects: u64,
+    /// Decoded objects that had at least one repair symbol admitted. This is
+    /// useful for scheduler attribution, but does not prove source loss.
+    pub repair_assisted_objects: u64,
+    /// Decoded objects for which RaptorQ replaced one or more missing source
+    /// symbols before the object deadline.
+    pub fec_recovered_objects: u64,
+    /// Exact number of missing source symbols reconstructed across recovered
+    /// objects.
+    pub fec_recovered_source_symbols: u64,
     pub expired_objects: u64,
     pub conflict_drops: u64,
     pub authentication_drops: u64,
@@ -491,6 +502,7 @@ struct ActiveObject {
     assembler: ObjectAssembler,
     parent_sessions: HashSet<u64>,
     symbols: HashMap<u32, SymbolFingerprint>,
+    source_symbols: usize,
     repair_symbols: usize,
     reserved_bytes: usize,
     last_activity_us: u64,
@@ -736,6 +748,7 @@ impl RelayObjectReceiver {
                 assembler,
                 parent_sessions,
                 symbols: HashMap::new(),
+                source_symbols: 0,
                 repair_symbols: 0,
                 reserved_bytes,
                 last_activity_us: now_us,
@@ -827,6 +840,7 @@ impl RelayObjectReceiver {
             return Ok(RelayIngressOutcome::Duplicate {
                 key: symbol.object_key,
                 role: symbol.role,
+                deadline: symbol.deadline,
             });
         }
 
@@ -872,6 +886,7 @@ impl RelayObjectReceiver {
                 Ok(RelayIngressOutcome::Duplicate {
                     key: symbol.object_key,
                     role: symbol.role,
+                    deadline: symbol.deadline,
                 })
             } else {
                 Err(RelayIngressError::SymbolReplayConflict)
@@ -888,6 +903,7 @@ impl RelayObjectReceiver {
         state.symbols.insert(header.packet_sequence, fingerprint);
         match symbol.role {
             MediaDatagramRole::Source => {
+                state.source_symbols = state.source_symbols.saturating_add(1);
                 self.counters.source_datagrams = self.counters.source_datagrams.saturating_add(1);
             }
             MediaDatagramRole::Repair => {
@@ -902,6 +918,7 @@ impl RelayObjectReceiver {
             return Ok(RelayIngressOutcome::Buffered {
                 key: symbol.object_key,
                 role: symbol.role,
+                deadline: symbol.deadline,
             });
         };
         validate_object_kind(&object, state.announcement.kind)?;
@@ -915,7 +932,18 @@ impl RelayObjectReceiver {
         let accepted_datagrams = active.symbols.len();
         self.counters.decoded_objects = self.counters.decoded_objects.saturating_add(1);
         if active.repair_symbols > 0 {
-            self.counters.repaired_objects = self.counters.repaired_objects.saturating_add(1);
+            self.counters.repair_assisted_objects =
+                self.counters.repair_assisted_objects.saturating_add(1);
+        }
+        let missing_source_symbols = usize::from(active.announcement.coding.source_symbols())
+            .saturating_sub(active.source_symbols);
+        if missing_source_symbols > 0 {
+            self.counters.fec_recovered_objects =
+                self.counters.fec_recovered_objects.saturating_add(1);
+            self.counters.fec_recovered_source_symbols = self
+                .counters
+                .fec_recovered_source_symbols
+                .saturating_add(missing_source_symbols as u64);
         }
         self.insert_completed(
             key,
@@ -927,6 +955,7 @@ impl RelayObjectReceiver {
         Ok(RelayIngressOutcome::Decoded {
             object: Box::new(object),
             role: symbol.role,
+            deadline: symbol.deadline,
             parent_count,
             accepted_datagrams,
             envelope_hash,
@@ -1463,6 +1492,10 @@ mod tests {
         assert_eq!(receiver.state().active_objects, 0);
         assert_eq!(receiver.state().completed_objects, 1);
         assert_eq!(receiver.state().buffered_datagrams, 0);
+        let counters = receiver.snapshot().counters;
+        assert_eq!(counters.repair_assisted_objects, 1);
+        assert_eq!(counters.fec_recovered_objects, 1);
+        assert_eq!(counters.fec_recovered_source_symbols, 5);
     }
 
     #[test]
@@ -1530,7 +1563,7 @@ mod tests {
                 dispatch
                     .push(secondary_peer, &wire, 2_000_001)
                     .expect("late controlled secondary repair"),
-                RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Duplicate { ref key, role })
+                RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Duplicate { ref key, role, .. })
                     if key == object.key() && role == MediaDatagramRole::Repair
             ));
         }
@@ -1557,6 +1590,9 @@ mod tests {
         assert_eq!(snapshot.counters.datagrams_rejected, 0);
         assert_eq!(snapshot.counters.authentication_drops, 0);
         assert_eq!(snapshot.counters.deadline_drops, 0);
+        assert_eq!(snapshot.counters.repair_assisted_objects, 0);
+        assert_eq!(snapshot.counters.fec_recovered_objects, 0);
+        assert_eq!(snapshot.counters.fec_recovered_source_symbols, 0);
     }
 
     #[test]
