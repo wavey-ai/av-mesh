@@ -30,7 +30,7 @@ linode = { git = "https://github.com/wavey-ai/linode.git", optional = true }
 message-packetizer = { git = "https://github.com/wavey-ai/message-packetizer.git" }
 media-object = { path = "../media-object" }
 media-capability = { path = "../needletail/crates/media-capability" }
-playlists = { path = "../playlists" }
+playlists = { path = "../playlists", features = ["mesh"] }
 raptorq-datagram-fec = { path = "../raptor-fec/crates/raptorq-datagram-fec" }
 raptorq-fec-transport = { path = "../raptor-fec/crates/raptorq-fec-transport" }
 relay-session = { path = "../relay-session", default-features = false }
