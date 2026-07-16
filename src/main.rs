@@ -105,6 +105,7 @@ const MESH_STORAGE_ERROR_PCT: u64 = 95;
 const MESH_MIN_STALE_INGEST_ALERT_MS: u64 = 5_000;
 const MESH_STREAM_LAG_WARN_PARTS: u64 = 6;
 const CANONICAL_EPOCH_ACTIVATION_WARN_US: u64 = 10_000_000;
+const RELAY_PROCESSING_P95_WARN_US: u64 = 1_000;
 const MESH_ACTIVITY_LIMIT: usize = 64;
 const EDGE_RECENT_RESPONSE_LIMIT: usize = 32;
 const EDGE_RESPONSE_DURATION_BUCKETS_US: [u64; 13] = [
@@ -2449,13 +2450,38 @@ async fn process_udp_fec_ingest_datagram(
     relay_dispatch: &mut RelayUdpDispatch,
     relay_forwarder: Option<&RelayDownstreamForwarder>,
 ) -> Result<Option<RelayDatagramObservation>> {
+    let started = Instant::now();
+    let result = process_udp_fec_ingest_datagram_inner(
+        peer,
+        datagram,
+        cache,
+        receiver,
+        relay_dispatch,
+        relay_forwarder,
+    )
+    .await;
+    cache.update_relay_runtime(
+        relay_dispatch.receiver().snapshot(),
+        relay_forwarder.map(RelayDownstreamForwarder::snapshot),
+    );
+    cache.record_relay_processing(started.elapsed());
+    result
+}
+
+async fn process_udp_fec_ingest_datagram_inner(
+    peer: SocketAddr,
+    datagram: &[u8],
+    cache: &LiveTsCache,
+    receiver: &mut UdpFecReceiver,
+    relay_dispatch: &mut RelayUdpDispatch,
+    relay_forwarder: Option<&RelayDownstreamForwarder>,
+) -> Result<Option<RelayDatagramObservation>> {
     debug!(
         peer = %peer,
         datagram_bytes = datagram.len(),
         "UDP-FEC mesh datagram received"
     );
     let relay_result = relay_dispatch.push(peer, datagram, now_unix_us());
-    cache.update_relay_ingress(relay_dispatch.receiver().snapshot());
     match relay_result {
         Ok(RelayUdpDispatchOutcome::Legacy) => {}
         Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Buffered {
@@ -2467,7 +2493,6 @@ async fn process_udp_fec_ingest_datagram(
                 forwarder
                     .forward(datagram, role, Some(&key), Some(deadline.expires_at_us))
                     .await;
-                cache.update_relay_forward(forwarder.snapshot());
             }
             debug!(
                 peer = %peer,
@@ -2498,15 +2523,14 @@ async fn process_udp_fec_ingest_datagram(
                         Some(deadline.expires_at_us),
                     )
                     .await;
-                cache.update_relay_forward(forwarder.snapshot());
             }
             let stream = object.key().stream().to_owned();
             let sequence = object.key().object();
-            let availability = relay_availability_observation(&object, now_unix_us());
+            let publication_clock = relay_publication_clock(&object);
             let decoded = match commit_relay_object(cache, *object).await {
                 Ok(_) => {
-                    if let Some(observation) = availability {
-                        cache.record_relay_availability(observation);
+                    if let Some(clock) = publication_clock {
+                        cache.record_relay_availability(clock.observe(now_unix_us()));
                     }
                     debug!(
                         peer = %peer,
@@ -2540,7 +2564,6 @@ async fn process_udp_fec_ingest_datagram(
                 forwarder
                     .forward(datagram, role, Some(&key), Some(deadline.expires_at_us))
                     .await;
-                cache.update_relay_forward(forwarder.snapshot());
             }
             debug!(
                 peer = %peer,
@@ -2735,10 +2758,34 @@ enum RelayAvailabilityObservation {
     UnusableClock,
 }
 
-fn relay_availability_observation(
-    object: &MediaObject,
-    available_at_us: u64,
-) -> Option<RelayAvailabilityObservation> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayPublicationClock {
+    Measured {
+        published_us: u64,
+        clock_error_us: u64,
+    },
+    Unusable,
+}
+
+impl RelayPublicationClock {
+    fn observe(self, available_at_us: u64) -> RelayAvailabilityObservation {
+        match self {
+            Self::Measured {
+                published_us,
+                clock_error_us,
+            } => available_at_us
+                .checked_sub(published_us)
+                .map(|duration_us| RelayAvailabilityObservation::Measured {
+                    duration_us,
+                    clock_error_us,
+                })
+                .unwrap_or(RelayAvailabilityObservation::UnusableClock),
+            Self::Unusable => RelayAvailabilityObservation::UnusableClock,
+        }
+    }
+}
+
+fn relay_publication_clock(object: &MediaObject) -> Option<RelayPublicationClock> {
     if object.kind() != ObjectKind::Media {
         return None;
     }
@@ -2748,22 +2795,26 @@ fn relay_availability_observation(
         .find(|timestamp| timestamp.stage() == Stage::Published)
         .map(|timestamp| timestamp.timestamp())
     else {
-        return Some(RelayAvailabilityObservation::UnusableClock);
+        return Some(RelayPublicationClock::Unusable);
     };
     let Ok(published_ns) = u64::try_from(published.unix_time_ns()) else {
-        return Some(RelayAvailabilityObservation::UnusableClock);
+        return Some(RelayPublicationClock::Unusable);
     };
     let Some(clock_error_ns) = published.confidence().maximum_error_ns() else {
-        return Some(RelayAvailabilityObservation::UnusableClock);
+        return Some(RelayPublicationClock::Unusable);
     };
-    let published_us = published_ns.div_ceil(1_000);
-    let Some(duration_us) = available_at_us.checked_sub(published_us) else {
-        return Some(RelayAvailabilityObservation::UnusableClock);
-    };
-    Some(RelayAvailabilityObservation::Measured {
-        duration_us,
+    Some(RelayPublicationClock::Measured {
+        published_us: published_ns.div_ceil(1_000),
         clock_error_us: clock_error_ns.div_ceil(1_000),
     })
+}
+
+#[cfg(test)]
+fn relay_availability_observation(
+    object: &MediaObject,
+    available_at_us: u64,
+) -> Option<RelayAvailabilityObservation> {
+    relay_publication_clock(object).map(|clock| clock.observe(available_at_us))
 }
 
 #[derive(Debug, Clone)]
@@ -2880,6 +2931,7 @@ struct LiveTsCache {
     playlist_cache: Vec<StdRwLock<Option<CachedPlaylist>>>,
     relay_ingress: StdRwLock<RelaySessionIngressSnapshot>,
     relay_failover_controller: StdRwLock<RelayFailoverControllerSnapshot>,
+    relay_processing: AtomicDurationHistogram,
     relay_availability: RelayAvailabilityTelemetry,
 }
 
@@ -2915,16 +2967,25 @@ impl LiveTsCache {
             playlist_cache,
             relay_ingress: StdRwLock::new(RelaySessionIngressSnapshot::default()),
             relay_failover_controller: StdRwLock::new(RelayFailoverControllerSnapshot::default()),
+            relay_processing: AtomicDurationHistogram::default(),
             relay_availability: RelayAvailabilityTelemetry::default(),
         })
     }
 
     fn update_relay_ingress(&self, snapshot: RelayIngressSnapshot) {
+        self.update_relay_runtime(snapshot, None);
+    }
+
+    fn update_relay_runtime(
+        &self,
+        snapshot: RelayIngressSnapshot,
+        forward: Option<RelayForwardSnapshot>,
+    ) {
         let mut current = self
             .relay_ingress
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let forward = current.forward_snapshot();
+        let forward = forward.unwrap_or_else(|| current.forward_snapshot());
         *current = snapshot.into();
         current.apply_forward_snapshot(forward);
     }
@@ -2955,8 +3016,18 @@ impl LiveTsCache {
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
+        snapshot.processing_duration_count = self.relay_processing.count.load(Ordering::Relaxed);
+        snapshot.processing_duration_sum_us = self.relay_processing.sum_us.load(Ordering::Relaxed);
+        snapshot.processing_duration_max_us = self.relay_processing.max_us.load(Ordering::Relaxed);
+        snapshot.processing_duration_buckets = std::array::from_fn(|index| {
+            self.relay_processing.buckets[index].load(Ordering::Relaxed)
+        });
         self.relay_availability.apply_to(&mut snapshot);
         snapshot
+    }
+
+    fn record_relay_processing(&self, duration: Duration) {
+        self.relay_processing.record(duration);
     }
 
     fn record_relay_availability(&self, observation: RelayAvailabilityObservation) {
@@ -4285,6 +4356,10 @@ struct RelaySessionIngressSnapshot {
     warm_source_expired_datagrams: u64,
     warm_source_retired_datagrams: u64,
     warm_source_evicted_datagrams: u64,
+    processing_duration_count: u64,
+    processing_duration_sum_us: u64,
+    processing_duration_max_us: u64,
+    processing_duration_buckets: [u64; EDGE_RESPONSE_DURATION_BUCKETS_US.len()],
     forward_duration_count: u64,
     forward_duration_sum_us: u64,
     forward_duration_max_us: u64,
@@ -6101,6 +6176,42 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
     }
     push_prometheus_metric_header(
         &mut output,
+        "av_mesh_relay_session_processing_duration_us",
+        "Application processing time from RelaySession datagram receipt through forwarding and any completed-object cache commit, in microseconds.",
+        "histogram",
+    );
+    for (upper_bound_us, count) in EDGE_RESPONSE_DURATION_BUCKETS_US
+        .iter()
+        .zip(snapshot.relay_session.processing_duration_buckets)
+    {
+        output.push_str(&format!(
+            "av_mesh_relay_session_processing_duration_us_bucket{{le=\"{upper_bound_us}\"}} {count}\n"
+        ));
+    }
+    output.push_str(&format!(
+        "av_mesh_relay_session_processing_duration_us_bucket{{le=\"+Inf\"}} {}\n",
+        snapshot.relay_session.processing_duration_count
+    ));
+    output.push_str(&format!(
+        "av_mesh_relay_session_processing_duration_us_sum {}\n",
+        snapshot.relay_session.processing_duration_sum_us
+    ));
+    output.push_str(&format!(
+        "av_mesh_relay_session_processing_duration_us_count {}\n",
+        snapshot.relay_session.processing_duration_count
+    ));
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_relay_session_processing_duration_max_us",
+        "Maximum observed RelaySession application processing time in microseconds.",
+        "gauge",
+    );
+    output.push_str(&format!(
+        "av_mesh_relay_session_processing_duration_max_us {}\n",
+        snapshot.relay_session.processing_duration_max_us
+    ));
+    push_prometheus_metric_header(
+        &mut output,
         "av_mesh_relay_session_forward_duration_us",
         "Time to submit one admitted RelaySession datagram to one downstream child in microseconds.",
         "histogram",
@@ -7181,6 +7292,32 @@ fn derive_mesh_alerts(
             node_id: None,
             stream_id_text: Some(stream_id_text(*stream_id)),
         });
+    }
+
+    for node in relay_nodes {
+        let relay = &node.relay_session;
+        let Some(processing_p95_us) = histogram_percentile_upper_bound_us(
+            relay.processing_duration_count,
+            &relay.processing_duration_buckets,
+            95,
+            relay.processing_duration_max_us,
+        ) else {
+            continue;
+        };
+        if processing_p95_us > RELAY_PROCESSING_P95_WARN_US {
+            alerts.push(MeshAlert {
+                level: "warn",
+                code: "relay_processing_p95_exceeded",
+                message: format!(
+                    "Relay {} application processing p95 is {processing_p95_us} us; the interactive and premium limit is {} us.",
+                    node.node_id, RELAY_PROCESSING_P95_WARN_US
+                ),
+                count: processing_p95_us,
+                last_seen_unix_ms: Some(now),
+                node_id: Some(node.node_id.clone()),
+                stream_id_text: None,
+            });
+        }
     }
 
     let controlled_relay_node_ids = relay_nodes
@@ -9592,6 +9729,14 @@ mod tests {
                 clock_error_us: 5_000,
             })
         );
+        let clock = relay_publication_clock(&object).expect("published media clock");
+        assert_eq!(
+            clock.observe(1_275_000),
+            RelayAvailabilityObservation::Measured {
+                duration_us: 275_000,
+                clock_error_us: 5_000,
+            }
+        );
 
         let telemetry = RelayAvailabilityTelemetry::default();
         telemetry.record(RelayAvailabilityObservation::Measured {
@@ -10647,6 +10792,10 @@ mod tests {
             warm_source_expired_datagrams: 2,
             warm_source_retired_datagrams: 8,
             warm_source_evicted_datagrams: 1,
+            processing_duration_count: 48,
+            processing_duration_sum_us: 4_800,
+            processing_duration_max_us: 320,
+            processing_duration_buckets: [48; EDGE_RESPONSE_DURATION_BUCKETS_US.len()],
             forward_duration_count: 24,
             forward_duration_sum_us: 2_400,
             forward_duration_max_us: 240,
@@ -10722,6 +10871,8 @@ mod tests {
         assert!(metrics.contains("av_mesh_relay_warm_source_expired_datagrams_total 2\n"));
         assert!(metrics.contains("av_mesh_relay_warm_source_retired_datagrams_total 8\n"));
         assert!(metrics.contains("av_mesh_relay_warm_source_evicted_datagrams_total 1\n"));
+        assert!(metrics.contains("av_mesh_relay_session_processing_duration_us_count 48\n"));
+        assert!(metrics.contains("av_mesh_relay_session_processing_duration_max_us 320\n"));
         assert!(metrics.contains("av_mesh_relay_session_forward_duration_us_count 24\n"));
         assert!(metrics.contains("av_mesh_relay_session_forward_duration_max_us 240\n"));
         assert!(metrics.contains("av_mesh_relay_session_publication_to_available_us_count 9\n"));
@@ -11378,6 +11529,52 @@ mod tests {
         assert!(alerts.iter().any(|alert| {
             alert.code == "linode_private_discovery_inactive"
                 && alert.node_id.as_deref() == Some("uk-local")
+        }));
+    }
+
+    #[test]
+    fn mesh_alerts_when_measured_relay_processing_exceeds_interactive_limit() {
+        let local_stream =
+            telemetry_snapshot_for_tests("edge", "jp", "apac", 35.7, 139.7, Vec::new(), 1).stream;
+        let processing_duration_buckets =
+            std::array::from_fn(|index| if index < 4 { 94 } else { 100 });
+        let relay_nodes = vec![RelayNodeSessionSnapshot {
+            node_id: "relay-primary".into(),
+            region: "eu-west".into(),
+            relay_session: RelaySessionIngressSnapshot {
+                processing_duration_count: 100,
+                processing_duration_sum_us: 50_000,
+                processing_duration_max_us: 2_500,
+                processing_duration_buckets,
+                ..RelaySessionIngressSnapshot::default()
+            },
+        }];
+
+        let alerts = derive_mesh_alerts(
+            &AggregateMetrics {
+                node_count: 2,
+                connection_count: 1,
+                ..AggregateMetrics::default()
+            },
+            &[],
+            &[],
+            &[],
+            &local_stream,
+            "edge",
+            &[],
+            &relay_nodes,
+            &[],
+            &TelemetryHealthSnapshot::default(),
+            &RelaySessionIngressSnapshot::default(),
+            &ProvisionStatus::default(),
+            &[],
+            &PrivateDiscoveryStatus::default(),
+        );
+
+        assert!(alerts.iter().any(|alert| {
+            alert.code == "relay_processing_p95_exceeded"
+                && alert.node_id.as_deref() == Some("relay-primary")
+                && alert.count == 2_500
         }));
     }
 
@@ -13898,6 +14095,9 @@ mod tests {
         assert!(relay.fec_recovered_source_symbols > 0);
         assert!(relay.source_datagrams > 0);
         assert!(relay.repair_datagrams > 0);
+        assert!(relay.processing_duration_count > 0);
+        assert!(relay.processing_duration_sum_us > 0);
+        assert!(relay.processing_duration_max_us > 0);
         let _ = shutdown_tx.send(());
         task.await.unwrap().unwrap();
     }
