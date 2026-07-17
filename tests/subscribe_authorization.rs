@@ -584,7 +584,7 @@ fn wrong_scope_signature_expiry_replay_and_proof_fail_closed() {
 }
 
 #[test]
-fn partitioned_catalog_filters_sources_and_talkback_audiences() {
+fn retained_catalog_filters_sources_and_rejects_talkback_objects() {
     let source_fixture = fixture(MediaClass::Source);
     let mut params = claims_params("cap_catalog_source", MediaClass::Source);
     params.source_ids = vec![source_fixture.source.clone()];
@@ -607,7 +607,8 @@ fn partitioned_catalog_filters_sources_and_talkback_audiences() {
     catalog
         .insert(source_entry("cfg_source_aux", "src_aux", 2))
         .unwrap();
-    let talkback = CanonicalCatalogEntry::from_media_object(canonical_object(
+    let program_before = catalog.lane_len(CatalogLane::Program);
+    let talkback_error = CanonicalCatalogEntry::from_media_object(canonical_object(
         MediaClass::Talkback,
         None,
         Some("aud_listener"),
@@ -618,22 +619,14 @@ fn partitioned_catalog_filters_sources_and_talkback_audiences() {
         960,
         240,
     ))
-    .unwrap();
+    .unwrap_err();
     assert_eq!(
-        talkback
-            .authorize(
-                &source_fixture.gate,
-                &source_lease,
-                CatalogLane::Program,
-                NOW,
-            )
-            .unwrap_err()
-            .code(),
+        talkback_error.code(),
         EdgeSubscribeErrorCode::CatalogLaneMismatch
     );
-    catalog.insert(talkback).unwrap();
+    assert_eq!(catalog.lane_len(CatalogLane::Program), program_before);
     assert_eq!(catalog.lane_len(CatalogLane::Program), 2);
-    assert_eq!(catalog.lane_len(CatalogLane::Talkback), 1);
+    assert_eq!(catalog.lane_len(CatalogLane::Talkback), 0);
     let visible = catalog
         .visible(
             &source_fixture.gate,
@@ -658,57 +651,6 @@ fn partitioned_catalog_filters_sources_and_talkback_audiences() {
         )
         .unwrap()
         .is_empty());
-
-    let talkback_fixture = fixture(MediaClass::Talkback);
-    let mut params = claims_params("cap_catalog_talkback", MediaClass::Talkback);
-    params.audience_ids = vec![talkback_fixture.audience.clone()];
-    let token = sign(&talkback_fixture.signing_key, params);
-    let talkback_lease = authorize(
-        &talkback_fixture,
-        &token,
-        "conn-catalog-talkback",
-        Some(PROOF),
-        None,
-        Some(&talkback_fixture.audience),
-        NOW,
-    )
-    .unwrap();
-    let mut talkback_catalog = PartitionedCatalog::new(4).unwrap();
-    for (audience, configuration, sequence) in [
-        ("aud_listener", "cfg_tb_listener", 4),
-        ("aud_other", "cfg_tb_other", 5),
-    ] {
-        talkback_catalog
-            .insert(
-                CanonicalCatalogEntry::from_media_object(canonical_object(
-                    MediaClass::Talkback,
-                    None,
-                    Some(audience),
-                    configuration,
-                    sequence,
-                    NOW + 80,
-                    1,
-                    960,
-                    240,
-                ))
-                .unwrap(),
-            )
-            .unwrap();
-    }
-    let visible = talkback_catalog
-        .visible(
-            &talkback_fixture.gate,
-            &talkback_lease,
-            CatalogLane::Talkback,
-            NOW,
-            4,
-        )
-        .unwrap();
-    assert_eq!(visible.len(), 1);
-    assert_eq!(
-        visible[0].identity().audience_id().unwrap().as_str(),
-        "aud_listener"
-    );
 }
 
 #[test]

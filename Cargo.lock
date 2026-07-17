@@ -171,6 +171,8 @@ dependencies = [
  "relay-session",
  "serde",
  "serde_json",
+ "synchronized-stems-media",
+ "talkback-media",
  "tcp-changes",
  "tokio",
  "tokio-tungstenite",
@@ -2689,6 +2691,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "synchronized-stems-media"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "synstructure"
 version = "0.12.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2730,6 +2740,13 @@ checksum = "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
 dependencies = [
  "core-foundation-sys",
  "libc",
+]
+
+[[package]]
+name = "talkback-media"
+version = "0.1.0"
+dependencies = [
+ "bytes",
 ]
 
 [[package]]

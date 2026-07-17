@@ -41,7 +41,8 @@ const OPERATION_METADATA: &str = "media-operation-v1";
 const CONFIGURATION_METADATA: &str = "media-frame-configuration-v1";
 const ENVELOPE_METADATA: &str = "media-frame-envelope-v1";
 
-/// Physically separate catalog partitions. Talkback never shares the program map.
+/// Requested delivery lane. Talkback frames use `talkback_lane`, never this
+/// module's retained `MediaObject` catalogue.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum CatalogLane {
     Program,
@@ -1121,7 +1122,8 @@ const ALL_ERROR_CODES: [EdgeSubscribeErrorCode; ERROR_CODE_COUNT] = [
     EdgeSubscribeErrorCode::DatagramLimit,
 ];
 
-/// Canonical catalog value parsed from P03 metadata before it can be revealed.
+/// Canonical retained-program catalog value parsed from P03 metadata before it
+/// can be revealed. A talkback object is rejected before insertion.
 #[derive(Clone)]
 pub struct CanonicalCatalogEntry {
     object: MediaObject,
@@ -1204,11 +1206,13 @@ impl CanonicalCatalogEntry {
                 "canonical_identity",
             ));
         }
-        let lane = if identity.media_class() == MediaClass::Talkback {
-            CatalogLane::Talkback
-        } else {
-            CatalogLane::Program
-        };
+        if identity.media_class() == MediaClass::Talkback {
+            return Err(EdgeSubscribeError::new(
+                EdgeSubscribeErrorCode::CatalogLaneMismatch,
+                "ephemeral_talkback_lane",
+            ));
+        }
+        let lane = CatalogLane::Program;
         Ok(Self {
             object,
             configuration,
@@ -1330,7 +1334,8 @@ impl fmt::Debug for CanonicalCatalogEntry {
     }
 }
 
-/// Bounded catalog with physically distinct program and talkback maps.
+/// Bounded retained catalog. The talkback partition remains empty under P09;
+/// its accessor is retained for migration observability.
 pub struct PartitionedCatalog {
     max_objects: usize,
     program: BTreeMap<ObjectKey, CanonicalCatalogEntry>,
