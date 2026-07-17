@@ -33,9 +33,9 @@ use playlists::chunk_cache::{ChunkCache, PutIfAbsentResult};
 use playlists::mesh::{CacheMesh, CacheMeshConfig, CacheMeshFecStats, CacheMeshHandle};
 use playlists::Options as CacheOptions;
 use raptorq_datagram_fec::{
-    decode_serialized_media_access_unit, DecodedMediaFrame, MediaCodec, MediaDatagramRole,
-    MediaFecDecoder, MediaFragmentHeader, MediaFrameMetadata, DATAGRAM_MAGIC,
-    MEDIA_FRAME_HEADER_LEN,
+    decode_serialized_media_access_unit, inspect_multichannel_audio_datagram, DecodedMediaFrame,
+    MediaCodec, MediaDatagramRole, MediaFecDecoder, MediaFragmentHeader, MediaFrameMetadata,
+    DATAGRAM_MAGIC, MEDIA_FRAME_HEADER_LEN,
 };
 use raptorq_fec_transport::{split_stream_id_prefix, FecDatagramDecoder, STREAM_ID_PREFIX_LEN};
 use relay_session::{
@@ -82,6 +82,7 @@ const RELAY_WARM_SOURCE_REPLAY_MAX_BYTES_PER_CHILD: usize = 4 * 1024 * 1024;
 // The reliable subscription/catalog lane will supply this for late joins. The
 // local transition path starts each canonical stream at object zero.
 const PART_WAIT_MS: u64 = 3_000;
+const LLHLS_TAIL_WAIT_MS: u64 = 250;
 const REPLICA_REQUEST_MIN_INTERVAL_MS: u64 = 1_000;
 const MESH_EVENTS_PATH: &str = "/api/mesh/events";
 const MESH_WEBSOCKET_PATH: &str = "/ws/mesh";
@@ -92,8 +93,148 @@ const MEDIA_ACCESS_UNIT_CONTENT_TYPE: &str = "application/vnd.wavey.media-access
 const LIVE_FMP4_CONTENT_TYPE: &str = "video/mp4";
 const LIVE_TS_CONTENT_TYPE: &str = "video/mp2t";
 const AUDIO_EPOCH_SUBSCRIPTION: &[u8] = b"WAVEY-AUDIO-EPOCH/1";
+const AUDIO_EPOCH_SUBSCRIPTION_V2_PREFIX: &[u8] = b"WAVEY-AUDIO-EPOCH/2 ";
 const AUDIO_EPOCH_BROADCAST_CAPACITY: usize = 2048;
+const NATIVE_AUDIO_SUBSCRIBE: &[u8] = b"WAVEY-DAW-SUBSCRIBE/1";
+const NATIVE_AUDIO_SUBSCRIBE_ACK: &[u8] = b"WAVEY-DAW-SUBSCRIBED/1";
+const NATIVE_AUDIO_SUBSCRIBE_V2_PREFIX: &[u8] = b"WAVEY-DAW-SUBSCRIBE/2 ";
+const NATIVE_AUDIO_SUBSCRIBE_ACK_V2_PREFIX: &[u8] = b"WAVEY-DAW-SUBSCRIBED/2 ";
+const NATIVE_AUDIO_UNSUBSCRIBE: &[u8] = b"WAVEY-DAW-UNSUBSCRIBE/1";
+const NATIVE_AUDIO_UNSUBSCRIBE_V2_PREFIX: &[u8] = b"WAVEY-DAW-UNSUBSCRIBE/2 ";
+const NATIVE_AUDIO_SUBSCRIPTION_TTL: Duration = Duration::from_secs(15);
 const MULTICHANNEL_AUDIO_TRANSPORT_MAGIC: &[u8] = b"AEP1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AudioEpochDatagram {
+    session_id: Option<u64>,
+    bytes: Bytes,
+}
+
+fn parse_audio_epoch_subscription(payload: &[u8]) -> Option<Option<u64>> {
+    if payload == AUDIO_EPOCH_SUBSCRIPTION {
+        return Some(None);
+    }
+    let session = payload.strip_prefix(AUDIO_EPOCH_SUBSCRIPTION_V2_PREFIX)?;
+    let session = std::str::from_utf8(session).ok()?;
+    if session.is_empty() || !session.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    session.parse().ok().map(Some)
+}
+
+fn parse_native_audio_session_message(payload: &[u8], prefix: &[u8]) -> Option<u64> {
+    let session = payload.strip_prefix(prefix)?;
+    let session = std::str::from_utf8(session).ok()?;
+    if session.is_empty() || !session.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    session.parse().ok()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NativeAudioSubscription {
+    session_id: Option<u64>,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct NativeAudioRelay {
+    subscriptions: HashMap<SocketAddr, NativeAudioSubscription>,
+}
+
+impl NativeAudioRelay {
+    fn expire(&mut self, now: Instant) {
+        self.subscriptions
+            .retain(|_, subscription| subscription.expires_at > now);
+    }
+
+    async fn handle_control(
+        &mut self,
+        socket: &UdpSocket,
+        peer: SocketAddr,
+        payload: &[u8],
+    ) -> bool {
+        if payload == NATIVE_AUDIO_SUBSCRIBE {
+            self.subscriptions.insert(
+                peer,
+                NativeAudioSubscription {
+                    session_id: None,
+                    expires_at: Instant::now() + NATIVE_AUDIO_SUBSCRIPTION_TTL,
+                },
+            );
+            if let Err(error) = socket.send_to(NATIVE_AUDIO_SUBSCRIBE_ACK, peer).await {
+                warn!(peer = %peer, error = %error, "failed to acknowledge native audio relay subscription");
+            }
+            return true;
+        }
+        if let Some(session_id) =
+            parse_native_audio_session_message(payload, NATIVE_AUDIO_SUBSCRIBE_V2_PREFIX)
+        {
+            self.subscriptions.insert(
+                peer,
+                NativeAudioSubscription {
+                    session_id: Some(session_id),
+                    expires_at: Instant::now() + NATIVE_AUDIO_SUBSCRIPTION_TTL,
+                },
+            );
+            let mut ack = Vec::with_capacity(NATIVE_AUDIO_SUBSCRIBE_ACK_V2_PREFIX.len() + 20);
+            ack.extend_from_slice(NATIVE_AUDIO_SUBSCRIBE_ACK_V2_PREFIX);
+            ack.extend_from_slice(session_id.to_string().as_bytes());
+            if let Err(error) = socket.send_to(&ack, peer).await {
+                warn!(peer = %peer, session_id, error = %error, "failed to acknowledge session-scoped native audio relay subscription");
+            }
+            return true;
+        }
+        if payload.starts_with(NATIVE_AUDIO_SUBSCRIBE_V2_PREFIX) {
+            warn!(peer = %peer, "ignored malformed session-scoped native audio relay subscription");
+            return true;
+        }
+        if payload == NATIVE_AUDIO_UNSUBSCRIBE {
+            self.subscriptions.remove(&peer);
+            return true;
+        }
+        if let Some(session_id) =
+            parse_native_audio_session_message(payload, NATIVE_AUDIO_UNSUBSCRIBE_V2_PREFIX)
+        {
+            if self
+                .subscriptions
+                .get(&peer)
+                .is_some_and(|subscription| subscription.session_id == Some(session_id))
+            {
+                self.subscriptions.remove(&peer);
+            }
+            return true;
+        }
+        if payload.starts_with(NATIVE_AUDIO_UNSUBSCRIBE_V2_PREFIX) {
+            warn!(peer = %peer, "ignored malformed session-scoped native audio relay unsubscription");
+            return true;
+        }
+        false
+    }
+
+    fn forward(&self, socket: &UdpSocket, datagram: &[u8], session_id: Option<u64>) {
+        for (target, subscription) in &self.subscriptions {
+            if subscription.session_id.is_some() && subscription.session_id != session_id {
+                continue;
+            }
+            match socket.try_send_to(datagram, *target) {
+                Ok(sent) if sent == datagram.len() => {}
+                Ok(sent) => warn!(
+                    target = %target,
+                    sent,
+                    expected = datagram.len(),
+                    "native audio relay sent a partial datagram"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    debug!(target = %target, "native audio relay skipped a datagram under socket backpressure");
+                }
+                Err(error) => {
+                    warn!(target = %target, error = %error, "native audio relay send failed")
+                }
+            }
+        }
+    }
+}
 const MESH_FMP4_SLOT_MAGIC: &[u8; 8] = b"AVFMP4S1";
 const MESH_FMP4_SLOT_HEADER_LEN: usize = 16;
 const TELEMETRY_TAG: [u8; 4] = *b"AVMT";
@@ -684,6 +825,7 @@ async fn main() -> Result<()> {
                 controller.snapshot()
             }),
     );
+    let (audio_epoch_tx, _) = broadcast::channel(AUDIO_EPOCH_BROADCAST_CAPACITY);
     let fec_ingest_task = tokio::spawn(run_udp_fec_ingest(
         fec_socket,
         Arc::clone(&cache),
@@ -692,12 +834,12 @@ async fn main() -> Result<()> {
             dispatch: relay_dispatch,
             secondary_socket: relay_secondary_socket,
             forwarder: relay_forwarder,
+            audio_epochs: Some(audio_epoch_tx.clone()),
             failover_controller: relay_failover_controller,
             failover_heartbeat: Duration::from_millis(args.relay_failover_heartbeat_ms),
         },
     ));
 
-    let (audio_epoch_tx, _) = broadcast::channel(AUDIO_EPOCH_BROADCAST_CAPACITY);
     let media_fec_socket = UdpSocket::bind(args.media_fec_bind)
         .await
         .with_context(|| {
@@ -2328,6 +2470,7 @@ struct RelayIngestRuntime {
     dispatch: RelayUdpDispatch,
     secondary_socket: Option<UdpSocket>,
     forwarder: Option<Arc<RelayDownstreamForwarder>>,
+    audio_epochs: Option<broadcast::Sender<AudioEpochDatagram>>,
     failover_controller: Option<RelayFailoverController>,
     failover_heartbeat: Duration,
 }
@@ -2342,10 +2485,13 @@ async fn run_udp_fec_ingest(
         dispatch: mut relay_dispatch,
         secondary_socket: relay_secondary_socket,
         forwarder: relay_forwarder,
+        audio_epochs,
         failover_controller: mut relay_failover_controller,
         failover_heartbeat,
     } = runtime;
     let mut receiver = UdpFecReceiver::new();
+    let mut audio_block_sessions = HashMap::<u32, (u64, Instant)>::new();
+    let mut native_audio_relay = NativeAudioRelay::default();
     cache.update_relay_ingress(relay_dispatch.receiver().snapshot());
     let mut buf = vec![0u8; 65_536];
     let mut relay_secondary_buf = vec![0u8; 65_536];
@@ -2367,6 +2513,7 @@ async fn run_udp_fec_ingest(
                 cache.rotate_if_due(false).await?;
             }
             _ = expire_fec.tick() => {
+                native_audio_relay.expire(Instant::now());
                 let expired = receiver.expire_inactive();
                 if expired.objects > 0 || expired.flows > 0 {
                     debug!(
@@ -2396,6 +2543,22 @@ async fn run_udp_fec_ingest(
             }
             received = socket.recv_from(&mut buf) => {
                 let (len, peer) = received?;
+                if native_audio_relay
+                    .handle_control(&socket, peer, &buf[..len])
+                    .await
+                {
+                    continue;
+                }
+                if process_relay_audio_epoch_datagram(
+                    peer,
+                    &buf[..len],
+                    &mut audio_block_sessions,
+                    audio_epochs.as_ref(),
+                    relay_forwarder.as_deref(),
+                    Some((&socket, &native_audio_relay)),
+                ).await {
+                    continue;
+                }
                 let observation = process_udp_fec_ingest_datagram(
                     peer,
                     &buf[..len],
@@ -2413,6 +2576,16 @@ async fn run_udp_fec_ingest(
             }
             received = recv_optional_udp(&relay_secondary_socket, &mut relay_secondary_buf) => {
                 let (len, peer) = received?;
+                if process_relay_audio_epoch_datagram(
+                    peer,
+                    &relay_secondary_buf[..len],
+                    &mut audio_block_sessions,
+                    audio_epochs.as_ref(),
+                    relay_forwarder.as_deref(),
+                    Some((&socket, &native_audio_relay)),
+                ).await {
+                    continue;
+                }
                 let observation = process_udp_fec_ingest_datagram(
                     peer,
                     &relay_secondary_buf[..len],
@@ -2430,6 +2603,71 @@ async fn run_udp_fec_ingest(
             }
         }
     }
+}
+
+async fn process_relay_audio_epoch_datagram(
+    peer: SocketAddr,
+    datagram: &[u8],
+    block_sessions: &mut HashMap<u32, (u64, Instant)>,
+    audio_epochs: Option<&broadcast::Sender<AudioEpochDatagram>>,
+    relay_forwarder: Option<&RelayDownstreamForwarder>,
+    native_audio_relay: Option<(&UdpSocket, &NativeAudioRelay)>,
+) -> bool {
+    if !is_multichannel_audio_transport_datagram(datagram) {
+        return false;
+    }
+
+    let now = Instant::now();
+    block_sessions.retain(|_, (_, expires_at)| *expires_at > now);
+    let identity = match inspect_multichannel_audio_datagram(
+        &datagram[MULTICHANNEL_AUDIO_TRANSPORT_MAGIC.len()..],
+    ) {
+        Ok(identity) => identity,
+        Err(error) => {
+            warn!(peer = %peer, error = %error, "invalid AEP1 datagram rejected at relay ingress");
+            return true;
+        }
+    };
+    let session_id = if let Some(session_id) = identity.session_id {
+        block_sessions.insert(
+            identity.block_id,
+            (session_id, now + Duration::from_secs(15)),
+        );
+        Some(session_id)
+    } else {
+        block_sessions
+            .get(&identity.block_id)
+            .map(|(session_id, _)| *session_id)
+    };
+    let role = if identity.source_index.is_some() {
+        MediaDatagramRole::Source
+    } else {
+        MediaDatagramRole::Repair
+    };
+
+    if let Some((socket, native_audio_relay)) = native_audio_relay {
+        native_audio_relay.forward(socket, datagram, session_id);
+    }
+
+    if let Some(forwarder) = relay_forwarder {
+        forwarder.forward(datagram, role, None, None).await;
+    }
+    if let Some(audio_epochs) = audio_epochs {
+        let receivers = audio_epochs.receiver_count();
+        let _ = audio_epochs.send(AudioEpochDatagram {
+            session_id,
+            bytes: Bytes::copy_from_slice(datagram),
+        });
+        debug!(
+            peer = %peer,
+            ?session_id,
+            ?role,
+            receivers,
+            datagram_bytes = datagram.len(),
+            "relayed AEP1 datagram to playback-edge subscribers"
+        );
+    }
+    true
 }
 
 async fn recv_optional_udp(
@@ -2673,11 +2911,14 @@ async fn commit_relay_object(cache: &LiveTsCache, object: MediaObject) -> Result
 async fn run_udp_media_fec_ingest(
     socket: UdpSocket,
     cache: Arc<LiveTsCache>,
-    audio_epochs: broadcast::Sender<Bytes>,
+    audio_epochs: broadcast::Sender<AudioEpochDatagram>,
     mut shutdown_rx: watch::Receiver<()>,
 ) -> Result<()> {
     let mut decoder = MediaFecDecoder::new();
+    let mut audio_block_sessions = HashMap::<(SocketAddr, u32), (u64, Instant)>::new();
+    let mut native_audio_relay = NativeAudioRelay::default();
     let mut buf = vec![0u8; 65_536];
+    let audio_block_ttl = Duration::from_secs(15);
 
     loop {
         tokio::select! {
@@ -2687,16 +2928,46 @@ async fn run_udp_media_fec_ingest(
             }
             received = socket.recv_from(&mut buf) => {
                 let (len, peer) = received?;
+                native_audio_relay.expire(Instant::now());
+                if native_audio_relay
+                    .handle_control(&socket, peer, &buf[..len])
+                    .await
+                {
+                    continue;
+                }
                 debug!(
                     peer = %peer,
                     datagram_bytes = len,
                     "media UDP-FEC datagram received"
                 );
                 if is_multichannel_audio_transport_datagram(&buf[..len]) {
+                    let now = Instant::now();
+                    audio_block_sessions.retain(|_, (_, expires_at)| *expires_at > now);
+                    let identity = inspect_multichannel_audio_datagram(
+                        &buf[MULTICHANNEL_AUDIO_TRANSPORT_MAGIC.len()..len],
+                    );
+                    let session_id = identity.ok().and_then(|identity| {
+                        if let Some(session_id) = identity.session_id {
+                            audio_block_sessions.insert(
+                                (peer, identity.block_id),
+                                (session_id, now + audio_block_ttl),
+                            );
+                            Some(session_id)
+                        } else {
+                            audio_block_sessions
+                                .get(&(peer, identity.block_id))
+                                .map(|(session_id, _)| *session_id)
+                        }
+                    });
+                    native_audio_relay.forward(&socket, &buf[..len], session_id);
                     let receivers = audio_epochs.receiver_count();
-                    let _ = audio_epochs.send(Bytes::copy_from_slice(&buf[..len]));
+                    let _ = audio_epochs.send(AudioEpochDatagram {
+                        session_id,
+                        bytes: Bytes::copy_from_slice(&buf[..len]),
+                    });
                     debug!(
                         peer = %peer,
+                        ?session_id,
                         datagram_bytes = len,
                         receivers,
                         "broadcast media UDP-FEC multichannel audio epoch datagram"
@@ -2928,6 +3199,7 @@ struct LiveTsCache {
     max_part_bytes: usize,
     state: RwLock<LiveState>,
     canonical_commit_locks: StdMutex<HashMap<u64, Arc<AsyncMutex<()>>>>,
+    part_updates: watch::Sender<u64>,
     playlist_cache: Vec<StdRwLock<Option<CachedPlaylist>>>,
     relay_ingress: StdRwLock<RelaySessionIngressSnapshot>,
     relay_failover_controller: StdRwLock<RelayFailoverControllerSnapshot>,
@@ -2955,6 +3227,7 @@ impl LiveTsCache {
             .collect();
         let chunk_cache = Arc::new(ChunkCache::new(options));
         let _ = chunk_cache.get_or_create_stream_idx(stream_id).await;
+        let (part_updates, _) = watch::channel(0);
         Arc::new(Self {
             chunk_cache,
             stream_id,
@@ -2964,6 +3237,7 @@ impl LiveTsCache {
             max_part_bytes: slot_kb * 1024,
             state: RwLock::new(LiveState::new()),
             canonical_commit_locks: StdMutex::new(HashMap::new()),
+            part_updates,
             playlist_cache,
             relay_ingress: StdRwLock::new(RelaySessionIngressSnapshot::default()),
             relay_failover_controller: StdRwLock::new(RelayFailoverControllerSnapshot::default()),
@@ -3112,6 +3386,8 @@ impl LiveTsCache {
             duration_ms = part.duration_ms,
             "committed mesh byte part"
         );
+        drop(state);
+        self.part_updates.send_replace(part.seq);
         Ok(())
     }
 
@@ -3295,6 +3571,8 @@ impl LiveTsCache {
                 keyframe = object.is_keyframe(),
                 "committed canonical RaptorQ media object"
             );
+            drop(state);
+            self.part_updates.send_replace(seq);
             return Ok(seq);
         }
 
@@ -3340,6 +3618,8 @@ impl LiveTsCache {
             media_kind = ?media_kind,
             "committed stream-prefixed mesh payload"
         );
+        drop(state);
+        self.part_updates.send_replace(seq);
         Ok(seq)
     }
 
@@ -3698,6 +3978,7 @@ impl LiveTsCache {
         &self,
         stream_id: u64,
         after: Option<u64>,
+        start_at_oldest: bool,
     ) -> Option<(u64, Bytes, u64)> {
         let (stream_idx, last) = self.stream_position_for_id(stream_id).await?;
         if let Some(after) = after {
@@ -3721,7 +4002,12 @@ impl LiveTsCache {
         }
 
         let first = last.saturating_sub(self.window_parts.saturating_sub(1));
-        for seq in (first..=last).rev() {
+        let sequences: Vec<usize> = if start_at_oldest {
+            (first..=last).collect()
+        } else {
+            (first..=last).rev().collect()
+        };
+        for seq in sequences {
             if let Some((bytes, hash)) = self.chunk_cache.get(stream_idx, seq).await {
                 let slot = LiveSlotPayload::decode_for_stream(bytes, stream_id);
                 if slot.has_media() {
@@ -3734,6 +4020,32 @@ impl LiveTsCache {
             }
         }
         None
+    }
+
+    async fn next_part_after_blocking_for_stream_id(
+        &self,
+        stream_id: u64,
+        after: Option<u64>,
+        start_at_oldest: bool,
+    ) -> Option<(u64, Bytes, u64)> {
+        let deadline = Instant::now() + Duration::from_millis(LLHLS_TAIL_WAIT_MS);
+        let mut updates = self.part_updates.subscribe();
+        loop {
+            if let Some(part) = self
+                .next_part_after_for_stream_id(stream_id, after, start_at_oldest)
+                .await
+            {
+                return Some(part);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero()
+                || tokio::time::timeout(remaining, updates.changed())
+                    .await
+                    .is_err()
+            {
+                return None;
+            }
+        }
     }
 
     async fn get_part_blocking(&self, seq: u64) -> Option<(Bytes, u64)> {
@@ -8142,7 +8454,7 @@ async fn connect_telemetry_peer(
 struct AppRouter {
     cache: Arc<LiveTsCache>,
     mesh: Arc<CacheMeshHandle>,
-    audio_epochs: broadcast::Sender<Bytes>,
+    audio_epochs: broadcast::Sender<AudioEpochDatagram>,
     mesh_transport: MeshTransportConfigSnapshot,
     node: MeshNode,
     replication_policy: ReplicationPolicy,
@@ -8163,7 +8475,7 @@ impl AppRouter {
     fn new(
         cache: Arc<LiveTsCache>,
         mesh: Arc<CacheMeshHandle>,
-        audio_epochs: broadcast::Sender<Bytes>,
+        audio_epochs: broadcast::Sender<AudioEpochDatagram>,
         mesh_transport: MeshTransportConfigSnapshot,
         node: MeshNode,
         replication_policy: ReplicationPolicy,
@@ -8914,9 +9226,14 @@ impl Router for AppRouter {
                         .await;
                     let read = self.edge_load.begin_read(true);
                     let after = parse_query_u64(query, "after");
+                    let start_at_oldest = parse_query_u64(query, "from") == Some(0);
                     let Some((sequence, bytes, hash)) = self
                         .cache
-                        .next_part_after_for_stream_id(stream_id, after)
+                        .next_part_after_blocking_for_stream_id(
+                            stream_id,
+                            after,
+                            start_at_oldest,
+                        )
                         .await
                     else {
                         read.finish(0);
@@ -9295,13 +9612,18 @@ impl WebTransportHandler for AppRouter {
                     let datagram = datagram
                         .map_err(|err| ServerError::Config(format!("read WebTransport datagram: {err}")))?;
                     let payload = datagram.into_payload();
-                    if payload.as_ref() == AUDIO_EPOCH_SUBSCRIPTION {
+                    if let Some(requested_session_id) = parse_audio_epoch_subscription(&payload) {
                         let mut audio_epochs = self.audio_epochs.subscribe();
-                        info!("WebTransport multichannel audio epoch session started");
+                        info!(?requested_session_id, "WebTransport multichannel audio epoch session started");
                         loop {
                             match audio_epochs.recv().await {
                                 Ok(datagram) => {
-                                    if let Err(error) = datagram_sender.send_datagram(datagram) {
+                                    if requested_session_id.is_some()
+                                        && datagram.session_id != requested_session_id
+                                    {
+                                        continue;
+                                    }
+                                    if let Err(error) = datagram_sender.send_datagram(datagram.bytes) {
                                         debug!("WebTransport audio epoch session closed: {:?}", error);
                                         break;
                                     }
@@ -9700,6 +10022,36 @@ mod tests {
         out.extend_from_slice(init);
         out.extend_from_slice(media);
         Bytes::from(out)
+    }
+
+    #[test]
+    fn webtransport_audio_subscription_supports_session_filtering() {
+        assert_eq!(
+            parse_audio_epoch_subscription(AUDIO_EPOCH_SUBSCRIPTION),
+            Some(None)
+        );
+        assert_eq!(
+            parse_audio_epoch_subscription(b"WAVEY-AUDIO-EPOCH/2 91"),
+            Some(Some(91))
+        );
+        assert_eq!(
+            parse_audio_epoch_subscription(b"WAVEY-AUDIO-EPOCH/2 all"),
+            None
+        );
+        assert_eq!(
+            parse_native_audio_session_message(
+                b"WAVEY-DAW-SUBSCRIBE/2 91",
+                NATIVE_AUDIO_SUBSCRIBE_V2_PREFIX,
+            ),
+            Some(91)
+        );
+        assert_eq!(
+            parse_native_audio_session_message(
+                b"WAVEY-DAW-SUBSCRIBE/2 all",
+                NATIVE_AUDIO_SUBSCRIBE_V2_PREFIX,
+            ),
+            None
+        );
     }
 
     #[test]
@@ -13330,6 +13682,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn llhls_tail_waits_for_the_next_part_without_a_polling_sleep() {
+        use tokio::time::timeout;
+
+        let cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 600, 64).await;
+        assert_eq!(
+            cache
+                .commit_stream_payload(77, Bytes::from_static(b"first"))
+                .await
+                .unwrap(),
+            0
+        );
+
+        let waiting_cache = Arc::clone(&cache);
+        let waiter = tokio::spawn(async move {
+            waiting_cache
+                .next_part_after_blocking_for_stream_id(77, Some(0), false)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        assert_eq!(
+            cache
+                .commit_stream_payload(77, Bytes::from_static(b"second"))
+                .await
+                .unwrap(),
+            1
+        );
+        let (sequence, bytes, _) = timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("blocking tail should wake immediately")
+            .unwrap()
+            .expect("next LL-HLS part");
+        assert_eq!(sequence, 1);
+        assert_eq!(bytes, Bytes::from_static(b"second"));
+    }
+
+    #[tokio::test]
     async fn warm_stream_control_requests_mesh_replica() {
         use playlists::mesh::{CacheMesh, CacheMeshConfig};
         use tokio::time::timeout;
@@ -13492,6 +13882,7 @@ mod tests {
                 dispatch: empty_relay_udp_dispatch(),
                 secondary_socket: None,
                 forwarder: None,
+                audio_epochs: None,
                 failover_controller: None,
                 failover_heartbeat: Duration::from_millis(100),
             },
@@ -13606,6 +13997,116 @@ mod tests {
         assert_eq!(snapshot.errors, 0);
         assert_eq!(snapshot.filtered_datagrams, 1);
         assert_eq!(snapshot.duration_count, 1);
+    }
+
+    #[tokio::test]
+    async fn relay_fabric_forwards_exact_aep1_source_and_repair_to_the_edge() {
+        use raptorq_datagram_fec::{
+            AudioPayloadKind, AudioSampleFormat, MultichannelAudioEpoch,
+            MultichannelAudioFecConfig, MultichannelAudioFecEncoder, MultichannelAudioGroup,
+        };
+        use raptorq_fec_transport::MultichannelAudioTransportAdapter;
+        use tokio::time::timeout;
+
+        let source_child = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let repair_child = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let forwarder = RelayDownstreamForwarder::bind(&[
+            RelayForwardEndpoint {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                target: source_child.local_addr().unwrap(),
+                role: RelayForwardRole::Source,
+            },
+            RelayForwardEndpoint {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                target: repair_child.local_addr().unwrap(),
+                role: RelayForwardRole::Repair,
+            },
+        ])
+        .await
+        .unwrap()
+        .unwrap();
+        let (audio_tx, mut audio_rx) = broadcast::channel(8);
+        let mut block_sessions = HashMap::new();
+
+        let transport = MultichannelAudioTransportAdapter::udp(1_200);
+        let mut encoder = MultichannelAudioFecEncoder::new(transport.prepare_fec_config(
+            MultichannelAudioFecConfig {
+                repair_symbols: 2,
+                ..MultichannelAudioFecConfig::default()
+            },
+        ));
+        let pcm = vec![9_u8; 2_400];
+        let groups = [MultichannelAudioGroup {
+            group_id: 3,
+            channel_start: 48,
+            channel_count: 2,
+            payload_kind: AudioPayloadKind::Pcm,
+            sample_format: AudioSampleFormat::S24Le,
+            flags: 0,
+            payload: &pcm,
+        }];
+        let encoded = encoder
+            .encode_epoch(MultichannelAudioEpoch {
+                session_id: 444,
+                config_generation: 2,
+                epoch_id: 8,
+                pts_samples: 1_920,
+                sample_rate: 48_000,
+                frame_count: 240,
+                groups: &groups,
+            })
+            .unwrap();
+        let wrapped = transport.wrap_epoch(encoded).unwrap();
+        let source = wrapped.source_datagrams().next().unwrap().payload.clone();
+        let repair = wrapped.repair_datagrams().next().unwrap().payload.clone();
+        let peer: SocketAddr = "127.0.0.1:41001".parse().unwrap();
+
+        assert!(
+            process_relay_audio_epoch_datagram(
+                peer,
+                &source,
+                &mut block_sessions,
+                Some(&audio_tx),
+                Some(&forwarder),
+                None,
+            )
+            .await
+        );
+        let mut received = vec![0_u8; 1_500];
+        let (source_len, _) = timeout(
+            Duration::from_secs(1),
+            source_child.recv_from(&mut received),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&received[..source_len], source.as_ref());
+        let edge_source = audio_rx.recv().await.unwrap();
+        assert_eq!(edge_source.session_id, Some(444));
+        assert_eq!(edge_source.bytes, source);
+
+        assert!(
+            process_relay_audio_epoch_datagram(
+                peer,
+                &repair,
+                &mut block_sessions,
+                Some(&audio_tx),
+                Some(&forwarder),
+                None,
+            )
+            .await
+        );
+        let (repair_len, _) = timeout(
+            Duration::from_secs(1),
+            repair_child.recv_from(&mut received),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&received[..repair_len], repair.as_ref());
+        let edge_repair = audio_rx.recv().await.unwrap();
+        assert_eq!(edge_repair.session_id, Some(444));
+        assert_eq!(edge_repair.bytes, repair);
     }
 
     #[test]
@@ -13865,6 +14366,7 @@ mod tests {
                 dispatch: empty_relay_udp_dispatch(),
                 secondary_socket: None,
                 forwarder: None,
+                audio_epochs: None,
                 failover_controller: None,
                 failover_heartbeat: Duration::from_millis(100),
             },
@@ -13992,6 +14494,7 @@ mod tests {
                 dispatch,
                 secondary_socket: Some(secondary_ingest),
                 forwarder: None,
+                audio_epochs: None,
                 failover_controller: None,
                 failover_heartbeat: Duration::from_millis(100),
             },
@@ -14160,6 +14663,11 @@ mod tests {
 
     #[tokio::test]
     async fn media_udp_fec_ingest_broadcasts_audio_epoch_datagrams() {
+        use raptorq_datagram_fec::{
+            AudioPayloadKind, AudioSampleFormat, MultichannelAudioEpoch,
+            MultichannelAudioFecConfig, MultichannelAudioFecEncoder, MultichannelAudioGroup,
+        };
+        use raptorq_fec_transport::MultichannelAudioTransportAdapter;
         use tokio::time::timeout;
 
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -14174,16 +14682,70 @@ mod tests {
             shutdown_rx,
         ));
 
+        let subscriber = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        subscriber
+            .send_to(b"WAVEY-DAW-SUBSCRIBE/2 55", bind)
+            .await
+            .unwrap();
+        let mut subscriber_buf = vec![0_u8; 1_500];
+        let (ack_len, ack_peer) = timeout(
+            Duration::from_secs(1),
+            subscriber.recv_from(&mut subscriber_buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(ack_peer, bind);
+        assert_eq!(&subscriber_buf[..ack_len], b"WAVEY-DAW-SUBSCRIBED/2 55");
+
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let epoch_datagram = Bytes::from_static(b"AEP1source-or-repair-shard");
+        let transport = MultichannelAudioTransportAdapter::udp(1_200);
+        let mut encoder = MultichannelAudioFecEncoder::new(
+            transport.prepare_fec_config(MultichannelAudioFecConfig::default()),
+        );
+        let pcm = vec![5_u8; 240 * 2 * 2];
+        let groups = [MultichannelAudioGroup {
+            group_id: 0,
+            channel_start: 0,
+            channel_count: 2,
+            payload_kind: AudioPayloadKind::Pcm,
+            sample_format: AudioSampleFormat::S16Le,
+            flags: 0,
+            payload: &pcm,
+        }];
+        let encoded = encoder
+            .encode_epoch(MultichannelAudioEpoch {
+                session_id: 55,
+                config_generation: 1,
+                epoch_id: 0,
+                pts_samples: 0,
+                sample_rate: 48_000,
+                frame_count: 240,
+                groups: &groups,
+            })
+            .unwrap();
+        let epoch_datagram = transport.wrap_epoch(encoded).unwrap().datagrams[0]
+            .payload
+            .clone();
         assert!(is_multichannel_audio_transport_datagram(&epoch_datagram));
         sender.send_to(&epoch_datagram, bind).await.unwrap();
+
+        let (relay_len, relay_peer) = timeout(
+            Duration::from_secs(1),
+            subscriber.recv_from(&mut subscriber_buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(relay_peer, bind);
+        assert_eq!(&subscriber_buf[..relay_len], epoch_datagram.as_ref());
 
         let received = timeout(Duration::from_secs(3), audio_epoch_rx.recv())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(received, epoch_datagram);
+        assert_eq!(received.session_id, Some(55));
+        assert_eq!(received.bytes, epoch_datagram);
         assert!(cache.get_media_access_unit(1, 0).await.is_none());
 
         let _ = shutdown_tx.send(());
