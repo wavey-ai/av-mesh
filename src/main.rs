@@ -4148,11 +4148,25 @@ impl LiveTsCache {
             if let Some((bytes, hash)) = self.get_part_for_stream_id(stream_id, seq).await {
                 return Some((bytes, hash));
             }
-            let (_, last) = self.stream_position_for_id(stream_id).await?;
-            if seq as usize > last || Instant::now() >= deadline {
+            let waiter = self
+                .chunk_cache
+                .exact_part_waiter(stream_id, usize::try_from(seq).ok()?)?;
+            let notified = waiter.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            // Register before rechecking the cache so a commit between the
+            // first lookup and this waiter cannot be missed.
+            if let Some((bytes, hash)) = self.get_part_for_stream_id(stream_id, seq).await {
+                return Some((bytes, hash));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero()
+                || tokio::time::timeout(remaining, &mut notified)
+                    .await
+                    .is_err()
+            {
                 return None;
             }
-            sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -13948,6 +13962,49 @@ mod tests {
             .unwrap()
             .expect("next LL-HLS part");
         assert_eq!(sequence, 1);
+        assert_eq!(bytes, Bytes::from_static(b"second"));
+    }
+
+    #[tokio::test]
+    async fn exact_llhls_part_waiters_wake_only_for_the_requested_sequence() {
+        use tokio::time::timeout;
+
+        let cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 600, 64).await;
+        let first_cache = Arc::clone(&cache);
+        let first =
+            tokio::spawn(async move { first_cache.get_part_blocking_for_stream_id(77, 0).await });
+        let second_cache = Arc::clone(&cache);
+        let second =
+            tokio::spawn(async move { second_cache.get_part_blocking_for_stream_id(77, 1).await });
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            cache
+                .commit_stream_payload(77, Bytes::from_static(b"first"))
+                .await
+                .unwrap(),
+            0
+        );
+        let (bytes, _) = timeout(Duration::from_millis(100), first)
+            .await
+            .expect("sequence zero waiter should wake immediately")
+            .unwrap()
+            .expect("sequence zero should be cached");
+        assert_eq!(bytes, Bytes::from_static(b"first"));
+        assert!(!second.is_finished());
+
+        assert_eq!(
+            cache
+                .commit_stream_payload(77, Bytes::from_static(b"second"))
+                .await
+                .unwrap(),
+            1
+        );
+        let (bytes, _) = timeout(Duration::from_millis(100), second)
+            .await
+            .expect("sequence one waiter should wake immediately")
+            .unwrap()
+            .expect("sequence one should be cached");
         assert_eq!(bytes, Bytes::from_static(b"second"));
     }
 
