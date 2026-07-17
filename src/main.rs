@@ -83,6 +83,7 @@ const RELAY_WARM_SOURCE_REPLAY_MAX_BYTES_PER_CHILD: usize = 4 * 1024 * 1024;
 // local transition path starts each canonical stream at object zero.
 const PART_WAIT_MS: u64 = 3_000;
 const LLHLS_TAIL_WAIT_MS: u64 = 250;
+const CANONICAL_STREAM_IDLE_RETENTION: Duration = Duration::from_secs(5 * 60);
 const REPLICA_REQUEST_MIN_INTERVAL_MS: u64 = 1_000;
 const MESH_EVENTS_PATH: &str = "/api/mesh/events";
 const MESH_WEBSOCKET_PATH: &str = "/ws/mesh";
@@ -2534,6 +2535,16 @@ async fn run_udp_fec_ingest(
                         "expired deadline-bound RelaySession receive state"
                     );
                 }
+                let retired_streams = cache
+                    .retire_streams_idle_before(
+                        now_unix_ms().saturating_sub(
+                            CANONICAL_STREAM_IDLE_RETENTION.as_millis() as u64,
+                        ),
+                    )
+                    .await;
+                if retired_streams > 0 {
+                    info!(retired_streams, "retired idle canonical stream cache state");
+                }
             }
             _ = failover_tick.tick(), if relay_failover_controller.is_some() => {
                 if let Some(controller) = relay_failover_controller.as_mut() {
@@ -3379,6 +3390,7 @@ impl LiveTsCache {
         state.last_committed_unix_ms = Some(part.committed_unix_ms);
         state.last_committed_bytes = Some(part.bytes);
         state.last_committed_duration_ms = Some(part.duration_ms);
+        state.record_part_available(self.stream_id, part.seq, now_unix_us(), self.window_parts);
         debug!(
             stream_id = self.stream_id,
             sequence = part.seq,
@@ -3393,6 +3405,10 @@ impl LiveTsCache {
 
     async fn commit_stream_payload(&self, stream_id: u64, payload: Bytes) -> Result<u64> {
         let bytes = payload.len();
+        // Stream commits and retirement share this lock so a newly arriving
+        // object cannot race cache/state removal for the same stream.
+        let commit_lock = self.canonical_commit_lock(stream_id);
+        let _commit_guard = commit_lock.lock().await;
         if let Some(object) = decode_canonical_stream_object(&payload)? {
             let expected_stream = stream_id.to_string();
             if object.key().stream() != expected_stream {
@@ -3402,12 +3418,6 @@ impl LiveTsCache {
                 );
             }
 
-            // A source incarnation owns one monotonically increasing object
-            // sequence. Serialize commits per stream so an epoch transition,
-            // cache reset, and first publication are atomic with respect to
-            // path-diverse duplicate delivery.
-            let commit_lock = self.canonical_commit_lock(stream_id);
-            let _commit_guard = commit_lock.lock().await;
             let source_epoch = object.key().epoch();
             let (previous_epoch, process_started_unix_us) = {
                 let state = self.state.read().await;
@@ -3447,6 +3457,9 @@ impl LiveTsCache {
                 state.stream_subscription_base_object.remove(&stream_id);
                 state.stream_latest_canonical_object.remove(&stream_id);
                 state.stream_next_seq.remove(&stream_id);
+                state
+                    .stream_part_available_unix_us
+                    .retain(|(retained_stream, _), _| *retained_stream != stream_id);
                 state.stream_inits.remove(&stream_id);
                 state.stream_media_kinds.remove(&stream_id);
                 if stream_id == self.stream_id {
@@ -3483,6 +3496,7 @@ impl LiveTsCache {
                 state.datagrams_received = state.datagrams_received.saturating_add(1);
                 state.bytes_received = state.bytes_received.saturating_add(bytes as u64);
                 state.last_ingest_unix_ms = Some(now_ms);
+                state.stream_last_ingest_unix_ms.insert(stream_id, now_ms);
                 state.observe_stream_seq(stream_id, seq);
                 state.stream_media_kinds.insert(stream_id, media_kind);
                 if matches!(
@@ -3559,6 +3573,7 @@ impl LiveTsCache {
             state.last_committed_unix_ms = Some(now_ms);
             state.last_committed_bytes = Some(media_bytes);
             state.last_committed_duration_ms = None;
+            state.record_part_available(stream_id, seq, now_unix_us(), self.window_parts);
             debug!(
                 stream_id,
                 source_epoch,
@@ -3586,6 +3601,7 @@ impl LiveTsCache {
             state.datagrams_received = state.datagrams_received.saturating_add(1);
             state.bytes_received = state.bytes_received.saturating_add(bytes as u64);
             state.last_ingest_unix_ms = Some(now_ms);
+            state.stream_last_ingest_unix_ms.insert(stream_id, now_ms);
             state.stream_media_kinds.insert(stream_id, media_kind);
             if let Some(init) = init.clone() {
                 state.stream_inits.insert(stream_id, init);
@@ -3609,6 +3625,7 @@ impl LiveTsCache {
         state.last_committed_unix_ms = Some(now_ms);
         state.last_committed_bytes = Some(media_bytes);
         state.last_committed_duration_ms = None;
+        state.record_part_available(stream_id, seq, now_unix_us(), self.window_parts);
         debug!(
             stream_id,
             sequence = seq,
@@ -3621,6 +3638,65 @@ impl LiveTsCache {
         drop(state);
         self.part_updates.send_replace(seq);
         Ok(seq)
+    }
+
+    async fn retire_streams_idle_before(&self, cutoff_unix_ms: u64) -> usize {
+        let candidates: Vec<u64> = {
+            let state = self.state.read().await;
+            state
+                .stream_last_ingest_unix_ms
+                .iter()
+                .filter_map(|(stream_id, last_ingest_unix_ms)| {
+                    (*stream_id != self.stream_id && *last_ingest_unix_ms <= cutoff_unix_ms)
+                        .then_some(*stream_id)
+                })
+                .collect()
+        };
+
+        let mut retired = 0;
+        for stream_id in candidates {
+            let commit_lock = self.canonical_commit_lock(stream_id);
+            let commit_guard = commit_lock.lock().await;
+            let still_idle = self
+                .state
+                .read()
+                .await
+                .stream_last_ingest_unix_ms
+                .get(&stream_id)
+                .is_some_and(|last_ingest_unix_ms| *last_ingest_unix_ms <= cutoff_unix_ms);
+            if !still_idle {
+                continue;
+            }
+
+            self.chunk_cache.zero_stream_id(stream_id).await;
+            self.state.write().await.forget_stream(stream_id);
+            for cached_playlist in &self.playlist_cache {
+                let mut cached_playlist = cached_playlist
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if cached_playlist
+                    .as_ref()
+                    .is_some_and(|cached| cached.stream_id == stream_id)
+                {
+                    *cached_playlist = None;
+                }
+            }
+            retired += 1;
+            drop(commit_guard);
+
+            let mut commit_locks = self
+                .canonical_commit_locks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if commit_locks
+                .get(&stream_id)
+                .is_some_and(|stored| Arc::ptr_eq(stored, &commit_lock))
+                && Arc::strong_count(&commit_lock) == 2
+            {
+                commit_locks.remove(&stream_id);
+            }
+        }
+        retired
     }
 
     async fn add_media_access_unit(
@@ -3972,6 +4048,15 @@ impl LiveTsCache {
             return Some((slot.media(), hash));
         }
         None
+    }
+
+    async fn part_available_unix_us(&self, stream_id: u64, seq: u64) -> Option<u64> {
+        self.state
+            .read()
+            .await
+            .stream_part_available_unix_us
+            .get(&(stream_id, seq))
+            .copied()
     }
 
     async fn next_part_after_for_stream_id(
@@ -4466,6 +4551,8 @@ struct LiveState {
     stream_canonical_epoch_activation_delay_us: HashMap<u64, u64>,
     stream_subscription_base_object: HashMap<u64, u64>,
     stream_latest_canonical_object: HashMap<u64, u64>,
+    stream_last_ingest_unix_ms: HashMap<u64, u64>,
+    stream_part_available_unix_us: HashMap<(u64, u64), u64>,
     stream_inits: HashMap<u64, Bytes>,
     stream_media_kinds: HashMap<u64, LiveMediaKind>,
 }
@@ -4491,6 +4578,8 @@ impl LiveState {
             stream_canonical_epoch_activation_delay_us: HashMap::new(),
             stream_subscription_base_object: HashMap::new(),
             stream_latest_canonical_object: HashMap::new(),
+            stream_last_ingest_unix_ms: HashMap::new(),
+            stream_part_available_unix_us: HashMap::new(),
             stream_inits: HashMap::new(),
             stream_media_kinds: HashMap::new(),
         }
@@ -4506,6 +4595,37 @@ impl LiveState {
     fn observe_stream_seq(&mut self, stream_id: u64, sequence: u64) {
         let next = self.stream_next_seq.entry(stream_id).or_insert(0);
         *next = (*next).max(sequence.saturating_add(1));
+    }
+
+    fn record_part_available(
+        &mut self,
+        stream_id: u64,
+        sequence: u64,
+        available_unix_us: u64,
+        window_parts: usize,
+    ) {
+        self.stream_part_available_unix_us
+            .entry((stream_id, sequence))
+            .or_insert(available_unix_us);
+        let oldest_retained = sequence.saturating_sub(window_parts.saturating_sub(1) as u64);
+        self.stream_part_available_unix_us
+            .retain(|(retained_stream, retained_sequence), _| {
+                *retained_stream != stream_id || *retained_sequence >= oldest_retained
+            });
+    }
+
+    fn forget_stream(&mut self, stream_id: u64) {
+        self.stream_next_seq.remove(&stream_id);
+        self.stream_canonical_epoch.remove(&stream_id);
+        self.stream_canonical_epoch_activation_delay_us
+            .remove(&stream_id);
+        self.stream_subscription_base_object.remove(&stream_id);
+        self.stream_latest_canonical_object.remove(&stream_id);
+        self.stream_last_ingest_unix_ms.remove(&stream_id);
+        self.stream_part_available_unix_us
+            .retain(|(retained_stream, _), _| *retained_stream != stream_id);
+        self.stream_inits.remove(&stream_id);
+        self.stream_media_kinds.remove(&stream_id);
     }
 
     fn take_current(&mut self, now: Instant, now_ms: u64) -> Option<PendingPart> {
@@ -9246,9 +9366,14 @@ impl Router for AppRouter {
                         .media_kind_hint(stream_id)
                         .await
                         .unwrap_or(LiveMediaKind::Ts);
+                    let available_unix_us = self
+                        .cache
+                        .part_available_unix_us(stream_id, sequence)
+                        .await;
                     let mut tail_response =
                         response(StatusCode::OK, Some(bytes), Some(media_kind.content_type()))
                             .with_etag(hash)
+                            .with_part_available_unix_us(available_unix_us)
                             .with_no_store();
                     tail_response
                         .headers
@@ -9325,9 +9450,14 @@ impl Router for AppRouter {
                             .media_kind_hint(stream_id)
                             .await
                             .unwrap_or(requested_kind);
+                        let available_unix_us = self
+                            .cache
+                            .part_available_unix_us(stream_id, seq)
+                            .await;
                         let response =
                             response(StatusCode::OK, Some(bytes), Some(media_kind.content_type()))
-                                .with_etag(hash);
+                                .with_etag(hash)
+                                .with_part_available_unix_us(available_unix_us);
             return Ok(self.record_edge_response(&method, path, query, response, started));
                     }
                     let response = response(StatusCode::NOT_FOUND, None, None);
@@ -9383,9 +9513,14 @@ impl Router for AppRouter {
                             .media_kind_hint(self.cache.stream_id)
                             .await
                             .unwrap_or(requested_kind);
+                        let available_unix_us = self
+                            .cache
+                            .part_available_unix_us(self.cache.stream_id, seq)
+                            .await;
                         let response =
                             response(StatusCode::OK, Some(bytes), Some(media_kind.content_type()))
-                                .with_etag(hash);
+                                .with_etag(hash)
+                                .with_part_available_unix_us(available_unix_us);
             return Ok(self.record_edge_response(&method, path, query, response, started));
                     }
                     let response = response(StatusCode::NOT_FOUND, None, None);
@@ -9697,6 +9832,7 @@ impl RawTcpHandler for AppRouter {
 trait ResponseExt {
     fn with_no_store(self) -> Self;
     fn with_etag(self, etag: u64) -> Self;
+    fn with_part_available_unix_us(self, available_unix_us: Option<u64>) -> Self;
 }
 
 impl ResponseExt for HandlerResponse {
@@ -9708,6 +9844,16 @@ impl ResponseExt for HandlerResponse {
 
     fn with_etag(mut self, etag: u64) -> Self {
         self.etag = Some(etag);
+        self
+    }
+
+    fn with_part_available_unix_us(mut self, available_unix_us: Option<u64>) -> Self {
+        if let Some(available_unix_us) = available_unix_us {
+            self.headers.push((
+                "x-needletail-cache-available-unix-us".into(),
+                available_unix_us.to_string(),
+            ));
+        }
         self
     }
 }
@@ -10277,6 +10423,10 @@ mod tests {
         let response = router.route(req).await.unwrap();
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(response.content_type.as_deref(), Some("video/mp4"));
+        assert!(response.headers.iter().any(|(name, value)| {
+            name == "x-needletail-cache-available-unix-us"
+                && value.parse::<u64>().is_ok_and(|value| value > 0)
+        }));
         assert_eq!(response.body.unwrap(), Bytes::from_static(b"moofmdat-a"));
 
         let req = Request::builder()
@@ -10293,6 +10443,88 @@ mod tests {
         );
 
         mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn idle_stream_retirement_releases_cache_and_auxiliary_state() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 600, 64).await;
+        let stream_id = 77;
+        let source_epoch = now_unix_us();
+        cache
+            .commit_stream_payload(
+                stream_id,
+                encode_test_canonical_fmp4_object_with_epoch(
+                    stream_id,
+                    source_epoch,
+                    0,
+                    ObjectKind::Initialization,
+                    false,
+                    b"ftypmoov",
+                ),
+            )
+            .await
+            .unwrap();
+        cache
+            .commit_stream_payload(
+                stream_id,
+                encode_test_canonical_fmp4_object_with_epoch(
+                    stream_id,
+                    source_epoch,
+                    1,
+                    ObjectKind::Media,
+                    true,
+                    b"moofmdat",
+                ),
+            )
+            .await
+            .unwrap();
+        let _ = cache.playlist_for_stream_id(stream_id).await;
+
+        assert!(cache.chunk_cache.get_stream_idx(stream_id).await.is_some());
+        assert!(cache.part_available_unix_us(stream_id, 1).await.is_some());
+        assert!(cache
+            .canonical_commit_locks
+            .lock()
+            .unwrap()
+            .contains_key(&stream_id));
+
+        assert_eq!(
+            cache
+                .retire_streams_idle_before(now_unix_ms().saturating_add(1))
+                .await,
+            1
+        );
+        assert!(cache.chunk_cache.get_stream_idx(stream_id).await.is_none());
+        assert!(cache.playlist_cache.iter().all(|cached| cached
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|entry| entry.stream_id != stream_id)));
+        assert!(!cache
+            .canonical_commit_locks
+            .lock()
+            .unwrap()
+            .contains_key(&stream_id));
+
+        let state = cache.state.read().await;
+        assert!(!state.stream_next_seq.contains_key(&stream_id));
+        assert!(!state.stream_canonical_epoch.contains_key(&stream_id));
+        assert!(!state
+            .stream_canonical_epoch_activation_delay_us
+            .contains_key(&stream_id));
+        assert!(!state
+            .stream_subscription_base_object
+            .contains_key(&stream_id));
+        assert!(!state
+            .stream_latest_canonical_object
+            .contains_key(&stream_id));
+        assert!(!state.stream_last_ingest_unix_ms.contains_key(&stream_id));
+        assert!(!state
+            .stream_part_available_unix_us
+            .keys()
+            .any(|(retained_stream, _)| *retained_stream == stream_id));
+        assert!(!state.stream_inits.contains_key(&stream_id));
+        assert!(!state.stream_media_kinds.contains_key(&stream_id));
     }
 
     #[tokio::test]
