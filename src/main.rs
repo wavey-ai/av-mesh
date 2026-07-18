@@ -96,6 +96,7 @@ const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8"
 const MEDIA_ACCESS_UNIT_CONTENT_TYPE: &str = "application/vnd.wavey.media-access-unit";
 const LIVE_FMP4_CONTENT_TYPE: &str = "video/mp4";
 const LIVE_TS_CONTENT_TYPE: &str = "video/mp2t";
+const LIVE_OPAQUE_CONTENT_TYPE: &str = "application/octet-stream";
 const AUDIO_EPOCH_SUBSCRIPTION: &[u8] = b"WAVEY-AUDIO-EPOCH/1";
 const AUDIO_EPOCH_SUBSCRIPTION_V2_PREFIX: &[u8] = b"WAVEY-AUDIO-EPOCH/2 ";
 const AUDIO_EPOCH_BROADCAST_CAPACITY: usize = 2048;
@@ -266,6 +267,7 @@ const PUBLICATION_AVAILABILITY_BUCKETS_US: [u64; 16] = [
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LiveMediaKind {
     Fmp4,
+    Opaque,
     Ts,
 }
 
@@ -273,6 +275,7 @@ impl LiveMediaKind {
     fn extension(self) -> &'static str {
         match self {
             Self::Fmp4 => "mp4",
+            Self::Opaque => "bin",
             Self::Ts => "ts",
         }
     }
@@ -280,6 +283,7 @@ impl LiveMediaKind {
     fn content_type(self) -> &'static str {
         match self {
             Self::Fmp4 => LIVE_FMP4_CONTENT_TYPE,
+            Self::Opaque => LIVE_OPAQUE_CONTENT_TYPE,
             Self::Ts => LIVE_TS_CONTENT_TYPE,
         }
     }
@@ -291,7 +295,7 @@ fn is_multichannel_audio_transport_datagram(datagram: &[u8]) -> bool {
 
 enum LiveSlotPayload {
     Fmp4 { init: Option<Bytes>, media: Bytes },
-    Opaque(Bytes),
+    Opaque { media: Bytes, kind: LiveMediaKind },
     Invalid,
 }
 
@@ -322,6 +326,14 @@ impl LiveSlotPayload {
                 .metadata()
                 .get("payload-format")
                 .is_some_and(|format| format.as_slice() == b"fmp4-slot-v1");
+            let is_opaque = object
+                .metadata()
+                .get("container")
+                .is_some_and(|container| container.as_slice() == b"opaque")
+                && object
+                    .metadata()
+                    .get("payload-format")
+                    .is_some_and(|format| format.as_slice() == b"opaque-part-v1");
             let object_payload = Bytes::copy_from_slice(object.payload());
             return match object.kind() {
                 ObjectKind::Media if is_fmp4 && is_fmp4_slot => {
@@ -331,7 +343,14 @@ impl LiveSlotPayload {
                     init: None,
                     media: object_payload,
                 },
-                ObjectKind::Media => Self::Opaque(object_payload),
+                ObjectKind::Media if is_opaque => Self::Opaque {
+                    media: object_payload,
+                    kind: LiveMediaKind::Opaque,
+                },
+                ObjectKind::Media => Self::Opaque {
+                    media: object_payload,
+                    kind: LiveMediaKind::Ts,
+                },
                 ObjectKind::Initialization | ObjectKind::CodecConfiguration if is_fmp4 => {
                     Self::Fmp4 {
                         init: Some(object_payload),
@@ -343,7 +362,10 @@ impl LiveSlotPayload {
                 | ObjectKind::Discontinuity => Self::Invalid,
             };
         }
-        Self::decode_fmp4_slot(payload.clone()).unwrap_or(Self::Opaque(payload))
+        Self::decode_fmp4_slot(payload.clone()).unwrap_or(Self::Opaque {
+            media: payload,
+            kind: LiveMediaKind::Ts,
+        })
     }
 
     fn decode_fmp4_slot(payload: Bytes) -> Option<Self> {
@@ -367,21 +389,22 @@ impl LiveSlotPayload {
     fn media_kind(&self) -> LiveMediaKind {
         match self {
             Self::Fmp4 { .. } => LiveMediaKind::Fmp4,
-            Self::Opaque(_) | Self::Invalid => LiveMediaKind::Ts,
+            Self::Opaque { kind, .. } => *kind,
+            Self::Invalid => LiveMediaKind::Ts,
         }
     }
 
     fn init(&self) -> Option<Bytes> {
         match self {
             Self::Fmp4 { init, .. } => init.clone(),
-            Self::Opaque(_) | Self::Invalid => None,
+            Self::Opaque { .. } | Self::Invalid => None,
         }
     }
 
     fn media(&self) -> Bytes {
         match self {
             Self::Fmp4 { media, .. } => media.clone(),
-            Self::Opaque(payload) => payload.clone(),
+            Self::Opaque { media, .. } => media.clone(),
             Self::Invalid => Bytes::new(),
         }
     }
@@ -389,7 +412,7 @@ impl LiveSlotPayload {
     fn has_media(&self) -> bool {
         match self {
             Self::Fmp4 { media, .. } => !media.is_empty(),
-            Self::Opaque(payload) => !payload.is_empty(),
+            Self::Opaque { media, .. } => !media.is_empty(),
             Self::Invalid => false,
         }
     }
@@ -3637,8 +3660,18 @@ impl LiveTsCache {
                 .metadata()
                 .get("container")
                 .is_some_and(|container| container.as_slice() == b"fmp4");
+            let is_opaque = object
+                .metadata()
+                .get("container")
+                .is_some_and(|container| container.as_slice() == b"opaque")
+                && object
+                    .metadata()
+                    .get("payload-format")
+                    .is_some_and(|format| format.as_slice() == b"opaque-part-v1");
             let media_kind = if is_fmp4 {
                 LiveMediaKind::Fmp4
+            } else if is_opaque {
+                LiveMediaKind::Opaque
             } else {
                 LiveMediaKind::Ts
             };
@@ -3967,17 +4000,13 @@ impl LiveTsCache {
         }
         let first = last.saturating_sub(self.window_parts.saturating_sub(1));
         let mut available = Vec::new();
-        let mut saw_fmp4 = false;
-        let mut saw_ts = false;
+        let mut latest_media_kind = None;
         let mut discovered_init = None;
         for seq in first..=last {
             if let Some((bytes, _hash)) = self.chunk_cache.get(stream_idx, seq).await {
                 let slot = LiveSlotPayload::decode_for_stream(bytes, stream_id);
                 if slot.has_media() {
-                    match slot.media_kind() {
-                        LiveMediaKind::Fmp4 => saw_fmp4 = true,
-                        LiveMediaKind::Ts => saw_ts = true,
-                    }
+                    latest_media_kind = Some(slot.media_kind());
                     if let Some(init) = slot.init() {
                         discovered_init = Some(init);
                     }
@@ -3998,10 +4027,8 @@ impl LiveTsCache {
         if let Some(init) = discovered_init {
             self.remember_stream_init(stream_id, init).await;
         }
-        let media_kind = if saw_fmp4 {
-            LiveMediaKind::Fmp4
-        } else if saw_ts {
-            LiveMediaKind::Ts
+        let media_kind = if let Some(media_kind) = latest_media_kind {
+            media_kind
         } else {
             self.media_kind_hint(stream_id)
                 .await
@@ -10225,6 +10252,11 @@ fn strip_live_media_suffix(value: &str) -> Option<(&str, LiveMediaKind)> {
         .map(|seq| (seq, LiveMediaKind::Fmp4))
         .or_else(|| {
             value
+                .strip_suffix(".bin")
+                .map(|seq| (seq, LiveMediaKind::Opaque))
+        })
+        .or_else(|| {
+            value
                 .strip_suffix(".ts")
                 .map(|seq| (seq, LiveMediaKind::Ts))
         })
@@ -10597,6 +10629,28 @@ mod tests {
             .with_keyframe(true)
             .with_metadata("container", b"fmp4".to_vec())
             .with_metadata("payload-format", b"fmp4-slot-v1".to_vec())
+            .build()
+            .unwrap();
+        Bytes::from(media_object::encode(&object).unwrap())
+    }
+
+    fn encode_test_canonical_opaque_object(stream_id: u64, sequence: u64, payload: &[u8]) -> Bytes {
+        let key = media_object::ObjectKey::for_payload(
+            "default",
+            stream_id.to_string(),
+            "opaque-audio",
+            0,
+            0,
+            sequence,
+            1,
+            payload,
+        )
+        .unwrap();
+        let object = MediaObject::builder(key, ObjectKind::Media, payload.to_vec())
+            .with_metadata("container", b"opaque".to_vec())
+            .with_metadata("payload-format", b"opaque-part-v1".to_vec())
+            .with_metadata("content-type", b"application/octet-stream".to_vec())
+            .with_metadata("file-extension", b"bin".to_vec())
             .build()
             .unwrap();
         Bytes::from(media_object::encode(&object).unwrap())
@@ -11133,6 +11187,39 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn canonical_opaque_media_is_served_as_an_exact_containerless_llhls_part() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 256, 64).await;
+        let stream_id = 89;
+        let sequence = 7;
+        let packet = b"deliberately-formatless-opaque-bytes";
+        let envelope = encode_test_canonical_opaque_object(stream_id, sequence, packet);
+
+        let decoded = LiveSlotPayload::decode_for_stream(envelope.clone(), stream_id);
+        assert_eq!(decoded.media_kind(), LiveMediaKind::Opaque);
+        assert_eq!(decoded.media(), packet.as_slice());
+
+        cache
+            .commit_stream_payload(stream_id, envelope)
+            .await
+            .unwrap();
+        assert_eq!(
+            cache
+                .get_part_for_stream_id(stream_id, sequence)
+                .await
+                .unwrap()
+                .0,
+            packet.as_slice()
+        );
+        assert_eq!(
+            cache.media_kind_hint(stream_id).await,
+            Some(LiveMediaKind::Opaque)
+        );
+        let playlist = cache.playlist_for_stream_id(stream_id).await;
+        assert!(playlist.contains("part7.bin"));
+        assert!(!playlist.contains("EXT-X-MAP"));
+    }
+
     #[test]
     fn parses_live_paths() {
         assert_eq!(parse_stream_playlist_path("/live/77/stream.m3u8"), Some(77));
@@ -11144,6 +11231,10 @@ mod tests {
         assert_eq!(
             parse_stream_part_path("/live/77/part42.mp4"),
             Some((77, 42, LiveMediaKind::Fmp4))
+        );
+        assert_eq!(
+            parse_stream_part_path("/live/77/part42.bin"),
+            Some((77, 42, LiveMediaKind::Opaque))
         );
         assert_eq!(
             parse_stream_segment_path("/live/77/seg7.ts"),
@@ -11164,6 +11255,10 @@ mod tests {
         assert_eq!(
             parse_part_path("/live/part42.mp4"),
             Some((42, LiveMediaKind::Fmp4))
+        );
+        assert_eq!(
+            parse_part_path("/live/part42.bin"),
+            Some((42, LiveMediaKind::Opaque))
         );
         assert_eq!(
             parse_segment_path("/live/seg7.ts"),
