@@ -10,12 +10,6 @@ use av_mesh::replication::{
     DemandSignal, MeshNode, ReplicaPlacement, ReplicaReason, ReplicationPolicy, StreamInfo,
 };
 use av_mesh::udp_fec::{UdpFecPushOutcome, UdpFecReceiver};
-use av_web_service::{
-    load_default_tls_base64, load_tls_base64_from_paths, read_length_prefixed_frame,
-    write_length_prefixed_frame, BodyStream, H2H3Server, HandlerResponse, HandlerResult,
-    RawTcpHandler, Router, Server, ServerBuilder, ServerError, StreamWriter, WebSocketHandler,
-    WebTransportHandler,
-};
 use bytes::{BufMut, Bytes, BytesMut};
 use clap::{Parser, ValueEnum};
 use control::{
@@ -63,6 +57,12 @@ use tokio::{
 };
 use tokio_tungstenite::{tungstenite::Message as WebSocketMessage, WebSocketStream};
 use tracing::{debug, info, warn};
+use web_service::{
+    load_default_tls_base64, load_tls_base64_from_paths, read_length_prefixed_frame,
+    write_length_prefixed_frame, BodyStream, H2H3Server, HandlerResponse, HandlerResult,
+    RawTcpHandler, Router, Server, ServerBuilder, ServerError, StreamWriter, WebSocketHandler,
+    WebTransportHandler,
+};
 
 const DEFAULT_STREAM_ID: u64 = 1;
 const DEFAULT_MESH_FEC_REPAIR_SYMBOLS: u32 = 1;
@@ -668,7 +668,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "av_mesh=info,playlists=info,av_web_service=info".into()),
+                .unwrap_or_else(|_| "av_mesh=info,playlists=info,web_service=info".into()),
         )
         .init();
 
@@ -9828,7 +9828,7 @@ impl WebTransportHandler for AppRouter {
 impl RawTcpHandler for AppRouter {
     async fn handle_stream(
         &self,
-        mut stream: Box<dyn av_web_service::traits::RawStream>,
+        mut stream: Box<dyn web_service::traits::RawStream>,
         _is_tls: bool,
     ) -> HandlerResult<()> {
         loop {
@@ -14006,6 +14006,289 @@ mod tests {
             .unwrap()
             .expect("sequence one should be cached");
         assert_eq!(bytes, Bytes::from_static(b"second"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "release-mode isolated capacity qualification"]
+    async fn isolated_cached_pcm_part_router_capacity() {
+        const STREAM_IDS: [u64; 2] = [77, 78];
+        const PARTS: usize = 512;
+        const PART_BYTES: usize = 5_760;
+        const STEP_DURATION: Duration = Duration::from_secs(2);
+
+        let cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 600, 64).await;
+        let payload = vec![0x5a_u8; PART_BYTES];
+        for stream_id in STREAM_IDS {
+            cache
+                .chunk_cache
+                .set_stream_initialization(stream_id, Bytes::from_static(b"qualification-init"))
+                .await
+                .unwrap();
+            cache
+                .remember_media_kind(stream_id, LiveMediaKind::Fmp4)
+                .await;
+            for sequence in 0..PARTS {
+                cache
+                    .chunk_cache
+                    .add_for_stream_id(stream_id, sequence, encode_test_fmp4_slot(None, &payload))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let router = Arc::new(app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh)));
+        let mut steps = Vec::new();
+        for workers in [1_usize, 2, 4, 8] {
+            let barrier = Arc::new(tokio::sync::Barrier::new(workers + 1));
+            let deadline = Instant::now() + STEP_DURATION;
+            let mut tasks = Vec::new();
+            for worker in 0..workers {
+                let router = Arc::clone(&router);
+                let barrier = Arc::clone(&barrier);
+                tasks.push(tokio::spawn(async move {
+                    barrier.wait().await;
+                    let mut requests = 0_u64;
+                    let mut failures = 0_u64;
+                    let mut latency_ns = Vec::new();
+                    let mut sequence = worker % PARTS;
+                    let mut stream = worker % STREAM_IDS.len();
+                    loop {
+                        let sampled = requests.is_multiple_of(1_024);
+                        let sample_started = sampled.then(Instant::now);
+                        let request = Request::builder()
+                            .method(Method::GET)
+                            .uri(format!("/live/{}/part{sequence}.mp4", STREAM_IDS[stream]))
+                            .body(())
+                            .unwrap();
+                        match router.route(request).await {
+                            Ok(response)
+                                if response.status == StatusCode::OK
+                                    && response
+                                        .body
+                                        .as_ref()
+                                        .is_some_and(|body| body.len() == PART_BYTES) =>
+                            {
+                                requests += 1;
+                            }
+                            _ => failures += 1,
+                        }
+                        if let Some(sample_started) = sample_started {
+                            latency_ns.push(
+                                sample_started
+                                    .elapsed()
+                                    .as_nanos()
+                                    .min(u128::from(u64::MAX))
+                                    as u64,
+                            );
+                        }
+                        sequence = (sequence + 1) % PARTS;
+                        if sequence == 0 {
+                            stream = (stream + 1) % STREAM_IDS.len();
+                        }
+                        if (requests + failures).is_multiple_of(256) && Instant::now() >= deadline {
+                            break;
+                        }
+                    }
+                    (requests, failures, latency_ns)
+                }));
+            }
+            barrier.wait().await;
+            let started = Instant::now();
+            let mut requests = 0_u64;
+            let mut failures = 0_u64;
+            let mut latency_ns = Vec::new();
+            for task in tasks {
+                let (worker_requests, worker_failures, worker_latency_ns) = task.await.unwrap();
+                requests += worker_requests;
+                failures += worker_failures;
+                latency_ns.extend(worker_latency_ns);
+            }
+            let elapsed_seconds = started.elapsed().as_secs_f64();
+            latency_ns.sort_unstable();
+            let percentile_us = |percentile: usize| {
+                let rank = latency_ns.len().saturating_mul(percentile).div_ceil(100);
+                latency_ns[rank.clamp(1, latency_ns.len()) - 1] as f64 / 1_000.0
+            };
+            steps.push(serde_json::json!({
+                "workers": workers,
+                "duration_seconds": elapsed_seconds,
+                "requests": requests,
+                "failures": failures,
+                "requests_per_second": requests as f64 / elapsed_seconds,
+                "customer_equivalents_at_400_part_requests_per_second":
+                    requests as f64 / elapsed_seconds / 400.0,
+                "logical_payload_gbit_per_second":
+                    requests as f64 * PART_BYTES as f64 * 8.0 / elapsed_seconds / 1e9,
+                "sampled_route_latency_us": {
+                    "samples": latency_ns.len(),
+                    "p50": percentile_us(50),
+                    "p95": percentile_us(95),
+                    "p99": percentile_us(99),
+                    "max": latency_ns.last().copied().unwrap_or(0) as f64 / 1_000.0,
+                }
+            }));
+        }
+
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": "needletail.av-mesh.router-capacity.v1",
+                "boundary": "B3_seeded_cached_pcm_part_AppRouter_route",
+                "bytes_per_part": PART_BYTES,
+                "part_ms": 5,
+                "streams": STREAM_IDS,
+                "production_costs_included": [
+                    "request_replica_for_stream",
+                    "DemandTracker",
+                    "LiveTsCache part decode and media-kind tracking",
+                    "EdgeLoad response telemetry",
+                    "path and response construction"
+                ],
+                "production_costs_excluded": ["HTTP/3", "TLS", "QUIC", "UDP", "network"],
+                "steps": steps
+            }))
+            .unwrap()
+        );
+        mesh.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "release-mode isolated capacity qualification"]
+    async fn isolated_cached_five_ms_playlist_router_capacity() {
+        const STREAM_ID: u64 = 77;
+        const PARTS: usize = 600;
+        const PART_BYTES: usize = 5_760;
+        const STEP_DURATION: Duration = Duration::from_secs(2);
+
+        let cache = LiveTsCache::new(1, Duration::from_millis(5), 200, PARTS, 64).await;
+        cache
+            .chunk_cache
+            .set_stream_initialization(STREAM_ID, Bytes::from_static(b"qualification-init"))
+            .await
+            .unwrap();
+        cache
+            .remember_media_kind(STREAM_ID, LiveMediaKind::Fmp4)
+            .await;
+        let payload = vec![0x5a_u8; PART_BYTES];
+        for sequence in 0..PARTS {
+            cache
+                .chunk_cache
+                .add_for_stream_id(STREAM_ID, sequence, encode_test_fmp4_slot(None, &payload))
+                .await
+                .unwrap();
+        }
+        let expected_playlist = cache.playlist_for_stream_id(STREAM_ID).await;
+        assert!(expected_playlist.contains("PART-TARGET=0.005"));
+        let playlist_bytes = expected_playlist.len();
+
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let router = Arc::new(app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh)));
+        let mut steps = Vec::new();
+        for workers in [1_usize, 2, 4, 8] {
+            let barrier = Arc::new(tokio::sync::Barrier::new(workers + 1));
+            let deadline = Instant::now() + STEP_DURATION;
+            let mut tasks = Vec::new();
+            for _ in 0..workers {
+                let router = Arc::clone(&router);
+                let barrier = Arc::clone(&barrier);
+                tasks.push(tokio::spawn(async move {
+                    barrier.wait().await;
+                    let mut requests = 0_u64;
+                    let mut failures = 0_u64;
+                    let mut latency_ns = Vec::new();
+                    loop {
+                        let sampled = requests.is_multiple_of(1_024);
+                        let sample_started = sampled.then(Instant::now);
+                        let request = Request::builder()
+                            .method(Method::GET)
+                            .uri("/live/77/stream.m3u8")
+                            .body(())
+                            .unwrap();
+                        match router.route(request).await {
+                            Ok(response)
+                                if response.status == StatusCode::OK
+                                    && response
+                                        .body
+                                        .as_ref()
+                                        .is_some_and(|body| body.len() == playlist_bytes) =>
+                            {
+                                requests += 1;
+                            }
+                            _ => failures += 1,
+                        }
+                        if let Some(sample_started) = sample_started {
+                            latency_ns.push(
+                                sample_started
+                                    .elapsed()
+                                    .as_nanos()
+                                    .min(u128::from(u64::MAX))
+                                    as u64,
+                            );
+                        }
+                        if (requests + failures).is_multiple_of(256) && Instant::now() >= deadline {
+                            break;
+                        }
+                    }
+                    (requests, failures, latency_ns)
+                }));
+            }
+            barrier.wait().await;
+            let started = Instant::now();
+            let mut requests = 0_u64;
+            let mut failures = 0_u64;
+            let mut latency_ns = Vec::new();
+            for task in tasks {
+                let (worker_requests, worker_failures, worker_latency_ns) = task.await.unwrap();
+                requests += worker_requests;
+                failures += worker_failures;
+                latency_ns.extend(worker_latency_ns);
+            }
+            let elapsed_seconds = started.elapsed().as_secs_f64();
+            latency_ns.sort_unstable();
+            let percentile_us = |percentile: usize| {
+                let rank = latency_ns.len().saturating_mul(percentile).div_ceil(100);
+                latency_ns[rank.clamp(1, latency_ns.len()) - 1] as f64 / 1_000.0
+            };
+            steps.push(serde_json::json!({
+                "workers": workers,
+                "duration_seconds": elapsed_seconds,
+                "requests": requests,
+                "failures": failures,
+                "requests_per_second": requests as f64 / elapsed_seconds,
+                "logical_body_gbit_per_second":
+                    requests as f64 * playlist_bytes as f64 * 8.0 / elapsed_seconds / 1e9,
+                "sampled_route_latency_us": {
+                    "samples": latency_ns.len(),
+                    "p50": percentile_us(50),
+                    "p95": percentile_us(95),
+                    "p99": percentile_us(99),
+                    "max": latency_ns.last().copied().unwrap_or(0) as f64 / 1_000.0,
+                }
+            }));
+        }
+
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": "needletail.av-mesh.playlist-router-capacity.v1",
+                "boundary": "B3_stable_cached_five_ms_playlist_AppRouter_route",
+                "part_ms": 5,
+                "retained_parts": PARTS,
+                "playlist_bytes": playlist_bytes,
+                "production_costs_included": [
+                    "cached playlist String clone",
+                    "request_replica_for_stream",
+                    "DemandTracker",
+                    "EdgeLoad response telemetry",
+                    "path and response construction"
+                ],
+                "production_costs_excluded": ["HTTP/3", "TLS", "QUIC", "UDP", "network"],
+                "steps": steps
+            }))
+            .unwrap()
+        );
+        mesh.shutdown();
     }
 
     #[tokio::test]
