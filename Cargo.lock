@@ -1759,7 +1759,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "system-configuration",
  "tokio",
  "tower-layer",
@@ -2887,7 +2887,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.40",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2925,7 +2925,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -4744,7 +4744,7 @@ dependencies = [
 [[package]]
 name = "web-service"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/web-services.git?rev=e91518534b53f38ded647b03d632d4c1601066b2#e91518534b53f38ded647b03d632d4c1601066b2"
+source = "git+https://github.com/wavey-ai/web-services.git?rev=909f584d1f689396e1a8423eaa4ac6f41d418808#909f584d1f689396e1a8423eaa4ac6f41d418808"
 dependencies = [
  "anyhow",
  "async-trait",
