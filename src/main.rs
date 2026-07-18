@@ -38,6 +38,7 @@ use relay_session::{
     SubscriptionId, TopologyGeneration, TrustMode, FAILOVER_CONTROL_WIRE_LEN,
 };
 use serde::{de, Deserialize, Serialize};
+use socket2::SockRef;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -71,6 +72,7 @@ const DEFAULT_MESH_FEC_REPAIR_RATIO: f32 = 0.03;
 const DEFAULT_MESH_FEC_MAX_REPAIR_SYMBOLS: u32 = 32;
 const DEFAULT_MESH_FEC_SYMBOL_SIZE: u16 = 1316;
 const DEFAULT_MESH_SYNC_INTERVAL_MS: u64 = 20;
+const DEFAULT_UDP_SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_RELAY_DOWNSTREAM_CHILDREN: usize = 4;
 const DEFAULT_RELAY_PRIMARY_SILENCE_MS: u64 = 250;
 const DEFAULT_RELAY_PRIMARY_RECOVERY_MS: u64 = 2_000;
@@ -447,6 +449,16 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:12001")]
     fec_bind: SocketAddr,
 
+    /// Requested receive and send buffer size for high-rate UDP ingest sockets.
+    /// The effective size can be clamped by host kernel limits and is reported
+    /// at startup.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_UDP_SOCKET_BUFFER_BYTES",
+        default_value_t = DEFAULT_UDP_SOCKET_BUFFER_BYTES
+    )]
+    udp_socket_buffer_bytes: usize,
+
     /// Enable deterministic direct-UDP RelaySession qualification. The peer
     /// address bindings below identify controlled endpoints and derive bounded
     /// object announcements from the first validated symbol.
@@ -665,6 +677,114 @@ struct Args {
     provision_timeout_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UdpSocketBufferState {
+    requested_bytes: usize,
+    receive_bytes: usize,
+    send_bytes: usize,
+    receive_request_succeeded: bool,
+    send_request_succeeded: bool,
+}
+
+impl UdpSocketBufferState {
+    const fn target_met(self) -> bool {
+        self.receive_request_succeeded
+            && self.send_request_succeeded
+            && self.receive_bytes >= self.requested_bytes
+            && self.send_bytes >= self.requested_bytes
+    }
+}
+
+fn validate_udp_socket_buffer_target(bytes: usize) -> Result<()> {
+    if bytes == 0 || bytes > i32::MAX as usize {
+        bail!(
+            "--udp-socket-buffer-bytes must be between 1 and {}",
+            i32::MAX
+        );
+    }
+    Ok(())
+}
+
+fn configure_udp_socket_buffers(
+    socket: &UdpSocket,
+    requested_bytes: usize,
+    purpose: &str,
+) -> Result<UdpSocketBufferState> {
+    validate_udp_socket_buffer_target(requested_bytes)?;
+    let socket_ref = SockRef::from(socket);
+    let receive_request_succeeded = match socket_ref.set_recv_buffer_size(requested_bytes) {
+        Ok(()) => true,
+        Err(error) => {
+            warn!(
+                purpose,
+                requested_bytes,
+                error = %error,
+                "could not apply the UDP receive-buffer target; continuing with the kernel value"
+            );
+            false
+        }
+    };
+    let send_request_succeeded = match socket_ref.set_send_buffer_size(requested_bytes) {
+        Ok(()) => true,
+        Err(error) => {
+            warn!(
+                purpose,
+                requested_bytes,
+                error = %error,
+                "could not apply the UDP send-buffer target; continuing with the kernel value"
+            );
+            false
+        }
+    };
+    let receive_bytes = socket_ref
+        .recv_buffer_size()
+        .context("failed to read the configured UDP receive-buffer size")?;
+    let send_bytes = socket_ref
+        .send_buffer_size()
+        .context("failed to read the configured UDP send-buffer size")?;
+    Ok(UdpSocketBufferState {
+        requested_bytes,
+        receive_bytes,
+        send_bytes,
+        receive_request_succeeded,
+        send_request_succeeded,
+    })
+}
+
+async fn bind_buffered_udp_ingress(
+    bind: SocketAddr,
+    requested_bytes: usize,
+    purpose: &str,
+) -> Result<UdpSocket> {
+    let socket = UdpSocket::bind(bind)
+        .await
+        .with_context(|| format!("failed to bind {purpose} on {bind}"))?;
+    let state = configure_udp_socket_buffers(&socket, requested_bytes, purpose)?;
+    let bind = socket.local_addr()?;
+    if state.target_met() {
+        info!(
+            purpose,
+            %bind,
+            requested_bytes = state.requested_bytes,
+            actual_receive_bytes = state.receive_bytes,
+            actual_send_bytes = state.send_bytes,
+            "UDP socket buffers configured"
+        );
+    } else {
+        warn!(
+            purpose,
+            %bind,
+            requested_bytes = state.requested_bytes,
+            actual_receive_bytes = state.receive_bytes,
+            actual_send_bytes = state.send_bytes,
+            receive_request_succeeded = state.receive_request_succeeded,
+            send_request_succeeded = state.send_request_succeeded,
+            "UDP socket buffer target was limited by the operating system"
+        );
+    }
+    Ok(socket)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -789,14 +909,20 @@ async fn main() -> Result<()> {
         None
     };
 
-    let fec_socket = UdpSocket::bind(args.fec_bind)
-        .await
-        .with_context(|| format!("failed to bind UDP-FEC ingest on {}", args.fec_bind))?;
+    let fec_socket = bind_buffered_udp_ingress(
+        args.fec_bind,
+        args.udp_socket_buffer_bytes,
+        "UDP-FEC mesh byte ingest",
+    )
+    .await?;
     info!(bind = %fec_socket.local_addr()?, "UDP-FEC mesh byte ingest listening");
     let relay_secondary_socket = if let Some(bind) = args.relay_secondary_bind {
-        let socket = UdpSocket::bind(bind)
-            .await
-            .with_context(|| format!("failed to bind secondary RelaySession ingest on {bind}"))?;
+        let socket = bind_buffered_udp_ingress(
+            bind,
+            args.udp_socket_buffer_bytes,
+            "secondary RelaySession repair ingest",
+        )
+        .await?;
         info!(bind = %socket.local_addr()?, "secondary RelaySession repair ingest listening");
         Some(socket)
     } else {
@@ -843,14 +969,12 @@ async fn main() -> Result<()> {
         },
     ));
 
-    let media_fec_socket = UdpSocket::bind(args.media_fec_bind)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to bind media UDP-FEC ingest on {}",
-                args.media_fec_bind
-            )
-        })?;
+    let media_fec_socket = bind_buffered_udp_ingress(
+        args.media_fec_bind,
+        args.udp_socket_buffer_bytes,
+        "media UDP-FEC access-unit ingest",
+    )
+    .await?;
     info!(
         bind = %media_fec_socket.local_addr()?,
         "media UDP-FEC access-unit ingest listening"
@@ -1028,6 +1152,7 @@ impl Args {
         self.mesh_sync_interval_ms = self.mesh_sync_interval_ms.max(1);
         self.mesh_symbol_size = self.mesh_symbol_size.max(1);
         self.mesh_max_repair_symbols = self.mesh_max_repair_symbols.max(self.mesh_repair_symbols);
+        validate_udp_socket_buffer_target(self.udp_socket_buffer_bytes)?;
         if !self.mesh_repair_ratio.is_finite() || self.mesh_repair_ratio < 0.0 {
             bail!("--mesh-repair-ratio must be a finite non-negative number");
         }
@@ -11042,6 +11167,66 @@ mod tests {
         assert_eq!(args.mesh_repair_ratio, 0.03);
         assert_eq!(args.mesh_max_repair_symbols, 32);
         assert_eq!(args.mesh_symbol_size, 1316);
+        assert_eq!(
+            args.udp_socket_buffer_bytes,
+            DEFAULT_UDP_SOCKET_BUFFER_BYTES
+        );
+    }
+
+    #[test]
+    fn parses_and_validates_udp_socket_buffer_target() {
+        let args = Args::try_parse_from(["av-mesh", "--udp-socket-buffer-bytes", "1048576"])
+            .unwrap()
+            .normalized()
+            .unwrap();
+        assert_eq!(args.udp_socket_buffer_bytes, 1_048_576);
+
+        let error = Args::try_parse_from(["av-mesh", "--udp-socket-buffer-bytes", "0"])
+            .unwrap()
+            .normalized()
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("--udp-socket-buffer-bytes must be between"));
+    }
+
+    #[tokio::test]
+    async fn buffered_udp_ingress_applies_buffers_without_breaking_receive() {
+        const TEST_BUFFER_BYTES: usize = 64 * 1024;
+        let socket = bind_buffered_udp_ingress(
+            "127.0.0.1:0".parse().unwrap(),
+            TEST_BUFFER_BYTES,
+            "test ingest",
+        )
+        .await
+        .unwrap();
+        let socket_ref = SockRef::from(&socket);
+        assert!(socket_ref.recv_buffer_size().unwrap() >= TEST_BUFFER_BYTES);
+        assert!(socket_ref.send_buffer_size().unwrap() >= TEST_BUFFER_BYTES);
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(b"buffered", socket.local_addr().unwrap())
+            .await
+            .unwrap();
+        let mut payload = [0_u8; 16];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(1), socket.recv_from(&mut payload))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&payload[..len], b"buffered");
+    }
+
+    #[test]
+    fn udp_socket_buffer_state_reports_kernel_shortfall() {
+        let state = UdpSocketBufferState {
+            requested_bytes: 8 * 1024 * 1024,
+            receive_bytes: 212_992,
+            send_bytes: 212_992,
+            receive_request_succeeded: true,
+            send_request_succeeded: true,
+        };
+        assert!(!state.target_met());
     }
 
     #[test]
