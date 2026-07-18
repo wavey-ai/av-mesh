@@ -251,6 +251,7 @@ const CANONICAL_EPOCH_ACTIVATION_WARN_US: u64 = 10_000_000;
 const RELAY_PROCESSING_P95_WARN_US: u64 = 1_000;
 const MESH_ACTIVITY_LIMIT: usize = 64;
 const EDGE_RECENT_RESPONSE_LIMIT: usize = 32;
+const EDGE_RECENT_SUCCESS_INTERVAL_MS: u64 = 100;
 const EDGE_RESPONSE_DURATION_BUCKETS_US: [u64; 13] = [
     100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
     1_000_000,
@@ -5352,6 +5353,7 @@ struct EdgeLoadInner {
     response_not_found: AtomicU64,
     last_response_unix_ms: AtomicU64,
     response_duration: AtomicDurationHistogram,
+    last_recent_success_unix_ms: AtomicU64,
     recent_responses: StdMutex<VecDeque<EdgeResponseSnapshot>>,
 }
 
@@ -5385,10 +5387,11 @@ impl AtomicDurationHistogram {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.sum_us.fetch_add(duration_us, Ordering::Relaxed);
         self.max_us.fetch_max(duration_us, Ordering::Relaxed);
-        for (index, upper_bound_us) in EDGE_RESPONSE_DURATION_BUCKETS_US.iter().enumerate() {
-            if duration_us <= *upper_bound_us {
-                self.buckets[index].fetch_add(1, Ordering::Relaxed);
-            }
+        if let Some(index) = EDGE_RESPONSE_DURATION_BUCKETS_US
+            .iter()
+            .position(|upper_bound_us| duration_us <= *upper_bound_us)
+        {
+            self.buckets[index].fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -5506,12 +5509,16 @@ impl EdgeLoad {
             value => Some(value),
         };
         let response_duration_count = self.inner.response_duration.count.load(Ordering::Relaxed);
+        let mut cumulative = 0_u64;
         let response_duration_buckets = self
             .inner
             .response_duration
             .buckets
             .iter()
-            .map(|bucket| bucket.load(Ordering::Relaxed))
+            .map(|bucket| {
+                cumulative = cumulative.saturating_add(bucket.load(Ordering::Relaxed));
+                cumulative
+            })
             .collect::<Vec<_>>();
         let response_duration_p95_us = histogram_percentile_upper_bound_us(
             response_duration_count,
@@ -5572,6 +5579,21 @@ impl EdgeLoad {
         self.inner
             .last_response_unix_ms
             .store(unix_ms, Ordering::Relaxed);
+
+        let retain_detail = response.status.is_client_error()
+            || response.status.is_server_error()
+            || self
+                .inner
+                .last_recent_success_unix_ms
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last_ms| {
+                    (last_ms == 0
+                        || unix_ms.saturating_sub(last_ms) >= EDGE_RECENT_SUCCESS_INTERVAL_MS)
+                        .then_some(unix_ms)
+                })
+                .is_ok();
+        if !retain_detail {
+            return;
+        }
 
         if let Ok(mut responses) = self.inner.recent_responses.lock() {
             responses.push_front(EdgeResponseSnapshot {
@@ -10216,6 +10238,46 @@ mod tests {
             requested += usize::from(task.await.unwrap());
         }
         assert_eq!(requested, 1);
+    }
+
+    #[test]
+    fn edge_recent_response_sampling_keeps_errors_and_exact_counters() {
+        let load = EdgeLoad::default();
+        let ok = response(
+            StatusCode::OK,
+            Some(Bytes::from_static(b"part")),
+            Some(LIVE_FMP4_CONTENT_TYPE),
+        );
+        for _ in 0..100 {
+            load.record_response(
+                &Method::GET,
+                "/live/77/part1.mp4",
+                None,
+                &ok,
+                Duration::from_micros(50),
+            );
+        }
+        let not_found = response(StatusCode::NOT_FOUND, None, None);
+        load.record_response(
+            &Method::GET,
+            "/live/77/part2.mp4",
+            None,
+            &not_found,
+            Duration::from_micros(75),
+        );
+
+        assert_eq!(load.inner.responses_total.load(Ordering::Relaxed), 101);
+        assert_eq!(load.inner.response_not_found.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            load.inner.response_duration.count.load(Ordering::Relaxed),
+            101
+        );
+        let recent = load.inner.recent_responses.lock().unwrap();
+        assert!(recent.len() < 101);
+        assert_eq!(
+            recent.front().unwrap().status,
+            StatusCode::NOT_FOUND.as_u16()
+        );
     }
 
     fn encode_test_fmp4_slot(init: Option<&[u8]>, media: &[u8]) -> Bytes {
