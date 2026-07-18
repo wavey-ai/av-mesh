@@ -5581,7 +5581,7 @@ impl EdgeLoad {
                 status,
                 bytes,
                 duration_us,
-                content_type: response.content_type.clone(),
+                content_type: response.content_type.clone().map(Into::into),
             });
             while responses.len() > EDGE_RECENT_RESPONSE_LIMIT {
                 responses.pop_back();
@@ -9391,10 +9391,10 @@ impl Router for AppRouter {
                             .with_no_store();
                     tail_response
                         .headers
-                        .push(("x-sequence".into(), sequence.to_string()));
+                        .push(("x-sequence".into(), sequence.to_string().into()));
                     tail_response
                         .headers
-                        .push(("x-av-stream-id".into(), stream_id.to_string()));
+                        .push(("x-av-stream-id".into(), stream_id.to_string().into()));
                     read.finish(bytes_len);
                     return Ok(self.record_edge_response(&method, path, query, tail_response, started));
                 }
@@ -9432,24 +9432,24 @@ impl Router for AppRouter {
                     .with_no_store();
                     media_response.headers.push((
                         "x-av-stream-id".into(),
-                        unit.metadata.stream_id.to_string(),
+                        unit.metadata.stream_id.to_string().into(),
                     ));
                     media_response
                         .headers
-                        .push(("x-av-sequence".into(), unit.metadata.sequence.to_string()));
+                        .push(("x-av-sequence".into(), unit.metadata.sequence.to_string().into()));
                     media_response
                         .headers
                         .push(("x-av-codec".into(), codec_name(unit.metadata.codec).into()));
                     media_response
                         .headers
-                        .push(("x-av-pts-ms".into(), unit.metadata.pts_ms.to_string()));
+                        .push(("x-av-pts-ms".into(), unit.metadata.pts_ms.to_string().into()));
                     media_response.headers.push((
                         "x-av-duration-ms".into(),
-                        unit.metadata.duration_ms.to_string(),
+                        unit.metadata.duration_ms.to_string().into(),
                     ));
                     media_response
                         .headers
-                        .push(("x-av-flags".into(), unit.metadata.flags.bits().to_string()));
+                        .push(("x-av-flags".into(), unit.metadata.flags.bits().to_string().into()));
                     return Ok(self.record_edge_response(&method, path, query, media_response, started));
                 }
 
@@ -9865,7 +9865,7 @@ impl ResponseExt for HandlerResponse {
         if let Some(available_unix_us) = available_unix_us {
             self.headers.push((
                 "x-needletail-cache-available-unix-us".into(),
-                available_unix_us.to_string(),
+                available_unix_us.to_string().into(),
             ));
         }
         self
@@ -9880,7 +9880,7 @@ fn response(
     HandlerResponse {
         status,
         body,
-        content_type: content_type.map(str::to_string),
+        content_type: content_type.map(Into::into),
         headers: vec![
             ("access-control-allow-origin".into(), "*".into()),
             (
@@ -13891,7 +13891,7 @@ mod tests {
                 .headers
                 .iter()
                 .find(|(name, _)| name == "x-sequence")
-                .map(|(_, value)| value.as_str()),
+                .map(|(_, value)| value.as_ref()),
             Some("0")
         );
         assert_eq!(
@@ -13899,7 +13899,7 @@ mod tests {
                 .headers
                 .iter()
                 .find(|(name, _)| name == "x-av-stream-id")
-                .map(|(_, value)| value.as_str()),
+                .map(|(_, value)| value.as_ref()),
             Some("77")
         );
 

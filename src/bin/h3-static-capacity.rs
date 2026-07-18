@@ -113,7 +113,7 @@ impl Router for StaticRouter {
         Ok(HandlerResponse {
             status: StatusCode::OK,
             body: Some(self.payload.clone()),
-            content_type: Some("video/mp4".to_owned()),
+            content_type: Some("video/mp4".into()),
             ..HandlerResponse::default()
         })
     }
