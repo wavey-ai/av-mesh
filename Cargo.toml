@@ -19,6 +19,7 @@ anyhow = "1.0"
 async-trait = "0.1"
 bytes = "1.9"
 clap = { version = "4.5", features = ["derive", "env"] }
+dashmap = "6.2"
 discovery = { git = "https://github.com/wavey-ai/discovery.git", optional = true }
 futures-util = "0.3"
 h3 = "0.0.8"
@@ -46,7 +47,7 @@ tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 talkback-media = { path = "../av-api/talkback-media" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-web-service = { git = "https://github.com/wavey-ai/web-services.git", rev = "d80c578d298701f60773a63acf0c933842a3475e", features = ["h3-tokio-quiche"] }
+web-service = { git = "https://github.com/wavey-ai/web-services.git", rev = "f725087c137bee6f1e384f9c800708ab239ef198", features = ["h3-tokio-quiche"] }
 
 [dev-dependencies]
 base64 = "0.22"

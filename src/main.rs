@@ -16,6 +16,7 @@ use control::{
     packetize_control_message, reassemble_unsigned_control_packets, MeshControlEvent,
     MeshControlMessage,
 };
+use dashmap::{mapref::entry::Entry, DashMap};
 use futures_util::{SinkExt, StreamExt};
 use h3_webtransport::server::{AcceptedBi, WebTransportSession};
 use http::{Method, Request, Response, StatusCode};
@@ -5811,20 +5812,34 @@ impl NodeLifecycle {
 
 #[derive(Debug, Clone, Default)]
 struct DemandTracker {
-    last_replica_request_unix_ms: Arc<RwLock<HashMap<u64, u64>>>,
+    last_replica_request_unix_ms: Arc<DashMap<u64, AtomicU64>>,
 }
 
 impl DemandTracker {
-    async fn should_request_replica(&self, stream_id: u64, now_ms: u64) -> bool {
-        let mut requests = self.last_replica_request_unix_ms.write().await;
-        let should_request = requests
-            .get(&stream_id)
-            .map(|last| now_ms.saturating_sub(*last) >= REPLICA_REQUEST_MIN_INTERVAL_MS)
-            .unwrap_or(true);
-        if should_request {
-            requests.insert(stream_id, now_ms);
+    fn should_request_replica(&self, stream_id: u64, now_ms: u64) -> bool {
+        let last_request = match self.last_replica_request_unix_ms.entry(stream_id) {
+            Entry::Vacant(entry) => {
+                entry.insert(AtomicU64::new(now_ms));
+                return true;
+            }
+            Entry::Occupied(entry) => entry,
+        };
+        let last_request = last_request.get();
+        let mut last_ms = last_request.load(Ordering::Relaxed);
+        loop {
+            if now_ms.saturating_sub(last_ms) < REPLICA_REQUEST_MIN_INTERVAL_MS {
+                return false;
+            }
+            match last_request.compare_exchange_weak(
+                last_ms,
+                now_ms,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => last_ms = observed,
+            }
         }
-        should_request
     }
 }
 
@@ -9103,7 +9118,7 @@ impl AppRouter {
         demand_region: Option<&str>,
     ) {
         let now_ms = now_unix_ms();
-        if !self.demand.should_request_replica(stream_id, now_ms).await {
+        if !self.demand.should_request_replica(stream_id, now_ms) {
             return;
         }
 
@@ -9198,7 +9213,7 @@ impl AppRouter {
         }
 
         let now_ms = now_unix_ms();
-        if !self.demand.should_request_replica(stream_id, now_ms).await {
+        if !self.demand.should_request_replica(stream_id, now_ms) {
             return false;
         }
 
@@ -9267,19 +9282,17 @@ async fn run_replication_planner(
 impl Router for AppRouter {
     async fn route(&self, req: Request<()>) -> HandlerResult<HandlerResponse> {
         let started = Instant::now();
-        let method = req.method().clone();
-        let path_owned = req.uri().path().to_owned();
-        let query_owned = req.uri().query().map(ToOwned::to_owned);
-        let path = path_owned.as_str();
-        let query = query_owned.as_deref();
+        let method = req.method();
+        let path = req.uri().path();
+        let query = req.uri().query();
 
         if req.method() == Method::OPTIONS {
             let response = response(StatusCode::NO_CONTENT, None, None);
-            return Ok(self.record_edge_response(&method, path, query, response, started));
+            return Ok(self.record_edge_response(method, path, query, response, started));
         }
         if req.method() != Method::GET && req.method() != Method::HEAD {
             let response = response(StatusCode::METHOD_NOT_ALLOWED, None, None);
-            return Ok(self.record_edge_response(&method, path, query, response, started));
+            return Ok(self.record_edge_response(method, path, query, response, started));
         }
 
         match path {
@@ -9308,7 +9321,7 @@ impl Router for AppRouter {
                     Some("application/vnd.apple.mpegurl"),
                 )
                 .with_no_store();
-                Ok(self.record_edge_response(&method, path, query, response, started))
+                Ok(self.record_edge_response(method, path, query, response, started))
             }
             "/api/stats" => {
                 let json = serde_json::to_vec(&self.cache.stats(&self.mesh).await)
@@ -9352,7 +9365,7 @@ impl Router for AppRouter {
                         Some("application/vnd.apple.mpegurl"),
                     )
                     .with_no_store();
-            return Ok(self.record_edge_response(&method, path, query, response, started));
+            return Ok(self.record_edge_response(method, path, query, response, started));
                 }
 
                 if let Some(stream_id) = parse_llhls_tail_path(path) {
@@ -9372,7 +9385,7 @@ impl Router for AppRouter {
                     else {
                         read.finish(0);
                         let response = response(StatusCode::NO_CONTENT, None, None).with_no_store();
-            return Ok(self.record_edge_response(&method, path, query, response, started));
+            return Ok(self.record_edge_response(method, path, query, response, started));
                     };
                     let bytes_len = bytes.len();
                     let media_kind = self
@@ -9396,7 +9409,7 @@ impl Router for AppRouter {
                         .headers
                         .push(("x-av-stream-id".into(), stream_id.to_string().into()));
                     read.finish(bytes_len);
-                    return Ok(self.record_edge_response(&method, path, query, tail_response, started));
+                    return Ok(self.record_edge_response(method, path, query, tail_response, started));
                 }
 
                 if let Some(stream_id) = parse_stream_init_path(path) {
@@ -9409,10 +9422,10 @@ impl Router for AppRouter {
                             Some(LiveMediaKind::Fmp4.content_type()),
                         )
                         .with_no_store();
-            return Ok(self.record_edge_response(&method, path, query, response, started));
+            return Ok(self.record_edge_response(method, path, query, response, started));
                     }
                     let response = response(StatusCode::NOT_FOUND, None, None);
-            return Ok(self.record_edge_response(&method, path, query, response, started));
+            return Ok(self.record_edge_response(method, path, query, response, started));
                 }
 
                 if let Some((stream_id, sequence)) = parse_media_unit_path(path) {
@@ -9421,7 +9434,7 @@ impl Router for AppRouter {
                     let Some(unit) = self.cache.get_media_access_unit(stream_id, sequence).await
                     else {
                         let response = response(StatusCode::NOT_FOUND, None, None);
-            return Ok(self.record_edge_response(&method, path, query, response, started));
+            return Ok(self.record_edge_response(method, path, query, response, started));
                     };
                     let mut media_response = response(
                         StatusCode::OK,
@@ -9450,7 +9463,7 @@ impl Router for AppRouter {
                     media_response
                         .headers
                         .push(("x-av-flags".into(), unit.metadata.flags.bits().to_string().into()));
-                    return Ok(self.record_edge_response(&method, path, query, media_response, started));
+                    return Ok(self.record_edge_response(method, path, query, media_response, started));
                 }
 
                 if let Some((stream_id, seq, requested_kind)) = parse_stream_part_path(path) {
@@ -9472,10 +9485,10 @@ impl Router for AppRouter {
                             response(StatusCode::OK, Some(bytes), Some(media_kind.content_type()))
                                 .with_etag(hash)
                                 .with_part_available_unix_us(available_unix_us);
-            return Ok(self.record_edge_response(&method, path, query, response, started));
+            return Ok(self.record_edge_response(method, path, query, response, started));
                     }
                     let response = response(StatusCode::NOT_FOUND, None, None);
-            return Ok(self.record_edge_response(&method, path, query, response, started));
+            return Ok(self.record_edge_response(method, path, query, response, started));
                 }
 
                 if let Some((stream_id, segment, requested_kind)) = parse_stream_segment_path(path) {
@@ -9493,10 +9506,10 @@ impl Router for AppRouter {
                             Some(bytes),
                             Some(media_kind.content_type()),
                         );
-            return Ok(self.record_edge_response(&method, path, query, response, started));
+            return Ok(self.record_edge_response(method, path, query, response, started));
                     }
                     let response = response(StatusCode::NOT_FOUND, None, None);
-            return Ok(self.record_edge_response(&method, path, query, response, started));
+            return Ok(self.record_edge_response(method, path, query, response, started));
                 }
 
                 if parse_init_path(path) {
@@ -9514,10 +9527,10 @@ impl Router for AppRouter {
                             Some(LiveMediaKind::Fmp4.content_type()),
                         )
                         .with_no_store();
-            return Ok(self.record_edge_response(&method, path, query, response, started));
+            return Ok(self.record_edge_response(method, path, query, response, started));
                     }
                     let response = response(StatusCode::NOT_FOUND, None, None);
-            return Ok(self.record_edge_response(&method, path, query, response, started));
+            return Ok(self.record_edge_response(method, path, query, response, started));
                 }
 
                 if let Some((seq, requested_kind)) = parse_part_path(path) {
@@ -9535,10 +9548,10 @@ impl Router for AppRouter {
                             response(StatusCode::OK, Some(bytes), Some(media_kind.content_type()))
                                 .with_etag(hash)
                                 .with_part_available_unix_us(available_unix_us);
-            return Ok(self.record_edge_response(&method, path, query, response, started));
+            return Ok(self.record_edge_response(method, path, query, response, started));
                     }
                     let response = response(StatusCode::NOT_FOUND, None, None);
-            return Ok(self.record_edge_response(&method, path, query, response, started));
+            return Ok(self.record_edge_response(method, path, query, response, started));
                 }
 
                 if let Some((segment, requested_kind)) = parse_segment_path(path) {
@@ -9553,14 +9566,14 @@ impl Router for AppRouter {
                             Some(bytes),
                             Some(media_kind.content_type()),
                         );
-            return Ok(self.record_edge_response(&method, path, query, response, started));
+            return Ok(self.record_edge_response(method, path, query, response, started));
                     }
                     let response = response(StatusCode::NOT_FOUND, None, None);
-            return Ok(self.record_edge_response(&method, path, query, response, started));
+            return Ok(self.record_edge_response(method, path, query, response, started));
                 }
 
                 let response = response(StatusCode::NOT_FOUND, None, None);
-                Ok(self.record_edge_response(&method, path, query, response, started))
+                Ok(self.record_edge_response(method, path, query, response, started))
             }
         }
     }
@@ -10172,6 +10185,38 @@ mod tests {
         task::{Context as TaskContext, Poll},
     };
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    #[test]
+    fn demand_tracker_throttles_each_stream_independently() {
+        let tracker = DemandTracker::default();
+        assert!(tracker.should_request_replica(77, 0));
+        assert!(!tracker.should_request_replica(77, 0));
+        assert!(!tracker.should_request_replica(77, REPLICA_REQUEST_MIN_INTERVAL_MS - 1));
+        assert!(tracker.should_request_replica(77, REPLICA_REQUEST_MIN_INTERVAL_MS));
+        assert!(tracker.should_request_replica(78, 1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_demand_only_requests_one_replica() {
+        let tracker = DemandTracker::default();
+        let barrier = Arc::new(tokio::sync::Barrier::new(65));
+        let mut tasks = Vec::new();
+        for _ in 0..64 {
+            let tracker = tracker.clone();
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                tracker.should_request_replica(77, 1)
+            }));
+        }
+        barrier.wait().await;
+
+        let mut requested = 0;
+        for task in tasks {
+            requested += usize::from(task.await.unwrap());
+        }
+        assert_eq!(requested, 1);
+    }
 
     fn encode_test_fmp4_slot(init: Option<&[u8]>, media: &[u8]) -> Bytes {
         let init = init.unwrap_or_default();

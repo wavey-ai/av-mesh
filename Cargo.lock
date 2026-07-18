@@ -166,6 +166,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "clap 4.6.1",
+ "dashmap",
  "discovery",
  "ed25519-dalek",
  "futures-util",
@@ -4744,7 +4745,7 @@ dependencies = [
 [[package]]
 name = "web-service"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/web-services.git?rev=d80c578d298701f60773a63acf0c933842a3475e#d80c578d298701f60773a63acf0c933842a3475e"
+source = "git+https://github.com/wavey-ai/web-services.git?rev=f725087c137bee6f1e384f9c800708ab239ef198#f725087c137bee6f1e384f9c800708ab239ef198"
 dependencies = [
  "anyhow",
  "async-trait",
