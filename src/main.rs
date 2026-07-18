@@ -3,8 +3,8 @@ mod control;
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use av_mesh::relay_ingress::{
-    ControlledRelayParentSession, RelayIngressOutcome, RelayIngressSnapshot, RelayObjectReceiver,
-    RelayObjectReceiverConfig, RelayUdpDispatch, RelayUdpDispatchOutcome,
+    ControlledRelayParentSession, RelayIngressError, RelayIngressOutcome, RelayIngressSnapshot,
+    RelayObjectReceiver, RelayObjectReceiverConfig, RelayUdpDispatch, RelayUdpDispatchOutcome,
 };
 use av_mesh::replication::{
     DemandSignal, MeshNode, ReplicaPlacement, ReplicaReason, ReplicationPolicy, StreamInfo,
@@ -2603,6 +2603,12 @@ struct RelayIngestRuntime {
     failover_heartbeat: Duration,
 }
 
+fn take_relay_deadline_drop_delta(reported_total: &mut u64, current_total: u64) -> Option<u64> {
+    let delta = current_total.saturating_sub(*reported_total);
+    *reported_total = current_total;
+    (delta > 0).then_some(delta)
+}
+
 async fn run_udp_fec_ingest(
     socket: UdpSocket,
     cache: Arc<LiveTsCache>,
@@ -2627,6 +2633,7 @@ async fn run_udp_fec_ingest(
     rotate.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut expire_fec = interval(Duration::from_secs(1));
     expire_fec.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut reported_deadline_drops = 0_u64;
     let mut failover_tick = interval(failover_heartbeat);
     failover_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -2653,7 +2660,18 @@ async fn run_udp_fec_ingest(
                     );
                 }
                 let relay_expired = relay_dispatch.receiver_mut().expire(now_unix_us());
-                cache.update_relay_ingress(relay_dispatch.receiver().snapshot());
+                let relay_snapshot = relay_dispatch.receiver().snapshot();
+                cache.update_relay_ingress(relay_snapshot);
+                if let Some(deadline_drops) = take_relay_deadline_drop_delta(
+                    &mut reported_deadline_drops,
+                    relay_snapshot.counters.deadline_drops,
+                ) {
+                    warn!(
+                        deadline_drops,
+                        deadline_drops_total = reported_deadline_drops,
+                        "dropped expired RelaySession datagrams since previous ingress report"
+                    );
+                }
                 if relay_expired.objects > 0 {
                     debug!(
                         expired_objects = relay_expired.objects,
@@ -2952,6 +2970,14 @@ async fn process_udp_fec_ingest_datagram_inner(
                 role,
                 decoded: false,
             }));
+        }
+        Err(RelayIngressError::DeadlineExpired) => {
+            // This is an expected overload/late-arrival outcome and is already
+            // counted in RelayIngressCounters::deadline_drops. Logging every
+            // expired symbol here would add synchronous work to the UDP receive
+            // loop precisely when ingress is behind; the receive loop reports
+            // one aggregate warning per expiry tick instead.
+            return Ok(None);
         }
         Err(error) => {
             warn!(
@@ -10332,6 +10358,15 @@ mod tests {
         task::{Context as TaskContext, Poll},
     };
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    #[test]
+    fn relay_deadline_drop_reporting_emits_only_counter_deltas() {
+        let mut reported = 0;
+        assert_eq!(take_relay_deadline_drop_delta(&mut reported, 0), None);
+        assert_eq!(take_relay_deadline_drop_delta(&mut reported, 12), Some(12));
+        assert_eq!(take_relay_deadline_drop_delta(&mut reported, 12), None);
+        assert_eq!(take_relay_deadline_drop_delta(&mut reported, 17), Some(5));
+    }
 
     #[test]
     fn demand_tracker_throttles_each_stream_independently() {

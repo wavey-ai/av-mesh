@@ -1719,6 +1719,8 @@ mod tests {
             receiver.push_wire_datagram(1, &wire, 100),
             Err(RelayIngressError::DeadlineExpired)
         ));
+        assert_eq!(receiver.snapshot().counters.datagrams_rejected, 1);
+        assert_eq!(receiver.snapshot().counters.deadline_drops, 1);
         assert_eq!(receiver.state().active_objects, 0);
         assert_eq!(receiver.state().buffered_object_bytes, 0);
 
