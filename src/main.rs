@@ -86,6 +86,7 @@ const RELAY_WARM_SOURCE_REPLAY_MAX_BYTES_PER_CHILD: usize = 4 * 1024 * 1024;
 // local transition path starts each canonical stream at object zero.
 const PART_WAIT_MS: u64 = 3_000;
 const LLHLS_TAIL_WAIT_MS: u64 = 250;
+const MAX_LLHLS_TAIL_PARTS: usize = 200;
 const CANONICAL_STREAM_IDLE_RETENTION: Duration = Duration::from_secs(5 * 60);
 const REPLICA_REQUEST_MIN_INTERVAL_MS: u64 = 1_000;
 const MESH_EVENTS_PATH: &str = "/api/mesh/events";
@@ -607,6 +608,11 @@ struct Args {
     #[arg(long, env = "AV_LL_HLS_PART_MS", default_value_t = 50)]
     part_ms: u64,
 
+    /// Default duration represented by one blocking LL-HLS tail response.
+    /// The cache remains at part-ms granularity.
+    #[arg(long, env = "AV_LL_HLS_RESPONSE_MS")]
+    response_ms: Option<u64>,
+
     #[arg(long, default_value_t = 4)]
     parts_per_segment: usize,
 
@@ -1036,6 +1042,8 @@ async fn main() -> Result<()> {
     };
     let router = AppRouter::new(
         Arc::clone(&cache),
+        usize::try_from(args.response_ms.unwrap_or(args.part_ms) / args.part_ms)
+            .context("LL-HLS response part count exceeds this platform")?,
         Arc::clone(&mesh_handle),
         audio_epoch_tx.clone(),
         mesh_transport,
@@ -1167,8 +1175,23 @@ impl Args {
         if self.part_ms == 0 {
             bail!("--part-ms must be at least 1");
         }
+        if let Some(response_ms) = self.response_ms {
+            if response_ms < self.part_ms || !response_ms.is_multiple_of(self.part_ms) {
+                bail!("--response-ms must be a positive multiple of --part-ms");
+            }
+            if response_ms / self.part_ms > MAX_LLHLS_TAIL_PARTS as u64 {
+                bail!("--response-ms may contain at most {MAX_LLHLS_TAIL_PARTS} parts");
+            }
+        }
         self.parts_per_segment = self.parts_per_segment.max(1);
         self.window_parts = self.window_parts.max(self.parts_per_segment * 3).max(6);
+        let response_parts = self.response_ms.unwrap_or(self.part_ms) / self.part_ms;
+        let retained_cache_parts = self.window_parts.saturating_mul(4).max(32) as u64;
+        if response_parts > retained_cache_parts {
+            bail!(
+                "--response-ms requires {response_parts} retained parts, but --window-parts retains capacity for {retained_cache_parts}; increase --window-parts"
+            );
+        }
         self.slot_kb = self.slot_kb.max(64);
         self.storage_bytes = self.storage_bytes.max((self.slot_kb as u64) * 1024);
         self.egress_capacity_bps = self.egress_capacity_bps.max(1);
@@ -4215,17 +4238,30 @@ impl LiveTsCache {
     }
 
     async fn get_part_for_stream_id(&self, stream_id: u64, seq: u64) -> Option<(Bytes, u64)> {
+        let (media, hash, media_kind, init) = self.read_part_for_stream_id(stream_id, seq).await?;
+        if let Some(init) = init {
+            self.remember_stream_init(stream_id, init).await;
+        }
+        self.remember_media_kind(stream_id, media_kind).await;
+        Some((media, hash))
+    }
+
+    /// Read one immutable cache slot without updating stream metadata. A
+    /// response that combines many consecutive slots establishes metadata
+    /// from its first slot once, rather than taking the global state write lock
+    /// for every constituent 5 ms unit.
+    async fn read_part_for_stream_id(
+        &self,
+        stream_id: u64,
+        seq: u64,
+    ) -> Option<(Bytes, u64, LiveMediaKind, Option<Bytes>)> {
         let (bytes, hash) = self
             .chunk_cache
             .get_for_stream_id(stream_id, seq as usize)
             .await?;
         let slot = LiveSlotPayload::decode_for_stream(bytes, stream_id);
         if slot.has_media() {
-            if let Some(init) = slot.init() {
-                self.remember_stream_init(stream_id, init).await;
-            }
-            self.remember_media_kind(stream_id, slot.media_kind()).await;
-            return Some((slot.media(), hash));
+            return Some((slot.media(), hash, slot.media_kind(), slot.init()));
         }
         None
     }
@@ -4313,6 +4349,40 @@ impl LiveTsCache {
         }
     }
 
+    async fn next_part_batch_after_blocking_for_stream_id(
+        &self,
+        stream_id: u64,
+        after: Option<u64>,
+        start_at_oldest: bool,
+        part_count: usize,
+    ) -> Option<(u64, u64, Bytes, Option<u64>)> {
+        if part_count == 0 || part_count > MAX_LLHLS_TAIL_PARTS {
+            return None;
+        }
+        let (start_sequence, first, first_hash) = self
+            .next_part_after_blocking_for_stream_id(stream_id, after, start_at_oldest)
+            .await?;
+        if part_count == 1 {
+            return Some((start_sequence, start_sequence, first, Some(first_hash)));
+        }
+
+        let end_sequence = start_sequence.checked_add(part_count as u64 - 1)?;
+        // Waiting on the exact final sequence avoids a timer or polling loop. Once
+        // it is committed, every earlier sequence in this small bounded range
+        // must already be available in the cache.
+        let (last, _, _, _) = self
+            .read_part_blocking_for_stream_id(stream_id, end_sequence)
+            .await?;
+        let mut body = BytesMut::with_capacity(first.len().saturating_mul(part_count));
+        body.extend_from_slice(&first);
+        for sequence in start_sequence + 1..end_sequence {
+            let (part, _, _, _) = self.read_part_for_stream_id(stream_id, sequence).await?;
+            body.extend_from_slice(&part);
+        }
+        body.extend_from_slice(&last);
+        Some((start_sequence, end_sequence, body.freeze(), None))
+    }
+
     async fn get_part_blocking(&self, seq: u64) -> Option<(Bytes, u64)> {
         self.get_part_blocking_for_stream_id(self.stream_id, seq)
             .await
@@ -4338,6 +4408,38 @@ impl LiveTsCache {
             // first lookup and this waiter cannot be missed.
             if let Some((bytes, hash)) = self.get_part_for_stream_id(stream_id, seq).await {
                 return Some((bytes, hash));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero()
+                || tokio::time::timeout(remaining, &mut notified)
+                    .await
+                    .is_err()
+            {
+                return None;
+            }
+        }
+    }
+
+    async fn read_part_blocking_for_stream_id(
+        &self,
+        stream_id: u64,
+        seq: u64,
+    ) -> Option<(Bytes, u64, LiveMediaKind, Option<Bytes>)> {
+        let deadline = Instant::now() + Duration::from_millis(PART_WAIT_MS);
+        loop {
+            if let Some(part) = self.read_part_for_stream_id(stream_id, seq).await {
+                return Some(part);
+            }
+            let waiter = self
+                .chunk_cache
+                .exact_part_waiter(stream_id, usize::try_from(seq).ok()?)?;
+            let notified = waiter.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            // Register before rechecking the cache so a commit between the
+            // first lookup and this waiter cannot be missed.
+            if let Some(part) = self.read_part_for_stream_id(stream_id, seq).await {
+                return Some(part);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero()
@@ -8802,6 +8904,7 @@ async fn connect_telemetry_peer(
 #[derive(Clone)]
 struct AppRouter {
     cache: Arc<LiveTsCache>,
+    llhls_default_tail_parts: usize,
     mesh: Arc<CacheMeshHandle>,
     audio_epochs: broadcast::Sender<AudioEpochDatagram>,
     mesh_transport: MeshTransportConfigSnapshot,
@@ -8823,6 +8926,7 @@ impl AppRouter {
     #[allow(clippy::too_many_arguments)]
     fn new(
         cache: Arc<LiveTsCache>,
+        llhls_default_tail_parts: usize,
         mesh: Arc<CacheMeshHandle>,
         audio_epochs: broadcast::Sender<AudioEpochDatagram>,
         mesh_transport: MeshTransportConfigSnapshot,
@@ -8841,6 +8945,7 @@ impl AppRouter {
     ) -> Self {
         Self {
             cache,
+            llhls_default_tail_parts,
             mesh,
             audio_epochs,
             mesh_transport,
@@ -9572,14 +9677,38 @@ impl Router for AppRouter {
                     self.request_replica_for_stream(stream_id, "llhls-tail-demand", None)
                         .await;
                     let read = self.edge_load.begin_read(true);
-                    let after = parse_query_u64(query, "after");
-                    let start_at_oldest = parse_query_u64(query, "from") == Some(0);
-                    let Some((sequence, bytes, hash)) = self
+                    let part_count = match parse_llhls_tail_part_count(
+                        query,
+                        self.llhls_default_tail_parts,
+                        self.cache.window_parts.saturating_mul(4).max(32),
+                    ) {
+                        Ok(part_count) => part_count,
+                        Err(()) => {
+                            read.finish(0);
+                            let response = response(
+                                StatusCode::BAD_REQUEST,
+                                Some(Bytes::from_static(
+                                    b"parts must fit the retained cache window\n",
+                                )),
+                                Some("text/plain; charset=utf-8"),
+                            )
+                            .with_no_store();
+                            return Ok(
+                                self.record_edge_response(method, path, query, response, started)
+                            );
+                        }
+                    };
+                    let from = parse_query_u64(query, "from");
+                    let after = parse_query_u64(query, "after")
+                        .or_else(|| from.and_then(|sequence| sequence.checked_sub(1)));
+                    let start_at_oldest = from == Some(0);
+                    let Some((start_sequence, end_sequence, bytes, etag)) = self
                         .cache
-                        .next_part_after_blocking_for_stream_id(
+                        .next_part_batch_after_blocking_for_stream_id(
                             stream_id,
                             after,
                             start_at_oldest,
+                            part_count,
                         )
                         .await
                     else {
@@ -9595,16 +9724,41 @@ impl Router for AppRouter {
                         .unwrap_or(LiveMediaKind::Ts);
                     let available_unix_us = self
                         .cache
-                        .part_available_unix_us(stream_id, sequence)
+                        .part_available_unix_us(stream_id, end_sequence)
                         .await;
-                    let mut tail_response =
-                        response(StatusCode::OK, Some(bytes), Some(media_kind.content_type()))
-                            .with_etag(hash)
-                            .with_part_available_unix_us(available_unix_us)
-                            .with_no_store();
+                    let mut tail_response = response(
+                        StatusCode::OK,
+                        Some(bytes),
+                        Some(media_kind.content_type()),
+                    )
+                    .with_part_available_unix_us(available_unix_us)
+                    .with_no_store();
+                    if let Some(etag) = etag {
+                        tail_response = tail_response.with_etag(etag);
+                    }
                     tail_response
                         .headers
-                        .push(("x-sequence".into(), sequence.to_string().into()));
+                        .push(("x-sequence".into(), end_sequence.to_string().into()));
+                    tail_response.headers.push((
+                        "x-sequence-start".into(),
+                        start_sequence.to_string().into(),
+                    ));
+                    tail_response.headers.push((
+                        "x-sequence-end".into(),
+                        end_sequence.to_string().into(),
+                    ));
+                    tail_response
+                        .headers
+                        .push(("x-part-count".into(), part_count.to_string().into()));
+                    let part_duration_ms = self.cache.part_target.as_millis();
+                    tail_response.headers.push((
+                        "x-part-duration-ms".into(),
+                        part_duration_ms.to_string().into(),
+                    ));
+                    tail_response.headers.push((
+                        "x-response-duration-ms".into(),
+                        part_duration_ms.saturating_mul(part_count as u128).to_string().into(),
+                    ));
                     tail_response
                         .headers
                         .push(("x-av-stream-id".into(), stream_id.to_string().into()));
@@ -10283,6 +10437,25 @@ fn query_value<'a>(query: Option<&'a str>, key: &str) -> Option<&'a str> {
 
 fn parse_query_u64(query: Option<&str>, key: &str) -> Option<u64> {
     query_value(query, key)?.parse().ok()
+}
+
+fn parse_llhls_tail_part_count(
+    query: Option<&str>,
+    default: usize,
+    retained_cache_parts: usize,
+) -> Result<usize, ()> {
+    let maximum = retained_cache_parts.min(MAX_LLHLS_TAIL_PARTS);
+    let Some(value) = query_value(query, "parts") else {
+        return (1..=maximum)
+            .contains(&default)
+            .then_some(default)
+            .ok_or(());
+    };
+    let part_count = value.parse::<usize>().map_err(|_| ())?;
+    if !(1..=maximum).contains(&part_count) {
+        return Err(());
+    }
+    Ok(part_count)
 }
 
 async fn read_body_bytes(body: &mut BodyStream) -> HandlerResult<Bytes> {
@@ -11275,6 +11448,25 @@ mod tests {
             parse_query_u64(Some("mode=part&after=41"), "after"),
             Some(41)
         );
+        assert_eq!(parse_llhls_tail_part_count(None, 1, 96), Ok(1));
+        assert_eq!(parse_llhls_tail_part_count(None, 40, 96), Ok(40));
+        assert_eq!(
+            parse_llhls_tail_part_count(Some("mode=part&parts=40"), 1, 96),
+            Ok(40)
+        );
+        assert_eq!(parse_llhls_tail_part_count(Some("parts=0"), 1, 96), Err(()));
+        assert_eq!(
+            parse_llhls_tail_part_count(Some("parts=97"), 1, 96),
+            Err(())
+        );
+        assert_eq!(
+            parse_llhls_tail_part_count(Some("parts=201"), 1, 400),
+            Err(())
+        );
+        assert_eq!(
+            parse_llhls_tail_part_count(Some("parts=nope"), 1, 96),
+            Err(())
+        );
         assert_eq!(
             normalize_playback_base_url("https://node/live/"),
             "https://node/live"
@@ -11291,6 +11483,7 @@ mod tests {
         assert!(!args.edge_websocket);
         assert!(!args.edge_webtransport);
         assert!(args.raw_tcp_port.is_none());
+        assert_eq!(args.response_ms, None);
         assert_eq!(args.telemetry_dns_name, "local.wavey.ai");
         assert_eq!(args.mesh_sync_interval_ms, 20);
         assert_eq!(args.mesh_repair_symbols, 1);
@@ -11301,6 +11494,37 @@ mod tests {
             args.udp_socket_buffer_bytes,
             DEFAULT_UDP_SOCKET_BUFFER_BYTES
         );
+    }
+
+    #[test]
+    fn validates_default_llhls_response_duration() {
+        let args = Args::try_parse_from([
+            "av-mesh",
+            "--part-ms",
+            "5",
+            "--response-ms",
+            "200",
+            "--window-parts",
+            "50",
+        ])
+        .unwrap()
+        .normalized()
+        .unwrap();
+        assert_eq!(args.response_ms, Some(200));
+
+        let error = Args::try_parse_from(["av-mesh", "--part-ms", "5", "--response-ms", "201"])
+            .unwrap()
+            .normalized()
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("--response-ms must be a positive multiple"));
+
+        let error = Args::try_parse_from(["av-mesh", "--part-ms", "5", "--response-ms", "500"])
+            .unwrap()
+            .normalized()
+            .unwrap_err();
+        assert!(error.to_string().contains("increase --window-parts"));
     }
 
     #[test]
@@ -14388,6 +14612,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn llhls_tail_aggregates_exact_parts_and_waits_for_the_final_sequence() {
+        use tokio::time::timeout;
+
+        let cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 600, 64).await;
+        assert_eq!(
+            cache
+                .commit_stream_payload(77, Bytes::from_static(b"one-"))
+                .await
+                .unwrap(),
+            0
+        );
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let router = Arc::new(app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh)));
+        let waiting_router = Arc::clone(&router);
+        let request = tokio::spawn(async move {
+            waiting_router
+                .route(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/live/77/tail?from=0&parts=4")
+                        .body(())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        tokio::task::yield_now().await;
+        assert!(!request.is_finished());
+
+        for (expected_sequence, bytes) in [
+            (1, b"two-".as_slice()),
+            (2, b"three-".as_slice()),
+            (3, b"four".as_slice()),
+        ] {
+            assert_eq!(
+                cache
+                    .commit_stream_payload(77, Bytes::copy_from_slice(bytes))
+                    .await
+                    .unwrap(),
+                expected_sequence
+            );
+        }
+        let response = timeout(Duration::from_millis(100), request)
+            .await
+            .expect("aggregate tail should wake when its final part commits")
+            .unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response.body.unwrap(),
+            Bytes::from_static(b"one-two-three-four")
+        );
+        let header = |name: &str| {
+            response
+                .headers
+                .iter()
+                .find(|(candidate, _)| candidate == name)
+                .map(|(_, value)| value.as_ref())
+        };
+        assert_eq!(header("x-sequence"), Some("3"));
+        assert_eq!(header("x-sequence-start"), Some("0"));
+        assert_eq!(header("x-sequence-end"), Some("3"));
+        assert_eq!(header("x-part-count"), Some("4"));
+        assert_eq!(header("x-part-duration-ms"), Some("5"));
+        assert_eq!(header("x-response-duration-ms"), Some("20"));
+        assert!(header("x-needletail-cache-available-unix-us").is_some());
+        assert!(response.etag.is_none());
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
     async fn exact_llhls_part_waiters_wake_only_for_the_requested_sequence() {
         use tokio::time::timeout;
 
@@ -16232,6 +16526,7 @@ mod tests {
     ) -> AppRouter {
         AppRouter::new(
             cache,
+            1,
             mesh,
             broadcast::channel(AUDIO_EPOCH_BROADCAST_CAPACITY).0,
             MeshTransportConfigSnapshot::default(),

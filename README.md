@@ -315,11 +315,24 @@ Then read either region:
   and execute them by region or node id.
 
 For `av-llhls`, pass the selected node's `playback_base_url` as `baseUrl` and
-the decimal-string playlist/stream id as `streamId`. The client will poll
-`/live/<stream_id>/tail?mode=part&after=<sequence>`; if the selected node does
-not have the stream yet, the first tail polls create mesh demand and return
-`204` until replicated bytes arrive. It remains `av-llhls`'s responsibility to
-choose a playlist id whose bytestream is compatible with its decoder.
+the decimal-string playlist/stream id as `streamId`. The blocking tail route is
+`/live/<stream_id>/tail?after=<sequence>`. It waits on the exact next cache
+commit without a polling sleep. A bounded wait can return `204` when the stream
+has not arrived; that request also creates mesh demand.
+
+The cache and replication unit remains `--part-ms` (or
+`AV_LL_HLS_PART_MS`). Set `--response-ms` or `AV_LL_HLS_RESPONSE_MS` to make
+the tail combine consecutive units by default. For example, 5 ms cache units
+and `AV_LL_HLS_RESPONSE_MS=200` return 40 ordered units per blocking response.
+Controlled clients can override the service default with `parts=<count>` for
+an A/B test. Counts are bounded to 200 and to the configured retained cache
+capacity; startup rejects a service default that cannot fit. The response
+includes
+`x-sequence-start`, `x-sequence-end`, `x-part-count`,
+`x-part-duration-ms`, and `x-response-duration-ms`. `x-sequence` is the final
+sequence and is the cursor for the next request. The body is the byte-exact
+concatenation of the cached units, so the selected bytestream must be
+self-delimiting when more than one unit is returned.
 
 The server uses the local TLS material from `av-service`; clients will need to
 trust that cert or use an insecure local test client.
