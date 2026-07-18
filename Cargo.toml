@@ -46,7 +46,7 @@ tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 talkback-media = { path = "../av-api/talkback-media" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-web-service = { git = "https://github.com/wavey-ai/web-services.git", rev = "798189ae9b6fe9284e83d0bf6de0fa2b655c937f", features = ["h3-tokio-quiche"] }
+web-service = { git = "https://github.com/wavey-ai/web-services.git", rev = "e91518534b53f38ded647b03d632d4c1601066b2", features = ["h3-tokio-quiche"] }
 
 [dev-dependencies]
 base64 = "0.22"
