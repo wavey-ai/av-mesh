@@ -4408,21 +4408,37 @@ impl LiveTsCache {
         if stream_ids.is_empty() || stream_ids.len() > MAX_TAIL_BUNDLE_ENTRIES {
             return None;
         }
-        let entries = join_all(stream_ids.iter().copied().map(|stream_id| async move {
+        let parts = join_all(stream_ids.iter().copied().map(|stream_id| async move {
             let (start_sequence, end_sequence, payload, _etag) = self
                 .exact_part_batch_blocking_for_stream_id(stream_id, start_sequence, part_count)
                 .await?;
-            Some(TailBundleEntry {
-                stream_id,
-                start_sequence,
-                end_sequence,
-                available_unix_us: self.part_available_unix_us(stream_id, end_sequence).await,
-                payload,
-            })
+            Some((stream_id, start_sequence, end_sequence, payload))
         }))
         .await
         .into_iter()
         .collect::<Option<Vec<_>>>()?;
+        // Availability belongs to the immutable cache commit, so collect it
+        // under one shared state lock after all media reads complete. Taking
+        // one lock per track made an eight-track 5 ms response contend with
+        // the ingress writer eight times at the H3 capacity boundary.
+        let state = self.state.read().await;
+        let entries = parts
+            .into_iter()
+            .map(
+                |(stream_id, start_sequence, end_sequence, payload)| TailBundleEntry {
+                    stream_id,
+                    start_sequence,
+                    end_sequence,
+                    available_unix_us: state
+                        .stream_parts
+                        .get(&stream_id)
+                        .and_then(|parts| parts.get(&end_sequence))
+                        .map(|part| part.available_unix_us),
+                    payload,
+                },
+            )
+            .collect::<Vec<_>>();
+        drop(state);
         encode_tail_bundle(&entries).ok()
     }
 
@@ -4441,11 +4457,7 @@ impl LiveTsCache {
             .read_part_until_for_stream_id(stream_id, end_sequence, deadline)
             .await?;
         if part_count == 1 {
-            let (media, hash, media_kind, init) = final_part;
-            if let Some(init) = init {
-                self.remember_stream_init(stream_id, init).await;
-            }
-            self.remember_media_kind(stream_id, media_kind).await;
+            let (media, hash, _media_kind, _init) = final_part;
             return Some((start_sequence, end_sequence, media, Some(hash)));
         }
 
@@ -4454,22 +4466,12 @@ impl LiveTsCache {
             .get_range_for_stream_id(stream_id, usize::try_from(start_sequence).ok()?, part_count)
             .await?;
         let mut body = BytesMut::new();
-        let mut first_metadata = None;
         for (bytes, _hash) in cached_parts {
             let slot = LiveSlotPayload::decode_for_stream(bytes, stream_id);
             if !slot.has_media() {
                 return None;
             }
-            if first_metadata.is_none() {
-                first_metadata = Some((slot.media_kind(), slot.init()));
-            }
             body.extend_from_slice(&slot.media());
-        }
-        if let Some((media_kind, init)) = first_metadata {
-            if let Some(init) = init {
-                self.remember_stream_init(stream_id, init).await;
-            }
-            self.remember_media_kind(stream_id, media_kind).await;
         }
         Some((start_sequence, end_sequence, body.freeze(), None))
     }
@@ -4725,6 +4727,34 @@ impl LiveTsCache {
                 .await
                 .is_some_and(|(_, contiguous)| contiguous as u64 >= head),
         }
+    }
+
+    async fn streams_are_locally_fresh(&self, stream_ids: &[u64]) -> bool {
+        if stream_ids.is_empty() {
+            return false;
+        }
+        let stale_after_ms =
+            stream_stale_threshold_ms(self.part_target.as_millis() as u64, self.window_parts);
+        let now_ms = now_unix_ms();
+        let state = self.state.read().await;
+        stream_ids.iter().all(|stream_id| {
+            state
+                .stream_last_ingest_unix_ms
+                .get(stream_id)
+                .is_some_and(|last_ingest_unix_ms| {
+                    now_ms.saturating_sub(*last_ingest_unix_ms) <= stale_after_ms
+                })
+                && state
+                    .stream_latest_canonical_object
+                    .get(stream_id)
+                    .is_none_or(|head| {
+                        state
+                            .stream_parts
+                            .get(stream_id)
+                            .and_then(BTreeMap::last_key_value)
+                            .is_some_and(|(contiguous, _)| contiguous >= head)
+                    })
+        })
     }
 
     async fn stream_telemetry(
@@ -9894,10 +9924,16 @@ impl Router for AppRouter {
                             );
                         }
                     };
-                    join_all(stream_ids.iter().copied().map(|stream_id| {
-                        self.request_replica_for_stream(stream_id, "llhls-tail-bundle-demand", None)
-                    }))
-                    .await;
+                    if !self.cache.streams_are_locally_fresh(&stream_ids).await {
+                        join_all(stream_ids.iter().copied().map(|stream_id| {
+                            self.request_replica_for_stream(
+                                stream_id,
+                                "llhls-tail-bundle-demand",
+                                None,
+                            )
+                        }))
+                        .await;
+                    }
                     let read = self.edge_load.begin_read(true);
                     let Some(bytes) = self
                         .cache
