@@ -82,6 +82,21 @@ The first implementation keeps the mesh transport intentionally small:
   telemetry-selected target node ids when known, so subscribers execute matching
   warm/close requests on concrete nodes instead of relying only on broad region
   filtering.
+- Optional `--telemetry-fec-target` sends the node snapshot to a central
+  `--telemetry-fec-bind` UDP collector through the shared
+  `raptorq-datagram-fec` codec. The collector inserts decoded snapshots into the
+  same bounded aggregator used by `/api/mesh`; browsers never connect to nodes
+  individually. This lane is intended for controlled private networking. Keep
+  the TLS/TCP changes path for authenticated control commands.
+- FEC telemetry defaults to one snapshot every 5 seconds and a total 32 Kbit/s
+  send budget. Payloads use named MessagePack inside a versioned 32 KiB envelope
+  with a CRC, boot id, and monotonic sequence. The sender retains at most two
+  snapshots or 64 KiB, replaces the oldest snapshot under load, sends source
+  symbols before repair, and skips remaining repair when a newer snapshot is
+  waiting. It does not emit per-datagram logs or write telemetry to a database.
+- `/api/mesh` and `/metrics` expose bounded FEC queue, send, receive, decode,
+  duplicate, and error counters under `orchestration.telemetry_fec` and
+  `av_mesh_telemetry_fec_*`.
 - Optional `--provision-command` lets the UI/API `provision_node` control hand
   off to an operator-provided shell command. The command receives
   `AV_MESH_PROVISION_NODE_ID`, `AV_MESH_PROVISION_REGION`,
@@ -209,6 +224,20 @@ cargo run -- \
   --telemetry-bind 127.0.0.1:7301 \
   --telemetry-peer 127.0.0.1:7300
 ```
+
+To qualify the FEC snapshot lane locally, make the UK process the collector by
+adding `--telemetry-fec-bind 127.0.0.1:7350`, then add this to the US process:
+
+```bash
+--telemetry-fec-target 127.0.0.1:7350
+```
+
+The FEC lane and TCP changes lane can run together during rollout. Snapshot
+collection and serialization remain on one 5-second producer; a full TCP queue
+or UDP socket drops telemetry work instead of applying backpressure. Add
+`--telemetry-snapshots-fec-only` on a sending node after comparison; this stops
+TCP snapshot publication but leaves the TLS/TCP channel available for `AVMC`
+control commands.
 
 Publish MPEG-TS bytes over UDP-FEC into the UK mesh byte socket:
 
@@ -433,7 +462,7 @@ scrapers must use the deployment CA. Alert thresholds are labeled
 regional soak establishes production SLOs. See `observability/README.md` for
 deployment and notification-routing notes.
 
-## Needletail Mission Control
+## Needletail Operations
 
 The product UI lives in `../needletail/mission-control`. Its Leptos/WASM app
 consumes `av-mesh` `/api/mesh` and `av-contrib` `/api/status` using bounded,
@@ -457,13 +486,13 @@ make local-stack
 ```
 
 The supervisor builds release `av-mesh`, release `../av-contrib`, and
-Needletail Mission Control, then passes the product assets to each playback edge
+Needletail Operations, then passes the product assets to each playback edge
 with `NEEDLETAIL_MISSION_CONTROL_DIST`. It uses the local bitneedle TLS material from
 `../tls/local.bitneedle.com`, starts UK and US mesh nodes plus one `av-contrib`
 ingress, and prefixes every child process stdout/stderr line into the supervisor
 stdout. By default it uses stream id `1`, UK egress
 `https://local.bitneedle.com:19444/live/1/stream.m3u8`, US egress
-`https://local.bitneedle.com:19445/live/1/stream.m3u8`, and Mission Control at
+`https://local.bitneedle.com:19445/live/1/stream.m3u8`, and Operations at
 `/mesh` on both ports. OBS can publish RTMP to server
 `rtmp://local.bitneedle.com:19350/live` with stream key `obs-local`, or SRT to
 `srt://local.bitneedle.com:27001?mode=caller`. RIST is also bound on
@@ -565,10 +594,10 @@ proves the shared-cache behavior needed by the requested mesh:
 6. Playlist demand and warm-stream controls broadcast replica requests over the
    mesh transport, and peers with the requested stream send cached slots back to
    the requester.
-7. The first telemetry/UI path exposes local snapshots through HTTPS and can
-   publish the same snapshots over a TCP changes feed for a central collector.
-   A node started with `--telemetry-peer` consumes those feeds and exposes an
-   aggregate node/connection/capacity/edge-service view.
+7. The telemetry/UI path exposes local snapshots through HTTPS and can publish
+   them through either the compatibility TCP changes feed or the bounded
+   RaptorQ UDP lane. Both feed one central aggregate
+   node/connection/capacity/edge-service view.
 8. The runtime planner exposes planned replicas through `/api/mesh` and asks for
    the stream when the local node is selected as a baseline replica.
 9. UI/API/raw TCP controls publish `AVMC` command frames over TCP changes when a

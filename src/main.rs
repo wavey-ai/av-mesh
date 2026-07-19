@@ -9,6 +9,11 @@ use av_mesh::relay_ingress::{
 use av_mesh::replication::{
     DemandSignal, MeshNode, ReplicaPlacement, ReplicaReason, ReplicationPolicy, StreamInfo,
 };
+use av_mesh::telemetry_fec::{
+    LatestTelemetryQueue, QueuePushOutcome, TelemetryDecodeOutcome, TelemetryEnvelope,
+    TelemetryFecDecoder, TelemetryFecEncoder, DEFAULT_TELEMETRY_REPAIR_PERCENT,
+    MAX_TELEMETRY_ENVELOPE_BYTES,
+};
 use av_mesh::udp_fec::{UdpFecPushOutcome, UdpFecReceiver};
 use bytes::{BufMut, Bytes, BytesMut};
 use clap::{Parser, ValueEnum};
@@ -77,6 +82,9 @@ const DEFAULT_MESH_FEC_REPAIR_RATIO: f32 = 0.03;
 const DEFAULT_MESH_FEC_MAX_REPAIR_SYMBOLS: u32 = 32;
 const DEFAULT_MESH_FEC_SYMBOL_SIZE: u16 = 1316;
 const DEFAULT_MESH_SYNC_INTERVAL_MS: u64 = 20;
+const DEFAULT_TELEMETRY_INTERVAL_MS: u64 = 5_000;
+const DEFAULT_TELEMETRY_FEC_RATE_BPS: u64 = 32_000;
+const MAX_TELEMETRY_FEC_TARGETS: usize = 16;
 const DEFAULT_UDP_SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_RELAY_DOWNSTREAM_CHILDREN: usize = 4;
 const DEFAULT_RELAY_PRIMARY_SILENCE_MS: u64 = 250;
@@ -658,13 +666,40 @@ struct Args {
     #[arg(long = "telemetry-peer")]
     telemetry_peers: Vec<String>,
 
+    /// Receive bounded RaptorQ fleet snapshots on this UDP socket.
+    #[arg(long)]
+    telemetry_fec_bind: Option<SocketAddr>,
+
+    /// Send bounded RaptorQ fleet snapshots to this collector. Repeatable.
+    #[arg(long = "telemetry-fec-target")]
+    telemetry_fec_targets: Vec<String>,
+
+    /// Total paced telemetry-FEC wire budget across all configured targets.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_TELEMETRY_FEC_RATE_BPS",
+        default_value_t = DEFAULT_TELEMETRY_FEC_RATE_BPS
+    )]
+    telemetry_fec_rate_bps: u64,
+
+    #[arg(long, default_value_t = DEFAULT_TELEMETRY_REPAIR_PERCENT)]
+    telemetry_fec_repair_percent: u8,
+
+    /// Publish snapshots only on FEC while retaining the TCP control channel.
+    #[arg(long)]
+    telemetry_snapshots_fec_only: bool,
+
     #[arg(long, default_value = "local.wavey.ai")]
     telemetry_dns_name: String,
 
     #[arg(long, default_value_t = Ipv4Addr::LOCALHOST)]
     telemetry_private_ipv4: Ipv4Addr,
 
-    #[arg(long, env = "NEEDLETAIL_TELEMETRY_INTERVAL_MS", default_value_t = 1000)]
+    #[arg(
+        long,
+        env = "NEEDLETAIL_TELEMETRY_INTERVAL_MS",
+        default_value_t = DEFAULT_TELEMETRY_INTERVAL_MS
+    )]
     telemetry_interval_ms: u64,
 
     #[arg(long, default_value_t = DEFAULT_TELEMETRY_STALE_MS)]
@@ -832,6 +867,16 @@ async fn main() -> Result<()> {
     let args = Args::parse().normalized()?;
     let mesh_peers = resolve_socket_addr_args("peer", &args.peers).await?;
     let telemetry_peers = resolve_socket_addr_args("telemetry-peer", &args.telemetry_peers).await?;
+    let mut telemetry_fec_targets =
+        resolve_socket_addr_args("telemetry-fec-target", &args.telemetry_fec_targets).await?;
+    telemetry_fec_targets.sort_unstable();
+    telemetry_fec_targets.dedup();
+    if telemetry_fec_targets.len() > MAX_TELEMETRY_FEC_TARGETS {
+        bail!(
+            "resolved telemetry FEC targets exceed the configured limit {}",
+            MAX_TELEMETRY_FEC_TARGETS
+        );
+    }
     let node_id = args.node_id.clone().unwrap_or_else(|| args.region.clone());
     let node_profile = MeshNode {
         node_id: node_id.clone(),
@@ -858,6 +903,15 @@ async fn main() -> Result<()> {
     let lifecycle = NodeLifecycle::default();
     let telemetry_aggregator = TelemetryAggregator::new(args.telemetry_stale_ms);
     let telemetry_peer_monitor = TelemetryPeerMonitor::new(&telemetry_peers);
+    let telemetry_fec_queue =
+        (!telemetry_fec_targets.is_empty()).then(LatestTelemetryQueue::default);
+    let telemetry_fec_monitor = TelemetryFecMonitor::new(
+        args.telemetry_fec_bind,
+        telemetry_fec_targets.len(),
+        args.telemetry_interval_ms,
+        args.telemetry_fec_rate_bps,
+        telemetry_fec_queue.clone(),
+    );
     let playback_base_url = args
         .playback_base_url
         .as_deref()
@@ -1029,17 +1083,7 @@ async fn main() -> Result<()> {
                 args.telemetry_private_ipv4,
                 cert.clone(),
                 key.clone(),
-                args.telemetry_interval_ms,
-                Arc::clone(&cache),
-                Arc::clone(&mesh_handle),
-                node_profile.clone(),
-                replication_policy.clone(),
-                control_plane.clone(),
-                lifecycle.clone(),
                 control_dispatch.clone(),
-                playback_base_url.clone(),
-                edge_load.clone(),
-                ingest_shutdown_rx.clone(),
             )
             .await?,
         )
@@ -1064,7 +1108,48 @@ async fn main() -> Result<()> {
         edge_load.clone(),
         provision_executor.clone(),
         telemetry_peer_monitor.clone(),
+        telemetry_fec_monitor.clone(),
         private_discovery_status,
+    );
+    let telemetry_fec_sender = if let Some(queue) = telemetry_fec_queue.clone() {
+        Some(
+            start_telemetry_fec_sender(
+                telemetry_fec_targets.clone(),
+                args.telemetry_fec_rate_bps,
+                args.telemetry_fec_repair_percent,
+                queue,
+                telemetry_fec_monitor.clone(),
+                ingest_shutdown_rx.clone(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let telemetry_fec_collector = if let Some(bind) = args.telemetry_fec_bind {
+        Some(
+            start_telemetry_fec_collector(
+                bind,
+                telemetry_aggregator.clone(),
+                telemetry_fec_monitor.clone(),
+                ingest_shutdown_rx.clone(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let telemetry_publisher_task = start_telemetry_publisher(
+        router.clone(),
+        args.telemetry_interval_ms,
+        if args.telemetry_snapshots_fec_only {
+            None
+        } else {
+            telemetry_runtime.as_ref().map(|runtime| runtime.tx.clone())
+        },
+        telemetry_fec_queue
+            .map(|queue| TelemetryFecPublisher::new(queue, telemetry_fec_monitor.clone())),
+        ingest_shutdown_rx.clone(),
     );
     let telemetry_collector_tasks = start_telemetry_collectors(
         telemetry_peers.clone(),
@@ -1110,7 +1195,7 @@ async fn main() -> Result<()> {
         args.http_port
     );
     println!(
-        "needletail-mission-control: https://127.0.0.1:{}/mesh",
+        "needletail-operations: https://127.0.0.1:{}/mesh",
         args.http_port
     );
     if args.edge_websocket {
@@ -1130,6 +1215,16 @@ async fn main() -> Result<()> {
     }
     if !telemetry_peers.is_empty() {
         println!("telemetry-peers: {}", telemetry_peers.len());
+    }
+    if let Some(runtime) = &telemetry_fec_sender {
+        println!(
+            "telemetry-fec-send: udp+fec://{} targets={}",
+            runtime.local_addr,
+            telemetry_fec_targets.len()
+        );
+    }
+    if let Some(runtime) = &telemetry_fec_collector {
+        println!("telemetry-fec-recv: udp+fec://{}", runtime.local_addr);
     }
     if let Some(raw_tcp_port) = args.raw_tcp_port {
         println!(
@@ -1160,10 +1255,18 @@ async fn main() -> Result<()> {
     }
     let _ = media_fec_ingest_task.await;
     let _ = replication_planner_task.await;
+    if let Some(task) = telemetry_publisher_task {
+        let _ = task.await;
+    }
+    if let Some(runtime) = telemetry_fec_sender {
+        let _ = runtime.task.await;
+    }
+    if let Some(runtime) = telemetry_fec_collector {
+        let _ = runtime.task.await;
+    }
     if let Some(runtime) = telemetry_runtime {
         let _ = runtime.shutdown_tx.send(());
         let _ = runtime.finished_rx.await;
-        let _ = runtime.publisher_task.await;
     }
     #[cfg(feature = "private-subnet-discovery")]
     if let Some(runtime) = private_subnet_discovery {
@@ -1360,7 +1463,23 @@ impl Args {
             .context("--relay-topology-generation must be positive")?;
         SubscriptionId::new(self.relay_subscription_id)
             .context("--relay-subscription-id must be positive")?;
-        self.telemetry_interval_ms = self.telemetry_interval_ms.max(100);
+        if self.telemetry_fec_targets.len() > MAX_TELEMETRY_FEC_TARGETS {
+            bail!(
+                "{} --telemetry-fec-target values exceed the configured limit {}",
+                self.telemetry_fec_targets.len(),
+                MAX_TELEMETRY_FEC_TARGETS
+            );
+        }
+        if self.telemetry_fec_rate_bps == 0 {
+            bail!("--telemetry-fec-rate-bps must be positive");
+        }
+        if self.telemetry_fec_repair_percent > 100 {
+            bail!("--telemetry-fec-repair-percent must be between 0 and 100");
+        }
+        if self.telemetry_snapshots_fec_only && self.telemetry_fec_targets.is_empty() {
+            bail!("--telemetry-snapshots-fec-only requires --telemetry-fec-target");
+        }
+        self.telemetry_interval_ms = self.telemetry_interval_ms.max(1_000);
         self.replication_plan_interval_ms = self.replication_plan_interval_ms.max(100);
         self.provision_timeout_ms = self.provision_timeout_ms.max(100);
         #[cfg(feature = "linode-provisioner")]
@@ -5502,6 +5621,240 @@ struct TelemetryPeerStatus {
     last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct TelemetryFecStatus {
+    enabled: bool,
+    collector_bind: Option<String>,
+    publisher_targets: usize,
+    interval_ms: u64,
+    rate_bps: u64,
+    queue_blocks: usize,
+    queue_bytes: usize,
+    snapshots_submitted: u64,
+    snapshots_replaced: u64,
+    snapshots_oversized: u64,
+    blocks_encoded: u64,
+    encoded_envelope_bytes: u64,
+    source_datagrams_encoded: u64,
+    repair_datagrams_encoded: u64,
+    source_datagrams_sent: u64,
+    repair_datagrams_sent: u64,
+    sent_bytes: u64,
+    skipped_repair_datagrams: u64,
+    send_drops: u64,
+    received_datagrams: u64,
+    received_bytes: u64,
+    decoded_snapshots: u64,
+    decoded_payload_bytes: u64,
+    duplicate_snapshots: u64,
+    encode_errors: u64,
+    receive_errors: u64,
+    decode_errors: u64,
+    ingest_errors: u64,
+    last_received_unix_ms: Option<u64>,
+    last_decoded_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct TelemetryFecCounters {
+    snapshots_submitted: AtomicU64,
+    snapshots_replaced: AtomicU64,
+    snapshots_oversized: AtomicU64,
+    blocks_encoded: AtomicU64,
+    encoded_envelope_bytes: AtomicU64,
+    source_datagrams_encoded: AtomicU64,
+    repair_datagrams_encoded: AtomicU64,
+    source_datagrams_sent: AtomicU64,
+    repair_datagrams_sent: AtomicU64,
+    sent_bytes: AtomicU64,
+    skipped_repair_datagrams: AtomicU64,
+    send_drops: AtomicU64,
+    received_datagrams: AtomicU64,
+    received_bytes: AtomicU64,
+    decoded_snapshots: AtomicU64,
+    decoded_payload_bytes: AtomicU64,
+    duplicate_snapshots: AtomicU64,
+    encode_errors: AtomicU64,
+    receive_errors: AtomicU64,
+    decode_errors: AtomicU64,
+    ingest_errors: AtomicU64,
+    last_received_unix_ms: AtomicU64,
+    last_decoded_unix_ms: AtomicU64,
+}
+
+#[derive(Debug, Clone)]
+struct TelemetryFecMonitor {
+    collector_bind: Option<String>,
+    publisher_targets: usize,
+    interval_ms: u64,
+    rate_bps: u64,
+    queue: Option<LatestTelemetryQueue>,
+    counters: Arc<TelemetryFecCounters>,
+}
+
+impl Default for TelemetryFecMonitor {
+    fn default() -> Self {
+        Self::new(None, 0, DEFAULT_TELEMETRY_INTERVAL_MS, 0, None)
+    }
+}
+
+impl TelemetryFecMonitor {
+    fn new(
+        collector_bind: Option<SocketAddr>,
+        publisher_targets: usize,
+        interval_ms: u64,
+        rate_bps: u64,
+        queue: Option<LatestTelemetryQueue>,
+    ) -> Self {
+        Self {
+            collector_bind: collector_bind.map(|bind| bind.to_string()),
+            publisher_targets,
+            interval_ms,
+            rate_bps,
+            queue,
+            counters: Arc::new(TelemetryFecCounters::default()),
+        }
+    }
+
+    fn record_submission(&self, outcome: QueuePushOutcome) {
+        self.counters
+            .snapshots_submitted
+            .fetch_add(1, Ordering::Relaxed);
+        if let QueuePushOutcome::Replaced { blocks } = outcome {
+            self.counters
+                .snapshots_replaced
+                .fetch_add(blocks as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn record_oversized_snapshot(&self) {
+        self.counters
+            .snapshots_oversized
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_encoded_block(&self, bytes: usize, source: usize, repair: usize) {
+        self.counters.blocks_encoded.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .encoded_envelope_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.counters
+            .source_datagrams_encoded
+            .fetch_add(source as u64, Ordering::Relaxed);
+        self.counters
+            .repair_datagrams_encoded
+            .fetch_add(repair as u64, Ordering::Relaxed);
+    }
+
+    fn record_encode_error(&self) {
+        self.counters.encode_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_sent_datagram(&self, repair: bool, bytes: usize) {
+        let counter = if repair {
+            &self.counters.repair_datagrams_sent
+        } else {
+            &self.counters.source_datagrams_sent
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .sent_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn record_skipped_repairs(&self, datagrams: usize, targets: usize) {
+        self.counters
+            .skipped_repair_datagrams
+            .fetch_add(datagrams.saturating_mul(targets) as u64, Ordering::Relaxed);
+    }
+
+    fn record_send_drop(&self) {
+        self.counters.send_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_received_datagram(&self, bytes: usize) {
+        self.counters
+            .received_datagrams
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .received_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.counters
+            .last_received_unix_ms
+            .store(now_unix_ms(), Ordering::Relaxed);
+    }
+
+    fn record_decoded_snapshot(&self, bytes: usize) {
+        self.counters
+            .decoded_snapshots
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .decoded_payload_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.counters
+            .last_decoded_unix_ms
+            .store(now_unix_ms(), Ordering::Relaxed);
+    }
+
+    fn record_duplicate(&self) {
+        self.counters
+            .duplicate_snapshots
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_receive_error(&self) {
+        self.counters.receive_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_decode_error(&self) {
+        self.counters.decode_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_ingest_error(&self) {
+        self.counters.ingest_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> TelemetryFecStatus {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        let optional_timestamp = |counter: &AtomicU64| {
+            let value = load(counter);
+            (value != 0).then_some(value)
+        };
+        TelemetryFecStatus {
+            enabled: self.collector_bind.is_some() || self.publisher_targets > 0,
+            collector_bind: self.collector_bind.clone(),
+            publisher_targets: self.publisher_targets,
+            interval_ms: self.interval_ms,
+            rate_bps: self.rate_bps,
+            queue_blocks: self.queue.as_ref().map_or(0, LatestTelemetryQueue::len),
+            queue_bytes: self.queue.as_ref().map_or(0, LatestTelemetryQueue::bytes),
+            snapshots_submitted: load(&self.counters.snapshots_submitted),
+            snapshots_replaced: load(&self.counters.snapshots_replaced),
+            snapshots_oversized: load(&self.counters.snapshots_oversized),
+            blocks_encoded: load(&self.counters.blocks_encoded),
+            encoded_envelope_bytes: load(&self.counters.encoded_envelope_bytes),
+            source_datagrams_encoded: load(&self.counters.source_datagrams_encoded),
+            repair_datagrams_encoded: load(&self.counters.repair_datagrams_encoded),
+            source_datagrams_sent: load(&self.counters.source_datagrams_sent),
+            repair_datagrams_sent: load(&self.counters.repair_datagrams_sent),
+            sent_bytes: load(&self.counters.sent_bytes),
+            skipped_repair_datagrams: load(&self.counters.skipped_repair_datagrams),
+            send_drops: load(&self.counters.send_drops),
+            received_datagrams: load(&self.counters.received_datagrams),
+            received_bytes: load(&self.counters.received_bytes),
+            decoded_snapshots: load(&self.counters.decoded_snapshots),
+            decoded_payload_bytes: load(&self.counters.decoded_payload_bytes),
+            duplicate_snapshots: load(&self.counters.duplicate_snapshots),
+            encode_errors: load(&self.counters.encode_errors),
+            receive_errors: load(&self.counters.receive_errors),
+            decode_errors: load(&self.counters.decode_errors),
+            ingest_errors: load(&self.counters.ingest_errors),
+            last_received_unix_ms: optional_timestamp(&self.counters.last_received_unix_ms),
+            last_decoded_unix_ms: optional_timestamp(&self.counters.last_decoded_unix_ms),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct ReplicaPlacementSnapshot {
     stream_id: u64,
@@ -5569,6 +5922,7 @@ struct OrchestrationStatus {
     control_dispatch_ready: bool,
     provision: ProvisionStatus,
     telemetry_peers: Vec<TelemetryPeerStatus>,
+    telemetry_fec: TelemetryFecStatus,
     private_discovery: PrivateDiscoveryStatus,
 }
 
@@ -7443,6 +7797,84 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
         "av_mesh_telemetry_nodes{{state=\"stale\"}} {}\n",
         snapshot.telemetry.stale_remote_count
     ));
+    let telemetry_fec = &snapshot.orchestration.telemetry_fec;
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_telemetry_fec_queue_blocks",
+        "Bounded fleet telemetry snapshots waiting for FEC transmission.",
+        "gauge",
+    );
+    output.push_str(&format!(
+        "av_mesh_telemetry_fec_queue_blocks {}\n",
+        telemetry_fec.queue_blocks
+    ));
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_telemetry_fec_queue_bytes",
+        "Bytes retained by the bounded fleet telemetry send queue.",
+        "gauge",
+    );
+    output.push_str(&format!(
+        "av_mesh_telemetry_fec_queue_bytes {}\n",
+        telemetry_fec.queue_bytes
+    ));
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_telemetry_fec_snapshots_total",
+        "Fleet telemetry snapshot outcomes on the RaptorQ lane.",
+        "counter",
+    );
+    for (outcome, value) in [
+        ("submitted", telemetry_fec.snapshots_submitted),
+        ("replaced", telemetry_fec.snapshots_replaced),
+        ("oversized", telemetry_fec.snapshots_oversized),
+        ("encoded", telemetry_fec.blocks_encoded),
+        ("decoded", telemetry_fec.decoded_snapshots),
+        ("duplicate", telemetry_fec.duplicate_snapshots),
+        ("encode_error", telemetry_fec.encode_errors),
+        ("decode_error", telemetry_fec.decode_errors),
+        ("ingest_error", telemetry_fec.ingest_errors),
+    ] {
+        output.push_str(&format!(
+            "av_mesh_telemetry_fec_snapshots_total{{outcome=\"{outcome}\"}} {value}\n"
+        ));
+    }
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_telemetry_fec_datagrams_total",
+        "Fleet telemetry FEC datagram outcomes by direction and role.",
+        "counter",
+    );
+    for (direction, role, value) in [
+        ("send", "source", telemetry_fec.source_datagrams_sent),
+        ("send", "repair", telemetry_fec.repair_datagrams_sent),
+        (
+            "send",
+            "skipped_repair",
+            telemetry_fec.skipped_repair_datagrams,
+        ),
+        ("send", "drop", telemetry_fec.send_drops),
+        ("receive", "all", telemetry_fec.received_datagrams),
+        ("receive", "error", telemetry_fec.receive_errors),
+    ] {
+        output.push_str(&format!(
+            "av_mesh_telemetry_fec_datagrams_total{{direction=\"{direction}\",role=\"{role}\"}} {value}\n"
+        ));
+    }
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_telemetry_fec_bytes_total",
+        "Fleet telemetry FEC bytes by direction.",
+        "counter",
+    );
+    output.push_str(&format!(
+        "av_mesh_telemetry_fec_bytes_total{{direction=\"send\"}} {}\n",
+        telemetry_fec.sent_bytes
+    ));
+    output.push_str(&format!(
+        "av_mesh_telemetry_fec_bytes_total{{direction=\"receive\"}} {}\n",
+        telemetry_fec.received_bytes
+    ));
 
     push_prometheus_metric_header(
         &mut output,
@@ -8923,26 +9355,15 @@ struct TelemetryRuntime {
     local_addr: SocketAddr,
     shutdown_tx: watch::Sender<()>,
     finished_rx: tokio::sync::oneshot::Receiver<()>,
-    publisher_task: tokio::task::JoinHandle<()>,
+    tx: mpsc::Sender<TcpChangesMessage>,
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn start_telemetry_feed(
     bind: SocketAddr,
     private_ipv4: Ipv4Addr,
     cert: String,
     key: String,
-    interval_ms: u64,
-    cache: Arc<LiveTsCache>,
-    mesh: Arc<CacheMeshHandle>,
-    node: MeshNode,
-    policy: ReplicationPolicy,
-    control: ControlPlane,
-    lifecycle: NodeLifecycle,
     dispatch: ControlDispatch,
-    playback_base_url: Option<String>,
-    edge_load: EdgeLoad,
-    mut shutdown_rx: watch::Receiver<()>,
 ) -> Result<TelemetryRuntime> {
     let server = tcp_changes::Server::new(cert, key, private_ipv4);
     let (up_rx, finished_rx, shutdown_tx, tx) = server
@@ -8954,51 +9375,296 @@ async fn start_telemetry_feed(
         .map_err(|_| anyhow!("tcp changes telemetry feed failed before ready"))?;
     dispatch.set_sender(tx.clone()).await;
 
-    let publisher_task = tokio::spawn(async move {
+    Ok(TelemetryRuntime {
+        local_addr: bind,
+        shutdown_tx,
+        finished_rx,
+        tx,
+    })
+}
+
+#[derive(Clone)]
+struct TelemetryFecPublisher {
+    queue: LatestTelemetryQueue,
+    monitor: TelemetryFecMonitor,
+    boot_id: u64,
+    next_sequence: Arc<AtomicU64>,
+}
+
+impl TelemetryFecPublisher {
+    fn new(queue: LatestTelemetryQueue, monitor: TelemetryFecMonitor) -> Self {
+        Self {
+            queue,
+            monitor,
+            boot_id: telemetry_boot_id(),
+            next_sequence: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    fn submit(&self, snapshot: &MeshSnapshot, payload: Vec<u8>, period_ms: u64) {
+        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
+        let period_ms = u32::try_from(period_ms).unwrap_or(u32::MAX);
+        let envelope = TelemetryEnvelope::mesh_snapshot(
+            self.boot_id,
+            sequence,
+            snapshot.updated_unix_ms,
+            period_ms,
+            snapshot.node.node_id.clone(),
+            payload,
+        );
+        let Ok(envelope) = envelope.encode() else {
+            self.monitor.record_oversized_snapshot();
+            return;
+        };
+        match self.queue.push(envelope) {
+            Ok(outcome) => self.monitor.record_submission(outcome),
+            Err(_) => self.monitor.record_oversized_snapshot(),
+        }
+    }
+}
+
+fn start_telemetry_publisher(
+    router: AppRouter,
+    interval_ms: u64,
+    tcp_tx: Option<mpsc::Sender<TcpChangesMessage>>,
+    fec: Option<TelemetryFecPublisher>,
+    mut shutdown_rx: watch::Receiver<()>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if tcp_tx.is_none() && fec.is_none() {
+        return None;
+    }
+    Some(tokio::spawn(async move {
         let mut ticker = interval(Duration::from_millis(interval_ms));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    return;
-                }
+                _ = shutdown_rx.changed() => return,
                 _ = ticker.tick() => {
-                    let mut node = node.clone();
-                    node.draining = lifecycle.is_draining().await;
-                    let snapshot = cache
-                        .mesh_snapshot(&mesh, node, policy.clone(), &control)
-                        .await;
-                    let edge_service =
-                        edge_load.snapshot(&snapshot.node, playback_base_url.clone());
-                    let snapshot = snapshot.with_edge_service(edge_service);
-                    match serde_json::to_vec(&snapshot) {
-                        Ok(json) => {
-                            debug!(
-                                node_id = %snapshot.node.node_id,
-                                active_streams = snapshot.node.active_streams,
-                                stream_telemetry = snapshot.streams.len(),
-                                peers = snapshot.peers.len(),
-                                bytes = json.len(),
-                                "publishing mesh telemetry snapshot"
-                            );
-                            let message = TcpChangesMessage::new(TELEMETRY_TAG, vec![Bytes::from(json)]);
-                            if tx.send(message).await.is_err() {
-                                return;
-                            }
+                    let snapshot = router.local_mesh_snapshot().await;
+                    if let Some(fec) = &fec {
+                        match encode_mesh_telemetry_binary(&snapshot) {
+                            Ok(payload) => fec.submit(&snapshot, payload, interval_ms),
+                            Err(_) => fec.monitor.record_encode_error(),
                         }
-                        Err(error) => warn!(error = %error, "failed to encode mesh telemetry snapshot"),
+                    }
+                    if let Some(tx) = &tcp_tx {
+                        let Ok(json) = serde_json::to_vec(&snapshot) else {
+                            continue;
+                        };
+                        let message = TcpChangesMessage::new(
+                            TELEMETRY_TAG,
+                            vec![Bytes::from(json)],
+                        );
+                        match tx.try_send(message) {
+                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Err(mpsc::error::TrySendError::Closed(_)) if fec.is_none() => return,
+                            Err(mpsc::error::TrySendError::Closed(_)) => {}
+                        }
+                    }
+                }
+            }
+        }
+    }))
+}
+
+struct TelemetryFecSenderRuntime {
+    local_addr: SocketAddr,
+    task: tokio::task::JoinHandle<()>,
+}
+
+async fn start_telemetry_fec_sender(
+    targets: Vec<SocketAddr>,
+    rate_bps: u64,
+    repair_percent: u8,
+    queue: LatestTelemetryQueue,
+    monitor: TelemetryFecMonitor,
+    mut shutdown_rx: watch::Receiver<()>,
+) -> Result<TelemetryFecSenderRuntime> {
+    let Some(first) = targets.first().copied() else {
+        bail!("telemetry FEC sender requires at least one target");
+    };
+    if targets
+        .iter()
+        .any(|target| target.is_ipv4() != first.is_ipv4())
+    {
+        bail!("telemetry FEC targets must use one address family per process");
+    }
+    let bind: SocketAddr = if first.is_ipv4() {
+        "0.0.0.0:0".parse().expect("valid IPv4 wildcard")
+    } else {
+        "[::]:0".parse().expect("valid IPv6 wildcard")
+    };
+    let socket = UdpSocket::bind(bind)
+        .await
+        .context("failed to bind telemetry FEC sender")?;
+    let local_addr = socket.local_addr()?;
+    let task = tokio::spawn(async move {
+        let mut encoder = TelemetryFecEncoder::new(repair_percent);
+        let mut pacer = TelemetryWirePacer::new(rate_bps);
+        loop {
+            let Some(envelope) = queue.try_pop() else {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => return,
+                    _ = queue.notified() => {}
+                }
+                continue;
+            };
+            let Ok(block) = encoder.encode(&envelope) else {
+                monitor.record_encode_error();
+                continue;
+            };
+            monitor.record_encoded_block(
+                envelope.len(),
+                block.source_datagrams,
+                block.datagrams.len().saturating_sub(block.source_datagrams),
+            );
+            for (index, datagram) in block.datagrams.iter().enumerate() {
+                let repair = index >= block.source_datagrams;
+                if repair && queue.has_pending() {
+                    monitor.record_skipped_repairs(
+                        block.datagrams.len().saturating_sub(index),
+                        targets.len(),
+                    );
+                    break;
+                }
+                for target in &targets {
+                    if !pacer.wait_for(datagram.len(), &mut shutdown_rx).await {
+                        return;
+                    }
+                    match socket.try_send_to(datagram, *target) {
+                        Ok(sent) if sent == datagram.len() => {
+                            monitor.record_sent_datagram(repair, sent);
+                        }
+                        Ok(_) => monitor.record_send_drop(),
+                        Err(_) => monitor.record_send_drop(),
                     }
                 }
             }
         }
     });
+    Ok(TelemetryFecSenderRuntime { local_addr, task })
+}
 
-    Ok(TelemetryRuntime {
-        local_addr: bind,
-        shutdown_tx,
-        finished_rx,
-        publisher_task,
-    })
+struct TelemetryWirePacer {
+    rate_bps: u64,
+    next_send: Instant,
+}
+
+impl TelemetryWirePacer {
+    fn new(rate_bps: u64) -> Self {
+        Self {
+            rate_bps: rate_bps.max(1),
+            next_send: Instant::now(),
+        }
+    }
+
+    async fn wait_for(&mut self, bytes: usize, shutdown_rx: &mut watch::Receiver<()>) -> bool {
+        let now = Instant::now();
+        self.next_send = self.next_send.max(now);
+        let wait_until = self.next_send;
+        let wire_nanos =
+            (u128::from(bytes as u64) * 8 * 1_000_000_000).div_ceil(u128::from(self.rate_bps));
+        self.next_send += Duration::from_nanos(u64::try_from(wire_nanos).unwrap_or(u64::MAX));
+        if wait_until <= now {
+            return true;
+        }
+        tokio::select! {
+            _ = shutdown_rx.changed() => false,
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wait_until)) => true,
+        }
+    }
+}
+
+struct TelemetryFecCollectorRuntime {
+    local_addr: SocketAddr,
+    task: tokio::task::JoinHandle<()>,
+}
+
+async fn start_telemetry_fec_collector(
+    bind: SocketAddr,
+    telemetry: TelemetryAggregator,
+    monitor: TelemetryFecMonitor,
+    mut shutdown_rx: watch::Receiver<()>,
+) -> Result<TelemetryFecCollectorRuntime> {
+    let socket = UdpSocket::bind(bind)
+        .await
+        .with_context(|| format!("failed to bind telemetry FEC collector on {bind}"))?;
+    let local_addr = socket.local_addr()?;
+    let task = tokio::spawn(async move {
+        let mut decoder = TelemetryFecDecoder::default();
+        let mut datagram = vec![0_u8; 2_048];
+        loop {
+            let received = tokio::select! {
+                _ = shutdown_rx.changed() => return,
+                received = socket.recv_from(&mut datagram) => received,
+            };
+            let (bytes, peer) = match received {
+                Ok(received) => received,
+                Err(_) => {
+                    monitor.record_receive_error();
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => return,
+                        _ = sleep(Duration::from_millis(100)) => {}
+                    }
+                    continue;
+                }
+            };
+            monitor.record_received_datagram(bytes);
+            match decoder.push_datagram(peer, &datagram[..bytes]) {
+                Ok(TelemetryDecodeOutcome::Pending) => {}
+                Ok(TelemetryDecodeOutcome::Duplicate) => monitor.record_duplicate(),
+                Ok(TelemetryDecodeOutcome::Complete(envelope)) => {
+                    let snapshot = decode_mesh_telemetry_binary(&envelope.payload);
+                    match snapshot {
+                        Ok(snapshot) if snapshot.node.node_id == envelope.node_id => {
+                            monitor.record_decoded_snapshot(envelope.payload.len());
+                            telemetry.ingest_snapshot(snapshot).await;
+                        }
+                        Ok(_) | Err(_) => monitor.record_ingest_error(),
+                    }
+                }
+                Err(_) => monitor.record_decode_error(),
+            }
+        }
+    });
+    Ok(TelemetryFecCollectorRuntime { local_addr, task })
+}
+
+fn telemetry_boot_id() -> u64 {
+    let process = u64::from(std::process::id());
+    now_unix_ms().rotate_left(17) ^ process.rotate_left(41)
+}
+
+fn encode_mesh_telemetry_binary(snapshot: &MeshSnapshot) -> Result<Vec<u8>> {
+    let payload = rmp_serde::to_vec_named(snapshot)
+        .context("failed to encode mesh telemetry MessagePack payload")?;
+    if payload.len() > MAX_TELEMETRY_ENVELOPE_BYTES {
+        bail!(
+            "mesh telemetry payload exceeds {} bytes",
+            MAX_TELEMETRY_ENVELOPE_BYTES
+        );
+    }
+    Ok(payload)
+}
+
+fn decode_mesh_telemetry_binary(payload: &[u8]) -> Result<MeshSnapshot> {
+    if payload.len() > MAX_TELEMETRY_ENVELOPE_BYTES {
+        bail!(
+            "mesh telemetry payload exceeds {} bytes",
+            MAX_TELEMETRY_ENVELOPE_BYTES
+        );
+    }
+    let mut cursor = std::io::Cursor::new(payload);
+    let snapshot = {
+        let mut deserializer = rmp_serde::Deserializer::new(&mut cursor);
+        deserializer.set_max_depth(64);
+        MeshSnapshot::deserialize(&mut deserializer)
+            .context("failed to decode mesh telemetry MessagePack payload")?
+    };
+    if cursor.position() != payload.len() as u64 {
+        bail!("mesh telemetry payload has trailing bytes");
+    }
+    Ok(snapshot)
 }
 
 fn start_telemetry_collectors(
@@ -9109,6 +9775,7 @@ struct AppRouter {
     edge_load: EdgeLoad,
     provision: ProvisionExecutor,
     telemetry_peers: TelemetryPeerMonitor,
+    telemetry_fec: TelemetryFecMonitor,
     private_discovery: PrivateDiscoveryStatus,
 }
 
@@ -9131,6 +9798,7 @@ impl AppRouter {
         edge_load: EdgeLoad,
         provision: ProvisionExecutor,
         telemetry_peers: TelemetryPeerMonitor,
+        telemetry_fec: TelemetryFecMonitor,
         private_discovery: PrivateDiscoveryStatus,
     ) -> Self {
         Self {
@@ -9150,6 +9818,7 @@ impl AppRouter {
             edge_load,
             provision,
             telemetry_peers,
+            telemetry_fec,
             private_discovery,
         }
     }
@@ -9216,6 +9885,7 @@ impl AppRouter {
             control_dispatch_ready: self.dispatch.ready().await,
             provision: self.provision.status(),
             telemetry_peers: self.telemetry_peers.snapshot().await,
+            telemetry_fec: self.telemetry_fec.snapshot(),
             private_discovery: self.private_discovery.clone(),
         }
     }
@@ -9802,7 +10472,7 @@ impl Router for AppRouter {
             "/" => Ok(response(
                 StatusCode::OK,
                 Some(Bytes::from_static(
-                    b"av-mesh playback edge\n\nNeedletail Mission Control: /mesh\nHLS: /live/stream.m3u8\nHealth: /up\nStats: /api/stats\nMetrics: /metrics\n",
+                    b"av-mesh playback edge\n\nNeedletail Operations: /mesh\nHLS: /live/stream.m3u8\nHealth: /up\nStats: /api/stats\nMetrics: /metrics\n",
                 )),
                 Some("text/plain; charset=utf-8"),
             )),
@@ -10578,7 +11248,7 @@ fn mission_control_setup_response() -> HandlerResponse {
     response(
         StatusCode::SERVICE_UNAVAILABLE,
         Some(Bytes::from_static(
-            b"Needletail Mission Control setup: configure NEEDLETAIL_MISSION_CONTROL_DIST with the built asset directory.\n",
+            b"Needletail Operations setup: configure NEEDLETAIL_MISSION_CONTROL_DIST with the built asset directory.\n",
         )),
         Some("text/plain; charset=utf-8"),
     )
@@ -11878,6 +12548,13 @@ mod tests {
         assert!(args.raw_tcp_port.is_none());
         assert_eq!(args.response_ms, None);
         assert_eq!(args.telemetry_dns_name, "local.wavey.ai");
+        assert_eq!(args.telemetry_interval_ms, DEFAULT_TELEMETRY_INTERVAL_MS);
+        assert_eq!(args.telemetry_fec_rate_bps, DEFAULT_TELEMETRY_FEC_RATE_BPS);
+        assert_eq!(
+            args.telemetry_fec_repair_percent,
+            DEFAULT_TELEMETRY_REPAIR_PERCENT
+        );
+        assert!(!args.telemetry_snapshots_fec_only);
         assert_eq!(args.mesh_sync_interval_ms, 20);
         assert_eq!(args.mesh_repair_symbols, 1);
         assert_eq!(args.mesh_repair_ratio, 0.03);
@@ -11887,6 +12564,29 @@ mod tests {
             args.udp_socket_buffer_bytes,
             DEFAULT_UDP_SOCKET_BUFFER_BYTES
         );
+    }
+
+    #[test]
+    fn fec_only_snapshots_require_a_fec_target() {
+        let error = Args::try_parse_from(["av-mesh", "--telemetry-snapshots-fec-only"])
+            .unwrap()
+            .normalized()
+            .unwrap_err();
+        assert!(error.to_string().contains("--telemetry-fec-target"));
+
+        let args = Args::try_parse_from([
+            "av-mesh",
+            "--telemetry-snapshots-fec-only",
+            "--telemetry-fec-target",
+            "127.0.0.1:27300",
+            "--telemetry-interval-ms",
+            "100",
+        ])
+        .unwrap()
+        .normalized()
+        .unwrap();
+        assert!(args.telemetry_snapshots_fec_only);
+        assert_eq!(args.telemetry_interval_ms, 1_000);
     }
 
     #[test]
@@ -12613,7 +13313,7 @@ mod tests {
         let body = String::from_utf8(response.body.unwrap().to_vec()).unwrap();
         assert_eq!(
             body,
-            "Needletail Mission Control setup: configure NEEDLETAIL_MISSION_CONTROL_DIST with the built asset directory.\n"
+            "Needletail Operations setup: configure NEEDLETAIL_MISSION_CONTROL_DIST with the built asset directory.\n"
         );
     }
 
@@ -13857,19 +14557,17 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             cert.clone(),
             key,
-            50,
-            Arc::clone(&source_cache),
-            Arc::clone(&source_mesh),
-            source_router.node.clone(),
-            source_router.replication_policy.clone(),
-            source_router.control.clone(),
-            source_router.lifecycle.clone(),
             source_router.dispatch.clone(),
-            source_router.playback_base_url.clone(),
-            source_router.edge_load.clone(),
-            publisher_shutdown_rx,
         )
         .await
+        .unwrap();
+        let publisher_task = start_telemetry_publisher(
+            source_router.clone(),
+            50,
+            Some(telemetry_runtime.tx.clone()),
+            None,
+            publisher_shutdown_rx,
+        )
         .unwrap();
 
         let (collector_shutdown_tx, collector_shutdown_rx) = watch::channel(());
@@ -13959,12 +14657,147 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        timeout(Duration::from_secs(2), telemetry_runtime.publisher_task)
+        timeout(Duration::from_secs(2), publisher_task)
             .await
             .unwrap()
             .unwrap();
         source_mesh.shutdown();
         collector_mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn telemetry_fec_lane_feeds_the_existing_fleet_aggregator() {
+        use tokio::time::timeout;
+
+        let source_cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let source_mesh = mesh_handle_for_tests(Arc::clone(&source_cache.chunk_cache)).await;
+        let source_router = app_router_for_tests_with_node(
+            Arc::clone(&source_cache),
+            Arc::clone(&source_mesh),
+            mesh_node_for_tests("eu-source", "eu-west", "eu", 51.5, -0.1),
+        );
+        let telemetry = TelemetryAggregator::default();
+        let queue = LatestTelemetryQueue::default();
+        let bind = unused_udp_loopback_addr().await;
+        let monitor = TelemetryFecMonitor::new(
+            Some(bind),
+            1,
+            DEFAULT_TELEMETRY_INTERVAL_MS,
+            100_000_000,
+            Some(queue.clone()),
+        );
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let collector = start_telemetry_fec_collector(
+            bind,
+            telemetry.clone(),
+            monitor.clone(),
+            shutdown_rx.clone(),
+        )
+        .await
+        .unwrap();
+        let sender = start_telemetry_fec_sender(
+            vec![collector.local_addr],
+            100_000_000,
+            DEFAULT_TELEMETRY_REPAIR_PERCENT,
+            queue.clone(),
+            monitor.clone(),
+            shutdown_rx,
+        )
+        .await
+        .unwrap();
+
+        let snapshot = source_router.local_mesh_snapshot().await;
+        let binary = encode_mesh_telemetry_binary(&snapshot).unwrap();
+        assert!(binary.len() < MAX_TELEMETRY_ENVELOPE_BYTES);
+        TelemetryFecPublisher::new(queue, monitor.clone()).submit(
+            &snapshot,
+            binary,
+            DEFAULT_TELEMETRY_INTERVAL_MS,
+        );
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if telemetry.snapshots.read().await.contains_key("eu-source") {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let status = monitor.snapshot();
+        assert_eq!(status.snapshots_submitted, 1);
+        assert_eq!(status.blocks_encoded, 1);
+        assert_eq!(status.decoded_snapshots, 1);
+        assert_eq!(status.decode_errors, 0);
+        assert_eq!(status.ingest_errors, 0);
+        assert!(status.source_datagrams_sent > 0);
+        assert!(status.received_datagrams > 0);
+
+        let _ = shutdown_tx.send(());
+        timeout(Duration::from_secs(2), sender.task)
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(2), collector.task)
+            .await
+            .unwrap()
+            .unwrap();
+        source_mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn telemetry_wire_pacer_enforces_the_configured_budget() {
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(());
+        let mut pacer = TelemetryWirePacer::new(80_000);
+        assert!(pacer.wait_for(1_000, &mut shutdown_rx).await);
+        let started = Instant::now();
+        assert!(pacer.wait_for(1_000, &mut shutdown_rx).await);
+        assert!(started.elapsed() >= Duration::from_millis(80));
+    }
+
+    #[tokio::test]
+    #[ignore = "release-mode isolated telemetry encoding qualification"]
+    async fn isolated_telemetry_encoding_stays_within_cpu_budget() {
+        const ITERATIONS: u32 = 1_000;
+        const MAX_AVERAGE: Duration = Duration::from_millis(25);
+
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 24, 2_048).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let router = app_router_for_tests_with_node(
+            Arc::clone(&cache),
+            Arc::clone(&mesh),
+            mesh_node_for_tests("qualification", "uk", "eu", 51.5, -0.1),
+        );
+        let snapshot = router.local_mesh_snapshot().await;
+        let mut fec = TelemetryFecEncoder::default();
+        let started = Instant::now();
+        let mut wire_bytes = 0_usize;
+        for sequence in 1..=u64::from(ITERATIONS) {
+            let payload = encode_mesh_telemetry_binary(&snapshot).unwrap();
+            let envelope = TelemetryEnvelope::mesh_snapshot(
+                1,
+                sequence,
+                snapshot.updated_unix_ms,
+                DEFAULT_TELEMETRY_INTERVAL_MS as u32,
+                snapshot.node.node_id.clone(),
+                payload,
+            )
+            .encode()
+            .unwrap();
+            let block = fec.encode(&envelope).unwrap();
+            wire_bytes =
+                wire_bytes.saturating_add(block.datagrams.iter().map(Vec::len).sum::<usize>());
+        }
+        let elapsed = started.elapsed();
+        let average = elapsed / ITERATIONS;
+        println!(
+            "telemetry encode qualification: iterations={ITERATIONS} elapsed={elapsed:?} average={average:?} wire_bytes={wire_bytes}"
+        );
+        assert!(average < MAX_AVERAGE);
+        std::hint::black_box(wire_bytes);
+        mesh.shutdown();
     }
 
     #[tokio::test]
@@ -17017,6 +17850,7 @@ mod tests {
             EdgeLoad::default(),
             provision,
             monitor,
+            TelemetryFecMonitor::default(),
             PrivateDiscoveryStatus::default(),
         )
     }
@@ -17114,6 +17948,11 @@ mod tests {
     fn unused_tcp_loopback_addr() -> SocketAddr {
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         listener.local_addr().unwrap()
+    }
+
+    async fn unused_udp_loopback_addr() -> SocketAddr {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.local_addr().unwrap()
     }
 
     fn tls_pair_for_tests() -> (String, String) {
