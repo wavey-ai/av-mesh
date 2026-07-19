@@ -4370,16 +4370,20 @@ impl LiveTsCache {
         // Waiting on the exact final sequence avoids a timer or polling loop. Once
         // it is committed, every earlier sequence in this small bounded range
         // must already be available in the cache.
-        let (last, _, _, _) = self
-            .read_part_blocking_for_stream_id(stream_id, end_sequence)
+        self.read_part_blocking_for_stream_id(stream_id, end_sequence)
+            .await?;
+        let cached_parts = self
+            .chunk_cache
+            .get_range_for_stream_id(stream_id, usize::try_from(start_sequence).ok()?, part_count)
             .await?;
         let mut body = BytesMut::with_capacity(first.len().saturating_mul(part_count));
-        body.extend_from_slice(&first);
-        for sequence in start_sequence + 1..end_sequence {
-            let (part, _, _, _) = self.read_part_for_stream_id(stream_id, sequence).await?;
-            body.extend_from_slice(&part);
+        for (bytes, _hash) in cached_parts {
+            let slot = LiveSlotPayload::decode_for_stream(bytes, stream_id);
+            if !slot.has_media() {
+                return None;
+            }
+            body.extend_from_slice(&slot.media());
         }
-        body.extend_from_slice(&last);
         Some((start_sequence, end_sequence, body.freeze(), None))
     }
 
