@@ -17,7 +17,7 @@ use control::{
     MeshControlMessage,
 };
 use dashmap::{mapref::entry::Entry, DashMap};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{future::join_all, SinkExt, StreamExt};
 use h3_webtransport::server::{AcceptedBi, WebTransportSession};
 use http::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -26,6 +26,11 @@ use linode::{regions::REGIONS as LINODE_REGIONS, LinodeClient};
 use media_object::{MediaObject, ObjectKind, Stage, WIRE_MAGIC};
 use playlists::chunk_cache::{ChunkCache, PutIfAbsentResult};
 use playlists::mesh::{CacheMesh, CacheMeshConfig, CacheMeshFecStats, CacheMeshHandle};
+#[cfg(test)]
+use playlists::tail_bundle::decode_tail_bundle;
+use playlists::tail_bundle::{
+    encode_tail_bundle, TailBundleEntry, MAX_TAIL_BUNDLE_ENTRIES, TAIL_BUNDLE_CONTENT_TYPE,
+};
 use playlists::Options as CacheOptions;
 use raptorq_datagram_fec::{
     decode_serialized_media_access_unit, inspect_multichannel_audio_datagram, DecodedMediaFrame,
@@ -87,6 +92,7 @@ const RELAY_WARM_SOURCE_REPLAY_MAX_BYTES_PER_CHILD: usize = 4 * 1024 * 1024;
 const PART_WAIT_MS: u64 = 3_000;
 const LLHLS_TAIL_WAIT_MS: u64 = 250;
 const MAX_LLHLS_TAIL_PARTS: usize = 200;
+const LLHLS_TAIL_BUNDLE_PATH: &str = "/live/tail-bundle";
 const CANONICAL_STREAM_IDLE_RETENTION: Duration = Duration::from_secs(5 * 60);
 const REPLICA_REQUEST_MIN_INTERVAL_MS: u64 = 1_000;
 const MESH_EVENTS_PATH: &str = "/api/mesh/events";
@@ -4385,6 +4391,39 @@ impl LiveTsCache {
             body.extend_from_slice(&slot.media());
         }
         Some((start_sequence, end_sequence, body.freeze(), None))
+    }
+
+    async fn next_part_bundle_after_blocking_for_stream_ids(
+        &self,
+        stream_ids: &[u64],
+        after: Option<u64>,
+        start_at_oldest: bool,
+        part_count: usize,
+    ) -> Option<Bytes> {
+        if stream_ids.is_empty() || stream_ids.len() > MAX_TAIL_BUNDLE_ENTRIES {
+            return None;
+        }
+        let entries = join_all(stream_ids.iter().copied().map(|stream_id| async move {
+            let (start_sequence, end_sequence, payload, _etag) = self
+                .next_part_batch_after_blocking_for_stream_id(
+                    stream_id,
+                    after,
+                    start_at_oldest,
+                    part_count,
+                )
+                .await?;
+            Some(TailBundleEntry {
+                stream_id,
+                start_sequence,
+                end_sequence,
+                available_unix_us: self.part_available_unix_us(stream_id, end_sequence).await,
+                payload,
+            })
+        }))
+        .await
+        .into_iter()
+        .collect::<Option<Vec<_>>>()?;
+        encode_tail_bundle(&entries).ok()
     }
 
     async fn get_part_blocking(&self, seq: u64) -> Option<(Bytes, u64)> {
@@ -9674,7 +9713,102 @@ impl Router for AppRouter {
                         Some("application/vnd.apple.mpegurl"),
                     )
                     .with_no_store();
-            return Ok(self.record_edge_response(method, path, query, response, started));
+                    return Ok(self.record_edge_response(method, path, query, response, started));
+                }
+
+                if path == LLHLS_TAIL_BUNDLE_PATH {
+                    let stream_ids = match parse_llhls_tail_stream_ids(query) {
+                        Ok(stream_ids) => stream_ids,
+                        Err(()) => {
+                            let response = response(
+                                StatusCode::BAD_REQUEST,
+                                Some(Bytes::from_static(
+                                    b"streams must contain 1 to 128 unique numeric stream ids\n",
+                                )),
+                                Some("text/plain; charset=utf-8"),
+                            )
+                            .with_no_store();
+                            return Ok(
+                                self.record_edge_response(method, path, query, response, started)
+                            );
+                        }
+                    };
+                    let part_count = match parse_llhls_tail_part_count(
+                        query,
+                        self.llhls_default_tail_parts,
+                        self.cache.window_parts.saturating_mul(4).max(32),
+                    ) {
+                        Ok(part_count) => part_count,
+                        Err(()) => {
+                            let response = response(
+                                StatusCode::BAD_REQUEST,
+                                Some(Bytes::from_static(
+                                    b"parts must fit the retained cache window\n",
+                                )),
+                                Some("text/plain; charset=utf-8"),
+                            )
+                            .with_no_store();
+                            return Ok(
+                                self.record_edge_response(method, path, query, response, started)
+                            );
+                        }
+                    };
+                    join_all(stream_ids.iter().copied().map(|stream_id| {
+                        self.request_replica_for_stream(stream_id, "llhls-tail-bundle-demand", None)
+                    }))
+                    .await;
+                    let read = self.edge_load.begin_read(true);
+                    let from = parse_query_u64(query, "from");
+                    let after = parse_query_u64(query, "after")
+                        .or_else(|| from.and_then(|sequence| sequence.checked_sub(1)));
+                    let start_at_oldest = from == Some(0);
+                    let Some(bytes) = self
+                        .cache
+                        .next_part_bundle_after_blocking_for_stream_ids(
+                            &stream_ids,
+                            after,
+                            start_at_oldest,
+                            part_count,
+                        )
+                        .await
+                    else {
+                        read.finish(0);
+                        let response = response(StatusCode::NO_CONTENT, None, None).with_no_store();
+                        return Ok(
+                            self.record_edge_response(method, path, query, response, started)
+                        );
+                    };
+                    let bytes_len = bytes.len();
+                    let mut bundle_response = response(
+                        StatusCode::OK,
+                        Some(bytes),
+                        Some(TAIL_BUNDLE_CONTENT_TYPE),
+                    )
+                    .with_no_store();
+                    bundle_response.headers.push((
+                        "x-stream-count".into(),
+                        stream_ids.len().to_string().into(),
+                    ));
+                    bundle_response
+                        .headers
+                        .push(("x-part-count".into(), part_count.to_string().into()));
+                    let part_duration_ms = self.cache.part_target.as_millis();
+                    bundle_response.headers.push((
+                        "x-part-duration-ms".into(),
+                        part_duration_ms.to_string().into(),
+                    ));
+                    bundle_response.headers.push((
+                        "x-response-duration-ms".into(),
+                        part_duration_ms.saturating_mul(part_count as u128).to_string().into(),
+                    ));
+                    read.finish(bytes_len);
+                    return Ok(self.record_edge_response(
+                        method,
+                        path,
+                        query,
+                        bundle_response,
+                        started,
+                    ));
                 }
 
                 if let Some(stream_id) = parse_llhls_tail_path(path) {
@@ -10441,6 +10575,26 @@ fn query_value<'a>(query: Option<&'a str>, key: &str) -> Option<&'a str> {
 
 fn parse_query_u64(query: Option<&str>, key: &str) -> Option<u64> {
     query_value(query, key)?.parse().ok()
+}
+
+fn parse_llhls_tail_stream_ids(query: Option<&str>) -> Result<Vec<u64>, ()> {
+    let stream_list = query_value(query, "streams").ok_or(())?;
+    let mut stream_ids = Vec::new();
+    let mut unique = HashSet::new();
+    for stream_id in stream_list.split(',') {
+        if stream_id.is_empty() || stream_ids.len() == MAX_TAIL_BUNDLE_ENTRIES {
+            return Err(());
+        }
+        let stream_id = stream_id.parse::<u64>().map_err(|_| ())?;
+        if !unique.insert(stream_id) {
+            return Err(());
+        }
+        stream_ids.push(stream_id);
+    }
+    if stream_ids.is_empty() {
+        return Err(());
+    }
+    Ok(stream_ids)
 }
 
 fn parse_llhls_tail_part_count(
@@ -11448,6 +11602,21 @@ mod tests {
         assert_eq!(parse_part_path("/live/seg7.ts"), None);
         assert_eq!(parse_llhls_tail_path("/live/77/tail"), Some(77));
         assert_eq!(parse_llhls_tail_path("/live/not-number/tail"), None);
+        assert_eq!(
+            parse_llhls_tail_stream_ids(Some("streams=77")),
+            Ok(vec![77])
+        );
+        assert_eq!(
+            parse_llhls_tail_stream_ids(Some("mode=part&streams=77,78&from=0")),
+            Ok(vec![77, 78])
+        );
+        assert_eq!(parse_llhls_tail_stream_ids(None), Err(()));
+        assert_eq!(parse_llhls_tail_stream_ids(Some("streams=")), Err(()));
+        assert_eq!(parse_llhls_tail_stream_ids(Some("streams=77,77")), Err(()));
+        assert_eq!(
+            parse_llhls_tail_stream_ids(Some("streams=77,nope")),
+            Err(())
+        );
         assert_eq!(
             parse_query_u64(Some("mode=part&after=41"), "after"),
             Some(41)
@@ -14682,6 +14851,79 @@ mod tests {
         assert_eq!(header("x-response-duration-ms"), Some("20"));
         assert!(header("x-needletail-cache-available-unix-us").is_some());
         assert!(response.etag.is_none());
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn llhls_tail_bundle_waits_for_every_stream_and_preserves_opaque_bytes() {
+        use tokio::time::timeout;
+
+        let cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 600, 64).await;
+        assert_eq!(
+            cache
+                .commit_stream_payload(77, Bytes::from_static(b"opus-track-a"))
+                .await
+                .unwrap(),
+            0
+        );
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let router = Arc::new(app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh)));
+        let waiting_router = Arc::clone(&router);
+        let request = tokio::spawn(async move {
+            waiting_router
+                .route(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/live/tail-bundle?streams=77,78&from=0&parts=1")
+                        .body(())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        tokio::task::yield_now().await;
+        assert!(!request.is_finished());
+
+        assert_eq!(
+            cache
+                .commit_stream_payload(78, Bytes::from_static(b"opaque-track-b"))
+                .await
+                .unwrap(),
+            0
+        );
+        let response = timeout(Duration::from_millis(100), request)
+            .await
+            .expect("bundle should wake when every requested stream is cached")
+            .unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response.content_type.as_deref(),
+            Some(TAIL_BUNDLE_CONTENT_TYPE)
+        );
+        let header = |name: &str| {
+            response
+                .headers
+                .iter()
+                .find(|(candidate, _)| candidate == name)
+                .map(|(_, value)| value.as_ref())
+        };
+        assert_eq!(header("x-stream-count"), Some("2"));
+        assert_eq!(header("x-part-count"), Some("1"));
+        assert_eq!(header("x-part-duration-ms"), Some("5"));
+        assert_eq!(header("x-response-duration-ms"), Some("5"));
+
+        let entries = decode_tail_bundle(response.body.unwrap()).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].stream_id, 77);
+        assert_eq!(entries[0].start_sequence, 0);
+        assert_eq!(entries[0].end_sequence, 0);
+        assert_eq!(entries[0].payload, Bytes::from_static(b"opus-track-a"));
+        assert!(entries[0].available_unix_us.is_some());
+        assert_eq!(entries[1].stream_id, 78);
+        assert_eq!(entries[1].start_sequence, 0);
+        assert_eq!(entries[1].end_sequence, 0);
+        assert_eq!(entries[1].payload, Bytes::from_static(b"opaque-track-b"));
+        assert!(entries[1].available_unix_us.is_some());
         mesh.shutdown();
     }
 
