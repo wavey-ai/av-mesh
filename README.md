@@ -53,12 +53,12 @@ The first implementation keeps the mesh transport intentionally small:
 - WebSocket and WebTransport handlers remain as explicit edge paths only. They
   are disabled by default; use `--edge-websocket` or
   `--edge-webtransport` when a client specifically needs them.
-- `message-packetizer` remains available for bounded UDP-style announcements;
+- `message-packetizer` remains available for bounded UDP-style announcements
   operator commands use `AVMC` over TCP changes.
 - Contributor ingest through `../av-contrib` supports arbitrary non-OBS byte
   streams via `POST`/`PUT /ingest?stream_id=...`, pure-Rust RIST MPEG-TS, SRT
   MPEG-TS, RTMP/FLV, and HTTP `POST`/`PUT /media/access-unit` non-TS media
-  access units. OBS-style inputs are boxed into fMP4/CMAF before entering mesh;
+  access units. OBS-style inputs are boxed into fMP4/CMAF before entering mesh
   raw RIST, SRT, RTMP, and MPEG-TS payloads stay outside the mesh boundary.
 - The sibling `../av-contrib` project is the contributor-facing repo boundary.
   It currently owns
@@ -139,7 +139,7 @@ The first implementation keeps the mesh transport intentionally small:
   incomplete/expired objects, and encode/decode errors. RelaySession ingress
   separately reports repair-assisted decodes, exact FEC-recovered objects, and
   the exact number of missing source symbols reconstructed by RaptorQ. Warm
-  relays retain at most four objects, 2,048 datagrams, and 4 MiB per child;
+  relays retain at most four objects, 2,048 datagrams, and 4 MiB per child
   promotion replays only source datagrams whose object deadlines remain valid.
 - `/metrics` exposes Prometheus text metrics for topology, telemetry freshness,
   node capacity, edge traffic/errors, per-stream ingest/replica lag, current
@@ -362,6 +362,32 @@ includes
 sequence and is the cursor for the next request. The body is the byte-exact
 concatenation of the cached units, so the selected bytestream must be
 self-delimiting when more than one unit is returned.
+
+Synchronized clients can instead request
+`/live/tail-bundle?streams=1,2,3,4,5,6,7,8&from=<sequence>&parts=1`.
+The bounded `NTB1` response carries the exact requested sequence range for
+every stream or returns no partial bundle. The implementation resolves one
+cache generation per range, uses exact stream/sequence waiters, and serves
+prevalidated `Bytes` slices from an indexed canonical slot while retaining the
+complete canonical envelope for conflict and replication checks. Per-track
+waits run sequentially under one shared absolute deadline; every registration
+rechecks the cache, so arbitrary track arrival order cannot create a lost
+wakeup or extend the request budget.
+
+RelaySession recovery now carries the exact FEC-reconstructed envelope beside
+the already bounded, payload-hash-verified `MediaObject`. The cache can commit
+that pair directly instead of encoding it twice and decoding/hashing it again.
+This does not bypass canonical parsing, announcement-key rebinding, payload
+integrity, replay checks, or immutable cache conflict checks. A playback leaf
+with no downstream relay or audio subscriber also discards AEP1 traffic after
+the magic check; forwarding relays and active subscribers retain full
+validation.
+
+The matched private-GCP profile and its strict non-pass are recorded in
+[`Needletail's 19 July tail-bundle report`](../needletail/docs/real-world-tests/2026-07-19-opus-h3-tail-bundle.md).
+The latest retained run delivered 2,304,000/2,304,000 parts and reduced edge
+host CPU to 34.765%, but 9 of 288,000 bundles exceeded 20 ms. Treat that as an
+optimization result, not an endurance or production-sizing claim.
 
 The server uses the local TLS material from `av-service`; clients will need to
 trust that cert or use an insecure local test client.

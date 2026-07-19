@@ -280,6 +280,10 @@ pub enum RelayIngressOutcome {
     },
     Decoded {
         object: Box<MediaObject>,
+        /// Exact bounded canonical envelope reconstructed and validated by the
+        /// object assembler. Callers may commit these bytes directly instead
+        /// of encoding and decoding the validated object again.
+        envelope: Vec<u8>,
         /// Role of the symbol that completed the object. Relay executables use
         /// this to preserve source/repair observability while forwarding the
         /// admitted wire datagram without changing its coding geometry.
@@ -287,10 +291,6 @@ pub enum RelayIngressOutcome {
         deadline: MediaDeadline,
         parent_count: usize,
         accepted_datagrams: usize,
-        /// SHA-256 over the exact canonical envelope reconstructed by RaptorQ.
-        /// The announcement schema still needs a matching field for prior
-        /// end-to-end envelope binding.
-        envelope_hash: PayloadHash,
     },
     Duplicate {
         key: ObjectKey,
@@ -922,8 +922,10 @@ impl RelayObjectReceiver {
             });
         };
         validate_object_kind(&object, state.announcement.kind)?;
-        let envelope = media_object::encode(&object).map_err(relay_session::Error::from)?;
-        let envelope_hash = PayloadHash::digest(&envelope);
+        let envelope = state
+            .assembler
+            .take_completed_envelope()
+            .expect("a completed object must retain its validated canonical envelope");
         let key = object.key().clone();
         let active = self
             .remove_active_object(&key, false)
@@ -954,11 +956,11 @@ impl RelayObjectReceiver {
         );
         Ok(RelayIngressOutcome::Decoded {
             object: Box::new(object),
+            envelope,
             role: symbol.role,
             deadline: symbol.deadline,
             parent_count,
             accepted_datagrams,
-            envelope_hash,
         })
     }
 
@@ -1472,8 +1474,8 @@ mod tests {
             let wire = encode_datagram(symbol, RelayLimits::default()).expect("repair wire");
             if let RelayIngressOutcome::Decoded {
                 object,
+                envelope,
                 parent_count,
-                envelope_hash,
                 ..
             } = receiver
                 .push_wire_datagram(2, &wire, 1_200)
@@ -1481,8 +1483,8 @@ mod tests {
             {
                 assert_eq!(parent_count, 2);
                 assert_eq!(
-                    envelope_hash,
-                    PayloadHash::digest(&media_object::encode(&object).expect("envelope"))
+                    envelope,
+                    media_object::encode(&object).expect("canonical envelope")
                 );
                 decoded = Some(*object);
                 break;

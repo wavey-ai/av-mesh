@@ -163,6 +163,10 @@ struct NativeAudioRelay {
 }
 
 impl NativeAudioRelay {
+    fn has_subscriptions(&self) -> bool {
+        !self.subscriptions.is_empty()
+    }
+
     fn expire(&mut self, now: Instant) {
         self.subscriptions
             .retain(|_, subscription| subscription.expires_at > now);
@@ -257,6 +261,13 @@ impl NativeAudioRelay {
 }
 const MESH_FMP4_SLOT_MAGIC: &[u8; 8] = b"AVFMP4S1";
 const MESH_FMP4_SLOT_HEADER_LEN: usize = 16;
+// Canonical envelopes are fully authenticated and validated before entering
+// the live cache. Retain the exact envelope after this fixed index so retries
+// still compare every canonical byte, while hot LL-HLS reads can return a
+// checked Bytes slice instead of decoding, allocating, and hashing the object
+// again for every customer.
+const CANONICAL_LIVE_SLOT_MAGIC: &[u8; 8] = b"AVMOBJS1";
+const CANONICAL_LIVE_SLOT_HEADER_LEN: usize = 40;
 const TELEMETRY_TAG: [u8; 4] = *b"AVMT";
 const CONTROL_TAG: [u8; 4] = *b"AVMC";
 const DEFAULT_TELEMETRY_STALE_MS: u64 = 30_000;
@@ -302,6 +313,23 @@ impl LiveMediaKind {
             Self::Ts => LIVE_TS_CONTENT_TYPE,
         }
     }
+
+    const fn canonical_slot_tag(self) -> u8 {
+        match self {
+            Self::Fmp4 => 0,
+            Self::Opaque => 1,
+            Self::Ts => 2,
+        }
+    }
+
+    const fn from_canonical_slot_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::Fmp4),
+            1 => Some(Self::Opaque),
+            2 => Some(Self::Ts),
+            _ => None,
+        }
+    }
 }
 
 fn is_multichannel_audio_transport_datagram(datagram: &[u8]) -> bool {
@@ -324,6 +352,10 @@ impl LiveSlotPayload {
     }
 
     fn decode_inner(payload: Bytes, expected_stream_id: Option<u64>) -> Self {
+        if payload.starts_with(CANONICAL_LIVE_SLOT_MAGIC) {
+            return Self::decode_canonical_live_slot(payload, expected_stream_id)
+                .unwrap_or(Self::Invalid);
+        }
         if payload.starts_with(&WIRE_MAGIC) {
             let Ok(object) = media_object::decode(&payload) else {
                 return Self::Invalid;
@@ -383,6 +415,51 @@ impl LiveSlotPayload {
         })
     }
 
+    fn decode_canonical_live_slot(payload: Bytes, expected_stream_id: Option<u64>) -> Option<Self> {
+        if payload.len() < CANONICAL_LIVE_SLOT_HEADER_LEN
+            || !payload.starts_with(CANONICAL_LIVE_SLOT_MAGIC)
+            || payload[17..20] != [0, 0, 0]
+        {
+            return None;
+        }
+        let stream_id = u64::from_be_bytes(payload[8..16].try_into().ok()?);
+        if expected_stream_id.is_some_and(|expected| expected != stream_id) {
+            return None;
+        }
+        let kind = LiveMediaKind::from_canonical_slot_tag(payload[16])?;
+        let envelope_len = u32::from_be_bytes(payload[20..24].try_into().ok()?) as usize;
+        if envelope_len != payload.len().checked_sub(CANONICAL_LIVE_SLOT_HEADER_LEN)?
+            || !payload[CANONICAL_LIVE_SLOT_HEADER_LEN..].starts_with(&WIRE_MAGIC)
+        {
+            return None;
+        }
+        let init_offset = u32::from_be_bytes(payload[24..28].try_into().ok()?) as usize;
+        let init_len = u32::from_be_bytes(payload[28..32].try_into().ok()?) as usize;
+        let media_offset = u32::from_be_bytes(payload[32..36].try_into().ok()?) as usize;
+        let media_len = u32::from_be_bytes(payload[36..40].try_into().ok()?) as usize;
+        let checked_range = |offset: usize, len: usize| {
+            let end = offset.checked_add(len)?;
+            (offset >= CANONICAL_LIVE_SLOT_HEADER_LEN && end <= payload.len())
+                .then(|| payload.slice(offset..end))
+        };
+        let init = if init_len == 0 {
+            if init_offset != 0 {
+                return None;
+            }
+            None
+        } else {
+            Some(checked_range(init_offset, init_len)?)
+        };
+        let media = checked_range(media_offset, media_len)?;
+        match kind {
+            LiveMediaKind::Fmp4 => Some(Self::Fmp4 { init, media }),
+            LiveMediaKind::Opaque | LiveMediaKind::Ts if init.is_none() => {
+                Some(Self::Opaque { media, kind })
+            }
+            LiveMediaKind::Opaque | LiveMediaKind::Ts => None,
+        }
+    }
+
     fn decode_fmp4_slot(payload: Bytes) -> Option<Self> {
         if payload.len() < MESH_FMP4_SLOT_HEADER_LEN || !payload.starts_with(MESH_FMP4_SLOT_MAGIC) {
             return None;
@@ -431,6 +508,76 @@ impl LiveSlotPayload {
             Self::Invalid => false,
         }
     }
+}
+
+fn encode_canonical_live_slot(
+    stream_id: u64,
+    object: &MediaObject,
+    envelope: Bytes,
+    media_kind: LiveMediaKind,
+) -> Result<Bytes> {
+    if object.kind() != ObjectKind::Media || object.payload().is_empty() {
+        bail!("only non-empty canonical media objects can enter the live media cache");
+    }
+    let envelope_len = u32::try_from(envelope.len()).context("canonical envelope is too large")?;
+    let object_payload_offset = CANONICAL_LIVE_SLOT_HEADER_LEN
+        .checked_add(
+            envelope
+                .len()
+                .checked_sub(object.payload().len())
+                .context("canonical payload is not contained in its envelope")?,
+        )
+        .context("canonical live-slot payload offset overflow")?;
+    let is_fmp4_slot = media_kind == LiveMediaKind::Fmp4
+        && object
+            .metadata()
+            .get("payload-format")
+            .is_some_and(|format| format.as_slice() == b"fmp4-slot-v1");
+    let (init_offset, init_len, media_offset, media_len) = if is_fmp4_slot {
+        let slot = object.payload();
+        if slot.len() < MESH_FMP4_SLOT_HEADER_LEN || !slot.starts_with(MESH_FMP4_SLOT_MAGIC) {
+            bail!("canonical fMP4 slot has an invalid header");
+        }
+        let init_len = u32::from_be_bytes(slot[8..12].try_into().unwrap()) as usize;
+        let media_len = u32::from_be_bytes(slot[12..16].try_into().unwrap()) as usize;
+        let init_start = object_payload_offset
+            .checked_add(MESH_FMP4_SLOT_HEADER_LEN)
+            .context("canonical fMP4 init offset overflow")?;
+        let media_start = init_start
+            .checked_add(init_len)
+            .context("canonical fMP4 media offset overflow")?;
+        let media_end = media_start
+            .checked_add(media_len)
+            .context("canonical fMP4 media length overflow")?;
+        if media_end != CANONICAL_LIVE_SLOT_HEADER_LEN + envelope.len() {
+            bail!("canonical fMP4 slot lengths do not match its envelope");
+        }
+        (
+            if init_len > 0 { init_start } else { 0 },
+            init_len,
+            media_start,
+            media_len,
+        )
+    } else {
+        (0, 0, object_payload_offset, object.payload().len())
+    };
+
+    let mut cached = BytesMut::with_capacity(CANONICAL_LIVE_SLOT_HEADER_LEN + envelope.len());
+    cached.put_slice(CANONICAL_LIVE_SLOT_MAGIC);
+    cached.put_u64(stream_id);
+    cached.put_u8(media_kind.canonical_slot_tag());
+    cached.put_bytes(0, 3);
+    cached.put_u32(envelope_len);
+    cached.put_u32(u32::try_from(init_offset).context("canonical init offset is too large")?);
+    cached.put_u32(u32::try_from(init_len).context("canonical init is too large")?);
+    cached.put_u32(u32::try_from(media_offset).context("canonical media offset is too large")?);
+    cached.put_u32(u32::try_from(media_len).context("canonical media is too large")?);
+    cached.put_slice(&envelope);
+    debug_assert_eq!(
+        cached.len(),
+        CANONICAL_LIVE_SLOT_HEADER_LEN + envelope.len()
+    );
+    Ok(cached.freeze())
 }
 
 fn decode_canonical_stream_object(payload: &[u8]) -> Result<Option<MediaObject>> {
@@ -2944,6 +3091,17 @@ async fn process_relay_audio_epoch_datagram(
         return false;
     }
 
+    let audio_epoch_receivers = audio_epochs.map_or(0, broadcast::Sender::receiver_count);
+    let has_native_audio_subscriptions = native_audio_relay
+        .as_ref()
+        .is_some_and(|(_, relay)| relay.has_subscriptions());
+    if relay_forwarder.is_none() && audio_epoch_receivers == 0 && !has_native_audio_subscriptions {
+        // A leaf with no live audio consumer cannot use this datagram. Consume
+        // the AEP1 lane without parsing, allocating, or retaining session state;
+        // relays and active subscribers still take the validated path below.
+        return true;
+    }
+
     let now = Instant::now();
     block_sessions.retain(|_, (_, expires_at)| *expires_at > now);
     let identity = match inspect_multichannel_audio_datagram(
@@ -2980,7 +3138,6 @@ async fn process_relay_audio_epoch_datagram(
         forwarder.forward(datagram, role, None, None).await;
     }
     if let Some(audio_epochs) = audio_epochs {
-        let receivers = audio_epochs.receiver_count();
         let _ = audio_epochs.send(AudioEpochDatagram {
             session_id,
             bytes: Bytes::copy_from_slice(datagram),
@@ -2989,7 +3146,7 @@ async fn process_relay_audio_epoch_datagram(
             peer = %peer,
             ?session_id,
             ?role,
-            receivers,
+            receivers = audio_epoch_receivers,
             datagram_bytes = datagram.len(),
             "relayed AEP1 datagram to playback-edge subscribers"
         );
@@ -3073,6 +3230,7 @@ async fn process_udp_fec_ingest_datagram_inner(
         }
         Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Decoded {
             object,
+            envelope,
             role,
             deadline,
             parent_count,
@@ -3092,7 +3250,7 @@ async fn process_udp_fec_ingest_datagram_inner(
             let stream = object.key().stream().to_owned();
             let sequence = object.key().object();
             let publication_clock = relay_publication_clock(&object);
-            let decoded = match commit_relay_object(cache, *object).await {
+            let decoded = match commit_relay_object(cache, *object, envelope).await {
                 Ok(_) => {
                     if let Some(clock) = publication_clock {
                         cache.record_relay_availability(clock.observe(now_unix_us()));
@@ -3231,15 +3389,18 @@ async fn process_udp_fec_ingest_datagram_inner(
     Ok(None)
 }
 
-async fn commit_relay_object(cache: &LiveTsCache, object: MediaObject) -> Result<u64> {
+async fn commit_relay_object(
+    cache: &LiveTsCache,
+    object: MediaObject,
+    envelope: Vec<u8>,
+) -> Result<u64> {
     let stream_id = object
         .key()
         .stream()
         .parse::<u64>()
         .context("RelaySession object stream identity must map to a local numeric stream")?;
-    let envelope = media_object::encode(&object).context("failed to encode canonical object")?;
     cache
-        .commit_stream_payload(stream_id, Bytes::from(envelope))
+        .commit_validated_stream_payload(stream_id, Bytes::from(envelope), object)
         .await
 }
 
@@ -3734,12 +3895,36 @@ impl LiveTsCache {
     }
 
     async fn commit_stream_payload(&self, stream_id: u64, payload: Bytes) -> Result<u64> {
+        self.commit_stream_payload_inner(stream_id, payload, None)
+            .await
+    }
+
+    async fn commit_validated_stream_payload(
+        &self,
+        stream_id: u64,
+        payload: Bytes,
+        object: MediaObject,
+    ) -> Result<u64> {
+        self.commit_stream_payload_inner(stream_id, payload, Some(object))
+            .await
+    }
+
+    async fn commit_stream_payload_inner(
+        &self,
+        stream_id: u64,
+        payload: Bytes,
+        validated_object: Option<MediaObject>,
+    ) -> Result<u64> {
         let bytes = payload.len();
         // Stream commits and retirement share this lock so a newly arriving
         // object cannot race cache/state removal for the same stream.
         let commit_lock = self.canonical_commit_lock(stream_id);
         let _commit_guard = commit_lock.lock().await;
-        if let Some(object) = decode_canonical_stream_object(&payload)? {
+        let canonical_object = match validated_object {
+            Some(object) => Some(object),
+            None => decode_canonical_stream_object(&payload)?,
+        };
+        if let Some(object) = canonical_object {
             let expected_stream = stream_id.to_string();
             if object.key().stream() != expected_stream {
                 bail!(
@@ -3887,7 +4072,7 @@ impl LiveTsCache {
                     stream_id,
                     slot_id,
                     subscription_base_object,
-                    payload,
+                    encode_canonical_live_slot(stream_id, &object, payload, media_kind)?,
                 )
                 .await
                 .map_err(|err| anyhow!("canonical stream cache write failed: {err}"))?;
@@ -4527,15 +4712,23 @@ impl LiveTsCache {
         if stream_ids.is_empty() || stream_ids.len() > MAX_TAIL_BUNDLE_ENTRIES {
             return None;
         }
-        let parts = join_all(stream_ids.iter().copied().map(|stream_id| async move {
+        let deadline = Instant::now() + Duration::from_millis(LLHLS_TAIL_WAIT_MS);
+        let mut parts = Vec::with_capacity(stream_ids.len());
+        // Exact wait registration always rechecks the cache, so tracks may
+        // arrive in any order without requiring one heap-backed joined future
+        // per track. One absolute deadline keeps the bundle all-or-nothing and
+        // prevents sequential waits from extending the request budget.
+        for &stream_id in stream_ids {
             let (start_sequence, end_sequence, payload, _etag) = self
-                .exact_part_batch_blocking_for_stream_id(stream_id, start_sequence, part_count)
+                .exact_part_batch_until_for_stream_id(
+                    stream_id,
+                    start_sequence,
+                    part_count,
+                    deadline,
+                )
                 .await?;
-            Some((stream_id, start_sequence, end_sequence, payload))
-        }))
-        .await
-        .into_iter()
-        .collect::<Option<Vec<_>>>()?;
+            parts.push((stream_id, start_sequence, end_sequence, payload));
+        }
         // Availability belongs to the immutable cache commit, so collect it
         // under one shared state lock after all media reads complete. Taking
         // one lock per track made an eight-track 5 ms response contend with
@@ -4561,17 +4754,17 @@ impl LiveTsCache {
         encode_tail_bundle(&entries).ok()
     }
 
-    async fn exact_part_batch_blocking_for_stream_id(
+    async fn exact_part_batch_until_for_stream_id(
         &self,
         stream_id: u64,
         start_sequence: u64,
         part_count: usize,
+        deadline: Instant,
     ) -> Option<(u64, u64, Bytes, Option<u64>)> {
         if part_count == 0 || part_count > MAX_LLHLS_TAIL_PARTS {
             return None;
         }
         let end_sequence = start_sequence.checked_add(part_count as u64 - 1)?;
-        let deadline = Instant::now() + Duration::from_millis(LLHLS_TAIL_WAIT_MS);
         let final_part = self
             .read_part_until_for_stream_id(stream_id, end_sequence, deadline)
             .await?;
@@ -5329,6 +5522,7 @@ struct MeshApiSnapshot {
     node: MeshNode,
     mesh_transport: MeshTransportConfigSnapshot,
     mesh_fec: MeshFecRuntimeSnapshot,
+    llhls_runtime: LlhlsRuntimeSnapshot,
     relay_session: RelaySessionIngressSnapshot,
     relay_nodes: Vec<RelayNodeSessionSnapshot>,
     peers: Vec<PeerSnapshot>,
@@ -5346,6 +5540,23 @@ struct MeshApiSnapshot {
     edge_services: Vec<EdgeServiceSnapshot>,
     connections: Vec<ConnectionSnapshot>,
     streams: Vec<StreamTelemetry>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+struct LlhlsRuntimeSnapshot {
+    exact_waiter_keys: usize,
+    exact_waiter_registrations: usize,
+    exact_waiter_capacity: usize,
+}
+
+impl From<playlists::chunk_cache::ExactPartWaiterStats> for LlhlsRuntimeSnapshot {
+    fn from(stats: playlists::chunk_cache::ExactPartWaiterStats) -> Self {
+        Self {
+            exact_waiter_keys: stats.retained_keys,
+            exact_waiter_registrations: stats.active_registrations,
+            exact_waiter_capacity: stats.capacity,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -7030,6 +7241,7 @@ impl MeshApiSnapshot {
             node: local.node,
             mesh_transport: MeshTransportConfigSnapshot::default(),
             mesh_fec: MeshFecRuntimeSnapshot::default(),
+            llhls_runtime: LlhlsRuntimeSnapshot::default(),
             relay_session,
             relay_nodes,
             peers: local.peers,
@@ -7119,6 +7331,30 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
     ] {
         push_prometheus_metric_header(&mut output, name, help, "gauge");
         output.push_str(&format!("{name} {value}\n"));
+    }
+
+    let local_node_id = prometheus_label_value(&snapshot.node.node_id);
+    let local_region = prometheus_label_value(&snapshot.node.region);
+    let local_labels = format!("node_id=\"{local_node_id}\",region=\"{local_region}\"");
+    for (name, help, value) in [
+        (
+            "av_mesh_llhls_exact_waiter_keys",
+            "Exact stream and sequence waiter keys retained by the local LL-HLS cache.",
+            snapshot.llhls_runtime.exact_waiter_keys,
+        ),
+        (
+            "av_mesh_llhls_exact_waiter_registrations",
+            "Blocked local LL-HLS requests holding exact-part waiter registrations.",
+            snapshot.llhls_runtime.exact_waiter_registrations,
+        ),
+        (
+            "av_mesh_llhls_exact_waiter_capacity",
+            "Hard upper bound on exact-part waiter keys in the local LL-HLS cache.",
+            snapshot.llhls_runtime.exact_waiter_capacity,
+        ),
+    ] {
+        push_prometheus_metric_header(&mut output, name, help, "gauge");
+        output.push_str(&format!("{name}{{{local_labels}}} {value}\n"));
     }
 
     for (name, help, value) in [
@@ -9856,6 +10092,7 @@ impl AppRouter {
         );
         snapshot.mesh_transport = self.mesh_transport.clone();
         snapshot.mesh_fec = self.mesh.fec_stats().into();
+        snapshot.llhls_runtime = self.cache.chunk_cache.exact_part_waiter_stats().into();
         snapshot
     }
 
@@ -12389,6 +12626,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canonical_fmp4_live_slot_indexes_validated_init_and_media_ranges() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let stream_id = 87;
+        let sequence = 11;
+        let envelope = encode_test_canonical_fmp4_bundle(
+            stream_id,
+            sequence,
+            Some(b"ftypmoov-indexed"),
+            b"moofmdat-indexed",
+        );
+
+        cache
+            .commit_stream_payload(stream_id, envelope.clone())
+            .await
+            .unwrap();
+        let (cached, _) = cache
+            .chunk_cache
+            .get_for_stream_id(stream_id, sequence as usize)
+            .await
+            .unwrap();
+        assert!(cached.starts_with(CANONICAL_LIVE_SLOT_MAGIC));
+        assert_eq!(&cached[CANONICAL_LIVE_SLOT_HEADER_LEN..], envelope.as_ref());
+        assert_eq!(
+            cache
+                .get_part_for_stream_id(stream_id, sequence)
+                .await
+                .unwrap()
+                .0,
+            Bytes::from_static(b"moofmdat-indexed")
+        );
+        assert_eq!(
+            cache.get_init_for_stream_id(stream_id).await.unwrap(),
+            Bytes::from_static(b"ftypmoov-indexed")
+        );
+    }
+
+    #[tokio::test]
     async fn canonical_opaque_media_is_served_as_an_exact_containerless_llhls_part() {
         let cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 256, 64).await;
         let stream_id = 89;
@@ -12401,9 +12675,26 @@ mod tests {
         assert_eq!(decoded.media(), packet.as_slice());
 
         cache
-            .commit_stream_payload(stream_id, envelope)
+            .commit_stream_payload(stream_id, envelope.clone())
             .await
             .unwrap();
+        let (cached, _) = cache
+            .chunk_cache
+            .get_for_stream_id(stream_id, sequence as usize)
+            .await
+            .unwrap();
+        assert!(cached.starts_with(CANONICAL_LIVE_SLOT_MAGIC));
+        assert_eq!(&cached[CANONICAL_LIVE_SLOT_HEADER_LEN..], envelope.as_ref());
+        assert!(
+            !LiveSlotPayload::decode_for_stream(cached.clone(), stream_id + 1).has_media(),
+            "the indexed stream identity must remain fenced"
+        );
+        let mut corrupt = cached.to_vec();
+        corrupt[32..36].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(
+            !LiveSlotPayload::decode_for_stream(Bytes::from(corrupt), stream_id).has_media(),
+            "an out-of-bounds indexed media range must be rejected"
+        );
         assert_eq!(
             cache
                 .get_part_for_stream_id(stream_id, sequence)
@@ -13270,6 +13561,7 @@ mod tests {
         let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
         cache.push_payload(b"latency-metric-part").await.unwrap();
         cache.rotate_if_due(true).await.unwrap();
+        let exact_waiter = cache.chunk_cache.exact_part_waiter(77, 999).unwrap();
 
         let playlist_req = Request::builder()
             .method(Method::GET)
@@ -13297,6 +13589,27 @@ mod tests {
         assert!(metrics.contains("av_mesh_nodes 1\n"));
         assert!(metrics.contains(
             "av_mesh_edge_response_duration_seconds_count{node_id=\"test-node\",region=\"test-region\"} 1\n"
+        ));
+        assert!(metrics.contains(
+            "av_mesh_llhls_exact_waiter_keys{node_id=\"test-node\",region=\"test-region\"} 1\n"
+        ));
+        assert!(metrics.contains(
+            "av_mesh_llhls_exact_waiter_registrations{node_id=\"test-node\",region=\"test-region\"} 1\n"
+        ));
+        assert!(metrics.contains(
+            "av_mesh_llhls_exact_waiter_capacity{node_id=\"test-node\",region=\"test-region\"} 65536\n"
+        ));
+
+        drop(exact_waiter);
+        let metrics_req = Request::builder()
+            .method(Method::GET)
+            .uri(MESH_METRICS_PATH)
+            .body(())
+            .unwrap();
+        let response = router.route(metrics_req).await.unwrap();
+        let metrics = String::from_utf8(response.body.unwrap().to_vec()).unwrap();
+        assert!(metrics.contains(
+            "av_mesh_llhls_exact_waiter_registrations{node_id=\"test-node\",region=\"test-region\"} 0\n"
         ));
 
         mesh.shutdown();
@@ -16657,6 +16970,20 @@ mod tests {
         let source = wrapped.source_datagrams().next().unwrap().payload.clone();
         let repair = wrapped.repair_datagrams().next().unwrap().payload.clone();
         let peer: SocketAddr = "127.0.0.1:41001".parse().unwrap();
+
+        let mut discarded_block_sessions = HashMap::new();
+        assert!(
+            process_relay_audio_epoch_datagram(
+                peer,
+                &source,
+                &mut discarded_block_sessions,
+                None,
+                None,
+                None,
+            )
+            .await
+        );
+        assert!(discarded_block_sessions.is_empty());
 
         assert!(
             process_relay_audio_epoch_datagram(
