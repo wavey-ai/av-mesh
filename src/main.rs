@@ -4396,8 +4396,7 @@ impl LiveTsCache {
     async fn next_part_bundle_after_blocking_for_stream_ids(
         &self,
         stream_ids: &[u64],
-        after: Option<u64>,
-        start_at_oldest: bool,
+        start_sequence: u64,
         part_count: usize,
     ) -> Option<Bytes> {
         if stream_ids.is_empty() || stream_ids.len() > MAX_TAIL_BUNDLE_ENTRIES {
@@ -4405,12 +4404,7 @@ impl LiveTsCache {
         }
         let entries = join_all(stream_ids.iter().copied().map(|stream_id| async move {
             let (start_sequence, end_sequence, payload, _etag) = self
-                .next_part_batch_after_blocking_for_stream_id(
-                    stream_id,
-                    after,
-                    start_at_oldest,
-                    part_count,
-                )
+                .exact_part_batch_blocking_for_stream_id(stream_id, start_sequence, part_count)
                 .await?;
             Some(TailBundleEntry {
                 stream_id,
@@ -4424,6 +4418,54 @@ impl LiveTsCache {
         .into_iter()
         .collect::<Option<Vec<_>>>()?;
         encode_tail_bundle(&entries).ok()
+    }
+
+    async fn exact_part_batch_blocking_for_stream_id(
+        &self,
+        stream_id: u64,
+        start_sequence: u64,
+        part_count: usize,
+    ) -> Option<(u64, u64, Bytes, Option<u64>)> {
+        if part_count == 0 || part_count > MAX_LLHLS_TAIL_PARTS {
+            return None;
+        }
+        let end_sequence = start_sequence.checked_add(part_count as u64 - 1)?;
+        let deadline = Instant::now() + Duration::from_millis(LLHLS_TAIL_WAIT_MS);
+        let final_part = self
+            .read_part_until_for_stream_id(stream_id, end_sequence, deadline)
+            .await?;
+        if part_count == 1 {
+            let (media, hash, media_kind, init) = final_part;
+            if let Some(init) = init {
+                self.remember_stream_init(stream_id, init).await;
+            }
+            self.remember_media_kind(stream_id, media_kind).await;
+            return Some((start_sequence, end_sequence, media, Some(hash)));
+        }
+
+        let cached_parts = self
+            .chunk_cache
+            .get_range_for_stream_id(stream_id, usize::try_from(start_sequence).ok()?, part_count)
+            .await?;
+        let mut body = BytesMut::new();
+        let mut first_metadata = None;
+        for (bytes, _hash) in cached_parts {
+            let slot = LiveSlotPayload::decode_for_stream(bytes, stream_id);
+            if !slot.has_media() {
+                return None;
+            }
+            if first_metadata.is_none() {
+                first_metadata = Some((slot.media_kind(), slot.init()));
+            }
+            body.extend_from_slice(&slot.media());
+        }
+        if let Some((media_kind, init)) = first_metadata {
+            if let Some(init) = init {
+                self.remember_stream_init(stream_id, init).await;
+            }
+            self.remember_media_kind(stream_id, media_kind).await;
+        }
+        Some((start_sequence, end_sequence, body.freeze(), None))
     }
 
     async fn get_part_blocking(&self, seq: u64) -> Option<(Bytes, u64)> {
@@ -4469,6 +4511,16 @@ impl LiveTsCache {
         seq: u64,
     ) -> Option<(Bytes, u64, LiveMediaKind, Option<Bytes>)> {
         let deadline = Instant::now() + Duration::from_millis(PART_WAIT_MS);
+        self.read_part_until_for_stream_id(stream_id, seq, deadline)
+            .await
+    }
+
+    async fn read_part_until_for_stream_id(
+        &self,
+        stream_id: u64,
+        seq: u64,
+        deadline: Instant,
+    ) -> Option<(Bytes, u64, LiveMediaKind, Option<Bytes>)> {
         loop {
             if let Some(part) = self.read_part_for_stream_id(stream_id, seq).await {
                 return Some(part);
@@ -9753,21 +9805,32 @@ impl Router for AppRouter {
                             );
                         }
                     };
+                    let start_sequence = match parse_llhls_tail_start_sequence(query) {
+                        Ok(start_sequence) => start_sequence,
+                        Err(()) => {
+                            let response = response(
+                                StatusCode::BAD_REQUEST,
+                                Some(Bytes::from_static(
+                                    b"supply exactly one numeric from or after cursor\n",
+                                )),
+                                Some("text/plain; charset=utf-8"),
+                            )
+                            .with_no_store();
+                            return Ok(
+                                self.record_edge_response(method, path, query, response, started)
+                            );
+                        }
+                    };
                     join_all(stream_ids.iter().copied().map(|stream_id| {
                         self.request_replica_for_stream(stream_id, "llhls-tail-bundle-demand", None)
                     }))
                     .await;
                     let read = self.edge_load.begin_read(true);
-                    let from = parse_query_u64(query, "from");
-                    let after = parse_query_u64(query, "after")
-                        .or_else(|| from.and_then(|sequence| sequence.checked_sub(1)));
-                    let start_at_oldest = from == Some(0);
                     let Some(bytes) = self
                         .cache
                         .next_part_bundle_after_blocking_for_stream_ids(
                             &stream_ids,
-                            after,
-                            start_at_oldest,
+                            start_sequence,
                             part_count,
                         )
                         .await
@@ -10595,6 +10658,18 @@ fn parse_llhls_tail_stream_ids(query: Option<&str>) -> Result<Vec<u64>, ()> {
         return Err(());
     }
     Ok(stream_ids)
+}
+
+fn parse_llhls_tail_start_sequence(query: Option<&str>) -> Result<u64, ()> {
+    match (query_value(query, "from"), query_value(query, "after")) {
+        (Some(from), None) => from.parse().map_err(|_| ()),
+        (None, Some(after)) => after
+            .parse::<u64>()
+            .map_err(|_| ())?
+            .checked_add(1)
+            .ok_or(()),
+        _ => Err(()),
+    }
 }
 
 fn parse_llhls_tail_part_count(
@@ -11615,6 +11690,26 @@ mod tests {
         assert_eq!(parse_llhls_tail_stream_ids(Some("streams=77,77")), Err(()));
         assert_eq!(
             parse_llhls_tail_stream_ids(Some("streams=77,nope")),
+            Err(())
+        );
+        assert_eq!(
+            parse_llhls_tail_start_sequence(Some("streams=77,78&from=0")),
+            Ok(0)
+        );
+        assert_eq!(
+            parse_llhls_tail_start_sequence(Some("streams=77,78&after=41")),
+            Ok(42)
+        );
+        assert_eq!(
+            parse_llhls_tail_start_sequence(Some("streams=77,78")),
+            Err(())
+        );
+        assert_eq!(
+            parse_llhls_tail_start_sequence(Some("from=0&after=41")),
+            Err(())
+        );
+        assert_eq!(
+            parse_llhls_tail_start_sequence(Some("after=18446744073709551615")),
             Err(())
         );
         assert_eq!(
@@ -14881,6 +14976,16 @@ mod tests {
                 .await
                 .unwrap()
         });
+        tokio::task::yield_now().await;
+        assert!(!request.is_finished());
+
+        assert_eq!(
+            cache
+                .commit_stream_payload(79, Bytes::from_static(b"unrelated-track"))
+                .await
+                .unwrap(),
+            0
+        );
         tokio::task::yield_now().await;
         assert!(!request.is_finished());
 
