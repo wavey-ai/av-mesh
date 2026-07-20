@@ -34,7 +34,8 @@ use playlists::mesh::{CacheMesh, CacheMeshConfig, CacheMeshFecStats, CacheMeshHa
 #[cfg(test)]
 use playlists::tail_bundle::decode_tail_bundle;
 use playlists::tail_bundle::{
-    encode_tail_bundle, TailBundleEntry, MAX_TAIL_BUNDLE_ENTRIES, TAIL_BUNDLE_CONTENT_TYPE,
+    encode_tail_bundle, encode_tail_bundle_stream_frame, TailBundleEntry, MAX_TAIL_BUNDLE_ENTRIES,
+    TAIL_BUNDLE_CONTENT_TYPE, TAIL_BUNDLE_STREAM_CONTENT_TYPE,
 };
 use playlists::Options as CacheOptions;
 use raptorq_datagram_fec::{
@@ -101,6 +102,7 @@ const PART_WAIT_MS: u64 = 3_000;
 const LLHLS_TAIL_WAIT_MS: u64 = 250;
 const MAX_LLHLS_TAIL_PARTS: usize = 200;
 const LLHLS_TAIL_BUNDLE_PATH: &str = "/live/tail-bundle";
+const LLHLS_TAIL_BUNDLE_STREAM_PATH: &str = "/live/tail-bundle-stream";
 const CANONICAL_STREAM_IDLE_RETENTION: Duration = Duration::from_secs(5 * 60);
 const REPLICA_REQUEST_MIN_INTERVAL_MS: u64 = 1_000;
 const MESH_EVENTS_PATH: &str = "/api/mesh/events";
@@ -3880,6 +3882,7 @@ impl LiveTsCache {
             part.seq,
             part.bytes,
             now_unix_us(),
+            u32::try_from(part.duration_ms).ok(),
             self.window_parts,
         );
         debug!(
@@ -3974,6 +3977,8 @@ impl LiveTsCache {
                 state.stream_next_seq.remove(&stream_id);
                 state.stream_parts.remove(&stream_id);
                 state.stream_retained_bytes.remove(&stream_id);
+                state.stream_max_part_duration_ms.remove(&stream_id);
+                state.stream_max_segment_duration_ms.remove(&stream_id);
                 state.stream_inits.remove(&stream_id);
                 state.stream_media_kinds.remove(&stream_id);
                 if stream_id == self.stream_id {
@@ -3994,6 +3999,12 @@ impl LiveTsCache {
             let seq = object.key().object();
             let kind = object.kind();
             let media_bytes = object.payload().len();
+            let media_duration_ms = object
+                .metadata()
+                .get("duration-ms")
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|duration_ms| *duration_ms > 0);
             let is_fmp4 = object
                 .metadata()
                 .get("container")
@@ -4096,8 +4107,15 @@ impl LiveTsCache {
                 Some(state.last_committed_seq.map_or(seq, |last| last.max(seq)));
             state.last_committed_unix_ms = Some(now_ms);
             state.last_committed_bytes = Some(media_bytes);
-            state.last_committed_duration_ms = None;
-            state.record_part_available(stream_id, seq, bytes, now_unix_us(), self.window_parts);
+            state.last_committed_duration_ms = media_duration_ms.map(u64::from);
+            state.record_part_available(
+                stream_id,
+                seq,
+                bytes,
+                now_unix_us(),
+                media_duration_ms,
+                self.window_parts,
+            );
             debug!(
                 stream_id,
                 source_epoch,
@@ -4149,7 +4167,14 @@ impl LiveTsCache {
         state.last_committed_unix_ms = Some(now_ms);
         state.last_committed_bytes = Some(media_bytes);
         state.last_committed_duration_ms = None;
-        state.record_part_available(stream_id, seq, bytes, now_unix_us(), self.window_parts);
+        state.record_part_available(
+            stream_id,
+            seq,
+            bytes,
+            now_unix_us(),
+            None,
+            self.window_parts,
+        );
         debug!(
             stream_id,
             sequence = seq,
@@ -4382,18 +4407,70 @@ impl LiveTsCache {
         let first_available = *available.first().unwrap();
         let media_sequence = first_available / self.parts_per_segment as u64;
         let next_part = available.last().copied().unwrap_or(0) + 1;
-        let part_target = self.part_target.as_secs_f64();
-        let target_duration = (part_target * self.parts_per_segment as f64)
-            .ceil()
-            .max(1.0) as u64;
+        let nominal_part_duration_ms =
+            self.part_target.as_millis().clamp(1, u32::MAX as u128) as u32;
+        let (part_target_ms, available) = {
+            let state = self.state.read().await;
+            let observations = state.stream_parts.get(&stream_id);
+            let part_target_ms = state
+                .stream_max_part_duration_ms
+                .get(&stream_id)
+                .copied()
+                .unwrap_or(nominal_part_duration_ms)
+                .max(nominal_part_duration_ms);
+            let available = available
+                .into_iter()
+                .map(|sequence| {
+                    let duration_ms = observations
+                        .and_then(|parts| parts.get(&sequence))
+                        .and_then(|part| part.duration_ms)
+                        .unwrap_or(nominal_part_duration_ms);
+                    (sequence, duration_ms)
+                })
+                .collect::<Vec<_>>();
+            (part_target_ms, available)
+        };
+        let part_target = f64::from(part_target_ms) / 1_000.0;
 
-        let mut groups: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
-        for seq in available {
+        let mut groups: BTreeMap<u64, Vec<(u64, u32)>> = BTreeMap::new();
+        for (seq, duration_ms) in available {
             groups
                 .entry(seq / self.parts_per_segment as u64)
                 .or_default()
-                .push(seq);
+                .push((seq, duration_ms));
         }
+        let observed_segment_duration_ms = groups
+            .values()
+            .filter(|group| group.len() == self.parts_per_segment)
+            .map(|group| {
+                group
+                    .iter()
+                    .map(|(_sequence, duration_ms)| u64::from(*duration_ms))
+                    .sum::<u64>()
+            })
+            .max();
+        let fallback_segment_duration_ms =
+            u64::from(nominal_part_duration_ms) * self.parts_per_segment as u64;
+        let segment_target_ms = {
+            let mut state = self.state.write().await;
+            if let Some(observed_duration_ms) = observed_segment_duration_ms {
+                state
+                    .stream_max_segment_duration_ms
+                    .entry(stream_id)
+                    .and_modify(|duration_ms| {
+                        *duration_ms = (*duration_ms).max(observed_duration_ms);
+                    })
+                    .or_insert(observed_duration_ms);
+            }
+            state
+                .stream_max_segment_duration_ms
+                .get(&stream_id)
+                .copied()
+                .unwrap_or(fallback_segment_duration_ms)
+                .max(fallback_segment_duration_ms)
+        };
+        let segment_target = segment_target_ms as f64 / 1_000.0;
+        let target_duration = segment_target.ceil().max(1.0) as u64;
 
         let mut out = String::new();
         out.push_str("#EXTM3U\n");
@@ -4414,16 +4491,17 @@ impl LiveTsCache {
         out.push_str(&format!(
             "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={:.3},HOLD-BACK={:.3}\n",
             part_target * 3.0,
-            (part_target * self.parts_per_segment as f64 * 2.0).max(3.0)
+            (segment_target * 2.0).max(3.0)
         ));
 
         let extension = media_kind.extension();
         for (segment, group) in groups {
             let mut duration = 0.0;
-            for seq in &group {
-                duration += part_target;
+            for (seq, duration_ms) in &group {
+                let part_duration = f64::from(*duration_ms) / 1_000.0;
+                duration += part_duration;
                 out.push_str(&format!(
-                    "#EXT-X-PART:DURATION={part_target:.3},URI=\"part{seq}.{extension}\"\n"
+                    "#EXT-X-PART:DURATION={part_duration:.3},URI=\"part{seq}.{extension}\"\n"
                 ));
             }
             if group.len() == self.parts_per_segment {
@@ -5271,6 +5349,7 @@ impl LiveTsCache {
 struct RetainedPartObservation {
     bytes: usize,
     available_unix_us: u64,
+    duration_ms: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -5302,6 +5381,8 @@ struct LiveState {
     stream_last_ingest_unix_ms: HashMap<u64, u64>,
     stream_parts: HashMap<u64, BTreeMap<u64, RetainedPartObservation>>,
     stream_retained_bytes: HashMap<u64, u64>,
+    stream_max_part_duration_ms: HashMap<u64, u32>,
+    stream_max_segment_duration_ms: HashMap<u64, u64>,
     stream_inits: HashMap<u64, Bytes>,
     stream_media_kinds: HashMap<u64, LiveMediaKind>,
 }
@@ -5330,6 +5411,8 @@ impl LiveState {
             stream_last_ingest_unix_ms: HashMap::new(),
             stream_parts: HashMap::new(),
             stream_retained_bytes: HashMap::new(),
+            stream_max_part_duration_ms: HashMap::new(),
+            stream_max_segment_duration_ms: HashMap::new(),
             stream_inits: HashMap::new(),
             stream_media_kinds: HashMap::new(),
         }
@@ -5353,8 +5436,15 @@ impl LiveState {
         sequence: u64,
         bytes: usize,
         available_unix_us: u64,
+        duration_ms: Option<u32>,
         window_parts: usize,
     ) {
+        if let Some(duration_ms) = duration_ms {
+            self.stream_max_part_duration_ms
+                .entry(stream_id)
+                .and_modify(|maximum| *maximum = (*maximum).max(duration_ms))
+                .or_insert(duration_ms);
+        }
         let (inserted_bytes, removed_bytes) = {
             let parts = self.stream_parts.entry(stream_id).or_default();
             let inserted_bytes =
@@ -5362,6 +5452,7 @@ impl LiveState {
                     entry.insert(RetainedPartObservation {
                         bytes,
                         available_unix_us,
+                        duration_ms,
                     });
                     bytes as u64
                 } else {
@@ -5422,6 +5513,8 @@ impl LiveState {
         self.stream_last_ingest_unix_ms.remove(&stream_id);
         self.stream_parts.remove(&stream_id);
         self.stream_retained_bytes.remove(&stream_id);
+        self.stream_max_part_duration_ms.remove(&stream_id);
+        self.stream_max_segment_duration_ms.remove(&stream_id);
         self.stream_inits.remove(&stream_id);
         self.stream_media_kinds.remove(&stream_id);
     }
@@ -10858,28 +10951,43 @@ impl Router for AppRouter {
                         );
                     };
                     let bytes_len = bytes.len();
-                    let mut bundle_response = response(
-                        StatusCode::OK,
-                        Some(bytes),
-                        Some(TAIL_BUNDLE_CONTENT_TYPE),
-                    )
-                    .with_no_store();
-                    bundle_response.headers.push((
-                        "x-stream-count".into(),
-                        stream_ids.len().to_string().into(),
-                    ));
-                    bundle_response
-                        .headers
-                        .push(("x-part-count".into(), part_count.to_string().into()));
-                    let part_duration_ms = self.cache.part_target.as_millis();
-                    bundle_response.headers.push((
-                        "x-part-duration-ms".into(),
-                        part_duration_ms.to_string().into(),
-                    ));
-                    bundle_response.headers.push((
-                        "x-response-duration-ms".into(),
-                        part_duration_ms.saturating_mul(part_count as u128).to_string().into(),
-                    ));
+                    let bundle_response = if query_value(query, "compact") == Some("1") {
+                        // The bundle envelope already carries stream and sequence identity.
+                        // High-cadence clients can omit redundant diagnostic headers to avoid
+                        // rebuilding and QPACK-encoding four values every five milliseconds.
+                        HandlerResponse {
+                            status: StatusCode::OK,
+                            body: Some(bytes),
+                            content_type: Some(TAIL_BUNDLE_CONTENT_TYPE.into()),
+                            headers: Vec::with_capacity(1),
+                            etag: None,
+                        }
+                        .with_no_store()
+                    } else {
+                        let mut response = response(
+                            StatusCode::OK,
+                            Some(bytes),
+                            Some(TAIL_BUNDLE_CONTENT_TYPE),
+                        )
+                        .with_no_store();
+                        response.headers.push((
+                            "x-stream-count".into(),
+                            stream_ids.len().to_string().into(),
+                        ));
+                        response
+                            .headers
+                            .push(("x-part-count".into(), part_count.to_string().into()));
+                        let part_duration_ms = self.cache.part_target.as_millis();
+                        response.headers.push((
+                            "x-part-duration-ms".into(),
+                            part_duration_ms.to_string().into(),
+                        ));
+                        response.headers.push((
+                            "x-response-duration-ms".into(),
+                            part_duration_ms.saturating_mul(part_count as u128).to_string().into(),
+                        ));
+                        response
+                    };
                     read.finish(bytes_len);
                     return Ok(self.record_edge_response(
                         method,
@@ -11187,7 +11295,7 @@ impl Router for AppRouter {
     }
 
     fn is_streaming(&self, path: &str) -> bool {
-        path == MESH_EVENTS_PATH
+        path == MESH_EVENTS_PATH || path == LLHLS_TAIL_BUNDLE_STREAM_PATH
     }
 
     async fn route_stream(
@@ -11195,24 +11303,129 @@ impl Router for AppRouter {
         req: Request<()>,
         mut stream_writer: Box<dyn StreamWriter>,
     ) -> HandlerResult<()> {
-        if req.uri().path() != MESH_EVENTS_PATH {
-            return Err(ServerError::Config("unsupported streaming path".into()));
-        }
+        match req.uri().path() {
+            MESH_EVENTS_PATH => {
+                let response = Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .header("cache-control", "no-store, max-age=0")
+                    .body(())
+                    .map_err(ServerError::Http)?;
+                stream_writer.send_response(response).await?;
 
-        let response = Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "text/event-stream")
-            .header("cache-control", "no-store, max-age=0")
-            .body(())
-            .map_err(ServerError::Http)?;
-        stream_writer.send_response(response).await?;
+                let mut ticker = interval(Duration::from_secs(1));
+                loop {
+                    stream_writer
+                        .send_data(self.mesh_sse_event().await?)
+                        .await?;
+                    ticker.tick().await;
+                }
+            }
+            LLHLS_TAIL_BUNDLE_STREAM_PATH => {
+                let query = req.uri().query();
+                let parsed = parse_llhls_tail_stream_ids(query).and_then(|stream_ids| {
+                    let part_count = parse_llhls_tail_part_count(
+                        query,
+                        self.llhls_default_tail_parts,
+                        self.cache.window_parts.saturating_mul(4).max(32),
+                    )?;
+                    let start_sequence = parse_llhls_tail_start_sequence(query)?;
+                    Ok((stream_ids, part_count, start_sequence))
+                });
+                let (stream_ids, part_count, mut next_sequence) = match parsed {
+                    Ok(parsed) => parsed,
+                    Err(()) => {
+                        let response = Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .header("content-type", "text/plain; charset=utf-8")
+                            .header("cache-control", "no-store, max-age=0")
+                            .body(())
+                            .map_err(ServerError::Http)?;
+                        stream_writer.send_response(response).await?;
+                        stream_writer
+                            .send_data(Bytes::from_static(
+                                b"supply valid streams, from cursor, and parts count\n",
+                            ))
+                            .await?;
+                        return stream_writer.finish().await;
+                    }
+                };
 
-        let mut ticker = interval(Duration::from_secs(1));
-        loop {
-            stream_writer
-                .send_data(self.mesh_sse_event().await?)
-                .await?;
-            ticker.tick().await;
+                if !self.cache.streams_are_locally_fresh(&stream_ids).await {
+                    join_all(stream_ids.iter().copied().map(|stream_id| {
+                        self.request_replica_for_stream(
+                            stream_id,
+                            "llhls-tail-bundle-stream-demand",
+                            None,
+                        )
+                    }))
+                    .await;
+                }
+
+                let started = Instant::now();
+                let response = Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", TAIL_BUNDLE_STREAM_CONTENT_TYPE)
+                    .header("cache-control", "no-store, max-age=0")
+                    .body(())
+                    .map_err(ServerError::Http)?;
+                stream_writer.send_response(response).await?;
+                self.edge_load.record_response(
+                    req.method(),
+                    req.uri().path(),
+                    query,
+                    &HandlerResponse {
+                        status: StatusCode::OK,
+                        body: None,
+                        content_type: Some(TAIL_BUNDLE_STREAM_CONTENT_TYPE.into()),
+                        headers: vec![("cache-control".into(), "no-store, max-age=0".into())],
+                        etag: None,
+                    },
+                    started.elapsed(),
+                );
+
+                // One long-lived read represents one customer. Each body frame
+                // carries the existing self-describing synchronized bundle, so
+                // delivery does not create a request task or QPACK field section
+                // every five milliseconds.
+                let read = self.edge_load.begin_read(true);
+                let mut bytes_served = 0_usize;
+                loop {
+                    let Some(bundle) = self
+                        .cache
+                        .next_part_bundle_after_blocking_for_stream_ids(
+                            &stream_ids,
+                            next_sequence,
+                            part_count,
+                        )
+                        .await
+                    else {
+                        continue;
+                    };
+                    let frame = match encode_tail_bundle_stream_frame(bundle) {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            read.finish(bytes_served);
+                            return Err(ServerError::Handler(Box::new(error)));
+                        }
+                    };
+                    bytes_served = bytes_served.saturating_add(frame.len());
+                    if let Err(error) = stream_writer.send_data(frame).await {
+                        read.finish(bytes_served);
+                        return Err(error);
+                    }
+                    next_sequence = match next_sequence.checked_add(part_count as u64) {
+                        Some(sequence) => sequence,
+                        None => {
+                            read.finish(bytes_served);
+                            return Err(ServerError::Config(
+                                "tail bundle stream sequence overflow".into(),
+                            ));
+                        }
+                    };
+                }
+            }
+            _ => Err(ServerError::Config("unsupported streaming path".into())),
         }
     }
 
@@ -12035,6 +12248,16 @@ mod tests {
         init: Option<&[u8]>,
         media: &[u8],
     ) -> Bytes {
+        encode_test_canonical_fmp4_bundle_with_duration(stream_id, sequence, init, media, None)
+    }
+
+    fn encode_test_canonical_fmp4_bundle_with_duration(
+        stream_id: u64,
+        sequence: u64,
+        init: Option<&[u8]>,
+        media: &[u8],
+        duration_ms: Option<u32>,
+    ) -> Bytes {
         let payload = encode_test_fmp4_slot(init, media);
         let key = media_object::ObjectKey::for_payload(
             "default",
@@ -12047,12 +12270,14 @@ mod tests {
             &payload,
         )
         .unwrap();
-        let object = MediaObject::builder(key, ObjectKind::Media, payload.to_vec())
+        let mut builder = MediaObject::builder(key, ObjectKind::Media, payload.to_vec())
             .with_keyframe(true)
             .with_metadata("container", b"fmp4".to_vec())
-            .with_metadata("payload-format", b"fmp4-slot-v1".to_vec())
-            .build()
-            .unwrap();
+            .with_metadata("payload-format", b"fmp4-slot-v1".to_vec());
+        if let Some(duration_ms) = duration_ms {
+            builder = builder.with_metadata("duration-ms", duration_ms.to_string().into_bytes());
+        }
+        let object = builder.build().unwrap();
         Bytes::from(media_object::encode(&object).unwrap())
     }
 
@@ -12202,18 +12427,93 @@ mod tests {
         mesh.shutdown();
     }
 
+    #[tokio::test]
+    async fn canonical_fmp4_playlist_uses_observed_media_durations() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(5), 2, 6, 64).await;
+        cache
+            .commit_stream_payload(
+                77,
+                encode_test_canonical_fmp4_bundle_with_duration(
+                    77,
+                    0,
+                    Some(b"ftypmoov"),
+                    b"moofmdat-a",
+                    Some(33),
+                ),
+            )
+            .await
+            .unwrap();
+        cache
+            .commit_stream_payload(
+                77,
+                encode_test_canonical_fmp4_bundle_with_duration(
+                    77,
+                    1,
+                    None,
+                    b"moofmdat-b",
+                    Some(34),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let playlist = cache.playlist_for_stream_id(77).await;
+        assert!(playlist.contains("#EXT-X-PART-INF:PART-TARGET=0.034"));
+        assert!(playlist.contains("#EXT-X-PART:DURATION=0.033,URI=\"part0.mp4\""));
+        assert!(playlist.contains("#EXT-X-PART:DURATION=0.034,URI=\"part1.mp4\""));
+        assert!(playlist.contains("#EXTINF:0.067,"));
+        assert_eq!(
+            cache.state.read().await.last_committed_duration_ms,
+            Some(34)
+        );
+    }
+
+    #[tokio::test]
+    async fn playlist_target_duration_uses_complete_segment_duration() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(5), 2, 6, 64).await;
+        for (sequence, duration_ms) in [(0, 1_100), (1, 100)] {
+            cache
+                .commit_stream_payload(
+                    77,
+                    encode_test_canonical_fmp4_bundle_with_duration(
+                        77,
+                        sequence,
+                        (sequence == 0).then_some(b"ftypmoov".as_slice()),
+                        b"moofmdat",
+                        Some(duration_ms),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+
+        let playlist = cache.playlist_for_stream_id(77).await;
+        assert!(playlist.contains("#EXT-X-PART-INF:PART-TARGET=1.100"));
+        assert!(playlist.contains("#EXT-X-TARGETDURATION:2\n"));
+        assert!(playlist.contains("#EXTINF:1.200,"));
+        assert!(!playlist.contains("#EXT-X-TARGETDURATION:3\n"));
+    }
+
     #[test]
     fn retained_part_index_is_bounded_per_stream() {
         let mut state = LiveState::new();
         for sequence in 0..8 {
-            state.record_part_available(1, sequence, 10 + sequence as usize, 1_000 + sequence, 4);
+            state.record_part_available(
+                1,
+                sequence,
+                10 + sequence as usize,
+                1_000 + sequence,
+                Some(33),
+                4,
+            );
         }
-        state.record_part_available(2, 0, 55, 2_000, 4);
-        state.record_part_available(1, 7, 999, 9_999, 4);
+        state.record_part_available(2, 0, 55, 2_000, None, 4);
+        state.record_part_available(1, 7, 999, 9_999, Some(99), 4);
 
         let first = state.stream_parts.get(&1).unwrap();
         assert_eq!(first.keys().copied().collect::<Vec<_>>(), vec![4, 5, 6, 7]);
         assert_eq!(first.get(&7).unwrap().available_unix_us, 1_007);
+        assert_eq!(first.get(&7).unwrap().duration_ms, Some(33));
         assert_eq!(state.stream_retained_bytes.get(&1), Some(&62));
         assert_eq!(state.stream_retained_bytes.get(&2), Some(&55));
         assert_eq!(state.retained_stream_summaries()[&1].retained_parts, 4);
@@ -14604,6 +14904,7 @@ mod tests {
         let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
 
         assert!(router.is_streaming(MESH_EVENTS_PATH));
+        assert!(router.is_streaming(LLHLS_TAIL_BUNDLE_STREAM_PATH));
 
         let response = router.mesh_protocol_response_from_bytes(b"snapshot").await;
         assert!(response.ok);
@@ -16300,6 +16601,21 @@ mod tests {
         assert_eq!(entries[1].end_sequence, 0);
         assert_eq!(entries[1].payload, Bytes::from_static(b"opaque-track-b"));
         assert!(entries[1].available_unix_us.is_some());
+
+        let compact = router
+            .route(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/live/tail-bundle?streams=77,78&from=0&parts=1&compact=1")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(compact.status, StatusCode::OK);
+        assert_eq!(compact.headers.len(), 1);
+        assert_eq!(compact.headers[0].0, "cache-control");
+        assert_eq!(decode_tail_bundle(compact.body.unwrap()).unwrap().len(), 2);
         mesh.shutdown();
     }
 
