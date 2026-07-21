@@ -68,7 +68,7 @@ struct Args {
     tls_key: Option<PathBuf>,
     #[arg(long)]
     tls_ca: Option<PathBuf>,
-    #[arg(long, default_value = "local.bitneedle.com")]
+    #[arg(long, default_value = "local.infidelity.io")]
     server_name: String,
     #[arg(long, default_value_t = DEFAULT_PCM_PART_BYTES)]
     response_bytes: usize,

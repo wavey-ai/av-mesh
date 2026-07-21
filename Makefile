@@ -6,7 +6,7 @@ NEEDLETAIL_ROOT ?= ../needletail
 MISSION_CONTROL_DIST ?= $(abspath $(NEEDLETAIL_ROOT)/mission-control/dist)
 
 RUST_LOG ?= info
-HOST ?= local.bitneedle.com
+HOST ?= local.infidelity.io
 STREAM_ID ?= 1
 PART_MS ?= 50
 
@@ -43,7 +43,7 @@ help:
 	@printf '%s\n' '  make k3d-down         Delete the local k3d mesh cluster'
 	@printf '%s\n' '  make test              Run cargo test --locked'
 	@printf '%s\n' ''
-	@printf '%s\n' 'Common overrides: STREAM_ID=1 PART_MS=50 RUST_LOG=info HOST=local.bitneedle.com'
+	@printf '%s\n' 'Common overrides: STREAM_ID=1 PART_MS=50 RUST_LOG=info HOST=local.infidelity.io'
 
 service:
 	AV_LL_HLS_PART_MS=$(PART_MS) RUST_LOG=$(RUST_LOG) NEEDLETAIL_MISSION_CONTROL_DIST=$(MISSION_CONTROL_DIST) \

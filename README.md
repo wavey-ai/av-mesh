@@ -11,7 +11,7 @@ artifacts or other stream-addressed slots from any region.
 RaptorQ-FEC is the mesh transport. Cache synchronization inside the mesh moves
 opaque stream bytes over the Wavey RaptorQ datagram protocol.
 Contributor-facing RIST, SRT, and RTMP input belongs in `../av-contrib`. That
-service terminates the protocols and packages OBS-style media as fMP4/CMAF
+service terminates the protocols and packages sender-agnostic media as fMP4/CMAF
 LL-HLS artifacts. It publishes only stream-addressed artifact bytes into the
 mesh FEC socket.
 
@@ -36,7 +36,7 @@ The first implementation keeps the mesh transport intentionally small:
 - Optional `private-subnet-discovery` support can add mesh peers discovered on a
   10.x private subnet by the existing `discovery` crate's VLAN broadcast path.
   `linode-private-discovery` is an alias for the same generic feature. Use this
-  alias for Linode VLAN deployments that the sibling `linode` project provides.
+  alias for Linode VLAN deployments. The `linode` crate provides the required API.
 - Playlist reads and warm-stream controls send mesh replica requests, so a node
   with local demand can ask peers for a stream immediately.
 - Replica requests begin at the earliest missing retained slot for the requested
@@ -59,10 +59,10 @@ The first implementation keeps the mesh transport intentionally small:
   `--edge-webtransport` when a client specifically needs them.
 - `message-packetizer` remains available for bounded UDP-style announcements
   operator commands use `AVMC` over TCP changes.
-- Contributor ingest through `../av-contrib` supports arbitrary non-OBS byte
+- Contributor ingest through `../av-contrib` supports arbitrary byte
   streams via `POST`/`PUT /ingest?stream_id=...`, pure-Rust RIST MPEG-TS, SRT
   MPEG-TS, RTMP/FLV, and HTTP `POST`/`PUT /media/access-unit` non-TS media
-  access units. The service boxes OBS-style inputs into fMP4/CMAF before they
+  access units. The service boxes protocol inputs into fMP4/CMAF before they
   enter the mesh. Raw RIST, SRT, RTMP, and MPEG-TS payloads stay outside the mesh
   boundary.
 - The sibling `../av-contrib` project is the contributor-facing repo boundary.
@@ -73,6 +73,10 @@ The first implementation keeps the mesh transport intentionally small:
   supervisor. The dashboard presents service and feed health, compiled delivery
   programs, and independent source and repair lanes. It also presents RaptorQ
   recovery, deadline health, publication continuity, and realtime latency.
+- `/<stream-id>` serves the Needletail player bundle supplied through
+  `NEEDLETAIL_PLAYER_DIST`. Player assets and LL-HLS media remain same-origin.
+  The player selects native HLS when available. It also includes HLS.js for
+  conformance and fallback tests.
 - Optional `--telemetry-bind` publishes JSON mesh snapshots to a TCP changes feed
   with the `AVMT` tag for central aggregation without scraping stdout. Snapshots
   include the node's mesh socket address so `/api/mesh` can resolve peer
@@ -105,8 +109,8 @@ The first implementation keeps the mesh transport intentionally small:
   off to an operator-provided shell command. The command receives
   `AV_MESH_PROVISION_NODE_ID`, `AV_MESH_PROVISION_REGION`,
   `AV_MESH_LOCAL_NODE_ID`, `AV_MESH_LOCAL_REGION`, and `AV_MESH_CONTROL_ID`.
-- With `--features linode-provisioner`, `--linode-provision` uses the sibling
-  `../linode` crate to create a node, attach it to the region VLAN with a
+- With `--features linode-provisioner`, `--linode-provision` uses the `linode`
+  crate to create a node. It attaches the node to the region VLAN with a
   `10.0.0.x/24` private address, reboot it, and update DNS. Use
   `--linode-region-map mesh-region=linode-region` for mesh names such as
   `uk=gb-lon`. `linode-private-discovery` enables this provisioner together
@@ -323,6 +327,7 @@ Then read either region:
 - UK LLHLS tail for playlist/stream id 1:
   `https://127.0.0.1:9444/live/1/tail?mode=part`
 - UK mesh UI: `https://127.0.0.1:9444/mesh`
+- UK player: `https://127.0.0.1:9444/1`
 - US default playlist: `https://127.0.0.1:9445/live/stream.m3u8`
 - US stream-specific playlist for playlist/stream id 1:
   `https://127.0.0.1:9445/live/1/stream.m3u8`
@@ -510,11 +515,11 @@ make mission-control-build
 make mission-control-serve
 ```
 
-By default it points at the local OBS stack endpoints:
-`https://local.bitneedle.com:19444/api/mesh` and
-`https://local.bitneedle.com:19443/api/status`.
+By default it points at the local stack endpoints:
+`https://local.infidelity.io:19444/api/mesh` and
+`https://local.infidelity.io:19443/api/status`.
 
-For local OBS testing with both playback edges and the contributor ingress under
+For local live-ingest testing with both playback edges and the contributor ingress under
 one Rust supervisor, use Needletail:
 
 ```bash
@@ -523,17 +528,18 @@ make local-stack
 
 The supervisor builds release `av-mesh`, release `../av-contrib`, and
 Needletail Operations. It passes the product assets to each playback edge with
-`NEEDLETAIL_MISSION_CONTROL_DIST`. It uses the local bitneedle TLS material from
-`../tls/local.bitneedle.com`. It starts UK and US mesh nodes and one `av-contrib`
+`NEEDLETAIL_MISSION_CONTROL_DIST`. It uses the Infidelity wildcard TLS material from
+`../tls/local.infidelity.io`. It starts UK and US mesh nodes and one `av-contrib`
 ingress. It prefixes each child process output line with its source.
 
 By default, it uses stream ID `1`, UK egress
-`https://local.bitneedle.com:19444/live/1/stream.m3u8`, US egress
-`https://local.bitneedle.com:19445/live/1/stream.m3u8`, and Operations at
-`/mesh` on both ports. OBS can publish RTMP to server
-`rtmp://local.bitneedle.com:19350/live` with stream key `obs-local`, or SRT to
-`srt://local.bitneedle.com:27001?mode=caller`. RIST is also bound on
-`local.bitneedle.com:27000` with main profile and flow id `0x11223344`. The
+`https://local.infidelity.io:19444/live/1/stream.m3u8`, US egress
+`https://local.infidelity.io:19445/live/1/stream.m3u8`, and Operations at
+`/mesh` on both ports. Any compatible sender can publish SRT to
+`srt://local.infidelity.io:27001?mode=caller` or RIST to
+`local.infidelity.io:27000` with main profile and flow id `0x11223344`. RTMP
+compatibility remains available at `rtmp://local.infidelity.io:19350/live` with
+stream key `live-local`. The
 supervisor defaults the LL-HLS part target to 50 ms, accepts
 `AV_LL_HLS_PART_MS` or `--part-ms` overrides, and shells out to `curl` for local
 health checks.
@@ -544,11 +550,11 @@ Useful overrides:
 PART_MS=67 \
 RUST_LOG=av_mesh=trace,av_contrib=trace,rtmp_ingress=debug \
   STACK_ARGS="--rtmp-bind 127.0.0.1:19351 --srt-bind 127.0.0.1:27011" \
-  make local-stack STREAM_ID=4294967351 HOST=local.bitneedle.com
+  make local-stack STREAM_ID=4294967351 HOST=local.infidelity.io
 ```
 
 Use `--cert` and `--key` to point at alternate PEM files. The default hostname
-must resolve to loopback. On this machine `local.bitneedle.com` resolves to
+must resolve to loopback. On this machine `local.infidelity.io` resolves to
 `127.0.0.1` and `::1`.
 
 Use `--mission-control-dist /path/to/dist` to reuse specific product assets.
@@ -643,3 +649,7 @@ proves the shared-cache behavior needed by the requested mesh:
 
 Next, harden the bootstrap image path. Remove the remaining contributor-ingest
 smoke paths from `av-mesh` after `av-contrib` owns those fixtures end to end.
+
+## License
+
+av-mesh is available under the [MIT License](LICENSE).

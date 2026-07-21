@@ -16,6 +16,7 @@ use av_mesh::telemetry_fec::{
 };
 use av_mesh::udp_fec::{UdpFecPushOutcome, UdpFecReceiver};
 use bytes::{BufMut, Bytes, BytesMut};
+use chrono::{DateTime, SecondsFormat, Utc};
 use clap::{Parser, ValueEnum};
 use control::{
     packetize_control_message, reassemble_unsigned_control_packets, MeshControlEvent,
@@ -99,6 +100,7 @@ const RELAY_WARM_SOURCE_REPLAY_MAX_BYTES_PER_CHILD: usize = 4 * 1024 * 1024;
 // The reliable subscription/catalog lane will supply this for late joins. The
 // local transition path starts each canonical stream at object zero.
 const PART_WAIT_MS: u64 = 3_000;
+const HLS_PLAYLIST_WAIT_MS: u64 = 3_000;
 const LLHLS_TAIL_WAIT_MS: u64 = 250;
 const MAX_LLHLS_TAIL_PARTS: usize = 200;
 const LLHLS_TAIL_BUNDLE_PATH: &str = "/live/tail-bundle";
@@ -108,6 +110,7 @@ const REPLICA_REQUEST_MIN_INTERVAL_MS: u64 = 1_000;
 const MESH_EVENTS_PATH: &str = "/api/mesh/events";
 const MESH_WEBSOCKET_PATH: &str = "/ws/mesh";
 const MISSION_CONTROL_DIST_ENV: &str = "NEEDLETAIL_MISSION_CONTROL_DIST";
+const PLAYER_DIST_ENV: &str = "NEEDLETAIL_PLAYER_DIST";
 const MESH_METRICS_PATH: &str = "/metrics";
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 const MEDIA_ACCESS_UNIT_CONTENT_TYPE: &str = "application/vnd.wavey.media-access-unit";
@@ -2788,6 +2791,16 @@ fn duration_ms(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+fn hls_target_duration_from_millis(duration_ms: u64) -> u64 {
+    ((duration_ms.saturating_add(500)) / 1_000).max(1)
+}
+
+fn format_hls_program_date_time(unix_us: u64) -> Option<String> {
+    let unix_us = i64::try_from(unix_us).ok()?;
+    DateTime::<Utc>::from_timestamp_micros(unix_us)
+        .map(|value| value.to_rfc3339_opts(SecondsFormat::Millis, true))
+}
+
 fn atomic_saturating_sub(value: &AtomicU64, amount: u64) {
     let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_sub(amount))
@@ -3688,6 +3701,12 @@ struct CachedPlaylist {
     body: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HlsReloadPosition {
+    msn: u64,
+    part: Option<usize>,
+}
+
 struct LiveTsCache {
     chunk_cache: Arc<ChunkCache>,
     stream_id: u64,
@@ -3883,6 +3902,8 @@ impl LiveTsCache {
             part.bytes,
             now_unix_us(),
             u32::try_from(part.duration_ms).ok(),
+            false,
+            false,
             self.window_parts,
         );
         debug!(
@@ -3976,6 +3997,7 @@ impl LiveTsCache {
                 state.stream_latest_canonical_object.remove(&stream_id);
                 state.stream_next_seq.remove(&stream_id);
                 state.stream_parts.remove(&stream_id);
+                state.stream_current_fmp4_segment.remove(&stream_id);
                 state.stream_retained_bytes.remove(&stream_id);
                 state.stream_max_part_duration_ms.remove(&stream_id);
                 state.stream_max_segment_duration_ms.remove(&stream_id);
@@ -4114,6 +4136,8 @@ impl LiveTsCache {
                 bytes,
                 now_unix_us(),
                 media_duration_ms,
+                object.is_keyframe(),
+                media_kind == LiveMediaKind::Fmp4,
                 self.window_parts,
             );
             debug!(
@@ -4173,6 +4197,8 @@ impl LiveTsCache {
             bytes,
             now_unix_us(),
             None,
+            false,
+            false,
             self.window_parts,
         );
         debug!(
@@ -4403,9 +4429,15 @@ impl LiveTsCache {
         } else {
             None
         };
+        if media_kind == LiveMediaKind::Fmp4 && init.is_none() {
+            warn!(
+                stream_id,
+                "suppressing fMP4 live playlist until init segment is available"
+            );
+            let playlist = self.waiting_playlist(false);
+            return self.cache_playlist(stream_id, stream_idx, version, playlist);
+        }
 
-        let first_available = *available.first().unwrap();
-        let media_sequence = first_available / self.parts_per_segment as u64;
         let next_part = available.last().copied().unwrap_or(0) + 1;
         let nominal_part_duration_ms =
             self.part_target.as_millis().clamp(1, u32::MAX as u128) as u32;
@@ -4425,27 +4457,84 @@ impl LiveTsCache {
                         .and_then(|parts| parts.get(&sequence))
                         .and_then(|part| part.duration_ms)
                         .unwrap_or(nominal_part_duration_ms);
-                    (sequence, duration_ms)
+                    let keyframe = observations
+                        .and_then(|parts| parts.get(&sequence))
+                        .is_some_and(|part| part.keyframe);
+                    let fmp4_segment_id = observations
+                        .and_then(|parts| parts.get(&sequence))
+                        .and_then(|part| part.fmp4_segment_id);
+                    let available_unix_us = observations
+                        .and_then(|parts| parts.get(&sequence))
+                        .map(|part| part.available_unix_us)
+                        .unwrap_or_default();
+                    (
+                        sequence,
+                        duration_ms,
+                        keyframe,
+                        fmp4_segment_id,
+                        available_unix_us,
+                    )
                 })
                 .collect::<Vec<_>>();
             (part_target_ms, available)
         };
         let part_target = f64::from(part_target_ms) / 1_000.0;
 
-        let mut groups: BTreeMap<u64, Vec<(u64, u32)>> = BTreeMap::new();
-        for (seq, duration_ms) in available {
-            groups
-                .entry(seq / self.parts_per_segment as u64)
-                .or_default()
-                .push((seq, duration_ms));
+        let keyframe_aligned_segments = media_kind == LiveMediaKind::Fmp4
+            && available.iter().any(
+                |(_sequence, _duration_ms, _keyframe, segment_id, _available_unix_us)| {
+                    segment_id.is_some()
+                },
+            );
+        let mut groups: BTreeMap<u64, Vec<(u64, u32, bool, u64)>> = BTreeMap::new();
+        for (seq, duration_ms, keyframe, fmp4_segment_id, available_unix_us) in available {
+            let segment_id = if keyframe_aligned_segments {
+                let Some(segment_id) = fmp4_segment_id else {
+                    continue;
+                };
+                segment_id
+            } else {
+                seq / self.parts_per_segment as u64
+            };
+            groups.entry(segment_id).or_default().push((
+                seq,
+                duration_ms,
+                keyframe,
+                available_unix_us,
+            ));
         }
+        if keyframe_aligned_segments {
+            // A retained window can begin halfway through a GOP. Do not
+            // advertise that truncated parent as a playable HLS segment.
+            groups.retain(|_segment_id, group| {
+                group.first().is_some_and(
+                    |(_sequence, _duration_ms, keyframe, _available_unix_us)| *keyframe,
+                )
+            });
+        }
+        let open_segment_id = keyframe_aligned_segments
+            .then(|| {
+                groups
+                    .last_key_value()
+                    .map(|(segment_id, _group)| *segment_id)
+            })
+            .flatten();
+        let segment_is_complete = |segment_id: u64, group_len: usize| {
+            if keyframe_aligned_segments {
+                Some(segment_id) != open_segment_id
+            } else {
+                group_len == self.parts_per_segment
+            }
+        };
         let observed_segment_duration_ms = groups
-            .values()
-            .filter(|group| group.len() == self.parts_per_segment)
-            .map(|group| {
+            .iter()
+            .filter(|(segment_id, group)| segment_is_complete(**segment_id, group.len()))
+            .map(|(_segment_id, group)| {
                 group
                     .iter()
-                    .map(|(_sequence, duration_ms)| u64::from(*duration_ms))
+                    .map(|(_sequence, duration_ms, _keyframe, _available_unix_us)| {
+                        u64::from(*duration_ms)
+                    })
                     .sum::<u64>()
             })
             .max();
@@ -4469,14 +4558,17 @@ impl LiveTsCache {
                 .unwrap_or(fallback_segment_duration_ms)
                 .max(fallback_segment_duration_ms)
         };
-        let segment_target = segment_target_ms as f64 / 1_000.0;
-        let target_duration = segment_target.ceil().max(1.0) as u64;
+        let target_duration = hls_target_duration_from_millis(segment_target_ms);
 
         let mut out = String::new();
         out.push_str("#EXTM3U\n");
         out.push_str("#EXT-X-VERSION:9\n");
         out.push_str(&format!("#EXT-X-TARGETDURATION:{target_duration}\n"));
+        let media_sequence = groups.keys().next().copied().unwrap_or(0);
         out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{media_sequence}\n"));
+        if keyframe_aligned_segments {
+            out.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
+        }
         if media_kind == LiveMediaKind::Fmp4 {
             if init.is_some() {
                 out.push_str("#EXT-X-MAP:URI=\"init.mp4\"\n");
@@ -4491,20 +4583,37 @@ impl LiveTsCache {
         out.push_str(&format!(
             "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={:.3},HOLD-BACK={:.3}\n",
             part_target * 3.0,
-            (segment_target * 2.0).max(3.0)
+            (target_duration as f64 * 3.0).max(3.0)
         ));
+        let program_date_time = groups
+            .values()
+            .next()
+            .and_then(|group| group.first())
+            .and_then(|(_sequence, duration_ms, _keyframe, available_unix_us)| {
+                let start_unix_us =
+                    available_unix_us.saturating_sub(u64::from(*duration_ms).saturating_mul(1_000));
+                format_hls_program_date_time(start_unix_us)
+            });
+        if let Some(program_date_time) = program_date_time {
+            out.push_str(&format!("#EXT-X-PROGRAM-DATE-TIME:{program_date_time}\n"));
+        }
 
         let extension = media_kind.extension();
         for (segment, group) in groups {
             let mut duration = 0.0;
-            for (seq, duration_ms) in &group {
+            for (seq, duration_ms, keyframe, _available_unix_us) in &group {
                 let part_duration = f64::from(*duration_ms) / 1_000.0;
                 duration += part_duration;
+                let independent = if *keyframe && media_kind == LiveMediaKind::Fmp4 {
+                    ",INDEPENDENT=YES"
+                } else {
+                    ""
+                };
                 out.push_str(&format!(
-                    "#EXT-X-PART:DURATION={part_duration:.3},URI=\"part{seq}.{extension}\"\n"
+                    "#EXT-X-PART:DURATION={part_duration:.3},URI=\"part{seq}.{extension}\"{independent}\n"
                 ));
             }
-            if group.len() == self.parts_per_segment {
+            if segment_is_complete(segment, group.len()) {
                 out.push_str(&format!("#EXTINF:{duration:.3},\n"));
                 out.push_str(&format!("seg{segment}.{extension}\n"));
             }
@@ -4553,17 +4662,39 @@ impl LiveTsCache {
         include_map: bool,
     ) -> String {
         let part_target = self.part_target.as_secs_f64();
-        let target_duration = (part_target * self.parts_per_segment as f64)
-            .ceil()
-            .max(1.0) as u64;
+        let target_duration = hls_target_duration_from_millis(
+            (self.part_target.as_millis() as u64) * self.parts_per_segment as u64,
+        );
         let extension = media_kind.extension();
         let map = if include_map {
             "#EXT-X-MAP:URI=\"init.mp4\"\n"
         } else {
             ""
         };
+        let preload_hint = if media_kind == LiveMediaKind::Fmp4 && !include_map {
+            String::new()
+        } else {
+            format!("#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part{next_part}.{extension}\"\n")
+        };
         format!(
-            "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:0\n{map}#EXT-X-PART-INF:PART-TARGET={part_target:.3}\n#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={:.3},HOLD-BACK={:.3}\n#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part{next_part}.{extension}\"\n",
+            "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:0\n{map}#EXT-X-PART-INF:PART-TARGET={part_target:.3}\n#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={:.3},HOLD-BACK={:.3}\n{preload_hint}",
+            part_target * 3.0,
+            (part_target * self.parts_per_segment as f64 * 2.0).max(3.0)
+        )
+    }
+
+    fn waiting_playlist(&self, include_map: bool) -> String {
+        let part_target = self.part_target.as_secs_f64();
+        let target_duration = hls_target_duration_from_millis(
+            (self.part_target.as_millis() as u64) * self.parts_per_segment as u64,
+        );
+        let map = if include_map {
+            "#EXT-X-MAP:URI=\"init.mp4\"\n"
+        } else {
+            ""
+        };
+        format!(
+            "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:0\n{map}#EXT-X-PART-INF:PART-TARGET={part_target:.3}\n#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={:.3},HOLD-BACK={:.3}\n",
             part_target * 3.0,
             (part_target * self.parts_per_segment as f64 * 2.0).max(3.0)
         )
@@ -4740,6 +4871,72 @@ impl LiveTsCache {
             {
                 return None;
             }
+        }
+    }
+
+    async fn wait_for_hls_reload_position(
+        &self,
+        stream_id: u64,
+        position: HlsReloadPosition,
+    ) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(HLS_PLAYLIST_WAIT_MS);
+        let mut updates = self.part_updates.subscribe();
+        loop {
+            if self
+                .hls_reload_position_available(stream_id, position)
+                .await
+            {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero()
+                || tokio::time::timeout(remaining, updates.changed())
+                    .await
+                    .is_err()
+            {
+                return false;
+            }
+        }
+    }
+
+    async fn hls_reload_position_available(
+        &self,
+        stream_id: u64,
+        position: HlsReloadPosition,
+    ) -> bool {
+        let state = self.state.read().await;
+        let Some(parts) = state.stream_parts.get(&stream_id) else {
+            return false;
+        };
+        let keyframe_segments = parts.values().any(|part| part.fmp4_segment_id.is_some());
+        let mut segment_parts = BTreeMap::<u64, usize>::new();
+        for (sequence, observation) in parts {
+            let segment = if keyframe_segments {
+                let Some(segment) = observation.fmp4_segment_id else {
+                    continue;
+                };
+                segment
+            } else {
+                sequence / self.parts_per_segment as u64
+            };
+            *segment_parts.entry(segment).or_default() += 1;
+        }
+        let Some((&first_segment, _)) = segment_parts.first_key_value() else {
+            return false;
+        };
+        let (&last_segment, _) = segment_parts.last_key_value().unwrap();
+        if position.msn < first_segment || position.msn < last_segment {
+            return true;
+        }
+        let Some(part_count) = segment_parts.get(&position.msn).copied() else {
+            return false;
+        };
+        if let Some(part) = position.part {
+            part < part_count
+        } else if keyframe_segments {
+            position.msn < last_segment
+        } else {
+            part_count >= self.parts_per_segment
         }
     }
 
@@ -4951,6 +5148,49 @@ impl LiveTsCache {
     }
 
     async fn get_segment_for_stream_id(&self, stream_id: u64, segment: u64) -> Option<Bytes> {
+        let keyframe_aligned_sequences = {
+            let state = self.state.read().await;
+            match state.stream_parts.get(&stream_id) {
+                Some(parts) if parts.values().any(|part| part.fmp4_segment_id.is_some()) => {
+                    let segment_is_closed = parts.values().any(|part| {
+                        part.fmp4_segment_id
+                            .is_some_and(|segment_id| segment_id > segment)
+                    });
+                    let sequences = parts
+                        .iter()
+                        .filter_map(|(sequence, part)| {
+                            (part.fmp4_segment_id == Some(segment))
+                                .then_some((*sequence, part.keyframe))
+                        })
+                        .collect::<Vec<_>>();
+                    if !segment_is_closed
+                        || !sequences
+                            .first()
+                            .is_some_and(|(_sequence, keyframe)| *keyframe)
+                    {
+                        return None;
+                    }
+                    Some(
+                        sequences
+                            .into_iter()
+                            .map(|(sequence, _keyframe)| sequence)
+                            .collect::<Vec<_>>(),
+                    )
+                }
+                _ => None,
+            }
+        };
+        if let Some(sequences) = keyframe_aligned_sequences {
+            let mut out = Vec::new();
+            for sequence in sequences {
+                let (bytes, _) = self
+                    .get_part_blocking_for_stream_id(stream_id, sequence)
+                    .await?;
+                out.extend_from_slice(&bytes);
+            }
+            return Some(Bytes::from(out));
+        }
+
         let first_part = segment.checked_mul(self.parts_per_segment as u64)?;
         let mut out = Vec::new();
         for offset in 0..self.parts_per_segment {
@@ -5350,6 +5590,8 @@ struct RetainedPartObservation {
     bytes: usize,
     available_unix_us: u64,
     duration_ms: Option<u32>,
+    keyframe: bool,
+    fmp4_segment_id: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -5380,6 +5622,7 @@ struct LiveState {
     stream_latest_canonical_object: HashMap<u64, u64>,
     stream_last_ingest_unix_ms: HashMap<u64, u64>,
     stream_parts: HashMap<u64, BTreeMap<u64, RetainedPartObservation>>,
+    stream_current_fmp4_segment: HashMap<u64, u64>,
     stream_retained_bytes: HashMap<u64, u64>,
     stream_max_part_duration_ms: HashMap<u64, u32>,
     stream_max_segment_duration_ms: HashMap<u64, u64>,
@@ -5410,6 +5653,7 @@ impl LiveState {
             stream_latest_canonical_object: HashMap::new(),
             stream_last_ingest_unix_ms: HashMap::new(),
             stream_parts: HashMap::new(),
+            stream_current_fmp4_segment: HashMap::new(),
             stream_retained_bytes: HashMap::new(),
             stream_max_part_duration_ms: HashMap::new(),
             stream_max_segment_duration_ms: HashMap::new(),
@@ -5437,6 +5681,8 @@ impl LiveState {
         bytes: usize,
         available_unix_us: u64,
         duration_ms: Option<u32>,
+        keyframe: bool,
+        keyframe_segments: bool,
         window_parts: usize,
     ) {
         if let Some(duration_ms) = duration_ms {
@@ -5445,6 +5691,25 @@ impl LiveState {
                 .and_modify(|maximum| *maximum = (*maximum).max(duration_ms))
                 .or_insert(duration_ms);
         }
+        let existing = self
+            .stream_parts
+            .get(&stream_id)
+            .and_then(|parts| parts.get(&sequence))
+            .copied();
+        let fmp4_segment_id = if let Some(existing) = existing {
+            existing.fmp4_segment_id
+        } else if keyframe_segments && keyframe {
+            let segment_id = self
+                .stream_current_fmp4_segment
+                .entry(stream_id)
+                .and_modify(|segment_id| *segment_id = segment_id.saturating_add(1))
+                .or_insert(0);
+            Some(*segment_id)
+        } else if keyframe_segments {
+            self.stream_current_fmp4_segment.get(&stream_id).copied()
+        } else {
+            None
+        };
         let (inserted_bytes, removed_bytes) = {
             let parts = self.stream_parts.entry(stream_id).or_default();
             let inserted_bytes =
@@ -5453,6 +5718,8 @@ impl LiveState {
                         bytes,
                         available_unix_us,
                         duration_ms,
+                        keyframe,
+                        fmp4_segment_id,
                     });
                     bytes as u64
                 } else {
@@ -5512,6 +5779,7 @@ impl LiveState {
         self.stream_latest_canonical_object.remove(&stream_id);
         self.stream_last_ingest_unix_ms.remove(&stream_id);
         self.stream_parts.remove(&stream_id);
+        self.stream_current_fmp4_segment.remove(&stream_id);
         self.stream_retained_bytes.remove(&stream_id);
         self.stream_max_part_duration_ms.remove(&stream_id);
         self.stream_max_segment_duration_ms.remove(&stream_id);
@@ -8691,17 +8959,10 @@ fn derive_mesh_alerts(
                 .map(move |response| (edge, response))
         })
         .max_by_key(|(_, response)| response.unix_ms);
-    if edge_response_errors > 0 {
-        let (node_id, path, status, last_seen) = edge_recent_errors
-            .map(|(edge, response)| {
-                (
-                    Some(edge.node_id.clone()),
-                    response.path.clone(),
-                    response.status,
-                    Some(response.unix_ms),
-                )
-            })
-            .unwrap_or((None, "unknown edge path".into(), 0, Some(now)));
+    if let Some((edge, response)) = edge_recent_errors {
+        let node_id = Some(edge.node_id.clone());
+        let path = response.path.clone();
+        let status = response.status;
         alerts.push(MeshAlert {
             level: if status >= 500 { "error" } else { "warn" },
             code: "edge_response_errors",
@@ -8709,7 +8970,7 @@ fn derive_mesh_alerts(
                 "Edge playback/API paths have returned {edge_response_errors} non-success response(s); latest was HTTP {status} for {path}."
             ),
             count: edge_response_errors,
-            last_seen_unix_ms: last_seen,
+            last_seen_unix_ms: Some(response.unix_ms),
             node_id,
             stream_id_text: None,
         });
@@ -10799,16 +11060,9 @@ impl Router for AppRouter {
         }
 
         match path {
-            "/" => Ok(response(
-                StatusCode::OK,
-                Some(Bytes::from_static(
-                    b"av-mesh playback edge\n\nNeedletail Operations: /mesh\nHLS: /live/stream.m3u8\nHealth: /up\nStats: /api/stats\nMetrics: /metrics\n",
-                )),
-                Some("text/plain; charset=utf-8"),
-            )),
-            "/mesh" => Ok(mission_control_asset_response(path).unwrap_or_else(|| {
-                mission_control_setup_response()
-            })),
+            "/" => Ok(player_asset_response(path).unwrap_or_else(|| player_setup_response())),
+            "/mesh" => Ok(mission_control_asset_response(path)
+                .unwrap_or_else(|| mission_control_setup_response())),
             "/up" => Ok(response(
                 StatusCode::OK,
                 Some(Bytes::from_static(b"OK")),
@@ -10817,6 +11071,11 @@ impl Router for AppRouter {
             "/live/stream.m3u8" => {
                 self.request_replica_for_stream(self.cache.stream_id, "playlist-demand", None)
                     .await;
+                if let Ok(Some(position)) = parse_hls_reload_position(query) {
+                    self.cache
+                        .wait_for_hls_reload_position(self.cache.stream_id, position)
+                        .await;
+                }
                 let playlist = self.cache.playlist().await;
                 let response = response(
                     StatusCode::OK,
@@ -10854,6 +11113,9 @@ impl Router for AppRouter {
             )
             .with_no_store()),
             _ => {
+                if let Some(player_asset) = player_asset_response(path) {
+                    return Ok(player_asset);
+                }
                 if let Some(mission_control_asset) = mission_control_asset_response(path) {
                     return Ok(mission_control_asset);
                 }
@@ -10861,6 +11123,11 @@ impl Router for AppRouter {
                 if let Some(stream_id) = parse_stream_playlist_path(path) {
                     self.request_replica_for_stream(stream_id, "playlist-demand", None)
                         .await;
+                    if let Ok(Some(position)) = parse_hls_reload_position(query) {
+                        self.cache
+                            .wait_for_hls_reload_position(stream_id, position)
+                            .await;
+                    }
                     let playlist = self.cache.playlist_for_stream_id(stream_id).await;
                     let response = response(
                         StatusCode::OK,
@@ -10964,16 +11231,12 @@ impl Router for AppRouter {
                         }
                         .with_no_store()
                     } else {
-                        let mut response = response(
-                            StatusCode::OK,
-                            Some(bytes),
-                            Some(TAIL_BUNDLE_CONTENT_TYPE),
-                        )
-                        .with_no_store();
-                        response.headers.push((
-                            "x-stream-count".into(),
-                            stream_ids.len().to_string().into(),
-                        ));
+                        let mut response =
+                            response(StatusCode::OK, Some(bytes), Some(TAIL_BUNDLE_CONTENT_TYPE))
+                                .with_no_store();
+                        response
+                            .headers
+                            .push(("x-stream-count".into(), stream_ids.len().to_string().into()));
                         response
                             .headers
                             .push(("x-part-count".into(), part_count.to_string().into()));
@@ -10984,7 +11247,10 @@ impl Router for AppRouter {
                         ));
                         response.headers.push((
                             "x-response-duration-ms".into(),
-                            part_duration_ms.saturating_mul(part_count as u128).to_string().into(),
+                            part_duration_ms
+                                .saturating_mul(part_count as u128)
+                                .to_string()
+                                .into(),
                         ));
                         response
                     };
@@ -11039,7 +11305,9 @@ impl Router for AppRouter {
                     else {
                         read.finish(0);
                         let response = response(StatusCode::NO_CONTENT, None, None).with_no_store();
-            return Ok(self.record_edge_response(method, path, query, response, started));
+                        return Ok(
+                            self.record_edge_response(method, path, query, response, started)
+                        );
                     };
                     let bytes_len = bytes.len();
                     let media_kind = self
@@ -11051,27 +11319,22 @@ impl Router for AppRouter {
                         .cache
                         .part_available_unix_us(stream_id, end_sequence)
                         .await;
-                    let mut tail_response = response(
-                        StatusCode::OK,
-                        Some(bytes),
-                        Some(media_kind.content_type()),
-                    )
-                    .with_part_available_unix_us(available_unix_us)
-                    .with_no_store();
+                    let mut tail_response =
+                        response(StatusCode::OK, Some(bytes), Some(media_kind.content_type()))
+                            .with_part_available_unix_us(available_unix_us)
+                            .with_no_store();
                     if let Some(etag) = etag {
                         tail_response = tail_response.with_etag(etag);
                     }
                     tail_response
                         .headers
                         .push(("x-sequence".into(), end_sequence.to_string().into()));
-                    tail_response.headers.push((
-                        "x-sequence-start".into(),
-                        start_sequence.to_string().into(),
-                    ));
-                    tail_response.headers.push((
-                        "x-sequence-end".into(),
-                        end_sequence.to_string().into(),
-                    ));
+                    tail_response
+                        .headers
+                        .push(("x-sequence-start".into(), start_sequence.to_string().into()));
+                    tail_response
+                        .headers
+                        .push(("x-sequence-end".into(), end_sequence.to_string().into()));
                     tail_response
                         .headers
                         .push(("x-part-count".into(), part_count.to_string().into()));
@@ -11082,13 +11345,22 @@ impl Router for AppRouter {
                     ));
                     tail_response.headers.push((
                         "x-response-duration-ms".into(),
-                        part_duration_ms.saturating_mul(part_count as u128).to_string().into(),
+                        part_duration_ms
+                            .saturating_mul(part_count as u128)
+                            .to_string()
+                            .into(),
                     ));
                     tail_response
                         .headers
                         .push(("x-av-stream-id".into(), stream_id.to_string().into()));
                     read.finish(bytes_len);
-                    return Ok(self.record_edge_response(method, path, query, tail_response, started));
+                    return Ok(self.record_edge_response(
+                        method,
+                        path,
+                        query,
+                        tail_response,
+                        started,
+                    ));
                 }
 
                 if let Some(stream_id) = parse_stream_init_path(path) {
@@ -11101,10 +11373,12 @@ impl Router for AppRouter {
                             Some(LiveMediaKind::Fmp4.content_type()),
                         )
                         .with_no_store();
-            return Ok(self.record_edge_response(method, path, query, response, started));
+                        return Ok(
+                            self.record_edge_response(method, path, query, response, started)
+                        );
                     }
                     let response = response(StatusCode::NOT_FOUND, None, None);
-            return Ok(self.record_edge_response(method, path, query, response, started));
+                    return Ok(self.record_edge_response(method, path, query, response, started));
                 }
 
                 if let Some((stream_id, sequence)) = parse_media_unit_path(path) {
@@ -11113,7 +11387,9 @@ impl Router for AppRouter {
                     let Some(unit) = self.cache.get_media_access_unit(stream_id, sequence).await
                     else {
                         let response = response(StatusCode::NOT_FOUND, None, None);
-            return Ok(self.record_edge_response(method, path, query, response, started));
+                        return Ok(
+                            self.record_edge_response(method, path, query, response, started)
+                        );
                     };
                     let mut media_response = response(
                         StatusCode::OK,
@@ -11126,69 +11402,83 @@ impl Router for AppRouter {
                         "x-av-stream-id".into(),
                         unit.metadata.stream_id.to_string().into(),
                     ));
-                    media_response
-                        .headers
-                        .push(("x-av-sequence".into(), unit.metadata.sequence.to_string().into()));
+                    media_response.headers.push((
+                        "x-av-sequence".into(),
+                        unit.metadata.sequence.to_string().into(),
+                    ));
                     media_response
                         .headers
                         .push(("x-av-codec".into(), codec_name(unit.metadata.codec).into()));
-                    media_response
-                        .headers
-                        .push(("x-av-pts-ms".into(), unit.metadata.pts_ms.to_string().into()));
+                    media_response.headers.push((
+                        "x-av-pts-ms".into(),
+                        unit.metadata.pts_ms.to_string().into(),
+                    ));
                     media_response.headers.push((
                         "x-av-duration-ms".into(),
                         unit.metadata.duration_ms.to_string().into(),
                     ));
-                    media_response
-                        .headers
-                        .push(("x-av-flags".into(), unit.metadata.flags.bits().to_string().into()));
-                    return Ok(self.record_edge_response(method, path, query, media_response, started));
+                    media_response.headers.push((
+                        "x-av-flags".into(),
+                        unit.metadata.flags.bits().to_string().into(),
+                    ));
+                    return Ok(self.record_edge_response(
+                        method,
+                        path,
+                        query,
+                        media_response,
+                        started,
+                    ));
                 }
 
                 if let Some((stream_id, seq, requested_kind)) = parse_stream_part_path(path) {
                     self.request_replica_for_stream(stream_id, "playlist-part-demand", None)
                         .await;
-                    if let Some((bytes, hash)) =
-                        self.cache.get_part_blocking_for_stream_id(stream_id, seq).await
+                    if let Some((bytes, hash)) = self
+                        .cache
+                        .get_part_blocking_for_stream_id(stream_id, seq)
+                        .await
                     {
                         let media_kind = self
                             .cache
                             .media_kind_hint(stream_id)
                             .await
                             .unwrap_or(requested_kind);
-                        let available_unix_us = self
-                            .cache
-                            .part_available_unix_us(stream_id, seq)
-                            .await;
+                        let available_unix_us =
+                            self.cache.part_available_unix_us(stream_id, seq).await;
                         let response =
                             response(StatusCode::OK, Some(bytes), Some(media_kind.content_type()))
                                 .with_etag(hash)
                                 .with_part_available_unix_us(available_unix_us);
-            return Ok(self.record_edge_response(method, path, query, response, started));
+                        return Ok(
+                            self.record_edge_response(method, path, query, response, started)
+                        );
                     }
                     let response = response(StatusCode::NOT_FOUND, None, None);
-            return Ok(self.record_edge_response(method, path, query, response, started));
+                    return Ok(self.record_edge_response(method, path, query, response, started));
                 }
 
-                if let Some((stream_id, segment, requested_kind)) = parse_stream_segment_path(path) {
+                if let Some((stream_id, segment, requested_kind)) = parse_stream_segment_path(path)
+                {
                     self.request_replica_for_stream(stream_id, "playlist-segment-demand", None)
                         .await;
-                    if let Some(bytes) = self.cache.get_segment_for_stream_id(stream_id, segment).await
+                    if let Some(bytes) = self
+                        .cache
+                        .get_segment_for_stream_id(stream_id, segment)
+                        .await
                     {
                         let media_kind = self
                             .cache
                             .media_kind_hint(stream_id)
                             .await
                             .unwrap_or(requested_kind);
-                        let response = response(
-                            StatusCode::OK,
-                            Some(bytes),
-                            Some(media_kind.content_type()),
+                        let response =
+                            response(StatusCode::OK, Some(bytes), Some(media_kind.content_type()));
+                        return Ok(
+                            self.record_edge_response(method, path, query, response, started)
                         );
-            return Ok(self.record_edge_response(method, path, query, response, started));
                     }
                     let response = response(StatusCode::NOT_FOUND, None, None);
-            return Ok(self.record_edge_response(method, path, query, response, started));
+                    return Ok(self.record_edge_response(method, path, query, response, started));
                 }
 
                 if parse_init_path(path) {
@@ -11198,7 +11488,10 @@ impl Router for AppRouter {
                         None,
                     )
                     .await;
-                    if let Some(init) = self.cache.get_init_for_stream_id(self.cache.stream_id).await
+                    if let Some(init) = self
+                        .cache
+                        .get_init_for_stream_id(self.cache.stream_id)
+                        .await
                     {
                         let response = response(
                             StatusCode::OK,
@@ -11206,10 +11499,12 @@ impl Router for AppRouter {
                             Some(LiveMediaKind::Fmp4.content_type()),
                         )
                         .with_no_store();
-            return Ok(self.record_edge_response(method, path, query, response, started));
+                        return Ok(
+                            self.record_edge_response(method, path, query, response, started)
+                        );
                     }
                     let response = response(StatusCode::NOT_FOUND, None, None);
-            return Ok(self.record_edge_response(method, path, query, response, started));
+                    return Ok(self.record_edge_response(method, path, query, response, started));
                 }
 
                 if let Some((seq, requested_kind)) = parse_part_path(path) {
@@ -11227,10 +11522,12 @@ impl Router for AppRouter {
                             response(StatusCode::OK, Some(bytes), Some(media_kind.content_type()))
                                 .with_etag(hash)
                                 .with_part_available_unix_us(available_unix_us);
-            return Ok(self.record_edge_response(method, path, query, response, started));
+                        return Ok(
+                            self.record_edge_response(method, path, query, response, started)
+                        );
                     }
                     let response = response(StatusCode::NOT_FOUND, None, None);
-            return Ok(self.record_edge_response(method, path, query, response, started));
+                    return Ok(self.record_edge_response(method, path, query, response, started));
                 }
 
                 if let Some((segment, requested_kind)) = parse_segment_path(path) {
@@ -11240,15 +11537,14 @@ impl Router for AppRouter {
                             .media_kind_hint(self.cache.stream_id)
                             .await
                             .unwrap_or(requested_kind);
-                        let response = response(
-                            StatusCode::OK,
-                            Some(bytes),
-                            Some(media_kind.content_type()),
+                        let response =
+                            response(StatusCode::OK, Some(bytes), Some(media_kind.content_type()));
+                        return Ok(
+                            self.record_edge_response(method, path, query, response, started)
                         );
-            return Ok(self.record_edge_response(method, path, query, response, started));
                     }
                     let response = response(StatusCode::NOT_FOUND, None, None);
-            return Ok(self.record_edge_response(method, path, query, response, started));
+                    return Ok(self.record_edge_response(method, path, query, response, started));
                 }
 
                 let response = response(StatusCode::NOT_FOUND, None, None);
@@ -11759,6 +12055,69 @@ fn mission_control_asset_content_type(path: &str) -> Option<&'static str> {
     }
 }
 
+fn player_asset_response(path: &str) -> Option<HandlerResponse> {
+    let dist_dir = std::env::var_os(PLAYER_DIST_ENV).map(PathBuf::from)?;
+    player_asset_response_from_dir(&dist_dir, path)
+}
+
+fn player_setup_response() -> HandlerResponse {
+    response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        Some(Bytes::from_static(
+            b"Needletail Player setup: configure NEEDLETAIL_PLAYER_DIST with the built asset directory.\n",
+        )),
+        Some("text/plain; charset=utf-8"),
+    )
+    .with_no_store()
+}
+
+fn player_asset_response_from_dir(dist_dir: &Path, path: &str) -> Option<HandlerResponse> {
+    let relative_path = player_asset_relative_path(path)?;
+    let bytes = std::fs::read(dist_dir.join(relative_path)).ok()?;
+    Some(
+        response(
+            StatusCode::OK,
+            Some(Bytes::from(bytes)),
+            player_asset_content_type(relative_path),
+        )
+        .with_no_store(),
+    )
+}
+
+fn player_asset_relative_path(path: &str) -> Option<&str> {
+    match path {
+        "/" => Some("index.html"),
+        "/player.css" => Some("player.css"),
+        "/player.js" => Some("player.js"),
+        "/hls.min.js" => Some("hls.min.js"),
+        "/manifest.webmanifest" => Some("manifest.webmanifest"),
+        _ if parse_player_stream_path(path).is_some() => Some("index.html"),
+        _ => None,
+    }
+}
+
+fn parse_player_stream_path(path: &str) -> Option<u64> {
+    let stream_id = path.strip_prefix('/')?;
+    if stream_id.is_empty() || stream_id.contains('/') {
+        return None;
+    }
+    stream_id.parse().ok()
+}
+
+fn player_asset_content_type(path: &str) -> Option<&'static str> {
+    if path.ends_with(".html") {
+        Some("text/html; charset=utf-8")
+    } else if path.ends_with(".js") {
+        Some("text/javascript; charset=utf-8")
+    } else if path.ends_with(".css") {
+        Some("text/css; charset=utf-8")
+    } else if path.ends_with(".webmanifest") {
+        Some("application/manifest+json")
+    } else {
+        None
+    }
+}
+
 fn stream_id_text(stream_id: u64) -> String {
     stream_id.to_string()
 }
@@ -11867,6 +12226,19 @@ fn query_value<'a>(query: Option<&'a str>, key: &str) -> Option<&'a str> {
 
 fn parse_query_u64(query: Option<&str>, key: &str) -> Option<u64> {
     query_value(query, key)?.parse().ok()
+}
+
+fn parse_hls_reload_position(query: Option<&str>) -> Result<Option<HlsReloadPosition>, ()> {
+    let msn = query_value(query, "_HLS_msn");
+    let part = query_value(query, "_HLS_part");
+    match (msn, part) {
+        (None, None) => Ok(None),
+        (Some(msn), part) => Ok(Some(HlsReloadPosition {
+            msn: msn.parse().map_err(|_| ())?,
+            part: part.map(str::parse).transpose().map_err(|_| ())?,
+        })),
+        (None, Some(_)) => Err(()),
+    }
 }
 
 fn parse_llhls_tail_stream_ids(query: Option<&str>) -> Result<Vec<u64>, ()> {
@@ -12248,7 +12620,9 @@ mod tests {
         init: Option<&[u8]>,
         media: &[u8],
     ) -> Bytes {
-        encode_test_canonical_fmp4_bundle_with_duration(stream_id, sequence, init, media, None)
+        encode_test_canonical_fmp4_bundle_with_duration(
+            stream_id, sequence, init, media, None, true,
+        )
     }
 
     fn encode_test_canonical_fmp4_bundle_with_duration(
@@ -12257,6 +12631,7 @@ mod tests {
         init: Option<&[u8]>,
         media: &[u8],
         duration_ms: Option<u32>,
+        keyframe: bool,
     ) -> Bytes {
         let payload = encode_test_fmp4_slot(init, media);
         let key = media_object::ObjectKey::for_payload(
@@ -12271,7 +12646,7 @@ mod tests {
         )
         .unwrap();
         let mut builder = MediaObject::builder(key, ObjectKind::Media, payload.to_vec())
-            .with_keyframe(true)
+            .with_keyframe(keyframe)
             .with_metadata("container", b"fmp4".to_vec())
             .with_metadata("payload-format", b"fmp4-slot-v1".to_vec());
         if let Some(duration_ms) = duration_ms {
@@ -12317,6 +12692,8 @@ mod tests {
     #[tokio::test]
     async fn playlist_uses_replicated_cache_parts() {
         let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let empty_playlist = cache.playlist().await;
+        assert!(empty_playlist.contains("CAN-BLOCK-RELOAD=YES"));
         cache
             .chunk_cache
             .add_for_stream_id(1, 0, Bytes::from_static(b"part0"))
@@ -12332,6 +12709,7 @@ mod tests {
         assert!(playlist.contains("part0.ts"));
         assert!(playlist.contains("part1.ts"));
         assert!(playlist.contains("seg0.ts"));
+        assert!(playlist.contains("CAN-BLOCK-RELOAD=YES"));
 
         cache
             .chunk_cache
@@ -12341,6 +12719,70 @@ mod tests {
         let playlist = cache.playlist_for_stream_id(77).await;
         assert!(playlist.contains("part0.ts"));
         assert!(playlist.contains("#EXT-X-PRELOAD-HINT"));
+    }
+
+    #[tokio::test]
+    async fn hls_blocking_reload_waits_for_the_requested_part() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(200), 5, 30, 64).await;
+        cache
+            .commit_stream_payload(
+                77,
+                encode_test_canonical_fmp4_bundle_with_duration(
+                    77,
+                    0,
+                    Some(b"ftypmoov"),
+                    b"moofmdat-a",
+                    Some(200),
+                    true,
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(
+            cache
+                .hls_reload_position_available(
+                    77,
+                    HlsReloadPosition {
+                        msn: 0,
+                        part: Some(0),
+                    },
+                )
+                .await
+        );
+
+        let waiting_cache = Arc::clone(&cache);
+        let waiter = tokio::spawn(async move {
+            waiting_cache
+                .wait_for_hls_reload_position(
+                    77,
+                    HlsReloadPosition {
+                        msn: 0,
+                        part: Some(1),
+                    },
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        cache
+            .commit_stream_payload(
+                77,
+                encode_test_canonical_fmp4_bundle_with_duration(
+                    77,
+                    1,
+                    None,
+                    b"moofmdat-b",
+                    Some(200),
+                    false,
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap());
     }
 
     #[tokio::test]
@@ -12381,6 +12823,7 @@ mod tests {
             .unwrap();
 
         let playlist = cache.playlist_for_stream_id(77).await;
+        assert!(playlist.contains("#EXT-X-PROGRAM-DATE-TIME:"));
         assert!(playlist.contains("#EXT-X-MAP:URI=\"init.mp4\""));
         assert!(playlist.contains("part0.mp4"));
         assert!(playlist.contains("part1.mp4"));
@@ -12427,6 +12870,14 @@ mod tests {
         mesh.shutdown();
     }
 
+    #[test]
+    fn hls_program_date_time_uses_utc_milliseconds() {
+        assert_eq!(
+            format_hls_program_date_time(1_234_567),
+            Some("1970-01-01T00:00:01.234Z".to_string())
+        );
+    }
+
     #[tokio::test]
     async fn canonical_fmp4_playlist_uses_observed_media_durations() {
         let cache = LiveTsCache::new(1, Duration::from_millis(5), 2, 6, 64).await;
@@ -12439,6 +12890,7 @@ mod tests {
                     Some(b"ftypmoov"),
                     b"moofmdat-a",
                     Some(33),
+                    true,
                 ),
             )
             .await
@@ -12452,26 +12904,51 @@ mod tests {
                     None,
                     b"moofmdat-b",
                     Some(34),
+                    false,
+                ),
+            )
+            .await
+            .unwrap();
+        cache
+            .commit_stream_payload(
+                77,
+                encode_test_canonical_fmp4_bundle_with_duration(
+                    77,
+                    2,
+                    None,
+                    b"moofmdat-c",
+                    Some(35),
+                    true,
                 ),
             )
             .await
             .unwrap();
 
         let playlist = cache.playlist_for_stream_id(77).await;
-        assert!(playlist.contains("#EXT-X-PART-INF:PART-TARGET=0.034"));
+        assert!(playlist.contains("#EXT-X-PART-INF:PART-TARGET=0.035"));
         assert!(playlist.contains("#EXT-X-PART:DURATION=0.033,URI=\"part0.mp4\""));
         assert!(playlist.contains("#EXT-X-PART:DURATION=0.034,URI=\"part1.mp4\""));
+        assert!(playlist.contains("#EXT-X-PART:DURATION=0.033,URI=\"part0.mp4\",INDEPENDENT=YES"));
+        assert!(playlist.contains("#EXT-X-INDEPENDENT-SEGMENTS"));
         assert!(playlist.contains("#EXTINF:0.067,"));
+        assert!(playlist.contains("seg0.mp4"));
+        assert!(!playlist.contains("seg1.mp4"));
+        assert_eq!(
+            cache.get_segment_for_stream_id(77, 0).await,
+            Some(Bytes::from_static(b"moofmdat-amoofmdat-b"))
+        );
+        assert_eq!(cache.get_segment_for_stream_id(77, 1).await, None);
         assert_eq!(
             cache.state.read().await.last_committed_duration_ms,
-            Some(34)
+            Some(35)
         );
     }
 
     #[tokio::test]
-    async fn playlist_target_duration_uses_complete_segment_duration() {
+    async fn playlist_target_duration_uses_nearest_complete_segment_duration() {
         let cache = LiveTsCache::new(1, Duration::from_millis(5), 2, 6, 64).await;
-        for (sequence, duration_ms) in [(0, 1_100), (1, 100)] {
+        for (sequence, duration_ms, keyframe) in [(0, 1_100, true), (1, 100, false), (2, 100, true)]
+        {
             cache
                 .commit_stream_payload(
                     77,
@@ -12481,6 +12958,7 @@ mod tests {
                         (sequence == 0).then_some(b"ftypmoov".as_slice()),
                         b"moofmdat",
                         Some(duration_ms),
+                        keyframe,
                     ),
                 )
                 .await
@@ -12489,9 +12967,9 @@ mod tests {
 
         let playlist = cache.playlist_for_stream_id(77).await;
         assert!(playlist.contains("#EXT-X-PART-INF:PART-TARGET=1.100"));
-        assert!(playlist.contains("#EXT-X-TARGETDURATION:2\n"));
+        assert!(playlist.contains("#EXT-X-TARGETDURATION:1\n"));
         assert!(playlist.contains("#EXTINF:1.200,"));
-        assert!(!playlist.contains("#EXT-X-TARGETDURATION:3\n"));
+        assert!(!playlist.contains("#EXT-X-TARGETDURATION:2\n"));
     }
 
     #[test]
@@ -12504,16 +12982,20 @@ mod tests {
                 10 + sequence as usize,
                 1_000 + sequence,
                 Some(33),
+                sequence == 5,
+                true,
                 4,
             );
         }
-        state.record_part_available(2, 0, 55, 2_000, None, 4);
-        state.record_part_available(1, 7, 999, 9_999, Some(99), 4);
+        state.record_part_available(2, 0, 55, 2_000, None, false, false, 4);
+        state.record_part_available(1, 7, 999, 9_999, Some(99), true, true, 4);
 
         let first = state.stream_parts.get(&1).unwrap();
         assert_eq!(first.keys().copied().collect::<Vec<_>>(), vec![4, 5, 6, 7]);
         assert_eq!(first.get(&7).unwrap().available_unix_us, 1_007);
         assert_eq!(first.get(&7).unwrap().duration_ms, Some(33));
+        assert!(first.get(&5).unwrap().keyframe);
+        assert_eq!(first.get(&5).unwrap().fmp4_segment_id, Some(0));
         assert_eq!(state.stream_retained_bytes.get(&1), Some(&62));
         assert_eq!(state.stream_retained_bytes.get(&2), Some(&55));
         assert_eq!(state.retained_stream_summaries()[&1].retained_parts, 4);
@@ -12894,6 +13376,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fmp4_playlist_without_init_suppresses_media_fragments() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(50), 2, 6, 64).await;
+        let stream_id = 92;
+        assert!(!cache
+            .empty_playlist(0, LiveMediaKind::Fmp4, false)
+            .contains("#EXT-X-PRELOAD-HINT"));
+        cache
+            .commit_stream_payload(
+                stream_id,
+                encode_test_canonical_fmp4_object(
+                    stream_id,
+                    0,
+                    ObjectKind::Media,
+                    true,
+                    b"moof-mdat-without-init",
+                ),
+            )
+            .await
+            .unwrap();
+
+        let playlist = cache.playlist_for_stream_id(stream_id).await;
+        assert!(playlist.contains("#EXT-X-PART-INF:PART-TARGET=0.050"));
+        assert!(!playlist.contains("#EXT-X-MAP"));
+        assert!(!playlist.contains("part0.mp4"));
+        assert!(!playlist.contains("seg0.mp4"));
+        assert!(!playlist.contains("#EXT-X-PRELOAD-HINT"));
+    }
+
+    #[tokio::test]
     async fn canonical_fmp4_bundle_preserves_init_across_cache_replication() {
         let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
         let stream_id = 88;
@@ -13102,6 +13613,23 @@ mod tests {
             parse_query_u64(Some("mode=part&after=41"), "after"),
             Some(41)
         );
+        assert_eq!(parse_hls_reload_position(None), Ok(None));
+        assert_eq!(
+            parse_hls_reload_position(Some("_HLS_msn=42&_HLS_part=3")),
+            Ok(Some(HlsReloadPosition {
+                msn: 42,
+                part: Some(3),
+            }))
+        );
+        assert_eq!(
+            parse_hls_reload_position(Some("_HLS_msn=42")),
+            Ok(Some(HlsReloadPosition {
+                msn: 42,
+                part: None,
+            }))
+        );
+        assert_eq!(parse_hls_reload_position(Some("_HLS_part=3")), Err(()));
+        assert_eq!(parse_hls_reload_position(Some("_HLS_msn=nope")), Err(()));
         assert_eq!(parse_llhls_tail_part_count(None, 1, 96), Ok(1));
         assert_eq!(parse_llhls_tail_part_count(None, 40, 96), Ok(40));
         assert_eq!(
@@ -13680,6 +14208,10 @@ mod tests {
             draining: false,
         });
         let mut snapshot = TelemetryAggregator::default().snapshot(local).await;
+        assert!(!snapshot
+            .alerts
+            .iter()
+            .any(|alert| alert.code == "edge_response_errors"));
         snapshot.mesh_fec = MeshFecRuntimeSnapshot {
             tx_objects: 8,
             tx_source_datagrams: 16,
@@ -13967,6 +14499,68 @@ mod tests {
         let wasm = mission_control_asset_response_from_dir(&temp_dir, "/app_bg.wasm").unwrap();
         assert_eq!(wasm.content_type.as_deref(), Some("application/wasm"));
         assert!(mission_control_asset_response_from_dir(&temp_dir, "/live/stream.m3u8").is_none());
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn player_setup_response_is_concise_and_actionable() {
+        let response = player_setup_response();
+        assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.content_type.as_deref(),
+            Some("text/plain; charset=utf-8")
+        );
+        let body = String::from_utf8(response.body.unwrap().to_vec()).unwrap();
+        assert_eq!(
+            body,
+            "Needletail Player setup: configure NEEDLETAIL_PLAYER_DIST with the built asset directory.\n"
+        );
+    }
+
+    #[test]
+    fn player_asset_response_is_namespaced_and_bounded() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("needletail-player-dist-test-{}", now_unix_ms()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(
+            temp_dir.join("index.html"),
+            r#"<html><body><script src="./hls.min.js"></script></body></html>"#,
+        )
+        .unwrap();
+        std::fs::write(temp_dir.join("hls.min.js"), "globalThis.Hls = {};").unwrap();
+        std::fs::write(temp_dir.join("player.css"), "body { color: white; }").unwrap();
+        std::fs::write(temp_dir.join("manifest.webmanifest"), "{}").unwrap();
+
+        for path in ["/", "/1", "/18446744073709551615"] {
+            let index = player_asset_response_from_dir(&temp_dir, path).unwrap();
+            assert_eq!(index.status, StatusCode::OK);
+            assert_eq!(
+                index.content_type.as_deref(),
+                Some("text/html; charset=utf-8")
+            );
+            assert!(index
+                .headers
+                .iter()
+                .any(|(name, value)| name == "cache-control" && value.contains("no-store")));
+        }
+
+        let js = player_asset_response_from_dir(&temp_dir, "/hls.min.js").unwrap();
+        assert_eq!(
+            js.content_type.as_deref(),
+            Some("text/javascript; charset=utf-8")
+        );
+        let manifest = player_asset_response_from_dir(&temp_dir, "/manifest.webmanifest").unwrap();
+        assert_eq!(
+            manifest.content_type.as_deref(),
+            Some("application/manifest+json")
+        );
+        assert!(player_asset_response_from_dir(&temp_dir, "/2/player.js").is_none());
+        assert!(player_asset_response_from_dir(&temp_dir, "/../index.html").is_none());
+        assert!(player_asset_response_from_dir(&temp_dir, "/not-a-stream").is_none());
+        assert!(player_asset_response_from_dir(&temp_dir, "/18446744073709551616").is_none());
+        assert!(player_asset_response_from_dir(&temp_dir, "/watch").is_none());
+        assert!(player_asset_response_from_dir(&temp_dir, "/live/stream.m3u8").is_none());
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
