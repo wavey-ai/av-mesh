@@ -33,6 +33,13 @@ The first implementation keeps the mesh transport intentionally small:
   the reusable `raptorq-datagram-fec` crate. Seed peers and private-subnet
   broadcast discovery only bootstrap the peer set. Normal mesh `HELLO` frames
   gossip known peer addresses after that.
+- Cache nodes use `--cache-mesh-role edge|distributor|peer`. An edge is a leaf.
+  It receives from same-region distributors and never forwards cache data.
+  Production cache nodes enable same-region validation for the mesh protocol.
+  Use `--cache-mesh-region` when the cache region differs from telemetry region.
+  `--cache-mesh-max-parents` defaults to 2 and bounds repair requests. A
+  distributor sends objects to at most 8 children by default with
+  `--cache-mesh-max-children`.
 - Optional `private-subnet-discovery` support can add mesh peers discovered on a
   10.x private subnet by the existing `discovery` crate's VLAN broadcast path.
   `linode-private-discovery` is an alias for the same generic feature. Use this
@@ -54,9 +61,9 @@ The first implementation keeps the mesh transport intentionally small:
 - Optional raw TCP accepts the same snapshot/control and serialized media
   access-unit bytes in length-prefixed frames. Completed access units are cached
   as stream slots.
-- WebSocket and WebTransport handlers remain as explicit edge paths only. They
-  are disabled by default. Use `--edge-websocket` or
-  `--edge-webtransport` when a client specifically needs them.
+- HTTP/3, WebSocket, and WebTransport remain explicit edge options.
+  Use `--edge-http3` for HLS over HTTP/3.
+  Use `--edge-websocket` or `--edge-webtransport` for those protocols.
 - `message-packetizer` remains available for bounded UDP-style announcements
   operator commands use `AVMC` over TCP changes.
 - Contributor ingest through `../av-contrib` supports arbitrary byte
@@ -109,6 +116,12 @@ The first implementation keeps the mesh transport intentionally small:
   off to an operator-provided shell command. The command receives
   `AV_MESH_PROVISION_NODE_ID`, `AV_MESH_PROVISION_REGION`,
   `AV_MESH_LOCAL_NODE_ID`, `AV_MESH_LOCAL_REGION`, and `AV_MESH_CONTROL_ID`.
+  `AV_MESH_PROVISION_ACTION` is `provision` or `close`.
+- `--edge-lifecycle` enables demand-based edge provisioning and idle edge
+  draining. The planner samples with the replication interval, defaults to
+  five seconds, keeps one edge per region, and limits a region to four edges.
+  It provisions after sustained reader or egress pressure and closes an idle
+  edge after fifteen minutes.
 - With `--features linode-provisioner`, `--linode-provision` uses the `linode`
   crate to create a node. It attaches the node to the region VLAN with a
   `10.0.0.x/24` private address, reboot it, and update DNS. Use
@@ -139,6 +152,10 @@ The first implementation keeps the mesh transport intentionally small:
   and maximum repair symbols. The default policy has a one-symbol floor and 3%
   proportional repair. It avoids a fixed high redundancy cost for small parts.
   It also protects larger parts from loss of multiple packets.
+- Playback requests can supply a CMCD `sid` value.
+  An overloaded edge continues admitted sessions and rejects new sessions with HTTP 429.
+  The response identifies healthy same-region edges with `Link` and `X-Needletail-Alternate-Edges`.
+  The master playlist also contains duplicate variants for healthy DAG edges.
 - `/api/mesh` also exposes `mesh_fec` runtime outcomes. These outcomes include
   source and repair datagrams, protected and wire bytes, and decoded objects.
   They also include repair recovery, late sources, incomplete or expired
@@ -321,16 +338,18 @@ printf 'h264-access-unit-bytes' | \
 
 Then read either region:
 
-- UK default playlist: `https://127.0.0.1:9444/live/stream.m3u8`
-- UK stream-specific playlist for playlist/stream id 1:
+- UK default master playlist: `https://127.0.0.1:9444/live/master.m3u8`
+- UK stream-specific master playlist for playlist/stream id 1:
+  `https://127.0.0.1:9444/live/1/master.m3u8`
+- UK media playlist for playlist/stream id 1:
   `https://127.0.0.1:9444/live/1/stream.m3u8`
 - UK LLHLS tail for playlist/stream id 1:
   `https://127.0.0.1:9444/live/1/tail?mode=part`
 - UK mesh UI: `https://127.0.0.1:9444/mesh`
 - UK player: `https://127.0.0.1:9444/1`
-- US default playlist: `https://127.0.0.1:9445/live/stream.m3u8`
-- US stream-specific playlist for playlist/stream id 1:
-  `https://127.0.0.1:9445/live/1/stream.m3u8`
+- US default master playlist: `https://127.0.0.1:9445/live/master.m3u8`
+- US stream-specific master playlist for playlist/stream id 1:
+  `https://127.0.0.1:9445/live/1/master.m3u8`
 - Health: `https://127.0.0.1:9444/up`
 - Stats: `https://127.0.0.1:9444/api/stats`
 - Mesh snapshot: `https://127.0.0.1:9444/api/mesh`
@@ -339,6 +358,7 @@ Then read either region:
   `wss://127.0.0.1:9444/ws/mesh`.
 - Edge WebTransport: opt in with `--edge-webtransport`. Media datagrams can be
   raw RQD2 or `raptorq-fec-transport` stream-prefixed RQD2.
+- Edge HTTP/3: opt in with `--edge-http3` for HLS and other HTTP routes.
 - Mesh/control raw TCP: opt in with `--raw-tcp-port <port>`. Each request and
   response is framed as `[u32_be length][payload]`. Payloads can be JSON mesh
   protocol requests or serialized media access units. Add `--raw-tcp-tls` to
@@ -533,8 +553,8 @@ Needletail Operations. It passes the product assets to each playback edge with
 ingress. It prefixes each child process output line with its source.
 
 By default, it uses stream ID `1`, UK egress
-`https://local.infidelity.io:19444/live/1/stream.m3u8`, US egress
-`https://local.infidelity.io:19445/live/1/stream.m3u8`, and Operations at
+`https://local.infidelity.io:19444/live/1/master.m3u8`, US egress
+`https://local.infidelity.io:19445/live/1/master.m3u8`, and Operations at
 `/mesh` on both ports. Any compatible sender can publish SRT to
 `srt://local.infidelity.io:27001?mode=caller` or RIST to
 `local.infidelity.io:27000` with main profile and flow id `0x11223344`. RTMP

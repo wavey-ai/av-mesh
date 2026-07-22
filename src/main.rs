@@ -1,4 +1,6 @@
 mod control;
+mod edge_admission;
+mod edge_lifecycle;
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -23,6 +25,15 @@ use control::{
     MeshControlMessage,
 };
 use dashmap::{mapref::entry::Entry, DashMap};
+use edge_admission::{
+    EdgeAdmission, EdgeAdmissionConfig, EdgeAdmissionSnapshot, PlaybackAdmission,
+    DEFAULT_ADMISSION_PERCENT, DEFAULT_EGRESS_CAPACITY_BPS, DEFAULT_MAX_SESSIONS,
+    DEFAULT_MIN_SUSTAINED_SECONDS, DEFAULT_RECOVERY_PERCENT, DEFAULT_SESSION_IDLE_SECONDS,
+    DEFAULT_WINDOW_SECONDS,
+};
+use edge_lifecycle::{
+    EdgeLifecycleAction, EdgeLifecycleConfig, EdgeLifecycleNode, EdgeLifecyclePlanner,
+};
 use futures_util::{future::join_all, SinkExt, StreamExt};
 use h3_webtransport::server::{AcceptedBi, WebTransportSession};
 use http::{Method, Request, Response, StatusCode};
@@ -31,7 +42,10 @@ use hyper_util::rt::TokioIo;
 use linode::{regions::REGIONS as LINODE_REGIONS, LinodeClient};
 use media_object::{MediaObject, ObjectKind, Stage, WIRE_MAGIC};
 use playlists::chunk_cache::{ChunkCache, PutIfAbsentResult};
-use playlists::mesh::{CacheMesh, CacheMeshConfig, CacheMeshFecStats, CacheMeshHandle};
+use playlists::mesh::{
+    CacheMesh, CacheMeshConfig, CacheMeshFecStats, CacheMeshHandle, CacheMeshRole,
+};
+use playlists::multivariant::{MultivariantPlaylist, VariantStream};
 #[cfg(test)]
 use playlists::tail_bundle::decode_tail_bundle;
 use playlists::tail_bundle::{
@@ -86,6 +100,7 @@ const DEFAULT_MESH_FEC_SYMBOL_SIZE: u16 = 1316;
 const DEFAULT_MESH_SYNC_INTERVAL_MS: u64 = 20;
 const DEFAULT_TELEMETRY_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_TELEMETRY_FEC_RATE_BPS: u64 = 32_000;
+const DEFAULT_HLS_FAILOVER_BANDWIDTH_BPS: u64 = 4_000_000;
 const MAX_TELEMETRY_FEC_TARGETS: usize = 16;
 const DEFAULT_UDP_SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_RELAY_DOWNSTREAM_CHILDREN: usize = 4;
@@ -750,8 +765,20 @@ struct Args {
     #[arg(long)]
     playback_base_url: Option<String>,
 
+    /// Peak bandwidth for each duplicate stream in the failover playlist.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_HLS_FAILOVER_BANDWIDTH_BPS",
+        default_value_t = DEFAULT_HLS_FAILOVER_BANDWIDTH_BPS
+    )]
+    hls_failover_bandwidth_bps: u64,
+
     #[arg(long)]
     edge_websocket: bool,
+
+    /// Enable HTTP/3 for HLS and other HTTP routes.
+    #[arg(long, env = "NEEDLETAIL_EDGE_HTTP3")]
+    edge_http3: bool,
 
     #[arg(long)]
     edge_webtransport: bool,
@@ -791,6 +818,22 @@ struct Args {
     #[arg(long, default_value = "eu")]
     continent: String,
 
+    /// Cache-plane role. Edges receive from regional distributors and do not forward cache data.
+    #[arg(long, value_enum, default_value_t = CacheMeshRoleArg::Edge)]
+    cache_mesh_role: CacheMeshRoleArg,
+
+    /// Optional cache-plane region. This can differ from the telemetry region.
+    #[arg(long, env = "NEEDLETAIL_CACHE_MESH_REGION")]
+    cache_mesh_region: Option<String>,
+
+    /// Maximum regional parent distributors queried by one cache request.
+    #[arg(long, env = "NEEDLETAIL_CACHE_MESH_MAX_PARENTS", default_value_t = 2)]
+    cache_mesh_max_parents: usize,
+
+    /// Maximum child edges served by one distributor sync tick.
+    #[arg(long, env = "NEEDLETAIL_CACHE_MESH_MAX_CHILDREN", default_value_t = 8)]
+    cache_mesh_max_children: usize,
+
     #[arg(long, default_value_t = 51.5074)]
     latitude: f64,
 
@@ -800,8 +843,77 @@ struct Args {
     #[arg(long, default_value_t = 100_000_000_000)]
     storage_bytes: u64,
 
-    #[arg(long, default_value_t = 10_000_000_000)]
+    #[arg(
+        long,
+        env = "NEEDLETAIL_EDGE_EGRESS_CAPACITY_BPS",
+        default_value_t = DEFAULT_EGRESS_CAPACITY_BPS
+    )]
     egress_capacity_bps: u64,
+
+    #[arg(
+        long,
+        env = "NEEDLETAIL_EDGE_EGRESS_ADMISSION_PERCENT",
+        default_value_t = DEFAULT_ADMISSION_PERCENT
+    )]
+    egress_admission_percent: u8,
+
+    #[arg(
+        long,
+        env = "NEEDLETAIL_EDGE_EGRESS_RECOVERY_PERCENT",
+        default_value_t = DEFAULT_RECOVERY_PERCENT
+    )]
+    egress_recovery_percent: u8,
+
+    #[arg(
+        long,
+        env = "NEEDLETAIL_EDGE_EGRESS_WINDOW_SECONDS",
+        default_value_t = DEFAULT_WINDOW_SECONDS
+    )]
+    egress_window_seconds: u64,
+
+    #[arg(
+        long,
+        env = "NEEDLETAIL_EDGE_EGRESS_MIN_SUSTAINED_SECONDS",
+        default_value_t = DEFAULT_MIN_SUSTAINED_SECONDS
+    )]
+    egress_min_sustained_seconds: u64,
+
+    #[arg(
+        long,
+        env = "NEEDLETAIL_EDGE_SESSION_IDLE_SECONDS",
+        default_value_t = DEFAULT_SESSION_IDLE_SECONDS
+    )]
+    egress_session_idle_seconds: u64,
+
+    #[arg(
+        long,
+        env = "NEEDLETAIL_EDGE_MAX_SESSIONS",
+        default_value_t = DEFAULT_MAX_SESSIONS
+    )]
+    egress_max_sessions: usize,
+
+    /// Enable demand-based edge provisioning and idle edge draining.
+    #[arg(long, env = "NEEDLETAIL_EDGE_LIFECYCLE")]
+    edge_lifecycle: bool,
+
+    #[arg(long, env = "NEEDLETAIL_EDGE_MIN_PER_REGION", default_value_t = 1)]
+    edge_min_per_region: usize,
+
+    #[arg(long, env = "NEEDLETAIL_EDGE_MAX_PER_REGION", default_value_t = 4)]
+    edge_max_per_region: usize,
+
+    #[arg(long, env = "NEEDLETAIL_EDGE_SCALE_UP_READERS", default_value_t = 80)]
+    edge_scale_up_readers: u64,
+
+    #[arg(long, env = "NEEDLETAIL_EDGE_IDLE_SECONDS", default_value_t = 900)]
+    edge_idle_seconds: u64,
+
+    #[arg(
+        long,
+        env = "NEEDLETAIL_EDGE_PROVISION_COOLDOWN_SECONDS",
+        default_value_t = 30
+    )]
+    edge_provision_cooldown_seconds: u64,
 
     #[arg(long, default_value_t = 0)]
     baseline_per_region: usize,
@@ -857,7 +969,7 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_TELEMETRY_STALE_MS)]
     telemetry_stale_ms: u64,
 
-    #[arg(long, default_value_t = 1000)]
+    #[arg(long, default_value_t = 5000)]
     replication_plan_interval_ms: u64,
 
     #[arg(long)]
@@ -1068,7 +1180,24 @@ async fn main() -> Result<()> {
         .playback_base_url
         .as_deref()
         .map(normalize_playback_base_url);
-    let edge_load = EdgeLoad::default();
+    let edge_load = EdgeLoad::new(EdgeAdmissionConfig {
+        capacity_bps: args.egress_capacity_bps,
+        admission_percent: args.egress_admission_percent,
+        recovery_percent: args.egress_recovery_percent,
+        window_seconds: args.egress_window_seconds,
+        min_sustained_seconds: args.egress_min_sustained_seconds,
+        session_idle_seconds: args.egress_session_idle_seconds,
+        max_sessions: args.egress_max_sessions,
+    });
+    let edge_lifecycle_config = EdgeLifecycleConfig {
+        enabled: args.edge_lifecycle,
+        min_edges_per_region: args.edge_min_per_region,
+        max_edges_per_region: args.edge_max_per_region,
+        scale_up_active_readers: args.edge_scale_up_readers,
+        idle_seconds: args.edge_idle_seconds,
+        provision_cooldown_seconds: args.edge_provision_cooldown_seconds,
+    }
+    .normalized();
     let provision_executor = {
         let executor = ProvisionExecutor::new(
             args.provision_command.clone(),
@@ -1103,9 +1232,16 @@ async fn main() -> Result<()> {
         max_repair_symbols: args.mesh_max_repair_symbols,
         symbol_size: args.mesh_symbol_size,
     };
-    let mut mesh_config =
-        CacheMeshConfig::new(node_id.clone(), args.region.clone(), args.mesh_bind)
-            .with_peers(mesh_peers);
+    let cache_mesh_region = args
+        .cache_mesh_region
+        .clone()
+        .unwrap_or_else(|| args.region.clone());
+    let mut mesh_config = CacheMeshConfig::new(node_id.clone(), cache_mesh_region, args.mesh_bind)
+        .with_peers(mesh_peers)
+        .with_same_region_only(true)
+        .with_role(args.cache_mesh_role.into())
+        .with_max_parents(args.cache_mesh_max_parents)
+        .with_max_children(args.cache_mesh_max_children);
     mesh_config.sync_interval = Duration::from_millis(args.mesh_sync_interval_ms);
     mesh_config.repair_symbols = args.mesh_repair_symbols;
     mesh_config.repair_ratio = args.mesh_repair_ratio;
@@ -1250,6 +1386,7 @@ async fn main() -> Result<()> {
         audio_epoch_tx.clone(),
         mesh_transport,
         node_profile.clone(),
+        args.cache_mesh_role.into(),
         replication_policy.clone(),
         control_plane.clone(),
         control_dispatch.clone(),
@@ -1257,7 +1394,9 @@ async fn main() -> Result<()> {
         demand_tracker.clone(),
         lifecycle.clone(),
         playback_base_url.clone(),
+        args.hls_failover_bandwidth_bps,
         edge_load.clone(),
+        edge_lifecycle_config,
         provision_executor.clone(),
         telemetry_peer_monitor.clone(),
         telemetry_fec_monitor.clone(),
@@ -1320,7 +1459,7 @@ async fn main() -> Result<()> {
         .with_tls(cert, key)
         .with_port(args.http_port)
         .enable_h2(true)
-        .enable_h3(args.edge_webtransport)
+        .enable_h3(args.edge_http3 || args.edge_webtransport)
         .enable_webtransport(args.edge_webtransport)
         .enable_websocket(args.edge_websocket);
     if let Some(raw_tcp_port) = args.raw_tcp_port {
@@ -1339,17 +1478,20 @@ async fn main() -> Result<()> {
     println!("fec:     udp+fec://{}", args.fec_bind);
     println!("media:   udp+media-fec://{}", args.media_fec_bind);
     println!(
-        "hls:     https://127.0.0.1:{}/live/{}/stream.m3u8",
+        "hls:     https://127.0.0.1:{}/live/{}/master.m3u8",
         args.http_port, args.stream_id
     );
     println!(
-        "hls-default: https://127.0.0.1:{}/live/stream.m3u8",
+        "hls-default: https://127.0.0.1:{}/live/master.m3u8",
         args.http_port
     );
     println!(
         "needletail-operations: https://127.0.0.1:{}/mesh",
         args.http_port
     );
+    if args.edge_http3 || args.edge_webtransport {
+        println!("hls-http3: https://127.0.0.1:{} (HTTP/3)", args.http_port);
+    }
     if args.edge_websocket {
         println!(
             "edge-ws: wss://127.0.0.1:{}{}",
@@ -1456,6 +1598,25 @@ impl Args {
         self.slot_kb = self.slot_kb.max(64);
         self.storage_bytes = self.storage_bytes.max((self.slot_kb as u64) * 1024);
         self.egress_capacity_bps = self.egress_capacity_bps.max(1);
+        self.egress_admission_percent = self.egress_admission_percent.clamp(1, 100);
+        self.egress_recovery_percent = self
+            .egress_recovery_percent
+            .clamp(1, self.egress_admission_percent.saturating_sub(1).max(1));
+        self.egress_window_seconds = self.egress_window_seconds.max(1);
+        self.egress_min_sustained_seconds = self
+            .egress_min_sustained_seconds
+            .clamp(1, self.egress_window_seconds);
+        self.edge_min_per_region = self.edge_min_per_region.max(1);
+        self.edge_max_per_region = self.edge_max_per_region.max(self.edge_min_per_region);
+        self.edge_scale_up_readers = self.edge_scale_up_readers.max(1);
+        self.edge_idle_seconds = self.edge_idle_seconds.max(1);
+        self.edge_provision_cooldown_seconds = self.edge_provision_cooldown_seconds.max(1);
+        self.cache_mesh_region = self
+            .cache_mesh_region
+            .take()
+            .filter(|region| !region.trim().is_empty());
+        self.cache_mesh_max_parents = self.cache_mesh_max_parents.max(1);
+        self.cache_mesh_max_children = self.cache_mesh_max_children.max(1);
         self.mesh_sync_interval_ms = self.mesh_sync_interval_ms.max(1);
         self.mesh_symbol_size = self.mesh_symbol_size.max(1);
         self.mesh_max_repair_symbols = self.mesh_max_repair_symbols.max(self.mesh_repair_symbols);
@@ -1704,6 +1865,32 @@ enum RelayForwardRole {
     All,
     Source,
     Repair,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+enum CacheMeshRoleArg {
+    #[default]
+    Edge,
+    Distributor,
+    Peer,
+}
+
+impl From<CacheMeshRoleArg> for CacheMeshRole {
+    fn from(value: CacheMeshRoleArg) -> Self {
+        match value {
+            CacheMeshRoleArg::Edge => Self::Edge,
+            CacheMeshRoleArg::Distributor => Self::Distributor,
+            CacheMeshRoleArg::Peer => Self::Peer,
+        }
+    }
+}
+
+fn cache_mesh_role_label(role: CacheMeshRole) -> &'static str {
+    match role {
+        CacheMeshRole::Peer => "peer",
+        CacheMeshRole::Distributor => "distributor",
+        CacheMeshRole::Edge => "edge",
+    }
 }
 
 impl RelayForwardRole {
@@ -6493,6 +6680,7 @@ struct TelemetryNodeHealth {
 struct OrchestrationStatus {
     control_dispatch_ready: bool,
     provision: ProvisionStatus,
+    edge_lifecycle: EdgeLifecycleConfig,
     telemetry_peers: Vec<TelemetryPeerStatus>,
     telemetry_fec: TelemetryFecStatus,
     private_discovery: PrivateDiscoveryStatus,
@@ -6641,6 +6829,8 @@ struct EdgeServiceSnapshot {
     node_id: String,
     region: String,
     continent: String,
+    #[serde(default = "default_cache_mesh_role_label")]
+    cache_mesh_role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     playback_base_url: Option<String>,
     active_readers: u64,
@@ -6665,6 +6855,26 @@ struct EdgeServiceSnapshot {
     response_duration_buckets: Vec<u64>,
     #[serde(default)]
     recent_responses: Vec<EdgeResponseSnapshot>,
+    #[serde(default)]
+    egress_capacity_bps: u64,
+    #[serde(default)]
+    egress_observed_bps: u64,
+    #[serde(default)]
+    egress_admission_bps: u64,
+    #[serde(default)]
+    egress_recovery_bps: u64,
+    #[serde(default)]
+    egress_observation_seconds: u64,
+    #[serde(default)]
+    egress_window_seconds: u64,
+    #[serde(default)]
+    egress_overloaded: bool,
+    #[serde(default)]
+    egress_rejected_requests: u64,
+    #[serde(default)]
+    active_playback_sessions: u64,
+    #[serde(default)]
+    admitted_playback_sessions: u64,
     draining: bool,
 }
 
@@ -6672,12 +6882,14 @@ impl EdgeServiceSnapshot {
     fn from_node(
         node: &MeshNode,
         playback_base_url: Option<String>,
+        cache_mesh_role: &str,
         load: EdgeLoadSnapshot,
     ) -> Self {
         Self {
             node_id: node.node_id.clone(),
             region: node.region.clone(),
             continent: node.continent.clone(),
+            cache_mesh_role: cache_mesh_role.to_owned(),
             playback_base_url,
             active_readers: load.active_readers,
             requests_served: load.requests_served,
@@ -6692,13 +6904,27 @@ impl EdgeServiceSnapshot {
             response_duration_p95_us: load.response_duration_p95_us,
             response_duration_buckets: load.response_duration_buckets,
             recent_responses: load.recent_responses,
+            egress_capacity_bps: load.egress.capacity_bps,
+            egress_observed_bps: load.egress.observed_bps,
+            egress_admission_bps: load.egress.admission_bps,
+            egress_recovery_bps: load.egress.recovery_bps,
+            egress_observation_seconds: load.egress.observation_seconds,
+            egress_window_seconds: load.egress.window_seconds,
+            egress_overloaded: load.egress.overloaded,
+            egress_rejected_requests: load.egress.rejected_requests,
+            active_playback_sessions: load.egress.active_sessions,
+            admitted_playback_sessions: load.egress.admitted_sessions,
             draining: node.draining,
         }
     }
 
     fn fallback_for_node(node: &MeshNode) -> Self {
-        Self::from_node(node, None, EdgeLoadSnapshot::default())
+        Self::from_node(node, None, "edge", EdgeLoadSnapshot::default())
     }
+}
+
+fn default_cache_mesh_role_label() -> String {
+    "edge".to_owned()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -6716,6 +6942,7 @@ struct EdgeLoadSnapshot {
     response_duration_p95_us: Option<u64>,
     response_duration_buckets: Vec<u64>,
     recent_responses: Vec<EdgeResponseSnapshot>,
+    egress: EdgeAdmissionSnapshot,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -6733,9 +6960,16 @@ struct EdgeResponseSnapshot {
     content_type: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct EdgeLoad {
     inner: Arc<EdgeLoadInner>,
+    egress: EdgeAdmission,
+}
+
+impl Default for EdgeLoad {
+    fn default() -> Self {
+        Self::new(EdgeAdmissionConfig::default())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -6879,6 +7113,25 @@ fn histogram_percentile_upper_bound_us(
 }
 
 impl EdgeLoad {
+    fn new(config: EdgeAdmissionConfig) -> Self {
+        Self {
+            inner: Arc::new(EdgeLoadInner::default()),
+            egress: EdgeAdmission::new(config),
+        }
+    }
+
+    fn admission_snapshot(&self) -> EdgeAdmissionSnapshot {
+        self.egress.snapshot()
+    }
+
+    fn record_rejection(&self) {
+        self.egress.record_rejection();
+    }
+
+    fn admit_playback(&self, session_id: Option<&str>) -> PlaybackAdmission {
+        self.egress.admit_playback(session_id)
+    }
+
     fn begin_read(&self, llhls_tail: bool) -> EdgeReadGuard {
         self.inner.active_readers.fetch_add(1, Ordering::Relaxed);
         self.inner.requests_served.fetch_add(1, Ordering::Relaxed);
@@ -6890,10 +7143,16 @@ impl EdgeLoad {
         EdgeReadGuard {
             load: self.clone(),
             finished: false,
+            bytes_recorded: 0,
         }
     }
 
-    fn snapshot(&self, node: &MeshNode, playback_base_url: Option<String>) -> EdgeServiceSnapshot {
+    fn snapshot(
+        &self,
+        node: &MeshNode,
+        playback_base_url: Option<String>,
+        cache_mesh_role: &str,
+    ) -> EdgeServiceSnapshot {
         let recent_responses = self
             .inner
             .recent_responses
@@ -6925,6 +7184,7 @@ impl EdgeLoad {
         EdgeServiceSnapshot::from_node(
             node,
             playback_base_url,
+            cache_mesh_role,
             EdgeLoadSnapshot {
                 active_readers: self.inner.active_readers.load(Ordering::Relaxed),
                 requests_served: self.inner.requests_served.load(Ordering::Relaxed),
@@ -6943,6 +7203,7 @@ impl EdgeLoad {
                 response_duration_p95_us,
                 response_duration_buckets,
                 recent_responses,
+                egress: self.admission_snapshot(),
             },
         )
     }
@@ -6962,6 +7223,9 @@ impl EdgeLoad {
             .as_ref()
             .map(|body| body.len() as u64)
             .unwrap_or(0);
+        if method != Method::HEAD {
+            self.egress.record_bytes(bytes as usize);
+        }
         let duration_us = self.inner.response_duration.record(duration);
         self.inner.responses_total.fetch_add(1, Ordering::Relaxed);
         if response.status.is_client_error() || response.status.is_server_error() {
@@ -6996,7 +7260,7 @@ impl EdgeLoad {
                 unix_ms,
                 method: method.as_str().into(),
                 path: path.into(),
-                query: query.map(ToOwned::to_owned),
+                query: sanitized_response_query(query),
                 status,
                 bytes,
                 duration_us,
@@ -7012,15 +7276,26 @@ impl EdgeLoad {
 struct EdgeReadGuard {
     load: EdgeLoad,
     finished: bool,
+    bytes_recorded: usize,
 }
 
 impl EdgeReadGuard {
     fn finish(mut self, bytes_served: usize) {
+        let remaining = bytes_served.saturating_sub(self.bytes_recorded);
         self.load
             .inner
             .bytes_served
-            .fetch_add(bytes_served as u64, Ordering::Relaxed);
+            .fetch_add(remaining as u64, Ordering::Relaxed);
         self.finished = true;
+    }
+
+    fn record_bytes(&mut self, bytes: usize) {
+        self.bytes_recorded = self.bytes_recorded.saturating_add(bytes);
+        self.load
+            .inner
+            .bytes_served
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.load.egress.record_bytes(bytes);
     }
 }
 
@@ -8586,6 +8861,31 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
             "Recorded LL-HLS responses by mesh node and outcome.",
             "counter",
         ),
+        (
+            "av_mesh_edge_egress_bps",
+            "Observed and configured edge egress rates by mesh node.",
+            "gauge",
+        ),
+        (
+            "av_mesh_edge_egress_overloaded",
+            "Whether sustained edge egress is above its admission boundary.",
+            "gauge",
+        ),
+        (
+            "av_mesh_edge_egress_rejections_total",
+            "Playback requests rejected at the sustained egress boundary.",
+            "counter",
+        ),
+        (
+            "av_mesh_edge_playback_sessions",
+            "Playback sessions tracked for edge admission by state.",
+            "gauge",
+        ),
+        (
+            "av_mesh_edge_playback_sessions_admitted_total",
+            "Playback sessions admitted by the edge.",
+            "counter",
+        ),
     ] {
         push_prometheus_metric_header(&mut output, name, help, metric_type);
     }
@@ -8608,6 +8908,32 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
         output.push_str(&format!(
             "av_mesh_edge_llhls_tail_requests_total{{{labels}}} {}\n",
             edge.llhls_tail_requests
+        ));
+        for (kind, value) in [
+            ("observed", edge.egress_observed_bps),
+            ("capacity", edge.egress_capacity_bps),
+            ("admission", edge.egress_admission_bps),
+            ("recovery", edge.egress_recovery_bps),
+        ] {
+            output.push_str(&format!(
+                "av_mesh_edge_egress_bps{{{labels},kind=\"{kind}\"}} {value}\n"
+            ));
+        }
+        output.push_str(&format!(
+            "av_mesh_edge_egress_overloaded{{{labels}}} {}\n",
+            u8::from(edge.egress_overloaded)
+        ));
+        output.push_str(&format!(
+            "av_mesh_edge_egress_rejections_total{{{labels}}} {}\n",
+            edge.egress_rejected_requests
+        ));
+        output.push_str(&format!(
+            "av_mesh_edge_playback_sessions{{{labels},state=\"active\"}} {}\n",
+            edge.active_playback_sessions
+        ));
+        output.push_str(&format!(
+            "av_mesh_edge_playback_sessions_admitted_total{{{labels}}} {}\n",
+            edge.admitted_playback_sessions
         ));
         for (outcome, value) in [
             ("all", edge.responses_total),
@@ -9654,7 +9980,9 @@ impl ProvisionExecutor {
 
         #[cfg(feature = "linode-provisioner")]
         if let Some(config) = &self.linode {
-            let (status, result) = self.run_linode(config, local_node, request).await;
+            let (status, result) = self
+                .run_linode(config, control_id, local_node, request)
+                .await;
             let failed = status.contains(" failed:") || status.contains(" skipped:");
             statuses.push(status);
             linode_result = result;
@@ -9670,6 +9998,7 @@ impl ProvisionExecutor {
                     control_id,
                     local_node,
                     request,
+                    "provision",
                     #[cfg(feature = "linode-provisioner")]
                     linode_result.as_ref(),
                 )
@@ -9684,18 +10013,52 @@ impl ProvisionExecutor {
         statuses.join("; ")
     }
 
+    async fn close(
+        &self,
+        control_id: u64,
+        local_node: &MeshNode,
+        request: &ControlRequest,
+    ) -> String {
+        let mut statuses = Vec::new();
+        #[cfg(feature = "linode-provisioner")]
+        if let Some(config) = &self.linode {
+            statuses.push(self.close_linode(config, local_node, request).await);
+        }
+        if let Some(script) = &self.command {
+            statuses.push(
+                self.run_command(
+                    script,
+                    control_id,
+                    local_node,
+                    request,
+                    "close",
+                    #[cfg(feature = "linode-provisioner")]
+                    None,
+                )
+                .await,
+            );
+        }
+        if statuses.is_empty() {
+            "local close skipped: no provision backend configured".into()
+        } else {
+            statuses.join("; ")
+        }
+    }
+
     async fn run_command(
         &self,
         script: &str,
         control_id: u64,
         local_node: &MeshNode,
         request: &ControlRequest,
+        action: &'static str,
         #[cfg(feature = "linode-provisioner")] linode_result: Option<&linode::ScaleUpResult>,
     ) -> String {
         let mut command = Command::new("sh");
         command
             .arg("-c")
             .arg(script)
+            .env("AV_MESH_PROVISION_ACTION", action)
             .env("AV_MESH_CONTROL_ID", control_id.to_string())
             .env("AV_MESH_LOCAL_NODE_ID", &local_node.node_id)
             .env("AV_MESH_LOCAL_REGION", &local_node.region)
@@ -9733,26 +10096,82 @@ impl ProvisionExecutor {
 
         match tokio::time::timeout(self.timeout, command.output()).await {
             Err(_) => format!(
-                "local provision failed: command timed out after {} ms",
+                "local {action} failed: command timed out after {} ms",
                 self.timeout.as_millis()
             ),
-            Ok(Err(error)) => format!("local provision failed: command spawn failed: {error}"),
+            Ok(Err(error)) => format!("local {action} failed: command spawn failed: {error}"),
             Ok(Ok(output)) if output.status.success() => {
                 let detail = command_output_detail(&output.stdout, &output.stderr);
                 if detail.is_empty() {
-                    format!("local provision executed: {}", output.status)
+                    format!("local {action} executed: {}", output.status)
                 } else {
-                    format!("local provision executed: {}; {detail}", output.status)
+                    format!("local {action} executed: {}; {detail}", output.status)
                 }
             }
             Ok(Ok(output)) => {
                 let detail = command_output_detail(&output.stdout, &output.stderr);
                 if detail.is_empty() {
-                    format!("local provision failed: {}", output.status)
+                    format!("local {action} failed: {}", output.status)
                 } else {
-                    format!("local provision failed: {}; {detail}", output.status)
+                    format!("local {action} failed: {}; {detail}", output.status)
                 }
             }
+        }
+    }
+
+    #[cfg(feature = "linode-provisioner")]
+    async fn close_linode(
+        &self,
+        config: &LinodeProvisionConfig,
+        local_node: &MeshNode,
+        request: &ControlRequest,
+    ) -> String {
+        let requested_region = request.region.as_deref().unwrap_or(&local_node.region);
+        let region_code = config.resolve_region(requested_region);
+        let Some(region_info) = LINODE_REGIONS.get(region_code.as_str()) else {
+            return format!(
+                "local linode close skipped: region {requested_region} resolved to unsupported Linode region {region_code}"
+            );
+        };
+        let token = match std::env::var(&config.token_env) {
+            Ok(value) if !value.trim().is_empty() => value,
+            _ => return format!("local linode close skipped: missing {}", config.token_env),
+        };
+        let pub_key = match std::env::var(&config.pub_key_env) {
+            Ok(value) if !value.trim().is_empty() => value,
+            _ => return format!("local linode close skipped: missing {}", config.pub_key_env),
+        };
+        let client = match LinodeClient::new(token, pub_key) {
+            Ok(client) => client,
+            Err(error) => {
+                return format!("local linode close failed: invalid client config: {error}")
+            }
+        };
+        let Some(node_id) = request
+            .node_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return "local linode close skipped: missing target node id".into();
+        };
+        let label = linode_edge_label(requested_region, node_id);
+        match tokio::time::timeout(
+            self.timeout,
+            client.scale_down_named(config.domain_id, region_info, &config.vlan_tag, &label),
+        )
+        .await
+        {
+            Err(_) => format!(
+                "local linode close failed: timed out after {} ms",
+                self.timeout.as_millis()
+            ),
+            Ok(Err(error)) => format!("local linode close failed: {error}"),
+            Ok(Ok(true)) => format!(
+                "local linode close requested: region={requested_region} node={node_id} label={label}"
+            ),
+            Ok(Ok(false)) => format!(
+                "local linode close skipped: no instance matched region={requested_region} node={node_id} label={label}"
+            ),
         }
     }
 
@@ -9760,6 +10179,7 @@ impl ProvisionExecutor {
     async fn run_linode(
         &self,
         config: &LinodeProvisionConfig,
+        control_id: u64,
         local_node: &MeshNode,
         request: &ControlRequest,
     ) -> (String, Option<linode::ScaleUpResult>) {
@@ -9807,14 +10227,22 @@ impl ProvisionExecutor {
             }
         };
 
+        let requested_node = request
+            .node_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("edge-{control_id}"));
+        let label = linode_edge_label(requested_region, &requested_node);
         match tokio::time::timeout(
             self.timeout,
-            client.scale_up_one(
+            client.scale_up_one_named(
                 &config.image_id,
                 &config.instance_type,
                 config.domain_id,
                 region_info,
                 &config.vlan_tag,
+                Some(&label),
             ),
         )
         .await
@@ -9912,6 +10340,32 @@ fn format_linode_provision_result(
         result.private_ipam_address,
         result.vlan_label
     )
+}
+
+#[cfg(feature = "linode-provisioner")]
+fn linode_edge_label(region: &str, node_id: &str) -> String {
+    let prefix = format!("needletail-{region}-");
+    let mut value = if node_id.starts_with(&prefix) {
+        node_id.to_owned()
+    } else {
+        format!("{prefix}{node_id}")
+    };
+    value = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let mut value = value.trim_matches('-').to_owned();
+    if value.is_empty() {
+        value = "needletail-edge".to_owned();
+    }
+    value.truncate(64);
+    value.trim_matches('-').to_owned()
 }
 
 fn command_output_detail(stdout: &[u8], stderr: &[u8]) -> String {
@@ -10355,6 +10809,7 @@ struct AppRouter {
     audio_epochs: broadcast::Sender<AudioEpochDatagram>,
     mesh_transport: MeshTransportConfigSnapshot,
     node: MeshNode,
+    cache_mesh_role: CacheMeshRole,
     replication_policy: ReplicationPolicy,
     control: ControlPlane,
     dispatch: ControlDispatch,
@@ -10362,7 +10817,10 @@ struct AppRouter {
     demand: DemandTracker,
     lifecycle: NodeLifecycle,
     playback_base_url: Option<String>,
+    hls_failover_bandwidth_bps: u64,
     edge_load: EdgeLoad,
+    edge_lifecycle_config: EdgeLifecycleConfig,
+    edge_lifecycle: Arc<StdMutex<EdgeLifecyclePlanner>>,
     provision: ProvisionExecutor,
     telemetry_peers: TelemetryPeerMonitor,
     telemetry_fec: TelemetryFecMonitor,
@@ -10378,6 +10836,7 @@ impl AppRouter {
         audio_epochs: broadcast::Sender<AudioEpochDatagram>,
         mesh_transport: MeshTransportConfigSnapshot,
         node: MeshNode,
+        cache_mesh_role: CacheMeshRole,
         replication_policy: ReplicationPolicy,
         control: ControlPlane,
         dispatch: ControlDispatch,
@@ -10385,7 +10844,9 @@ impl AppRouter {
         demand: DemandTracker,
         lifecycle: NodeLifecycle,
         playback_base_url: Option<String>,
+        hls_failover_bandwidth_bps: u64,
         edge_load: EdgeLoad,
+        edge_lifecycle_config: EdgeLifecycleConfig,
         provision: ProvisionExecutor,
         telemetry_peers: TelemetryPeerMonitor,
         telemetry_fec: TelemetryFecMonitor,
@@ -10398,6 +10859,7 @@ impl AppRouter {
             audio_epochs,
             mesh_transport,
             node,
+            cache_mesh_role,
             replication_policy,
             control,
             dispatch,
@@ -10405,7 +10867,10 @@ impl AppRouter {
             demand,
             lifecycle,
             playback_base_url,
+            hls_failover_bandwidth_bps: hls_failover_bandwidth_bps.max(1),
             edge_load,
+            edge_lifecycle_config: edge_lifecycle_config.normalized(),
+            edge_lifecycle: Arc::new(StdMutex::new(EdgeLifecyclePlanner::default())),
             provision,
             telemetry_peers,
             telemetry_fec,
@@ -10425,10 +10890,11 @@ impl AppRouter {
                 &self.control,
             )
             .await;
-        snapshot.with_edge_service(
-            self.edge_load
-                .snapshot(&node, self.playback_base_url.clone()),
-        )
+        snapshot.with_edge_service(self.edge_load.snapshot(
+            &node,
+            self.playback_base_url.clone(),
+            cache_mesh_role_label(self.cache_mesh_role),
+        ))
     }
 
     async fn mesh_api_snapshot(&self) -> MeshApiSnapshot {
@@ -10471,10 +10937,91 @@ impl AppRouter {
         response
     }
 
+    async fn playback_admission_response(
+        &self,
+        path: &str,
+        query: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Option<HandlerResponse> {
+        if self.edge_load.admit_playback(session_id) != PlaybackAdmission::Rejected {
+            return None;
+        }
+        let alternatives = self.same_region_alternative_edges(path, query).await;
+        self.edge_load.record_rejection();
+        Some(edge_overloaded_response(&alternatives))
+    }
+
+    async fn same_region_alternative_edges(&self, path: &str, query: Option<&str>) -> Vec<String> {
+        let local = self.local_mesh_snapshot().await;
+        let (snapshots, _) = self.telemetry.snapshots_with_local(local).await;
+        let mut candidates = snapshots
+            .into_iter()
+            .filter(|snapshot| {
+                snapshot.node.node_id != self.node.node_id
+                    && snapshot.node.region == self.node.region
+                    && !snapshot.node.draining
+            })
+            .filter_map(|snapshot| snapshot.edge_service)
+            .filter(|edge| {
+                edge.cache_mesh_role == "edge" && !edge.draining && !edge.egress_overloaded
+            })
+            .filter_map(|edge| {
+                let base_url = edge.playback_base_url.as_deref()?;
+                let url = playback_request_url(base_url, path, query)?;
+                let utilization = if edge.egress_capacity_bps == 0 {
+                    u64::MAX
+                } else {
+                    edge.egress_observed_bps
+                        .saturating_mul(1_000_000)
+                        .saturating_div(edge.egress_capacity_bps)
+                };
+                Some((utilization, edge.active_readers, edge.node_id, url))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+        });
+        let mut seen = HashSet::new();
+        candidates
+            .into_iter()
+            .filter_map(|(_, _, _, url)| seen.insert(url.clone()).then_some(url))
+            .take(8)
+            .collect()
+    }
+
+    async fn hls_failover_playlist_response(&self, media_path: &str) -> HandlerResponse {
+        let overloaded = self.edge_load.admission_snapshot().overloaded;
+        let alternatives = self.same_region_alternative_edges(media_path, None).await;
+        let mut variants = Vec::with_capacity(alternatives.len().saturating_add(1));
+        if !overloaded {
+            if let Ok(variant) = VariantStream::new("stream.m3u8", self.hls_failover_bandwidth_bps)
+            {
+                variants.push(variant);
+            }
+        }
+        variants.extend(alternatives.iter().filter_map(|url| {
+            VariantStream::new(url.clone(), self.hls_failover_bandwidth_bps).ok()
+        }));
+        let Ok(playlist) = MultivariantPlaylist::new(variants) else {
+            self.edge_load.record_rejection();
+            return edge_overloaded_response(&alternatives);
+        };
+        response(
+            StatusCode::OK,
+            Some(playlist.render()),
+            Some("application/vnd.apple.mpegurl"),
+        )
+        .with_no_store()
+    }
+
     async fn orchestration_status(&self) -> OrchestrationStatus {
         OrchestrationStatus {
             control_dispatch_ready: self.dispatch.ready().await,
             provision: self.provision.status(),
+            edge_lifecycle: self.edge_lifecycle_config.clone(),
             telemetry_peers: self.telemetry_peers.snapshot().await,
             telemetry_fec: self.telemetry_fec.snapshot(),
             private_discovery: self.private_discovery.clone(),
@@ -10663,6 +11210,9 @@ impl AppRouter {
             self.apply_control_locally(kind, &request, dispatch, command.id, &target_node_ids)
                 .await,
         ];
+        if dispatch && kind == ControlKind::CloseNode && request.node_id.is_some() {
+            statuses.push(self.provision.close(command.id, &self.node, &request).await);
+        }
 
         if dispatch {
             let envelope = ControlEnvelope {
@@ -11013,6 +11563,66 @@ impl AppRouter {
             }
         }
     }
+
+    async fn run_edge_lifecycle(&self) {
+        if !self.edge_lifecycle_config.enabled {
+            return;
+        }
+        let local = self.local_mesh_snapshot().await;
+        let (snapshots, _) = self.telemetry.snapshots_with_local(local).await;
+        let nodes = snapshots
+            .iter()
+            .filter_map(|snapshot| {
+                let edge = snapshot.edge_service.as_ref()?;
+                if edge.cache_mesh_role != "edge" {
+                    return None;
+                }
+                Some(EdgeLifecycleNode {
+                    node_id: edge.node_id.clone(),
+                    region: edge.region.clone(),
+                    updated_unix_ms: snapshot.updated_unix_ms,
+                    last_response_unix_ms: edge.last_response_unix_ms,
+                    active_readers: edge.active_readers,
+                    egress_overloaded: edge.egress_overloaded,
+                    draining: edge.draining,
+                })
+            })
+            .collect::<Vec<_>>();
+        let actions = self
+            .edge_lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .plan(
+                &self.edge_lifecycle_config,
+                &nodes,
+                &self.node.node_id,
+                now_unix_ms(),
+            );
+        for action in actions {
+            let (kind, request, detail) = match action {
+                EdgeLifecycleAction::Provision { region } => (
+                    ControlKind::ProvisionNode,
+                    ControlRequest {
+                        node_id: None,
+                        region: Some(region.clone()),
+                        stream_id: None,
+                    },
+                    format!("demand-based edge provision for region {region}"),
+                ),
+                EdgeLifecycleAction::Close { node_id, region } => (
+                    ControlKind::CloseNode,
+                    ControlRequest {
+                        node_id: Some(node_id.clone()),
+                        region: Some(region.clone()),
+                        stream_id: None,
+                    },
+                    format!("idle edge close for node {node_id} in region {region}"),
+                ),
+            };
+            let command = self.execute_control(kind, request).await;
+            info!(command_id = command.id, status = %command.status, "{detail}");
+        }
+    }
 }
 
 async fn run_replication_planner(
@@ -11027,6 +11637,7 @@ async fn run_replication_planner(
         tokio::select! {
             _ = shutdown_rx.changed() => return,
             _ = ticker.tick() => {
+                router.run_edge_lifecycle().await;
                 let requested_streams = router
                     .request_planned_local_replicas("baseline-replication")
                     .await;
@@ -11049,6 +11660,7 @@ impl Router for AppRouter {
         let method = req.method();
         let path = req.uri().path();
         let query = req.uri().query();
+        let failover_media_path = hls_failover_media_path(path);
 
         if req.method() == Method::OPTIONS {
             let response = response(StatusCode::NO_CONTENT, None, None);
@@ -11057,6 +11669,15 @@ impl Router for AppRouter {
         if req.method() != Method::GET && req.method() != Method::HEAD {
             let response = response(StatusCode::METHOD_NOT_ALLOWED, None, None);
             return Ok(self.record_edge_response(method, path, query, response, started));
+        }
+        if is_playback_media_path(path) && failover_media_path.is_none() {
+            let session_id = playback_session_id(req.headers(), query);
+            if let Some(response) = self
+                .playback_admission_response(path, query, session_id.as_deref())
+                .await
+            {
+                return Ok(self.record_edge_response(method, path, query, response, started));
+            }
         }
 
         match path {
@@ -11083,6 +11704,13 @@ impl Router for AppRouter {
                     Some("application/vnd.apple.mpegurl"),
                 )
                 .with_no_store();
+                Ok(self.record_edge_response(method, path, query, response, started))
+            }
+            "/live/master.m3u8" => {
+                let media_path = failover_media_path
+                    .as_deref()
+                    .expect("the default failover playlist path was parsed");
+                let response = self.hls_failover_playlist_response(media_path).await;
                 Ok(self.record_edge_response(method, path, query, response, started))
             }
             "/api/stats" => {
@@ -11118,6 +11746,11 @@ impl Router for AppRouter {
                 }
                 if let Some(mission_control_asset) = mission_control_asset_response(path) {
                     return Ok(mission_control_asset);
+                }
+
+                if let Some(media_path) = failover_media_path.as_deref() {
+                    let response = self.hls_failover_playlist_response(media_path).await;
+                    return Ok(self.record_edge_response(method, path, query, response, started));
                 }
 
                 if let Some(stream_id) = parse_stream_playlist_path(path) {
@@ -11599,6 +12232,38 @@ impl Router for AppRouter {
         req: Request<()>,
         mut stream_writer: Box<dyn StreamWriter>,
     ) -> HandlerResult<()> {
+        let path = req.uri().path();
+        let query = req.uri().query();
+        if is_playback_media_path(path) && hls_failover_media_path(path).is_none() {
+            let session_id = playback_session_id(req.headers(), query);
+            if let Some(rejection) = self
+                .playback_admission_response(path, query, session_id.as_deref())
+                .await
+            {
+                self.edge_load.record_response(
+                    req.method(),
+                    path,
+                    query,
+                    &rejection,
+                    Duration::ZERO,
+                );
+                let mut builder = Response::builder().status(rejection.status);
+                if let Some(content_type) = &rejection.content_type {
+                    builder = builder.header("content-type", content_type.as_ref());
+                }
+                for (name, value) in &rejection.headers {
+                    builder = builder.header(name.as_ref(), value.as_ref());
+                }
+                let response = builder.body(()).map_err(ServerError::Http)?;
+                stream_writer.send_response(response).await?;
+                if req.method() != Method::HEAD {
+                    if let Some(body) = rejection.body {
+                        stream_writer.send_data(body).await?;
+                    }
+                }
+                return stream_writer.finish().await;
+            }
+        }
         match req.uri().path() {
             MESH_EVENTS_PATH => {
                 let response = Response::builder()
@@ -11684,7 +12349,7 @@ impl Router for AppRouter {
                 // carries the existing self-describing synchronized bundle, so
                 // delivery does not create a request task or QPACK field section
                 // every five milliseconds.
-                let read = self.edge_load.begin_read(true);
+                let mut read = self.edge_load.begin_read(true);
                 let mut bytes_served = 0_usize;
                 loop {
                     let Some(bundle) = self
@@ -11705,11 +12370,13 @@ impl Router for AppRouter {
                             return Err(ServerError::Handler(Box::new(error)));
                         }
                     };
-                    bytes_served = bytes_served.saturating_add(frame.len());
+                    let frame_len = frame.len();
                     if let Err(error) = stream_writer.send_data(frame).await {
                         read.finish(bytes_served);
                         return Err(error);
                     }
+                    bytes_served = bytes_served.saturating_add(frame_len);
+                    read.record_bytes(frame_len);
                     next_sequence = match next_sequence.checked_add(part_count as u64) {
                         Some(sequence) => sequence,
                         None => {
@@ -11980,9 +12647,84 @@ fn response(
                 "access-control-allow-methods".into(),
                 "GET, HEAD, POST, PUT, OPTIONS".into(),
             ),
+            (
+                "access-control-allow-headers".into(),
+                "CMCD, CMCD-Object, CMCD-Request, CMCD-Session, CMCD-Status, X-Playback-Session-Id"
+                    .into(),
+            ),
         ],
         etag: None,
     }
+}
+
+fn is_playback_media_path(path: &str) -> bool {
+    path == "/live/stream.m3u8" || path.starts_with("/live/")
+}
+
+fn hls_failover_media_path(path: &str) -> Option<String> {
+    if path == "/live/master.m3u8" {
+        return Some("/live/stream.m3u8".to_owned());
+    }
+    let rest = path.strip_prefix("/live/")?;
+    let stream_id = rest.strip_suffix("/master.m3u8")?;
+    if stream_id.is_empty() || stream_id.contains('/') || stream_id.parse::<u64>().is_err() {
+        return None;
+    }
+    Some(format!("/live/{stream_id}/stream.m3u8"))
+}
+
+fn playback_request_url(base_url: &str, path: &str, query: Option<&str>) -> Option<String> {
+    if !is_playback_media_path(path) {
+        return None;
+    }
+    let base_url = base_url.trim_end_matches('/');
+    if base_url.is_empty() || !(base_url.starts_with("https://") || base_url.starts_with("http://"))
+    {
+        return None;
+    }
+    let suffix = if base_url.ends_with("/live") {
+        path.strip_prefix("/live").unwrap_or(path)
+    } else {
+        path
+    };
+    let mut url = format!("{base_url}{suffix}");
+    if let Some(query) = query.filter(|query| !query.is_empty()) {
+        url.push('?');
+        url.push_str(query);
+    }
+    Some(url)
+}
+
+fn edge_overloaded_response(alternatives: &[String]) -> HandlerResponse {
+    let mut response = response(
+        StatusCode::TOO_MANY_REQUESTS,
+        Some(Bytes::from_static(
+            b"This edge is busy. Try another edge listed in the response headers.\n",
+        )),
+        Some("text/plain; charset=utf-8"),
+    )
+    .with_no_store();
+    response.headers.push(("retry-after".into(), "1".into()));
+    response.headers.push((
+        "access-control-expose-headers".into(),
+        "Link, Retry-After, X-Needletail-Alternate-Edges".into(),
+    ));
+    if !alternatives.is_empty() {
+        response.headers.push((
+            "link".into(),
+            alternatives
+                .iter()
+                .map(|url| format!("<{url}>; rel=\"alternate\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+                .into(),
+        ));
+        response.headers.push((
+            "x-needletail-alternate-edges".into(),
+            alternatives.join(", ").into(),
+        ));
+    }
+    response
 }
 
 fn mission_control_asset_response(path: &str) -> Option<HandlerResponse> {
@@ -12222,6 +12964,140 @@ fn query_value<'a>(query: Option<&'a str>, key: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+fn sanitized_response_query(query: Option<&str>) -> Option<String> {
+    let query = query?;
+    Some(
+        query
+            .split('&')
+            .map(|part| {
+                let key = part.split_once('=').map_or(part, |(key, _)| key);
+                if key.eq_ignore_ascii_case("CMCD") {
+                    "CMCD=[redacted]"
+                } else {
+                    part
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("&"),
+    )
+}
+
+fn playback_session_id(headers: &http::HeaderMap, query: Option<&str>) -> Option<String> {
+    headers
+        .get_all("cmcd-session")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(parse_cmcd_session_id)
+        .or_else(|| {
+            let value = query_value(query, "CMCD")?;
+            let decoded = percent_decode_query_value(value)?;
+            parse_cmcd_session_id(&decoded)
+        })
+        .or_else(|| {
+            headers
+                .get("x-playback-session-id")
+                .and_then(|value| value.to_str().ok())
+                .and_then(normalize_playback_session_id)
+        })
+}
+
+fn parse_cmcd_session_id(value: &str) -> Option<String> {
+    let mut field_start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in value
+        .char_indices()
+        .chain(std::iter::once((value.len(), ',')))
+    {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                let field = value[field_start..index].trim();
+                if let Some((key, raw_value)) = field.split_once('=') {
+                    if key.trim() == "sid" {
+                        return parse_cmcd_string(raw_value.trim());
+                    }
+                }
+                field_start = index.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse_cmcd_string(value: &str) -> Option<String> {
+    let inner = value.strip_prefix('"')?.strip_suffix('"')?;
+    let mut decoded = String::with_capacity(inner.len());
+    let mut escaped = false;
+    for character in inner.chars() {
+        if escaped {
+            decoded.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else {
+            decoded.push(character);
+        }
+    }
+    if escaped {
+        return None;
+    }
+    normalize_playback_session_id(&decoded)
+}
+
+fn normalize_playback_session_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii() && !byte.is_ascii_control()))
+    .then(|| value.to_owned())
+}
+
+fn percent_decode_query_value(value: &str) -> Option<String> {
+    if value.len() > 4_096 {
+        return None;
+    }
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                let high = hex_value(*bytes.get(index.saturating_add(1))?)?;
+                let low = hex_value(*bytes.get(index.saturating_add(2))?)?;
+                decoded.push((high << 4) | low);
+                index = index.saturating_add(3);
+            }
+            b'+' => {
+                decoded.push(b' ');
+                index = index.saturating_add(1);
+            }
+            byte => {
+                decoded.push(byte);
+                index = index.saturating_add(1);
+            }
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn parse_query_u64(query: Option<&str>, key: &str) -> Option<u64> {
@@ -13663,6 +14539,7 @@ mod tests {
             .unwrap();
 
         assert!(!args.edge_websocket);
+        assert!(!args.edge_http3);
         assert!(!args.edge_webtransport);
         assert!(args.raw_tcp_port.is_none());
         assert_eq!(args.response_ms, None);
@@ -13683,6 +14560,32 @@ mod tests {
             args.udp_socket_buffer_bytes,
             DEFAULT_UDP_SOCKET_BUFFER_BYTES
         );
+    }
+
+    #[test]
+    fn normalizes_cache_plane_region_and_fanout_limits() {
+        let args = Args::try_parse_from([
+            "av-mesh",
+            "--cache-mesh-region",
+            "uk-cache",
+            "--cache-mesh-max-parents",
+            "0",
+            "--cache-mesh-max-children",
+            "0",
+        ])
+        .unwrap()
+        .normalized()
+        .unwrap();
+
+        assert_eq!(args.cache_mesh_region.as_deref(), Some("uk-cache"));
+        assert_eq!(args.cache_mesh_max_parents, 1);
+        assert_eq!(args.cache_mesh_max_children, 1);
+
+        let args = Args::try_parse_from(["av-mesh", "--cache-mesh-region", "   "])
+            .unwrap()
+            .normalized()
+            .unwrap();
+        assert!(args.cache_mesh_region.is_none());
     }
 
     #[test]
@@ -13800,6 +14703,7 @@ mod tests {
         let args = Args::try_parse_from([
             "av-mesh",
             "--edge-websocket",
+            "--edge-http3",
             "--edge-webtransport",
             "--raw-tcp-port",
             "19000",
@@ -13809,6 +14713,7 @@ mod tests {
         .unwrap();
 
         assert!(args.edge_websocket);
+        assert!(args.edge_http3);
         assert!(args.edge_webtransport);
         assert_eq!(args.raw_tcp_port, Some(19000));
     }
@@ -14188,6 +15093,7 @@ mod tests {
             node_id: "uk-1".into(),
             region: "uk".into(),
             continent: "eu".into(),
+            cache_mesh_role: "edge".into(),
             playback_base_url: Some("https://uk.example/live".into()),
             active_readers: 2,
             requests_served: 10,
@@ -14205,6 +15111,16 @@ mod tests {
                 .map(|upper_bound| u64::from(*upper_bound >= 2_500) * 12)
                 .collect(),
             recent_responses: Vec::new(),
+            egress_capacity_bps: 4_000_000_000,
+            egress_observed_bps: 1_000_000_000,
+            egress_admission_bps: 3_400_000_000,
+            egress_recovery_bps: 3_000_000_000,
+            egress_observation_seconds: 10,
+            egress_window_seconds: 10,
+            egress_overloaded: false,
+            egress_rejected_requests: 0,
+            active_playback_sessions: 0,
+            admitted_playback_sessions: 0,
             draining: false,
         });
         let mut snapshot = TelemetryAggregator::default().snapshot(local).await;
@@ -14460,6 +15376,188 @@ mod tests {
             body,
             "Needletail Operations setup: configure NEEDLETAIL_MISSION_CONTROL_DIST with the built asset directory.\n"
         );
+    }
+
+    #[test]
+    fn overloaded_edge_response_lists_same_region_alternates() {
+        let response = edge_overloaded_response(&[
+            "https://edge-b.example/live/stream.m3u8?part=7".into(),
+            "https://edge-c.example/live/stream.m3u8?part=7".into(),
+        ]);
+        assert_eq!(response.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| name == "retry-after" && value == "1"));
+        assert!(response.headers.iter().any(|(name, value)| {
+            name == "link"
+                && value
+                    .contains("<https://edge-b.example/live/stream.m3u8?part=7>; rel=\"alternate\"")
+                && value
+                    .contains("<https://edge-c.example/live/stream.m3u8?part=7>; rel=\"alternate\"")
+        }));
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| name == "x-needletail-alternate-edges"
+                && value.contains("edge-b.example")));
+    }
+
+    #[test]
+    fn parses_standard_cmcd_session_ids() {
+        let header_request = Request::builder()
+            .header(
+                "CMCD-Session",
+                "cid=\"content\",sid=\"header-session\",sf=h",
+            )
+            .body(())
+            .unwrap();
+        assert_eq!(
+            playback_session_id(header_request.headers(), None).as_deref(),
+            Some("header-session")
+        );
+
+        let query_request = Request::builder().body(()).unwrap();
+        assert_eq!(
+            playback_session_id(
+                query_request.headers(),
+                Some("CMCD=cid%3D%22content%22%2Csid%3D%22query-session%22")
+            )
+            .as_deref(),
+            Some("query-session")
+        );
+        assert_eq!(parse_cmcd_session_id("sid=\"unterminated"), None);
+        assert_eq!(normalize_playback_session_id(&"x".repeat(65)), None);
+        assert_eq!(
+            sanitized_response_query(Some("_HLS_msn=4&CMCD=sid%3Dsecret&_HLS_part=2")).as_deref(),
+            Some("_HLS_msn=4&CMCD=[redacted]&_HLS_part=2")
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_alarm_preserves_existing_session_and_rejects_new_session() {
+        let cache = LiveTsCache::new(801, Duration::from_millis(50), 2, 6, 64).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let telemetry = TelemetryAggregator::default();
+        let mut remote = telemetry_snapshot_for_tests(
+            "edge-b",
+            "test-region",
+            "test-continent",
+            51.6,
+            -0.2,
+            Vec::new(),
+            801,
+        );
+        remote.edge_service = Some(EdgeServiceSnapshot::from_node(
+            &remote.node,
+            Some("https://edge-b.example/live".into()),
+            "edge",
+            EdgeLoadSnapshot::default(),
+        ));
+        telemetry.ingest_snapshot(remote).await;
+        let mut router =
+            app_router_for_tests_with_telemetry(Arc::clone(&cache), Arc::clone(&mesh), telemetry);
+        router.edge_load = EdgeLoad::new(EdgeAdmissionConfig {
+            capacity_bps: 8,
+            admission_percent: 100,
+            recovery_percent: 50,
+            window_seconds: 1,
+            min_sustained_seconds: 1,
+            session_idle_seconds: 60,
+            max_sessions: 100,
+        });
+
+        let existing = || {
+            Request::builder()
+                .method(Method::GET)
+                .uri("/live/801/stream.m3u8")
+                .header("CMCD-Session", "sid=\"existing-session\"")
+                .body(())
+                .unwrap()
+        };
+        assert_eq!(
+            router.route(existing()).await.unwrap().status,
+            StatusCode::OK
+        );
+        assert!(router.edge_load.admission_snapshot().overloaded);
+        assert_eq!(
+            router.route(existing()).await.unwrap().status,
+            StatusCode::OK
+        );
+
+        let rejected = router
+            .route(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/live/801/stream.m3u8")
+                    .header("CMCD-Session", "sid=\"new-session\"")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(rejected.headers.iter().any(|(name, value)| {
+            name == "link" && value.contains("https://edge-b.example/live/801/stream.m3u8")
+        }));
+        assert_eq!(router.edge_load.admission_snapshot().active_sessions, 1);
+
+        let failover = router
+            .route(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/live/801/master.m3u8")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let failover_body = String::from_utf8(failover.body.unwrap().to_vec()).unwrap();
+        assert_eq!(failover.status, StatusCode::OK);
+        assert!(!failover_body.lines().any(|line| line == "stream.m3u8"));
+        assert!(failover_body.contains("https://edge-b.example/live/801/stream.m3u8"));
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn multivariant_playlist_uses_healthy_same_region_dag_edges() {
+        let cache = LiveTsCache::new(801, Duration::from_millis(50), 2, 6, 64).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let telemetry = TelemetryAggregator::default();
+        let mut remote = telemetry_snapshot_for_tests(
+            "edge-b",
+            "test-region",
+            "test-continent",
+            51.6,
+            -0.2,
+            Vec::new(),
+            801,
+        );
+        remote.edge_service = Some(EdgeServiceSnapshot::from_node(
+            &remote.node,
+            Some("https://edge-b.example/live".into()),
+            "edge",
+            EdgeLoadSnapshot::default(),
+        ));
+        telemetry.ingest_snapshot(remote).await;
+        let router =
+            app_router_for_tests_with_telemetry(Arc::clone(&cache), Arc::clone(&mesh), telemetry);
+
+        let response = router
+            .route(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/live/801/master.m3u8")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = String::from_utf8(response.body.unwrap().to_vec()).unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(body.contains("#EXT-X-STREAM-INF:BANDWIDTH=4000000\nstream.m3u8"));
+        assert!(body.contains("https://edge-b.example/live/801/stream.m3u8"));
+        mesh.shutdown();
     }
 
     #[test]
@@ -16017,7 +17115,7 @@ mod tests {
             Arc::clone(&mesh),
             ProvisionExecutor::new(
                 Some(
-                    "test \"$AV_MESH_PROVISION_REGION\" = eu-test && test \"$AV_MESH_PROVISION_NODE_ID\" = eu-test-2 && printf provision-ok"
+                    "test \"$AV_MESH_PROVISION_ACTION\" = provision && test \"$AV_MESH_PROVISION_REGION\" = eu-test && test \"$AV_MESH_PROVISION_NODE_ID\" = eu-test-2 && printf provision-ok"
                         .into(),
                 ),
                 Duration::from_secs(1),
@@ -16363,6 +17461,33 @@ mod tests {
 
         assert!(command.status.contains("draining"));
         assert!(router.mesh_api_snapshot().await.node.draining);
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn close_node_control_passes_close_action_to_executor() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let router = app_router_for_tests_with_provision(
+            Arc::clone(&cache),
+            Arc::clone(&mesh),
+            ProvisionExecutor::new(
+                Some("test \"$AV_MESH_PROVISION_ACTION\" = close && printf close-ok".into()),
+                Duration::from_secs(1),
+            ),
+        );
+        let command = router
+            .execute_control(
+                ControlKind::CloseNode,
+                ControlRequest {
+                    node_id: Some("test-node".into()),
+                    region: Some("test-region".into()),
+                    stream_id: None,
+                },
+            )
+            .await;
+        assert!(command.status.contains("local close executed"));
+        assert!(command.status.contains("close-ok"));
         mesh.shutdown();
     }
 
@@ -19077,6 +20202,7 @@ mod tests {
             broadcast::channel(AUDIO_EPOCH_BROADCAST_CAPACITY).0,
             MeshTransportConfigSnapshot::default(),
             node,
+            CacheMeshRole::Edge,
             replication_policy,
             ControlPlane::default(),
             ControlDispatch::default(),
@@ -19084,7 +20210,9 @@ mod tests {
             DemandTracker::default(),
             NodeLifecycle::default(),
             Some("https://test-node.local/live".into()),
+            DEFAULT_HLS_FAILOVER_BANDWIDTH_BPS,
             EdgeLoad::default(),
+            EdgeLifecycleConfig::default(),
             provision,
             monitor,
             TelemetryFecMonitor::default(),

@@ -30,11 +30,11 @@ h3-webtransport = "0.1.2"
 http = "1"
 hyper = { version = "1.6", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
-linode = { version = "0.0.2", optional = true }
+linode = { git = "https://github.com/wavey-ai/linode.git", rev = "df7374666fa1534a04c229d09411ba5832fd5fac", optional = true }
 message-packetizer = "0.1.0"
 media-object = "0.1.1"
 media-capability = "0.1.1"
-playlists = { version = "0.1.6", features = ["mesh"] }
+playlists = { git = "https://github.com/wavey-ai/playlists.git", rev = "2d3043376dec86bca0a8dea33c6fe614089b3ca1", features = ["mesh"] }
 raptorq-datagram-fec = "0.1.6"
 raptorq-fec-transport = "0.1.4"
 relay-session = { version = "0.1.1", default-features = false }
@@ -51,7 +51,7 @@ tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 talkback-media = "0.1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-web-service = { package = "av-web-service", version = "0.1.0", features = ["h3-tokio-quiche"] }
+web-service = { package = "av-web-service", git = "https://github.com/wavey-ai/web-services.git", rev = "7f41cda3688fefba18e32ccefb80af317c01e201", features = ["h3-tokio-quiche"] }
 
 [dev-dependencies]
 base64 = "0.22"
