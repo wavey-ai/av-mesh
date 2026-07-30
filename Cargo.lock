@@ -131,7 +131,7 @@ checksum = "ae36dc4177970ef04fde5178d3e2429882def40e57a451f919c098f72baa6cec"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.3",
+ "syn 3.0.2",
 ]
 
 [[package]]
@@ -167,11 +167,12 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
- "clap 4.6.4",
+ "clap 4.6.3",
  "crc32fast",
  "dashmap",
  "discovery",
  "ed25519-dalek",
+ "flate2",
  "futures-util",
  "h3",
  "h3-quinn",
@@ -183,7 +184,7 @@ dependencies = [
  "media-capability",
  "media-object",
  "message-packetizer",
- "playlists 0.1.6 (git+https://github.com/wavey-ai/playlists.git?rev=2d3043376dec86bca0a8dea33c6fe614089b3ca1)",
+ "playlists 0.1.6 (git+https://github.com/wavey-ai/playlists.git?rev=f9037f88749671dde5436158086838c136cd20ce)",
  "raptorq-datagram-fec",
  "raptorq-fec-transport",
  "rcgen",
@@ -534,9 +535,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.4"
+version = "4.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d91e0c145792ef73a6ad36d27c75ac09f1832222a3c209689d90f534685ee5b7"
+checksum = "0fb99565819980999fb7b4a1796046a5c949e6d4ff132cf5fadf5a641e20d776"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -556,14 +557,14 @@ dependencies = [
 
 [[package]]
 name = "clap_derive"
-version = "4.6.4"
+version = "4.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d012d2b9d65aca7f18f4d9878a045bc17899bba951561ba5ec3c2ba1eed9a061"
+checksum = "32f2392eae7f16557a3d727ef3a12e57b2b2ca6f98566a5f4fb41ffe305df077"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
  "quote",
- "syn 3.0.3",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1421,9 +1422,9 @@ checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
 name = "glob"
-version = "0.3.4"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
+checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "governor"
@@ -1463,7 +1464,7 @@ dependencies = [
  "indexmap 2.14.0",
  "slab",
  "tokio",
- "tokio-util 0.7.19",
+ "tokio-util 0.7.18",
  "tracing",
 ]
 
@@ -1482,7 +1483,7 @@ dependencies = [
  "indexmap 2.14.0",
  "slab",
  "tokio",
- "tokio-util 0.7.19",
+ "tokio-util 0.7.18",
  "tracing",
 ]
 
@@ -1523,7 +1524,7 @@ dependencies = [
  "h3-datagram",
  "quinn",
  "tokio",
- "tokio-util 0.7.19",
+ "tokio-util 0.7.18",
 ]
 
 [[package]]
@@ -1834,7 +1835,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-layer",
@@ -2150,9 +2151,9 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "libc"
-version = "0.2.189"
+version = "0.2.187"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+checksum = "a7743783ea728ef5c31194c6590797eed286449b4a4e87d626d8a51f0a94e732"
 
 [[package]]
 name = "libloading"
@@ -2686,7 +2687,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "playlists"
 version = "0.1.6"
-source = "git+https://github.com/wavey-ai/playlists.git?rev=2d3043376dec86bca0a8dea33c6fe614089b3ca1#2d3043376dec86bca0a8dea33c6fe614089b3ca1"
+source = "git+https://github.com/wavey-ai/playlists.git?rev=f9037f88749671dde5436158086838c136cd20ce#f9037f88749671dde5436158086838c136cd20ce"
 dependencies = [
  "access-unit",
  "bytes",
@@ -2703,7 +2704,7 @@ dependencies = [
 [[package]]
 name = "playlists"
 version = "0.1.6"
-source = "git+https://github.com/wavey-ai/playlists.git#2d3043376dec86bca0a8dea33c6fe614089b3ca1"
+source = "git+https://github.com/wavey-ai/playlists.git#f9037f88749671dde5436158086838c136cd20ce"
 dependencies = [
  "access-unit",
  "bytes",
@@ -2979,7 +2980,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.42",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -3017,7 +3018,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -3261,7 +3262,7 @@ checksum = "2c9283685feec7d69af75fb0e858d5e7378f33fe4fc699383b2916ab9273e03c"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.3",
+ "syn 3.0.2",
 ]
 
 [[package]]
@@ -3650,7 +3651,7 @@ checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.3",
+ "syn 3.0.2",
 ]
 
 [[package]]
@@ -4034,9 +4035,9 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "3.0.3"
+version = "3.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53e9bae58849f64dfa4f5d5ae372c8341f7305f82a3868709269343628b659a3"
+checksum = "a207d6d6a2b7fc470b80443726053f18a2481b7e1eee970597051596567987a3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4154,7 +4155,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -4215,7 +4216,7 @@ checksum = "43cbfe0cf76104d42a574802844187e84a305e531ed54455f11fbde0f10541cd"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.3",
+ "syn 3.0.2",
 ]
 
 [[package]]
@@ -4379,7 +4380,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tokio-stream",
- "tokio-util 0.7.19",
+ "tokio-util 0.7.18",
  "url",
 ]
 
@@ -4447,16 +4448,15 @@ dependencies = [
 
 [[package]]
 name = "tokio-util"
-version = "0.7.19"
+version = "0.7.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "494815d09bf52b5548659851081238f0ca39ff638363907596da739561c62c52"
+checksum = "9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098"
 dependencies = [
  "bytes",
  "futures-core",
  "futures-io",
  "futures-sink",
  "futures-util",
- "libc",
  "pin-project-lite",
  "slab",
  "tokio",
@@ -4512,7 +4512,7 @@ dependencies = [
  "slab",
  "sync_wrapper",
  "tokio",
- "tokio-util 0.7.19",
+ "tokio-util 0.7.18",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -5128,9 +5128,9 @@ dependencies = [
 
 [[package]]
 name = "xxhash-rust"
-version = "0.8.18"
+version = "0.8.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
+checksum = "985eec839aaf2a1270af8f4ebcf63cf9401cfd90f0902f97c28d9f104ffbde72"
 
 [[package]]
 name = "yaml-merge-keys"

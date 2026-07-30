@@ -123,7 +123,7 @@ impl EdgeLifecyclePlanner {
             }
 
             if live_nodes <= config.min_edges_per_region
-                || !leader.is_some_and(|node| node.node_id == controller_node_id)
+                || leader.is_none_or(|node| node.node_id != controller_node_id)
             {
                 continue;
             }

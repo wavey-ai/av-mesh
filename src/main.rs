@@ -34,6 +34,7 @@ use edge_admission::{
 use edge_lifecycle::{
     EdgeLifecycleAction, EdgeLifecycleConfig, EdgeLifecycleNode, EdgeLifecyclePlanner,
 };
+use flate2::{write::GzEncoder, Compression};
 use futures_util::{future::join_all, SinkExt, StreamExt};
 use h3_webtransport::server::{AcceptedBi, WebTransportSession};
 use http::{Method, Request, Response, StatusCode};
@@ -66,6 +67,7 @@ use relay_session::{
 use serde::{de, Deserialize, Serialize};
 use socket2::SockRef;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -130,6 +132,7 @@ const MESH_METRICS_PATH: &str = "/metrics";
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 const MEDIA_ACCESS_UNIT_CONTENT_TYPE: &str = "application/vnd.wavey.media-access-unit";
 const LIVE_FMP4_CONTENT_TYPE: &str = "video/mp4";
+const LIVE_AUDIO_FMP4_CONTENT_TYPE: &str = "audio/mp4";
 const LIVE_TS_CONTENT_TYPE: &str = "video/mp2t";
 const LIVE_OPAQUE_CONTENT_TYPE: &str = "application/octet-stream";
 const AUDIO_EPOCH_SUBSCRIPTION: &[u8] = b"WAVEY-AUDIO-EPOCH/1";
@@ -4698,6 +4701,23 @@ impl LiveTsCache {
                     |(_sequence, _duration_ms, keyframe, _available_unix_us)| *keyframe,
                 )
             });
+        } else if groups.len() > 1 {
+            // A retained window can also begin halfway through a fixed-size
+            // audio parent segment. Omit that incomplete old parent.
+            let first_segment = groups.first_key_value().map(|(segment, _)| *segment);
+            if let Some(first_segment) = first_segment {
+                let expected_first_sequence =
+                    first_segment.saturating_mul(self.parts_per_segment as u64);
+                if groups
+                    .get(&first_segment)
+                    .and_then(|group| group.first())
+                    .is_some_and(|(sequence, _duration_ms, _keyframe, _available_unix_us)| {
+                        *sequence != expected_first_sequence
+                    })
+                {
+                    groups.remove(&first_segment);
+                }
+            }
         }
         let open_segment_id = keyframe_aligned_segments
             .then(|| {
@@ -4749,11 +4769,13 @@ impl LiveTsCache {
 
         let mut out = String::new();
         out.push_str("#EXTM3U\n");
-        out.push_str("#EXT-X-VERSION:9\n");
+        out.push_str("#EXT-X-VERSION:10\n");
         out.push_str(&format!("#EXT-X-TARGETDURATION:{target_duration}\n"));
         let media_sequence = groups.keys().next().copied().unwrap_or(0);
         out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{media_sequence}\n"));
-        if keyframe_aligned_segments {
+        let audio_only_fmp4 = media_kind == LiveMediaKind::Fmp4
+            && init.as_deref().is_some_and(fmp4_init_is_audio_only);
+        if keyframe_aligned_segments || audio_only_fmp4 {
             out.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
         }
         if media_kind == LiveMediaKind::Fmp4 {
@@ -4786,16 +4808,29 @@ impl LiveTsCache {
         }
 
         let extension = media_kind.extension();
+        let last_segment = groups
+            .last_key_value()
+            .map(|(segment, _group)| *segment)
+            .unwrap_or(0);
+        let parted_window_segments = (target_duration.saturating_mul(3_000))
+            .div_ceil(segment_target_ms.max(1))
+            .max(1);
+        let first_parted_segment =
+            last_segment.saturating_sub(parted_window_segments.saturating_sub(1));
         for (segment, group) in groups {
             let mut duration = 0.0;
             for (seq, duration_ms, keyframe, _available_unix_us) in &group {
                 let part_duration = f64::from(*duration_ms) / 1_000.0;
                 duration += part_duration;
-                let independent = if *keyframe && media_kind == LiveMediaKind::Fmp4 {
-                    ",INDEPENDENT=YES"
-                } else {
-                    ""
-                };
+                if segment < first_parted_segment {
+                    continue;
+                }
+                let independent =
+                    if (*keyframe || audio_only_fmp4) && media_kind == LiveMediaKind::Fmp4 {
+                        ",INDEPENDENT=YES"
+                    } else {
+                        ""
+                    };
                 out.push_str(&format!(
                     "#EXT-X-PART:DURATION={part_duration:.3},URI=\"part{seq}.{extension}\"{independent}\n"
                 ));
@@ -4864,9 +4899,9 @@ impl LiveTsCache {
             format!("#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part{next_part}.{extension}\"\n")
         };
         format!(
-            "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:0\n{map}#EXT-X-PART-INF:PART-TARGET={part_target:.3}\n#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={:.3},HOLD-BACK={:.3}\n{preload_hint}",
+            "#EXTM3U\n#EXT-X-VERSION:10\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:0\n{map}#EXT-X-PART-INF:PART-TARGET={part_target:.3}\n#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={:.3},HOLD-BACK={:.3}\n{preload_hint}",
             part_target * 3.0,
-            (part_target * self.parts_per_segment as f64 * 2.0).max(3.0)
+            (target_duration as f64 * 3.0).max(3.0)
         )
     }
 
@@ -4881,9 +4916,9 @@ impl LiveTsCache {
             ""
         };
         format!(
-            "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:0\n{map}#EXT-X-PART-INF:PART-TARGET={part_target:.3}\n#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={:.3},HOLD-BACK={:.3}\n",
+            "#EXTM3U\n#EXT-X-VERSION:10\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:0\n{map}#EXT-X-PART-INF:PART-TARGET={part_target:.3}\n#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={:.3},HOLD-BACK={:.3}\n",
             part_target * 3.0,
-            (part_target * self.parts_per_segment as f64 * 2.0).max(3.0)
+            (target_duration as f64 * 3.0).max(3.0)
         )
     }
 
@@ -5861,6 +5896,7 @@ impl LiveState {
         *next = (*next).max(sequence.saturating_add(1));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_part_available(
         &mut self,
         stream_id: u64,
@@ -10992,29 +11028,55 @@ impl AppRouter {
             .collect()
     }
 
-    async fn hls_failover_playlist_response(&self, media_path: &str) -> HandlerResponse {
+    async fn live_media_content_type(
+        &self,
+        stream_id: u64,
+        media_kind: LiveMediaKind,
+    ) -> &'static str {
+        if media_kind != LiveMediaKind::Fmp4 {
+            return media_kind.content_type();
+        }
+        let init = self.cache.get_init_for_stream_id(stream_id).await;
+        fmp4_content_type_from_init(init.as_deref())
+    }
+
+    async fn hls_failover_playlist_response(
+        &self,
+        media_path: &str,
+        gzip: bool,
+    ) -> HandlerResponse {
         let overloaded = self.edge_load.admission_snapshot().overloaded;
         let alternatives = self.same_region_alternative_edges(media_path, None).await;
+        let stream_id = parse_stream_playlist_path(media_path).unwrap_or(self.cache.stream_id);
+        let codecs = self
+            .cache
+            .get_init_for_stream_id(stream_id)
+            .await
+            .as_deref()
+            .and_then(hls_codecs_from_init);
+        let make_variant = |uri: String| {
+            let variant = VariantStream::new(uri, self.hls_failover_bandwidth_bps).ok()?;
+            match codecs.as_deref() {
+                Some(codecs) => variant.with_codecs(codecs).ok(),
+                None => Some(variant),
+            }
+        };
         let mut variants = Vec::with_capacity(alternatives.len().saturating_add(1));
         if !overloaded {
-            if let Ok(variant) = VariantStream::new("stream.m3u8", self.hls_failover_bandwidth_bps)
-            {
+            if let Some(variant) = make_variant("stream.m3u8".to_owned()) {
                 variants.push(variant);
             }
         }
-        variants.extend(alternatives.iter().filter_map(|url| {
-            VariantStream::new(url.clone(), self.hls_failover_bandwidth_bps).ok()
-        }));
+        variants.extend(
+            alternatives
+                .iter()
+                .filter_map(|url| make_variant(url.clone())),
+        );
         let Ok(playlist) = MultivariantPlaylist::new(variants) else {
             self.edge_load.record_rejection();
             return edge_overloaded_response(&alternatives);
         };
-        response(
-            StatusCode::OK,
-            Some(playlist.render()),
-            Some("application/vnd.apple.mpegurl"),
-        )
-        .with_no_store()
+        playlist_response(playlist.render(), gzip).with_no_store()
     }
 
     async fn orchestration_status(&self) -> OrchestrationStatus {
@@ -11661,6 +11723,7 @@ impl Router for AppRouter {
         let path = req.uri().path();
         let query = req.uri().query();
         let failover_media_path = hls_failover_media_path(path);
+        let gzip_playlists = accepts_gzip(req.headers());
 
         if req.method() == Method::OPTIONS {
             let response = response(StatusCode::NO_CONTENT, None, None);
@@ -11681,9 +11744,11 @@ impl Router for AppRouter {
         }
 
         match path {
-            "/" => Ok(player_asset_response(path).unwrap_or_else(|| player_setup_response())),
-            "/mesh" => Ok(mission_control_asset_response(path)
-                .unwrap_or_else(|| mission_control_setup_response())),
+            "/" => Ok(player_asset_response(path).unwrap_or_else(player_setup_response)),
+            "/mesh" => {
+                Ok(mission_control_asset_response(path)
+                    .unwrap_or_else(mission_control_setup_response))
+            }
             "/up" => Ok(response(
                 StatusCode::OK,
                 Some(Bytes::from_static(b"OK")),
@@ -11698,19 +11763,17 @@ impl Router for AppRouter {
                         .await;
                 }
                 let playlist = self.cache.playlist().await;
-                let response = response(
-                    StatusCode::OK,
-                    Some(Bytes::from(playlist)),
-                    Some("application/vnd.apple.mpegurl"),
-                )
-                .with_no_store();
+                let response =
+                    playlist_response(Bytes::from(playlist), gzip_playlists).with_no_store();
                 Ok(self.record_edge_response(method, path, query, response, started))
             }
             "/live/master.m3u8" => {
                 let media_path = failover_media_path
                     .as_deref()
                     .expect("the default failover playlist path was parsed");
-                let response = self.hls_failover_playlist_response(media_path).await;
+                let response = self
+                    .hls_failover_playlist_response(media_path, gzip_playlists)
+                    .await;
                 Ok(self.record_edge_response(method, path, query, response, started))
             }
             "/api/stats" => {
@@ -11749,7 +11812,9 @@ impl Router for AppRouter {
                 }
 
                 if let Some(media_path) = failover_media_path.as_deref() {
-                    let response = self.hls_failover_playlist_response(media_path).await;
+                    let response = self
+                        .hls_failover_playlist_response(media_path, gzip_playlists)
+                        .await;
                     return Ok(self.record_edge_response(method, path, query, response, started));
                 }
 
@@ -11762,12 +11827,8 @@ impl Router for AppRouter {
                             .await;
                     }
                     let playlist = self.cache.playlist_for_stream_id(stream_id).await;
-                    let response = response(
-                        StatusCode::OK,
-                        Some(Bytes::from(playlist)),
-                        Some("application/vnd.apple.mpegurl"),
-                    )
-                    .with_no_store();
+                    let response =
+                        playlist_response(Bytes::from(playlist), gzip_playlists).with_no_store();
                     return Ok(self.record_edge_response(method, path, query, response, started));
                 }
 
@@ -11948,12 +12009,13 @@ impl Router for AppRouter {
                         .media_kind_hint(stream_id)
                         .await
                         .unwrap_or(LiveMediaKind::Ts);
+                    let content_type = self.live_media_content_type(stream_id, media_kind).await;
                     let available_unix_us = self
                         .cache
                         .part_available_unix_us(stream_id, end_sequence)
                         .await;
                     let mut tail_response =
-                        response(StatusCode::OK, Some(bytes), Some(media_kind.content_type()))
+                        response(StatusCode::OK, Some(bytes), Some(content_type))
                             .with_part_available_unix_us(available_unix_us)
                             .with_no_store();
                     if let Some(etag) = etag {
@@ -12000,12 +12062,9 @@ impl Router for AppRouter {
                     self.request_replica_for_stream(stream_id, "playlist-init-demand", None)
                         .await;
                     if let Some(init) = self.cache.get_init_for_stream_id(stream_id).await {
-                        let response = response(
-                            StatusCode::OK,
-                            Some(init),
-                            Some(LiveMediaKind::Fmp4.content_type()),
-                        )
-                        .with_no_store();
+                        let content_type = fmp4_content_type_from_init(Some(&init));
+                        let response = response(StatusCode::OK, Some(init), Some(content_type))
+                            .with_no_store();
                         return Ok(
                             self.record_edge_response(method, path, query, response, started)
                         );
@@ -12076,12 +12135,13 @@ impl Router for AppRouter {
                             .media_kind_hint(stream_id)
                             .await
                             .unwrap_or(requested_kind);
+                        let content_type =
+                            self.live_media_content_type(stream_id, media_kind).await;
                         let available_unix_us =
                             self.cache.part_available_unix_us(stream_id, seq).await;
-                        let response =
-                            response(StatusCode::OK, Some(bytes), Some(media_kind.content_type()))
-                                .with_etag(hash)
-                                .with_part_available_unix_us(available_unix_us);
+                        let response = response(StatusCode::OK, Some(bytes), Some(content_type))
+                            .with_etag(hash)
+                            .with_part_available_unix_us(available_unix_us);
                         return Ok(
                             self.record_edge_response(method, path, query, response, started)
                         );
@@ -12104,8 +12164,9 @@ impl Router for AppRouter {
                             .media_kind_hint(stream_id)
                             .await
                             .unwrap_or(requested_kind);
-                        let response =
-                            response(StatusCode::OK, Some(bytes), Some(media_kind.content_type()));
+                        let content_type =
+                            self.live_media_content_type(stream_id, media_kind).await;
+                        let response = response(StatusCode::OK, Some(bytes), Some(content_type));
                         return Ok(
                             self.record_edge_response(method, path, query, response, started)
                         );
@@ -12126,12 +12187,9 @@ impl Router for AppRouter {
                         .get_init_for_stream_id(self.cache.stream_id)
                         .await
                     {
-                        let response = response(
-                            StatusCode::OK,
-                            Some(init),
-                            Some(LiveMediaKind::Fmp4.content_type()),
-                        )
-                        .with_no_store();
+                        let content_type = fmp4_content_type_from_init(Some(&init));
+                        let response = response(StatusCode::OK, Some(init), Some(content_type))
+                            .with_no_store();
                         return Ok(
                             self.record_edge_response(method, path, query, response, started)
                         );
@@ -12147,14 +12205,16 @@ impl Router for AppRouter {
                             .media_kind_hint(self.cache.stream_id)
                             .await
                             .unwrap_or(requested_kind);
+                        let content_type = self
+                            .live_media_content_type(self.cache.stream_id, media_kind)
+                            .await;
                         let available_unix_us = self
                             .cache
                             .part_available_unix_us(self.cache.stream_id, seq)
                             .await;
-                        let response =
-                            response(StatusCode::OK, Some(bytes), Some(media_kind.content_type()))
-                                .with_etag(hash)
-                                .with_part_available_unix_us(available_unix_us);
+                        let response = response(StatusCode::OK, Some(bytes), Some(content_type))
+                            .with_etag(hash)
+                            .with_part_available_unix_us(available_unix_us);
                         return Ok(
                             self.record_edge_response(method, path, query, response, started)
                         );
@@ -12170,8 +12230,10 @@ impl Router for AppRouter {
                             .media_kind_hint(self.cache.stream_id)
                             .await
                             .unwrap_or(requested_kind);
-                        let response =
-                            response(StatusCode::OK, Some(bytes), Some(media_kind.content_type()));
+                        let content_type = self
+                            .live_media_content_type(self.cache.stream_id, media_kind)
+                            .await;
+                        let response = response(StatusCode::OK, Some(bytes), Some(content_type));
                         return Ok(
                             self.record_edge_response(method, path, query, response, started)
                         );
@@ -12657,6 +12719,31 @@ fn response(
     }
 }
 
+fn playlist_response(body: Bytes, gzip: bool) -> HandlerResponse {
+    let mut response = response(
+        StatusCode::OK,
+        Some(body.clone()),
+        Some("application/vnd.apple.mpegurl"),
+    );
+    response
+        .headers
+        .push(("vary".into(), "Accept-Encoding".into()));
+    if !gzip {
+        return response;
+    }
+
+    let mut encoder = GzEncoder::new(Vec::with_capacity(body.len()), Compression::fast());
+    if encoder.write_all(&body).is_ok() {
+        if let Ok(compressed) = encoder.finish() {
+            response.body = Some(Bytes::from(compressed));
+            response
+                .headers
+                .push(("content-encoding".into(), "gzip".into()));
+        }
+    }
+    response
+}
+
 fn is_playback_media_path(path: &str) -> bool {
     path == "/live/stream.m3u8" || path.starts_with("/live/")
 }
@@ -12671,6 +12758,184 @@ fn hls_failover_media_path(path: &str) -> Option<String> {
         return None;
     }
     Some(format!("/live/{stream_id}/stream.m3u8"))
+}
+
+fn hls_codecs_from_init(init: &[u8]) -> Option<String> {
+    let mut codecs = Vec::new();
+    if init.windows(4).any(|box_type| box_type == b"avcC") {
+        codecs.push(hls_avc_codec_from_init(init)?);
+    }
+    if init.windows(4).any(|box_type| box_type == b"mp4a") {
+        codecs.push(hls_aac_codec_from_init(init)?);
+    } else if init.windows(4).any(|box_type| box_type == b"fLaC") {
+        codecs.push("fLaC".to_owned());
+    } else if init.windows(4).any(|box_type| box_type == b"alac") {
+        codecs.push("alac".to_owned());
+    } else if init.windows(4).any(|box_type| box_type == b"Opus") {
+        codecs.push("opus".to_owned());
+    } else if init.windows(4).any(|box_type| box_type == b"ipcm") {
+        codecs.push("ipcm".to_owned());
+    }
+    (!codecs.is_empty()).then(|| codecs.join(","))
+}
+
+fn hls_avc_codec_from_init(init: &[u8]) -> Option<String> {
+    let avcc = mp4_box_payload(init, b"avcC")?;
+    if avcc.len() < 4 || avcc[0] != 1 {
+        return None;
+    }
+    Some(format!(
+        "avc1.{:02X}{:02X}{:02X}",
+        avcc[1], avcc[2], avcc[3]
+    ))
+}
+
+fn hls_aac_codec_from_init(init: &[u8]) -> Option<String> {
+    let esds = mp4_box_payload(init, b"esds")?;
+    let (tag, es_descriptor, _) = mp4_descriptor(esds.get(4..)?)?;
+    if tag != 0x03 || es_descriptor.len() < 3 {
+        return None;
+    }
+
+    let flags = es_descriptor[2];
+    let mut decoder_offset = 3_usize;
+    if flags & 0x80 != 0 {
+        decoder_offset = decoder_offset.checked_add(2)?;
+    }
+    if flags & 0x40 != 0 {
+        let url_length = usize::from(*es_descriptor.get(decoder_offset)?);
+        decoder_offset = decoder_offset.checked_add(1)?.checked_add(url_length)?;
+    }
+    if flags & 0x20 != 0 {
+        decoder_offset = decoder_offset.checked_add(2)?;
+    }
+
+    let (tag, decoder_config, _) = mp4_descriptor(es_descriptor.get(decoder_offset..)?)?;
+    if tag != 0x04 || decoder_config.len() < 13 {
+        return None;
+    }
+    let object_type_indication = decoder_config[0];
+    let (tag, audio_specific_config, _) = mp4_descriptor(decoder_config.get(13..)?)?;
+    if tag != 0x05 {
+        return None;
+    }
+    let first = *audio_specific_config.first()?;
+    let mut audio_object_type = u16::from(first >> 3);
+    if audio_object_type == 31 {
+        let second = *audio_specific_config.get(1)?;
+        audio_object_type = 32 + u16::from(((first & 0x07) << 3) | (second >> 5));
+    }
+    if audio_object_type == 0 {
+        return None;
+    }
+    Some(format!(
+        "mp4a.{object_type_indication:02X}.{audio_object_type}"
+    ))
+}
+
+fn mp4_box_payload<'a>(input: &'a [u8], box_type: &[u8; 4]) -> Option<&'a [u8]> {
+    for type_offset in 4..input.len().saturating_sub(3) {
+        if input.get(type_offset..type_offset + 4) != Some(box_type.as_slice()) {
+            continue;
+        }
+        let size_offset = type_offset - 4;
+        let size =
+            u32::from_be_bytes(input.get(size_offset..type_offset)?.try_into().ok()?) as usize;
+        if size < 8 {
+            continue;
+        }
+        let end = size_offset.checked_add(size)?;
+        if end <= input.len() {
+            return input.get(type_offset + 4..end);
+        }
+    }
+    None
+}
+
+fn mp4_descriptor(input: &[u8]) -> Option<(u8, &[u8], usize)> {
+    let tag = *input.first()?;
+    let mut payload_length = 0_usize;
+    let mut header_length = 1_usize;
+    let mut complete = false;
+    for _ in 0..4 {
+        let byte = *input.get(header_length)?;
+        header_length += 1;
+        payload_length = payload_length
+            .checked_mul(128)?
+            .checked_add(usize::from(byte & 0x7f))?;
+        if byte & 0x80 == 0 {
+            complete = true;
+            break;
+        }
+    }
+    if !complete {
+        return None;
+    }
+    let end = header_length.checked_add(payload_length)?;
+    Some((tag, input.get(header_length..end)?, end))
+}
+
+fn fmp4_init_is_audio_only(init: &[u8]) -> bool {
+    let has_audio = [
+        b"fLaC".as_slice(),
+        b"alac".as_slice(),
+        b"Opus".as_slice(),
+        b"mp4a".as_slice(),
+        b"ipcm".as_slice(),
+        b"fpcm".as_slice(),
+    ]
+    .iter()
+    .any(|sample_entry| {
+        init.windows(sample_entry.len())
+            .any(|candidate| candidate == *sample_entry)
+    });
+    let has_video = [
+        b"avcC".as_slice(),
+        b"hvcC".as_slice(),
+        b"av1C".as_slice(),
+        b"vpcC".as_slice(),
+    ]
+    .iter()
+    .any(|configuration| {
+        init.windows(configuration.len())
+            .any(|candidate| candidate == *configuration)
+    });
+    has_audio && !has_video
+}
+
+fn fmp4_content_type_from_init(init: Option<&[u8]>) -> &'static str {
+    if init.is_some_and(fmp4_init_is_audio_only) {
+        LIVE_AUDIO_FMP4_CONTENT_TYPE
+    } else {
+        LIVE_FMP4_CONTENT_TYPE
+    }
+}
+
+fn accepts_gzip(headers: &http::HeaderMap) -> bool {
+    headers
+        .get_all(http::header::ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|coding| {
+            let mut fields = coding.trim().split(';');
+            let Some(name) = fields.next() else {
+                return false;
+            };
+            if !name.eq_ignore_ascii_case("gzip") && name != "*" {
+                return false;
+            }
+            fields
+                .filter_map(|parameter| parameter.trim().split_once('='))
+                .find_map(|(name, value)| {
+                    name.trim()
+                        .eq_ignore_ascii_case("q")
+                        .then(|| value.trim().parse::<f32>().ok())
+                        .flatten()
+                })
+                .unwrap_or(1.0)
+                > 0.0
+        })
 }
 
 fn playback_request_url(base_url: &str, path: &str, query: Option<&str>) -> Option<String> {
@@ -12778,6 +13043,7 @@ fn mission_control_asset_extension_allowed(path: &str) -> bool {
     path.ends_with(".js")
         || path.ends_with(".wasm")
         || path.ends_with(".css")
+        || path.ends_with(".png")
         || path.ends_with(".ico")
 }
 
@@ -12790,6 +13056,8 @@ fn mission_control_asset_content_type(path: &str) -> Option<&'static str> {
         Some("application/wasm")
     } else if path.ends_with(".css") {
         Some("text/css; charset=utf-8")
+    } else if path.ends_with(".png") {
+        Some("image/png")
     } else if path.ends_with(".ico") {
         Some("image/x-icon")
     } else {
@@ -13366,6 +13634,30 @@ mod tests {
         Bytes::from(out)
     }
 
+    fn test_mp4_box(box_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + payload.len());
+        out.extend_from_slice(&u32::try_from(8 + payload.len()).unwrap().to_be_bytes());
+        out.extend_from_slice(box_type);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn test_h264_aac_init() -> Vec<u8> {
+        let mut init = test_mp4_box(b"avcC", &[1, 0x64, 0x00, 0x33]);
+        let esds = test_mp4_box(
+            b"esds",
+            &[
+                0, 0, 0, 0, // Full-box version and flags.
+                0x03, 0x19, 0, 0, 0, // ES descriptor.
+                0x04, 0x11, 0x40, 0x15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // AAC decoder.
+                0x05, 0x02, 0x11, 0x90, // AAC-LC AudioSpecificConfig.
+                0x06, 0x01, 0x02, // SL config.
+            ],
+        );
+        init.extend_from_slice(&test_mp4_box(b"mp4a", &esds));
+        init
+    }
+
     #[test]
     fn webtransport_audio_subscription_supports_session_filtering() {
         assert_eq!(
@@ -13742,6 +14034,155 @@ mod tests {
             response.body.unwrap(),
             Bytes::from_static(b"moofmdat-amoofmdat-b")
         );
+
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn lossless_audio_playlist_uses_standard_ll_hls_windows() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(250), 4, 32, 64).await;
+        for sequence in 0..32 {
+            cache
+                .commit_stream_payload(
+                    77,
+                    encode_test_canonical_fmp4_bundle_with_duration(
+                        77,
+                        sequence,
+                        (sequence == 0).then_some(b"ftyp-fLaC-moov".as_slice()),
+                        format!("moof-mdat-{sequence:02}").as_bytes(),
+                        Some(250),
+                        false,
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+
+        let playlist = cache.playlist_for_stream_id(77).await;
+        assert!(playlist.starts_with("#EXTM3U\n#EXT-X-VERSION:10\n"));
+        assert!(playlist.contains("#EXT-X-TARGETDURATION:1\n"));
+        assert!(playlist.contains("#EXT-X-MEDIA-SEQUENCE:0\n"));
+        assert!(playlist.contains("#EXT-X-INDEPENDENT-SEGMENTS\n"));
+        assert!(playlist.contains("#EXT-X-MAP:URI=\"init.mp4\"\n"));
+        assert!(playlist.contains("#EXT-X-PART-INF:PART-TARGET=0.250\n"));
+        assert!(playlist.contains(
+            "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=0.750,HOLD-BACK=3.000\n"
+        ));
+        assert_eq!(playlist.matches("#EXT-X-PART:").count(), 12);
+        assert_eq!(playlist.matches("#EXTINF:1.000,").count(), 8);
+        assert!(!playlist.contains("URI=\"part0.mp4\""));
+        assert!(playlist.contains("#EXT-X-PART:DURATION=0.250,URI=\"part20.mp4\",INDEPENDENT=YES"));
+        assert!(playlist.contains("#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part32.mp4\""));
+        assert_eq!(
+            cache.get_segment_for_stream_id(77, 0).await,
+            Some(Bytes::from_static(
+                b"moof-mdat-00moof-mdat-01moof-mdat-02moof-mdat-03"
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn lossless_audio_routes_use_audio_mp4_codecs_and_gzip() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let cache = LiveTsCache::new(1, Duration::from_millis(250), 4, 32, 64).await;
+        cache
+            .commit_stream_payload(
+                77,
+                encode_test_canonical_fmp4_bundle_with_duration(
+                    77,
+                    0,
+                    Some(b"ftyp-fLaC-moov"),
+                    b"moof-mdat-flac",
+                    Some(250),
+                    false,
+                ),
+            )
+            .await
+            .unwrap();
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
+
+        for path in ["/live/77/init.mp4", "/live/77/part0.mp4"] {
+            let response = router
+                .route(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(path)
+                        .body(())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status, StatusCode::OK);
+            assert_eq!(response.content_type.as_deref(), Some("audio/mp4"));
+        }
+
+        let response = router
+            .route(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/live/77/master.m3u8")
+                    .header("accept-encoding", "br, gzip")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| { name == "content-encoding" && value == "gzip" }));
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| name == "vary" && value == "Accept-Encoding"));
+        let compressed = response.body.unwrap();
+        let mut decoder = GzDecoder::new(compressed.as_ref());
+        let mut playlist = String::new();
+        decoder.read_to_string(&mut playlist).unwrap();
+        assert!(playlist.starts_with("#EXTM3U\n#EXT-X-VERSION:10\n"));
+        assert!(playlist.contains("CODECS=\"fLaC\""));
+
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn h264_aac_master_playlist_advertises_rfc_6381_codecs() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(250), 4, 32, 64).await;
+        cache
+            .commit_stream_payload(
+                77,
+                encode_test_canonical_fmp4_bundle_with_duration(
+                    77,
+                    0,
+                    Some(&test_h264_aac_init()),
+                    b"moof-mdat-av",
+                    Some(250),
+                    true,
+                ),
+            )
+            .await
+            .unwrap();
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
+
+        let response = router
+            .route(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/live/77/master.m3u8")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        let playlist = String::from_utf8(response.body.unwrap().to_vec()).unwrap();
+        assert!(playlist.contains(
+            "#EXT-X-STREAM-INF:BANDWIDTH=4000000,CODECS=\"avc1.640033,mp4a.40.2\"\nstream.m3u8"
+        ));
 
         mesh.shutdown();
     }
@@ -15574,6 +16015,7 @@ mod tests {
         .unwrap();
         std::fs::write(temp_dir.join("app.js"), "export default {};").unwrap();
         std::fs::write(temp_dir.join("app_bg.wasm"), b"\0asm").unwrap();
+        std::fs::write(temp_dir.join("world-map.png"), b"\x89PNG\r\n\x1a\n").unwrap();
 
         let index = mission_control_asset_response_from_dir(&temp_dir, "/mesh").unwrap();
         assert_eq!(index.status, StatusCode::OK);
@@ -15596,6 +16038,8 @@ mod tests {
         );
         let wasm = mission_control_asset_response_from_dir(&temp_dir, "/app_bg.wasm").unwrap();
         assert_eq!(wasm.content_type.as_deref(), Some("application/wasm"));
+        let map = mission_control_asset_response_from_dir(&temp_dir, "/world-map.png").unwrap();
+        assert_eq!(map.content_type.as_deref(), Some("image/png"));
         assert!(mission_control_asset_response_from_dir(&temp_dir, "/live/stream.m3u8").is_none());
 
         let _ = std::fs::remove_dir_all(temp_dir);

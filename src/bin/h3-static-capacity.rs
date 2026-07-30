@@ -414,6 +414,7 @@ async fn run_capacity(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_step(
     edge: SocketAddr,
     server_name: &str,
