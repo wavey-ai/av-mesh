@@ -103,6 +103,7 @@ const DEFAULT_MESH_SYNC_INTERVAL_MS: u64 = 20;
 const DEFAULT_TELEMETRY_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_TELEMETRY_FEC_RATE_BPS: u64 = 32_000;
 const DEFAULT_HLS_FAILOVER_BANDWIDTH_BPS: u64 = 4_000_000;
+const DEFAULT_HLS_RENDITION_STALE_MS: u64 = 5_000;
 const MAX_TELEMETRY_FEC_TARGETS: usize = 16;
 const DEFAULT_UDP_SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_RELAY_DOWNSTREAM_CHILDREN: usize = 4;
@@ -782,6 +783,27 @@ struct Args {
     )]
     hls_failover_bandwidth_bps: u64,
 
+    /// Adaptive HLS rendition. Repeat as
+    /// MASTER_STREAM:STREAM:BANDWIDTH:AVERAGE_BANDWIDTH:WIDTHxHEIGHT:FRAME_RATE_MILLIHERTZ.
+    /// Only renditions with fresh media and an initialization segment are
+    /// advertised. Include the master stream itself to describe the source
+    /// rendition.
+    #[arg(
+        long = "hls-rendition",
+        env = "NEEDLETAIL_HLS_RENDITIONS",
+        value_delimiter = ';',
+        value_parser = parse_hls_rendition_spec
+    )]
+    hls_renditions: Vec<HlsRenditionSpec>,
+
+    /// Stop advertising a configured rendition after this much ingest silence.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_HLS_RENDITION_STALE_MS",
+        default_value_t = DEFAULT_HLS_RENDITION_STALE_MS
+    )]
+    hls_rendition_stale_ms: u64,
+
     #[arg(long)]
     edge_websocket: bool,
 
@@ -1415,7 +1437,8 @@ async fn main() -> Result<()> {
         telemetry_fec_monitor.clone(),
         private_discovery_status,
         args.operations_snapshot_file.clone(),
-    );
+    )
+    .with_hls_renditions(args.hls_renditions.clone(), args.hls_rendition_stale_ms);
     let telemetry_fec_sender = if let Some(queue) = telemetry_fec_queue.clone() {
         Some(
             start_telemetry_fec_sender(
@@ -1620,6 +1643,17 @@ impl Args {
         self.egress_min_sustained_seconds = self
             .egress_min_sustained_seconds
             .clamp(1, self.egress_window_seconds);
+        self.hls_rendition_stale_ms = self.hls_rendition_stale_ms.max(1);
+        let mut hls_rendition_streams = HashSet::with_capacity(self.hls_renditions.len());
+        for rendition in &self.hls_renditions {
+            if !hls_rendition_streams.insert((rendition.master_stream_id, rendition.stream_id)) {
+                bail!(
+                    "duplicate HLS rendition stream {} for master stream {}",
+                    rendition.stream_id,
+                    rendition.master_stream_id
+                );
+            }
+        }
         self.edge_min_per_region = self.edge_min_per_region.max(1);
         self.edge_max_per_region = self.edge_max_per_region.max(self.edge_min_per_region);
         self.edge_scale_up_readers = self.edge_scale_up_readers.max(1);
@@ -1873,6 +1907,46 @@ struct RelayFailoverControllerEndpoint {
     target: SocketAddr,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HlsRenditionSpec {
+    master_stream_id: u64,
+    stream_id: u64,
+    bandwidth_bps: u64,
+    average_bandwidth_bps: u64,
+    width: u32,
+    height: u32,
+    frame_rate_millihertz: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct HlsRenditionCatalog {
+    by_master_stream: HashMap<u64, Vec<HlsRenditionSpec>>,
+}
+
+impl HlsRenditionCatalog {
+    fn new(renditions: Vec<HlsRenditionSpec>) -> Self {
+        let mut by_master_stream: HashMap<u64, Vec<HlsRenditionSpec>> = HashMap::new();
+        for rendition in renditions {
+            by_master_stream
+                .entry(rendition.master_stream_id)
+                .or_default()
+                .push(rendition);
+        }
+        for variants in by_master_stream.values_mut() {
+            variants.sort_by_key(|variant| {
+                (std::cmp::Reverse(variant.bandwidth_bps), variant.stream_id)
+            });
+        }
+        Self { by_master_stream }
+    }
+
+    fn variants(&self, master_stream_id: u64) -> Option<&[HlsRenditionSpec]> {
+        self.by_master_stream
+            .get(&master_stream_id)
+            .map(Vec::as_slice)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 enum RelayForwardRole {
     #[default]
@@ -1939,6 +2013,55 @@ fn parse_relay_forward_endpoint(value: &str) -> std::result::Result<RelayForward
         .parse::<SocketAddr>()
         .map_err(|error| format!("invalid relay forward target {target}: {error}"))?;
     Ok(RelayForwardEndpoint { bind, target, role })
+}
+
+fn parse_hls_rendition_spec(value: &str) -> std::result::Result<HlsRenditionSpec, String> {
+    let fields = value.split(':').collect::<Vec<_>>();
+    if fields.len() != 6 {
+        return Err(
+            "expected MASTER_STREAM:STREAM:BANDWIDTH:AVERAGE_BANDWIDTH:WIDTHxHEIGHT:FRAME_RATE_MILLIHERTZ"
+                .to_owned(),
+        );
+    }
+    let parse_u64 = |field: &str, label: &str| {
+        field
+            .parse::<u64>()
+            .map_err(|error| format!("invalid HLS rendition {label} {field}: {error}"))
+            .and_then(|parsed| {
+                (parsed > 0)
+                    .then_some(parsed)
+                    .ok_or_else(|| format!("HLS rendition {label} must be positive"))
+            })
+    };
+    let parse_u32 = |field: &str, label: &str| {
+        field
+            .parse::<u32>()
+            .map_err(|error| format!("invalid HLS rendition {label} {field}: {error}"))
+            .and_then(|parsed| {
+                (parsed > 0)
+                    .then_some(parsed)
+                    .ok_or_else(|| format!("HLS rendition {label} must be positive"))
+            })
+    };
+    let master_stream_id = parse_u64(fields[0], "master stream")?;
+    let stream_id = parse_u64(fields[1], "stream")?;
+    let bandwidth_bps = parse_u64(fields[2], "bandwidth")?;
+    let average_bandwidth_bps = parse_u64(fields[3], "average bandwidth")?;
+    if average_bandwidth_bps > bandwidth_bps {
+        return Err("HLS rendition average bandwidth cannot exceed peak bandwidth".to_owned());
+    }
+    let (width, height) = fields[4]
+        .split_once('x')
+        .ok_or_else(|| "HLS rendition resolution must be WIDTHxHEIGHT".to_owned())?;
+    Ok(HlsRenditionSpec {
+        master_stream_id,
+        stream_id,
+        bandwidth_bps,
+        average_bandwidth_bps,
+        width: parse_u32(width, "width")?,
+        height: parse_u32(height, "height")?,
+        frame_rate_millihertz: parse_u32(fields[5], "frame rate millihertz")?,
+    })
 }
 
 fn parse_relay_failover_listener_endpoint(
@@ -10865,6 +10988,8 @@ struct AppRouter {
     lifecycle: NodeLifecycle,
     playback_base_url: Option<String>,
     hls_failover_bandwidth_bps: u64,
+    hls_renditions: Arc<HlsRenditionCatalog>,
+    hls_rendition_stale_ms: u64,
     edge_load: EdgeLoad,
     edge_lifecycle_config: EdgeLifecycleConfig,
     edge_lifecycle: Arc<StdMutex<EdgeLifecyclePlanner>>,
@@ -10917,6 +11042,8 @@ impl AppRouter {
             lifecycle,
             playback_base_url,
             hls_failover_bandwidth_bps: hls_failover_bandwidth_bps.max(1),
+            hls_renditions: Arc::new(HlsRenditionCatalog::default()),
+            hls_rendition_stale_ms: DEFAULT_HLS_RENDITION_STALE_MS,
             edge_load,
             edge_lifecycle_config: edge_lifecycle_config.normalized(),
             edge_lifecycle: Arc::new(StdMutex::new(EdgeLifecyclePlanner::default())),
@@ -10926,6 +11053,12 @@ impl AppRouter {
             private_discovery,
             operations_snapshot_file,
         }
+    }
+
+    fn with_hls_renditions(mut self, renditions: Vec<HlsRenditionSpec>, stale_ms: u64) -> Self {
+        self.hls_renditions = Arc::new(HlsRenditionCatalog::new(renditions));
+        self.hls_rendition_stale_ms = stale_ms.max(1);
+        self
     }
 
     async fn local_mesh_snapshot(&self) -> MeshSnapshot {
@@ -11062,6 +11195,46 @@ impl AppRouter {
         let overloaded = self.edge_load.admission_snapshot().overloaded;
         let alternatives = self.same_region_alternative_edges(media_path, None).await;
         let stream_id = parse_stream_playlist_path(media_path).unwrap_or(self.cache.stream_id);
+        if let Some(configured) = self.hls_renditions.variants(stream_id) {
+            let configured = configured.to_vec();
+            let mut active = Vec::with_capacity(configured.len());
+            for rendition in configured {
+                self.request_replica_for_stream(rendition.stream_id, "hls-rendition-demand", None)
+                    .await;
+                let Some(init) = self.fresh_hls_rendition_init(rendition.stream_id).await else {
+                    continue;
+                };
+                active.push((rendition, hls_codecs_from_init(&init)));
+            }
+
+            let mut variants = Vec::new();
+            if !overloaded {
+                variants.extend(active.iter().filter_map(|(rendition, codecs)| {
+                    make_hls_rendition_variant(
+                        format!("/live/{}/stream.m3u8", rendition.stream_id),
+                        *rendition,
+                        codecs.as_deref(),
+                    )
+                }));
+            } else {
+                for (rendition, codecs) in &active {
+                    let rendition_path = format!("/live/{}/stream.m3u8", rendition.stream_id);
+                    let rendition_alternatives = self
+                        .same_region_alternative_edges(&rendition_path, None)
+                        .await;
+                    variants.extend(rendition_alternatives.into_iter().filter_map(|uri| {
+                        make_hls_rendition_variant(uri, *rendition, codecs.as_deref())
+                    }));
+                }
+            }
+
+            let Ok(playlist) = MultivariantPlaylist::new(variants) else {
+                self.edge_load.record_rejection();
+                return hls_renditions_unavailable_response(&alternatives);
+            };
+            return playlist_response(playlist.render(), gzip).with_no_store();
+        }
+
         let codecs = self
             .cache
             .get_init_for_stream_id(stream_id)
@@ -11091,6 +11264,22 @@ impl AppRouter {
             return edge_overloaded_response(&alternatives);
         };
         playlist_response(playlist.render(), gzip).with_no_store()
+    }
+
+    async fn fresh_hls_rendition_init(&self, stream_id: u64) -> Option<Bytes> {
+        let now_ms = now_unix_ms();
+        let last_ingest_ms = self
+            .cache
+            .state
+            .read()
+            .await
+            .stream_last_ingest_unix_ms
+            .get(&stream_id)
+            .copied()?;
+        if now_ms.saturating_sub(last_ingest_ms) > self.hls_rendition_stale_ms {
+            return None;
+        }
+        self.cache.get_init_for_stream_id(stream_id).await
     }
 
     async fn orchestration_status(&self) -> OrchestrationStatus {
@@ -13031,6 +13220,49 @@ fn edge_overloaded_response(alternatives: &[String]) -> HandlerResponse {
     response
 }
 
+fn hls_renditions_unavailable_response(alternatives: &[String]) -> HandlerResponse {
+    let mut response = response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        Some(Bytes::from_static(
+            b"No configured HLS rendition is currently fresh. Retry after the source or rendition worker starts publishing.\n",
+        )),
+        Some("text/plain; charset=utf-8"),
+    )
+    .with_no_store();
+    response.headers.push(("retry-after".into(), "1".into()));
+    if !alternatives.is_empty() {
+        response.headers.push((
+            "link".into(),
+            alternatives
+                .iter()
+                .map(|url| format!("<{url}>; rel=\"alternate\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+                .into(),
+        ));
+    }
+    response
+}
+
+fn make_hls_rendition_variant(
+    uri: String,
+    rendition: HlsRenditionSpec,
+    codecs: Option<&str>,
+) -> Option<VariantStream> {
+    let mut variant = VariantStream::new(uri, rendition.bandwidth_bps)
+        .ok()?
+        .with_average_bandwidth(rendition.average_bandwidth_bps)
+        .ok()?
+        .with_resolution(rendition.width, rendition.height)
+        .ok()?
+        .with_frame_rate_millihertz(rendition.frame_rate_millihertz)
+        .ok()?;
+    if let Some(codecs) = codecs {
+        variant = variant.with_codecs(codecs).ok()?;
+    }
+    Some(variant)
+}
+
 fn mission_control_asset_response(path: &str) -> Option<HandlerResponse> {
     let dist_dir = std::env::var_os(MISSION_CONTROL_DIST_ENV).map(PathBuf::from)?;
     mission_control_asset_response_from_dir(&dist_dir, path)
@@ -14348,6 +14580,114 @@ mod tests {
         assert!(playlist.contains(
             "#EXT-X-STREAM-INF:BANDWIDTH=4000000,CODECS=\"avc1.640033,mp4a.40.2\"\nstream.m3u8"
         ));
+
+        mesh.shutdown();
+    }
+
+    #[test]
+    fn parses_hls_rendition_specs() {
+        assert_eq!(
+            parse_hls_rendition_spec("77:78:8000000:7000000:1920x1080:59940").unwrap(),
+            HlsRenditionSpec {
+                master_stream_id: 77,
+                stream_id: 78,
+                bandwidth_bps: 8_000_000,
+                average_bandwidth_bps: 7_000_000,
+                width: 1_920,
+                height: 1_080,
+                frame_rate_millihertz: 59_940,
+            }
+        );
+        assert!(parse_hls_rendition_spec("77:78:7000000:8000000:1920x1080:59940").is_err());
+        assert!(parse_hls_rendition_spec("77:78:8000000:7000000:1920:59940").is_err());
+        assert!(parse_hls_rendition_spec("77:78:8000000").is_err());
+    }
+
+    #[tokio::test]
+    async fn adaptive_master_advertises_only_fresh_configured_renditions() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(250), 4, 32, 64).await;
+        for stream_id in [77, 78, 79] {
+            cache
+                .commit_stream_payload(
+                    stream_id,
+                    encode_test_canonical_fmp4_bundle_with_duration(
+                        stream_id,
+                        0,
+                        Some(&test_h264_aac_init()),
+                        b"moof-mdat-av",
+                        Some(250),
+                        true,
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        cache
+            .state
+            .write()
+            .await
+            .stream_last_ingest_unix_ms
+            .insert(79, now_unix_ms().saturating_sub(2_000));
+
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh))
+            .with_hls_renditions(
+                vec![
+                    parse_hls_rendition_spec("77:77:18000000:16000000:3840x2160:59940").unwrap(),
+                    parse_hls_rendition_spec("77:78:8000000:7000000:1920x1080:59940").unwrap(),
+                    parse_hls_rendition_spec("77:79:4000000:3500000:1280x720:59940").unwrap(),
+                ],
+                1_000,
+            );
+
+        let response = router
+            .route(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/live/77/master.m3u8")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        let playlist = String::from_utf8(response.body.unwrap().to_vec()).unwrap();
+        assert!(playlist.contains(
+            "#EXT-X-STREAM-INF:BANDWIDTH=18000000,AVERAGE-BANDWIDTH=16000000,CODECS=\"avc1.640033,mp4a.40.2\",RESOLUTION=3840x2160,FRAME-RATE=59.940\n/live/77/stream.m3u8"
+        ));
+        assert!(playlist.contains(
+            "#EXT-X-STREAM-INF:BANDWIDTH=8000000,AVERAGE-BANDWIDTH=7000000,CODECS=\"avc1.640033,mp4a.40.2\",RESOLUTION=1920x1080,FRAME-RATE=59.940\n/live/78/stream.m3u8"
+        ));
+        assert!(!playlist.contains("/live/79/stream.m3u8"));
+
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn adaptive_master_is_unavailable_until_a_configured_rendition_is_fresh() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(250), 4, 32, 64).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh))
+            .with_hls_renditions(
+                vec![parse_hls_rendition_spec("77:77:18000000:16000000:3840x2160:59940").unwrap()],
+                1_000,
+            );
+
+        let response = router
+            .route(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/live/77/master.m3u8")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| name == "retry-after" && value == "1"));
 
         mesh.shutdown();
     }
