@@ -128,6 +128,12 @@ const MESH_EVENTS_PATH: &str = "/api/mesh/events";
 const MESH_WEBSOCKET_PATH: &str = "/ws/mesh";
 const MISSION_CONTROL_DIST_ENV: &str = "NEEDLETAIL_MISSION_CONTROL_DIST";
 const PLAYER_DIST_ENV: &str = "NEEDLETAIL_PLAYER_DIST";
+const OPERATIONS_SNAPSHOT_SCHEMA: &str = "needletail.operations-snapshot.v1";
+const OPERATIONS_CONTROLLER_AUTHORITY: &str = "needletail-controller";
+const MAX_OPERATIONS_SNAPSHOT_BYTES: u64 = 8 * 1024 * 1024;
+const OPERATIONS_SNAPSHOT_STALE_MS: u64 = 10_000;
+const OPERATIONS_LEASE_SAFETY_MARGIN_MS: u64 = 1_000;
+const OPERATIONS_WELL_KNOWN_PATH: &str = "/.well-known/needletail-operations";
 const MESH_METRICS_PATH: &str = "/metrics";
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 const MEDIA_ACCESS_UNIT_CONTENT_TYPE: &str = "application/vnd.wavey.media-access-unit";
@@ -933,6 +939,10 @@ struct Args {
     #[arg(long = "telemetry-peer")]
     telemetry_peers: Vec<String>,
 
+    /// Serve this quorum-elected canonical document from `/api/mesh`.
+    #[arg(long, env = "NEEDLETAIL_OPERATIONS_SNAPSHOT_FILE")]
+    operations_snapshot_file: Option<PathBuf>,
+
     /// Receive bounded RaptorQ fleet snapshots on this UDP socket.
     #[arg(long)]
     telemetry_fec_bind: Option<SocketAddr>,
@@ -1404,6 +1414,7 @@ async fn main() -> Result<()> {
         telemetry_peer_monitor.clone(),
         telemetry_fec_monitor.clone(),
         private_discovery_status,
+        args.operations_snapshot_file.clone(),
     );
     let telemetry_fec_sender = if let Some(queue) = telemetry_fec_queue.clone() {
         Some(
@@ -10861,6 +10872,7 @@ struct AppRouter {
     telemetry_peers: TelemetryPeerMonitor,
     telemetry_fec: TelemetryFecMonitor,
     private_discovery: PrivateDiscoveryStatus,
+    operations_snapshot_file: Option<PathBuf>,
 }
 
 impl AppRouter {
@@ -10887,6 +10899,7 @@ impl AppRouter {
         telemetry_peers: TelemetryPeerMonitor,
         telemetry_fec: TelemetryFecMonitor,
         private_discovery: PrivateDiscoveryStatus,
+        operations_snapshot_file: Option<PathBuf>,
     ) -> Self {
         Self {
             cache,
@@ -10911,6 +10924,7 @@ impl AppRouter {
             telemetry_peers,
             telemetry_fec,
             private_discovery,
+            operations_snapshot_file,
         }
     }
 
@@ -11749,6 +11763,17 @@ impl Router for AppRouter {
                 Ok(mission_control_asset_response(path)
                     .unwrap_or_else(mission_control_setup_response))
             }
+            OPERATIONS_WELL_KNOWN_PATH => match self.operations_snapshot_file.as_deref() {
+                Some(path) => Ok(operations_discovery_response(path)),
+                None => Ok(response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Some(Bytes::from_static(
+                        b"Global Operations discovery is not configured.\n",
+                    )),
+                    Some("text/plain; charset=utf-8"),
+                )
+                .with_no_store()),
+            },
             "/up" => Ok(response(
                 StatusCode::OK,
                 Some(Bytes::from_static(b"OK")),
@@ -11786,7 +11811,7 @@ impl Router for AppRouter {
                 )
                 .with_no_store())
             }
-            "/api/mesh" => {
+            "/api/mesh/local" => {
                 let snapshot = self.mesh_api_snapshot().await;
                 let json = serde_json::to_vec(&snapshot)
                     .map_err(|err| ServerError::Handler(Box::new(err)))?;
@@ -11797,6 +11822,20 @@ impl Router for AppRouter {
                 )
                 .with_no_store())
             }
+            "/api/mesh" => match self.operations_snapshot_file.as_deref() {
+                Some(path) => Ok(operations_snapshot_response(path)),
+                None => {
+                    let snapshot = self.mesh_api_snapshot().await;
+                    let json = serde_json::to_vec(&snapshot)
+                        .map_err(|err| ServerError::Handler(Box::new(err)))?;
+                    Ok(response(
+                        StatusCode::OK,
+                        Some(Bytes::from(json)),
+                        Some("application/json"),
+                    )
+                    .with_no_store())
+                }
+            },
             MESH_METRICS_PATH => Ok(response(
                 StatusCode::OK,
                 Some(self.prometheus_metrics().await),
@@ -13006,6 +13045,132 @@ fn mission_control_setup_response() -> HandlerResponse {
         Some("text/plain; charset=utf-8"),
     )
     .with_no_store()
+}
+
+fn operations_snapshot_response(path: &Path) -> HandlerResponse {
+    match read_current_operations_snapshot(path, now_unix_ms()) {
+        Ok(bytes) => response(
+            StatusCode::OK,
+            Some(Bytes::from(bytes)),
+            Some("application/json"),
+        )
+        .with_no_store(),
+        Err(error) => response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some(Bytes::from(format!(
+                "Global Operations snapshot unavailable: {error}\n"
+            ))),
+            Some("text/plain; charset=utf-8"),
+        )
+        .with_no_store(),
+    }
+}
+
+fn operations_discovery_response(path: &Path) -> HandlerResponse {
+    let bytes = match read_current_operations_snapshot(path, now_unix_ms()) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some(Bytes::from(format!(
+                    "Global Operations discovery unavailable: {error}\n"
+                ))),
+                Some("text/plain; charset=utf-8"),
+            )
+            .with_no_store();
+        }
+    };
+    let endpoint = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|snapshot| {
+            snapshot
+                .pointer("/orchestration/collector/public_endpoint")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    let Some(endpoint) = endpoint.filter(|endpoint| {
+        endpoint.starts_with("https://")
+            && endpoint.ends_with("/mesh")
+            && !endpoint
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+            && !endpoint.contains(['?', '#', '\\', '@'])
+    }) else {
+        return response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some(Bytes::from_static(
+                b"Global Operations discovery has no safe collector endpoint.\n",
+            )),
+            Some("text/plain; charset=utf-8"),
+        )
+        .with_no_store();
+    };
+    let mut redirect = response(
+        StatusCode::TEMPORARY_REDIRECT,
+        Some(Bytes::from_static(b"Temporary Redirect\n")),
+        Some("text/plain; charset=utf-8"),
+    )
+    .with_no_store();
+    redirect.headers.push(("location".into(), endpoint.into()));
+    redirect
+}
+
+fn read_current_operations_snapshot(
+    path: &Path,
+    now_unix_ms: u64,
+) -> std::result::Result<Vec<u8>, &'static str> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| "snapshot file is missing")?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > MAX_OPERATIONS_SNAPSHOT_BYTES
+    {
+        return Err("snapshot file is not a bounded regular file");
+    }
+    let bytes = std::fs::read(path).map_err(|_| "snapshot file cannot be read")?;
+    if bytes.len() as u64 > MAX_OPERATIONS_SNAPSHOT_BYTES {
+        return Err("snapshot file exceeds its size limit");
+    }
+    let snapshot =
+        serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|_| "snapshot is invalid")?;
+    if snapshot.get("schema").and_then(serde_json::Value::as_str)
+        != Some(OPERATIONS_SNAPSHOT_SCHEMA)
+        || snapshot
+            .pointer("/orchestration/collector/authority")
+            .and_then(serde_json::Value::as_str)
+            != Some(OPERATIONS_CONTROLLER_AUTHORITY)
+        || snapshot
+            .pointer("/orchestration/collector/quorum_healthy")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        || snapshot
+            .pointer("/orchestration/collector/term")
+            .and_then(serde_json::Value::as_u64)
+            .is_none_or(|term| term == 0)
+        || snapshot
+            .pointer("/orchestration/collector/fencing_generation")
+            .and_then(serde_json::Value::as_u64)
+            .is_none_or(|generation| generation == 0)
+    {
+        return Err("snapshot does not contain a committed collector proof");
+    }
+    let updated_unix_ms = snapshot
+        .get("updated_unix_ms")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("snapshot freshness is missing")?;
+    if updated_unix_ms > now_unix_ms.saturating_add(1_000)
+        || now_unix_ms.saturating_sub(updated_unix_ms) > OPERATIONS_SNAPSHOT_STALE_MS
+    {
+        return Err("snapshot is stale");
+    }
+    let age_ms = now_unix_ms.saturating_sub(updated_unix_ms);
+    let lease_remaining_ms = snapshot
+        .pointer("/orchestration/collector/lease_remaining_ms")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("snapshot lease is missing")?;
+    if lease_remaining_ms <= age_ms.saturating_add(OPERATIONS_LEASE_SAFETY_MARGIN_MS) {
+        return Err("snapshot collector lease expired");
+    }
+    Ok(bytes)
 }
 
 fn mission_control_asset_response_from_dir(dist_dir: &Path, path: &str) -> Option<HandlerResponse> {
@@ -16042,6 +16207,52 @@ mod tests {
         assert_eq!(map.content_type.as_deref(), Some("image/png"));
         assert!(mission_control_asset_response_from_dir(&temp_dir, "/live/stream.m3u8").is_none());
 
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn global_operations_snapshot_requires_a_fresh_committed_lease() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "needletail-operations-snapshot-test-{}",
+            now_unix_ms()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let path = temp_dir.join("snapshot.json");
+        let now = now_unix_ms();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": OPERATIONS_SNAPSHOT_SCHEMA,
+                "updated_unix_ms": now - 500,
+                "orchestration": {
+                    "collector": {
+                        "authority": OPERATIONS_CONTROLLER_AUTHORITY,
+                        "quorum_healthy": true,
+                        "term": 7,
+                        "fencing_generation": 9,
+                        "lease_remaining_ms": 8_000,
+                        "public_endpoint": "https://ops-london.example.com/mesh"
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(read_current_operations_snapshot(&path, now).is_ok());
+        let discovery = operations_discovery_response(&path);
+        assert_eq!(discovery.status, StatusCode::TEMPORARY_REDIRECT);
+        assert!(discovery.headers.iter().any(|(name, value)| {
+            name == "location" && value == "https://ops-london.example.com/mesh"
+        }));
+
+        let mut stale: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        stale["orchestration"]["collector"]["lease_remaining_ms"] = serde_json::json!(1_000);
+        std::fs::write(&path, serde_json::to_vec(&stale).unwrap()).unwrap();
+        assert_eq!(
+            read_current_operations_snapshot(&path, now).unwrap_err(),
+            "snapshot collector lease expired"
+        );
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
@@ -20661,6 +20872,7 @@ mod tests {
             monitor,
             TelemetryFecMonitor::default(),
             PrivateDiscoveryStatus::default(),
+            None,
         )
     }
 
