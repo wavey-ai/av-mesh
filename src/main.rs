@@ -1,6 +1,7 @@
 mod control;
 mod edge_admission;
 mod edge_lifecycle;
+mod link_telemetry;
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -34,6 +35,7 @@ use edge_admission::{
 use edge_lifecycle::{
     EdgeLifecycleAction, EdgeLifecycleConfig, EdgeLifecycleNode, EdgeLifecyclePlanner,
 };
+use link_telemetry::{LinkObservation, LinkTelemetry};
 use flate2::{write::GzEncoder, Compression};
 use futures_util::{future::join_all, SinkExt, StreamExt};
 use h3_webtransport::server::{AcceptedBi, WebTransportSession};
@@ -1259,6 +1261,14 @@ async fn main() -> Result<()> {
         args.slot_kb,
     )
     .await;
+    let link_telemetry = Arc::new(LinkTelemetry::new(
+        node_id.clone(),
+        args.relay_primary_peer
+            .map(|peer| (args.relay_primary_id.clone(), peer)),
+        args.relay_secondary_peer
+            .map(|peer| (args.relay_secondary_id.clone(), peer)),
+    ));
+    cache.set_link_telemetry(Arc::clone(&link_telemetry));
 
     let mesh_transport = MeshTransportConfigSnapshot {
         sync_interval_ms: args.mesh_sync_interval_ms,
@@ -1304,6 +1314,7 @@ async fn main() -> Result<()> {
     );
 
     let (ingest_shutdown_tx, ingest_shutdown_rx) = watch::channel(());
+    link_telemetry.start(ingest_shutdown_rx.clone());
 
     #[cfg(feature = "private-subnet-discovery")]
     let private_subnet_discovery = if args.private_subnet_discovery {
@@ -1378,6 +1389,7 @@ async fn main() -> Result<()> {
             audio_epochs: Some(audio_epoch_tx.clone()),
             failover_controller: relay_failover_controller,
             failover_heartbeat: Duration::from_millis(args.relay_failover_heartbeat_ms),
+            link_telemetry: Some(link_telemetry),
         },
     ));
 
@@ -3258,6 +3270,7 @@ struct RelayIngestRuntime {
     audio_epochs: Option<broadcast::Sender<AudioEpochDatagram>>,
     failover_controller: Option<RelayFailoverController>,
     failover_heartbeat: Duration,
+    link_telemetry: Option<Arc<LinkTelemetry>>,
 }
 
 fn take_relay_deadline_drop_delta(reported_total: &mut u64, current_total: u64) -> Option<u64> {
@@ -3279,6 +3292,7 @@ async fn run_udp_fec_ingest(
         audio_epochs,
         failover_controller: mut relay_failover_controller,
         failover_heartbeat,
+        link_telemetry,
     } = runtime;
     let mut receiver = UdpFecReceiver::new();
     let mut audio_block_sessions = HashMap::<u32, (u64, Instant)>::new();
@@ -3356,6 +3370,9 @@ async fn run_udp_fec_ingest(
             }
             received = socket.recv_from(&mut buf) => {
                 let (len, peer) = received?;
+                if let Some(telemetry) = &link_telemetry {
+                    telemetry.record_primary_bytes(peer, len);
+                }
                 if native_audio_relay
                     .handle_control(&socket, peer, &buf[..len])
                     .await
@@ -3389,6 +3406,9 @@ async fn run_udp_fec_ingest(
             }
             received = recv_optional_udp(&relay_secondary_socket, &mut relay_secondary_buf) => {
                 let (len, peer) = received?;
+                if let Some(telemetry) = &link_telemetry {
+                    telemetry.record_secondary_bytes(peer, len);
+                }
                 if process_relay_audio_epoch_datagram(
                     peer,
                     &relay_secondary_buf[..len],
@@ -4046,6 +4066,7 @@ struct LiveTsCache {
     relay_failover_controller: StdRwLock<RelayFailoverControllerSnapshot>,
     relay_processing: AtomicDurationHistogram,
     relay_availability: RelayAvailabilityTelemetry,
+    link_telemetry: StdRwLock<Option<Arc<LinkTelemetry>>>,
 }
 
 impl LiveTsCache {
@@ -4084,7 +4105,23 @@ impl LiveTsCache {
             relay_failover_controller: StdRwLock::new(RelayFailoverControllerSnapshot::default()),
             relay_processing: AtomicDurationHistogram::default(),
             relay_availability: RelayAvailabilityTelemetry::default(),
+            link_telemetry: StdRwLock::new(None),
         })
+    }
+
+    fn set_link_telemetry(&self, telemetry: Arc<LinkTelemetry>) {
+        *self
+            .link_telemetry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(telemetry);
+    }
+
+    fn link_observations(&self) -> Vec<LinkObservation> {
+        self.link_telemetry
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map_or_else(Vec::new, |telemetry| telemetry.snapshot())
     }
 
     fn update_relay_ingress(&self, snapshot: RelayIngressSnapshot) {
@@ -5925,6 +5962,7 @@ impl LiveTsCache {
             mesh_addr: Some(mesh.local_addr().to_string()),
             edge_service: None,
             relay_session: self.relay_ingress_snapshot(),
+            link_observations: self.link_observations(),
             peers: stats
                 .mesh_peers
                 .iter()
@@ -6220,6 +6258,8 @@ struct MeshSnapshot {
     edge_service: Option<EdgeServiceSnapshot>,
     #[serde(default)]
     relay_session: RelaySessionIngressSnapshot,
+    #[serde(default)]
+    link_observations: Vec<LinkObservation>,
     peers: Vec<PeerSnapshot>,
     stream: StatsSnapshot,
     #[serde(default)]
@@ -6242,6 +6282,7 @@ struct MeshApiSnapshot {
     mesh_fec: MeshFecRuntimeSnapshot,
     llhls_runtime: LlhlsRuntimeSnapshot,
     relay_session: RelaySessionIngressSnapshot,
+    link_observations: Vec<LinkObservation>,
     relay_nodes: Vec<RelayNodeSessionSnapshot>,
     peers: Vec<PeerSnapshot>,
     stream: StatsSnapshot,
@@ -7947,6 +7988,7 @@ impl MeshApiSnapshot {
         let mut edge_services = Vec::with_capacity(snapshots.len());
         let mut relay_nodes = Vec::with_capacity(snapshots.len());
         let mut connections = Vec::new();
+        let mut link_observations = Vec::new();
         let mut streams = Vec::with_capacity(snapshots.len());
         let mut peer_addr_to_node_id = HashMap::with_capacity(snapshots.len() * 2);
 
@@ -7959,6 +8001,7 @@ impl MeshApiSnapshot {
         }
 
         for snapshot in snapshots {
+            link_observations.extend(snapshot.link_observations.iter().cloned());
             aggregate.node_count += 1;
             aggregate.total_storage_bytes = aggregate
                 .total_storage_bytes
@@ -8015,6 +8058,18 @@ impl MeshApiSnapshot {
                 .then_with(|| left.target_node_id.cmp(&right.target_node_id))
         });
         connections.dedup();
+        link_observations.sort_by(|left, right| {
+            left.from_node_id
+                .cmp(&right.from_node_id)
+                .then_with(|| left.to_node_id.cmp(&right.to_node_id))
+                .then_with(|| left.role.cmp(&right.role))
+                .then_with(|| right.observed_unix_ms.cmp(&left.observed_unix_ms))
+        });
+        link_observations.dedup_by(|left, right| {
+            left.from_node_id == right.from_node_id
+                && left.to_node_id == right.to_node_id
+                && left.role == right.role
+        });
         relay_nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
         aggregate.connection_count = connections.len();
         let topology = TopologyConfidenceSnapshot::from_connections(&connections);
@@ -8049,6 +8104,7 @@ impl MeshApiSnapshot {
             mesh_fec: MeshFecRuntimeSnapshot::default(),
             llhls_runtime: LlhlsRuntimeSnapshot::default(),
             relay_session,
+            link_observations,
             relay_nodes,
             peers: local.peers,
             stream: local.stream,
@@ -19825,6 +19881,7 @@ mod tests {
                 audio_epochs: None,
                 failover_controller: None,
                 failover_heartbeat: Duration::from_millis(100),
+                link_telemetry: None,
             },
         ));
         let mut sender = UdpFecSender::new(bind).await.unwrap();
@@ -19940,7 +19997,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_fabric_forwards_exact_aep1_source_and_repair_to_the_edge() {
+    async fn relay_fabric_forwards_exact_soundkit_v2_aep1_source_and_repair_to_the_edge() {
         use raptorq_datagram_fec::{
             AudioPayloadKind, AudioSampleFormat, MultichannelAudioEpoch,
             MultichannelAudioFecConfig, MultichannelAudioFecEncoder, MultichannelAudioGroup,
@@ -19975,15 +20032,15 @@ mod tests {
                 ..MultichannelAudioFecConfig::default()
             },
         ));
-        let pcm = vec![9_u8; 2_400];
+        let soundkit_v2 = vec![9_u8; 2_400];
         let groups = [MultichannelAudioGroup {
             group_id: 3,
             channel_start: 48,
             channel_count: 2,
-            payload_kind: AudioPayloadKind::Pcm,
-            sample_format: AudioSampleFormat::S24Le,
+            payload_kind: AudioPayloadKind::SoundKitV2,
+            sample_format: AudioSampleFormat::Unspecified,
             flags: 0,
-            payload: &pcm,
+            payload: &soundkit_v2,
         }];
         let encoded = encoder
             .encode_epoch(MultichannelAudioEpoch {
@@ -20323,6 +20380,7 @@ mod tests {
                 audio_epochs: None,
                 failover_controller: None,
                 failover_heartbeat: Duration::from_millis(100),
+                link_telemetry: None,
             },
         ));
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -20451,6 +20509,7 @@ mod tests {
                 audio_epochs: None,
                 failover_controller: None,
                 failover_heartbeat: Duration::from_millis(100),
+                link_telemetry: None,
             },
         ));
 
@@ -21265,6 +21324,7 @@ mod tests {
             mesh_addr: Some(node_id.into()),
             edge_service: None,
             relay_session: RelaySessionIngressSnapshot::default(),
+            link_observations: Vec::new(),
             peers,
             stream: StatsSnapshot {
                 stream_id,

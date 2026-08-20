@@ -58,3 +58,6 @@ web-service = { package = "av-web-service", git = "https://github.com/wavey-ai/w
 base64 = "0.22"
 ed25519-dalek = "2.2"
 rcgen = "0.13"
+
+[patch.crates-io]
+raptorq-datagram-fec = { path = "../raptor-fec/crates/raptorq-datagram-fec" }

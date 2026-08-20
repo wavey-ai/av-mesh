@@ -3185,8 +3185,6 @@ checksum = "4d4215fb79ef19442a0c71616aabb0715a386e6a16ed9031775ee3e3f20e7502"
 [[package]]
 name = "raptorq-datagram-fec"
 version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8aef794a9c41cf367daa21ced02d91bd828e33411b01c9ea14c81d1a90e8979"
 dependencies = [
  "bytes",
  "crc32fast",
