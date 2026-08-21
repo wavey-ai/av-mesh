@@ -35,12 +35,12 @@ use edge_admission::{
 use edge_lifecycle::{
     EdgeLifecycleAction, EdgeLifecycleConfig, EdgeLifecycleNode, EdgeLifecyclePlanner,
 };
-use link_telemetry::{LinkObservation, LinkTelemetry};
 use flate2::{write::GzEncoder, Compression};
 use futures_util::{future::join_all, SinkExt, StreamExt};
 use h3_webtransport::server::{AcceptedBi, WebTransportSession};
 use http::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use link_telemetry::{LinkObservation, LinkTelemetry};
 #[cfg(feature = "linode-provisioner")]
 use linode::{regions::REGIONS as LINODE_REGIONS, LinodeClient};
 use media_object::{MediaObject, ObjectKind, Stage, WIRE_MAGIC};
@@ -68,6 +68,7 @@ use relay_session::{
 };
 use serde::{de, Deserialize, Serialize};
 use socket2::SockRef;
+use soundkit_fmp4::{rebox_soundkit_v2, ReboxOptions, SoundKitFmp4Codec};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -155,6 +156,9 @@ const NATIVE_AUDIO_UNSUBSCRIBE: &[u8] = b"WAVEY-DAW-UNSUBSCRIBE/1";
 const NATIVE_AUDIO_UNSUBSCRIBE_V2_PREFIX: &[u8] = b"WAVEY-DAW-UNSUBSCRIBE/2 ";
 const NATIVE_AUDIO_SUBSCRIPTION_TTL: Duration = Duration::from_secs(15);
 const MULTICHANNEL_AUDIO_TRANSPORT_MAGIC: &[u8] = b"AEP1";
+const SOUNDKIT_V2_BUNDLE_MAGIC: &[u8; 8] = b"NTV2PART";
+const SOUNDKIT_V2_BUNDLE_HEADER_LEN: usize = 21;
+const SOUNDKIT_V2_EPOCH_DURATION_MS: u64 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AudioEpochDatagram {
@@ -540,6 +544,106 @@ impl LiveSlotPayload {
             Self::Invalid => false,
         }
     }
+}
+
+#[derive(Debug)]
+struct ReboxedLiveAudio {
+    init: Bytes,
+    media: Bytes,
+    duration_ms: u32,
+}
+
+fn rebox_soundkit_v2_bundle(payload: &[u8], sequence: u64) -> Result<ReboxedLiveAudio> {
+    if payload.len() < SOUNDKIT_V2_BUNDLE_HEADER_LEN
+        || !payload.starts_with(SOUNDKIT_V2_BUNDLE_MAGIC)
+    {
+        bail!("Soundkit v2 bundle has an invalid header");
+    }
+    let codec = match payload[8] {
+        1 => SoundKitFmp4Codec::Flac,
+        2 => SoundKitFmp4Codec::Opus,
+        tag => bail!("Soundkit v2 bundle has unsupported codec tag {tag}"),
+    };
+    let epoch_count = u64::from_be_bytes(payload[9..17].try_into().unwrap());
+    let base_group_id = u16::from_be_bytes(payload[17..19].try_into().unwrap());
+    let track_count = u16::from_be_bytes(payload[19..21].try_into().unwrap());
+    if epoch_count == 0 || track_count == 0 {
+        bail!("Soundkit v2 bundle declares no epochs or tracks");
+    }
+    if track_count != 1 {
+        bail!(
+            "Soundkit v2 HLS publication currently requires one track per canonical stream; bundle has {track_count}"
+        );
+    }
+
+    let mut offset = SOUNDKIT_V2_BUNDLE_HEADER_LEN;
+    let mut framed = Vec::new();
+    for epoch in 0..epoch_count {
+        let entry_header_end = offset
+            .checked_add(6)
+            .context("Soundkit v2 bundle entry header overflow")?;
+        if entry_header_end > payload.len() {
+            bail!("Soundkit v2 bundle ended before epoch {epoch}");
+        }
+        let group_id = u16::from_be_bytes(payload[offset..offset + 2].try_into().unwrap());
+        let frame_len =
+            u32::from_be_bytes(payload[offset + 2..entry_header_end].try_into().unwrap()) as usize;
+        if group_id != base_group_id {
+            bail!("Soundkit v2 bundle epoch {epoch} changed group identity");
+        }
+        offset = entry_header_end;
+        let frame_end = offset
+            .checked_add(frame_len)
+            .context("Soundkit v2 bundle frame length overflow")?;
+        if frame_end > payload.len() {
+            bail!("Soundkit v2 bundle epoch {epoch} frame is truncated");
+        }
+        framed.extend_from_slice(&payload[offset..frame_end]);
+        offset = frame_end;
+    }
+    if offset != payload.len() {
+        bail!("Soundkit v2 bundle has trailing bytes");
+    }
+
+    let start_pts_ms = sequence
+        .checked_mul(epoch_count)
+        .and_then(|value| value.checked_mul(SOUNDKIT_V2_EPOCH_DURATION_MS))
+        .context("Soundkit v2 publication timeline overflow")?;
+    let reboxed = rebox_soundkit_v2(
+        &framed,
+        ReboxOptions {
+            sequence: u32::try_from(sequence).context("fMP4 sequence exceeds u32")?,
+            include_init: true,
+            start_pts_ms: Some(start_pts_ms),
+        },
+    )
+    .map_err(|error| anyhow!("Soundkit v2 rebox failed: {error}"))?;
+    if reboxed.codec != codec {
+        bail!(
+            "Soundkit v2 bundle codec {} disagrees with framed codec {}",
+            codec.name(),
+            reboxed.codec.name()
+        );
+    }
+    Ok(ReboxedLiveAudio {
+        init: reboxed
+            .init
+            .context("Soundkit v2 rebox did not return fMP4 initialization")?,
+        media: reboxed.media,
+        duration_ms: reboxed.duration_ms,
+    })
+}
+
+fn encode_fmp4_slot(init: &[u8], media: &[u8]) -> Result<Bytes> {
+    let init_len = u32::try_from(init.len()).context("fMP4 init is too large")?;
+    let media_len = u32::try_from(media.len()).context("fMP4 fragment is too large")?;
+    let mut slot = BytesMut::with_capacity(MESH_FMP4_SLOT_HEADER_LEN + init.len() + media.len());
+    slot.put_slice(MESH_FMP4_SLOT_MAGIC);
+    slot.put_u32(init_len);
+    slot.put_u32(media_len);
+    slot.put_slice(init);
+    slot.put_slice(media);
+    Ok(slot.freeze())
 }
 
 fn encode_canonical_live_slot(
@@ -4381,13 +4485,27 @@ impl LiveTsCache {
 
             let seq = object.key().object();
             let kind = object.kind();
-            let media_bytes = object.payload().len();
-            let media_duration_ms = object
+            let is_soundkit_v2_bundle = object
                 .metadata()
-                .get("duration-ms")
-                .and_then(|value| std::str::from_utf8(value).ok())
-                .and_then(|value| value.parse::<u32>().ok())
-                .filter(|duration_ms| *duration_ms > 0);
+                .get("payload-format")
+                .is_some_and(|format| format.as_slice() == b"soundkit-v2-bundle");
+            let reboxed_audio = (kind == ObjectKind::Media && is_soundkit_v2_bundle)
+                .then(|| rebox_soundkit_v2_bundle(object.payload(), seq))
+                .transpose()?;
+            let media_bytes = reboxed_audio
+                .as_ref()
+                .map_or_else(|| object.payload().len(), |reboxed| reboxed.media.len());
+            let media_duration_ms = reboxed_audio
+                .as_ref()
+                .map(|reboxed| reboxed.duration_ms)
+                .or_else(|| {
+                    object
+                        .metadata()
+                        .get("duration-ms")
+                        .and_then(|value| std::str::from_utf8(value).ok())
+                        .and_then(|value| value.parse::<u32>().ok())
+                        .filter(|duration_ms| *duration_ms > 0)
+                });
             let is_fmp4 = object
                 .metadata()
                 .get("container")
@@ -4400,7 +4518,7 @@ impl LiveTsCache {
                     .metadata()
                     .get("payload-format")
                     .is_some_and(|format| format.as_slice() == b"opaque-part-v1");
-            let media_kind = if is_fmp4 {
+            let media_kind = if reboxed_audio.is_some() || is_fmp4 {
                 LiveMediaKind::Fmp4
             } else if is_opaque {
                 LiveMediaKind::Opaque
@@ -4417,6 +4535,9 @@ impl LiveTsCache {
                 state.stream_last_ingest_unix_ms.insert(stream_id, now_ms);
                 state.observe_stream_seq(stream_id, seq);
                 state.stream_media_kinds.insert(stream_id, media_kind);
+                if let Some(reboxed) = &reboxed_audio {
+                    state.stream_inits.insert(stream_id, reboxed.init.clone());
+                }
                 if matches!(
                     kind,
                     ObjectKind::Initialization | ObjectKind::CodecConfiguration
@@ -4425,6 +4546,15 @@ impl LiveTsCache {
                         .stream_inits
                         .insert(stream_id, Bytes::copy_from_slice(object.payload()));
                 }
+            }
+
+            if let Some(reboxed) = &reboxed_audio {
+                self.chunk_cache
+                    .set_stream_initialization(stream_id, reboxed.init.clone())
+                    .await
+                    .map_err(|err| {
+                        anyhow!("Soundkit fMP4 initialization cache write failed: {err}")
+                    })?;
             }
 
             if matches!(
@@ -4460,13 +4590,19 @@ impl LiveTsCache {
                 .unwrap_or(seq);
             let subscription_base_object = usize::try_from(subscription_base_object)
                 .context("stream subscription base object is too large")?;
+            let cached_payload = if let Some(reboxed) = &reboxed_audio {
+                encode_fmp4_slot(&reboxed.init, &reboxed.media)?
+            } else {
+                encode_canonical_live_slot(stream_id, &object, payload, media_kind)?
+            };
+            let cached_bytes = cached_payload.len();
             let write_result = self
                 .chunk_cache
                 .put_if_absent_contiguous_for_stream_id(
                     stream_id,
                     slot_id,
                     subscription_base_object,
-                    encode_canonical_live_slot(stream_id, &object, payload, media_kind)?,
+                    cached_payload,
                 )
                 .await
                 .map_err(|err| anyhow!("canonical stream cache write failed: {err}"))?;
@@ -4494,7 +4630,7 @@ impl LiveTsCache {
             state.record_part_available(
                 stream_id,
                 seq,
-                bytes,
+                cached_bytes,
                 now_unix_us(),
                 media_duration_ms,
                 object.is_keyframe(),
