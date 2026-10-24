@@ -79,12 +79,7 @@ struct LinkState {
 }
 
 impl LinkState {
-    fn new(
-        from_node_id: String,
-        to_node_id: String,
-        role: LinkRole,
-        peer: SocketAddr,
-    ) -> Self {
+    fn new(from_node_id: String, to_node_id: String, role: LinkRole, peer: SocketAddr) -> Self {
         Self {
             from_node_id,
             to_node_id,
@@ -113,10 +108,8 @@ impl LinkState {
             let elapsed_ms = observed_unix_ms.saturating_sub(probe.last_rate_sample_unix_ms);
             if elapsed_ms > 0 {
                 let received = total_bytes.saturating_sub(probe.last_total_bytes);
-                probe.throughput_bps = received
-                    .saturating_mul(8)
-                    .saturating_mul(1_000)
-                    / elapsed_ms;
+                probe.throughput_bps =
+                    received.saturating_mul(8).saturating_mul(1_000) / elapsed_ms;
             }
         }
         probe.last_total_bytes = total_bytes;
@@ -144,8 +137,7 @@ impl LinkState {
                 .sum::<f64>();
             Some(total / (successful.len() - 1) as f64)
         };
-        let loss_percent = 100.0
-            * (probe.samples.len().saturating_sub(successful.len())) as f64
+        let loss_percent = 100.0 * (probe.samples.len().saturating_sub(successful.len())) as f64
             / probe.samples.len() as f64;
         Some(LinkObservation {
             from_node_id: self.from_node_id.clone(),
@@ -191,12 +183,7 @@ impl LinkTelemetry {
                 ))
             }),
             secondary: secondary.map(|(from, peer)| {
-                Arc::new(LinkState::new(
-                    from,
-                    to_node_id,
-                    LinkRole::Secondary,
-                    peer,
-                ))
+                Arc::new(LinkState::new(from, to_node_id, LinkRole::Secondary, peer))
             }),
         }
     }
@@ -265,21 +252,20 @@ async fn run_probe(link: Arc<LinkState>, mut shutdown_rx: watch::Receiver<()>) {
 }
 
 fn parse_ping_rtt_ms(output: &str) -> Option<f64> {
-    output.split_whitespace().find_map(|token| {
-        let value = token
-            .strip_prefix("time=")
-            .or_else(|| token.strip_prefix("time<"))?;
-        value.parse::<f64>().ok()
-    }).or_else(|| {
-        output.lines().find_map(|line| {
-            let values = line
-                .split_once('=')?
-                .1
-                .trim()
-                .strip_suffix(" ms")?;
-            values.split('/').nth(1)?.parse::<f64>().ok()
+    output
+        .split_whitespace()
+        .find_map(|token| {
+            let value = token
+                .strip_prefix("time=")
+                .or_else(|| token.strip_prefix("time<"))?;
+            value.parse::<f64>().ok()
         })
-    })
+        .or_else(|| {
+            output.lines().find_map(|line| {
+                let values = line.split_once('=')?.1.trim().strip_suffix(" ms")?;
+                values.split('/').nth(1)?.parse::<f64>().ok()
+            })
+        })
 }
 
 fn now_unix_ms() -> u64 {
