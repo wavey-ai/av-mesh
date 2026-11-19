@@ -6367,6 +6367,48 @@ impl LiveTsCache {
         streams
     }
 
+    /// The first missing slot among the newest `window_parts` slots of a
+    /// stream, or `None` when those slots are all stored.
+    ///
+    /// A cache-mesh edge uses this for its replica request. A distributor
+    /// that never recovers an object skips it after the canonical gap hold, so
+    /// an edge can hold a slot that no parent will ever supply. The parent
+    /// answers a replica request with every slot from the requested one to its
+    /// newest, so a request that starts at such an old hole makes each parent
+    /// send the retained window again, once a second, until the hole leaves
+    /// the window. That flood overflows the edge and makes new holes.
+    async fn recent_replica_request_from_slot(
+        &self,
+        stream_id: u64,
+        window_parts: usize,
+    ) -> Option<usize> {
+        let stream_idx = self.chunk_cache.get_stream_idx(stream_id).await?;
+        let last = self.chunk_cache.last(stream_idx)?;
+        let start = last
+            .saturating_sub(window_parts.saturating_sub(1))
+            .max(self.chunk_cache.retained_start(last));
+        for seq in start..=last {
+            let present = self
+                .chunk_cache
+                .get(stream_idx, seq)
+                .await
+                .map(|(bytes, hash)| hash != 0 || !bytes.is_empty())
+                .unwrap_or(false);
+            if !present {
+                return Some(seq);
+            }
+        }
+        None
+    }
+
+    /// Whether this node stores any slot of the stream.
+    async fn has_stream_slots(&self, stream_id: u64) -> bool {
+        match self.chunk_cache.get_stream_idx(stream_id).await {
+            Some(stream_idx) => self.chunk_cache.last(stream_idx).is_some(),
+            None => false,
+        }
+    }
+
     async fn replica_request_from_slot(&self, stream_id: u64) -> usize {
         let Some(stream_idx) = self.chunk_cache.get_stream_idx(stream_id).await else {
             return 0;
@@ -12401,7 +12443,9 @@ impl AppRouter {
             .await;
         let planned_replicas =
             self.plan_replicas_from_snapshots(stream_id, local_bytes, &snapshots, &demand);
-        let from_slot = self.cache.replica_request_from_slot(stream_id).await;
+        let Some(from_slot) = self.replica_request_start(stream_id).await else {
+            return;
+        };
         match self.mesh.request_replica(stream_id, from_slot).await {
             Ok(peer_count) => {
                 let mut command = self
@@ -12428,6 +12472,34 @@ impl AppRouter {
                 );
             }
         }
+    }
+
+    /// The slot from which this node asks its parents for a replica, or
+    /// `None` when it has nothing to ask for.
+    ///
+    /// A cache-mesh edge that already stores the stream asks only for a hole
+    /// among its newest slots: the canonical gap hold, and at least the hole
+    /// repair window. Older holes are parts that its parents skipped. A node
+    /// with no slot of the stream, a node that is not an edge, and a node with
+    /// gap skipping disabled keep the request from the first missing slot of
+    /// the retained window.
+    async fn replica_request_start(&self, stream_id: u64) -> Option<usize> {
+        let hold_ms = self.cache.canonical_gap_skip_snapshot().hold_ms;
+        if self.cache_mesh_role != CacheMeshRole::Edge
+            || hold_ms == 0
+            || !self.cache.has_stream_slots(stream_id).await
+        {
+            return Some(self.cache.replica_request_from_slot(stream_id).await);
+        }
+        let part_ms = u64::try_from(self.cache.part_target.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let window_ms = hold_ms.max(EDGE_HOLE_REPAIR_WINDOW_MS);
+        let window_parts =
+            usize::try_from(window_ms.div_ceil(part_ms).max(1)).unwrap_or(usize::MAX);
+        self.cache
+            .recent_replica_request_from_slot(stream_id, window_parts)
+            .await
     }
 
     async fn known_active_stream_ids(&self) -> Vec<u64> {
@@ -15909,6 +15981,74 @@ mod tests {
 
         parent_mesh.shutdown();
         edge_mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn edge_replica_request_ignores_a_hole_older_than_the_gap_hold() {
+        let stream_id = 77;
+        let edge_cache = canonical_gap_test_cache().await;
+        let source_cache = canonical_gap_test_cache().await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&edge_cache.chunk_cache)).await;
+        let router = app_router_for_tests(Arc::clone(&edge_cache), mesh);
+
+        // No slot of the stream yet: the edge asks from the start, as before.
+        assert_eq!(router.replica_request_start(stream_id).await, Some(0));
+
+        // The test cache holds a gap for 8 parts of 5 ms, and the hole repair
+        // window is 500 ms, so the replica window is the newest 100 parts.
+        let window_parts = (EDGE_HOLE_REPAIR_WINDOW_MS / 5) as usize;
+        let old_hole = 3_usize;
+        let head = old_hole + window_parts + 40;
+        let recent_hole = head - 10;
+        for sequence in 0..=head {
+            commit_canonical_gap_test_part(&source_cache, stream_id, sequence as u64).await;
+            if sequence == old_hole || sequence == recent_hole {
+                continue;
+            }
+            let (slot, _hash) = source_cache
+                .chunk_cache
+                .get_for_stream_id(stream_id, sequence)
+                .await
+                .unwrap();
+            edge_cache
+                .chunk_cache
+                .add_for_stream_id(stream_id, sequence, slot)
+                .await
+                .unwrap();
+        }
+        // The unbounded request would start at the old hole and make each
+        // parent send the whole window again.
+        assert_eq!(
+            edge_cache.replica_request_from_slot(stream_id).await,
+            old_hole
+        );
+        // The edge asks for the recent hole only.
+        assert_eq!(
+            router.replica_request_start(stream_id).await,
+            Some(recent_hole)
+        );
+
+        // Once the recent hole is filled the edge asks for nothing, although
+        // the old hole is still in its retained window.
+        let (slot, _hash) = source_cache
+            .chunk_cache
+            .get_for_stream_id(stream_id, recent_hole)
+            .await
+            .unwrap();
+        edge_cache
+            .chunk_cache
+            .add_for_stream_id(stream_id, recent_hole, slot)
+            .await
+            .unwrap();
+        assert_eq!(router.replica_request_start(stream_id).await, None);
+
+        // With gap skipping disabled no parent skips a part, so the request
+        // keeps its first missing slot.
+        edge_cache.set_canonical_gap_hold(Duration::ZERO);
+        assert_eq!(
+            router.replica_request_start(stream_id).await,
+            Some(old_hole)
+        );
     }
 
     #[tokio::test]
