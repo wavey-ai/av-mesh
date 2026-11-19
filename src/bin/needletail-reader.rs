@@ -548,7 +548,7 @@ impl Reader {
     /// the whole list has failed, ask an entry point again.
     async fn fail_over(&mut self, part: u64, failed_in_a_row: usize, detail: String) {
         self.report.request_errors += 1;
-        if failed_in_a_row > 0 && failed_in_a_row % self.master.caches.len() == 0 {
+        if failed_in_a_row > 0 && failed_in_a_row.is_multiple_of(self.master.caches.len()) {
             let previous = self.current_name();
             if self.load_master().await.is_ok() {
                 self.current = 0;
