@@ -160,6 +160,13 @@ const PLAYLIST_DEMAND_SWEEP_MS: u64 = 500;
 /// subscribed to, before it answers the request that created the demand.
 const PLAYLIST_WARM_WAIT_MS: u64 = 1_500;
 const ASSIGNMENT_PATH: &str = "/api/assignment";
+/// Shortest stretch of a playlist over which its bit rate is measured. A
+/// copy that is still warming holds a second or less, and one key frame in
+/// that second reads as a much higher rate than the stream has.
+const MIN_BITRATE_WINDOW_MS: u64 = 4_000;
+/// Most playlists that an edge holds for its readers at one time. The live
+/// cache has 16 playlist slots, and one is the default stream of the node.
+const MAX_EDGE_PLAYLISTS: usize = 15;
 /// Fewest parts in the playlist window of a stream whose parts are longer
 /// than the nominal part of the node.
 const MIN_STREAM_WINDOW_PARTS: usize = 32;
@@ -1568,6 +1575,7 @@ async fn main() -> Result<()> {
         } else {
             args.window_parts
         },
+        max_playlists: MAX_EDGE_PLAYLISTS,
     });
 
     let control_packets = packetize_control_message(&MeshControlMessage {
@@ -5360,7 +5368,15 @@ impl LiveTsCache {
     async fn playlist_bitrate_bps(&self, stream_id: u64) -> Option<u64> {
         let nominal_ms = self.part_target.as_millis().clamp(1, u128::from(u32::MAX)) as u64;
         let state = self.state.read().await;
-        state.playlist_bitrate_bps(stream_id, nominal_ms)
+        state.playlist_bitrate_bps(stream_id, nominal_ms, self.min_bitrate_window_ms())
+    }
+
+    /// The bit rate of a playlist is measured over at least four seconds, or
+    /// over half of the window of a node with a shorter window.
+    fn min_bitrate_window_ms(&self) -> u64 {
+        let window_ms = (self.window_parts as u64)
+            .saturating_mul(self.part_target.as_millis().clamp(1, u128::from(u32::MAX)) as u64);
+        MIN_BITRATE_WINDOW_MS.min(window_ms / 2)
     }
 
     /// Wait until a playlist that this node has just subscribed to has parts
@@ -6645,7 +6661,7 @@ impl LiveTsCache {
                 state.stream_subscription_base_object.clone(),
                 state.stream_latest_canonical_object.clone(),
                 state.stream_last_ingest_unix_ms.clone(),
-                state.retained_stream_summaries(nominal_part_ms),
+                state.retained_stream_summaries(nominal_part_ms, self.min_bitrate_window_ms()),
             )
         };
         for (stream_id, retained) in retained_streams {
@@ -7293,8 +7309,14 @@ impl LiveState {
         }
     }
 
-    /// Bit rate of a stream over its retained parts.
-    fn playlist_bitrate_bps(&self, stream_id: u64, nominal_part_ms: u64) -> Option<u64> {
+    /// Bit rate of a stream over its retained parts, or `None` while the
+    /// retained parts cover less than `min_window_ms`.
+    fn playlist_bitrate_bps(
+        &self,
+        stream_id: u64,
+        nominal_part_ms: u64,
+        min_window_ms: u64,
+    ) -> Option<u64> {
         let parts = self.stream_parts.get(&stream_id)?;
         let (bytes, duration_ms) = parts.values().fold((0_u64, 0_u64), |(bytes, ms), part| {
             (
@@ -7302,13 +7324,14 @@ impl LiveState {
                 ms.saturating_add(part.duration_ms.map_or(nominal_part_ms, u64::from)),
             )
         });
-        (duration_ms > 0 && bytes > 0)
+        (duration_ms > 0 && duration_ms >= min_window_ms && bytes > 0)
             .then(|| bytes.saturating_mul(8_000).saturating_div(duration_ms))
     }
 
     fn retained_stream_summaries(
         &self,
         nominal_part_ms: u64,
+        min_bitrate_window_ms: u64,
     ) -> HashMap<u64, RetainedStreamSummary> {
         self.stream_parts
             .iter()
@@ -7325,7 +7348,11 @@ impl LiveState {
                             .copied()
                             .unwrap_or_default(),
                         retained_parts: parts.len() as u64,
-                        bitrate_bps: self.playlist_bitrate_bps(*stream_id, nominal_part_ms),
+                        bitrate_bps: self.playlist_bitrate_bps(
+                            *stream_id,
+                            nominal_part_ms,
+                            min_bitrate_window_ms,
+                        ),
                     },
                 ))
             })
@@ -9005,6 +9032,10 @@ struct PlaylistDemandConfig {
     lease: Duration,
     idle: Duration,
     warm_parts: usize,
+    /// Most playlists that the edge holds at one time. The cache has a fixed
+    /// number of playlist slots, and a request for one more playlist must not
+    /// evict a playlist that has readers.
+    max_playlists: usize,
 }
 
 /// Reader demand for each playlist on an edge.
@@ -9019,6 +9050,7 @@ struct PlaylistDemand {
     streams: Arc<DashMap<u64, PlaylistDemandEntry>>,
     subscriptions_opened: Arc<AtomicU64>,
     subscriptions_released: Arc<AtomicU64>,
+    subscriptions_refused: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -9033,6 +9065,9 @@ struct PlaylistDemandTouch {
     /// This request is the first demand for the playlist.
     new: bool,
     opened_unix_ms: u64,
+    /// The edge holds as many playlists as it can. It does not subscribe to
+    /// this one.
+    refused: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -9051,6 +9086,7 @@ impl PlaylistDemand {
             streams: Arc::new(DashMap::new()),
             subscriptions_opened: Arc::new(AtomicU64::new(0)),
             subscriptions_released: Arc::new(AtomicU64::new(0)),
+            subscriptions_refused: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -9060,11 +9096,13 @@ impl PlaylistDemand {
             lease: Duration::from_secs(5),
             idle: Duration::from_secs(30),
             warm_parts: 0,
+            max_playlists: MAX_EDGE_PLAYLISTS,
         })
     }
 
     /// Record one request for a playlist.
     fn touch(&self, stream_id: u64, now_ms: u64) -> PlaylistDemandTouch {
+        let held = self.streams.len();
         match self.streams.entry(stream_id) {
             Entry::Occupied(entry) => {
                 entry
@@ -9074,6 +9112,15 @@ impl PlaylistDemand {
                 PlaylistDemandTouch {
                     new: false,
                     opened_unix_ms: entry.get().opened_unix_ms,
+                    refused: false,
+                }
+            }
+            Entry::Vacant(_) if held >= self.config.max_playlists.max(1) => {
+                self.subscriptions_refused.fetch_add(1, Ordering::Relaxed);
+                PlaylistDemandTouch {
+                    new: false,
+                    opened_unix_ms: 0,
+                    refused: true,
                 }
             }
             Entry::Vacant(entry) => {
@@ -9086,6 +9133,7 @@ impl PlaylistDemand {
                 PlaylistDemandTouch {
                     new: true,
                     opened_unix_ms: now_ms,
+                    refused: false,
                 }
             }
         }
@@ -9167,6 +9215,8 @@ struct CacheReplicationSnapshot {
     demand: Vec<PlaylistDemandSnapshot>,
     subscriptions_opened: u64,
     subscriptions_released: u64,
+    /// Requests for one more playlist than this edge can hold.
+    subscriptions_refused: u64,
     /// Subscriptions that this distributor serves to edges.
     served_subscriptions: Vec<ServedSubscriptionSnapshot>,
 }
@@ -12777,6 +12827,10 @@ impl AppRouter {
                 .playlist_demand
                 .subscriptions_released
                 .load(Ordering::Relaxed),
+            subscriptions_refused: self
+                .playlist_demand
+                .subscriptions_refused
+                .load(Ordering::Relaxed),
             served_subscriptions: self
                 .mesh
                 .served_subscriptions()
@@ -12842,6 +12896,9 @@ impl AppRouter {
         }
         let now_ms = now_unix_ms();
         let touch = self.playlist_demand.touch(stream_id, now_ms);
+        if touch.refused {
+            return;
+        }
         if touch.new {
             match self
                 .mesh
@@ -17165,7 +17222,7 @@ mod tests {
         assert_eq!(first.get(&5).unwrap().fmp4_segment_id, Some(0));
         assert_eq!(state.stream_retained_bytes.get(&1), Some(&62));
         assert_eq!(state.stream_retained_bytes.get(&2), Some(&55));
-        assert_eq!(state.retained_stream_summaries(50)[&1].retained_parts, 4);
+        assert_eq!(state.retained_stream_summaries(50, 0)[&1].retained_parts, 4);
         assert_eq!(state.stream_parts[&2].len(), 1);
     }
 
@@ -24698,6 +24755,31 @@ mod tests {
         assert!(cache.chunk_cache.get_for_stream_id(77, 208).await.is_some());
         assert!(cache.chunk_cache.get_for_stream_id(77, 207).await.is_none());
         assert!(cache.chunk_cache.get_for_stream_id(77, 0).await.is_none());
+        // The bit rate is measured over the window: four 250 ms parts of about
+        // this size each second. A key-frame part also carries the init.
+        let part_bytes = cache.state.read().await.stream_parts[&77][&399].bytes as u64;
+        let rate = cache.playlist_bitrate_bps(77).await.unwrap();
+        assert!(
+            (part_bytes * 32..part_bytes * 40).contains(&rate),
+            "{rate} bit/s for parts of {part_bytes} bytes"
+        );
+        // A copy that holds less than four seconds has no measured rate yet.
+        let warming = LiveTsCache::new(1, Duration::from_millis(5), 200, 2_400, 64).await;
+        for sequence in 0..15_u64 {
+            warming
+                .commit_stream_payload(
+                    77,
+                    encode_test_published_fmp4_part(77, 5, sequence, sequence % 8 == 0, 250),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(warming.playlist_bitrate_bps(77).await, None);
+        warming
+            .commit_stream_payload(77, encode_test_published_fmp4_part(77, 5, 15, false, 250))
+            .await
+            .unwrap();
+        assert!(warming.playlist_bitrate_bps(77).await.is_some());
         // The gap hold of one second is four video parts, not 200.
         assert_eq!(cache.state.read().await.stream_part_ms(77), 250);
         assert_eq!(cache.state.read().await.stream_part_ms(2001), 5);
@@ -24710,6 +24792,7 @@ mod tests {
             lease: Duration::from_millis(3_000),
             idle: Duration::from_millis(10_000),
             warm_parts: 8,
+            max_playlists: 2,
         });
         assert!(demand.touch(7, 1_000).new);
         assert!(!demand.touch(7, 1_200).new);
@@ -24727,6 +24810,19 @@ mod tests {
         assert!(demand.touch(7, 20_000).new);
         assert_eq!(demand.subscriptions_opened.load(Ordering::Relaxed), 2);
         assert_eq!(demand.subscriptions_released.load(Ordering::Relaxed), 1);
+
+        // The edge holds two playlists at most. A request for a third is
+        // refused and does not replace a playlist that has readers.
+        assert!(demand.touch(8, 20_000).new);
+        let third = demand.touch(9, 20_000);
+        assert!(third.refused && !third.new);
+        assert!(!demand.touch(7, 20_100).refused);
+        assert_eq!(demand.snapshot(20_100).len(), 2);
+        assert_eq!(demand.subscriptions_refused.load(Ordering::Relaxed), 1);
+        // When one is released the third can be held.
+        demand.touch(7, 25_000);
+        assert_eq!(demand.take_idle(30_100), vec![8]);
+        assert!(demand.touch(9, 30_100).new);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -24775,6 +24871,7 @@ mod tests {
             lease: Duration::from_millis(900),
             idle: Duration::from_millis(1_200),
             warm_parts: 16,
+            max_playlists: MAX_EDGE_PLAYLISTS,
         });
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         let router = app_router_for_tests(Arc::clone(&edge_cache), Arc::clone(&edge_mesh))
