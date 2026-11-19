@@ -37,9 +37,9 @@ The first implementation keeps the mesh transport intentionally small:
   It receives from same-region distributors and never forwards cache data.
   Production cache nodes enable same-region validation for the mesh protocol.
   Use `--cache-mesh-region` when the cache region differs from telemetry region.
-  `--cache-mesh-max-parents` defaults to 2 and bounds repair requests. A
-  distributor sends objects to at most 8 children by default with
-  `--cache-mesh-max-children`.
+  `--cache-mesh-max-parents` defaults to 2 and bounds the parents of each
+  playlist. A distributor sends objects to at most 8 children in one tick by
+  default with `--cache-mesh-max-children`.
 - Replication follows each stream's contiguous watermark. A canonical object the
   relay never recovers holds that watermark for `--canonical-gap-hold-ms`
   (default 1000, converted to parts with `--part-ms`). The watermark then skips
@@ -160,7 +160,8 @@ The first implementation keeps the mesh transport intentionally small:
 - Playback requests can supply a CMCD `sid` value.
   An overloaded edge continues admitted sessions and rejects new sessions with HTTP 429.
   The response identifies healthy same-region edges with `Link` and `X-Needletail-Alternate-Edges`.
-  The master playlist also contains duplicate variants for healthy DAG edges.
+  The Multivariant Playlist names the caches that can serve the reader. See
+  [Regional LL-HLS caches](#regional-ll-hls-caches).
 - `/api/mesh` also exposes `mesh_fec` runtime outcomes. These outcomes include
   source and repair datagrams, protected and wire bytes, and decoded objects.
   They also include repair recovery, late sources, incomplete or expired
@@ -173,6 +174,152 @@ The first implementation keeps the mesh transport intentionally small:
   capacity, edge traffic, errors, stream lag, alerts, and transport settings. It
   also exposes cache-mesh FEC outcomes and per-node LL-HLS latency histograms.
   Scrapes use the same bounded telemetry snapshot as `/api/mesh`.
+
+## Regional LL-HLS caches
+
+A region has distributors, which receive media from the relay DAG, and edges,
+which serve readers. The unit that the region replicates, advertises and
+assigns is the LL-HLS playlist of a stream with its parts.
+
+### Replication on demand
+
+An edge holds a playlist only while it has readers for it.
+
+- The first request for a playlist subscribes the edge at its distributors.
+  The request waits up to 1.5 s for the first parts and is then answered.
+- A distributor pushes a playlist to an edge only while the edge holds a
+  subscription lease (`--cache-mesh-lease-ms`, default 5,000). The edge renews
+  three times in each lease while requests keep arriving.
+- A new copy receives a warm-up window, newest part first, after the live
+  parts of each tick. `--cache-mesh-warm-parts` sets its length (default: the
+  playlist window). `--cache-mesh-warm-kbps` limits its rate for each edge
+  (default 20,000). Only the first parent sends it.
+- `--cache-mesh-demand-idle-ms` (default 30,000) after the last request the
+  edge releases the playlist. The distributors stop pushing it, and the edge
+  frees the parts.
+- An edge chooses two parents for each playlist with a rendezvous hash of its
+  node id, the stream id and the distributor address. Playlists and edges
+  spread over the distributors of a region, and a distributor that has been
+  silent for two seconds is not chosen.
+- `--cache-mesh-replication all` restores the earlier behavior: every
+  distributor pushes every playlist to every edge. The `peer` role always
+  uses it.
+
+A part carries its own playlist entry: its duration, whether it starts with a
+key frame, and when the contributor published it. An edge reads the entry from
+each part that arrives, so its playlist has the same parts, independent-part
+flags, segment boundaries and program date and time as the playlist of its
+distributor.
+
+The window of a playlist is a length of time: `--window-parts` nominal parts
+of `--part-ms`. A stream whose parts are longer covers the same time with
+fewer parts, and the node keeps only four of those windows in memory. One node
+that is sized for 5 ms audio parts can therefore hold 4K video.
+
+`--mesh-max-symbol-size` lets a large part use a multiple of
+`--mesh-symbol-size`, so that it is at most about 64 datagrams. A 5 ms audio
+part keeps the small symbol. On a 1 vCPU edge that served four 4K readers,
+symbols scaled up to 16,000 bytes halved the processor use and reduced reader
+latency p99 from 33 ms to 5 ms against fixed 900-byte symbols.
+
+### Limits and admission
+
+Each node declares its limits, and enforces them:
+
+| Flag | Limit |
+| --- | --- |
+| `--egress-capacity-bps`, `--egress-admission-percent` | Egress. New sessions are admitted up to the admission share (default 85%). |
+| `--edge-session-limit` | Playback sessions served at one time. Zero sets no limit. |
+
+A session is admitted against the bit rate of the playlist that it asks for:
+the highest rate that the node has measured for that playlist. The node
+rejects a new session when the sessions already admitted leave less than that.
+This acts on the first request and does not wait for the measured egress to
+rise. Measured egress above the admission share for three seconds also stops
+admission, as before. A rejected request receives HTTP 429 with the other
+caches of the region that can take it.
+
+### Entry point
+
+Every distributor and edge of a region is an entry point for its readers.
+The answer is a pure function of what the caches of the region advertise and
+of the session identifier, so entry points agree without shared state. They
+agree once they have seen the same advertisements, which takes one telemetry
+interval.
+
+Each cache advertises, in its telemetry snapshot, the playlists that it holds
+with the newest part and the reader count of each, its load in thousandths of
+its admission limit, and whether it drains.
+
+| Request | Answer |
+| --- | --- |
+| `GET /live/<stream>/master.m3u8?sid=<session>` | Multivariant Playlist. The assigned cache is the first variant. The next caches are the failover order. Each cache is one Content Steering pathway. |
+| `GET /live/<stream>/steering.json?sid=<session>` | Content Steering manifest. The player sends `_HLS_pathway`, and the list starts with that cache while it is healthy. |
+| `GET /api/assignment?stream=<stream>&sid=<session>` | The assignment with the reason for each cache, and the state of every cache of the region. |
+
+The session comes from the CMCD `sid`, or from the `sid` query parameter.
+
+The rules, in order:
+
+1. `cache=<node id>` pins the reader to that cache. The answer names only that
+   cache, whatever its load. A cache of another region is not found.
+2. A reader that already uses a cache keeps it while the cache is healthy and
+   does not drain. The entry point also remembers the cache that it assigned
+   to a session for two minutes.
+3. A new reader goes to a cache that holds the playlist and is below the
+   spread target (`--assignment-spread-percent`, default 60).
+4. When every holder is above the spread target, the reader goes to a cache
+   without the playlist. That cache subscribes: a copy is added when demand
+   arrives.
+5. When every cache is above the spread target, the reader goes to any cache
+   that still admits sessions.
+
+Within a rule the choice is a rendezvous hash of the session, weighted by free
+capacity. A cache with a stale advertisement, a draining cache and a full
+cache are not assigned. `--assignment-alternates` (default 2) sets the number
+of caches after the first.
+
+### Drain and failure
+
+`POST /api/control/drain-node` with `{"node_id": "<node>"}` drains a cache, and
+`/api/control/resume-node` ends the drain. A draining cache:
+
+- advertises that it drains, so entry points stop assigning it and steer its
+  readers to other caches;
+- answers each playlist reload of an admitted session with HTTP 307 to the
+  same request at another cache, and still serves the parts that the reader
+  was told about;
+- rejects a new session with HTTP 429 and the other caches.
+
+When a cache fails, a reader uses the next cache of its playlist. Caches of a
+region name parts alike, so the reader continues at the next part.
+
+`needletail-reader` is a reader that follows these rules. It reads through an
+entry point, records which cache served each part and every move, and reports
+parts that arrived later than a player buffer allows:
+
+```sh
+cargo run --release --bin needletail-reader -- \
+  --entry https://10.77.1.11:19444 --stream 1 --session viewer-1 \
+  --tls-ca ca.crt --server-name mesh.needletail.test \
+  --duration-seconds 30 --steering
+```
+
+Add `--cache <node id>` to pin the reader, and `--readers N` for N sessions.
+
+### Known limits
+
+- Caches number the segments of a video playlist alike only when the
+  key-frame interval is `--parts-per-segment` parts. With another interval a
+  cache that joined later uses other segment numbers. Part names, segment
+  boundaries and the program date and time still agree. The contributor
+  should stamp the segment number on each key-frame part.
+- A Content Steering manifest can only order the pathways that the
+  Multivariant Playlist named. A cache that starts later is used by sessions
+  that start later.
+- Warming a 4K copy takes processor time from a 1 vCPU edge. At 50 Mbit/s the
+  edge stopped serving its other readers for about a second. The default
+  warm-up rate is 20 Mbit/s for that reason.
 
 ## Local two-region prototype
 

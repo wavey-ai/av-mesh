@@ -22,6 +22,10 @@ pub struct EdgeAdmissionConfig {
     pub min_sustained_seconds: u64,
     pub session_idle_seconds: u64,
     pub max_sessions: usize,
+    /// Most playback sessions that the node serves at one time. Zero sets no
+    /// limit. This is the reader limit of a small node, where the processor
+    /// is exhausted before the network.
+    pub session_limit: usize,
 }
 
 impl Default for EdgeAdmissionConfig {
@@ -34,6 +38,7 @@ impl Default for EdgeAdmissionConfig {
             min_sustained_seconds: DEFAULT_MIN_SUSTAINED_SECONDS,
             session_idle_seconds: DEFAULT_SESSION_IDLE_SECONDS,
             max_sessions: DEFAULT_MAX_SESSIONS,
+            session_limit: 0,
         }
     }
 }
@@ -73,6 +78,28 @@ pub struct EdgeAdmissionSnapshot {
     pub rejected_requests: u64,
     pub active_sessions: u64,
     pub admitted_sessions: u64,
+    /// Most sessions served at one time. Zero means no limit.
+    #[serde(default)]
+    pub session_limit: u64,
+    /// Bit rate that the admitted sessions are entitled to: for each session,
+    /// the bit rate of the playlist that it reads.
+    #[serde(default)]
+    pub committed_bps: u64,
+    /// Load in thousandths of the admission limit: the largest of observed
+    /// egress, committed egress and sessions. At 1,000 the node admits no new
+    /// session.
+    #[serde(default)]
+    pub load_permille: u32,
+}
+
+/// What a new playback session would add to the node.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlaybackRequest<'a> {
+    pub session_id: Option<&'a str>,
+    /// Playlist that the request reads, when the path names one.
+    pub stream_id: Option<u64>,
+    /// The node is draining and takes no new session.
+    pub draining: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,7 +123,18 @@ struct EdgeAdmissionInner {
     overloaded: AtomicBool,
     rejected_requests: AtomicU64,
     admitted_sessions: AtomicU64,
-    sessions: Mutex<HashMap<String, u64>>,
+    sessions: Mutex<HashMap<String, PlaybackSession>>,
+    playlist_bps: Mutex<HashMap<u64, u64>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PlaybackSession {
+    last_seen_ms: u64,
+    stream_id: Option<u64>,
+    /// The node has sent the session to another cache. It no longer counts
+    /// towards the load of this node, but requests that it still makes here
+    /// are served.
+    moved: bool,
 }
 
 impl Default for EdgeAdmission {
@@ -116,6 +154,7 @@ impl EdgeAdmission {
                 rejected_requests: AtomicU64::new(0),
                 admitted_sessions: AtomicU64::new(0),
                 sessions: Mutex::new(HashMap::new()),
+                playlist_bps: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -139,15 +178,110 @@ impl EdgeAdmission {
         self.inner.rejected_requests.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn admit_playback(&self, session_id: Option<&str>) -> PlaybackAdmission {
+    pub fn admit_playback(&self, request: PlaybackRequest<'_>) -> PlaybackAdmission {
         let overloaded = self.snapshot().overloaded;
-        let elapsed_ms = self
+        let elapsed_ms = self.elapsed_ms();
+        self.admit_playback_at(request, overloaded, elapsed_ms)
+    }
+
+    /// Record the measured bit rate of a playlist that this node holds. A new
+    /// session is admitted against the bit rate of the playlist that it asks
+    /// for.
+    ///
+    /// The node keeps the highest rate that it has measured for the playlist.
+    /// The measured rate follows the content, and a session admitted during a
+    /// quiet passage still needs the rate of a busy one.
+    pub fn set_playlist_bps(&self, stream_id: u64, bps: u64) {
+        if bps == 0 {
+            return;
+        }
+        let mut playlist_bps = self
             .inner
+            .playlist_bps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let peak = playlist_bps.entry(stream_id).or_insert(bps);
+        *peak = (*peak).max(bps);
+    }
+
+    /// Forget the bit rate of a playlist that this node no longer holds.
+    pub fn clear_playlist_bps(&self, stream_id: u64) {
+        self.inner
+            .playlist_bps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&stream_id);
+    }
+
+    pub fn playlist_bps(&self, stream_id: u64) -> Option<u64> {
+        self.inner
+            .playlist_bps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&stream_id)
+            .copied()
+    }
+
+    /// Record that this node has sent a session to another cache. Its
+    /// commitment is free for another reader at once. The parts that the
+    /// session was already told about are still served to it.
+    pub fn release_session(&self, session_id: &str) -> bool {
+        let mut sessions = self
+            .inner
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match sessions.get_mut(session_id) {
+            Some(session) if !session.moved => {
+                session.moved = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Active sessions of each playlist.
+    pub fn sessions_by_playlist(&self) -> HashMap<u64, u64> {
+        let elapsed_ms = self.elapsed_ms();
+        let mut sessions = self
+            .inner
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        prune_sessions(
+            &mut sessions,
+            elapsed_ms,
+            self.inner.config.session_idle_seconds,
+        );
+        let mut by_playlist = HashMap::new();
+        for session in sessions.values().filter(|session| !session.moved) {
+            if let Some(stream_id) = session.stream_id {
+                *by_playlist.entry(stream_id).or_insert(0_u64) += 1;
+            }
+        }
+        by_playlist
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.inner
             .started
             .elapsed()
             .as_millis()
-            .min(u128::from(u64::MAX)) as u64;
-        self.admit_playback_at(session_id, overloaded, elapsed_ms)
+            .min(u128::from(u64::MAX)) as u64
+    }
+
+    fn committed_bps(&self, sessions: &HashMap<String, PlaybackSession>) -> u64 {
+        let playlist_bps = self
+            .inner
+            .playlist_bps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sessions
+            .values()
+            .filter(|session| !session.moved)
+            .filter_map(|session| session.stream_id)
+            .filter_map(|stream_id| playlist_bps.get(&stream_id))
+            .fold(0_u64, |total, bps| total.saturating_add(*bps))
     }
 
     fn snapshot_at(&self, second: u64) -> EdgeAdmissionSnapshot {
@@ -168,13 +302,31 @@ impl EdgeAdmission {
         };
         self.inner.overloaded.store(overloaded, Ordering::Relaxed);
 
-        let active_sessions = self.active_sessions_at(
-            self.inner
-                .started
-                .elapsed()
-                .as_millis()
-                .min(u128::from(u64::MAX)) as u64,
-        );
+        let (active_sessions, committed_bps) = {
+            let elapsed_ms = self.elapsed_ms();
+            let mut sessions = self
+                .inner
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            prune_sessions(
+                &mut sessions,
+                elapsed_ms,
+                self.inner.config.session_idle_seconds,
+            );
+            (
+                active_session_count(&sessions),
+                self.committed_bps(&sessions),
+            )
+        };
+        let session_limit = self.inner.config.session_limit as u64;
+        let mut load_permille = permille(observed_bps.max(committed_bps), admission_bps);
+        if session_limit > 0 {
+            load_permille = load_permille.max(permille(active_sessions, session_limit));
+        }
+        if overloaded {
+            load_permille = load_permille.max(1_000);
+        }
 
         EdgeAdmissionSnapshot {
             capacity_bps: self.inner.config.capacity_bps,
@@ -187,17 +339,20 @@ impl EdgeAdmission {
             rejected_requests: self.inner.rejected_requests.load(Ordering::Relaxed),
             active_sessions,
             admitted_sessions: self.inner.admitted_sessions.load(Ordering::Relaxed),
+            session_limit,
+            committed_bps,
+            load_permille,
         }
     }
 
     fn admit_playback_at(
         &self,
-        session_id: Option<&str>,
+        request: PlaybackRequest<'_>,
         overloaded: bool,
         elapsed_ms: u64,
     ) -> PlaybackAdmission {
-        let Some(session_id) = session_id else {
-            return if overloaded {
+        let Some(session_id) = request.session_id else {
+            return if overloaded || request.draining {
                 PlaybackAdmission::Rejected
             } else {
                 PlaybackAdmission::Anonymous
@@ -213,27 +368,54 @@ impl EdgeAdmission {
             elapsed_ms,
             self.inner.config.session_idle_seconds,
         );
-        if let Some(last_seen_ms) = sessions.get_mut(session_id) {
-            *last_seen_ms = elapsed_ms;
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.last_seen_ms = elapsed_ms;
+            if request.stream_id.is_some() {
+                session.stream_id = request.stream_id;
+            }
             return PlaybackAdmission::Existing;
         }
-        if overloaded {
+        if overloaded || request.draining {
             return PlaybackAdmission::Rejected;
+        }
+        let session_limit = self.inner.config.session_limit;
+        if session_limit > 0 && active_session_count(&sessions) >= session_limit as u64 {
+            return PlaybackAdmission::Rejected;
+        }
+        // The session is entitled to the bit rate of its playlist. Admit it
+        // only when the sessions already admitted leave that much room. This
+        // acts before the measured egress has risen.
+        if let Some(playlist_bps) = request
+            .stream_id
+            .and_then(|stream_id| self.playlist_bps(stream_id))
+        {
+            let committed_bps = self.committed_bps(&sessions);
+            if committed_bps.saturating_add(playlist_bps) > self.inner.config.admission_bps() {
+                return PlaybackAdmission::Rejected;
+            }
         }
         if sessions.len() >= self.inner.config.max_sessions {
             if let Some(oldest) = sessions
                 .iter()
-                .min_by_key(|(_, last_seen_ms)| **last_seen_ms)
+                .min_by_key(|(_, session)| session.last_seen_ms)
                 .map(|(session_id, _)| session_id.clone())
             {
                 sessions.remove(&oldest);
             }
         }
-        sessions.insert(session_id.to_owned(), elapsed_ms);
+        sessions.insert(
+            session_id.to_owned(),
+            PlaybackSession {
+                last_seen_ms: elapsed_ms,
+                stream_id: request.stream_id,
+                moved: false,
+            },
+        );
         self.inner.admitted_sessions.fetch_add(1, Ordering::Relaxed);
         PlaybackAdmission::Admitted
     }
 
+    #[cfg(test)]
     fn active_sessions_at(&self, elapsed_ms: u64) -> u64 {
         let mut sessions = self
             .inner
@@ -245,7 +427,7 @@ impl EdgeAdmission {
             elapsed_ms,
             self.inner.config.session_idle_seconds,
         );
-        sessions.len().min(u64::MAX as usize) as u64
+        active_session_count(&sessions)
     }
 
     #[cfg(test)]
@@ -317,9 +499,21 @@ fn percent_of(value: u64, percent: u8) -> u64 {
     value.saturating_mul(u64::from(percent)).saturating_div(100)
 }
 
-fn prune_sessions(sessions: &mut HashMap<String, u64>, now_ms: u64, idle_seconds: u64) {
+fn active_session_count(sessions: &HashMap<String, PlaybackSession>) -> u64 {
+    sessions.values().filter(|session| !session.moved).count() as u64
+}
+
+fn permille(value: u64, limit: u64) -> u32 {
+    if limit == 0 {
+        return u32::MAX;
+    }
+    let scaled = u128::from(value) * 1_000 / u128::from(limit);
+    scaled.min(u128::from(u32::MAX)) as u32
+}
+
+fn prune_sessions(sessions: &mut HashMap<String, PlaybackSession>, now_ms: u64, idle_seconds: u64) {
     let idle_ms = idle_seconds.saturating_mul(1_000);
-    sessions.retain(|_, last_seen_ms| now_ms.saturating_sub(*last_seen_ms) < idle_ms);
+    sessions.retain(|_, session| now_ms.saturating_sub(session.last_seen_ms) < idle_ms);
 }
 
 #[cfg(test)]
@@ -335,7 +529,23 @@ mod tests {
             min_sustained_seconds: 3,
             session_idle_seconds: 5,
             max_sessions: 2,
+            session_limit: 0,
         })
+    }
+
+    fn session(session_id: &str) -> PlaybackRequest<'_> {
+        PlaybackRequest {
+            session_id: Some(session_id),
+            ..PlaybackRequest::default()
+        }
+    }
+
+    fn reader(session_id: &str, stream_id: u64) -> PlaybackRequest<'_> {
+        PlaybackRequest {
+            session_id: Some(session_id),
+            stream_id: Some(stream_id),
+            draining: false,
+        }
     }
 
     #[test]
@@ -385,6 +595,7 @@ mod tests {
             min_sustained_seconds: 100,
             session_idle_seconds: 0,
             max_sessions: 0,
+            session_limit: 0,
         }
         .normalized();
         assert_eq!(config.capacity_bps, 1);
@@ -400,32 +611,142 @@ mod tests {
     fn preserves_admitted_sessions_during_overload() {
         let admission = admission();
         assert_eq!(
-            admission.admit_playback_at(Some("existing"), false, 0),
+            admission.admit_playback_at(session("existing"), false, 0),
             PlaybackAdmission::Admitted
         );
         assert_eq!(
-            admission.admit_playback_at(Some("existing"), true, 1_000),
+            admission.admit_playback_at(session("existing"), true, 1_000),
             PlaybackAdmission::Existing
         );
         assert_eq!(
-            admission.admit_playback_at(Some("new"), true, 1_000),
+            admission.admit_playback_at(session("new"), true, 1_000),
             PlaybackAdmission::Rejected
         );
         assert_eq!(
-            admission.admit_playback_at(None, true, 1_000),
+            admission.admit_playback_at(PlaybackRequest::default(), true, 1_000),
             PlaybackAdmission::Rejected
+        );
+    }
+
+    #[test]
+    fn session_limit_rejects_a_new_session_and_keeps_admitted_ones() {
+        let admission = EdgeAdmission::new(EdgeAdmissionConfig {
+            capacity_bps: 1_000_000,
+            session_limit: 2,
+            max_sessions: 100,
+            ..EdgeAdmissionConfig::default()
+        });
+        assert_eq!(
+            admission.admit_playback_at(session("one"), false, 0),
+            PlaybackAdmission::Admitted
+        );
+        assert_eq!(
+            admission.admit_playback_at(session("two"), false, 0),
+            PlaybackAdmission::Admitted
+        );
+        assert_eq!(
+            admission.admit_playback_at(session("three"), false, 0),
+            PlaybackAdmission::Rejected
+        );
+        assert_eq!(
+            admission.admit_playback_at(session("one"), false, 1_000),
+            PlaybackAdmission::Existing
+        );
+        let snapshot = admission.snapshot();
+        assert_eq!(snapshot.session_limit, 2);
+        assert_eq!(snapshot.load_permille, 1_000);
+    }
+
+    #[test]
+    fn sessions_are_admitted_against_the_bit_rate_of_their_playlist() {
+        // 100 Mbit/s node, 85 Mbit/s admission limit, one 16 Mbit/s playlist
+        // and one 2 Mbit/s playlist.
+        let admission = EdgeAdmission::new(EdgeAdmissionConfig {
+            capacity_bps: 100_000_000,
+            ..EdgeAdmissionConfig::default()
+        });
+        admission.set_playlist_bps(1, 16_000_000);
+        admission.set_playlist_bps(2001, 2_000_000);
+        for index in 0..5 {
+            let id = format!("video-{index}");
+            assert_eq!(
+                admission.admit_playback_at(reader(&id, 1), false, 0),
+                PlaybackAdmission::Admitted
+            );
+        }
+        // 80 Mbit/s is committed. A sixth 4K reader does not fit. Two audio
+        // readers do, and a third does not.
+        assert_eq!(
+            admission.admit_playback_at(reader("video-5", 1), false, 0),
+            PlaybackAdmission::Rejected
+        );
+        assert_eq!(
+            admission.admit_playback_at(reader("audio-0", 2001), false, 0),
+            PlaybackAdmission::Admitted
+        );
+        assert_eq!(
+            admission.admit_playback_at(reader("audio-1", 2001), false, 0),
+            PlaybackAdmission::Admitted
+        );
+        assert_eq!(
+            admission.admit_playback_at(reader("audio-2", 2001), false, 0),
+            PlaybackAdmission::Rejected
+        );
+        // A quiet passage does not lower the rate that a session is held to.
+        admission.set_playlist_bps(1, 9_000_000);
+        assert_eq!(admission.playlist_bps(1), Some(16_000_000));
+        admission.clear_playlist_bps(7);
+        let snapshot = admission.snapshot();
+        assert_eq!(snapshot.committed_bps, 84_000_000);
+        assert_eq!(snapshot.load_permille, 988);
+        assert_eq!(admission.sessions_by_playlist()[&1], 5);
+        assert_eq!(admission.sessions_by_playlist()[&2001], 2);
+    }
+
+    #[test]
+    fn a_draining_node_keeps_its_sessions_and_takes_no_new_one() {
+        let admission = admission();
+        assert_eq!(
+            admission.admit_playback_at(session("existing"), false, 0),
+            PlaybackAdmission::Admitted
+        );
+        let draining = |session_id| PlaybackRequest {
+            session_id,
+            stream_id: None,
+            draining: true,
+        };
+        assert_eq!(
+            admission.admit_playback_at(draining(Some("existing")), false, 1_000),
+            PlaybackAdmission::Existing
+        );
+        assert_eq!(
+            admission.admit_playback_at(draining(Some("new")), false, 1_000),
+            PlaybackAdmission::Rejected
+        );
+        assert_eq!(
+            admission.admit_playback_at(draining(None), false, 1_000),
+            PlaybackAdmission::Rejected
+        );
+        // The node sends the session to another cache. The session no longer
+        // counts, and what it still asks for here is served.
+        assert!(admission.release_session("existing"));
+        assert!(!admission.release_session("existing"));
+        assert_eq!(admission.active_sessions_at(1_000), 0);
+        assert_eq!(
+            admission.admit_playback_at(draining(Some("existing")), false, 1_500),
+            PlaybackAdmission::Existing
         );
     }
 
     #[test]
     fn expires_idle_sessions_and_bounds_the_registry() {
         let admission = admission();
-        admission.admit_playback_at(Some("one"), false, 0);
-        admission.admit_playback_at(Some("two"), false, 1_000);
-        admission.admit_playback_at(Some("three"), false, 2_000);
+        admission.admit_playback_at(session("one"), false, 0);
+        admission.admit_playback_at(session("two"), false, 1_000);
+        admission.admit_playback_at(session("three"), false, 2_000);
         assert_eq!(admission.active_sessions_at(2_000), 2);
         assert_eq!(
-            admission.admit_playback_at(Some("one"), true, 2_000),
+            admission.admit_playback_at(session("one"), true, 2_000),
             PlaybackAdmission::Rejected
         );
         assert_eq!(admission.active_sessions_at(7_000), 0);

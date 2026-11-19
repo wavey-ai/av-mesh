@@ -1,9 +1,14 @@
+mod assignment;
 mod control;
 mod edge_admission;
 mod edge_lifecycle;
 mod link_telemetry;
 
 use anyhow::{anyhow, bail, Context, Result};
+use assignment::{
+    assign, AssignedCache, Assignment, AssignmentError, AssignmentPolicy, AssignmentRequest,
+    CacheCandidate,
+};
 use async_trait::async_trait;
 use av_mesh::relay_ingress::{
     ControlledRelayParentSession, RelayIngressError, RelayIngressOutcome, RelayIngressSnapshot,
@@ -27,7 +32,7 @@ use control::{
 };
 use dashmap::{mapref::entry::Entry, DashMap};
 use edge_admission::{
-    EdgeAdmission, EdgeAdmissionConfig, EdgeAdmissionSnapshot, PlaybackAdmission,
+    EdgeAdmission, EdgeAdmissionConfig, EdgeAdmissionSnapshot, PlaybackAdmission, PlaybackRequest,
     DEFAULT_ADMISSION_PERCENT, DEFAULT_EGRESS_CAPACITY_BPS, DEFAULT_MAX_SESSIONS,
     DEFAULT_MIN_SUSTAINED_SECONDS, DEFAULT_RECOVERY_PERCENT, DEFAULT_SESSION_IDLE_SECONDS,
     DEFAULT_WINDOW_SECONDS,
@@ -46,9 +51,12 @@ use linode::{regions::REGIONS as LINODE_REGIONS, LinodeClient};
 use media_object::{MediaObject, ObjectKind, Stage, WIRE_MAGIC};
 use playlists::chunk_cache::{ChunkCache, PutIfAbsentResult};
 use playlists::mesh::{
-    CacheMesh, CacheMeshConfig, CacheMeshFecStats, CacheMeshHandle, CacheMeshRole,
+    AppliedSlot, CacheMesh, CacheMeshConfig, CacheMeshFecStats, CacheMeshHandle, CacheMeshRole,
+    ReplicationMode,
 };
-use playlists::multivariant::{MultivariantPlaylist, VariantStream};
+use playlists::multivariant::{
+    is_valid_pathway_id, ContentSteering, MultivariantPlaylist, VariantStream,
+};
 #[cfg(test)]
 use playlists::tail_bundle::decode_tail_bundle;
 use playlists::tail_bundle::{
@@ -146,6 +154,19 @@ const EDGE_HOLE_REPAIR_MIN_INTERVAL_MS: u64 = 50;
 /// newest part. Holes older than this window are left to the once-a-second
 /// replica request, so one repair answer stays small.
 const EDGE_HOLE_REPAIR_WINDOW_MS: u64 = 500;
+/// How often an edge looks for playlists whose readers have gone.
+const PLAYLIST_DEMAND_SWEEP_MS: u64 = 500;
+/// Longest wait for the first parts of a playlist that an edge has just
+/// subscribed to, before it answers the request that created the demand.
+const PLAYLIST_WARM_WAIT_MS: u64 = 1_500;
+const ASSIGNMENT_PATH: &str = "/api/assignment";
+/// Fewest parts in the playlist window of a stream whose parts are longer
+/// than the nominal part of the node.
+const MIN_STREAM_WINDOW_PARTS: usize = 32;
+/// Sessions whose assigned cache an entry point remembers.
+const MAX_REMEMBERED_ASSIGNMENTS: usize = 50_000;
+/// How long an entry point remembers the cache of a session that is silent.
+const REMEMBERED_ASSIGNMENT_MS: u64 = 120_000;
 const MESH_EVENTS_PATH: &str = "/api/mesh/events";
 const MESH_WEBSOCKET_PATH: &str = "/ws/mesh";
 const MISSION_CONTROL_DIST_ENV: &str = "NEEDLETAIL_MISSION_CONTROL_DIST";
@@ -773,6 +794,12 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_MESH_FEC_SYMBOL_SIZE)]
     mesh_symbol_size: u16,
 
+    /// Largest cache-mesh symbol for a large object. A part that needs more
+    /// than 64 symbols of --mesh-symbol-size uses a multiple of it, up to
+    /// this size. Zero keeps one symbol size for every object.
+    #[arg(long, env = "NEEDLETAIL_MESH_MAX_SYMBOL_SIZE", default_value_t = 0)]
+    mesh_max_symbol_size: u16,
+
     #[cfg(feature = "private-subnet-discovery")]
     #[arg(long)]
     private_subnet_discovery: bool,
@@ -999,6 +1026,90 @@ struct Args {
     /// Maximum child edges served by one distributor sync tick.
     #[arg(long, env = "NEEDLETAIL_CACHE_MESH_MAX_CHILDREN", default_value_t = 8)]
     cache_mesh_max_children: usize,
+
+    /// Which playlists a distributor pushes to an edge. `demand` pushes a
+    /// playlist only while the edge has readers for it. `all` pushes every
+    /// playlist to every edge. The `peer` role always uses `all`.
+    #[arg(
+        long,
+        value_enum,
+        env = "NEEDLETAIL_CACHE_MESH_REPLICATION",
+        default_value_t = CacheMeshReplicationArg::Demand
+    )]
+    cache_mesh_replication: CacheMeshReplicationArg,
+
+    /// How long a distributor keeps pushing a playlist after the last
+    /// subscription from an edge. The edge renews three times in this period.
+    #[arg(long, env = "NEEDLETAIL_CACHE_MESH_LEASE_MS", default_value_t = 5_000)]
+    cache_mesh_lease_ms: u64,
+
+    /// An edge releases a playlist this long after the last request for it.
+    /// The distributors stop pushing it and the edge drops its copy.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CACHE_MESH_DEMAND_IDLE_MS",
+        default_value_t = 30_000
+    )]
+    cache_mesh_demand_idle_ms: u64,
+
+    /// Parts that a new copy of a playlist receives before the live part.
+    /// Zero uses --window-parts.
+    #[arg(long, env = "NEEDLETAIL_CACHE_MESH_WARM_PARTS", default_value_t = 0)]
+    cache_mesh_warm_parts: usize,
+
+    /// Rate limit for warming a new copy, for each edge, in kbit/s. Live
+    /// parts are not limited. Zero sends the warm-up window at once. A
+    /// one-vCPU edge that warms a 4K copy at 50 Mbit/s stops serving its
+    /// readers for about a second, so the default is 20 Mbit/s.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CACHE_MESH_WARM_KBPS",
+        default_value_t = 20_000
+    )]
+    cache_mesh_warm_kbps: u64,
+
+    /// Receive and send buffer of the cache-mesh socket. It must hold the
+    /// largest part once for each parent. Zero uses --udp-socket-buffer-bytes.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CACHE_MESH_SOCKET_BUFFER_BYTES",
+        default_value_t = 0
+    )]
+    cache_mesh_socket_buffer_bytes: usize,
+
+    /// Fault injection for tests: drop this many received cache-mesh datagrams
+    /// in each million, as a lossy private network would.
+    #[arg(
+        long,
+        hide = true,
+        env = "NEEDLETAIL_CACHE_MESH_TEST_RECEIVE_LOSS_PPM",
+        default_value_t = 0
+    )]
+    cache_mesh_test_receive_loss_ppm: u32,
+
+    /// Most playback sessions that this node serves at one time. Zero sets
+    /// no limit. A node at the limit rejects a new session and names other
+    /// caches of the region.
+    #[arg(long, env = "NEEDLETAIL_EDGE_SESSION_LIMIT", default_value_t = 0)]
+    edge_session_limit: usize,
+
+    /// Load, as a percentage of the admission limit, below which a cache
+    /// that holds a playlist takes new readers before another cache adds a
+    /// copy of it.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_ASSIGNMENT_SPREAD_PERCENT",
+        default_value_t = 60
+    )]
+    assignment_spread_percent: u8,
+
+    /// Caches named after the assigned cache, as the failover order.
+    #[arg(long, env = "NEEDLETAIL_ASSIGNMENT_ALTERNATES", default_value_t = 2)]
+    assignment_alternates: usize,
+
+    /// Seconds after which a player reloads its Content Steering manifest.
+    #[arg(long, env = "NEEDLETAIL_STEERING_TTL_SECONDS", default_value_t = 5)]
+    steering_ttl_seconds: u64,
 
     #[arg(long, default_value_t = 51.5074)]
     latitude: f64,
@@ -1358,6 +1469,7 @@ async fn main() -> Result<()> {
         min_sustained_seconds: args.egress_min_sustained_seconds,
         session_idle_seconds: args.egress_session_idle_seconds,
         max_sessions: args.egress_max_sessions,
+        session_limit: args.edge_session_limit,
     });
     let edge_lifecycle_config = EdgeLifecycleConfig {
         enabled: args.edge_lifecycle,
@@ -1426,12 +1538,37 @@ async fn main() -> Result<()> {
     mesh_config.repair_ratio = args.mesh_repair_ratio;
     mesh_config.max_repair_symbols = args.mesh_max_repair_symbols;
     mesh_config.symbol_size = args.mesh_symbol_size;
+    let cache_mesh_role: CacheMeshRole = args.cache_mesh_role.into();
+    let replication = effective_replication(args.cache_mesh_replication, cache_mesh_role);
+    let (mesh_applied_tx, mesh_applied_rx) = mpsc::unbounded_channel();
+    let mesh_config = mesh_config
+        .with_receive_loss_ppm(args.cache_mesh_test_receive_loss_ppm)
+        .with_max_symbol_size(args.mesh_max_symbol_size)
+        .with_replication(replication)
+        .with_subscription_lease(Duration::from_millis(args.cache_mesh_lease_ms.max(100)))
+        .with_backfill_bytes_per_sec(args.cache_mesh_warm_kbps.saturating_mul(125))
+        .with_socket_buffer_bytes(if args.cache_mesh_socket_buffer_bytes > 0 {
+            args.cache_mesh_socket_buffer_bytes
+        } else {
+            args.udp_socket_buffer_bytes
+        })
+        .with_applied_tx(mesh_applied_tx);
     let mesh_handle = Arc::new(
         CacheMesh::new(Arc::clone(&cache.chunk_cache), mesh_config)
             .start()
             .await
             .context("failed to start cache mesh")?,
     );
+    let playlist_demand = PlaylistDemand::new(PlaylistDemandConfig {
+        enabled: replication == ReplicationMode::Demand && cache_mesh_role == CacheMeshRole::Edge,
+        lease: Duration::from_millis(args.cache_mesh_lease_ms.max(100)),
+        idle: Duration::from_millis(args.cache_mesh_demand_idle_ms.max(1_000)),
+        warm_parts: if args.cache_mesh_warm_parts > 0 {
+            args.cache_mesh_warm_parts
+        } else {
+            args.window_parts
+        },
+    });
 
     let control_packets = packetize_control_message(&MeshControlMessage {
         node_id: node_id.clone(),
@@ -1449,6 +1586,19 @@ async fn main() -> Result<()> {
 
     let (ingest_shutdown_tx, ingest_shutdown_rx) = watch::channel(());
     link_telemetry.start(ingest_shutdown_rx.clone());
+    let mesh_applied_task = tokio::spawn(run_mesh_applied_parts(
+        Arc::clone(&cache),
+        edge_load.clone(),
+        mesh_applied_rx,
+        ingest_shutdown_rx.clone(),
+    ));
+    let playlist_demand_task = tokio::spawn(run_playlist_demand(
+        Arc::clone(&cache),
+        Arc::clone(&mesh_handle),
+        edge_load.clone(),
+        playlist_demand.clone(),
+        ingest_shutdown_rx.clone(),
+    ));
 
     #[cfg(feature = "private-subnet-discovery")]
     let private_subnet_discovery = if args.private_subnet_discovery {
@@ -1567,7 +1717,7 @@ async fn main() -> Result<()> {
         audio_epoch_tx.clone(),
         mesh_transport,
         node_profile.clone(),
-        args.cache_mesh_role.into(),
+        cache_mesh_role,
         replication_policy.clone(),
         control_plane.clone(),
         control_dispatch.clone(),
@@ -1584,7 +1734,17 @@ async fn main() -> Result<()> {
         private_discovery_status,
         args.operations_snapshot_file.clone(),
     )
-    .with_hls_renditions(args.hls_renditions.clone(), args.hls_rendition_stale_ms);
+    .with_hls_renditions(args.hls_renditions.clone(), args.hls_rendition_stale_ms)
+    .with_playlist_demand(playlist_demand)
+    .with_assignment(
+        AssignmentPolicy {
+            spread_permille: u32::from(args.assignment_spread_percent.min(100)) * 10,
+            max_alternates: args.assignment_alternates,
+            max_head_lag_parts: 0,
+        },
+        args.steering_ttl_seconds.max(1),
+        args.telemetry_interval_ms,
+    );
     let telemetry_fec_sender = if let Some(queue) = telemetry_fec_queue.clone() {
         Some(
             start_telemetry_fec_sender(
@@ -1731,6 +1891,8 @@ async fn main() -> Result<()> {
         let _ = task.await;
     }
     let _ = media_fec_ingest_task.await;
+    let _ = mesh_applied_task.await;
+    let _ = playlist_demand_task.await;
     let _ = replication_planner_task.await;
     if let Some(task) = telemetry_publisher_task {
         let _ = task.await;
@@ -2099,6 +2261,24 @@ enum RelayForwardRole {
     All,
     Source,
     Repair,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+enum CacheMeshReplicationArg {
+    #[default]
+    Demand,
+    All,
+}
+
+/// The replication mode in effect for a role. The `peer` role is the
+/// symmetric mesh of local fixtures and always replicates every playlist.
+fn effective_replication(mode: CacheMeshReplicationArg, role: CacheMeshRole) -> ReplicationMode {
+    match (mode, role) {
+        (CacheMeshReplicationArg::Demand, CacheMeshRole::Edge | CacheMeshRole::Distributor) => {
+            ReplicationMode::Demand
+        }
+        _ => ReplicationMode::All,
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -4243,6 +4423,11 @@ impl LiveTsCache {
         let chunk_cache = Arc::new(ChunkCache::new(options));
         let _ = chunk_cache.get_or_create_stream_idx(stream_id).await;
         let (part_updates, _) = watch::channel(0);
+        let mut state = LiveState::new();
+        state.segment_seed_parts = parts_per_segment.max(1) as u64;
+        state.nominal_part_ms = u64::try_from(part_target.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
         Arc::new(Self {
             chunk_cache,
             stream_id,
@@ -4250,7 +4435,7 @@ impl LiveTsCache {
             parts_per_segment,
             window_parts,
             max_part_bytes: slot_kb * 1024,
-            state: RwLock::new(LiveState::new()),
+            state: RwLock::new(state),
             canonical_commit_locks: StdMutex::new(HashMap::new()),
             canonical_gap_hold_ms: AtomicU64::new(DEFAULT_CANONICAL_GAP_HOLD_MS),
             canonical_gap_hold_parts: AtomicU64::new(canonical_gap_hold_parts(
@@ -4395,7 +4580,13 @@ impl LiveTsCache {
     /// The caller must hold the stream's canonical commit lock. A stream with
     /// no hole costs one stream-index lookup and one watermark comparison.
     async fn release_held_canonical_gap(&self, stream_id: u64, committing_slot: usize) {
-        let hold_parts = self.canonical_gap_hold_parts.load(Ordering::Relaxed);
+        // The hold is a length of time. Count it in the parts of this stream,
+        // not in the nominal parts of the node.
+        let hold_ms = self.canonical_gap_hold_ms.load(Ordering::Relaxed);
+        if hold_ms == 0 {
+            return;
+        }
+        let hold_parts = hold_ms.div_ceil(self.state.read().await.stream_part_ms(stream_id));
         if hold_parts == 0 {
             return;
         }
@@ -4771,7 +4962,7 @@ impl LiveTsCache {
                 state.stream_latest_canonical_object.remove(&stream_id);
                 state.stream_next_seq.remove(&stream_id);
                 state.stream_parts.remove(&stream_id);
-                state.stream_current_fmp4_segment.remove(&stream_id);
+                state.stream_keyframe_segments.remove(&stream_id);
                 state.stream_retained_bytes.remove(&stream_id);
                 state.stream_max_part_duration_ms.remove(&stream_id);
                 state.stream_max_segment_duration_ms.remove(&stream_id);
@@ -4949,6 +5140,7 @@ impl LiveTsCache {
                 media_kind == LiveMediaKind::Fmp4,
                 self.window_parts,
             );
+            state.record_part_published(stream_id, seq, object_published_unix_us(&object));
             debug!(
                 stream_id,
                 source_epoch,
@@ -4962,6 +5154,7 @@ impl LiveTsCache {
                 "committed canonical RaptorQ media object"
             );
             drop(state);
+            self.trim_stream_ring(stream_id, slot_id).await;
             self.part_updates.send_replace(seq);
             return Ok(seq);
         }
@@ -5022,6 +5215,180 @@ impl LiveTsCache {
         drop(state);
         self.part_updates.send_replace(seq);
         Ok(seq)
+    }
+
+    /// Record the playlist entry of a part that the cache mesh delivered.
+    ///
+    /// A part carries its own playlist entry: its duration, whether it starts
+    /// with a key frame, and when the contributor published it. An edge reads
+    /// the entry from the part, so its playlist is the playlist of its
+    /// distributor and not a second, poorer one.
+    async fn observe_mesh_part(&self, stream_id: u64, slot_id: usize) -> Option<MeshPartRecord> {
+        let (bytes, _) = self
+            .chunk_cache
+            .get_for_stream_id(stream_id, slot_id)
+            .await?;
+        let record = MeshPartRecord::from_slot(&bytes, stream_id)?;
+        let sequence = slot_id as u64;
+        let now_ms = now_unix_ms();
+
+        let previous_epoch = self
+            .state
+            .read()
+            .await
+            .stream_canonical_epoch
+            .get(&stream_id)
+            .copied();
+        match (record.epoch, previous_epoch) {
+            // A late part of a publication that has been replaced.
+            (Some(epoch), Some(previous)) if epoch < previous => return None,
+            (Some(epoch), Some(previous)) if epoch > previous => {
+                // The source started a new publication, and its sequence
+                // starts again. Drop the copy of the old publication and keep
+                // the part that announced the new one.
+                let initialization = self.chunk_cache.stream_initialization(stream_id);
+                self.forget_mesh_stream(stream_id).await;
+                if let Some(initialization) = initialization {
+                    let _ = self
+                        .chunk_cache
+                        .set_stream_initialization(stream_id, initialization)
+                        .await;
+                }
+                if self
+                    .chunk_cache
+                    .add_for_stream_id(stream_id, slot_id, bytes.clone())
+                    .await
+                    .is_err()
+                {
+                    return None;
+                }
+                info!(
+                    stream_id,
+                    epoch, previous, "cache-mesh copy restarted for a new source publication"
+                );
+            }
+            _ => {}
+        }
+
+        let mut state = self.state.write().await;
+        if let Some(epoch) = record.epoch {
+            state.stream_canonical_epoch.insert(stream_id, epoch);
+        }
+        state.stream_last_ingest_unix_ms.insert(stream_id, now_ms);
+        state
+            .stream_media_kinds
+            .insert(stream_id, record.media_kind);
+        if let Some(init) = record.init.clone() {
+            state.stream_inits.insert(stream_id, init);
+        }
+        state.observe_stream_seq(stream_id, sequence);
+        state.record_part_available(
+            stream_id,
+            sequence,
+            bytes.len(),
+            now_unix_us(),
+            record.duration_ms,
+            record.keyframe,
+            record.keyframe_segments,
+            self.window_parts,
+        );
+        state.record_part_published(stream_id, sequence, record.published_unix_us);
+        drop(state);
+        self.trim_stream_ring(stream_id, slot_id).await;
+        // A reader can render the playlist between the cache write and this
+        // record. That rendering lacks the entry, so it must not be reused.
+        self.invalidate_cached_playlist(stream_id);
+        self.part_updates.send_replace(sequence);
+        Some(record)
+    }
+
+    fn invalidate_cached_playlist(&self, stream_id: u64) {
+        for cached_playlist in &self.playlist_cache {
+            let mut cached_playlist = cached_playlist
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if cached_playlist
+                .as_ref()
+                .is_some_and(|cached| cached.stream_id == stream_id)
+            {
+                *cached_playlist = None;
+            }
+        }
+    }
+
+    /// Drop the local copy of a playlist that the cache mesh supplied.
+    async fn forget_mesh_stream(&self, stream_id: u64) {
+        let commit_lock = self.canonical_commit_lock(stream_id);
+        let _commit_guard = commit_lock.lock().await;
+        // Release the bytes too. A copy that is only hidden stays in memory
+        // until another stream overwrites it, and a small node that holds 4K
+        // copies in turn would fill with copies that nobody reads.
+        self.chunk_cache.release_stream_id(stream_id).await;
+        self.state.write().await.forget_stream(stream_id);
+        self.invalidate_cached_playlist(stream_id);
+    }
+
+    /// Parts in the playlist window of one stream. See
+    /// [`LiveState::stream_window_parts`].
+    async fn window_parts_for(&self, stream_id: u64) -> usize {
+        self.state
+            .read()
+            .await
+            .stream_window_parts(stream_id, self.window_parts)
+    }
+
+    /// Release the part that has just left the retained window of a stream
+    /// with a shorter window than the cache ring.
+    ///
+    /// The ring keeps four windows of nominal parts for every stream. A 4K
+    /// part is hundreds of kilobytes, so a ring of them does not fit a small
+    /// node. A stream keeps four of its own windows instead.
+    async fn trim_stream_ring(&self, stream_id: u64, newest: usize) {
+        let window_parts = self.window_parts_for(stream_id).await;
+        if window_parts >= self.window_parts {
+            return;
+        }
+        let retained = window_parts.saturating_mul(4);
+        if let Some(expired) = newest.checked_sub(retained) {
+            self.chunk_cache
+                .clear_for_stream_id(stream_id, expired)
+                .await;
+        }
+    }
+
+    /// Measured bit rate of a playlist over its retained parts.
+    async fn playlist_bitrate_bps(&self, stream_id: u64) -> Option<u64> {
+        let nominal_ms = self.part_target.as_millis().clamp(1, u128::from(u32::MAX)) as u64;
+        let state = self.state.read().await;
+        state.playlist_bitrate_bps(stream_id, nominal_ms)
+    }
+
+    /// Wait until a playlist that this node has just subscribed to has parts
+    /// to serve, or the wait ends. Returns whether parts are present.
+    async fn wait_for_playlist_copy(&self, stream_id: u64, wait: Duration) -> bool {
+        let deadline = Instant::now() + wait;
+        let mut updates = self.part_updates.subscribe();
+        loop {
+            if self
+                .state
+                .read()
+                .await
+                .stream_parts
+                .get(&stream_id)
+                .is_some_and(|parts| !parts.is_empty())
+            {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let _ = tokio::time::timeout(
+                (deadline - now).min(Duration::from_millis(50)),
+                updates.changed(),
+            )
+            .await;
+        }
     }
 
     async fn retire_streams_idle_before(&self, cutoff_unix_ms: u64) -> usize {
@@ -5196,7 +5563,7 @@ impl LiveTsCache {
         if let Some(playlist) = self.cached_playlist(stream_id, stream_idx, version) {
             return playlist;
         }
-        let first = last.saturating_sub(self.window_parts.saturating_sub(1));
+        let first = last.saturating_sub(self.window_parts_for(stream_id).await.saturating_sub(1));
         let mut available = Vec::new();
         let mut latest_media_kind = None;
         let mut discovered_init = None;
@@ -5253,6 +5620,17 @@ impl LiveTsCache {
         let (part_target_ms, available) = {
             let state = self.state.read().await;
             let observations = state.stream_parts.get(&stream_id);
+            // A part that the cache mesh has just written has no playlist
+            // entry for a moment. Listing it now would give it the nominal
+            // duration of the node and no independent flag. It is listed
+            // when its entry is recorded, which invalidates this playlist.
+            let available = match observations {
+                Some(parts) if !parts.is_empty() => available
+                    .into_iter()
+                    .filter(|sequence| parts.contains_key(sequence))
+                    .collect::<Vec<_>>(),
+                _ => available,
+            };
             let part_target_ms = state
                 .stream_max_part_duration_ms
                 .get(&stream_id)
@@ -5272,9 +5650,12 @@ impl LiveTsCache {
                     let fmp4_segment_id = observations
                         .and_then(|parts| parts.get(&sequence))
                         .and_then(|part| part.fmp4_segment_id);
+                    // The publication time is written by the contributor, so
+                    // every cache derives the same program date and time. The
+                    // local arrival time is the fallback for a part without it.
                     let available_unix_us = observations
                         .and_then(|parts| parts.get(&sequence))
-                        .map(|part| part.available_unix_us)
+                        .map(|part| part.published_unix_us.unwrap_or(part.available_unix_us))
                         .unwrap_or_default();
                     (
                         sequence,
@@ -5417,6 +5798,9 @@ impl LiveTsCache {
             .values()
             .next()
             .and_then(|group| group.first())
+            .filter(|(_sequence, _duration_ms, _keyframe, available_unix_us)| {
+                *available_unix_us > 0
+            })
             .and_then(|(_sequence, duration_ms, _keyframe, available_unix_us)| {
                 let start_unix_us =
                     available_unix_us.saturating_sub(u64::from(*duration_ms).saturating_mul(1_000));
@@ -6244,11 +6628,14 @@ impl LiveTsCache {
         default_stats: &StatsSnapshot,
     ) -> Vec<StreamTelemetry> {
         let mut streams = Vec::new();
+        let now_ms = now_unix_ms();
+        let nominal_part_ms = self.part_target.as_millis().clamp(1, u128::from(u32::MAX)) as u64;
         let (
             canonical_epochs,
             canonical_epoch_activation_delays_us,
             subscription_bases,
             canonical_heads,
+            last_ingests,
             retained_streams,
         ) = {
             let state = self.state.read().await;
@@ -6257,7 +6644,8 @@ impl LiveTsCache {
                 state.stream_canonical_epoch_activation_delay_us.clone(),
                 state.stream_subscription_base_object.clone(),
                 state.stream_latest_canonical_object.clone(),
-                state.retained_stream_summaries(),
+                state.stream_last_ingest_unix_ms.clone(),
+                state.retained_stream_summaries(nominal_part_ms),
             )
         };
         for (stream_id, retained) in retained_streams {
@@ -6354,13 +6742,16 @@ impl LiveTsCache {
                 last_ingest_age_ms: if is_default_stream {
                     default_stats.last_ingest_age_ms
                 } else {
-                    None
+                    last_ingests
+                        .get(&stream_id)
+                        .map(|last| now_ms.saturating_sub(*last))
                 },
                 stale_threshold_ms: Some(stream_stale_threshold_ms(
                     default_stats.part_target_ms,
                     default_stats.window_parts,
                 )),
                 mesh_lag_parts: None,
+                bitrate_bps: retained.bitrate_bps,
             });
         }
         streams.sort_by_key(|stream| stream.stream_id);
@@ -6483,6 +6874,8 @@ impl LiveTsCache {
 struct RetainedPartObservation {
     bytes: usize,
     available_unix_us: u64,
+    /// When the contributor published the part, from the part itself.
+    published_unix_us: Option<u64>,
     duration_ms: Option<u32>,
     keyframe: bool,
     fmp4_segment_id: Option<u64>,
@@ -6494,6 +6887,71 @@ struct RetainedStreamSummary {
     latest_bytes: Option<usize>,
     retained_bytes: u64,
     retained_parts: u64,
+    bitrate_bps: Option<u64>,
+}
+
+/// The playlist entry that one cached part describes for itself.
+#[derive(Clone, Debug)]
+struct MeshPartRecord {
+    media_kind: LiveMediaKind,
+    init: Option<Bytes>,
+    duration_ms: Option<u32>,
+    keyframe: bool,
+    /// The part belongs to a stream whose segments start at key frames.
+    keyframe_segments: bool,
+    published_unix_us: Option<u64>,
+    epoch: Option<u64>,
+}
+
+impl MeshPartRecord {
+    fn from_slot(bytes: &Bytes, stream_id: u64) -> Option<Self> {
+        let slot = LiveSlotPayload::decode_for_stream(bytes.clone(), stream_id);
+        if !slot.has_media() {
+            return None;
+        }
+        let media_kind = slot.media_kind();
+        let init = slot.init();
+        if !bytes.starts_with(CANONICAL_LIVE_SLOT_MAGIC) {
+            return Some(Self {
+                media_kind,
+                init,
+                duration_ms: None,
+                keyframe: false,
+                keyframe_segments: false,
+                published_unix_us: None,
+                epoch: None,
+            });
+        }
+        // A canonical slot holds the complete media object behind a fixed
+        // index. The object names its own duration, key frame and times.
+        let object = media_object::decode(bytes.get(CANONICAL_LIVE_SLOT_HEADER_LEN..)?).ok()?;
+        let duration_ms = object
+            .metadata()
+            .get("duration-ms")
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|duration_ms| *duration_ms > 0);
+        Some(Self {
+            media_kind,
+            init,
+            duration_ms,
+            keyframe: object.is_keyframe(),
+            keyframe_segments: media_kind == LiveMediaKind::Fmp4,
+            published_unix_us: object_published_unix_us(&object),
+            epoch: Some(object.key().epoch()),
+        })
+    }
+}
+
+/// When the contributor published a media object, in Unix microseconds.
+fn object_published_unix_us(object: &MediaObject) -> Option<u64> {
+    object
+        .stage_timestamps()
+        .iter()
+        .find(|timestamp| timestamp.stage() == Stage::Published)
+        .and_then(|timestamp| u64::try_from(timestamp.timestamp().unix_time_ns()).ok())
+        .map(|published_ns| published_ns / 1_000)
+        .filter(|published_us| *published_us > 0)
 }
 
 struct LiveState {
@@ -6516,7 +6974,16 @@ struct LiveState {
     stream_latest_canonical_object: HashMap<u64, u64>,
     stream_last_ingest_unix_ms: HashMap<u64, u64>,
     stream_parts: HashMap<u64, BTreeMap<u64, RetainedPartObservation>>,
-    stream_current_fmp4_segment: HashMap<u64, u64>,
+    /// Segment number of each key-frame part of a stream, by part sequence.
+    stream_keyframe_segments: HashMap<u64, BTreeMap<u64, u64>>,
+    /// Parts in a nominal segment. It seeds the segment number of the first
+    /// key frame that a cache sees, so caches that join a stream at different
+    /// times number its segments alike when the key-frame interval is nominal.
+    /// Zero starts at segment zero.
+    segment_seed_parts: u64,
+    /// Nominal part duration of the node, which sizes the cache ring. Zero
+    /// gives every stream the configured window in parts.
+    nominal_part_ms: u64,
     stream_retained_bytes: HashMap<u64, u64>,
     stream_max_part_duration_ms: HashMap<u64, u32>,
     stream_max_segment_duration_ms: HashMap<u64, u64>,
@@ -6547,7 +7014,9 @@ impl LiveState {
             stream_latest_canonical_object: HashMap::new(),
             stream_last_ingest_unix_ms: HashMap::new(),
             stream_parts: HashMap::new(),
-            stream_current_fmp4_segment: HashMap::new(),
+            stream_keyframe_segments: HashMap::new(),
+            segment_seed_parts: 0,
+            nominal_part_ms: 0,
             stream_retained_bytes: HashMap::new(),
             stream_max_part_duration_ms: HashMap::new(),
             stream_max_segment_duration_ms: HashMap::new(),
@@ -6586,6 +7055,7 @@ impl LiveState {
                 .and_modify(|maximum| *maximum = (*maximum).max(duration_ms))
                 .or_insert(duration_ms);
         }
+        let window_parts = self.stream_window_parts(stream_id, window_parts);
         let existing = self
             .stream_parts
             .get(&stream_id)
@@ -6593,18 +7063,25 @@ impl LiveState {
             .copied();
         let fmp4_segment_id = if let Some(existing) = existing {
             existing.fmp4_segment_id
-        } else if keyframe_segments && keyframe {
-            let segment_id = self
-                .stream_current_fmp4_segment
-                .entry(stream_id)
-                .and_modify(|segment_id| *segment_id = segment_id.saturating_add(1))
-                .or_insert(0);
-            Some(*segment_id)
         } else if keyframe_segments {
-            self.stream_current_fmp4_segment.get(&stream_id).copied()
+            self.assign_fmp4_segment(stream_id, sequence, keyframe)
         } else {
             None
         };
+        let next_keyframe = (keyframe_segments && keyframe && existing.is_none()).then(|| {
+            self.stream_keyframe_segments
+                .get(&stream_id)
+                .and_then(|keyframes| {
+                    keyframes
+                        .range((
+                            std::ops::Bound::Excluded(sequence),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .next()
+                        .map(|(next, _)| *next)
+                })
+                .unwrap_or(u64::MAX)
+        });
         let (inserted_bytes, removed_bytes) = {
             let parts = self.stream_parts.entry(stream_id).or_default();
             let inserted_bytes =
@@ -6612,6 +7089,7 @@ impl LiveState {
                     entry.insert(RetainedPartObservation {
                         bytes,
                         available_unix_us,
+                        published_unix_us: None,
                         duration_ms,
                         keyframe,
                         fmp4_segment_id,
@@ -6620,6 +7098,19 @@ impl LiveState {
                 } else {
                     0
                 };
+            if let Some(next_keyframe) = next_keyframe {
+                // Parts can arrive before their key frame, for example when a
+                // new copy is warmed newest part first. They belong to the
+                // segment of this key frame.
+                for (_, part) in parts.range_mut((
+                    std::ops::Bound::Excluded(sequence),
+                    std::ops::Bound::Excluded(next_keyframe),
+                )) {
+                    if !part.keyframe {
+                        part.fmp4_segment_id = fmp4_segment_id;
+                    }
+                }
+            }
             let retention_head = parts
                 .last_key_value()
                 .map(|(retained_sequence, _)| *retained_sequence)
@@ -6635,6 +7126,16 @@ impl LiveState {
                     removed_bytes = removed_bytes.saturating_add(removed.bytes as u64);
                 }
             }
+            if let Some(keyframes) = self.stream_keyframe_segments.get_mut(&stream_id) {
+                // Keep the key frame that the oldest retained part belongs to.
+                if let Some(floor) = keyframes
+                    .range(..=oldest_retained)
+                    .next_back()
+                    .map(|(keyframe_sequence, _)| *keyframe_sequence)
+                {
+                    *keyframes = keyframes.split_off(&floor);
+                }
+            }
             (inserted_bytes, removed_bytes)
         };
         let retained_bytes = self.stream_retained_bytes.entry(stream_id).or_default();
@@ -6643,7 +7144,172 @@ impl LiveState {
             .saturating_sub(removed_bytes);
     }
 
-    fn retained_stream_summaries(&self) -> HashMap<u64, RetainedStreamSummary> {
+    /// Segment number of a part of a stream whose segments start at key
+    /// frames, or `None` while the key frame of the part is not known.
+    ///
+    /// Segment numbers must be consecutive, and they must not depend on the
+    /// order in which parts arrive: a live copy receives parts oldest first, a
+    /// warming copy newest first, and a repaired hole in any order.
+    ///
+    /// A key frame that is joined to a numbered key frame by stored parts is
+    /// its direct neighbour and takes the next or the previous number. A key
+    /// frame behind a hole takes its number from the distance in parts, at
+    /// the nominal segment length. The first key frame that a cache sees is
+    /// numbered from its part sequence in the same way, so caches that join a
+    /// stream at different times agree when the key-frame interval is nominal.
+    fn assign_fmp4_segment(
+        &mut self,
+        stream_id: u64,
+        sequence: u64,
+        keyframe: bool,
+    ) -> Option<u64> {
+        let seed_parts = self.segment_seed_parts;
+        let nominal_parts = seed_parts.max(1);
+        let keyframes = self.stream_keyframe_segments.entry(stream_id).or_default();
+        if !keyframe {
+            return keyframes
+                .range(..=sequence)
+                .next_back()
+                .map(|(_, segment)| *segment);
+        }
+        if let Some(segment) = keyframes.get(&sequence) {
+            return Some(*segment);
+        }
+        let previous = keyframes
+            .range(..sequence)
+            .next_back()
+            .map(|(keyframe_sequence, segment)| (*keyframe_sequence, *segment));
+        let next = keyframes
+            .range(sequence..)
+            .next()
+            .map(|(keyframe_sequence, segment)| (*keyframe_sequence, *segment));
+        let parts = self.stream_parts.get(&stream_id);
+        // Whether every part strictly between two sequences is stored.
+        let joined = |low: u64, high: u64| {
+            let between = high.saturating_sub(low).saturating_sub(1);
+            between == 0
+                || parts.is_some_and(|parts| {
+                    parts
+                        .range((
+                            std::ops::Bound::Excluded(low),
+                            std::ops::Bound::Excluded(high),
+                        ))
+                        .count() as u64
+                        == between
+                })
+        };
+        let segments_in =
+            |distance: u64| (distance.saturating_add(nominal_parts / 2) / nominal_parts).max(1);
+        let candidate = match (previous, next) {
+            (Some((previous_sequence, previous_segment)), _)
+                if joined(previous_sequence, sequence) =>
+            {
+                Some(previous_segment.saturating_add(1))
+            }
+            (_, Some((next_sequence, next_segment))) if joined(sequence, next_sequence) => {
+                next_segment.checked_sub(1)
+            }
+            (Some((previous_sequence, previous_segment)), _) => {
+                Some(previous_segment.saturating_add(segments_in(sequence - previous_sequence)))
+            }
+            (None, Some((next_sequence, next_segment))) => {
+                next_segment.checked_sub(segments_in(next_sequence - sequence))
+            }
+            (None, None) => Some(sequence.checked_div(seed_parts).unwrap_or(0)),
+        };
+        // The number must lie strictly between its neighbours. When no number
+        // is free the part extends the earlier segment.
+        let lower = previous.map(|(_, segment)| segment);
+        let upper = next.map(|(_, segment)| segment);
+        let segment = match (candidate, lower, upper) {
+            (Some(candidate), Some(lower), Some(upper)) => {
+                if upper <= lower.saturating_add(1) {
+                    return Some(lower);
+                }
+                candidate.clamp(lower + 1, upper - 1)
+            }
+            (Some(candidate), Some(lower), None) => candidate.max(lower.saturating_add(1)),
+            (Some(candidate), None, Some(upper)) => {
+                if upper == 0 {
+                    return None;
+                }
+                candidate.min(upper - 1)
+            }
+            (Some(candidate), None, None) => candidate,
+            (None, Some(lower), _) => return Some(lower),
+            (None, None, _) => return None,
+        };
+        keyframes.insert(sequence, segment);
+        Some(segment)
+    }
+
+    /// Parts in the playlist window of one stream.
+    ///
+    /// The configured window counts nominal parts, and the node sizes its
+    /// cache ring for it. The window is a length of time. A stream whose parts
+    /// are longer than the nominal part, such as 4K video beside 5 ms audio,
+    /// covers that time with fewer parts, so it retains fewer of them.
+    fn stream_window_parts(&self, stream_id: u64, configured: usize) -> usize {
+        let nominal_ms = self.nominal_part_ms;
+        let Some(part_ms) = self
+            .stream_max_part_duration_ms
+            .get(&stream_id)
+            .map(|part_ms| u64::from(*part_ms))
+        else {
+            return configured;
+        };
+        if nominal_ms == 0 || part_ms <= nominal_ms {
+            return configured;
+        }
+        let window_ms = (configured as u64).saturating_mul(nominal_ms);
+        usize::try_from(window_ms.div_ceil(part_ms))
+            .unwrap_or(configured)
+            .clamp(MIN_STREAM_WINDOW_PARTS.min(configured), configured)
+    }
+
+    /// Longest part of a stream seen so far, or the nominal part of the node.
+    fn stream_part_ms(&self, stream_id: u64) -> u64 {
+        self.stream_max_part_duration_ms
+            .get(&stream_id)
+            .map_or(self.nominal_part_ms, |part_ms| u64::from(*part_ms))
+            .max(1)
+    }
+
+    fn record_part_published(
+        &mut self,
+        stream_id: u64,
+        sequence: u64,
+        published_unix_us: Option<u64>,
+    ) {
+        let Some(published_unix_us) = published_unix_us else {
+            return;
+        };
+        if let Some(part) = self
+            .stream_parts
+            .get_mut(&stream_id)
+            .and_then(|parts| parts.get_mut(&sequence))
+        {
+            part.published_unix_us.get_or_insert(published_unix_us);
+        }
+    }
+
+    /// Bit rate of a stream over its retained parts.
+    fn playlist_bitrate_bps(&self, stream_id: u64, nominal_part_ms: u64) -> Option<u64> {
+        let parts = self.stream_parts.get(&stream_id)?;
+        let (bytes, duration_ms) = parts.values().fold((0_u64, 0_u64), |(bytes, ms), part| {
+            (
+                bytes.saturating_add(part.bytes as u64),
+                ms.saturating_add(part.duration_ms.map_or(nominal_part_ms, u64::from)),
+            )
+        });
+        (duration_ms > 0 && bytes > 0)
+            .then(|| bytes.saturating_mul(8_000).saturating_div(duration_ms))
+    }
+
+    fn retained_stream_summaries(
+        &self,
+        nominal_part_ms: u64,
+    ) -> HashMap<u64, RetainedStreamSummary> {
         self.stream_parts
             .iter()
             .filter_map(|(stream_id, parts)| {
@@ -6659,6 +7325,7 @@ impl LiveState {
                             .copied()
                             .unwrap_or_default(),
                         retained_parts: parts.len() as u64,
+                        bitrate_bps: self.playlist_bitrate_bps(*stream_id, nominal_part_ms),
                     },
                 ))
             })
@@ -6682,7 +7349,7 @@ impl LiveState {
         self.stream_latest_canonical_object.remove(&stream_id);
         self.stream_last_ingest_unix_ms.remove(&stream_id);
         self.stream_parts.remove(&stream_id);
-        self.stream_current_fmp4_segment.remove(&stream_id);
+        self.stream_keyframe_segments.remove(&stream_id);
         self.stream_retained_bytes.remove(&stream_id);
         self.stream_max_part_duration_ms.remove(&stream_id);
         self.stream_max_segment_duration_ms.remove(&stream_id);
@@ -6792,6 +7459,8 @@ struct MeshApiSnapshot {
     canonical_gap_skip: CanonicalGapSkipSnapshot,
     /// Targeted repair requests this edge sent for holes in live streams.
     edge_hole_repair_requests: u64,
+    /// Which playlists the cache mesh of this node replicates, and why.
+    cache_replication: CacheReplicationSnapshot,
     relay_session: RelaySessionIngressSnapshot,
     link_observations: Vec<LinkObservation>,
     relay_nodes: Vec<RelayNodeSessionSnapshot>,
@@ -7608,7 +8277,33 @@ struct EdgeServiceSnapshot {
     active_playback_sessions: u64,
     #[serde(default)]
     admitted_playback_sessions: u64,
+    /// Most playback sessions served at one time. Zero means no limit.
+    #[serde(default)]
+    session_limit: u64,
+    /// Bit rate that the admitted sessions are entitled to.
+    #[serde(default)]
+    committed_bps: u64,
+    /// Load in thousandths of the admission limit of this cache.
+    #[serde(default)]
+    load_permille: u32,
+    /// Playlists that this cache holds, with their readers.
+    #[serde(default)]
+    playlists: Vec<PlaylistHolding>,
     draining: bool,
+}
+
+/// One playlist that a cache holds. This is what a cache advertises to the
+/// entry points of its region.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct PlaylistHolding {
+    stream_id: u64,
+    /// Newest part that the cache holds.
+    head_part: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bitrate_bps: Option<u64>,
+    /// Playback sessions that read this playlist from this cache.
+    #[serde(default)]
+    sessions: u64,
 }
 
 impl EdgeServiceSnapshot {
@@ -7647,6 +8342,10 @@ impl EdgeServiceSnapshot {
             egress_rejected_requests: load.egress.rejected_requests,
             active_playback_sessions: load.egress.active_sessions,
             admitted_playback_sessions: load.egress.admitted_sessions,
+            session_limit: load.egress.session_limit,
+            committed_bps: load.egress.committed_bps,
+            load_permille: load.egress.load_permille,
+            playlists: Vec::new(),
             draining: node.draining,
         }
     }
@@ -7861,8 +8560,8 @@ impl EdgeLoad {
         self.egress.record_rejection();
     }
 
-    fn admit_playback(&self, session_id: Option<&str>) -> PlaybackAdmission {
-        self.egress.admit_playback(session_id)
+    fn admit_playback(&self, request: PlaybackRequest<'_>) -> PlaybackAdmission {
+        self.egress.admit_playback(request)
     }
 
     fn begin_read(&self, llhls_tail: bool) -> EdgeReadGuard {
@@ -8075,6 +8774,9 @@ struct StreamTelemetry {
     stale_threshold_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mesh_lag_parts: Option<u64>,
+    /// Measured bit rate of the playlist over its retained parts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bitrate_bps: Option<u64>,
 }
 
 impl StreamTelemetry {
@@ -8101,6 +8803,7 @@ impl StreamTelemetry {
                 stats.window_parts,
             )),
             mesh_lag_parts: None,
+            bitrate_bps: None,
         }
     }
 
@@ -8290,6 +8993,270 @@ impl DemandTracker {
             ) {
                 Ok(_) => return true,
                 Err(observed) => last_ms = observed,
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PlaylistDemandConfig {
+    /// This node is an edge that holds a playlist only while it has readers.
+    enabled: bool,
+    lease: Duration,
+    idle: Duration,
+    warm_parts: usize,
+}
+
+/// Reader demand for each playlist on an edge.
+///
+/// A request for a playlist is demand. The first request subscribes the edge
+/// to the playlist at its distributors. The subscription is renewed while
+/// requests keep arriving, and released when they have stopped for the idle
+/// period. The edge then drops its copy.
+#[derive(Debug, Clone)]
+struct PlaylistDemand {
+    config: PlaylistDemandConfig,
+    streams: Arc<DashMap<u64, PlaylistDemandEntry>>,
+    subscriptions_opened: Arc<AtomicU64>,
+    subscriptions_released: Arc<AtomicU64>,
+}
+
+#[derive(Debug)]
+struct PlaylistDemandEntry {
+    opened_unix_ms: u64,
+    last_request_unix_ms: AtomicU64,
+    last_subscribe_unix_ms: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlaylistDemandTouch {
+    /// This request is the first demand for the playlist.
+    new: bool,
+    opened_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct PlaylistDemandSnapshot {
+    stream_id: u64,
+    /// Milliseconds since the last request for the playlist.
+    idle_ms: u64,
+    /// Milliseconds for which this edge has held the playlist.
+    held_ms: u64,
+}
+
+impl PlaylistDemand {
+    fn new(config: PlaylistDemandConfig) -> Self {
+        Self {
+            config,
+            streams: Arc::new(DashMap::new()),
+            subscriptions_opened: Arc::new(AtomicU64::new(0)),
+            subscriptions_released: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn disabled() -> Self {
+        Self::new(PlaylistDemandConfig {
+            enabled: false,
+            lease: Duration::from_secs(5),
+            idle: Duration::from_secs(30),
+            warm_parts: 0,
+        })
+    }
+
+    /// Record one request for a playlist.
+    fn touch(&self, stream_id: u64, now_ms: u64) -> PlaylistDemandTouch {
+        match self.streams.entry(stream_id) {
+            Entry::Occupied(entry) => {
+                entry
+                    .get()
+                    .last_request_unix_ms
+                    .fetch_max(now_ms, Ordering::Relaxed);
+                PlaylistDemandTouch {
+                    new: false,
+                    opened_unix_ms: entry.get().opened_unix_ms,
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(PlaylistDemandEntry {
+                    opened_unix_ms: now_ms,
+                    last_request_unix_ms: AtomicU64::new(now_ms),
+                    last_subscribe_unix_ms: AtomicU64::new(now_ms),
+                });
+                self.subscriptions_opened.fetch_add(1, Ordering::Relaxed);
+                PlaylistDemandTouch {
+                    new: true,
+                    opened_unix_ms: now_ms,
+                }
+            }
+        }
+    }
+
+    /// Playlists whose last request is older than the idle period. Each is
+    /// removed, so the caller must release it.
+    fn take_idle(&self, now_ms: u64) -> Vec<u64> {
+        let idle_ms = u64::try_from(self.config.idle.as_millis()).unwrap_or(u64::MAX);
+        let idle = self
+            .streams
+            .iter()
+            .filter(|entry| {
+                now_ms.saturating_sub(entry.last_request_unix_ms.load(Ordering::Relaxed)) >= idle_ms
+            })
+            .map(|entry| *entry.key())
+            .collect::<Vec<_>>();
+        idle.into_iter()
+            .filter(|stream_id| {
+                self.streams
+                    .remove_if(stream_id, |_, entry| {
+                        now_ms.saturating_sub(entry.last_request_unix_ms.load(Ordering::Relaxed))
+                            >= idle_ms
+                    })
+                    .is_some()
+            })
+            .inspect(|_| {
+                self.subscriptions_released.fetch_add(1, Ordering::Relaxed);
+            })
+            .collect()
+    }
+
+    /// Playlists whose subscription is due for renewal: a third of the lease
+    /// has passed since the last subscribe.
+    fn take_renewals(&self, now_ms: u64) -> Vec<u64> {
+        let renew_ms = u64::try_from(self.config.lease.as_millis() / 3)
+            .unwrap_or(u64::MAX)
+            .max(1);
+        self.streams
+            .iter()
+            .filter(|entry| {
+                let last = entry.last_subscribe_unix_ms.load(Ordering::Relaxed);
+                now_ms.saturating_sub(last) >= renew_ms
+                    && entry
+                        .last_subscribe_unix_ms
+                        .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+            })
+            .map(|entry| *entry.key())
+            .collect()
+    }
+
+    fn snapshot(&self, now_ms: u64) -> Vec<PlaylistDemandSnapshot> {
+        let mut playlists = self
+            .streams
+            .iter()
+            .map(|entry| PlaylistDemandSnapshot {
+                stream_id: *entry.key(),
+                idle_ms: now_ms.saturating_sub(entry.last_request_unix_ms.load(Ordering::Relaxed)),
+                held_ms: now_ms.saturating_sub(entry.opened_unix_ms),
+            })
+            .collect::<Vec<_>>();
+        playlists.sort_by_key(|playlist| playlist.stream_id);
+        playlists
+    }
+}
+
+/// Replication state of the cache mesh of one node, for `/api/mesh/local`.
+#[derive(Debug, Clone, Default, Serialize)]
+struct CacheReplicationSnapshot {
+    /// `demand` or `all`.
+    mode: &'static str,
+    lease_ms: u64,
+    demand_idle_ms: u64,
+    warm_parts: usize,
+    /// Playlists that this edge subscribes to at its distributors.
+    subscribed_playlists: Vec<u64>,
+    /// Reader demand that keeps each subscription alive.
+    demand: Vec<PlaylistDemandSnapshot>,
+    subscriptions_opened: u64,
+    subscriptions_released: u64,
+    /// Subscriptions that this distributor serves to edges.
+    served_subscriptions: Vec<ServedSubscriptionSnapshot>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct ServedSubscriptionSnapshot {
+    child: String,
+    stream_id: u64,
+    warm_parts_pending: usize,
+}
+
+/// Record the playlist entry of every part that the cache mesh delivers.
+async fn run_mesh_applied_parts(
+    cache: Arc<LiveTsCache>,
+    edge_load: EdgeLoad,
+    mut applied_rx: mpsc::UnboundedReceiver<AppliedSlot>,
+    mut shutdown_rx: watch::Receiver<()>,
+) {
+    let mut bitrate_refreshed_unix_ms: HashMap<u64, u64> = HashMap::new();
+    loop {
+        let applied = tokio::select! {
+            _ = shutdown_rx.changed() => return,
+            applied = applied_rx.recv() => match applied {
+                Some(applied) => applied,
+                None => return,
+            },
+        };
+        if cache
+            .observe_mesh_part(applied.stream_id, applied.slot_id)
+            .await
+            .is_none()
+        {
+            continue;
+        }
+        // Admission works from the bit rate of each playlist. Refresh it at
+        // most once a second for each playlist.
+        let now_ms = now_unix_ms();
+        let refreshed = bitrate_refreshed_unix_ms
+            .entry(applied.stream_id)
+            .or_insert(0);
+        if now_ms.saturating_sub(*refreshed) >= 1_000 {
+            *refreshed = now_ms;
+            if let Some(bps) = cache.playlist_bitrate_bps(applied.stream_id).await {
+                edge_load.egress.set_playlist_bps(applied.stream_id, bps);
+            }
+        }
+    }
+}
+
+/// Renew the playlist subscriptions of an edge while they have readers, and
+/// release each one when its readers have gone.
+async fn run_playlist_demand(
+    cache: Arc<LiveTsCache>,
+    mesh: Arc<CacheMeshHandle>,
+    edge_load: EdgeLoad,
+    demand: PlaylistDemand,
+    mut shutdown_rx: watch::Receiver<()>,
+) {
+    if !demand.config.enabled {
+        return;
+    }
+    let mut ticker = interval(Duration::from_millis(PLAYLIST_DEMAND_SWEEP_MS));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => return,
+            _ = ticker.tick() => {}
+        }
+        let now_ms = now_unix_ms();
+        for stream_id in demand.take_idle(now_ms) {
+            if let Err(error) = mesh.unsubscribe(stream_id).await {
+                warn!(stream_id, error = %error, "failed to release a playlist subscription");
+            }
+            cache.forget_mesh_stream(stream_id).await;
+            edge_load.egress.clear_playlist_bps(stream_id);
+            info!(stream_id, "released a playlist that has no readers");
+        }
+        for stream_id in demand.take_renewals(now_ms) {
+            // A renewal names the first part that this edge lacks. A parent
+            // that already serves the lease only extends it. A parent that
+            // is new to this edge sends the parts from there.
+            let from_slot = cache
+                .stream_position_for_id(stream_id)
+                .await
+                .map_or(0, |(_, last)| last.saturating_add(1));
+            if let Err(error) = mesh
+                .subscribe(stream_id, from_slot, demand.config.warm_parts)
+                .await
+            {
+                warn!(stream_id, error = %error, "failed to renew a playlist subscription");
             }
         }
     }
@@ -8653,6 +9620,7 @@ impl MeshApiSnapshot {
             llhls_runtime: LlhlsRuntimeSnapshot::default(),
             canonical_gap_skip: CanonicalGapSkipSnapshot::default(),
             edge_hole_repair_requests: 0,
+            cache_replication: CacheReplicationSnapshot::default(),
             relay_session,
             link_observations,
             relay_nodes,
@@ -10531,6 +11499,8 @@ fn control_kind_code(kind: ControlKind) -> &'static str {
     match kind {
         ControlKind::ProvisionNode => "provision_node",
         ControlKind::CloseNode => "close_node",
+        ControlKind::DrainNode => "drain_node",
+        ControlKind::ResumeNode => "resume_node",
         ControlKind::WarmStream => "warm_stream",
         ControlKind::ReplicaRequest => "replica_request",
     }
@@ -10540,6 +11510,8 @@ fn control_kind_label(kind: ControlKind) -> &'static str {
     match kind {
         ControlKind::ProvisionNode => "Provision node",
         ControlKind::CloseNode => "Close node",
+        ControlKind::DrainNode => "Drain node",
+        ControlKind::ResumeNode => "Resume node",
         ControlKind::WarmStream => "Warm stream",
         ControlKind::ReplicaRequest => "Replica request",
     }
@@ -10694,6 +11666,11 @@ fn control_request_target_text(request: &ControlRequest) -> String {
 enum ControlKind {
     ProvisionNode,
     CloseNode,
+    /// Stop taking new readers and move the current readers to other caches.
+    /// The node keeps running.
+    DrainNode,
+    /// Take readers again after a drain.
+    ResumeNode,
     WarmStream,
     ReplicaRequest,
 }
@@ -11630,6 +12607,24 @@ struct AppRouter {
     telemetry_fec: TelemetryFecMonitor,
     private_discovery: PrivateDiscoveryStatus,
     operations_snapshot_file: Option<PathBuf>,
+    playlist_demand: PlaylistDemand,
+    assignment_policy: AssignmentPolicy,
+    steering_ttl_seconds: u64,
+    /// An advertisement older than this does not make a cache assignable.
+    assignment_fresh_ms: u64,
+    /// The cache that this entry point last assigned to each session, with
+    /// the time. It keeps a session on its cache when the session asks again
+    /// without naming the cache that it uses.
+    remembered_assignments: Arc<DashMap<String, (String, u64)>>,
+}
+
+/// A request that the entry point answers for a reader.
+#[derive(Debug, Clone, Copy)]
+struct ReaderRequest<'a> {
+    stream_id: u64,
+    session: Option<&'a str>,
+    pin: Option<&'a str>,
+    current: Option<&'a str>,
 }
 
 impl AppRouter {
@@ -11684,7 +12679,29 @@ impl AppRouter {
             telemetry_fec,
             private_discovery,
             operations_snapshot_file,
+            playlist_demand: PlaylistDemand::disabled(),
+            assignment_policy: AssignmentPolicy::default(),
+            steering_ttl_seconds: 5,
+            assignment_fresh_ms: DEFAULT_TELEMETRY_INTERVAL_MS.saturating_mul(3),
+            remembered_assignments: Arc::new(DashMap::new()),
         }
+    }
+
+    fn with_playlist_demand(mut self, playlist_demand: PlaylistDemand) -> Self {
+        self.playlist_demand = playlist_demand;
+        self
+    }
+
+    fn with_assignment(
+        mut self,
+        policy: AssignmentPolicy,
+        steering_ttl_seconds: u64,
+        telemetry_interval_ms: u64,
+    ) -> Self {
+        self.assignment_policy = policy;
+        self.steering_ttl_seconds = steering_ttl_seconds.max(1);
+        self.assignment_fresh_ms = telemetry_interval_ms.saturating_mul(3).max(3_000);
+        self
     }
 
     fn with_hls_renditions(mut self, renditions: Vec<HlsRenditionSpec>, stale_ms: u64) -> Self {
@@ -11705,11 +12722,67 @@ impl AppRouter {
                 &self.control,
             )
             .await;
-        snapshot.with_edge_service(self.edge_load.snapshot(
+        // Admission works from the bit rate of each playlist held here.
+        for stream in &snapshot.streams {
+            if let Some(bitrate_bps) = stream.bitrate_bps {
+                self.edge_load
+                    .egress
+                    .set_playlist_bps(stream.stream_id, bitrate_bps);
+            }
+        }
+        let sessions = self.edge_load.egress.sessions_by_playlist();
+        let mut edge_service = self.edge_load.snapshot(
             &node,
             self.playback_base_url.clone(),
             cache_mesh_role_label(self.cache_mesh_role),
-        ))
+        );
+        edge_service.playlists = snapshot
+            .streams
+            .iter()
+            .filter(|stream| stream.active() && !stream.stale())
+            .filter_map(|stream| {
+                Some(PlaylistHolding {
+                    stream_id: stream.stream_id,
+                    head_part: stream.latest_mesh_part?,
+                    bitrate_bps: stream.bitrate_bps,
+                    sessions: sessions.get(&stream.stream_id).copied().unwrap_or(0),
+                })
+            })
+            .collect();
+        snapshot.with_edge_service(edge_service)
+    }
+
+    fn cache_replication_snapshot(&self) -> CacheReplicationSnapshot {
+        let config = self.playlist_demand.config;
+        CacheReplicationSnapshot {
+            mode: match self.mesh.replication() {
+                ReplicationMode::Demand => "demand",
+                ReplicationMode::All => "all",
+            },
+            lease_ms: u64::try_from(self.mesh.subscription_lease().as_millis()).unwrap_or(u64::MAX),
+            demand_idle_ms: u64::try_from(config.idle.as_millis()).unwrap_or(u64::MAX),
+            warm_parts: config.warm_parts,
+            subscribed_playlists: self.mesh.subscribed_streams(),
+            demand: self.playlist_demand.snapshot(now_unix_ms()),
+            subscriptions_opened: self
+                .playlist_demand
+                .subscriptions_opened
+                .load(Ordering::Relaxed),
+            subscriptions_released: self
+                .playlist_demand
+                .subscriptions_released
+                .load(Ordering::Relaxed),
+            served_subscriptions: self
+                .mesh
+                .served_subscriptions()
+                .into_iter()
+                .map(|served| ServedSubscriptionSnapshot {
+                    child: served.child.to_string(),
+                    stream_id: served.stream_id,
+                    warm_parts_pending: served.backfill_parts_pending,
+                })
+                .collect(),
+        }
     }
 
     async fn mesh_api_snapshot(&self) -> MeshApiSnapshot {
@@ -11731,6 +12804,7 @@ impl AppRouter {
         snapshot.canonical_gap_skip = self.cache.canonical_gap_skip_snapshot();
         snapshot.edge_hole_repair_requests =
             self.demand.hole_repair_requests.load(Ordering::Relaxed);
+        snapshot.cache_replication = self.cache_replication_snapshot();
         snapshot
     }
 
@@ -11755,58 +12829,211 @@ impl AppRouter {
         response
     }
 
+    /// Subscribe this edge to a playlist when the first reader asks for it,
+    /// and hold the request until the copy has parts to serve.
+    async fn ensure_playlist_copy(&self, stream_id: u64) {
+        if !self.playlist_demand.config.enabled {
+            return;
+        }
+        let now_ms = now_unix_ms();
+        let touch = self.playlist_demand.touch(stream_id, now_ms);
+        if touch.new {
+            match self
+                .mesh
+                .subscribe(stream_id, 0, self.playlist_demand.config.warm_parts)
+                .await
+            {
+                Ok(parents) => info!(
+                    stream_id,
+                    parents = parents.len(),
+                    "reader demand subscribed this edge to a playlist"
+                ),
+                Err(error) => warn!(
+                    stream_id,
+                    error = %error,
+                    "failed to subscribe to a playlist"
+                ),
+            }
+        }
+        let waited_ms = now_ms.saturating_sub(touch.opened_unix_ms);
+        if waited_ms < PLAYLIST_WARM_WAIT_MS {
+            self.cache
+                .wait_for_playlist_copy(
+                    stream_id,
+                    Duration::from_millis(PLAYLIST_WARM_WAIT_MS - waited_ms),
+                )
+                .await;
+        }
+    }
+
+    /// Reject a playback request that this cache cannot take, or move it to
+    /// another cache. `None` means the request is served here.
     async fn playback_admission_response(
         &self,
         path: &str,
         query: Option<&str>,
         session_id: Option<&str>,
     ) -> Option<HandlerResponse> {
-        if self.edge_load.admit_playback(session_id) != PlaybackAdmission::Rejected {
-            return None;
+        let stream_ids = playback_stream_ids(path, query, self.cache.stream_id);
+        let stream_id = stream_ids.first().copied();
+        let draining = self.lifecycle.is_draining().await;
+        let admission = self.edge_load.admit_playback(PlaybackRequest {
+            session_id,
+            stream_id,
+            draining,
+        });
+        let reader = ReaderRequest {
+            stream_id: stream_id.unwrap_or(self.cache.stream_id),
+            session: session_id,
+            pin: None,
+            current: None,
+        };
+        if admission == PlaybackAdmission::Rejected {
+            let alternatives = self.alternate_cache_urls(reader, path, query).await;
+            self.edge_load.record_rejection();
+            return Some(edge_overloaded_response(&alternatives));
         }
-        let alternatives = self.same_region_alternative_edges(path, query).await;
-        self.edge_load.record_rejection();
-        Some(edge_overloaded_response(&alternatives))
+        if draining && is_playlist_reload_path(path) {
+            // A draining cache keeps serving the parts that a reader has
+            // already been told about. The next playlist reload goes to
+            // another cache of the region, which holds the same playlist.
+            let alternatives = self.alternate_cache_urls(reader, path, query).await;
+            if let Some(location) = alternatives.first() {
+                if let Some(session_id) = session_id {
+                    self.edge_load.egress.release_session(session_id);
+                }
+                return Some(drain_redirect_response(location, &alternatives));
+            }
+        }
+        for stream_id in stream_ids {
+            self.ensure_playlist_copy(stream_id).await;
+        }
+        None
     }
 
-    async fn same_region_alternative_edges(&self, path: &str, query: Option<&str>) -> Vec<String> {
+    /// The caches of this region as an entry point sees them, for one
+    /// playlist. The advertisement of each cache names the playlists that it
+    /// holds, its load against its admission limit, and whether it drains.
+    async fn cache_candidates(&self, stream_id: u64) -> Vec<CacheCandidate> {
         let local = self.local_mesh_snapshot().await;
         let (snapshots, _) = self.telemetry.snapshots_with_local(local).await;
-        let mut candidates = snapshots
-            .into_iter()
-            .filter(|snapshot| {
-                snapshot.node.node_id != self.node.node_id
-                    && snapshot.node.region == self.node.region
-                    && !snapshot.node.draining
+        let now_ms = now_unix_ms();
+        snapshots
+            .iter()
+            .filter_map(|snapshot| {
+                let edge = snapshot.edge_service.as_ref()?;
+                let is_local = snapshot.node.node_id == self.node.node_id;
+                let head_part = edge
+                    .playlists
+                    .iter()
+                    .find(|playlist| playlist.stream_id == stream_id)
+                    .map(|playlist| playlist.head_part)
+                    .or_else(|| {
+                        // An older node advertises its streams without the
+                        // playlist list.
+                        edge.playlists.is_empty().then_some(())?;
+                        snapshot_stream_for_id(snapshot, stream_id)
+                            .filter(|stream| stream.active() && !stream.stale())
+                            .and_then(|stream| stream.latest_mesh_part)
+                    });
+                Some(CacheCandidate {
+                    node_id: snapshot.node.node_id.clone(),
+                    region: snapshot.node.region.clone(),
+                    // This node can always name itself with a relative URI.
+                    playback_base_url: edge
+                        .playback_base_url
+                        .clone()
+                        .or_else(|| is_local.then(String::new)),
+                    serves_readers: edge.cache_mesh_role == "edge",
+                    fresh: is_local
+                        || now_ms.saturating_sub(snapshot.updated_unix_ms)
+                            <= self.assignment_fresh_ms,
+                    draining: edge.draining || snapshot.node.draining,
+                    overloaded: edge.egress_overloaded,
+                    load_permille: edge.load_permille,
+                    head_part,
+                })
             })
-            .filter_map(|snapshot| snapshot.edge_service)
-            .filter(|edge| {
-                edge.cache_mesh_role == "edge" && !edge.draining && !edge.egress_overloaded
-            })
-            .filter_map(|edge| {
-                let base_url = edge.playback_base_url.as_deref()?;
-                let url = playback_request_url(base_url, path, query)?;
-                let utilization = if edge.egress_capacity_bps == 0 {
-                    u64::MAX
-                } else {
-                    edge.egress_observed_bps
-                        .saturating_mul(1_000_000)
-                        .saturating_div(edge.egress_capacity_bps)
-                };
-                Some((utilization, edge.active_readers, edge.node_id, url))
-            })
-            .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| {
-            left.0
-                .cmp(&right.0)
-                .then_with(|| left.1.cmp(&right.1))
-                .then_with(|| left.2.cmp(&right.2))
-        });
+            .collect()
+    }
+
+    /// Assign a reader. With `remember`, the entry point keeps the assigned
+    /// cache of the session, so that the session gets the same cache when it
+    /// asks again, even after another cache has become a better first choice.
+    async fn assign_reader(
+        &self,
+        reader: ReaderRequest<'_>,
+        remember: bool,
+    ) -> (Result<Assignment, AssignmentError>, Vec<CacheCandidate>) {
+        let candidates = self.cache_candidates(reader.stream_id).await;
+        let now_ms = now_unix_ms();
+        let key = reader
+            .session
+            .map(|session| format!("{}/{session}", reader.stream_id));
+        let remembered = key
+            .as_ref()
+            .filter(|_| reader.current.is_none() && reader.pin.is_none())
+            .and_then(|key| self.remembered_assignments.get(key))
+            .filter(|entry| now_ms.saturating_sub(entry.1) < REMEMBERED_ASSIGNMENT_MS)
+            .map(|entry| entry.0.clone());
+        let assignment = assign(
+            AssignmentRequest {
+                region: &self.node.region,
+                session: reader.session,
+                pin: reader.pin,
+                current: reader.current.or(remembered.as_deref()),
+            },
+            self.assignment_policy,
+            &candidates,
+        );
+        if let (true, Some(key), Ok(assignment)) = (remember, key, &assignment) {
+            if !assignment.pinned {
+                if self.remembered_assignments.len() >= MAX_REMEMBERED_ASSIGNMENTS {
+                    self.remembered_assignments.retain(|_, entry| {
+                        now_ms.saturating_sub(entry.1) < REMEMBERED_ASSIGNMENT_MS
+                    });
+                }
+                if self.remembered_assignments.len() < MAX_REMEMBERED_ASSIGNMENTS {
+                    self.remembered_assignments
+                        .insert(key, (assignment.caches[0].node_id.clone(), now_ms));
+                }
+            }
+        }
+        (assignment, candidates)
+    }
+
+    /// The same request at the other caches of the region that can take the
+    /// reader, in assignment order. This node is never in the list.
+    async fn alternate_cache_urls(
+        &self,
+        reader: ReaderRequest<'_>,
+        path: &str,
+        query: Option<&str>,
+    ) -> Vec<String> {
+        let mut candidates = self.cache_candidates(reader.stream_id).await;
+        candidates.retain(|cache| cache.node_id != self.node.node_id);
+        let policy = AssignmentPolicy {
+            max_alternates: 7,
+            ..self.assignment_policy
+        };
+        let Ok(assignment) = assign(
+            AssignmentRequest {
+                region: &self.node.region,
+                session: reader.session,
+                pin: None,
+                current: None,
+            },
+            policy,
+            &candidates,
+        ) else {
+            return Vec::new();
+        };
         let mut seen = HashSet::new();
-        candidates
-            .into_iter()
-            .filter_map(|(_, _, _, url)| seen.insert(url.clone()).then_some(url))
-            .take(8)
+        assignment
+            .caches
+            .iter()
+            .filter_map(|cache| playback_request_url(&cache.playback_base_url, path, query))
+            .filter(|url| seen.insert(url.clone()))
             .collect()
     }
 
@@ -11822,14 +13049,80 @@ impl AppRouter {
         fmp4_content_type_from_init(init.as_deref())
     }
 
+    /// URI of a media playlist at an assigned cache. This node is named with
+    /// a relative URI, so a reader that reached it by any name stays on it.
+    fn assigned_playlist_uri(&self, cache: &AssignedCache, media_path: &str) -> Option<String> {
+        if cache.node_id == self.node.node_id {
+            return Some(match parse_stream_playlist_path(media_path) {
+                Some(_) => "stream.m3u8".to_owned(),
+                None => media_path.rsplit('/').next()?.to_owned(),
+            });
+        }
+        playback_request_url(&cache.playback_base_url, media_path, None)
+    }
+
+    /// The Multivariant Playlist of a stream: the entry point of a region.
+    ///
+    /// It carries the assignment of the reader. Each cache that can serve the
+    /// reader is one Content Steering pathway, and the assigned cache is the
+    /// first variant and the initial pathway. A player that does not use
+    /// Content Steering starts on the first variant and falls back to the
+    /// next ones, which is the failover order.
     async fn hls_failover_playlist_response(
         &self,
         media_path: &str,
+        query: Option<&str>,
+        session_id: Option<&str>,
         gzip: bool,
     ) -> HandlerResponse {
-        let overloaded = self.edge_load.admission_snapshot().overloaded;
-        let alternatives = self.same_region_alternative_edges(media_path, None).await;
         let stream_id = parse_stream_playlist_path(media_path).unwrap_or(self.cache.stream_id);
+        let pin = query_value(query, "cache")
+            .and_then(percent_decode_query_value)
+            .filter(|pin| !pin.is_empty());
+        let reader = ReaderRequest {
+            stream_id,
+            session: session_id,
+            pin: pin.as_deref(),
+            current: None,
+        };
+        let (assignment, _) = self.assign_reader(reader, true).await;
+        let caches = match assignment {
+            Ok(assignment) => assignment.caches,
+            Err(AssignmentError::UnknownPinnedCache) => {
+                return response(
+                    StatusCode::NOT_FOUND,
+                    Some(Bytes::from_static(
+                        b"The named cache is not a reader cache of this region.\n",
+                    )),
+                    Some("text/plain; charset=utf-8"),
+                )
+                .with_no_store();
+            }
+            Err(AssignmentError::NoCacheAvailable) => Vec::new(),
+        };
+        let alternatives = caches
+            .iter()
+            .filter(|cache| cache.node_id != self.node.node_id)
+            .filter_map(|cache| playback_request_url(&cache.playback_base_url, media_path, None))
+            .collect::<Vec<_>>();
+        // One pathway for each cache, when there is more than one cache to
+        // steer between and every cache has a name that is valid in a
+        // playlist. A pinned reader has one cache. Its variant still names
+        // the cache, so the reader can see where it was pinned.
+        let named = caches
+            .iter()
+            .all(|cache| is_valid_pathway_id(&cache.node_id));
+        let steer = caches.len() > 1 && named;
+        let name_pathways = steer || (named && pin.is_some() && !caches.is_empty());
+        let with_pathway = |variant: VariantStream, cache: &AssignedCache| {
+            if name_pathways {
+                variant.with_pathway_id(cache.node_id.clone()).ok()
+            } else {
+                Some(variant)
+            }
+        };
+
+        let mut variants = Vec::new();
         if let Some(configured) = self.hls_renditions.variants(stream_id) {
             let configured = configured.to_vec();
             let mut active = Vec::with_capacity(configured.len());
@@ -11841,64 +13134,208 @@ impl AppRouter {
                 };
                 active.push((rendition, hls_codecs_from_init(&init)));
             }
-
-            let mut variants = Vec::new();
-            if !overloaded {
-                variants.extend(active.iter().filter_map(|(rendition, codecs)| {
-                    make_hls_rendition_variant(
-                        format!("/live/{}/stream.m3u8", rendition.stream_id),
-                        *rendition,
-                        codecs.as_deref(),
-                    )
-                }));
-            } else {
+            for cache in &caches {
                 for (rendition, codecs) in &active {
                     let rendition_path = format!("/live/{}/stream.m3u8", rendition.stream_id);
-                    let rendition_alternatives = self
-                        .same_region_alternative_edges(&rendition_path, None)
-                        .await;
-                    variants.extend(rendition_alternatives.into_iter().filter_map(|uri| {
+                    let Some(uri) = (if cache.node_id == self.node.node_id {
+                        Some(rendition_path)
+                    } else {
+                        playback_request_url(&cache.playback_base_url, &rendition_path, None)
+                    }) else {
+                        continue;
+                    };
+                    if let Some(variant) =
                         make_hls_rendition_variant(uri, *rendition, codecs.as_deref())
-                    }));
+                            .and_then(|variant| with_pathway(variant, cache))
+                    {
+                        variants.push(variant);
+                    }
                 }
             }
-
-            let Ok(playlist) = MultivariantPlaylist::new(variants) else {
+            if variants.is_empty() {
                 self.edge_load.record_rejection();
                 return hls_renditions_unavailable_response(&alternatives);
-            };
-            return playlist_response(playlist.render(), gzip).with_no_store();
+            }
+        } else {
+            let codecs = self
+                .cache
+                .get_init_for_stream_id(stream_id)
+                .await
+                .as_deref()
+                .and_then(hls_codecs_from_init);
+            // The configured value is the declared peak. A playlist that
+            // measures above it, such as 4K video, declares what it measures.
+            let bandwidth_bps = self
+                .cache
+                .playlist_bitrate_bps(stream_id)
+                .await
+                .map_or(0, |bps| bps.div_ceil(1_000_000).saturating_mul(1_000_000))
+                .max(self.hls_failover_bandwidth_bps);
+            for cache in &caches {
+                let Some(uri) = self.assigned_playlist_uri(cache, media_path) else {
+                    continue;
+                };
+                let Ok(variant) = VariantStream::new(uri, bandwidth_bps) else {
+                    continue;
+                };
+                let variant = match codecs.as_deref() {
+                    Some(codecs) => variant.with_codecs(codecs).ok(),
+                    None => Some(variant),
+                };
+                if let Some(variant) = variant.and_then(|variant| with_pathway(variant, cache)) {
+                    variants.push(variant);
+                }
+            }
         }
 
-        let codecs = self
-            .cache
-            .get_init_for_stream_id(stream_id)
-            .await
-            .as_deref()
-            .and_then(hls_codecs_from_init);
-        let make_variant = |uri: String| {
-            let variant = VariantStream::new(uri, self.hls_failover_bandwidth_bps).ok()?;
-            match codecs.as_deref() {
-                Some(codecs) => variant.with_codecs(codecs).ok(),
-                None => Some(variant),
-            }
-        };
-        let mut variants = Vec::with_capacity(alternatives.len().saturating_add(1));
-        if !overloaded {
-            if let Some(variant) = make_variant("stream.m3u8".to_owned()) {
-                variants.push(variant);
-            }
-        }
-        variants.extend(
-            alternatives
-                .iter()
-                .filter_map(|url| make_variant(url.clone())),
-        );
-        let Ok(playlist) = MultivariantPlaylist::new(variants) else {
+        let Ok(mut playlist) = MultivariantPlaylist::new(variants) else {
             self.edge_load.record_rejection();
             return edge_overloaded_response(&alternatives);
         };
+        if steer {
+            let steering = ContentSteering::new(steering_uri(session_id, pin.as_deref()))
+                .and_then(|steering| steering.with_initial_pathway(caches[0].node_id.clone()));
+            if let Ok(steered) =
+                steering.and_then(|steering| playlist.clone().with_content_steering(steering))
+            {
+                playlist = steered;
+            }
+        }
         playlist_response(playlist.render(), gzip).with_no_store()
+    }
+
+    /// The Content Steering manifest of a stream. A player reloads it every
+    /// `TTL` seconds and uses the first pathway of the list. The list is the
+    /// current assignment of the reader, so a drained or failed cache leaves
+    /// it and the player moves.
+    async fn steering_response(
+        &self,
+        stream_id: u64,
+        query: Option<&str>,
+        session_id: Option<&str>,
+    ) -> HandlerResponse {
+        let pin = query_value(query, "cache")
+            .and_then(percent_decode_query_value)
+            .filter(|pin| !pin.is_empty());
+        let current = query_value(query, "_HLS_pathway")
+            .and_then(percent_decode_query_value)
+            .map(|pathway| pathway.trim_matches('"').to_owned())
+            .filter(|pathway| is_valid_pathway_id(pathway));
+        let (assignment, _) = self
+            .assign_reader(
+                ReaderRequest {
+                    stream_id,
+                    session: session_id,
+                    pin: pin.as_deref(),
+                    current: current.as_deref(),
+                },
+                true,
+            )
+            .await;
+        let priority = match assignment {
+            Ok(assignment) => assignment
+                .caches
+                .into_iter()
+                .map(|cache| cache.node_id)
+                .filter(|node_id| is_valid_pathway_id(node_id))
+                .collect::<Vec<_>>(),
+            Err(AssignmentError::UnknownPinnedCache) => {
+                return response(StatusCode::NOT_FOUND, None, None).with_no_store();
+            }
+            // No cache admits a reader now. The player keeps its pathway.
+            Err(AssignmentError::NoCacheAvailable) => current.into_iter().collect(),
+        };
+        if priority.is_empty() {
+            let mut unavailable =
+                response(StatusCode::SERVICE_UNAVAILABLE, None, None).with_no_store();
+            unavailable.headers.push(("retry-after".into(), "1".into()));
+            return unavailable;
+        }
+        let manifest = serde_json::json!({
+            "VERSION": 1,
+            "TTL": self.steering_ttl_seconds,
+            "RELOAD-URI": steering_uri(session_id, pin.as_deref()),
+            "PATHWAY-PRIORITY": priority,
+        });
+        response(
+            StatusCode::OK,
+            Some(Bytes::from(manifest.to_string())),
+            Some("application/json"),
+        )
+        .with_no_store()
+    }
+
+    /// The assignment of one reader with the reason for each cache and the
+    /// state of every cache of the region. Operators and tests use it.
+    async fn assignment_api_response(
+        &self,
+        query: Option<&str>,
+        session_id: Option<&str>,
+    ) -> HandlerResponse {
+        let stream_id = parse_query_u64(query, "stream").unwrap_or(self.cache.stream_id);
+        let decoded = |name: &str| {
+            query_value(query, name)
+                .and_then(percent_decode_query_value)
+                .filter(|value| !value.is_empty())
+        };
+        let pin = decoded("cache");
+        let current = decoded("current");
+        let (assignment, candidates) = self
+            .assign_reader(
+                ReaderRequest {
+                    stream_id,
+                    session: session_id,
+                    pin: pin.as_deref(),
+                    current: current.as_deref(),
+                },
+                false,
+            )
+            .await;
+        let caches = candidates
+            .iter()
+            .map(|cache| {
+                serde_json::json!({
+                    "node_id": cache.node_id,
+                    "region": cache.region,
+                    "playback_base_url": cache.playback_base_url,
+                    "serves_readers": cache.serves_readers,
+                    "fresh": cache.fresh,
+                    "draining": cache.draining,
+                    "overloaded": cache.overloaded,
+                    "load_permille": cache.load_permille,
+                    "head_part": cache.head_part,
+                })
+            })
+            .collect::<Vec<_>>();
+        let (status, assignment, error) = match assignment {
+            Ok(assignment) => (StatusCode::OK, Some(assignment), None),
+            Err(error @ AssignmentError::UnknownPinnedCache) => {
+                (StatusCode::NOT_FOUND, None, Some(error))
+            }
+            Err(error @ AssignmentError::NoCacheAvailable) => {
+                (StatusCode::SERVICE_UNAVAILABLE, None, Some(error))
+            }
+        };
+        let body = serde_json::json!({
+            "entry_point": self.node.node_id,
+            "region": self.node.region,
+            "stream_id": stream_id,
+            "session": session_id,
+            "pinned": assignment.as_ref().is_some_and(|assignment| assignment.pinned),
+            "assigned": assignment.as_ref().map(|assignment| &assignment.caches),
+            "error": error.map(|error| error.to_string()),
+            "policy": {
+                "spread_permille": self.assignment_policy.spread_permille,
+                "max_alternates": self.assignment_policy.max_alternates,
+            },
+            "caches": caches,
+        });
+        response(
+            status,
+            Some(Bytes::from(body.to_string())),
+            Some("application/json"),
+        )
+        .with_no_store()
     }
 
     async fn fresh_hls_rendition_init(&self, stream_id: u64) -> Option<Bytes> {
@@ -12172,6 +13609,14 @@ impl AppRouter {
                 self.lifecycle.set_draining(true).await;
                 "local close requested: draining".into()
             }
+            ControlKind::DrainNode => {
+                self.lifecycle.set_draining(true).await;
+                "local drain requested: readers move to other caches".into()
+            }
+            ControlKind::ResumeNode => {
+                self.lifecycle.set_draining(false).await;
+                "local resume requested: taking readers".into()
+            }
             ControlKind::ProvisionNode => {
                 if !originated_locally {
                     return "remote provision noted: executor only runs at command origin".into();
@@ -12412,6 +13857,12 @@ impl AppRouter {
         // a full mesh/cache snapshot once per stream per second before serving
         // the local part, producing periodic latency bursts that grew with the
         // retained window and track count.
+        // An edge that replicates on demand holds a subscription for every
+        // playlist that has readers. Its copy is warmed and kept current by
+        // that subscription, at a bounded rate.
+        if self.playlist_demand.config.enabled {
+            return;
+        }
         if self.cache.stream_is_locally_fresh(stream_id).await {
             return;
         }
@@ -12515,6 +13966,10 @@ impl AppRouter {
     }
 
     async fn request_planned_local_replicas(&self, reason: &'static str) -> Vec<u64> {
+        // Reader demand alone decides what such an edge holds.
+        if self.playlist_demand.config.enabled {
+            return Vec::new();
+        }
         let mut requested = Vec::new();
         for stream_id in self.known_active_stream_ids().await {
             if self.request_planned_local_replica(stream_id, reason).await {
@@ -12685,8 +14140,14 @@ impl Router for AppRouter {
             let response = response(StatusCode::METHOD_NOT_ALLOWED, None, None);
             return Ok(self.record_edge_response(method, path, query, response, started));
         }
+        let session_id = reader_session_id(req.headers(), query);
+        if let Some(stream_id) = parse_steering_path(path, self.cache.stream_id) {
+            let response = self
+                .steering_response(stream_id, query, session_id.as_deref())
+                .await;
+            return Ok(self.record_edge_response(method, path, query, response, started));
+        }
         if is_playback_media_path(path) && failover_media_path.is_none() {
-            let session_id = playback_session_id(req.headers(), query);
             if let Some(response) = self
                 .playback_admission_response(path, query, session_id.as_deref())
                 .await
@@ -12735,10 +14196,18 @@ impl Router for AppRouter {
                     .as_deref()
                     .expect("the default failover playlist path was parsed");
                 let response = self
-                    .hls_failover_playlist_response(media_path, gzip_playlists)
+                    .hls_failover_playlist_response(
+                        media_path,
+                        query,
+                        session_id.as_deref(),
+                        gzip_playlists,
+                    )
                     .await;
                 Ok(self.record_edge_response(method, path, query, response, started))
             }
+            ASSIGNMENT_PATH => Ok(self
+                .assignment_api_response(query, session_id.as_deref())
+                .await),
             "/api/stats" => {
                 let json = serde_json::to_vec(&self.cache.stats(&self.mesh).await)
                     .map_err(|err| ServerError::Handler(Box::new(err)))?;
@@ -12790,7 +14259,12 @@ impl Router for AppRouter {
 
                 if let Some(media_path) = failover_media_path.as_deref() {
                     let response = self
-                        .hls_failover_playlist_response(media_path, gzip_playlists)
+                        .hls_failover_playlist_response(
+                            media_path,
+                            query,
+                            session_id.as_deref(),
+                            gzip_playlists,
+                        )
                         .await;
                     return Ok(self.record_edge_response(method, path, query, response, started));
                 }
@@ -13722,6 +15196,99 @@ fn is_playback_media_path(path: &str) -> bool {
     path == "/live/stream.m3u8" || path.starts_with("/live/")
 }
 
+/// Playlists that a playback request reads.
+fn playback_stream_ids(path: &str, query: Option<&str>, default_stream_id: u64) -> Vec<u64> {
+    if path == LLHLS_TAIL_BUNDLE_PATH || path == LLHLS_TAIL_BUNDLE_STREAM_PATH {
+        return parse_llhls_tail_stream_ids(query).unwrap_or_default();
+    }
+    let Some(rest) = path.strip_prefix("/live/") else {
+        return Vec::new();
+    };
+    match rest.split_once('/') {
+        Some((stream_id, _)) => stream_id.parse::<u64>().ok().into_iter().collect(),
+        None => vec![default_stream_id],
+    }
+}
+
+/// Whether a request reloads a playlist or its tail, as opposed to fetching
+/// a part or segment that an earlier playlist named.
+fn is_playlist_reload_path(path: &str) -> bool {
+    path == "/live/stream.m3u8"
+        || parse_stream_playlist_path(path).is_some()
+        || parse_llhls_tail_path(path).is_some()
+        || path == LLHLS_TAIL_BUNDLE_PATH
+}
+
+/// `/live/steering.json` or `/live/<stream>/steering.json`.
+fn parse_steering_path(path: &str, default_stream_id: u64) -> Option<u64> {
+    let rest = path.strip_prefix("/live/")?;
+    if rest == "steering.json" {
+        return Some(default_stream_id);
+    }
+    let stream_id = rest.strip_suffix("/steering.json")?;
+    (!stream_id.is_empty() && !stream_id.contains('/'))
+        .then(|| stream_id.parse::<u64>().ok())
+        .flatten()
+}
+
+/// The Content Steering manifest URI, relative to the Multivariant Playlist.
+/// It carries the session, so that every reload gives the same reader the
+/// same order of caches, and the pin of a pinned reader.
+fn steering_uri(session_id: Option<&str>, pin: Option<&str>) -> String {
+    let mut uri = String::from("steering.json");
+    let mut separator = '?';
+    for (name, value) in [("sid", session_id), ("cache", pin)] {
+        let Some(value) = value else {
+            continue;
+        };
+        uri.push(separator);
+        separator = '&';
+        uri.push_str(name);
+        uri.push('=');
+        uri.push_str(&percent_encode_query_value(value));
+    }
+    uri
+}
+
+fn percent_encode_query_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+/// The playback session of a request: the CMCD session, or the `sid` query
+/// parameter that the entry point writes into the steering URI.
+fn reader_session_id(headers: &http::HeaderMap, query: Option<&str>) -> Option<String> {
+    playback_session_id(headers, query).or_else(|| {
+        query_value(query, "sid")
+            .and_then(percent_decode_query_value)
+            .as_deref()
+            .and_then(normalize_playback_session_id)
+    })
+}
+
+fn drain_redirect_response(location: &str, alternatives: &[String]) -> HandlerResponse {
+    let mut response = response(StatusCode::TEMPORARY_REDIRECT, None, None).with_no_store();
+    response
+        .headers
+        .push(("location".into(), location.to_owned().into()));
+    response.headers.push((
+        "access-control-expose-headers".into(),
+        "Location, X-Needletail-Alternate-Edges".into(),
+    ));
+    response.headers.push((
+        "x-needletail-alternate-edges".into(),
+        alternatives.join(", ").into(),
+    ));
+    response
+}
+
 fn hls_failover_media_path(path: &str) -> Option<String> {
     if path == "/live/master.m3u8" {
         return Some("/live/stream.m3u8".to_owned());
@@ -14628,6 +16195,8 @@ fn control_kind_from_path(path: &str) -> Option<ControlKind> {
     match path {
         "/api/control/provision-node" => Some(ControlKind::ProvisionNode),
         "/api/control/close-node" => Some(ControlKind::CloseNode),
+        "/api/control/drain-node" => Some(ControlKind::DrainNode),
+        "/api/control/resume-node" => Some(ControlKind::ResumeNode),
         "/api/control/warm-stream" => Some(ControlKind::WarmStream),
         _ => None,
     }
@@ -15566,7 +17135,7 @@ mod tests {
         assert_eq!(first.get(&5).unwrap().fmp4_segment_id, Some(0));
         assert_eq!(state.stream_retained_bytes.get(&1), Some(&62));
         assert_eq!(state.stream_retained_bytes.get(&2), Some(&55));
-        assert_eq!(state.retained_stream_summaries()[&1].retained_parts, 4);
+        assert_eq!(state.retained_stream_summaries(50)[&1].retained_parts, 4);
         assert_eq!(state.stream_parts[&2].len(), 1);
     }
 
@@ -17524,6 +19093,10 @@ mod tests {
             egress_rejected_requests: 0,
             active_playback_sessions: 0,
             admitted_playback_sessions: 0,
+            session_limit: 0,
+            committed_bps: 0,
+            load_permille: 0,
+            playlists: Vec::new(),
             draining: false,
         });
         let mut snapshot = TelemetryAggregator::default().snapshot(local).await;
@@ -17868,6 +19441,7 @@ mod tests {
             min_sustained_seconds: 1,
             session_idle_seconds: 60,
             max_sessions: 100,
+            session_limit: 0,
         });
 
         let existing = || {
@@ -17958,8 +19532,15 @@ mod tests {
             .unwrap();
         let body = String::from_utf8(response.body.unwrap().to_vec()).unwrap();
         assert_eq!(response.status, StatusCode::OK);
-        assert!(body.contains("#EXT-X-STREAM-INF:BANDWIDTH=4000000\nstream.m3u8"));
-        assert!(body.contains("https://edge-b.example/live/801/stream.m3u8"));
+        // Each cache is one Content Steering pathway. This node names itself
+        // with a relative URI.
+        assert!(body
+            .contains("#EXT-X-STREAM-INF:BANDWIDTH=4000000,PATHWAY-ID=\"test-node\"\nstream.m3u8"));
+        assert!(body.contains(
+            "#EXT-X-STREAM-INF:BANDWIDTH=4000000,PATHWAY-ID=\"edge-b\"\n\
+             https://edge-b.example/live/801/stream.m3u8"
+        ));
+        assert!(body.contains("#EXT-X-CONTENT-STEERING:SERVER-URI=\"steering.json\",PATHWAY-ID="));
         mesh.shutdown();
     }
 
@@ -18749,6 +20330,7 @@ mod tests {
             last_ingest_age_ms: Some(250),
             stale_threshold_ms: Some(5_000),
             mesh_lag_parts: None,
+            bitrate_bps: None,
         }];
         telemetry.ingest_snapshot(remote).await;
         let router =
@@ -18805,6 +20387,7 @@ mod tests {
             last_ingest_age_ms: Some(6_000),
             stale_threshold_ms: Some(5_000),
             mesh_lag_parts: None,
+            bitrate_bps: None,
         }];
         telemetry.ingest_snapshot(remote).await;
         let router =
@@ -18852,6 +20435,7 @@ mod tests {
             last_ingest_age_ms: Some(250),
             stale_threshold_ms: Some(5_000),
             mesh_lag_parts: None,
+            bitrate_bps: None,
         }];
         let mut lagging =
             telemetry_snapshot_for_tests("eu-lag", "eu-west", "eu", 51.5, -0.1, Vec::new(), 1);
@@ -18874,6 +20458,7 @@ mod tests {
             last_ingest_age_ms: Some(250),
             stale_threshold_ms: Some(5_000),
             mesh_lag_parts: None,
+            bitrate_bps: None,
         }];
         telemetry.ingest_snapshot(head).await;
         telemetry.ingest_snapshot(lagging).await;
@@ -18936,6 +20521,7 @@ mod tests {
                 last_ingest_age_ms: Some(10),
                 stale_threshold_ms: Some(5_000),
                 mesh_lag_parts: None,
+                bitrate_bps: None,
             }];
             telemetry.ingest_snapshot(remote).await;
         }
@@ -18993,6 +20579,7 @@ mod tests {
             last_ingest_age_ms: Some(20),
             stale_threshold_ms: Some(5_000),
             mesh_lag_parts: None,
+            bitrate_bps: None,
         }];
         let mut restarted_relay = telemetry_snapshot_for_tests(
             "relay-primary",
@@ -19023,6 +20610,7 @@ mod tests {
             last_ingest_age_ms: Some(20),
             stale_threshold_ms: Some(5_000),
             mesh_lag_parts: None,
+            bitrate_bps: None,
         }];
         telemetry.ingest_snapshot(head).await;
         telemetry.ingest_snapshot(restarted_relay).await;
@@ -19753,6 +21341,7 @@ mod tests {
             last_ingest_age_ms: Some(250),
             stale_threshold_ms: Some(5_000),
             mesh_lag_parts: None,
+            bitrate_bps: None,
         }];
 
         let mut na_edge =
@@ -20146,6 +21735,7 @@ mod tests {
             last_ingest_age_ms: Some(250),
             stale_threshold_ms: Some(5_000),
             mesh_lag_parts: None,
+            bitrate_bps: None,
         }];
         telemetry.ingest_snapshot(remote).await;
 
@@ -22792,5 +24382,875 @@ mod tests {
             base64_engine.encode(cert.pem()),
             base64_engine.encode(key_pair.serialize_pem()),
         )
+    }
+
+    // ---- Regional LL-HLS cache features: playlist replication on demand,
+    // ---- reader assignment, load balance, drain and pinning.
+
+    /// A canonical fMP4 part as the contributor publishes it: the part names
+    /// its duration, whether it starts with a key frame, and when it was
+    /// published.
+    fn encode_test_published_fmp4_part(
+        stream_id: u64,
+        epoch: u64,
+        sequence: u64,
+        keyframe: bool,
+        duration_ms: u32,
+    ) -> Bytes {
+        let init = test_h264_aac_init();
+        let media = format!("moof-mdat-{stream_id}-{epoch}-{sequence}");
+        let payload = encode_test_fmp4_slot(keyframe.then_some(init.as_slice()), media.as_bytes());
+        let key = media_object::ObjectKey::for_payload(
+            "default",
+            stream_id.to_string(),
+            "muxed-fmp4",
+            epoch,
+            0,
+            sequence,
+            1,
+            &payload,
+        )
+        .unwrap();
+        let published_ns = 1_795_000_000_000_000_000_i64
+            + i64::try_from(sequence + 1).unwrap() * i64::from(duration_ms) * 1_000_000;
+        let published = media_object::ClockTimestamp::new(
+            published_ns,
+            "source-clock",
+            media_object::ClockConfidence::estimated(1_000_000),
+        )
+        .unwrap();
+        let object = MediaObject::builder(key, ObjectKind::Media, payload.to_vec())
+            .with_keyframe(keyframe)
+            .with_stage_timestamp(media_object::StageTimestamp::new(
+                Stage::Published,
+                published,
+            ))
+            .with_metadata("container", b"fmp4".to_vec())
+            .with_metadata("payload-format", b"fmp4-slot-v1".to_vec())
+            .with_metadata("duration-ms", duration_ms.to_string().into_bytes())
+            .build()
+            .unwrap();
+        Bytes::from(media_object::encode(&object).unwrap())
+    }
+
+    /// Copy one stored part from a distributor cache to an edge cache, as the
+    /// cache mesh does, and record its playlist entry.
+    async fn deliver_mesh_part(from: &LiveTsCache, to: &LiveTsCache, stream_id: u64, slot: usize) {
+        let (bytes, _) = from
+            .chunk_cache
+            .get_for_stream_id(stream_id, slot)
+            .await
+            .unwrap();
+        to.chunk_cache
+            .add_for_stream_id(stream_id, slot, bytes)
+            .await
+            .unwrap();
+        to.observe_mesh_part(stream_id, slot).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mesh_fed_edge_renders_the_playlist_of_its_distributor() {
+        let distributor = LiveTsCache::new(1, Duration::from_millis(250), 4, 16, 64).await;
+        let edge = LiveTsCache::new(1, Duration::from_millis(250), 4, 16, 64).await;
+        for sequence in 0..14_u64 {
+            distributor
+                .commit_stream_payload(
+                    77,
+                    encode_test_published_fmp4_part(77, 5, sequence, sequence % 4 == 0, 250),
+                )
+                .await
+                .unwrap();
+        }
+        // A new copy is warmed newest part first. The parts of a segment
+        // arrive before the key frame that starts it.
+        for slot in (0..14).rev() {
+            deliver_mesh_part(&distributor, &edge, 77, slot).await;
+        }
+
+        let at_distributor = distributor.playlist_for_stream_id(77).await;
+        let at_edge = edge.playlist_for_stream_id(77).await;
+        assert_eq!(at_edge, at_distributor);
+        assert!(at_edge.contains("#EXT-X-INDEPENDENT-SEGMENTS"));
+        assert!(at_edge.contains("#EXT-X-PART:DURATION=0.250,URI=\"part12.mp4\",INDEPENDENT=YES"));
+        assert!(at_edge.contains("#EXT-X-PART:DURATION=0.250,URI=\"part13.mp4\"\n"));
+        // The program date and time comes from the publication time that the
+        // parts carry, not from the arrival time at each cache.
+        assert!(at_edge.contains("#EXT-X-PROGRAM-DATE-TIME:2026-11-"));
+        assert!(at_edge.contains("#EXTINF:1.000,\nseg1.mp4"));
+        assert_eq!(
+            edge.get_segment_for_stream_id(77, 1).await,
+            distributor.get_segment_for_stream_id(77, 1).await
+        );
+        assert!(edge.get_segment_for_stream_id(77, 1).await.is_some());
+        // A blocking playlist reload on the edge sees the parts.
+        assert!(
+            edge.hls_reload_position_available(
+                77,
+                HlsReloadPosition {
+                    msn: 3,
+                    part: Some(1)
+                }
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_part_is_listed_only_when_its_playlist_entry_is_known() {
+        // The node is sized for 5 ms parts. The stream has 250 ms parts.
+        let distributor = LiveTsCache::new(1, Duration::from_millis(5), 200, 2_400, 64).await;
+        let edge = LiveTsCache::new(1, Duration::from_millis(5), 200, 2_400, 64).await;
+        for sequence in 0..6_u64 {
+            distributor
+                .commit_stream_payload(
+                    77,
+                    encode_test_published_fmp4_part(77, 5, sequence, sequence % 4 == 0, 250),
+                )
+                .await
+                .unwrap();
+        }
+        for slot in 0..5 {
+            deliver_mesh_part(&distributor, &edge, 77, slot).await;
+        }
+        // Part 5 is in the cache, and its entry is not recorded yet.
+        let (bytes, _) = distributor
+            .chunk_cache
+            .get_for_stream_id(77, 5)
+            .await
+            .unwrap();
+        edge.chunk_cache
+            .add_for_stream_id(77, 5, bytes)
+            .await
+            .unwrap();
+        let playlist = edge.playlist_for_stream_id(77).await;
+        assert!(playlist.contains("#EXT-X-PART:DURATION=0.250,URI=\"part4.mp4\",INDEPENDENT=YES"));
+        assert!(!playlist.contains("part5.mp4\""), "{playlist}");
+        assert!(!playlist.contains("DURATION=0.005"), "{playlist}");
+
+        edge.observe_mesh_part(77, 5).await.unwrap();
+        let playlist = edge.playlist_for_stream_id(77).await;
+        assert!(playlist.contains("#EXT-X-PART:DURATION=0.250,URI=\"part5.mp4\"\n"));
+        assert_eq!(playlist, distributor.playlist_for_stream_id(77).await);
+    }
+
+    #[tokio::test]
+    async fn caches_that_join_a_stream_late_number_its_segments_alike() {
+        let early = LiveTsCache::new(1, Duration::from_millis(250), 4, 8, 64).await;
+        let late = LiveTsCache::new(1, Duration::from_millis(250), 4, 8, 64).await;
+        for sequence in 0..40_u64 {
+            let part = encode_test_published_fmp4_part(77, 5, sequence, sequence % 4 == 0, 250);
+            early.commit_stream_payload(77, part).await.unwrap();
+        }
+        // The late cache receives only the last eight parts.
+        for slot in (32..40).rev() {
+            deliver_mesh_part(&early, &late, 77, slot).await;
+        }
+        let early_playlist = early.playlist_for_stream_id(77).await;
+        assert!(early_playlist.contains("#EXT-X-MEDIA-SEQUENCE:8\n"));
+        assert_eq!(late.playlist_for_stream_id(77).await, early_playlist);
+    }
+
+    #[test]
+    fn segment_numbers_do_not_depend_on_arrival_order() {
+        let record = |state: &mut LiveState, sequence: u64| {
+            state.record_part_available(
+                7,
+                sequence,
+                100,
+                1_000 + sequence,
+                Some(250),
+                sequence % 4 == 0,
+                true,
+                64,
+            );
+        };
+        let segments = |state: &LiveState| {
+            state.stream_parts[&7]
+                .iter()
+                .map(|(sequence, part)| (*sequence, part.fmp4_segment_id))
+                .collect::<Vec<_>>()
+        };
+        let mut in_order = LiveState::new();
+        in_order.segment_seed_parts = 4;
+        for sequence in 8..24 {
+            record(&mut in_order, sequence);
+        }
+        let mut newest_first = LiveState::new();
+        newest_first.segment_seed_parts = 4;
+        for sequence in (8..24).rev() {
+            record(&mut newest_first, sequence);
+        }
+        let mut shuffled = LiveState::new();
+        shuffled.segment_seed_parts = 4;
+        for sequence in [20, 21, 9, 8, 23, 12, 13, 22, 10, 16, 11, 17, 15, 14, 19, 18] {
+            record(&mut shuffled, sequence);
+        }
+        let expected = (8..24_u64)
+            .map(|sequence| (sequence, Some(sequence / 4)))
+            .collect::<Vec<_>>();
+        assert_eq!(segments(&in_order), expected);
+        assert_eq!(segments(&newest_first), expected);
+        assert_eq!(segments(&shuffled), expected);
+
+        // Parts before the first key frame that a cache knows have no segment.
+        let mut truncated = LiveState::new();
+        truncated.segment_seed_parts = 4;
+        for sequence in [10, 11, 12, 13] {
+            record(&mut truncated, sequence);
+        }
+        assert_eq!(
+            segments(&truncated),
+            vec![(10, None), (11, None), (12, Some(3)), (13, Some(3))]
+        );
+    }
+
+    #[tokio::test]
+    async fn edge_copy_restarts_when_the_source_starts_a_new_publication() {
+        let distributor = LiveTsCache::new(1, Duration::from_millis(250), 4, 16, 64).await;
+        let edge = LiveTsCache::new(1, Duration::from_millis(250), 4, 16, 64).await;
+        for sequence in 0..12_u64 {
+            distributor
+                .commit_stream_payload(
+                    77,
+                    encode_test_published_fmp4_part(77, 5, sequence, sequence % 4 == 0, 250),
+                )
+                .await
+                .unwrap();
+            deliver_mesh_part(&distributor, &edge, 77, sequence as usize).await;
+        }
+        assert_eq!(edge.stream_position_for_id(77).await.unwrap().1, 11);
+
+        // The contributor restarts. Its new publication counts from zero.
+        for sequence in 0..2_u64 {
+            distributor
+                .commit_stream_payload(
+                    77,
+                    encode_test_published_fmp4_part(77, 6, sequence, sequence % 4 == 0, 250),
+                )
+                .await
+                .unwrap();
+            deliver_mesh_part(&distributor, &edge, 77, sequence as usize).await;
+        }
+        assert_eq!(edge.stream_position_for_id(77).await.unwrap().1, 1);
+        assert_eq!(
+            edge.playlist_for_stream_id(77).await,
+            distributor.playlist_for_stream_id(77).await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_node_sized_for_audio_parts_keeps_a_time_window_of_video_parts() {
+        // The node is configured for 5 ms audio parts and a 12 s window.
+        let cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 2_400, 64).await;
+        for sequence in 0..400_u64 {
+            cache
+                .commit_stream_payload(
+                    77,
+                    encode_test_published_fmp4_part(77, 5, sequence, sequence % 8 == 0, 250),
+                )
+                .await
+                .unwrap();
+        }
+        // 12 s of 250 ms parts is 48 parts, not 2,400.
+        assert_eq!(cache.window_parts_for(77).await, 48);
+        assert_eq!(cache.window_parts_for(2001).await, 2_400);
+        let playlist = cache.playlist_for_stream_id(77).await;
+        assert!(playlist.contains("part399.mp4"));
+        assert!(playlist.contains("seg45.mp4"));
+        assert!(!playlist.contains("seg43.mp4"), "{playlist}");
+        assert_eq!(
+            cache.state.read().await.stream_parts[&77].len(),
+            48,
+            "playlist entries are kept for one window"
+        );
+        // The ring keeps four windows of the stream and releases older parts.
+        assert!(cache.chunk_cache.get_for_stream_id(77, 399).await.is_some());
+        assert!(cache.chunk_cache.get_for_stream_id(77, 208).await.is_some());
+        assert!(cache.chunk_cache.get_for_stream_id(77, 207).await.is_none());
+        assert!(cache.chunk_cache.get_for_stream_id(77, 0).await.is_none());
+        // The gap hold of one second is four video parts, not 200.
+        assert_eq!(cache.state.read().await.stream_part_ms(77), 250);
+        assert_eq!(cache.state.read().await.stream_part_ms(2001), 5);
+    }
+
+    #[test]
+    fn playlist_demand_opens_renews_and_releases() {
+        let demand = PlaylistDemand::new(PlaylistDemandConfig {
+            enabled: true,
+            lease: Duration::from_millis(3_000),
+            idle: Duration::from_millis(10_000),
+            warm_parts: 8,
+        });
+        assert!(demand.touch(7, 1_000).new);
+        assert!(!demand.touch(7, 1_200).new);
+        assert_eq!(demand.touch(7, 1_200).opened_unix_ms, 1_000);
+        // A third of the lease after the subscribe, the renewal is due once.
+        assert!(demand.take_renewals(1_900).is_empty());
+        assert_eq!(demand.take_renewals(2_000), vec![7]);
+        assert!(demand.take_renewals(2_100).is_empty());
+        // Requests keep the playlist. Ten seconds without one release it.
+        demand.touch(7, 9_000);
+        assert!(demand.take_idle(18_999).is_empty());
+        assert_eq!(demand.snapshot(18_999)[0].idle_ms, 9_999);
+        assert_eq!(demand.take_idle(19_000), vec![7]);
+        assert!(demand.snapshot(19_000).is_empty());
+        assert!(demand.touch(7, 20_000).new);
+        assert_eq!(demand.subscriptions_opened.load(Ordering::Relaxed), 2);
+        assert_eq!(demand.subscriptions_released.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn edge_holds_a_playlist_only_while_it_has_readers() {
+        use tokio::time::timeout;
+
+        let distributor_addr = unused_loopback_addr();
+        let edge_addr = unused_loopback_addr();
+        let distributor_cache = LiveTsCache::new(1, Duration::from_millis(250), 4, 16, 64).await;
+        let edge_cache = LiveTsCache::new(1, Duration::from_millis(250), 4, 16, 64).await;
+
+        let mut distributor_config = CacheMeshConfig::new("dist-a", "uk", distributor_addr)
+            .with_peer(edge_addr)
+            .with_same_region_only(true)
+            .with_role(CacheMeshRole::Distributor)
+            .with_replication(ReplicationMode::Demand)
+            .with_subscription_lease(Duration::from_millis(900));
+        distributor_config.sync_interval = Duration::from_millis(10);
+        distributor_config.announce_interval = Duration::from_millis(100);
+        let distributor_mesh = CacheMesh::new(
+            Arc::clone(&distributor_cache.chunk_cache),
+            distributor_config,
+        )
+        .start()
+        .await
+        .unwrap();
+
+        let (applied_tx, applied_rx) = mpsc::unbounded_channel();
+        let mut edge_config = CacheMeshConfig::new("edge-1", "uk", edge_addr)
+            .with_peer(distributor_addr)
+            .with_same_region_only(true)
+            .with_role(CacheMeshRole::Edge)
+            .with_replication(ReplicationMode::Demand)
+            .with_subscription_lease(Duration::from_millis(900))
+            .with_applied_tx(applied_tx);
+        edge_config.sync_interval = Duration::from_millis(10);
+        edge_config.announce_interval = Duration::from_millis(100);
+        let edge_mesh = Arc::new(
+            CacheMesh::new(Arc::clone(&edge_cache.chunk_cache), edge_config)
+                .start()
+                .await
+                .unwrap(),
+        );
+        let demand = PlaylistDemand::new(PlaylistDemandConfig {
+            enabled: true,
+            lease: Duration::from_millis(900),
+            idle: Duration::from_millis(1_200),
+            warm_parts: 16,
+        });
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let router = app_router_for_tests(Arc::clone(&edge_cache), Arc::clone(&edge_mesh))
+            .with_playlist_demand(demand.clone());
+        tokio::spawn(run_mesh_applied_parts(
+            Arc::clone(&edge_cache),
+            router.edge_load.clone(),
+            applied_rx,
+            shutdown_rx.clone(),
+        ));
+        tokio::spawn(run_playlist_demand(
+            Arc::clone(&edge_cache),
+            Arc::clone(&edge_mesh),
+            router.edge_load.clone(),
+            demand.clone(),
+            shutdown_rx,
+        ));
+
+        // Two playlists are live at the distributor.
+        for sequence in 0..8_u64 {
+            for stream_id in [77_u64, 78] {
+                distributor_cache
+                    .commit_stream_payload(
+                        stream_id,
+                        encode_test_published_fmp4_part(
+                            stream_id,
+                            5,
+                            sequence,
+                            sequence % 4 == 0,
+                            250,
+                        ),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        // The edge must know its parent before a reader arrives.
+        timeout(Duration::from_secs(3), async {
+            while edge_mesh.parents_for(77).await.is_empty()
+                || distributor_mesh.peers().await.is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(edge_cache.stream_position_for_id(77).await.is_none());
+        assert!(edge_cache.stream_position_for_id(78).await.is_none());
+
+        // A reader asks the edge for playlist 77. The edge subscribes, the
+        // copy is warmed, and the answer is the playlist of the distributor.
+        let playlist_request = || {
+            Request::builder()
+                .method(Method::GET)
+                .uri("/live/77/stream.m3u8")
+                .header("CMCD-Session", "sid=\"reader-1\"")
+                .body(())
+                .unwrap()
+        };
+        let response = router.route(playlist_request()).await.unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        // The reader keeps reloading while the copy warms.
+        let mut warmed = false;
+        for _ in 0..100 {
+            let response = router.route(playlist_request()).await.unwrap();
+            assert_eq!(response.status, StatusCode::OK);
+            if String::from_utf8(response.body.unwrap().to_vec()).unwrap()
+                == distributor_cache.playlist_for_stream_id(77).await
+            {
+                warmed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            warmed,
+            "the edge copy did not reach the playlist of the distributor\n--- edge\n{}\n--- distributor\n{}",
+            edge_cache.playlist_for_stream_id(77).await,
+            distributor_cache.playlist_for_stream_id(77).await
+        );
+        // The playlist without readers stays at the distributor.
+        assert!(edge_cache.stream_position_for_id(78).await.is_none());
+        assert_eq!(edge_mesh.subscribed_streams(), vec![77]);
+        let replication = router.cache_replication_snapshot();
+        assert_eq!(replication.mode, "demand");
+        assert_eq!(replication.subscribed_playlists, vec![77]);
+
+        // The reader keeps reading for longer than the lease. Renewals keep
+        // the live parts coming.
+        for sequence in 8..14_u64 {
+            distributor_cache
+                .commit_stream_payload(
+                    77,
+                    encode_test_published_fmp4_part(77, 5, sequence, sequence % 4 == 0, 250),
+                )
+                .await
+                .unwrap();
+            let part = router
+                .route(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(format!("/live/77/part{sequence}.mp4"))
+                        .header("CMCD-Session", "sid=\"reader-1\"")
+                        .body(())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(part.status, StatusCode::OK, "part {sequence}");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert_eq!(distributor_mesh.served_subscriptions().len(), 1);
+
+        // The reader leaves. After the idle period the edge releases the
+        // playlist, the distributor stops pushing it, and the copy is gone.
+        timeout(Duration::from_secs(5), async {
+            while edge_cache.stream_position_for_id(77).await.is_some()
+                || !distributor_mesh.served_subscriptions().is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the idle playlist was not released");
+        distributor_cache
+            .commit_stream_payload(77, encode_test_published_fmp4_part(77, 5, 14, false, 250))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(edge_cache.stream_position_for_id(77).await.is_none());
+        assert!(edge_mesh.subscribed_streams().is_empty());
+        assert_eq!(demand.subscriptions_released.load(Ordering::Relaxed), 1);
+
+        let _ = shutdown_tx.send(());
+        distributor_mesh.shutdown();
+        edge_mesh.shutdown();
+    }
+
+    /// A telemetry snapshot of another reader cache of the test region.
+    fn reader_cache_snapshot_for_tests(
+        node_id: &str,
+        load_permille: u32,
+        head_part: Option<u64>,
+    ) -> MeshSnapshot {
+        let mut snapshot = telemetry_snapshot_for_tests(
+            node_id,
+            "test-region",
+            "test-continent",
+            51.6,
+            -0.2,
+            Vec::new(),
+            1,
+        );
+        let mut edge = EdgeServiceSnapshot::from_node(
+            &snapshot.node,
+            Some(format!("https://{node_id}.example/live")),
+            "edge",
+            EdgeLoadSnapshot::default(),
+        );
+        edge.load_permille = load_permille;
+        edge.playlists = head_part
+            .map(|head_part| PlaylistHolding {
+                stream_id: 801,
+                head_part,
+                bitrate_bps: Some(16_000_000),
+                sessions: 3,
+            })
+            .into_iter()
+            .collect();
+        snapshot.edge_service = Some(edge);
+        snapshot
+    }
+
+    async fn entry_point_for_tests(
+        remotes: Vec<MeshSnapshot>,
+    ) -> (AppRouter, Arc<CacheMeshHandle>) {
+        let cache = LiveTsCache::new(801, Duration::from_millis(50), 2, 6, 64).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let telemetry = TelemetryAggregator::default();
+        for remote in remotes {
+            telemetry.ingest_snapshot(remote).await;
+        }
+        let router = app_router_for_tests_with_telemetry(cache, Arc::clone(&mesh), telemetry);
+        (router, mesh)
+    }
+
+    async fn get_for_tests(router: &AppRouter, uri: &str) -> HandlerResponse {
+        router
+            .route(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn body_text(response: HandlerResponse) -> String {
+        String::from_utf8(response.body.unwrap().to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn entry_point_assigns_the_cache_that_holds_the_playlist() {
+        let (router, mesh) = entry_point_for_tests(vec![
+            reader_cache_snapshot_for_tests("edge-b", 200, Some(500)),
+            reader_cache_snapshot_for_tests("edge-c", 0, None),
+        ])
+        .await;
+
+        let master = get_for_tests(&router, "/live/801/master.m3u8?sid=reader-1").await;
+        assert_eq!(master.status, StatusCode::OK);
+        let master = body_text(master);
+        let variants = master
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .collect::<Vec<_>>();
+        // The holder is assigned. The other two caches are the failover order.
+        assert_eq!(variants[0], "https://edge-b.example/live/801/stream.m3u8");
+        assert_eq!(variants.len(), 3);
+        assert!(master.contains(
+            "#EXT-X-CONTENT-STEERING:SERVER-URI=\"steering.json?sid=reader-1\",PATHWAY-ID=\"edge-b\""
+        ));
+        assert!(master.contains("PATHWAY-ID=\"edge-c\""));
+        assert!(master.contains("PATHWAY-ID=\"test-node\""));
+
+        let steering = get_for_tests(&router, "/live/801/steering.json?sid=reader-1").await;
+        assert_eq!(steering.status, StatusCode::OK);
+        assert_eq!(steering.content_type.as_deref(), Some("application/json"));
+        let steering: serde_json::Value = serde_json::from_str(&body_text(steering)).unwrap();
+        assert_eq!(steering["VERSION"], 1);
+        assert_eq!(steering["TTL"], 5);
+        assert_eq!(steering["RELOAD-URI"], "steering.json?sid=reader-1");
+        assert_eq!(steering["PATHWAY-PRIORITY"][0], "edge-b");
+        assert_eq!(steering["PATHWAY-PRIORITY"].as_array().unwrap().len(), 3);
+
+        // The session keeps its cache when it asks again, even after another
+        // cache has become the better first choice for a new session.
+        let mut edge_b = reader_cache_snapshot_for_tests("edge-b", 700, Some(500));
+        edge_b.updated_unix_ms = now_unix_ms();
+        router.telemetry.ingest_snapshot(edge_b).await;
+        router
+            .telemetry
+            .ingest_snapshot(reader_cache_snapshot_for_tests("edge-c", 0, Some(500)))
+            .await;
+        let again = body_text(get_for_tests(&router, "/live/801/master.m3u8?sid=reader-1").await);
+        let first = again.lines().find(|line| !line.starts_with('#')).unwrap();
+        assert_eq!(first, "https://edge-b.example/live/801/stream.m3u8");
+        let other = body_text(get_for_tests(&router, "/live/801/master.m3u8?sid=reader-9").await);
+        let first = other.lines().find(|line| !line.starts_with('#')).unwrap();
+        assert_eq!(first, "https://edge-c.example/live/801/stream.m3u8");
+
+        let api = get_for_tests(&router, "/api/assignment?stream=801&sid=reader-1").await;
+        assert_eq!(api.status, StatusCode::OK);
+        let api: serde_json::Value = serde_json::from_str(&body_text(api)).unwrap();
+        assert_eq!(api["assigned"][0]["node_id"], "edge-b");
+        assert_eq!(api["assigned"][0]["reason"], "sticky");
+        assert_eq!(api["assigned"][1]["reason"], "alternate");
+        let api = get_for_tests(&router, "/api/assignment?stream=801&sid=reader-7").await;
+        let api: serde_json::Value = serde_json::from_str(&body_text(api)).unwrap();
+        assert_eq!(api["assigned"][0]["node_id"], "edge-c");
+        assert_eq!(api["assigned"][0]["reason"], "holds_playlist");
+        assert_eq!(api["caches"].as_array().unwrap().len(), 3);
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn entry_point_pins_a_reader_to_a_named_cache() {
+        let (router, mesh) = entry_point_for_tests(vec![
+            reader_cache_snapshot_for_tests("edge-b", 200, Some(500)),
+            reader_cache_snapshot_for_tests("edge-c", 990, None),
+        ])
+        .await;
+
+        let master =
+            get_for_tests(&router, "/live/801/master.m3u8?sid=reader-1&cache=edge-c").await;
+        assert_eq!(master.status, StatusCode::OK);
+        let master = body_text(master);
+        let variants = master
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .collect::<Vec<_>>();
+        assert_eq!(variants, ["https://edge-c.example/live/801/stream.m3u8"]);
+
+        let api = get_for_tests(
+            &router,
+            "/api/assignment?stream=801&sid=reader-1&cache=edge-c",
+        )
+        .await;
+        let api: serde_json::Value = serde_json::from_str(&body_text(api)).unwrap();
+        assert_eq!(api["pinned"], true);
+        assert_eq!(api["assigned"][0]["reason"], "pinned");
+        assert_eq!(api["assigned"].as_array().unwrap().len(), 1);
+
+        let unknown = get_for_tests(&router, "/live/801/master.m3u8?cache=edge-z").await;
+        assert_eq!(unknown.status, StatusCode::NOT_FOUND);
+        let unknown = get_for_tests(&router, "/api/assignment?stream=801&cache=edge-z").await;
+        assert_eq!(unknown.status, StatusCode::NOT_FOUND);
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn steering_keeps_a_reader_on_its_cache_and_moves_it_off_a_drained_cache() {
+        let mut edge_b = reader_cache_snapshot_for_tests("edge-b", 995, Some(500));
+        edge_b.edge_service.as_mut().unwrap().egress_overloaded = true;
+        let (router, mesh) = entry_point_for_tests(vec![
+            edge_b.clone(),
+            reader_cache_snapshot_for_tests("edge-c", 100, Some(500)),
+        ])
+        .await;
+        let priority = |steering: HandlerResponse| {
+            let steering: serde_json::Value = serde_json::from_str(&body_text(steering)).unwrap();
+            steering["PATHWAY-PRIORITY"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|pathway| pathway.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        // edge-b admits no new reader, so a new reader is not sent there.
+        let new_reader = get_for_tests(&router, "/live/801/steering.json?sid=reader-2").await;
+        assert!(!priority(new_reader).contains(&"edge-b".to_owned()));
+        // A reader that is already on edge-b stays there.
+        let sticky =
+            "/live/801/steering.json?sid=reader-1&_HLS_pathway=edge-b&_HLS_throughput=9000";
+        assert_eq!(priority(get_for_tests(&router, sticky).await)[0], "edge-b");
+
+        // edge-b drains. The same reader is told to use another cache.
+        edge_b.edge_service.as_mut().unwrap().draining = true;
+        router.telemetry.ingest_snapshot(edge_b).await;
+        let moved = priority(get_for_tests(&router, sticky).await);
+        assert_eq!(moved[0], "edge-c");
+        assert!(!moved.contains(&"edge-b".to_owned()));
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn draining_cache_moves_its_readers_and_takes_no_new_reader() {
+        let (router, mesh) = entry_point_for_tests(vec![reader_cache_snapshot_for_tests(
+            "edge-b",
+            100,
+            Some(500),
+        )])
+        .await;
+        let request = |uri: &str, session: &str| {
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header("CMCD-Session", format!("sid=\"{session}\""))
+                .body(())
+                .unwrap()
+        };
+        let playlist = "/live/801/stream.m3u8?_HLS_msn=4&_HLS_part=1";
+        assert_eq!(
+            router
+                .route(request(playlist, "reader-1"))
+                .await
+                .unwrap()
+                .status,
+            StatusCode::OK
+        );
+
+        let command = router
+            .execute_control(
+                ControlKind::DrainNode,
+                ControlRequest {
+                    node_id: Some("test-node".into()),
+                    region: None,
+                    stream_id: None,
+                },
+            )
+            .await;
+        assert!(command.status.contains("readers move to other caches"));
+        assert!(router.local_mesh_snapshot().await.node.draining);
+
+        // The admitted reader is sent to the other cache at its next playlist
+        // reload, with the same request.
+        let moved = router.route(request(playlist, "reader-1")).await.unwrap();
+        assert_eq!(moved.status, StatusCode::TEMPORARY_REDIRECT);
+        assert!(moved.headers.iter().any(|(name, value)| {
+            name == "location"
+                && value == "https://edge-b.example/live/801/stream.m3u8?_HLS_msn=4&_HLS_part=1"
+        }));
+        // A part that it was already told about is still served here.
+        let part = router
+            .route(request("/live/801/part999.mp4", "reader-1"))
+            .await
+            .unwrap();
+        assert_ne!(part.status, StatusCode::TEMPORARY_REDIRECT);
+        assert_ne!(part.status, StatusCode::TOO_MANY_REQUESTS);
+
+        // A new reader is rejected and told where to go.
+        let rejected = router.route(request(playlist, "reader-2")).await.unwrap();
+        assert_eq!(rejected.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(rejected.headers.iter().any(|(name, value)| {
+            name == "link" && value.contains("https://edge-b.example/live/801/stream.m3u8")
+        }));
+        // The entry point of the draining node assigns only the other cache.
+        let master = body_text(get_for_tests(&router, "/live/801/master.m3u8?sid=reader-3").await);
+        assert!(!master.lines().any(|line| line == "stream.m3u8"));
+        assert!(master.contains("https://edge-b.example/live/801/stream.m3u8"));
+
+        router
+            .execute_control(
+                ControlKind::ResumeNode,
+                ControlRequest {
+                    node_id: Some("test-node".into()),
+                    region: None,
+                    stream_id: None,
+                },
+            )
+            .await;
+        assert_eq!(
+            router
+                .route(request(playlist, "reader-2"))
+                .await
+                .unwrap()
+                .status,
+            StatusCode::OK
+        );
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn cache_at_its_reader_limit_rejects_a_new_reader_with_alternates() {
+        let (mut router, mesh) = entry_point_for_tests(vec![reader_cache_snapshot_for_tests(
+            "edge-b",
+            100,
+            Some(500),
+        )])
+        .await;
+        router.edge_load = EdgeLoad::new(EdgeAdmissionConfig {
+            session_limit: 2,
+            ..EdgeAdmissionConfig::default()
+        });
+        let request = |session: &str| {
+            Request::builder()
+                .method(Method::GET)
+                .uri("/live/801/stream.m3u8")
+                .header("CMCD-Session", format!("sid=\"{session}\""))
+                .body(())
+                .unwrap()
+        };
+        for session in ["reader-1", "reader-2"] {
+            assert_eq!(
+                router.route(request(session)).await.unwrap().status,
+                StatusCode::OK
+            );
+        }
+        let rejected = router.route(request("reader-3")).await.unwrap();
+        assert_eq!(rejected.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(rejected.headers.iter().any(|(name, value)| {
+            name == "x-needletail-alternate-edges"
+                && value == "https://edge-b.example/live/801/stream.m3u8"
+        }));
+        assert_eq!(
+            router.route(request("reader-1")).await.unwrap().status,
+            StatusCode::OK
+        );
+        // The node advertises that it is full, so entry points stop sending
+        // new readers to it.
+        let advertised = router.local_mesh_snapshot().await.edge_service.unwrap();
+        assert_eq!(advertised.session_limit, 2);
+        assert_eq!(advertised.active_playback_sessions, 2);
+        assert_eq!(advertised.load_permille, 1_000);
+        let api = get_for_tests(&router, "/api/assignment?stream=801&sid=reader-4").await;
+        let api: serde_json::Value = serde_json::from_str(&body_text(api)).unwrap();
+        assert_eq!(api["assigned"].as_array().unwrap().len(), 1);
+        assert_eq!(api["assigned"][0]["node_id"], "edge-b");
+        mesh.shutdown();
+    }
+
+    #[test]
+    fn entry_point_paths_and_steering_uri() {
+        assert_eq!(parse_steering_path("/live/77/steering.json", 1), Some(77));
+        assert_eq!(parse_steering_path("/live/steering.json", 1), Some(1));
+        assert_eq!(parse_steering_path("/live/77/stream.m3u8", 1), None);
+        assert_eq!(parse_steering_path("/live/a/b/steering.json", 1), None);
+        assert_eq!(steering_uri(None, None), "steering.json");
+        assert_eq!(
+            steering_uri(Some("a b&c"), Some("lon-edge-1")),
+            "steering.json?sid=a%20b%26c&cache=lon-edge-1"
+        );
+        assert_eq!(playback_stream_ids("/live/77/part3.mp4", None, 1), vec![77]);
+        assert_eq!(playback_stream_ids("/live/stream.m3u8", None, 1), vec![1]);
+        assert_eq!(
+            playback_stream_ids(LLHLS_TAIL_BUNDLE_PATH, Some("streams=2001,2002"), 1),
+            vec![2001, 2002]
+        );
+        assert!(is_playlist_reload_path("/live/77/stream.m3u8"));
+        assert!(!is_playlist_reload_path("/live/77/part3.mp4"));
+        assert!(!is_playlist_reload_path("/live/77/init.mp4"));
+        assert_eq!(
+            effective_replication(CacheMeshReplicationArg::Demand, CacheMeshRole::Peer),
+            ReplicationMode::All
+        );
+        assert_eq!(
+            effective_replication(CacheMeshReplicationArg::Demand, CacheMeshRole::Edge),
+            ReplicationMode::Demand
+        );
+        assert_eq!(
+            effective_replication(CacheMeshReplicationArg::All, CacheMeshRole::Distributor),
+            ReplicationMode::All
+        );
     }
 }
