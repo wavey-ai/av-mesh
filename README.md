@@ -276,8 +276,10 @@ The rules, in order:
 
 Within a rule the choice is a rendezvous hash of the session, weighted by free
 capacity. A cache with a stale advertisement, a draining cache and a full
-cache are not assigned. `--assignment-alternates` (default 2) sets the number
-of caches after the first.
+cache are not assigned. A new reader is also not assigned to a cache that has
+less room than the bit rate of the playlist: a cache can have room for an
+audio reader and not for a 4K reader. `--assignment-alternates` (default 2)
+sets the number of caches after the first.
 
 ### Drain and failure
 
