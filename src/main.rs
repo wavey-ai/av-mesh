@@ -164,6 +164,9 @@ const ASSIGNMENT_PATH: &str = "/api/assignment";
 /// copy that is still warming holds a second or less, and one key frame in
 /// that second reads as a much higher rate than the stream has.
 const MIN_BITRATE_WINDOW_MS: u64 = 4_000;
+/// How often a node without its own measurement of a playlist asks what
+/// rate the region advertises for it.
+const PLAYLIST_RATE_LOOKUP_INTERVAL_MS: u64 = 500;
 /// Most playlists that an edge holds for its readers at one time. The live
 /// cache has 16 playlist slots, and one is the default stream of the node.
 const MAX_EDGE_PLAYLISTS: usize = 15;
@@ -8971,6 +8974,7 @@ struct DemandTracker {
     last_replica_request_unix_ms: Arc<DashMap<u64, AtomicU64>>,
     last_hole_repair_unix_ms: Arc<DashMap<u64, AtomicU64>>,
     hole_repair_requests: Arc<AtomicU64>,
+    last_rate_lookup_unix_ms: Arc<DashMap<u64, AtomicU64>>,
 }
 
 impl DemandTracker {
@@ -8980,6 +8984,20 @@ impl DemandTracker {
             stream_id,
             now_ms,
             REPLICA_REQUEST_MIN_INTERVAL_MS,
+        )
+    }
+
+    /// Rate limit for asking the region what bit rate a playlist has.
+    fn should_look_up_rate(&self, stream_id: u64, now_ms: u64) -> bool {
+        // Stream identifiers come from requests. Keep the table small.
+        if self.last_rate_lookup_unix_ms.len() > 256 {
+            self.last_rate_lookup_unix_ms.clear();
+        }
+        Self::interval_elapsed(
+            &self.last_rate_lookup_unix_ms,
+            stream_id,
+            now_ms,
+            PLAYLIST_RATE_LOOKUP_INTERVAL_MS,
         )
     }
 
@@ -12928,6 +12946,25 @@ impl AppRouter {
         }
     }
 
+    /// Give admission a bit rate for a playlist that this node has not
+    /// measured yet.
+    ///
+    /// A node measures a playlist over four seconds of parts. Until then,
+    /// for example while a copy warms, it uses the rate that the region
+    /// advertises: its distributors hold the playlist all the time. Without
+    /// a rate the first readers of a new copy would be admitted with no
+    /// commitment, and the node could take more of them than it can serve.
+    async fn ensure_playlist_rate(&self, stream_id: u64) {
+        if self.edge_load.egress.playlist_bps(stream_id).is_some()
+            || !self.demand.should_look_up_rate(stream_id, now_unix_ms())
+        {
+            return;
+        }
+        if let Some(bps) = self.regional_playlist_bps(stream_id).await {
+            self.edge_load.egress.set_playlist_bps(stream_id, bps);
+        }
+    }
+
     /// Reject a playback request that this cache cannot take, or move it to
     /// another cache. `None` means the request is served here.
     async fn playback_admission_response(
@@ -12938,6 +12975,9 @@ impl AppRouter {
     ) -> Option<HandlerResponse> {
         let stream_ids = playback_stream_ids(path, query, self.cache.stream_id);
         let stream_id = stream_ids.first().copied();
+        if let Some(stream_id) = stream_id {
+            self.ensure_playlist_rate(stream_id).await;
+        }
         let draining = self.lifecycle.is_draining().await;
         let admission = self.edge_load.admit_playback(PlaybackRequest {
             session_id,
@@ -25344,6 +25384,45 @@ mod tests {
         let api: serde_json::Value = serde_json::from_str(&body_text(api)).unwrap();
         assert_eq!(api["assigned"].as_array().unwrap().len(), 1);
         assert_eq!(api["assigned"][0]["node_id"], "edge-b");
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_cold_cache_admits_readers_against_the_rate_that_the_region_advertises() {
+        // A distributor of the region advertises the playlist at 16 Mbit/s.
+        // This edge does not hold it yet.
+        let mut distributor = reader_cache_snapshot_for_tests("dist-a", 0, Some(500));
+        distributor.edge_service.as_mut().unwrap().cache_mesh_role = "distributor".into();
+        let (mut router, mesh) = entry_point_for_tests(vec![distributor]).await;
+        // The edge admits 85% of 40 Mbit/s: two 16 Mbit/s readers.
+        router.edge_load = EdgeLoad::new(EdgeAdmissionConfig {
+            capacity_bps: 40_000_000,
+            ..EdgeAdmissionConfig::default()
+        });
+        let request = |session: &str| {
+            Request::builder()
+                .method(Method::GET)
+                .uri("/live/801/stream.m3u8")
+                .header("CMCD-Session", format!("sid=\"{session}\""))
+                .body(())
+                .unwrap()
+        };
+        assert_eq!(router.edge_load.egress.playlist_bps(801), None);
+        for session in ["reader-1", "reader-2"] {
+            assert_eq!(
+                router.route(request(session)).await.unwrap().status,
+                StatusCode::OK
+            );
+        }
+        assert_eq!(router.edge_load.egress.playlist_bps(801), Some(16_000_000));
+        assert_eq!(
+            router.route(request("reader-3")).await.unwrap().status,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            router.edge_load.admission_snapshot().committed_bps,
+            32_000_000
+        );
         mesh.shutdown();
     }
 
