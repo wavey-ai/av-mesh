@@ -137,6 +137,15 @@ const DEFAULT_CANONICAL_GAP_HOLD_MS: u64 = 1_000;
 const CANONICAL_GAP_SCAN_LIMIT: usize = 1_024;
 const CANONICAL_GAP_LOG_INTERVAL_MS: u64 = 1_000;
 const REPLICA_REQUEST_MIN_INTERVAL_MS: u64 = 1_000;
+/// Time an edge waits for a requested part that both parents normally deliver
+/// within a millisecond of each other before it treats the part as a hole.
+const EDGE_HOLE_REPAIR_GRACE_MS: u64 = 15;
+/// Minimum time between two hole repair requests for one stream.
+const EDGE_HOLE_REPAIR_MIN_INTERVAL_MS: u64 = 50;
+/// A parent answers a repair request with every part from the hole to its
+/// newest part. Holes older than this window are left to the once-a-second
+/// replica request, so one repair answer stays small.
+const EDGE_HOLE_REPAIR_WINDOW_MS: u64 = 500;
 const MESH_EVENTS_PATH: &str = "/api/mesh/events";
 const MESH_WEBSOCKET_PATH: &str = "/ws/mesh";
 const MISSION_CONTROL_DIST_ENV: &str = "NEEDLETAIL_MISSION_CONTROL_DIST";
@@ -5906,6 +5915,16 @@ impl LiveTsCache {
         seq: u64,
     ) -> Option<(Bytes, u64)> {
         let deadline = Instant::now() + Duration::from_millis(PART_WAIT_MS);
+        self.get_part_until_for_stream_id(stream_id, seq, deadline)
+            .await
+    }
+
+    async fn get_part_until_for_stream_id(
+        &self,
+        stream_id: u64,
+        seq: u64,
+        deadline: Instant,
+    ) -> Option<(Bytes, u64)> {
         loop {
             if let Some((bytes, hash)) = self.get_part_for_stream_id(stream_id, seq).await {
                 return Some((bytes, hash));
@@ -6729,6 +6748,8 @@ struct MeshApiSnapshot {
     mesh_fec: MeshFecRuntimeSnapshot,
     llhls_runtime: LlhlsRuntimeSnapshot,
     canonical_gap_skip: CanonicalGapSkipSnapshot,
+    /// Targeted repair requests this edge sent for holes in live streams.
+    edge_hole_repair_requests: u64,
     relay_session: RelaySessionIngressSnapshot,
     link_observations: Vec<LinkObservation>,
     relay_nodes: Vec<RelayNodeSessionSnapshot>,
@@ -8176,11 +8197,37 @@ impl NodeLifecycle {
 #[derive(Debug, Clone, Default)]
 struct DemandTracker {
     last_replica_request_unix_ms: Arc<DashMap<u64, AtomicU64>>,
+    last_hole_repair_unix_ms: Arc<DashMap<u64, AtomicU64>>,
+    hole_repair_requests: Arc<AtomicU64>,
 }
 
 impl DemandTracker {
     fn should_request_replica(&self, stream_id: u64, now_ms: u64) -> bool {
-        let last_request = match self.last_replica_request_unix_ms.entry(stream_id) {
+        Self::interval_elapsed(
+            &self.last_replica_request_unix_ms,
+            stream_id,
+            now_ms,
+            REPLICA_REQUEST_MIN_INTERVAL_MS,
+        )
+    }
+
+    /// Rate limit for the targeted repair of a hole in a live stream.
+    fn should_repair_hole(&self, stream_id: u64, now_ms: u64, min_interval_ms: u64) -> bool {
+        Self::interval_elapsed(
+            &self.last_hole_repair_unix_ms,
+            stream_id,
+            now_ms,
+            min_interval_ms,
+        )
+    }
+
+    fn interval_elapsed(
+        last_requests: &DashMap<u64, AtomicU64>,
+        stream_id: u64,
+        now_ms: u64,
+        min_interval_ms: u64,
+    ) -> bool {
+        let last_request = match last_requests.entry(stream_id) {
             Entry::Vacant(entry) => {
                 entry.insert(AtomicU64::new(now_ms));
                 return true;
@@ -8190,7 +8237,7 @@ impl DemandTracker {
         let last_request = last_request.get();
         let mut last_ms = last_request.load(Ordering::Relaxed);
         loop {
-            if now_ms.saturating_sub(last_ms) < REPLICA_REQUEST_MIN_INTERVAL_MS {
+            if now_ms.saturating_sub(last_ms) < min_interval_ms {
                 return false;
             }
             match last_request.compare_exchange_weak(
@@ -8563,6 +8610,7 @@ impl MeshApiSnapshot {
             mesh_fec: MeshFecRuntimeSnapshot::default(),
             llhls_runtime: LlhlsRuntimeSnapshot::default(),
             canonical_gap_skip: CanonicalGapSkipSnapshot::default(),
+            edge_hole_repair_requests: 0,
             relay_session,
             link_observations,
             relay_nodes,
@@ -8694,6 +8742,11 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
             "av_mesh_canonical_gap_idle_flushes_total",
             "Times an idle canonical stream had its stranded tail published past a gap.",
             snapshot.canonical_gap_skip.idle_flushes,
+        ),
+        (
+            "av_mesh_edge_hole_repair_requests_total",
+            "Targeted repair requests this edge sent for holes in live streams.",
+            snapshot.edge_hole_repair_requests,
         ),
     ] {
         push_prometheus_metric_header(&mut output, name, help, "counter");
@@ -11634,6 +11687,8 @@ impl AppRouter {
         snapshot.mesh_fec = self.mesh.fec_stats().into();
         snapshot.llhls_runtime = self.cache.chunk_cache.exact_part_waiter_stats().into();
         snapshot.canonical_gap_skip = self.cache.canonical_gap_skip_snapshot();
+        snapshot.edge_hole_repair_requests =
+            self.demand.hole_repair_requests.load(Ordering::Relaxed);
         snapshot
     }
 
@@ -12218,6 +12273,90 @@ impl AppRouter {
             ));
         }
         planned
+    }
+
+    /// Wait for one part, and on a cache-mesh edge repair a hole quickly.
+    ///
+    /// Both parents push a part within about a millisecond of each other, so
+    /// one short receive outage on the edge loses both copies. The general
+    /// replica request runs at most once a second for each stream, which left
+    /// such a part up to a second late. An edge that still lacks a requested
+    /// part after a short grace, while newer parts of the stream are stored,
+    /// asks its parents for that part directly.
+    async fn get_part_repairing_holes(&self, stream_id: u64, seq: u64) -> Option<(Bytes, u64)> {
+        if self.cache_mesh_role != CacheMeshRole::Edge {
+            return self
+                .cache
+                .get_part_blocking_for_stream_id(stream_id, seq)
+                .await;
+        }
+        let deadline = Instant::now() + Duration::from_millis(PART_WAIT_MS);
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let wait_until = (now + Duration::from_millis(EDGE_HOLE_REPAIR_GRACE_MS)).min(deadline);
+            if let Some(part) = self
+                .cache
+                .get_part_until_for_stream_id(stream_id, seq, wait_until)
+                .await
+            {
+                return Some(part);
+            }
+            self.repair_stream_hole(stream_id, seq).await;
+        }
+    }
+
+    /// Ask the parents for `seq` when it is a hole behind the stored head of
+    /// the stream. Returns whether a request was sent.
+    async fn repair_stream_hole(&self, stream_id: u64, seq: u64) -> bool {
+        let Ok(slot) = usize::try_from(seq) else {
+            return false;
+        };
+        let Some(stream_idx) = self.cache.chunk_cache.get_stream_idx(stream_id).await else {
+            return false;
+        };
+        let Some(head) = self.cache.chunk_cache.last(stream_idx) else {
+            return false;
+        };
+        // A part at or beyond the stored head has not been published to this
+        // edge yet. It is not a hole.
+        if head <= slot {
+            return false;
+        }
+        let part_ms = u64::try_from(self.cache.part_target.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let window_parts =
+            usize::try_from((EDGE_HOLE_REPAIR_WINDOW_MS / part_ms).max(1)).unwrap_or(usize::MAX);
+        if head - slot > window_parts {
+            return false;
+        }
+        let min_interval_ms = EDGE_HOLE_REPAIR_MIN_INTERVAL_MS.max(part_ms);
+        if !self
+            .demand
+            .should_repair_hole(stream_id, now_unix_ms(), min_interval_ms)
+        {
+            return false;
+        }
+        match self.mesh.request_replica(stream_id, slot).await {
+            Ok(_) => {
+                self.demand
+                    .hole_repair_requests
+                    .fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Err(error) => {
+                debug!(
+                    stream_id,
+                    slot,
+                    error = %error,
+                    "edge hole repair request failed"
+                );
+                false
+            }
+        }
     }
 
     async fn request_replica_for_stream(
@@ -12891,10 +13030,7 @@ impl Router for AppRouter {
                 if let Some((stream_id, seq, requested_kind)) = parse_stream_part_path(path) {
                     self.request_replica_for_stream(stream_id, "playlist-part-demand", None)
                         .await;
-                    if let Some((bytes, hash)) = self
-                        .cache
-                        .get_part_blocking_for_stream_id(stream_id, seq)
-                        .await
+                    if let Some((bytes, hash)) = self.get_part_repairing_holes(stream_id, seq).await
                     {
                         let media_kind = self
                             .cache
@@ -15688,6 +15824,127 @@ mod tests {
         assert_eq!(filled.head_object, Some(3));
         assert_eq!(filled.gap_count, Some(0));
         mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn edge_repairs_a_recent_hole_without_waiting_for_the_replica_interval() {
+        use playlists::mesh::{CacheMesh, CacheMeshConfig};
+        use tokio::time::timeout;
+
+        let stream_id = 77;
+        let parent_addr = unused_loopback_addr();
+        let edge_addr = unused_loopback_addr();
+        let parent_cache = canonical_gap_test_cache().await;
+        let edge_cache = canonical_gap_test_cache().await;
+        // Neither mesh pushes during the test, so only a repair request can
+        // deliver the missing part.
+        let mut parent_config =
+            CacheMeshConfig::new("hole-parent", "uk", parent_addr).with_peer(edge_addr);
+        parent_config.sync_interval = Duration::from_secs(60);
+        let mut edge_config =
+            CacheMeshConfig::new("hole-edge", "uk", edge_addr).with_peer(parent_addr);
+        edge_config.sync_interval = Duration::from_secs(60);
+        let parent_mesh = CacheMesh::new(Arc::clone(&parent_cache.chunk_cache), parent_config)
+            .start()
+            .await
+            .unwrap();
+        let edge_mesh = Arc::new(
+            CacheMesh::new(Arc::clone(&edge_cache.chunk_cache), edge_config)
+                .start()
+                .await
+                .unwrap(),
+        );
+
+        // The parent holds parts 0 to 4. The edge lost part 2 from the mesh.
+        let hole = 2_u64;
+        for sequence in 0..=4_u64 {
+            commit_canonical_gap_test_part(&parent_cache, stream_id, sequence).await;
+            if sequence == hole {
+                continue;
+            }
+            let (slot, _hash) = parent_cache
+                .chunk_cache
+                .get_for_stream_id(stream_id, sequence as usize)
+                .await
+                .unwrap();
+            edge_cache
+                .chunk_cache
+                .add_for_stream_id(stream_id, sequence as usize, slot)
+                .await
+                .unwrap();
+        }
+        let router = app_router_for_tests(Arc::clone(&edge_cache), Arc::clone(&edge_mesh));
+        assert!(edge_cache
+            .get_part_for_stream_id(stream_id, hole)
+            .await
+            .is_none());
+
+        // A live reader has already used the once-a-second replica request.
+        assert!(router
+            .demand
+            .should_request_replica(stream_id, now_unix_ms()));
+        assert!(!router
+            .demand
+            .should_request_replica(stream_id, now_unix_ms()));
+
+        // The newest part and a part beyond it are not holes.
+        assert!(!router.repair_stream_hole(stream_id, 4).await);
+        assert!(!router.repair_stream_hole(stream_id, 5).await);
+
+        let started = Instant::now();
+        let (bytes, _hash) = timeout(
+            Duration::from_millis(REPLICA_REQUEST_MIN_INTERVAL_MS / 2),
+            router.get_part_repairing_holes(stream_id, hole),
+        )
+        .await
+        .expect("the hole must be repaired well inside the replica interval")
+        .expect("the repaired part must be readable");
+        assert_eq!(bytes, Bytes::from(canonical_gap_test_payload(hole)));
+        assert!(started.elapsed() >= Duration::from_millis(EDGE_HOLE_REPAIR_GRACE_MS));
+        assert!(router.demand.hole_repair_requests.load(Ordering::Relaxed) >= 1);
+        assert_eq!(
+            router.mesh_api_snapshot().await.edge_hole_repair_requests,
+            router.demand.hole_repair_requests.load(Ordering::Relaxed)
+        );
+
+        parent_mesh.shutdown();
+        edge_mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn edge_leaves_an_old_hole_to_the_replica_request() {
+        let stream_id = 77;
+        let edge_cache = canonical_gap_test_cache().await;
+        let source_cache = canonical_gap_test_cache().await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&edge_cache.chunk_cache)).await;
+        let router = app_router_for_tests(Arc::clone(&edge_cache), mesh);
+
+        // At 5 ms parts the repair window is 100 parts. Part 1 is missing and
+        // the stored head is 150 parts ahead of it.
+        let window_parts = EDGE_HOLE_REPAIR_WINDOW_MS / 5;
+        let head = 1 + window_parts + 50;
+        for sequence in [0, head] {
+            commit_canonical_gap_test_part(&source_cache, stream_id, sequence).await;
+            let (slot, _hash) = source_cache
+                .chunk_cache
+                .get_for_stream_id(stream_id, sequence as usize)
+                .await
+                .unwrap();
+            edge_cache
+                .chunk_cache
+                .add_for_stream_id(stream_id, sequence as usize, slot)
+                .await
+                .unwrap();
+        }
+        assert!(!router.repair_stream_hole(stream_id, 1).await);
+        // A hole inside the window is requested once, then rate limited.
+        let recent = head - window_parts;
+        assert!(router.repair_stream_hole(stream_id, recent).await);
+        assert!(!router.repair_stream_hole(stream_id, recent).await);
+        assert_eq!(
+            router.demand.hole_repair_requests.load(Ordering::Relaxed),
+            1
+        );
     }
 
     const TEST_GAP_HOLD_PARTS: u64 = 8;
