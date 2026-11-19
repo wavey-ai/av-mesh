@@ -236,9 +236,10 @@ Each node declares its limits, and enforces them:
 
 A session is admitted against the bit rate of the playlist that it asks for:
 the highest rate that the node has measured for that playlist. The rate is
-measured over at least four seconds of parts, so a copy that is still warming
-has no rate yet. The node rejects a new session when the sessions already
-admitted leave less than that.
+measured over at least four seconds of parts. Until a new copy has that much,
+the node uses the highest rate that the caches of its region advertise for the
+playlist. The node rejects a new session when the sessions already admitted
+leave less than that.
 This acts on the first request and does not wait for the measured egress to
 rise. Measured egress above the admission share for three seconds also stops
 admission, as before. A rejected request receives HTTP 429 with the other
