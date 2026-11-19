@@ -21174,6 +21174,11 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(datagram.delay_ms)).await;
             }
             sender.send_to(&datagram.bytes, bind).await.unwrap();
+            // The ingest task shares this current-thread runtime. Without a
+            // yield the zero-delay datagrams are all queued before the task
+            // first runs, and the kernel drops whatever exceeds the default
+            // receive buffer: loss the test neither intends nor accounts for.
+            tokio::task::yield_now().await;
         }
 
         for frame in &frames {
