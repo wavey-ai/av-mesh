@@ -40,6 +40,11 @@ The first implementation keeps the mesh transport intentionally small:
   `--cache-mesh-max-parents` defaults to 2 and bounds repair requests. A
   distributor sends objects to at most 8 children by default with
   `--cache-mesh-max-children`.
+- Replication follows each stream's contiguous watermark. A canonical object the
+  relay never recovers holds that watermark for `--canonical-gap-hold-ms`
+  (default 1000, converted to parts with `--part-ms`). The watermark then skips
+  the lost parts and replication continues. Keep the hold at or above the
+  contributor relay media deadline. A value of 0 disables skipping.
 - Optional `private-subnet-discovery` support can add mesh peers discovered on a
   10.x private subnet by the existing `discovery` crate's VLAN broadcast path.
   `linode-private-discovery` is an alias for the same generic feature. Use this

@@ -127,6 +127,15 @@ const MAX_LLHLS_TAIL_PARTS: usize = 200;
 const LLHLS_TAIL_BUNDLE_PATH: &str = "/live/tail-bundle";
 const LLHLS_TAIL_BUNDLE_STREAM_PATH: &str = "/live/tail-bundle-stream";
 const CANONICAL_STREAM_IDLE_RETENTION: Duration = Duration::from_secs(5 * 60);
+/// Default time an unrecovered canonical object may block the mesh-visible
+/// contiguous watermark. It must not be shorter than the contributor's relay
+/// media deadline, otherwise an object recovered late could land behind the
+/// cache-mesh per-peer send cursor.
+const DEFAULT_CANONICAL_GAP_HOLD_MS: u64 = 1_000;
+/// Upper bound on the slots probed per commit while a hole blocks the
+/// watermark, so a long loss burst cannot make every commit rescan it.
+const CANONICAL_GAP_SCAN_LIMIT: usize = 1_024;
+const CANONICAL_GAP_LOG_INTERVAL_MS: u64 = 1_000;
 const REPLICA_REQUEST_MIN_INTERVAL_MS: u64 = 1_000;
 const MESH_EVENTS_PATH: &str = "/api/mesh/events";
 const MESH_WEBSOCKET_PATH: &str = "/ws/mesh";
@@ -949,6 +958,17 @@ struct Args {
     #[arg(long, default_value_t = 24)]
     window_parts: usize,
 
+    /// How long one unrecovered canonical object may hold back the contiguous
+    /// watermark that gates cache-mesh replication before the watermark skips
+    /// past it. Converted to parts with --part-ms. Keep it at or above the
+    /// contributor relay media deadline. 0 disables gap skipping.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CANONICAL_GAP_HOLD_MS",
+        default_value_t = DEFAULT_CANONICAL_GAP_HOLD_MS
+    )]
+    canonical_gap_hold_ms: u64,
+
     #[arg(long, default_value_t = 2048)]
     slot_kb: usize,
 
@@ -1365,6 +1385,7 @@ async fn main() -> Result<()> {
         args.slot_kb,
     )
     .await;
+    cache.set_canonical_gap_hold(Duration::from_millis(args.canonical_gap_hold_ms));
     let link_telemetry = Arc::new(LinkTelemetry::new(
         node_id.clone(),
         args.relay_primary_peer
@@ -3455,6 +3476,10 @@ async fn run_udp_fec_ingest(
                         "expired deadline-bound RelaySession receive state"
                     );
                 }
+                // A hole near the end of a stream is never followed by
+                // enough commits to release it, so the idle tail is flushed
+                // here once the hold has elapsed without further ingest.
+                cache.flush_idle_canonical_gaps(now_unix_ms()).await;
                 let retired_streams = cache
                     .retire_streams_idle_before(
                         now_unix_ms().saturating_sub(
@@ -4155,6 +4180,15 @@ struct HlsReloadPosition {
     part: Option<usize>,
 }
 
+/// Convert the canonical gap hold into parts at the configured part cadence.
+/// A zero hold disables gap skipping; any other hold is at least one part.
+fn canonical_gap_hold_parts(hold_ms: u64, part_target: Duration) -> u64 {
+    let part_ms = u64::try_from(part_target.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    hold_ms.div_ceil(part_ms)
+}
+
 struct LiveTsCache {
     chunk_cache: Arc<ChunkCache>,
     stream_id: u64,
@@ -4164,6 +4198,12 @@ struct LiveTsCache {
     max_part_bytes: usize,
     state: RwLock<LiveState>,
     canonical_commit_locks: StdMutex<HashMap<u64, Arc<AsyncMutex<()>>>>,
+    canonical_gap_hold_ms: AtomicU64,
+    canonical_gap_hold_parts: AtomicU64,
+    canonical_gap_skips: AtomicU64,
+    canonical_gap_idle_flushes: AtomicU64,
+    canonical_gap_skipped_parts: AtomicU64,
+    canonical_gap_last_log_unix_ms: AtomicU64,
     part_updates: watch::Sender<u64>,
     playlist_cache: Vec<StdRwLock<Option<CachedPlaylist>>>,
     relay_ingress: StdRwLock<RelaySessionIngressSnapshot>,
@@ -4203,6 +4243,15 @@ impl LiveTsCache {
             max_part_bytes: slot_kb * 1024,
             state: RwLock::new(LiveState::new()),
             canonical_commit_locks: StdMutex::new(HashMap::new()),
+            canonical_gap_hold_ms: AtomicU64::new(DEFAULT_CANONICAL_GAP_HOLD_MS),
+            canonical_gap_hold_parts: AtomicU64::new(canonical_gap_hold_parts(
+                DEFAULT_CANONICAL_GAP_HOLD_MS,
+                part_target,
+            )),
+            canonical_gap_skips: AtomicU64::new(0),
+            canonical_gap_idle_flushes: AtomicU64::new(0),
+            canonical_gap_skipped_parts: AtomicU64::new(0),
+            canonical_gap_last_log_unix_ms: AtomicU64::new(0),
             part_updates,
             playlist_cache,
             relay_ingress: StdRwLock::new(RelaySessionIngressSnapshot::default()),
@@ -4300,6 +4349,257 @@ impl LiveTsCache {
                 .entry(stream_id)
                 .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
         )
+    }
+
+    /// Configure how long an unrecovered canonical object may hold back the
+    /// mesh-visible contiguous watermark. A zero hold disables gap skipping.
+    fn set_canonical_gap_hold(&self, hold: Duration) {
+        let hold_ms = u64::try_from(hold.as_millis()).unwrap_or(u64::MAX);
+        self.canonical_gap_hold_ms.store(hold_ms, Ordering::Relaxed);
+        self.canonical_gap_hold_parts.store(
+            canonical_gap_hold_parts(hold_ms, self.part_target),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn canonical_gap_skip_snapshot(&self) -> CanonicalGapSkipSnapshot {
+        CanonicalGapSkipSnapshot {
+            hold_ms: self.canonical_gap_hold_ms.load(Ordering::Relaxed),
+            hold_parts: self.canonical_gap_hold_parts.load(Ordering::Relaxed),
+            skips: self.canonical_gap_skips.load(Ordering::Relaxed),
+            idle_flushes: self.canonical_gap_idle_flushes.load(Ordering::Relaxed),
+            skipped_parts: self.canonical_gap_skipped_parts.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Release a hole that has blocked the contiguous watermark for longer
+    /// than the configured hold, measured in parts committed beyond it.
+    ///
+    /// `ChunkCache::last` gates cache-mesh replication and stops at the first
+    /// missing slot until that slot leaves the retained ring. An object the
+    /// relay never recovers would therefore freeze replication of the stream
+    /// for the whole ring and then release it as one burst. Once
+    /// `committing_slot` is more than the hold ahead of the watermark, the
+    /// watermark moves to the newest stored slot that is itself older than the
+    /// hold; the write that follows resumes contiguous publication from there.
+    ///
+    /// The caller must hold the stream's canonical commit lock. A stream with
+    /// no hole costs one stream-index lookup and one watermark comparison.
+    async fn release_held_canonical_gap(&self, stream_id: u64, committing_slot: usize) {
+        let hold_parts = self.canonical_gap_hold_parts.load(Ordering::Relaxed);
+        if hold_parts == 0 {
+            return;
+        }
+        let Some(ceiling) = usize::try_from(hold_parts)
+            .ok()
+            .and_then(|hold_parts| committing_slot.checked_sub(hold_parts))
+        else {
+            return;
+        };
+        let Some(stream_idx) = self.chunk_cache.get_stream_idx(stream_id).await else {
+            return;
+        };
+        // Nothing is published before the first canonical media object, so
+        // an empty watermark has no hole to release.
+        let Some(last) = self.chunk_cache.last(stream_idx) else {
+            return;
+        };
+        if last >= ceiling {
+            return;
+        }
+        self.advance_canonical_watermark(stream_id, stream_idx, last, ceiling, false)
+            .await;
+    }
+
+    /// Advance the watermark of idle canonical streams whose tail is stranded
+    /// behind a hole.
+    ///
+    /// The commit path releases a hole only when later objects arrive. A
+    /// stream that stops, or stalls, shortly after a lost object would keep
+    /// its last parts unpublished, so a stream with no ingest for longer than
+    /// the hold has its watermark moved to its newest stored object.
+    async fn flush_idle_canonical_gaps(&self, now_unix_ms: u64) -> usize {
+        let hold_ms = self.canonical_gap_hold_ms.load(Ordering::Relaxed);
+        if hold_ms == 0 {
+            return 0;
+        }
+        let candidates: Vec<u64> = {
+            let state = self.state.read().await;
+            state
+                .stream_latest_canonical_object
+                .keys()
+                .filter(|stream_id| {
+                    state.canonical_stream_idle_for(**stream_id, now_unix_ms, hold_ms)
+                })
+                .copied()
+                .collect()
+        };
+
+        let mut flushed = 0;
+        for stream_id in candidates {
+            // Never create a lock here: a stream retired since the candidate
+            // scan must not regain a commit-lock entry.
+            let Some(commit_lock) = self
+                .canonical_commit_locks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&stream_id)
+                .cloned()
+            else {
+                continue;
+            };
+            let _commit_guard = commit_lock.lock().await;
+            let head = {
+                let state = self.state.read().await;
+                if !state.canonical_stream_idle_for(stream_id, now_unix_ms, hold_ms) {
+                    continue;
+                }
+                state
+                    .stream_latest_canonical_object
+                    .get(&stream_id)
+                    .copied()
+            };
+            let Some(head) = head.and_then(|head| usize::try_from(head).ok()) else {
+                continue;
+            };
+            let Some(stream_idx) = self.chunk_cache.get_stream_idx(stream_id).await else {
+                continue;
+            };
+            let Some(last) = self.chunk_cache.last(stream_idx) else {
+                continue;
+            };
+            if last >= head {
+                continue;
+            }
+            if let Some(watermark) = self
+                .advance_canonical_watermark(stream_id, stream_idx, last, head, true)
+                .await
+            {
+                flushed += 1;
+                // Wake blocked playlist and tail readers so they observe the
+                // newly published tail without waiting for another commit.
+                self.part_updates.send_replace(watermark as u64);
+            }
+        }
+        flushed
+    }
+
+    /// Move the contiguous watermark to the newest stored slot in
+    /// `(last, ceiling]`, returning the new watermark.
+    ///
+    /// `ChunkCache` exposes no direct watermark control, so the stored bytes
+    /// of that slot are republished unchanged through `add_for_stream_id`,
+    /// which publishes the slot identity as the new watermark. The caller must
+    /// hold the stream's canonical commit lock so the slot cannot be replaced
+    /// between the read and the republication.
+    async fn advance_canonical_watermark(
+        &self,
+        stream_id: u64,
+        stream_idx: usize,
+        last: usize,
+        ceiling: usize,
+        idle_flush: bool,
+    ) -> Option<usize> {
+        let first_unpublished = last.checked_add(1)?;
+        let scan_floor =
+            first_unpublished.max(ceiling.saturating_sub(CANONICAL_GAP_SCAN_LIMIT - 1));
+        for candidate in (scan_floor..=ceiling).rev() {
+            let Some((bytes, _hash)) = self
+                .chunk_cache
+                .get_for_stream_id(stream_id, candidate)
+                .await
+            else {
+                continue;
+            };
+            if bytes.is_empty() {
+                continue;
+            }
+
+            // Slots that are no longer retained, or were never stored, are
+            // the parts replication will not carry.
+            let retained_start = self
+                .chunk_cache
+                .retained_start(candidate)
+                .max(first_unpublished);
+            let mut skipped_parts = (retained_start - first_unpublished) as u64;
+            for slot in retained_start..candidate {
+                if self
+                    .chunk_cache
+                    .get_for_stream_id(stream_id, slot)
+                    .await
+                    .is_none()
+                {
+                    skipped_parts = skipped_parts.saturating_add(1);
+                }
+            }
+
+            match self
+                .chunk_cache
+                .add_for_stream_id(stream_id, candidate, bytes)
+                .await
+            {
+                Ok(published_idx) if published_idx == stream_idx => {}
+                Ok(published_idx) => {
+                    warn!(
+                        stream_id,
+                        stream_idx,
+                        published_idx,
+                        "canonical stream cache index changed while releasing a gap"
+                    );
+                    return None;
+                }
+                Err(error) => {
+                    warn!(
+                        stream_id,
+                        watermark = last,
+                        candidate,
+                        error,
+                        "canonical gap release could not republish a stored slot"
+                    );
+                    return None;
+                }
+            }
+
+            if skipped_parts > 0 {
+                self.canonical_gap_skips.fetch_add(1, Ordering::Relaxed);
+                self.canonical_gap_skipped_parts
+                    .fetch_add(skipped_parts, Ordering::Relaxed);
+            }
+            if idle_flush {
+                self.canonical_gap_idle_flushes
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            let now_ms = now_unix_ms();
+            let last_log_ms = self.canonical_gap_last_log_unix_ms.load(Ordering::Relaxed);
+            if now_ms.saturating_sub(last_log_ms) >= CANONICAL_GAP_LOG_INTERVAL_MS
+                && self
+                    .canonical_gap_last_log_unix_ms
+                    .compare_exchange(last_log_ms, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                info!(
+                    stream_id,
+                    old_watermark = last,
+                    new_watermark = candidate,
+                    skipped_parts,
+                    idle_flush,
+                    gap_skips_total = self.canonical_gap_skips.load(Ordering::Relaxed),
+                    skipped_parts_total = self.canonical_gap_skipped_parts.load(Ordering::Relaxed),
+                    "advanced canonical contiguous watermark past an unrecovered gap"
+                );
+            } else {
+                debug!(
+                    stream_id,
+                    old_watermark = last,
+                    new_watermark = candidate,
+                    skipped_parts,
+                    idle_flush,
+                    "advanced canonical contiguous watermark past an unrecovered gap"
+                );
+            }
+            return Some(candidate);
+        }
+        None
     }
 
     async fn push_payload(&self, payload: &[u8]) -> Result<()> {
@@ -4596,6 +4896,9 @@ impl LiveTsCache {
                 encode_canonical_live_slot(stream_id, &object, payload, media_kind)?
             };
             let cached_bytes = cached_payload.len();
+            // Runs before the write so the contiguous publication performed by
+            // this commit resumes directly behind a released hole.
+            self.release_held_canonical_gap(stream_id, slot_id).await;
             let write_result = self
                 .chunk_cache
                 .put_if_absent_contiguous_for_stream_id(
@@ -6301,6 +6604,14 @@ impl LiveState {
             .collect()
     }
 
+    fn canonical_stream_idle_for(&self, stream_id: u64, now_unix_ms: u64, idle_ms: u64) -> bool {
+        self.stream_last_ingest_unix_ms
+            .get(&stream_id)
+            .is_some_and(|last_ingest_unix_ms| {
+                now_unix_ms.saturating_sub(*last_ingest_unix_ms) > idle_ms
+            })
+    }
+
     fn forget_stream(&mut self, stream_id: u64) {
         self.stream_next_seq.remove(&stream_id);
         self.stream_canonical_epoch.remove(&stream_id);
@@ -6417,6 +6728,7 @@ struct MeshApiSnapshot {
     mesh_transport: MeshTransportConfigSnapshot,
     mesh_fec: MeshFecRuntimeSnapshot,
     llhls_runtime: LlhlsRuntimeSnapshot,
+    canonical_gap_skip: CanonicalGapSkipSnapshot,
     relay_session: RelaySessionIngressSnapshot,
     link_observations: Vec<LinkObservation>,
     relay_nodes: Vec<RelayNodeSessionSnapshot>,
@@ -6442,6 +6754,17 @@ struct LlhlsRuntimeSnapshot {
     exact_waiter_keys: usize,
     exact_waiter_registrations: usize,
     exact_waiter_capacity: usize,
+}
+
+/// Contiguous-watermark advances past canonical objects the relay never
+/// recovered, as seen by this node's cache-mesh replication.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+struct CanonicalGapSkipSnapshot {
+    hold_ms: u64,
+    hold_parts: u64,
+    skips: u64,
+    idle_flushes: u64,
+    skipped_parts: u64,
 }
 
 impl From<playlists::chunk_cache::ExactPartWaiterStats> for LlhlsRuntimeSnapshot {
@@ -8239,6 +8562,7 @@ impl MeshApiSnapshot {
             mesh_transport: MeshTransportConfigSnapshot::default(),
             mesh_fec: MeshFecRuntimeSnapshot::default(),
             llhls_runtime: LlhlsRuntimeSnapshot::default(),
+            canonical_gap_skip: CanonicalGapSkipSnapshot::default(),
             relay_session,
             link_observations,
             relay_nodes,
@@ -8352,6 +8676,27 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
         ),
     ] {
         push_prometheus_metric_header(&mut output, name, help, "gauge");
+        output.push_str(&format!("{name}{{{local_labels}}} {value}\n"));
+    }
+
+    for (name, help, value) in [
+        (
+            "av_mesh_canonical_gap_skips_total",
+            "Times the local contiguous watermark advanced past canonical objects that were never recovered.",
+            snapshot.canonical_gap_skip.skips,
+        ),
+        (
+            "av_mesh_canonical_gap_skipped_parts_total",
+            "Canonical parts left behind the local contiguous watermark by gap skips.",
+            snapshot.canonical_gap_skip.skipped_parts,
+        ),
+        (
+            "av_mesh_canonical_gap_idle_flushes_total",
+            "Times an idle canonical stream had its stranded tail published past a gap.",
+            snapshot.canonical_gap_skip.idle_flushes,
+        ),
+    ] {
+        push_prometheus_metric_header(&mut output, name, help, "counter");
         output.push_str(&format!("{name}{{{local_labels}}} {value}\n"));
     }
 
@@ -11288,6 +11633,7 @@ impl AppRouter {
         snapshot.mesh_transport = self.mesh_transport.clone();
         snapshot.mesh_fec = self.mesh.fec_stats().into();
         snapshot.llhls_runtime = self.cache.chunk_cache.exact_part_waiter_stats().into();
+        snapshot.canonical_gap_skip = self.cache.canonical_gap_skip_snapshot();
         snapshot
     }
 
@@ -15342,6 +15688,528 @@ mod tests {
         assert_eq!(filled.head_object, Some(3));
         assert_eq!(filled.gap_count, Some(0));
         mesh.shutdown();
+    }
+
+    const TEST_GAP_HOLD_PARTS: u64 = 8;
+
+    /// A canonical cache at the deployed 5 ms part cadence whose gap hold is
+    /// `TEST_GAP_HOLD_PARTS` parts and whose ring retains 256 parts.
+    async fn canonical_gap_test_cache() -> Arc<LiveTsCache> {
+        let cache = LiveTsCache::new(1, Duration::from_millis(5), 2, 64, 64).await;
+        cache.set_canonical_gap_hold(Duration::from_millis(5 * TEST_GAP_HOLD_PARTS));
+        assert_eq!(
+            cache.canonical_gap_skip_snapshot().hold_parts,
+            TEST_GAP_HOLD_PARTS
+        );
+        cache
+    }
+
+    fn canonical_gap_test_payload(sequence: u64) -> Vec<u8> {
+        format!("gap-test-part-{sequence}").into_bytes()
+    }
+
+    async fn commit_canonical_gap_test_part(cache: &LiveTsCache, stream_id: u64, sequence: u64) {
+        assert_eq!(
+            cache
+                .commit_stream_payload(
+                    stream_id,
+                    encode_test_canonical_fmp4_object(
+                        stream_id,
+                        sequence,
+                        ObjectKind::Media,
+                        sequence == 0,
+                        &canonical_gap_test_payload(sequence),
+                    ),
+                )
+                .await
+                .unwrap(),
+            sequence
+        );
+    }
+
+    /// The contiguous watermark exactly as the cache-mesh sync loop reads it.
+    async fn canonical_gap_test_watermark(cache: &LiveTsCache, stream_id: u64) -> Option<usize> {
+        let stream_idx = cache.chunk_cache.get_stream_idx(stream_id).await?;
+        cache.chunk_cache.last(stream_idx)
+    }
+
+    /// Slot presence exactly as the cache-mesh sync loop reads it.
+    async fn canonical_gap_test_slot_present(
+        cache: &LiveTsCache,
+        stream_id: u64,
+        sequence: usize,
+    ) -> bool {
+        let stream_idx = cache.chunk_cache.get_stream_idx(stream_id).await.unwrap();
+        cache
+            .chunk_cache
+            .get(stream_idx, sequence)
+            .await
+            .is_some_and(|(bytes, hash)| hash != 0 || !bytes.is_empty())
+    }
+
+    #[test]
+    fn canonical_gap_hold_converts_to_parts_at_the_part_cadence() {
+        assert_eq!(
+            canonical_gap_hold_parts(1_000, Duration::from_millis(5)),
+            200
+        );
+        assert_eq!(
+            canonical_gap_hold_parts(1_000, Duration::from_millis(50)),
+            20
+        );
+        assert_eq!(canonical_gap_hold_parts(1, Duration::from_millis(5)), 1);
+        assert_eq!(canonical_gap_hold_parts(7, Duration::from_millis(5)), 2);
+        assert_eq!(canonical_gap_hold_parts(0, Duration::from_millis(5)), 0);
+        assert_eq!(canonical_gap_hold_parts(1_000, Duration::ZERO), 1_000);
+    }
+
+    #[tokio::test]
+    async fn canonical_gap_is_skipped_once_the_hold_has_passed() {
+        let cache = canonical_gap_test_cache().await;
+        let stream_id = 77;
+        let hole = 5_u64;
+
+        for sequence in 0..hole {
+            commit_canonical_gap_test_part(&cache, stream_id, sequence).await;
+        }
+        assert_eq!(
+            canonical_gap_test_watermark(&cache, stream_id).await,
+            Some(4)
+        );
+
+        // Every part up to and including `hole + hold` leaves the hole inside
+        // the hold, so the watermark must stay where the hole blocked it.
+        for sequence in hole + 1..=hole + TEST_GAP_HOLD_PARTS {
+            commit_canonical_gap_test_part(&cache, stream_id, sequence).await;
+            assert_eq!(
+                canonical_gap_test_watermark(&cache, stream_id).await,
+                Some(4),
+                "the hole must be held while part {sequence} is committed"
+            );
+        }
+        assert_eq!(cache.canonical_gap_skip_snapshot().skips, 0);
+
+        // One more part puts the hole beyond the hold. The watermark skips it
+        // and contiguous publication resumes through the newest part.
+        let head = hole + TEST_GAP_HOLD_PARTS + 1;
+        commit_canonical_gap_test_part(&cache, stream_id, head).await;
+        assert_eq!(
+            canonical_gap_test_watermark(&cache, stream_id).await,
+            Some(head as usize)
+        );
+        assert!(!canonical_gap_test_slot_present(&cache, stream_id, hole as usize).await);
+        for sequence in hole + 1..=head {
+            assert!(
+                canonical_gap_test_slot_present(&cache, stream_id, sequence as usize).await,
+                "part {sequence} behind the released hole must be readable by the mesh"
+            );
+            assert_eq!(
+                cache
+                    .get_part_for_stream_id(stream_id, sequence)
+                    .await
+                    .unwrap()
+                    .0,
+                Bytes::from(canonical_gap_test_payload(sequence)),
+                "releasing the hole must not alter part {sequence}"
+            );
+        }
+        let skip = cache.canonical_gap_skip_snapshot();
+        assert_eq!(skip.skips, 1);
+        assert_eq!(skip.skipped_parts, 1);
+        assert_eq!(skip.idle_flushes, 0);
+        assert!(cache.stream_is_locally_fresh(stream_id).await);
+
+        // Publication stays contiguous afterwards with no further skips.
+        for sequence in head + 1..=head + 3 * TEST_GAP_HOLD_PARTS {
+            commit_canonical_gap_test_part(&cache, stream_id, sequence).await;
+            assert_eq!(
+                canonical_gap_test_watermark(&cache, stream_id).await,
+                Some(sequence as usize)
+            );
+        }
+        assert_eq!(cache.canonical_gap_skip_snapshot(), skip);
+
+        // The lost part arriving after its release stays readable by identity
+        // and never moves the watermark backwards.
+        commit_canonical_gap_test_part(&cache, stream_id, hole).await;
+        assert!(canonical_gap_test_slot_present(&cache, stream_id, hole as usize).await);
+        assert_eq!(
+            canonical_gap_test_watermark(&cache, stream_id).await,
+            Some((head + 3 * TEST_GAP_HOLD_PARTS) as usize)
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_gap_skip_releases_each_hole_after_its_own_hold() {
+        let cache = canonical_gap_test_cache().await;
+        let stream_id = 77;
+        // Parts 5, 6 and 7 are lost as one burst and part 12 on its own.
+        let lost = [5_u64, 6, 7, 12];
+        let mut watermarks = Vec::new();
+        for sequence in 0..=30_u64 {
+            if lost.contains(&sequence) {
+                continue;
+            }
+            commit_canonical_gap_test_part(&cache, stream_id, sequence).await;
+            watermarks.push((
+                sequence,
+                canonical_gap_test_watermark(&cache, stream_id)
+                    .await
+                    .unwrap() as u64,
+            ));
+        }
+
+        for (sequence, watermark) in watermarks {
+            let expected = if sequence < 5 {
+                sequence
+            } else if sequence <= 7 + TEST_GAP_HOLD_PARTS {
+                // Held until the newest lost part of the burst is beyond the
+                // hold, which first happens at part 8 + hold.
+                4
+            } else if sequence <= 12 + TEST_GAP_HOLD_PARTS {
+                11
+            } else {
+                sequence
+            };
+            assert_eq!(
+                watermark, expected,
+                "watermark after committing part {sequence}"
+            );
+        }
+        let skip = cache.canonical_gap_skip_snapshot();
+        assert_eq!(skip.skips, 2);
+        assert_eq!(skip.skipped_parts, lost.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn canonical_gap_filled_within_the_hold_publishes_normally() {
+        let cache = canonical_gap_test_cache().await;
+        let stream_id = 77;
+        let hole = 5_u64;
+        let head = hole + TEST_GAP_HOLD_PARTS;
+
+        for sequence in (0..=head).filter(|sequence| *sequence != hole) {
+            commit_canonical_gap_test_part(&cache, stream_id, sequence).await;
+        }
+        assert_eq!(
+            canonical_gap_test_watermark(&cache, stream_id).await,
+            Some(4)
+        );
+
+        // The late part arrives while the hole is still held: the gap fills
+        // and every buffered part is published without skipping anything.
+        commit_canonical_gap_test_part(&cache, stream_id, hole).await;
+        assert_eq!(
+            canonical_gap_test_watermark(&cache, stream_id).await,
+            Some(head as usize)
+        );
+        for sequence in 0..=head {
+            assert!(canonical_gap_test_slot_present(&cache, stream_id, sequence as usize).await);
+        }
+
+        for sequence in head + 1..=head + 3 * TEST_GAP_HOLD_PARTS {
+            commit_canonical_gap_test_part(&cache, stream_id, sequence).await;
+            assert_eq!(
+                canonical_gap_test_watermark(&cache, stream_id).await,
+                Some(sequence as usize)
+            );
+        }
+        let skip = cache.canonical_gap_skip_snapshot();
+        assert_eq!(skip.skips, 0);
+        assert_eq!(skip.skipped_parts, 0);
+        assert_eq!(skip.idle_flushes, 0);
+    }
+
+    #[tokio::test]
+    async fn canonical_streams_without_gaps_are_unchanged_by_gap_skipping() {
+        let cache = canonical_gap_test_cache().await;
+        let legacy = LiveTsCache::new(1, Duration::from_millis(5), 2, 64, 64).await;
+        legacy.set_canonical_gap_hold(Duration::ZERO);
+        assert_eq!(legacy.canonical_gap_skip_snapshot().hold_parts, 0);
+        let stream_id = 77;
+
+        // In-order commits with one adjacent reordering, as the relay
+        // delivers them. The cache version counts every slot write, so equal
+        // versions prove gap skipping republished nothing.
+        let mut order: Vec<u64> = (0..=4 * TEST_GAP_HOLD_PARTS).collect();
+        order.swap(10, 11);
+        for sequence in order {
+            commit_canonical_gap_test_part(&cache, stream_id, sequence).await;
+            commit_canonical_gap_test_part(&legacy, stream_id, sequence).await;
+            assert_eq!(
+                canonical_gap_test_watermark(&cache, stream_id).await,
+                canonical_gap_test_watermark(&legacy, stream_id).await,
+                "watermark after committing part {sequence}"
+            );
+            let stream_idx = cache.chunk_cache.get_stream_idx(stream_id).await.unwrap();
+            let legacy_idx = legacy.chunk_cache.get_stream_idx(stream_id).await.unwrap();
+            assert_eq!(
+                cache.chunk_cache.version(stream_idx),
+                legacy.chunk_cache.version(legacy_idx),
+                "cache writes after committing part {sequence}"
+            );
+        }
+        assert_eq!(
+            canonical_gap_test_watermark(&cache, stream_id).await,
+            Some((4 * TEST_GAP_HOLD_PARTS) as usize)
+        );
+        let skip = cache.canonical_gap_skip_snapshot();
+        assert_eq!(skip.skips, 0);
+        assert_eq!(skip.skipped_parts, 0);
+        assert_eq!(skip.idle_flushes, 0);
+        assert_eq!(
+            cache
+                .flush_idle_canonical_gaps(now_unix_ms().saturating_add(60_000))
+                .await,
+            0,
+            "an idle stream without a gap has nothing to flush"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_gap_hold_of_zero_keeps_the_watermark_behind_a_hole() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(5), 2, 64, 64).await;
+        cache.set_canonical_gap_hold(Duration::ZERO);
+        let stream_id = 77;
+        for sequence in (0..=5 + 4 * TEST_GAP_HOLD_PARTS).filter(|sequence| *sequence != 5) {
+            commit_canonical_gap_test_part(&cache, stream_id, sequence).await;
+        }
+        assert_eq!(
+            cache
+                .flush_idle_canonical_gaps(now_unix_ms().saturating_add(60_000))
+                .await,
+            0
+        );
+        assert_eq!(
+            canonical_gap_test_watermark(&cache, stream_id).await,
+            Some(4)
+        );
+        assert_eq!(cache.canonical_gap_skip_snapshot().skips, 0);
+    }
+
+    #[tokio::test]
+    async fn idle_canonical_stream_tail_is_flushed_past_a_trailing_gap() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(5), 2, 64, 64).await;
+        // A long hold keeps this test independent of how slowly it runs: the
+        // flush is driven with explicit clock values instead of sleeping.
+        let hold_ms = 60_000_u64;
+        cache.set_canonical_gap_hold(Duration::from_millis(hold_ms));
+        let gapped_stream = 77;
+        let complete_stream = 78;
+
+        // The stream stops three parts after a lost part, far fewer than the
+        // hold, so no later commit can ever release the hole.
+        for sequence in (0..=8_u64).filter(|sequence| *sequence != 5) {
+            commit_canonical_gap_test_part(&cache, gapped_stream, sequence).await;
+        }
+        for sequence in 0..=8_u64 {
+            commit_canonical_gap_test_part(&cache, complete_stream, sequence).await;
+        }
+        assert_eq!(
+            canonical_gap_test_watermark(&cache, gapped_stream).await,
+            Some(4)
+        );
+        let complete_idx = cache
+            .chunk_cache
+            .get_stream_idx(complete_stream)
+            .await
+            .unwrap();
+        let complete_version = cache.chunk_cache.version(complete_idx);
+
+        let committed_ms = now_unix_ms();
+        assert_eq!(
+            cache.flush_idle_canonical_gaps(committed_ms).await,
+            0,
+            "a stream that is still within the hold must not be flushed"
+        );
+        assert_eq!(
+            canonical_gap_test_watermark(&cache, gapped_stream).await,
+            Some(4)
+        );
+
+        let mut updates = cache.part_updates.subscribe();
+        assert_eq!(
+            cache
+                .flush_idle_canonical_gaps(committed_ms + hold_ms + 1_000)
+                .await,
+            1
+        );
+        assert_eq!(
+            canonical_gap_test_watermark(&cache, gapped_stream).await,
+            Some(8)
+        );
+        assert!(updates.has_changed().unwrap());
+        assert_eq!(*updates.borrow_and_update(), 8);
+        for sequence in 6..=8 {
+            assert!(canonical_gap_test_slot_present(&cache, gapped_stream, sequence).await);
+        }
+        assert!(!canonical_gap_test_slot_present(&cache, gapped_stream, 5).await);
+        let skip = cache.canonical_gap_skip_snapshot();
+        assert_eq!(skip.skips, 1);
+        assert_eq!(skip.skipped_parts, 1);
+        assert_eq!(skip.idle_flushes, 1);
+
+        // The complete stream was left alone and a repeated flush is a no-op.
+        assert_eq!(
+            canonical_gap_test_watermark(&cache, complete_stream).await,
+            Some(8)
+        );
+        assert_eq!(cache.chunk_cache.version(complete_idx), complete_version);
+        assert_eq!(
+            cache
+                .flush_idle_canonical_gaps(committed_ms + hold_ms + 2_000)
+                .await,
+            0
+        );
+        assert_eq!(cache.canonical_gap_skip_snapshot(), skip);
+
+        // A stream that resumes continues contiguously from the flushed tail.
+        commit_canonical_gap_test_part(&cache, gapped_stream, 9).await;
+        assert_eq!(
+            canonical_gap_test_watermark(&cache, gapped_stream).await,
+            Some(9)
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_gap_skip_counters_are_exposed_by_the_local_api_and_metrics() {
+        let cache = canonical_gap_test_cache().await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
+        let stream_id = 77;
+        for sequence in (0..=6 + TEST_GAP_HOLD_PARTS).filter(|sequence| *sequence != 5) {
+            commit_canonical_gap_test_part(&cache, stream_id, sequence).await;
+        }
+
+        let metrics_req = Request::builder()
+            .method(Method::GET)
+            .uri(MESH_METRICS_PATH)
+            .body(())
+            .unwrap();
+        let response = router.route(metrics_req).await.unwrap();
+        let metrics = String::from_utf8(response.body.unwrap().to_vec()).unwrap();
+        assert!(metrics.contains("# TYPE av_mesh_canonical_gap_skips_total counter\n"));
+        assert!(metrics.contains(
+            "av_mesh_canonical_gap_skips_total{node_id=\"test-node\",region=\"test-region\"} 1\n"
+        ));
+        assert!(metrics.contains(
+            "av_mesh_canonical_gap_skipped_parts_total{node_id=\"test-node\",region=\"test-region\"} 1\n"
+        ));
+        assert!(metrics.contains(
+            "av_mesh_canonical_gap_idle_flushes_total{node_id=\"test-node\",region=\"test-region\"} 0\n"
+        ));
+
+        let local_req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/mesh/local")
+            .body(())
+            .unwrap();
+        let response = router.route(local_req).await.unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        let local: serde_json::Value = serde_json::from_slice(&response.body.unwrap()).unwrap();
+        assert_eq!(
+            local["canonical_gap_skip"],
+            serde_json::json!({
+                "hold_ms": 5 * TEST_GAP_HOLD_PARTS,
+                "hold_parts": TEST_GAP_HOLD_PARTS,
+                "skips": 1,
+                "idle_flushes": 0,
+                "skipped_parts": 1,
+            })
+        );
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn cache_mesh_replication_continues_past_a_skipped_canonical_gap() {
+        use playlists::mesh::{CacheMesh, CacheMeshConfig};
+        use tokio::time::timeout;
+
+        let distributor_addr = unused_loopback_addr();
+        let edge_addr = unused_loopback_addr();
+        let distributor = canonical_gap_test_cache().await;
+        let edge = LiveTsCache::new(1, Duration::from_millis(5), 2, 64, 64).await;
+        let mut distributor_config =
+            CacheMeshConfig::new("gap-distributor", "uk", distributor_addr)
+                .with_role(CacheMeshRole::Distributor)
+                .with_peer(edge_addr);
+        distributor_config.sync_interval = Duration::from_millis(10);
+        let distributor_mesh =
+            CacheMesh::new(Arc::clone(&distributor.chunk_cache), distributor_config)
+                .start()
+                .await
+                .unwrap();
+        let edge_mesh = CacheMesh::new(
+            Arc::clone(&edge.chunk_cache),
+            CacheMeshConfig::new("gap-edge", "uk", edge_addr)
+                .with_role(CacheMeshRole::Edge)
+                .with_peer(distributor_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+
+        async fn wait_for_edge_slot(edge: &LiveTsCache, stream_id: u64, sequence: usize) {
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    if edge
+                        .chunk_cache
+                        .get_for_stream_id(stream_id, sequence)
+                        .await
+                        .is_some_and(|(bytes, hash)| hash != 0 || !bytes.is_empty())
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("edge never received slot {sequence}"));
+        }
+
+        let stream_id = 77;
+        let hole = 5_u64;
+        // The hole is still inside the hold after these commits, so the edge
+        // receives the parts before it and nothing behind it.
+        for sequence in (0..=hole + TEST_GAP_HOLD_PARTS).filter(|sequence| *sequence != hole) {
+            commit_canonical_gap_test_part(&distributor, stream_id, sequence).await;
+        }
+        wait_for_edge_slot(&edge, stream_id, 4).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            edge.chunk_cache
+                .get_for_stream_id(stream_id, 6)
+                .await
+                .is_none(),
+            "parts behind a held hole must not be replicated yet"
+        );
+
+        // The next part releases the hole and replication resumes behind it.
+        let head = hole + TEST_GAP_HOLD_PARTS + 1;
+        commit_canonical_gap_test_part(&distributor, stream_id, head).await;
+        wait_for_edge_slot(&edge, stream_id, head as usize).await;
+        for sequence in (0..=head).filter(|sequence| *sequence != hole) {
+            wait_for_edge_slot(&edge, stream_id, sequence as usize).await;
+            assert_eq!(
+                edge.get_part_for_stream_id(stream_id, sequence)
+                    .await
+                    .unwrap()
+                    .0,
+                Bytes::from(canonical_gap_test_payload(sequence)),
+                "edge copy of part {sequence}"
+            );
+        }
+        assert!(edge
+            .chunk_cache
+            .get_for_stream_id(stream_id, hole as usize)
+            .await
+            .is_none());
+        assert_eq!(
+            canonical_gap_test_watermark(&edge, stream_id).await,
+            Some(head as usize)
+        );
+        distributor_mesh.shutdown();
+        edge_mesh.shutdown();
     }
 
     #[tokio::test]
