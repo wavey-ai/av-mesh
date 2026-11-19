@@ -197,6 +197,9 @@ An edge holds a playlist only while it has readers for it.
 - `--cache-mesh-demand-idle-ms` (default 30,000) after the last request the
   edge releases the playlist. The distributors stop pushing it, and the edge
   frees the parts.
+- An edge holds at most 15 playlists at one time. It does not subscribe to one
+  more, so a request for an unknown stream cannot displace a playlist that
+  has readers.
 - An edge chooses two parents for each playlist with a rendezvous hash of its
   node id, the stream id and the distributor address. Playlists and edges
   spread over the distributors of a region, and a distributor that has been
@@ -232,8 +235,10 @@ Each node declares its limits, and enforces them:
 | `--edge-session-limit` | Playback sessions served at one time. Zero sets no limit. |
 
 A session is admitted against the bit rate of the playlist that it asks for:
-the highest rate that the node has measured for that playlist. The node
-rejects a new session when the sessions already admitted leave less than that.
+the highest rate that the node has measured for that playlist. The rate is
+measured over at least four seconds of parts, so a copy that is still warming
+has no rate yet. The node rejects a new session when the sessions already
+admitted leave less than that.
 This acts on the first request and does not wait for the measured egress to
 rise. Measured egress above the admission share for three seconds also stops
 admission, as before. A rejected request receives HTTP 429 with the other
