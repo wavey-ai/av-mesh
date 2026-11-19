@@ -53,6 +53,8 @@ pub struct CacheCandidate {
     pub load_permille: u32,
     /// Newest part of the playlist that the cache holds, if it holds it.
     pub head_part: Option<u64>,
+    /// Bit rate that the cache can still admit, when it advertises it.
+    pub free_bps: Option<u64>,
 }
 
 impl CacheCandidate {
@@ -92,6 +94,10 @@ pub struct AssignmentRequest<'a> {
     pub pin: Option<&'a str>,
     /// Cache that the reader uses now, for example `_HLS_pathway`.
     pub current: Option<&'a str>,
+    /// Bit rate of the playlist that the reader asks for, when a cache of the
+    /// region has measured it. A new reader is assigned only to a cache that
+    /// has this much room.
+    pub playlist_bps: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -194,8 +200,17 @@ pub fn assign(
     // A cache can keep a reader while it is healthy. It can take a new reader
     // while it also admits sessions.
     let healthy = |cache: &CacheCandidate| cache.fresh && !cache.draining && !stalled(cache);
+    // A cache with some room can still be too full for this playlist: a 4K
+    // reader does not fit where an audio reader does.
+    let has_room = |cache: &CacheCandidate| match (cache.free_bps, request.playlist_bps) {
+        (Some(free), Some(needed)) => free >= needed,
+        _ => true,
+    };
     let admits = |cache: &CacheCandidate| {
-        healthy(cache) && !cache.overloaded && cache.load_permille < FULL_LOAD_PERMILLE
+        healthy(cache)
+            && !cache.overloaded
+            && cache.load_permille < FULL_LOAD_PERMILLE
+            && has_room(cache)
     };
 
     let session = request.session.unwrap_or("");
@@ -321,6 +336,7 @@ mod tests {
             overloaded: false,
             load_permille,
             head_part,
+            free_bps: None,
         }
     }
 
@@ -330,6 +346,7 @@ mod tests {
             session: Some(session),
             pin: None,
             current: None,
+            playlist_bps: None,
         }
     }
 
@@ -550,6 +567,56 @@ mod tests {
         full[1].load_permille = 1_000;
         assert_eq!(
             assign(request("a"), policy, &full).unwrap_err(),
+            AssignmentError::NoCacheAvailable
+        );
+    }
+
+    #[test]
+    fn a_new_reader_goes_only_to_a_cache_with_room_for_its_playlist() {
+        // Each cache admits 85 Mbit/s. Two have 14 Mbit/s left and one has
+        // 24 Mbit/s left. All three still admit sessions.
+        let mut caches = [
+            cache("edge-1", 835, Some(9)),
+            cache("edge-2", 835, Some(9)),
+            cache("edge-3", 718, Some(9)),
+        ];
+        caches[0].free_bps = Some(14_000_000);
+        caches[1].free_bps = Some(14_000_000);
+        caches[2].free_bps = Some(24_000_000);
+        for index in 0..50 {
+            let session = format!("viewer-{index}");
+            // A 16 Mbit/s 4K reader fits only on the third cache.
+            let video = AssignmentRequest {
+                playlist_bps: Some(16_000_000),
+                ..request(&session)
+            };
+            let assignment = assign(video, AssignmentPolicy::default(), &caches).unwrap();
+            assert_eq!(assignment.caches.len(), 1);
+            assert_eq!(assignment.caches[0].node_id, "edge-3");
+            // A 2 Mbit/s audio reader fits on all three.
+            let audio = AssignmentRequest {
+                playlist_bps: Some(2_000_000),
+                ..request(&session)
+            };
+            let assignment = assign(audio, AssignmentPolicy::default(), &caches).unwrap();
+            assert_eq!(assignment.caches.len(), 3);
+        }
+        // A reader that is already on a cache without room keeps it.
+        let sticky = AssignmentRequest {
+            playlist_bps: Some(16_000_000),
+            current: Some("edge-1"),
+            ..request("viewer-0")
+        };
+        let assignment = assign(sticky, AssignmentPolicy::default(), &caches).unwrap();
+        assert_eq!(first(&assignment), ("edge-1", AssignmentReason::Sticky));
+        // No cache has room: the region is full for this playlist.
+        caches[2].free_bps = Some(10_000_000);
+        let video = AssignmentRequest {
+            playlist_bps: Some(16_000_000),
+            ..request("viewer-0")
+        };
+        assert_eq!(
+            assign(video, AssignmentPolicy::default(), &caches).unwrap_err(),
             AssignmentError::NoCacheAvailable
         );
     }

@@ -12744,7 +12744,12 @@ impl AppRouter {
                 Some(PlaylistHolding {
                     stream_id: stream.stream_id,
                     head_part: stream.latest_mesh_part?,
-                    bitrate_bps: stream.bitrate_bps,
+                    // The rate that this cache admits a reader against.
+                    bitrate_bps: self
+                        .edge_load
+                        .egress
+                        .playlist_bps(stream.stream_id)
+                        .or(stream.bitrate_bps),
                     sessions: sessions.get(&stream.stream_id).copied().unwrap_or(0),
                 })
             })
@@ -12952,9 +12957,30 @@ impl AppRouter {
                     overloaded: edge.egress_overloaded,
                     load_permille: edge.load_permille,
                     head_part,
+                    // A node that does not advertise its limit is judged by
+                    // its load alone.
+                    free_bps: (edge.egress_admission_bps > 0).then(|| {
+                        edge.egress_admission_bps
+                            .saturating_sub(edge.egress_observed_bps.max(edge.committed_bps))
+                    }),
                 })
             })
             .collect()
+    }
+
+    /// Bit rate that a reader of the playlist is entitled to: the highest
+    /// rate that a cache of the region advertises for it.
+    async fn regional_playlist_bps(&self, stream_id: u64) -> Option<u64> {
+        let local = self.local_mesh_snapshot().await;
+        let (snapshots, _) = self.telemetry.snapshots_with_local(local).await;
+        snapshots
+            .iter()
+            .filter(|snapshot| snapshot.node.region == self.node.region)
+            .filter_map(|snapshot| snapshot.edge_service.as_ref())
+            .flat_map(|edge| edge.playlists.iter())
+            .filter(|playlist| playlist.stream_id == stream_id)
+            .filter_map(|playlist| playlist.bitrate_bps)
+            .max()
     }
 
     /// Assign a reader. With `remember`, the entry point keeps the assigned
@@ -12966,6 +12992,7 @@ impl AppRouter {
         remember: bool,
     ) -> (Result<Assignment, AssignmentError>, Vec<CacheCandidate>) {
         let candidates = self.cache_candidates(reader.stream_id).await;
+        let playlist_bps = self.regional_playlist_bps(reader.stream_id).await;
         let now_ms = now_unix_ms();
         let key = reader
             .session
@@ -12982,6 +13009,7 @@ impl AppRouter {
                 session: reader.session,
                 pin: reader.pin,
                 current: reader.current.or(remembered.as_deref()),
+                playlist_bps,
             },
             self.assignment_policy,
             &candidates,
@@ -13012,6 +13040,7 @@ impl AppRouter {
     ) -> Vec<String> {
         let mut candidates = self.cache_candidates(reader.stream_id).await;
         candidates.retain(|cache| cache.node_id != self.node.node_id);
+        let playlist_bps = self.regional_playlist_bps(reader.stream_id).await;
         let policy = AssignmentPolicy {
             max_alternates: 7,
             ..self.assignment_policy
@@ -13022,6 +13051,7 @@ impl AppRouter {
                 session: reader.session,
                 pin: None,
                 current: None,
+                playlist_bps,
             },
             policy,
             &candidates,
