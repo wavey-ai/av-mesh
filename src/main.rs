@@ -28658,6 +28658,39 @@ mod tests {
         );
     }
 
+    /// The client decodes a cache slot exactly as the edge does.
+    #[tokio::test]
+    async fn the_client_reads_a_slot_as_the_edge_does() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(250), 4, 32, 64).await;
+        for (stream_id, sequence, init) in [(77_u64, 0_u64, Some(b"ftyp-moov".as_slice())), (77, 1, None)] {
+            cache
+                .commit_stream_payload(
+                    stream_id,
+                    encode_test_canonical_fmp4_bundle_with_duration(
+                        stream_id,
+                        sequence,
+                        init,
+                        format!("moof-mdat-{sequence}").as_bytes(),
+                        Some(250),
+                        true,
+                    ),
+                )
+                .await
+                .unwrap();
+            let (slot, _) = cache
+                .chunk_cache
+                .get_for_stream_id(stream_id, sequence as usize)
+                .await
+                .unwrap();
+            let edge = LiveSlotPayload::decode_for_stream(slot.clone(), stream_id);
+            let (media, client_init) =
+                av_mesh::client_udp::slot_media(&slot, stream_id).expect("the client reads the slot");
+            assert_eq!(media, edge.media());
+            assert_eq!(client_init, edge.init());
+            assert!(av_mesh::client_udp::slot_media(&slot, stream_id + 1).is_none() || !slot.starts_with(b"AVMOBJS1"));
+        }
+    }
+
     /// Cut-through at the smallest parts: a distributor publishes parts at
     /// the rate of 2.5 ms Opus, 1 ms and 0.25 ms PCM and one-frame 4K video;
     /// the cache mesh carries them to an edge, which forwards each part's

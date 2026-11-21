@@ -537,6 +537,27 @@ fn fmp4_slot(payload: &Bytes) -> Option<(Bytes, Option<Bytes>)> {
     Some((payload.slice(init_end..media_end), init))
 }
 
+/// When the contributor published the part of a cache slot, in µs since
+/// the epoch: the `Published` stage timestamp of its media object, if the
+/// slot carries one.
+pub fn slot_published_unix_us(payload: &Bytes) -> Option<u64> {
+    let envelope = if payload.starts_with(b"AVMOBJS1") {
+        payload.get(40..)?
+    } else if payload.starts_with(&media_object::WIRE_MAGIC) {
+        payload.as_ref()
+    } else {
+        return None;
+    };
+    let object = media_object::decode(envelope).ok()?;
+    object
+        .stage_timestamps()
+        .iter()
+        .find(|timestamp| timestamp.stage() == media_object::Stage::Published)
+        .and_then(|timestamp| u64::try_from(timestamp.timestamp().unix_time_ns()).ok())
+        .map(|ns| ns / 1_000)
+        .filter(|us| *us > 0)
+}
+
 /// The object of a cut-through block: the cache-mesh chunk frame of a part.
 fn cut_through_object(frame: &[u8]) -> Option<PartObject> {
     let (stream_id, slot, payload) = playlists::mesh::chunk_frame_payload(frame)?;
@@ -547,7 +568,7 @@ fn cut_through_object(frame: &[u8]) -> Option<PartObject> {
         stream_id,
         part: slot,
         available_unix_us: 0,
-        published_unix_us: 0,
+        published_unix_us: slot_published_unix_us(&payload).unwrap_or(0),
         payload: media,
     })
 }
