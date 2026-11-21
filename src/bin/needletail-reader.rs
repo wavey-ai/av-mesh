@@ -638,6 +638,11 @@ struct Reader {
     rejected_in_a_row: usize,
     /// Shortest playlist round trip so far.
     round_trip: Option<Duration>,
+    /// The pathway priority of the newest steering manifest.
+    priority: Vec<String>,
+    /// Caches that failed lately, and when. A player leaves a pathway that
+    /// failed alone for a while.
+    penalised: HashMap<String, Instant>,
 }
 
 impl Reader {
@@ -770,7 +775,26 @@ impl Reader {
             }
         }
         if self.master.caches.len() > 1 {
-            let next = (self.current + 1) % self.master.caches.len();
+            // The cache that failed is left alone for a while. The next cache
+            // is the first one of the steering manifest that has not failed
+            // lately, as a player chooses it, or else the next of the list.
+            let failed = self.current_name();
+            self.penalised.insert(failed, Instant::now());
+            self.penalised
+                .retain(|_, at| at.elapsed() < Duration::from_secs(30));
+            let steered = self
+                .priority
+                .iter()
+                .filter(|name| !self.penalised.contains_key(*name))
+                .find_map(|name| {
+                    self.master
+                        .caches
+                        .iter()
+                        .position(|cache| &cache.name == name)
+                });
+            let next = steered
+                .filter(|index| *index != self.current)
+                .unwrap_or((self.current + 1) % self.master.caches.len());
             self.record_move(part, next, "failure", detail);
         }
     }
@@ -895,6 +919,12 @@ impl Reader {
             });
             self.report.pathway_clones += 1;
         }
+        self.priority = manifest["PATHWAY-PRIORITY"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|pathway| pathway.as_str().map(str::to_owned))
+            .collect();
         let first = manifest["PATHWAY-PRIORITY"]
             .as_array()
             .and_then(|priority| priority.first())
@@ -1478,6 +1508,8 @@ async fn main() -> Result<()> {
                 playlist_due: now,
                 rejected_in_a_row: 0,
                 round_trip: None,
+                priority: Vec::new(),
+                penalised: HashMap::new(),
                 args,
             };
             reader.run().await
