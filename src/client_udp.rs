@@ -8,36 +8,47 @@
 //! port. The edge sends every part of the stream that its cache holds, the
 //! same bytes that its LL-HLS part responses carry, as one RaptorQ object:
 //! the source symbols of the part and enough repair symbols to recover the
-//! loss that the client asked for.
+//! loss that the client reported.
 //!
 //! The protocol has two kinds of datagram.
 //!
 //! - Control datagrams are one line of ASCII text that starts with `NTU/1`:
 //!
-//!   | from   | text                                              |
-//!   | ------ | ------------------------------------------------- |
-//!   | client | `NTU/1 SUB <stream> <from part or -> <repair ‰> <min repair>` |
-//!   | client | `NTU/1 UNSUB <stream>`                            |
-//!   | edge   | `NTU/1 OK <stream> <first part>`                  |
-//!   | edge   | `NTU/1 REFUSED <stream> <reason>`                 |
-//!   | edge   | `NTU/1 MOVE <stream> <reason>`                    |
+//!   | from   | text                                                          |
+//!   | ------ | ------------------------------------------------------------- |
+//!   | client | `SUB <stream> <from part or -> <repair ‰> <min repair> <loss ppm> <token or ->` |
+//!   | client | `UNSUB <stream> <token>`                                      |
+//!   | edge   | `TOKEN <stream> <token>`                                      |
+//!   | edge   | `OK <stream> <next part>`                                     |
+//!   | edge   | `WAIT <stream> <next part>`                                   |
+//!   | edge   | `REFUSED <stream> <reason>`                                   |
+//!   | edge   | `MOVE <stream> <reason>`                                      |
 //!
-//!   A client repeats `SUB` at least every [`REFRESH`]; a subscription that is
-//!   not refreshed for [`SUBSCRIPTION_TTL`] ends. `MOVE` tells the client to
-//!   go to the next cache of its assignment (the edge drains, or has lost its
-//!   parents); `REFUSED` that this edge cannot take it.
+//!   An edge sends media only to an address that has shown that it receives
+//!   at that address: the first `SUB` of a client is answered with a `TOKEN`,
+//!   shorter than the request, and the client repeats its `SUB` with it. A
+//!   forged source address therefore cannot turn an edge into a reflector.
+//!   A client repeats `SUB` at least every [`REFRESH`], and the edge answers
+//!   each with `OK`; a subscription that is not refreshed for
+//!   [`SUBSCRIPTION_TTL`] ends. While a stream has no new part the edge sends
+//!   `WAIT` at least every [`KEEPALIVE`], so that a client can tell a quiet
+//!   stream from a dead edge. `MOVE` tells the client to go to the next cache
+//!   of its assignment (the edge drains, or has lost its parents); `REFUSED`
+//!   that this edge cannot take it.
 //! - Media datagrams are RaptorQ datagrams of `raptorq-datagram-fec` (they
 //!   start with its magic). Each decodes to one [`PartObject`]: a part, the
 //!   initialisation segment of an fMP4 stream, or the notice that the edge
 //!   skipped a part that it never received (a gap, as LL-HLS has
 //!   `EXT-X-GAP`). The block id is the part number, so a client knows which
-//!   part a lost block was.
+//!   part a lost block was. The object carries a CRC-32 of its payload.
 //!
-//! One client socket carries one stream: block ids are per stream.
+//! One client socket carries one stream: block ids are per stream. A client
+//! that moves to another edge starts a new decoder ([`ObjectReceiver::new_flow`]):
+//! two edges encode one part into different symbols.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use raptorq_datagram_fec::{DatagramFecDecoder, DatagramFecEncoder, DatagramFecHeader};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -46,29 +57,40 @@ pub const CONTROL_PREFIX: &str = "NTU/1 ";
 pub const REFRESH: Duration = Duration::from_secs(2);
 /// A subscription that is not repeated for this long ends.
 pub const SUBSCRIPTION_TTL: Duration = Duration::from_secs(10);
-/// Symbol size of the media datagrams: a datagram stays under 1,280 bytes
-/// with its headers, the smallest IPv6 path MTU.
+/// An edge sends something to every subscriber at least this often.
+pub const KEEPALIVE: Duration = Duration::from_millis(300);
+/// Largest symbol of the media datagrams: a datagram stays under 1,280 bytes
+/// with its headers, the smallest IPv6 path MTU. A small part is sent in
+/// symbols of its own size.
 pub const DEFAULT_SYMBOL_SIZE: u16 = 1_200;
-/// Repair asked for by default: a quarter of the source symbols, and at
-/// least three, so that a 5 ms audio part of one symbol arrives in four
-/// copies and survives 5 % random loss with a probability of 1 - 0.05^4.
+/// Repair asked for before any loss is measured: a quarter of the source
+/// symbols, and at least three.
 pub const DEFAULT_REPAIR_PERMILLE: u32 = 250;
 pub const DEFAULT_MIN_REPAIR_SYMBOLS: u32 = 3;
 /// The most repair an edge sends for one subscriber.
 pub const MAX_REPAIR_PERMILLE: u32 = 1_000;
 pub const MAX_MIN_REPAIR_SYMBOLS: u32 = 16;
-
-const OBJECT_MAGIC: &[u8; 4] = b"NTO1";
-const OBJECT_HEADER_LEN: usize = 4 + 1 + 1 + 4 + 8 + 8 + 8 + 8;
-/// Part loss that the adaptive repair aims below.
+pub const MAX_LOSS_PPM: u32 = 300_000;
+/// Part loss that the repair aims below.
 pub const TARGET_PART_LOSS: f64 = 1e-7;
+/// An edge answers a request without a token only if it is at least this
+/// long: longer than the answer.
+pub const MIN_FIRST_REQUEST_BYTES: usize = 64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+const OBJECT_MAGIC: &[u8; 4] = b"NTO2";
+const OBJECT_HEADER_LEN: usize = 4 + 1 + 1 + 4 + 4 + 8 + 8 + 8 + 8;
+const MIN_SYMBOL_SIZE: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RepairPolicy {
-    /// Repair symbols per thousand source symbols.
+    /// Repair symbols per thousand source symbols, at least.
     pub permille: u32,
-    /// Repair symbols of every part at least.
+    /// Repair symbols of every part, at least.
     pub min_symbols: u32,
+    /// Datagram loss of the client's path in parts per million, as the
+    /// client plans for it. Each part gets the repair that keeps its loss
+    /// below [`TARGET_PART_LOSS`] at this loss.
+    pub loss_ppm: u32,
 }
 
 impl Default for RepairPolicy {
@@ -76,8 +98,40 @@ impl Default for RepairPolicy {
         Self {
             permille: DEFAULT_REPAIR_PERMILLE,
             min_symbols: DEFAULT_MIN_REPAIR_SYMBOLS,
+            loss_ppm: 0,
         }
     }
+}
+
+/// Smallest `r` such that a part of `k` source symbols sent with `r` repair
+/// symbols is lost with a probability below [`TARGET_PART_LOSS`] when each
+/// datagram is lost with probability `p`. A RaptorQ block of more than one
+/// symbol is counted as decoded only with one symbol more than `k`.
+pub fn repair_for_loss(k: u32, p: f64) -> u32 {
+    if !(p > 0.0) {
+        return 0;
+    }
+    let p = p.min(0.5);
+    let margin = u32::from(k > 1);
+    let limit = k.saturating_mul(3).saturating_add(64);
+    let (ln_p, ln_q) = (p.ln(), (1.0 - p).ln());
+    let mut r = margin;
+    while r < limit {
+        let n = k + r;
+        let allowed = r - margin; // datagrams that may be lost
+        // P(lost <= allowed), with the binomial terms in log space.
+        let mut ln_term = f64::from(n) * ln_q;
+        let mut delivered = ln_term.exp();
+        for j in 0..allowed {
+            ln_term += (f64::from(n - j) / f64::from(j + 1)).ln() + ln_p - ln_q;
+            delivered += ln_term.exp();
+        }
+        if 1.0 - delivered <= TARGET_PART_LOSS {
+            return r;
+        }
+        r += 1;
+    }
+    limit
 }
 
 impl RepairPolicy {
@@ -85,47 +139,28 @@ impl RepairPolicy {
         Self {
             permille: self.permille.min(MAX_REPAIR_PERMILLE),
             min_symbols: self.min_symbols.min(MAX_MIN_REPAIR_SYMBOLS),
+            loss_ppm: self.loss_ppm.min(MAX_LOSS_PPM),
         }
     }
 
-    /// The larger of two policies, for a part sent to several subscribers.
-    pub fn max(self, other: Self) -> Self {
-        Self {
-            permille: self.permille.max(other.permille),
-            min_symbols: self.min_symbols.max(other.min_symbols),
-        }
-    }
-
-    /// The repair that keeps the loss of a part below [`TARGET_PART_LOSS`]
-    /// on a path that loses the fraction `loss` of datagrams at random, and
-    /// never less than `base`.
-    ///
-    /// The smallest part, one source symbol, is lost when all its datagrams
-    /// are: `loss^(1 + min_symbols)`. A large part of `k` source symbols
-    /// needs a margin over `k * loss`: three times the loss.
+    /// The policy of a client that has measured `loss` on its path, never
+    /// below `base`. The estimate is taken as half as much again, plus 0.2 %.
     pub fn for_loss(loss: f64, base: Self) -> Self {
         if !(loss > 0.0) {
             return base.bounded();
         }
-        // Measured loss is an estimate: plan for half as much again.
-        let loss = (loss * 1.5 + 0.002).min(0.5);
-        let mut min_symbols = base.min_symbols;
-        while min_symbols < MAX_MIN_REPAIR_SYMBOLS
-            && loss.powi(min_symbols as i32 + 1) > TARGET_PART_LOSS
-        {
-            min_symbols += 1;
-        }
-        let permille = ((loss * 3_000.0).ceil() as u32).max(base.permille);
+        let planned = (loss * 1.5 + 0.002).min(0.3);
         Self {
-            permille,
-            min_symbols,
+            loss_ppm: ((planned * 1e6).ceil() as u32).max(base.loss_ppm),
+            ..base
         }
         .bounded()
     }
 
     pub fn repair_symbols(self, source_symbols: u32) -> u32 {
         let proportional = (u64::from(source_symbols) * u64::from(self.permille)).div_ceil(1_000);
-        (proportional as u32).max(self.min_symbols)
+        let for_loss = repair_for_loss(source_symbols, f64::from(self.loss_ppm) / 1e6);
+        (proportional as u32).max(self.min_symbols).max(for_loss)
     }
 }
 
@@ -135,13 +170,23 @@ pub enum Control {
         stream_id: u64,
         from_part: Option<u64>,
         repair: RepairPolicy,
+        token: Option<u64>,
     },
     Unsubscribe {
         stream_id: u64,
+        token: u64,
+    },
+    Token {
+        stream_id: u64,
+        token: u64,
     },
     Subscribed {
         stream_id: u64,
-        first_part: u64,
+        next_part: u64,
+    },
+    Waiting {
+        stream_id: u64,
+        next_part: u64,
     },
     Refused {
         stream_id: u64,
@@ -154,23 +199,49 @@ pub enum Control {
 }
 
 impl Control {
+    pub fn stream_id(&self) -> u64 {
+        match self {
+            Self::Subscribe { stream_id, .. }
+            | Self::Unsubscribe { stream_id, .. }
+            | Self::Token { stream_id, .. }
+            | Self::Subscribed { stream_id, .. }
+            | Self::Waiting { stream_id, .. }
+            | Self::Refused { stream_id, .. }
+            | Self::Move { stream_id, .. } => *stream_id,
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let text = match self {
             Self::Subscribe {
                 stream_id,
                 from_part,
                 repair,
+                token,
             } => format!(
-                "{CONTROL_PREFIX}SUB {stream_id} {} {} {}",
+                "{CONTROL_PREFIX}SUB {stream_id} {} {} {} {} {}",
                 from_part.map_or_else(|| "-".to_owned(), |part| part.to_string()),
                 repair.permille,
-                repair.min_symbols
+                repair.min_symbols,
+                repair.loss_ppm,
+                // A first request carries padding, so that the edge's answer
+                // (a TOKEN) is never larger than the request.
+                token.map_or_else(|| format!("- {}", ".".repeat(48)), |token| format!("{token:016x}")),
             ),
-            Self::Unsubscribe { stream_id } => format!("{CONTROL_PREFIX}UNSUB {stream_id}"),
+            Self::Unsubscribe { stream_id, token } => {
+                format!("{CONTROL_PREFIX}UNSUB {stream_id} {token:016x}")
+            }
+            Self::Token { stream_id, token } => {
+                format!("{CONTROL_PREFIX}TOKEN {stream_id} {token:016x}")
+            }
             Self::Subscribed {
                 stream_id,
-                first_part,
-            } => format!("{CONTROL_PREFIX}OK {stream_id} {first_part}"),
+                next_part,
+            } => format!("{CONTROL_PREFIX}OK {stream_id} {next_part}"),
+            Self::Waiting {
+                stream_id,
+                next_part,
+            } => format!("{CONTROL_PREFIX}WAIT {stream_id} {next_part}"),
             Self::Refused { stream_id, reason } => {
                 format!("{CONTROL_PREFIX}REFUSED {stream_id} {}", word(reason))
             }
@@ -188,6 +259,7 @@ impl Control {
         let mut words = rest.split_ascii_whitespace();
         let verb = words.next()?;
         let stream_id = words.next()?.parse().ok()?;
+        let token = |word: &str| u64::from_str_radix(word, 16).ok();
         let control = match verb {
             "SUB" => {
                 let from_part = match words.next()? {
@@ -196,19 +268,43 @@ impl Control {
                 };
                 let permille = words.next()?.parse().ok()?;
                 let min_symbols = words.next()?.parse().ok()?;
+                let loss_ppm = words.next()?.parse().ok()?;
+                let token = match words.next()? {
+                    "-" => {
+                        // The padding of a first request.
+                        if words.clone().next().is_some_and(|pad| pad.bytes().all(|b| b == b'.')) {
+                            words.next();
+                        }
+                        None
+                    }
+                    word => Some(token(word)?),
+                };
                 Self::Subscribe {
                     stream_id,
                     from_part,
                     repair: RepairPolicy {
                         permille,
                         min_symbols,
+                        loss_ppm,
                     },
+                    token,
                 }
             }
-            "UNSUB" => Self::Unsubscribe { stream_id },
+            "UNSUB" => Self::Unsubscribe {
+                stream_id,
+                token: token(words.next()?)?,
+            },
+            "TOKEN" => Self::Token {
+                stream_id,
+                token: token(words.next()?)?,
+            },
             "OK" => Self::Subscribed {
                 stream_id,
-                first_part: words.next()?.parse().ok()?,
+                next_part: words.next()?.parse().ok()?,
+            },
+            "WAIT" => Self::Waiting {
+                stream_id,
+                next_part: words.next()?.parse().ok()?,
             },
             "REFUSED" => Self::Refused {
                 stream_id,
@@ -270,13 +366,13 @@ impl ObjectKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartObject {
     pub kind: ObjectKind,
+    /// Datagrams that the edge sent for this object: source and repair. A
+    /// client measures its loss from it. Set by [`encode_object`].
+    pub datagrams: u32,
     pub stream_id: u64,
     /// The part number, as in the playlist (`part<n>`). For an init object,
     /// the part that it was sent before.
     pub part: u64,
-    /// Datagrams that the edge sent for this object: source and repair. A
-    /// client measures its loss from it. Set by [`encode_object`].
-    pub datagrams: u32,
     /// When the part became available at the edge, in µs since the epoch,
     /// or 0.
     pub available_unix_us: u64,
@@ -304,6 +400,7 @@ impl PartObject {
         out.put_u8(self.kind.code());
         out.put_u8(0);
         out.put_u32(self.datagrams);
+        out.put_u32(crc32fast::hash(&self.payload));
         out.put_u64(self.stream_id);
         out.put_u64(self.part);
         out.put_u64(self.available_unix_us);
@@ -320,10 +417,15 @@ impl PartObject {
         let kind = ObjectKind::from_code(header.get_u8()).ok_or(ObjectError("unknown kind"))?;
         let _flags = header.get_u8();
         let datagrams = header.get_u32();
+        let crc = header.get_u32();
         let stream_id = header.get_u64();
         let part = header.get_u64();
         let available_unix_us = header.get_u64();
         let published_unix_us = header.get_u64();
+        let payload = object.slice(OBJECT_HEADER_LEN..);
+        if crc32fast::hash(&payload) != crc {
+            return Err(ObjectError("payload checksum mismatch"));
+        }
         Ok(Self {
             kind,
             datagrams,
@@ -331,14 +433,14 @@ impl PartObject {
             part,
             available_unix_us,
             published_unix_us,
-            payload: object.slice(OBJECT_HEADER_LEN..),
+            payload,
         })
     }
 }
 
-/// Block id of a part: its number, modulo 2^32, with the init objects in a
-/// separate half of the space so that an init never shares a block id with
-/// a part that is still in flight.
+/// Block id of a part: its number, modulo 2^31, with the init objects in the
+/// upper half of the space, so that an init never shares a block id with a
+/// part that is in flight.
 pub fn block_id(kind: ObjectKind, part: u64) -> u32 {
     let low = (part & 0x7fff_ffff) as u32;
     match kind {
@@ -347,25 +449,33 @@ pub fn block_id(kind: ObjectKind, part: u64) -> u32 {
     }
 }
 
+/// Source symbols and symbol size of an object of `length` bytes: as few
+/// symbols as `max_symbol_size` allows, each just large enough. A 5 ms audio
+/// part of 120 bytes is one symbol of 120 bytes, not of 1,200.
+pub fn geometry(length: usize, max_symbol_size: u16) -> (u32, u16) {
+    let max = usize::from(max_symbol_size).max(MIN_SYMBOL_SIZE);
+    let sources = length.div_ceil(max).max(1);
+    let size = length.div_ceil(sources).max(MIN_SYMBOL_SIZE);
+    (sources as u32, size as u16)
+}
+
 /// Encode one object into the datagrams that carry it.
 pub fn encode_object(
     object: &PartObject,
-    symbol_size: u16,
+    max_symbol_size: u16,
     repair: RepairPolicy,
 ) -> Result<Vec<Vec<u8>>, raptorq_datagram_fec::DatagramFecError> {
-    let symbol_size = symbol_size.max(16);
     let length = OBJECT_HEADER_LEN + object.payload.len();
-    let source_symbols = length.div_ceil(usize::from(symbol_size)).max(1);
-    let repair_symbols = repair.repair_symbols(source_symbols as u32);
+    let (sources, symbol_size) = geometry(length, max_symbol_size);
+    let repair_symbols = repair.repair_symbols(sources);
     let bytes = PartObject {
-        datagrams: (source_symbols as u32).saturating_add(repair_symbols),
+        datagrams: sources.saturating_add(repair_symbols),
         ..object.clone()
     }
     .encode();
-    let source_symbols_u16 = u16::try_from(source_symbols).unwrap_or(u16::MAX);
     let mut encoder = DatagramFecEncoder::new()
         .with_symbol_size(symbol_size)
-        .with_source_symbols(source_symbols_u16)
+        .with_source_symbols(u16::try_from(sources).unwrap_or(u16::MAX))
         .with_initial_block_id(block_id(object.kind, object.part));
     encoder.encode_object_with_repair_symbols(&bytes, repair_symbols)
 }
@@ -374,6 +484,7 @@ pub fn encode_object(
 #[derive(Debug, Clone, Copy)]
 struct BlockCount {
     received: u32,
+    source_symbols: u32,
     /// Known once the block is decoded.
     sent: Option<u32>,
     first_seen: Instant,
@@ -384,6 +495,10 @@ struct BlockCount {
 pub struct ObjectReceiver {
     decoder: DatagramFecDecoder,
     blocks: HashMap<u32, BlockCount>,
+    /// Blocks counted already, so that a late datagram does not count one
+    /// again.
+    settled: HashSet<u32>,
+    settled_order: VecDeque<u32>,
     window_received: u64,
     window_sent: u64,
     pub datagrams: u64,
@@ -396,15 +511,30 @@ pub struct ObjectReceiver {
     pub errors: u64,
     pub lost_datagrams: u64,
     pub sent_datagrams: u64,
+    pub flows: u64,
 }
 
 /// A block is counted for loss once its datagrams have had this long to
 /// arrive.
 const LOSS_SETTLE: Duration = Duration::from_millis(500);
+const SETTLED_MEMORY: usize = 8_192;
 
 impl ObjectReceiver {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            flows: 1,
+            ..Self::default()
+        }
+    }
+
+    /// Start receiving from another edge: its symbols of a part differ from
+    /// those of the last edge, and must not meet them in one decoder.
+    pub fn new_flow(&mut self) {
+        self.decoder = DatagramFecDecoder::new();
+        self.blocks.clear();
+        self.settled.clear();
+        self.settled_order.clear();
+        self.flows += 1;
     }
 
     /// Push one media datagram. Returns the object that it completed.
@@ -423,13 +553,16 @@ impl ObjectReceiver {
         } else {
             self.repair_datagrams += 1;
         }
-        let count = self.blocks.entry(header.block_id).or_insert(BlockCount {
-            received: 0,
-            sent: None,
-            first_seen: Instant::now(),
-        });
-        count.received += 1;
-        let seen = count.received;
+        if !self.settled.contains(&header.block_id) {
+            let count = self.blocks.entry(header.block_id).or_insert(BlockCount {
+                received: 0,
+                source_symbols: u32::from(header.source_symbols),
+                sent: None,
+                first_seen: Instant::now(),
+            });
+            count.received += 1;
+        }
+        let seen = self.blocks.get(&header.block_id).map_or(0, |count| count.received);
         match self.decoder.push_datagram(datagram) {
             Ok(Some(bytes)) => match PartObject::decode(Bytes::from(bytes)) {
                 Ok(object) => {
@@ -458,26 +591,36 @@ impl ObjectReceiver {
     }
 
     /// Count the blocks that have settled, and return the datagram loss
-    /// measured since the last call, if any datagram was due.
-    pub fn take_loss(&mut self) -> Option<f64> {
+    /// measured since the last call, if any datagram was due. A block that
+    /// was never decoded is counted as sent with the repair of `policy`.
+    pub fn take_loss(&mut self, policy: RepairPolicy) -> Option<f64> {
         let now = Instant::now();
-        let mut settled = Vec::new();
-        for (block, count) in &self.blocks {
-            if now.duration_since(count.first_seen) >= LOSS_SETTLE {
-                settled.push(*block);
-            }
-        }
+        let settled: Vec<u32> = self
+            .blocks
+            .iter()
+            .filter(|(_, count)| now.duration_since(count.first_seen) >= LOSS_SETTLE)
+            .map(|(block, _)| *block)
+            .collect();
         for block in settled {
             let count = self.blocks.remove(&block).unwrap();
-            match count.sent {
-                Some(sent) => {
-                    let received = count.received.min(sent);
-                    self.window_received += u64::from(received);
-                    self.window_sent += u64::from(sent);
-                    self.sent_datagrams += u64::from(sent);
-                    self.lost_datagrams += u64::from(sent - received);
+            let sent = match count.sent {
+                Some(sent) => sent,
+                None => {
+                    self.lost_objects += 1;
+                    count.source_symbols + policy.repair_symbols(count.source_symbols)
                 }
-                None => self.lost_objects += 1,
+            };
+            let received = count.received.min(sent);
+            self.window_received += u64::from(received);
+            self.window_sent += u64::from(sent);
+            self.sent_datagrams += u64::from(sent);
+            self.lost_datagrams += u64::from(sent - received);
+            self.settled.insert(block);
+            self.settled_order.push_back(block);
+            if self.settled_order.len() > SETTLED_MEMORY {
+                if let Some(old) = self.settled_order.pop_front() {
+                    self.settled.remove(&old);
+                }
             }
         }
         if self.window_sent == 0 {
@@ -515,6 +658,7 @@ mod tests {
                 stream_id: 3001,
                 from_part: Some(42),
                 repair: RepairPolicy::default(),
+                token: Some(0xdead_beef_0123_4567),
             },
             Control::Subscribe {
                 stream_id: 1,
@@ -522,12 +666,25 @@ mod tests {
                 repair: RepairPolicy {
                     permille: 500,
                     min_symbols: 4,
+                    loss_ppm: 52_000,
                 },
+                token: None,
             },
-            Control::Unsubscribe { stream_id: 9 },
+            Control::Unsubscribe {
+                stream_id: 9,
+                token: 7,
+            },
+            Control::Token {
+                stream_id: 9,
+                token: u64::MAX,
+            },
             Control::Subscribed {
                 stream_id: 9,
-                first_part: 77,
+                next_part: 77,
+            },
+            Control::Waiting {
+                stream_id: 9,
+                next_part: 78,
             },
             Control::Refused {
                 stream_id: 9,
@@ -542,25 +699,66 @@ mod tests {
         }
         assert_eq!(Control::decode(b"WAVEY-DAW-SUBSCRIBE/2 5"), None);
         assert_eq!(Control::decode(b"NTU/1 SUB 5 - 1"), None);
-        assert_eq!(Control::decode(b"NTU/1 SUB 5 - 1 2 3"), None);
+        assert_eq!(Control::decode(b"NTU/1 SUB 5 - 1 2 3 - x"), None);
     }
 
     #[test]
-    fn a_one_symbol_part_gets_the_minimum_repair_and_a_large_one_its_share() {
-        let policy = RepairPolicy::default();
-        assert_eq!(policy.repair_symbols(1), 3);
-        assert_eq!(policy.repair_symbols(340), 85);
-        assert_eq!(
-            RepairPolicy {
-                permille: 2_000,
-                min_symbols: 99
+    fn a_token_answer_is_shorter_than_the_request() {
+        let request = Control::Subscribe {
+            stream_id: 1,
+            from_part: None,
+            repair: RepairPolicy::default(),
+            token: None,
+        };
+        let answer = Control::Token {
+            stream_id: 1,
+            token: u64::MAX,
+        };
+        assert!(answer.encode().len() <= request.encode().len());
+        assert!(answer.encode().len() <= MIN_FIRST_REQUEST_BYTES);
+        assert!(request.encode().len() >= MIN_FIRST_REQUEST_BYTES);
+    }
+
+    /// The probability that a part of `k` symbols with `r` repair symbols is
+    /// lost at loss `p`, with the decode margin of `repair_for_loss`.
+    fn part_loss(k: u32, r: u32, p: f64) -> f64 {
+        let n = k + r;
+        let margin = u32::from(k > 1);
+        let mut delivered = 0.0;
+        for lost in 0..=(r.saturating_sub(margin)) {
+            let mut c = 1.0_f64;
+            for i in 0..lost {
+                c *= f64::from(n - i) / f64::from(i + 1);
             }
-            .bounded(),
-            RepairPolicy {
-                permille: MAX_REPAIR_PERMILLE,
-                min_symbols: MAX_MIN_REPAIR_SYMBOLS
+            delivered += c * p.powi(lost as i32) * (1.0 - p).powi((n - lost) as i32);
+        }
+        1.0 - delivered
+    }
+
+    #[test]
+    fn repair_keeps_every_part_size_below_the_target() {
+        for p in [0.001, 0.01, 0.05, 0.1] {
+            for k in [1_u32, 2, 3, 10, 30, 60, 340] {
+                let r = repair_for_loss(k, p);
+                assert!(part_loss(k, r, p) <= TARGET_PART_LOSS * 1.01, "k {k} p {p} r {r}");
+                if r > u32::from(k > 1) {
+                    assert!(part_loss(k, r - 1, p) > TARGET_PART_LOSS, "k {k} p {p}: {r} is not least");
+                }
             }
-        );
+        }
+        // The planned loss of a 5 % path covers a part of 30 symbols, which
+        // the earlier proportional rule did not.
+        let policy = RepairPolicy::for_loss(0.05, RepairPolicy::default());
+        assert!(part_loss(30, policy.repair_symbols(30), 0.05) <= TARGET_PART_LOSS);
+        assert_eq!(RepairPolicy::for_loss(0.0, RepairPolicy::default()), RepairPolicy::default());
+    }
+
+    #[test]
+    fn a_small_part_is_sent_in_a_symbol_of_its_own_size() {
+        assert_eq!(geometry(120, 1_200), (1, 120));
+        assert_eq!(geometry(1_500, 1_200), (2, 750));
+        assert_eq!(geometry(400_000, 1_200), (334, 1_198));
+        assert_eq!(geometry(3, 1_200), (1, 16));
     }
 
     fn object(part: u64, len: usize) -> PartObject {
@@ -571,26 +769,34 @@ mod tests {
             part,
             available_unix_us: 7,
             published_unix_us: 5,
-            payload: Bytes::from((0..len).map(|i| (i * 31 + part as usize) as u8).collect::<Vec<_>>()),
+            payload: Bytes::from(
+                (0..len)
+                    .map(|i| (i * 31 + part as usize) as u8)
+                    .collect::<Vec<_>>(),
+            ),
         }
     }
 
     #[test]
     fn a_part_is_recovered_bit_for_bit_with_any_loss_within_its_repair() {
-        // A 4K video part of 400 kB and a 5 ms audio part of 80 bytes.
-        for (part, len) in [(10_u64, 400_000_usize), (11, 80)] {
+        // A 4K video part of 400 kB, and 5 ms audio parts of 80 and 1,440
+        // bytes.
+        for (part, len) in [(10_u64, 400_000_usize), (11, 80), (12, 1_440)] {
             let original = object(part, len);
             let datagrams =
                 encode_object(&original, DEFAULT_SYMBOL_SIZE, RepairPolicy::default()).unwrap();
-            let source = len.div_ceil(DEFAULT_SYMBOL_SIZE as usize).max(1);
-            let repair = datagrams.len() - source;
-            assert_eq!(repair as u32, RepairPolicy::default().repair_symbols(source as u32));
-            // Drop as many datagrams as there are repair symbols, spread over
-            // the source symbols.
+            let (sources, _) = geometry(OBJECT_HEADER_LEN + len, DEFAULT_SYMBOL_SIZE);
+            let repair = datagrams.len() - sources as usize;
+            assert_eq!(repair as u32, RepairPolicy::default().repair_symbols(sources));
+            // Lose one datagram fewer than there are repair symbols (a block
+            // of more than one symbol is decoded with one to spare), spread
+            // over the source symbols.
+            let lose = repair - usize::from(sources > 1);
+            let stride = (datagrams.len() / lose.max(1)).max(1);
             let mut receiver = ObjectReceiver::new();
             let mut decoded = None;
             for (index, datagram) in datagrams.iter().enumerate() {
-                if index % (datagrams.len() / repair).max(1) == 0 && index / (datagrams.len() / repair).max(1) < repair {
+                if index % stride == 0 && index / stride < lose {
                     continue;
                 }
                 if let Some(object) = receiver.push(datagram) {
@@ -600,22 +806,42 @@ mod tests {
             let decoded = decoded.expect("object decoded");
             assert_eq!(decoded.datagrams as usize, datagrams.len());
             assert_eq!(PartObject { datagrams: 0, ..decoded }, original);
-            assert_eq!(receiver.recovered_objects, 1);
         }
     }
 
     #[test]
-    fn repair_grows_with_the_measured_loss() {
-        let base = RepairPolicy::default();
-        assert_eq!(RepairPolicy::for_loss(0.0, base), base);
-        let one = RepairPolicy::for_loss(0.01, base);
-        let five = RepairPolicy::for_loss(0.05, base);
-        assert!(one.min_symbols >= base.min_symbols);
-        assert!(five.min_symbols > one.min_symbols);
-        // A one-symbol part on a 5 % path is lost with a probability below
-        // the target, with the estimate taken at face value.
-        assert!(0.05_f64.powi(five.min_symbols as i32 + 1) <= TARGET_PART_LOSS);
-        assert!(five.permille >= 150);
+    fn symbols_of_one_part_from_two_edges_never_make_a_wrong_object() {
+        // Two edges stamp different availability times, so their symbols of
+        // one part differ. A decoder fed both either decodes one of them or
+        // rejects the result by its checksum; it never yields other bytes.
+        let mut a = object(20, 6_000);
+        a.available_unix_us = 1;
+        let mut b = a.clone();
+        b.available_unix_us = 2;
+        let policy = RepairPolicy::default();
+        let from_a = encode_object(&a, DEFAULT_SYMBOL_SIZE, policy).unwrap();
+        let from_b = encode_object(&b, DEFAULT_SYMBOL_SIZE, policy).unwrap();
+        let mut receiver = ObjectReceiver::new();
+        let mut decoded = None;
+        for (index, datagram) in from_a.iter().take(3).chain(from_b.iter().skip(3)).enumerate() {
+            let _ = index;
+            if let Some(object) = receiver.push(datagram) {
+                decoded = Some(object);
+            }
+        }
+        if let Some(decoded) = decoded {
+            assert_eq!(decoded.payload, a.payload);
+        }
+        // The client starts a new flow when it moves, and then decodes the
+        // second edge's part.
+        let mut receiver = ObjectReceiver::new();
+        for datagram in from_a.iter().take(3) {
+            receiver.push(datagram);
+        }
+        receiver.new_flow();
+        let decoded = from_b.iter().find_map(|datagram| receiver.push(datagram)).unwrap();
+        assert_eq!(decoded.payload, b.payload);
+        assert_eq!(decoded.available_unix_us, 2);
     }
 
     #[test]
@@ -634,9 +860,16 @@ mod tests {
             }
         }
         std::thread::sleep(LOSS_SETTLE);
-        let loss = receiver.take_loss().unwrap();
+        let loss = receiver.take_loss(RepairPolicy::default()).unwrap();
         assert!((0.08..0.12).contains(&loss), "{loss}");
         assert_eq!(receiver.objects, 200);
+        // A late datagram of a counted block is not counted again.
+        let late = encode_object(&object(0, 3_000), DEFAULT_SYMBOL_SIZE, RepairPolicy::default())
+            .unwrap();
+        receiver.push(&late[0]);
+        std::thread::sleep(LOSS_SETTLE);
+        assert_eq!(receiver.take_loss(RepairPolicy::default()), None);
+        assert_eq!(receiver.lost_objects, 0);
     }
 
     #[test]

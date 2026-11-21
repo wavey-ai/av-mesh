@@ -28146,16 +28146,41 @@ mod tests {
         ));
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let subscribe = Control::Subscribe {
+        let subscribe = |token| Control::Subscribe {
             stream_id: 77,
             from_part: Some(0),
             repair: RepairPolicy {
                 permille: 500,
                 min_symbols: 4,
+                loss_ppm: 0,
             },
+            token,
         };
-        client.send_to(&subscribe.encode(), edge).await.unwrap();
         let mut buf = vec![0_u8; 65_536];
+        // A first request gets a token and nothing else: an address that
+        // does not receive cannot be sent media.
+        client.send_to(&subscribe(None).encode(), edge).await.unwrap();
+        let (len, _) = timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let token = match Control::decode(&buf[..len]) {
+            Some(Control::Token { token, .. }) => token,
+            other => panic!("expected a token, got {other:?}"),
+        };
+        assert!(len <= subscribe(None).encode().len());
+        assert!(
+            timeout(Duration::from_millis(300), client.recv_from(&mut buf)).await.is_err(),
+            "nothing follows a token"
+        );
+        // A wrong token gets another token, not media.
+        client
+            .send_to(&subscribe(Some(token ^ 1)).encode(), edge)
+            .await
+            .unwrap();
+        let (len, _) = client.recv_from(&mut buf).await.unwrap();
+        assert!(matches!(Control::decode(&buf[..len]), Some(Control::Token { .. })));
+        client.send_to(&subscribe(Some(token)).encode(), edge).await.unwrap();
         let mut receiver = ObjectReceiver::new();
         let mut parts = BTreeMap::new();
         let mut init = None;
@@ -28168,7 +28193,9 @@ mod tests {
                 .unwrap();
             assert_eq!(peer, edge);
             if let Some(control) = Control::decode(&buf[..len]) {
-                subscribed = Some(control);
+                if matches!(control, Control::Subscribed { .. }) {
+                    subscribed = Some(control);
+                }
                 continue;
             }
             index += 1;
@@ -28189,7 +28216,7 @@ mod tests {
             subscribed,
             Some(Control::Subscribed {
                 stream_id: 77,
-                first_part: 0
+                next_part: 0
             })
         );
         assert!(receiver.recovered_objects > 0);

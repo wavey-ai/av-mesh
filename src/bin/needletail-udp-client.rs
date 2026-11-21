@@ -336,6 +336,8 @@ struct Report {
     final_repair_permille: u32,
     final_min_repair: u32,
     repair_changes: u64,
+    final_loss_ppm: u32,
+    flows: u64,
     payload_bytes: u64,
     verify: Option<VerifyReport>,
     publish_to_arrival_ms: Percentiles,
@@ -366,14 +368,16 @@ async fn subscribe(
     args: &Args,
     from_part: Option<u64>,
     repair: RepairPolicy,
-) -> Result<()> {
+    token: Option<u64>,
+) {
     let control = Control::Subscribe {
         stream_id: args.stream,
         from_part,
         repair,
+        token,
     };
-    socket.send_to(&control.encode(), target).await?;
-    Ok(())
+    // A failed send is a lost request: the next refresh repeats it.
+    let _ = socket.send_to(&control.encode(), target).await;
 }
 
 fn set_receive_buffer(socket: &UdpSocket, bytes: usize) {
@@ -481,7 +485,10 @@ async fn main() -> Result<()> {
     let base_repair = RepairPolicy {
         permille: args.repair_permille,
         min_symbols: args.min_repair,
+        loss_ppm: 0,
     };
+    // The edge left last, with the token that it gave, for an UNSUB.
+    let mut leaving: Option<(SocketAddr, u64)> = None;
     let mut repair = base_repair;
     let mut loss_estimate: Option<f64> = None;
     let mut loss_samples: Vec<f64> = Vec::new();
@@ -521,19 +528,40 @@ async fn main() -> Result<()> {
             Ok((status, _)) => {
                 eprintln!("{}: playlist answered {status}", cache.node_id);
                 skip.insert(cache.node_id.clone());
+                tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
             Err(error) => {
                 eprintln!("{}: playlist failed: {error:#}", cache.node_id);
                 skip.insert(cache.node_id.clone());
+                tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
         };
         let (host, _) = cache.base.host_port();
-        let target: SocketAddr = tokio::net::lookup_host((host.as_str(), port))
-            .await?
-            .next()
-            .ok_or_else(|| anyhow!("no address for {host}"))?;
+        let target: SocketAddr = match tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .ok()
+            .and_then(|mut addresses| addresses.next())
+        {
+            Some(target) => target,
+            None => {
+                eprintln!("{}: no address for {host}", cache.node_id);
+                skip.insert(cache.node_id.clone());
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        // Leave the last edge, so that it stops sending at once, and decode
+        // the new edge's symbols apart from the old edge's.
+        if let Some((old, token)) = leaving.take() {
+            let _ = socket
+                .send_to(&Control::Unsubscribe { stream_id: args.stream, token }.encode(), old)
+                .await;
+        }
+        if current.is_some() {
+            receiver.new_flow();
+        }
         if let Some(previous) = &current {
             if previous != &cache.node_id {
                 moves.push(MoveRecord {
@@ -547,7 +575,8 @@ async fn main() -> Result<()> {
         }
         current = Some(cache.node_id.clone());
         caches_used.push(cache.node_id.clone());
-        subscribe(&socket, target, &args, next_part, repair).await?;
+        let mut token: Option<u64> = None;
+        subscribe(&socket, target, &args, next_part, repair, token).await;
         let asked_at = Instant::now();
         let mut last_datagram = Instant::now();
         // Until the cache answers, the request is repeated often.
@@ -558,11 +587,14 @@ async fn main() -> Result<()> {
         loop {
             let now = Instant::now();
             if now >= deadline {
-                let _ = socket
-                    .send_to(&Control::Unsubscribe { stream_id: args.stream }.encode(), target)
-                    .await;
+                if let Some(token) = token {
+                    let _ = socket
+                        .send_to(&Control::Unsubscribe { stream_id: args.stream, token }.encode(), target)
+                        .await;
+                }
                 break 'caches;
             }
+            leaving = token.map(|token| (target, token));
             if !subscribed && now.duration_since(asked_at) > Duration::from_millis(args.answer_ms) {
                 move_reason = format!("no-answer-{}ms", args.answer_ms);
                 skip.insert(cache.node_id.clone());
@@ -575,7 +607,7 @@ async fn main() -> Result<()> {
             }
             if now >= next_loss_check {
                 next_loss_check = now + Duration::from_millis(500);
-                if let Some(loss) = receiver.take_loss() {
+                if let Some(loss) = receiver.take_loss(repair) {
                     loss_samples.push(loss);
                     // Rise at once, fall slowly.
                     let estimate = match loss_estimate {
@@ -595,8 +627,8 @@ async fn main() -> Result<()> {
             }
             if now >= next_refresh {
                 // Before the edge answers, keep asking from the same part.
-                subscribe(&socket, target, &args, if subscribed { None } else { next_part }, repair)
-                    .await?;
+                subscribe(&socket, target, &args, if subscribed { None } else { next_part }, repair, token)
+                    .await;
                 next_refresh = now
                     + if subscribed {
                         REFRESH
@@ -625,10 +657,18 @@ async fn main() -> Result<()> {
             last_datagram = Instant::now();
             if let Some(control) = Control::decode(&buf[..len]) {
                 match control {
-                    Control::Subscribed { first_part, .. } => {
+                    Control::Token { token: given, .. } => {
+                        if token != Some(given) {
+                            token = Some(given);
+                            subscribe(&socket, target, &args, next_part, repair, token).await;
+                        }
+                    }
+                    Control::Subscribed { next_part: first, .. } => {
+                        if !subscribed {
+                            first_subscribed_part.get_or_insert(first);
+                        }
                         subscribed = true;
                         next_refresh = Instant::now() + REFRESH;
-                        first_subscribed_part.get_or_insert(first_part);
                     }
                     Control::Move { reason, .. } | Control::Refused { reason, .. } => {
                         move_reason = reason;
@@ -686,7 +726,7 @@ async fn main() -> Result<()> {
         }
     }
     tokio::time::sleep(Duration::from_millis(600)).await;
-    let _ = receiver.take_loss();
+    let _ = receiver.take_loss(repair);
     drop(verify_tx);
     let verify = verifier.await.ok();
 
@@ -697,7 +737,14 @@ async fn main() -> Result<()> {
         }
     }
 
-    let first = received.keys().chain(gaps.iter()).min().copied();
+    // Missing parts are counted from the part that the first edge said it
+    // would send first.
+    let first = received
+        .keys()
+        .chain(gaps.iter())
+        .chain(first_subscribed_part.iter())
+        .min()
+        .copied();
     let last = received.keys().chain(gaps.iter()).max().copied();
     let expected = match (first, last) {
         (Some(first), Some(last)) => last - first + 1,
@@ -738,6 +785,8 @@ async fn main() -> Result<()> {
         final_repair_permille: repair.permille,
         final_min_repair: repair.min_symbols,
         repair_changes,
+        final_loss_ppm: repair.loss_ppm,
+        flows: receiver.flows,
         payload_bytes,
         verify: if args.verify_http { verify } else { None },
         publish_to_arrival_ms: percentiles(publish_ms),
