@@ -28658,6 +28658,216 @@ mod tests {
         );
     }
 
+    /// Cut-through at the smallest parts: a distributor publishes parts at
+    /// the rate of 2.5 ms Opus, 1 ms and 0.25 ms PCM and one-frame 4K video;
+    /// the cache mesh carries them to an edge, which forwards each part's
+    /// symbols to a UDP client as they arrive. Every part arrives, identical to
+    /// the edge's LL-HLS part, and through the cut-through path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn small_parts_reach_a_udp_client_cut_through_at_their_rate() {
+        use av_mesh::client_udp::{Control, ObjectKind as UdpObjectKind, ObjectReceiver, RepairPolicy};
+        use playlists::mesh::{CacheMesh, CacheMeshConfig, CacheMeshRole as MeshRole};
+        use tokio::time::timeout;
+
+        // name, stream, part interval, media bytes, parts
+        let cases: [(&str, u64, u64, usize, u64); 4] = [
+            ("opus-2.5ms", 3001, 2_500, 60, 400),
+            ("pcm-1ms", 4001, 1_000, 288, 1_000),
+            ("pcm-0.25ms", 4002, 250, 72, 2_000),
+            ("4k-one-frame", 1, 41_667, 70_000, 48),
+        ];
+        let mut summary = Vec::new();
+        for (name, stream_id, interval_us, media_bytes, parts) in cases {
+            let parent_cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 8_000, 512).await;
+            let edge_cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 8_000, 512).await;
+            let parent_addr = unused_loopback_addr();
+            let edge_addr = unused_loopback_addr();
+            let parent_mesh = CacheMesh::new(
+                Arc::clone(&parent_cache.chunk_cache),
+                CacheMeshConfig::new("dist-a", "uk", parent_addr)
+                    .with_peer(edge_addr)
+                    .with_role(MeshRole::Distributor)
+                    .with_announce_interval(Duration::from_millis(40)),
+            )
+            .start()
+            .await
+            .unwrap();
+            let cut = Arc::new(edge_udp::CutThrough::default());
+            let (applied_tx, mut applied_rx) = mpsc::unbounded_channel();
+            let edge_mesh = Arc::new(
+                CacheMesh::new(
+                    Arc::clone(&edge_cache.chunk_cache),
+                    CacheMeshConfig::new("edge-1", "uk", edge_addr)
+                        .with_peer(parent_addr)
+                        .with_role(MeshRole::Edge)
+                        .with_announce_interval(Duration::from_millis(40))
+                        .with_applied_tx(applied_tx)
+                        .with_receive_observer(Arc::clone(&cut) as _),
+                )
+                .start()
+                .await
+                .unwrap(),
+            );
+            let media = |part: u64| -> Vec<u8> {
+                (0..media_bytes).map(|i| (i as u64 * 31 + part * 7) as u8).collect()
+            };
+            let commit = |part: u64| {
+                let cache = Arc::clone(&parent_cache);
+                let body = media(part);
+                async move {
+                    cache
+                        .commit_stream_payload(
+                            stream_id,
+                            encode_test_canonical_fmp4_bundle_with_duration(
+                                stream_id,
+                                part,
+                                (part == 0).then_some(b"ftyp-moov".as_slice()),
+                                &body,
+                                Some(5),
+                                true,
+                            ),
+                        )
+                        .await
+                        .unwrap();
+                }
+            };
+            commit(0).await;
+            let router = app_router_for_tests(Arc::clone(&edge_cache), Arc::clone(&edge_mesh));
+            timeout(Duration::from_secs(5), async {
+                while edge_cache.stream_position_for_id(stream_id).await.is_none() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the edge receives the stream over the cache mesh");
+
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let edge = socket.local_addr().unwrap();
+            let stats: Arc<edge_udp::EdgeUdpStats> = Arc::default();
+            let (shutdown_tx, shutdown_rx) = watch::channel(());
+            let task = tokio::spawn(edge_udp::run_edge_udp(
+                socket,
+                router.clone(),
+                edge_udp::EdgeUdpConfig {
+                    symbol_size: 1_200,
+                    max_subscribers: 16,
+                },
+                Arc::clone(&stats),
+                Some(Arc::clone(&cut)),
+                shutdown_rx,
+            ));
+            let client = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let subscribe = |token| {
+                Control::Subscribe {
+                    stream_id,
+                    from_part: None,
+                    repair: RepairPolicy::default(),
+                    token,
+                }
+                .encode()
+            };
+            let mut buf = vec![0_u8; 65_536];
+            client.send_to(&subscribe(None), edge).await.unwrap();
+            let token = loop {
+                let (len, _) = client.recv_from(&mut buf).await.unwrap();
+                if let Some(Control::Token { token, .. }) = Control::decode(&buf[..len]) {
+                    break token;
+                }
+            };
+            client.send_to(&subscribe(Some(token)), edge).await.unwrap();
+            loop {
+                let (len, _) = client.recv_from(&mut buf).await.unwrap();
+                if matches!(Control::decode(&buf[..len]), Some(Control::Subscribed { .. })) {
+                    break;
+                }
+            }
+
+            // The receiver: every part with its arrival time.
+            let receiving = {
+                let client = Arc::clone(&client);
+                tokio::spawn(async move {
+                    let mut receiver = ObjectReceiver::new();
+                    let mut buf = vec![0_u8; 65_536];
+                    let mut arrived = BTreeMap::new();
+                    while arrived.len() < parts as usize {
+                        let Ok(Ok((len, _))) =
+                            timeout(Duration::from_secs(3), client.recv_from(&mut buf)).await
+                        else {
+                            break;
+                        };
+                        if let Some(object) = receiver.push(&buf[..len]) {
+                            if object.kind == UdpObjectKind::Part && object.part >= 1 {
+                                arrived
+                                    .entry(object.part)
+                                    .or_insert((Instant::now(), object.payload));
+                            }
+                        }
+                    }
+                    arrived
+                })
+            };
+
+            // The producer: absolute deadlines at the part interval.
+            let start = Instant::now() + Duration::from_millis(20);
+            let mut published = BTreeMap::new();
+            let mut published_us = HashMap::new();
+            for part in 1..=parts {
+                tokio::time::sleep_until((start + Duration::from_micros(interval_us * part)).into())
+                    .await;
+                published.insert(part, Instant::now());
+                published_us.insert(part as usize, now_unix_us());
+                commit(part).await;
+            }
+            let producer_ms = start.elapsed().as_secs_f64() * 1e3;
+            let arrived = receiving.await.unwrap();
+            // When the first datagram of each part reached the edge.
+            let mut edge_ms = Vec::new();
+            while let Ok(applied) = applied_rx.try_recv() {
+                if let Some(published) = published_us.get(&applied.slot_id) {
+                    edge_ms.push(applied.rx_first_us.saturating_sub(*published) as f64 / 1e3);
+                }
+            }
+            edge_ms.sort_by(f64::total_cmp);
+            let edge_p50 = edge_ms.get(edge_ms.len() / 2).copied().unwrap_or(-1.0);
+            let edge_p99 = edge_ms.get(edge_ms.len() * 99 / 100).copied().unwrap_or(-1.0);
+            let mut latencies: Vec<f64> = Vec::new();
+            for part in 1..=parts {
+                let (at, payload) = arrived
+                    .get(&part)
+                    .unwrap_or_else(|| panic!("{name}: part {part} did not arrive"));
+                assert_eq!(payload.as_ref(), media(part).as_slice(), "{name}: part {part}");
+                latencies.push(at.duration_since(published[&part]).as_secs_f64() * 1e3);
+            }
+            let http = get_for_tests(&router, &format!("/live/{stream_id}/part{parts}.mp4")).await;
+            assert_eq!(http.body.as_deref(), Some(media(parts).as_slice()));
+            latencies.sort_by(f64::total_cmp);
+            let at = |q: f64| latencies[((latencies.len() - 1) as f64 * q) as usize];
+            // What the edge adds: from the first datagram of a part at the
+            // edge to the part at the client. (What comes before it is the
+            // distributor's publication and the cache mesh.)
+            let added = at(0.5) - edge_p50;
+            let allowed = if media_bytes > 10_000 { 5.0 } else { 1.0 };
+            assert!(added < allowed, "{name}: the edge adds {added:.3} ms at the median");
+            let cut_parts = stats.cut_through_parts.load(Ordering::Relaxed);
+            assert!(cut_parts >= parts * 9 / 10, "{name}: {cut_parts} of {parts} parts cut through");
+            summary.push(format!(
+                "{name}: {parts} parts, publish to client p50 {:.3} ms p99 {:.3} ms max {:.3} ms, \
+                 {cut_parts} cut through, {} fallbacks, producer {producer_ms:.0} ms for {} ms, \
+                 first datagram at the edge p50 {edge_p50:.3} p99 {edge_p99:.3} ms after publication",
+                at(0.5),
+                at(0.99),
+                at(1.0),
+                stats.cut_through_fallbacks.load(Ordering::Relaxed),
+                interval_us * parts / 1_000
+            ));
+            let _ = shutdown_tx.send(());
+            task.await.unwrap().unwrap();
+            parent_mesh.shutdown();
+            edge_mesh.shutdown();
+        }
+        println!("{}", summary.join("\n"));
+    }
+
     /// RaptorQ FEC UDP to a client at an edge: every part that the edge's
     /// cache holds reaches the client bit for bit as its LL-HLS part, with a
     /// third of the datagrams lost; a new part follows live; a drain sends
