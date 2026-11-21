@@ -167,6 +167,10 @@ const MIN_BITRATE_WINDOW_MS: u64 = 4_000;
 /// How often a node without its own measurement of a playlist asks what
 /// rate the region advertises for it.
 const PLAYLIST_RATE_LOOKUP_INTERVAL_MS: u64 = 500;
+/// Requests a second that one worker thread of a small node answers with its
+/// processor full. Measured on a 1 vCPU node: forty readers of 5 ms parts,
+/// 8,080 requests a second over HTTP/2 and TLS, took 76% of the processor.
+const DEFAULT_REQUESTS_PER_WORKER: u64 = 9_000;
 /// Edges of a region that hold a playlist while it has readers.
 const DEFAULT_PLAYLIST_COPIES: usize = 2;
 /// An edge that holds this many playlists takes no standby copy: the slots
@@ -1098,6 +1102,14 @@ struct Args {
     )]
     failover_entries: Vec<String>,
 
+    /// Requests that this node answers in a second when its processor is
+    /// full. A session is charged the larger of its bit rate and the share of
+    /// the node that its requests take, so a node admits about forty readers
+    /// of 5 ms parts for each vCPU. Zero takes 9,000 for each worker thread,
+    /// which is what a Nanode measures.
+    #[arg(long, env = "NEEDLETAIL_EGRESS_REQUEST_CAPACITY", default_value_t = 0)]
+    egress_request_capacity: u64,
+
     /// Edges of a region that hold each playlist that has readers. With two,
     /// a second edge takes a copy of a playlist as soon as one edge has a
     /// reader for it, so a reader whose cache fails moves to a cache that
@@ -1511,6 +1523,7 @@ async fn main() -> Result<()> {
         session_idle_seconds: args.egress_session_idle_seconds,
         max_sessions: args.egress_max_sessions,
         session_limit: args.edge_session_limit,
+        request_capacity_per_sec: args.egress_request_capacity(),
     });
     let edge_lifecycle_config = EdgeLifecycleConfig {
         enabled: args.edge_lifecycle,
@@ -1976,6 +1989,25 @@ async fn main() -> Result<()> {
 }
 
 impl Args {
+    /// Requests a second that the node answers with its processor full:
+    /// the configured number, or 9,000 for each worker thread.
+    fn egress_request_capacity(&self) -> u64 {
+        if self.egress_request_capacity > 0 {
+            return self.egress_request_capacity;
+        }
+        let workers = std::env::var("TOKIO_WORKER_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|workers| *workers > 0)
+            .or_else(|| {
+                std::thread::available_parallelism()
+                    .ok()
+                    .map(|count| count.get() as u64)
+            })
+            .unwrap_or(1);
+        workers.saturating_mul(DEFAULT_REQUESTS_PER_WORKER)
+    }
+
     fn normalized(mut self) -> Result<Self> {
         if self.part_ms == 0 {
             bail!("--part-ms must be at least 1");
@@ -13373,11 +13405,13 @@ impl AppRouter {
                 Some(PlaylistHolding {
                     stream_id: stream.stream_id,
                     head_part: stream.latest_mesh_part?,
-                    // The rate that this cache admits a reader against.
+                    // The highest bit rate that this cache has measured. What
+                    // a session is charged also depends on the capacity of
+                    // the node, and stays with the node.
                     bitrate_bps: self
                         .edge_load
                         .egress
-                        .playlist_bps(stream.stream_id)
+                        .measured_playlist_bps(stream.stream_id)
                         .or(stream.bitrate_bps),
                     sessions: sessions.get(&stream.stream_id).copied().unwrap_or(0),
                 })
@@ -13526,7 +13560,32 @@ impl AppRouter {
     /// a rate the first readers of a new copy would be admitted with no
     /// commitment, and the node could take more of them than it can serve.
     async fn ensure_playlist_rate(&self, stream_id: u64) {
-        if self.edge_load.egress.playlist_bps(stream_id).is_some()
+        // A reader asks for each part and reloads the playlist now and then.
+        // The parts of a stream that this node does not hold yet are not
+        // known: its first readers are charged their bit rate alone.
+        let part_ms = {
+            let state = self.cache.state.read().await;
+            state
+                .stream_declared_ms
+                .get(&stream_id)
+                .map(|(part_ms, _)| u64::from(*part_ms))
+                .or_else(|| {
+                    state
+                        .stream_max_part_duration_ms
+                        .get(&stream_id)
+                        .map(|part_ms| u64::from(*part_ms))
+                })
+        };
+        if let Some(part_ms) = part_ms.filter(|part_ms| *part_ms > 0) {
+            self.edge_load
+                .egress
+                .set_playlist_request_rate(stream_id, 1_000_u64.div_ceil(part_ms) + 2);
+        }
+        if self
+            .edge_load
+            .egress
+            .measured_playlist_bps(stream_id)
+            .is_some()
             || !self.demand.should_look_up_rate(stream_id, now_unix_ms())
         {
             return;
@@ -20454,6 +20513,7 @@ mod tests {
             session_idle_seconds: 60,
             max_sessions: 100,
             session_limit: 0,
+            request_capacity_per_sec: 0,
         });
 
         let existing = || {

@@ -29,6 +29,13 @@ pub struct EdgeAdmissionConfig {
     /// limit. This is the reader limit of a small node, where the processor
     /// is exhausted before the network.
     pub session_limit: usize,
+    /// Requests that the node answers in a second when its processor is
+    /// full. A reader of 5 ms parts asks 200 times a second, and a small
+    /// node runs out of processor long before it runs out of network: one
+    /// vCPU serves about forty such readers whatever their bit rate. Each
+    /// session is therefore charged the larger of its bit rate and the share
+    /// of the node that its requests take. Zero charges the bit rate alone.
+    pub request_capacity_per_sec: u64,
 }
 
 impl Default for EdgeAdmissionConfig {
@@ -42,6 +49,7 @@ impl Default for EdgeAdmissionConfig {
             session_idle_seconds: DEFAULT_SESSION_IDLE_SECONDS,
             max_sessions: DEFAULT_MAX_SESSIONS,
             session_limit: 0,
+            request_capacity_per_sec: 0,
         }
     }
 }
@@ -128,6 +136,8 @@ struct EdgeAdmissionInner {
     admitted_sessions: AtomicU64,
     sessions: Mutex<HashMap<String, PlaybackSession>>,
     playlist_bps: Mutex<HashMap<u64, u64>>,
+    /// Requests that a reader of each playlist makes in a second.
+    playlist_request_rate: Mutex<HashMap<u64, u64>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -158,6 +168,7 @@ impl EdgeAdmission {
                 admitted_sessions: AtomicU64::new(0),
                 sessions: Mutex::new(HashMap::new()),
                 playlist_bps: Mutex::new(HashMap::new()),
+                playlist_request_rate: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -207,6 +218,16 @@ impl EdgeAdmission {
         *peak = (*peak).max(bps);
     }
 
+    /// Record how many requests a reader of a playlist makes in a second:
+    /// one for each part, and a playlist reload now and then.
+    pub fn set_playlist_request_rate(&self, stream_id: u64, requests_per_sec: u64) {
+        self.inner
+            .playlist_request_rate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(stream_id, requests_per_sec);
+    }
+
     /// Forget the bit rate of a playlist that this node no longer holds.
     pub fn clear_playlist_bps(&self, stream_id: u64) {
         self.inner
@@ -214,15 +235,59 @@ impl EdgeAdmission {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&stream_id);
+        self.inner
+            .playlist_request_rate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&stream_id);
     }
 
-    pub fn playlist_bps(&self, stream_id: u64) -> Option<u64> {
+    /// The highest bit rate that this node has measured for a playlist.
+    pub fn measured_playlist_bps(&self, stream_id: u64) -> Option<u64> {
         self.inner
             .playlist_bps
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&stream_id)
             .copied()
+    }
+
+    /// What one session of a playlist is charged, in bits per second: its
+    /// highest measured bit rate, or the share of the node that its requests
+    /// take, whichever is larger. `None` while neither is known.
+    pub fn playlist_bps(&self, stream_id: u64) -> Option<u64> {
+        let measured = self
+            .inner
+            .playlist_bps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&stream_id)
+            .copied();
+        let requests = self.request_cost_bps(stream_id);
+        match (measured, requests) {
+            (Some(measured), Some(requests)) => Some(measured.max(requests)),
+            (measured, requests) => measured.or(requests),
+        }
+    }
+
+    /// The share of the capacity of the node that the requests of one
+    /// session take, in bits per second.
+    fn request_cost_bps(&self, stream_id: u64) -> Option<u64> {
+        let capacity = self.inner.config.request_capacity_per_sec;
+        if capacity == 0 {
+            return None;
+        }
+        let rate = self
+            .inner
+            .playlist_request_rate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&stream_id)
+            .copied()?;
+        Some(
+            (u128::from(self.inner.config.capacity_bps) * u128::from(rate) / u128::from(capacity))
+                .min(u128::from(u64::MAX)) as u64,
+        )
     }
 
     /// Record that this node has sent a session to another cache. Its
@@ -274,17 +339,20 @@ impl EdgeAdmission {
     }
 
     fn committed_bps(&self, sessions: &HashMap<String, PlaybackSession>) -> u64 {
-        let playlist_bps = self
-            .inner
-            .playlist_bps
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut charges: HashMap<u64, u64> = HashMap::new();
         sessions
             .values()
             .filter(|session| !session.moved)
             .filter_map(|session| session.stream_id)
-            .filter_map(|stream_id| playlist_bps.get(&stream_id))
-            .fold(0_u64, |total, bps| total.saturating_add(*bps))
+            .filter_map(|stream_id| {
+                if let Some(charge) = charges.get(&stream_id) {
+                    return Some(*charge);
+                }
+                let charge = self.playlist_bps(stream_id)?;
+                charges.insert(stream_id, charge);
+                Some(charge)
+            })
+            .fold(0_u64, |total, bps| total.saturating_add(bps))
     }
 
     fn snapshot_at(&self, second: u64) -> EdgeAdmissionSnapshot {
@@ -523,6 +591,56 @@ fn prune_sessions(sessions: &mut HashMap<String, PlaybackSession>, now_ms: u64, 
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_session_is_charged_for_its_requests_when_they_cost_more_than_its_bits() {
+        // 100 Mbit/s of network, admission at 85%, and 9,000 requests a
+        // second of processor.
+        let admission = EdgeAdmission::new(EdgeAdmissionConfig {
+            capacity_bps: 100_000_000,
+            request_capacity_per_sec: 9_000,
+            ..EdgeAdmissionConfig::default()
+        });
+        // 4K video in 200 ms parts: seven requests a second. The bit rate
+        // is what a session costs.
+        admission.set_playlist_bps(1, 16_500_000);
+        admission.set_playlist_request_rate(1, 7);
+        assert_eq!(admission.playlist_bps(1), Some(16_500_000));
+        // Opus in 5 ms parts: 96 kbit/s and 202 requests a second. The
+        // requests cost 2.2% of the node, which is 2.24 Mbit/s of 100.
+        admission.set_playlist_bps(3001, 96_000);
+        admission.set_playlist_request_rate(3001, 202);
+        assert_eq!(admission.playlist_bps(3001), Some(2_244_444));
+
+        // The node admits 37 such readers, not the 885 that fit its network.
+        let mut admitted = 0;
+        for reader in 0..100 {
+            let session = format!("reader-{reader}");
+            let request = PlaybackRequest {
+                session_id: Some(&session),
+                stream_id: Some(3001),
+                draining: false,
+            };
+            if matches!(
+                admission.admit_playback(request),
+                PlaybackAdmission::Admitted
+            ) {
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, 37);
+        let snapshot = admission.snapshot();
+        assert!(snapshot.load_permille >= 950, "{}", snapshot.load_permille);
+
+        // Without a request capacity the bit rate alone counts.
+        let by_bits = EdgeAdmission::new(EdgeAdmissionConfig {
+            capacity_bps: 100_000_000,
+            ..EdgeAdmissionConfig::default()
+        });
+        by_bits.set_playlist_bps(3001, 96_000);
+        by_bits.set_playlist_request_rate(3001, 202);
+        assert_eq!(by_bits.playlist_bps(3001), Some(96_000));
+    }
+
     fn admission() -> EdgeAdmission {
         EdgeAdmission::new(EdgeAdmissionConfig {
             capacity_bps: 1_000,
@@ -533,6 +651,7 @@ mod tests {
             session_idle_seconds: 5,
             max_sessions: 2,
             session_limit: 0,
+            request_capacity_per_sec: 0,
         })
     }
 
@@ -599,6 +718,7 @@ mod tests {
             session_idle_seconds: 0,
             max_sessions: 0,
             session_limit: 0,
+            request_capacity_per_sec: 0,
         }
         .normalized();
         assert_eq!(config.capacity_bps, 1);
@@ -636,6 +756,7 @@ mod tests {
         let admission = EdgeAdmission::new(EdgeAdmissionConfig {
             capacity_bps: 1_000_000,
             session_limit: 2,
+            request_capacity_per_sec: 0,
             max_sessions: 100,
             ..EdgeAdmissionConfig::default()
         });
