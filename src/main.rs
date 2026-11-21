@@ -170,6 +170,9 @@ const PLAYLIST_RATE_LOOKUP_INTERVAL_MS: u64 = 500;
 /// Most playlists that an edge holds for its readers at one time. The live
 /// cache has 16 playlist slots, and one is the default stream of the node.
 const MAX_EDGE_PLAYLISTS: usize = 15;
+/// Segments that the playlist of a stamped stream holds at least: six whole
+/// segments, which a player that does not use parts needs, and the open one.
+const PLAYLIST_WINDOW_SEGMENTS: u64 = 7;
 /// Fewest parts in the playlist window of a stream whose parts are longer
 /// than the nominal part of the node.
 const MIN_STREAM_WINDOW_PARTS: usize = 32;
@@ -4880,6 +4883,7 @@ impl LiveTsCache {
             u32::try_from(part.duration_ms).ok(),
             false,
             false,
+            None,
             self.window_parts,
         );
         debug!(
@@ -4977,6 +4981,7 @@ impl LiveTsCache {
                 state.stream_retained_bytes.remove(&stream_id);
                 state.stream_max_part_duration_ms.remove(&stream_id);
                 state.stream_max_segment_duration_ms.remove(&stream_id);
+                state.stream_declared_ms.remove(&stream_id);
                 state.stream_inits.remove(&stream_id);
                 state.stream_media_kinds.remove(&stream_id);
                 if stream_id == self.stream_id {
@@ -5149,6 +5154,7 @@ impl LiveTsCache {
                 media_duration_ms,
                 object.is_keyframe(),
                 media_kind == LiveMediaKind::Fmp4,
+                object_part_stamp(&object),
                 self.window_parts,
             );
             state.record_part_published(stream_id, seq, object_published_unix_us(&object));
@@ -5212,6 +5218,7 @@ impl LiveTsCache {
             None,
             false,
             false,
+            None,
             self.window_parts,
         );
         debug!(
@@ -5301,6 +5308,7 @@ impl LiveTsCache {
             record.duration_ms,
             record.keyframe,
             record.keyframe_segments,
+            record.stamp,
             self.window_parts,
         );
         state.record_part_published(stream_id, sequence, record.published_unix_us);
@@ -5636,9 +5644,10 @@ impl LiveTsCache {
         let next_part = available.last().copied().unwrap_or(0) + 1;
         let nominal_part_duration_ms =
             self.part_target.as_millis().clamp(1, u32::MAX as u128) as u32;
-        let (part_target_ms, available) = {
+        let (part_target_ms, declared_target_ms, available) = {
             let state = self.state.read().await;
             let observations = state.stream_parts.get(&stream_id);
+            let declared = state.stream_declared_ms.get(&stream_id).copied();
             // A part that the cache mesh has just written has no playlist
             // entry for a moment. Listing it now would give it the nominal
             // duration of the node and no independent flag. It is listed
@@ -5650,12 +5659,18 @@ impl LiveTsCache {
                     .collect::<Vec<_>>(),
                 _ => available,
             };
-            let part_target_ms = state
-                .stream_max_part_duration_ms
-                .get(&stream_id)
-                .copied()
-                .unwrap_or(nominal_part_duration_ms)
-                .max(nominal_part_duration_ms);
+            // A stamped stream has the part target that its contributor
+            // declares. Another stream has its longest part, and no less
+            // than the nominal part of the node.
+            let part_target_ms = match declared {
+                Some((part_ms, _)) if part_ms > 0 => part_ms,
+                _ => state
+                    .stream_max_part_duration_ms
+                    .get(&stream_id)
+                    .copied()
+                    .unwrap_or(nominal_part_duration_ms)
+                    .max(nominal_part_duration_ms),
+            };
             let available = available
                 .into_iter()
                 .map(|sequence| {
@@ -5669,6 +5684,9 @@ impl LiveTsCache {
                     let fmp4_segment_id = observations
                         .and_then(|parts| parts.get(&sequence))
                         .and_then(|part| part.fmp4_segment_id);
+                    let stamped_part = observations
+                        .and_then(|parts| parts.get(&sequence))
+                        .and_then(|part| part.stamped_part);
                     // The publication time is written by the contributor, so
                     // every cache derives the same program date and time. The
                     // local arrival time is the fallback for a part without it.
@@ -5682,21 +5700,38 @@ impl LiveTsCache {
                         keyframe,
                         fmp4_segment_id,
                         available_unix_us,
+                        stamped_part,
                     )
                 })
                 .collect::<Vec<_>>();
-            (part_target_ms, available)
+            (
+                part_target_ms,
+                declared.map(|(_, target_ms)| u64::from(target_ms)),
+                available,
+            )
         };
         let part_target = f64::from(part_target_ms) / 1_000.0;
 
-        let keyframe_aligned_segments = media_kind == LiveMediaKind::Fmp4
-            && available.iter().any(
-                |(_sequence, _duration_ms, _keyframe, segment_id, _available_unix_us)| {
-                    segment_id.is_some()
-                },
-            );
+        // The contributor stamps the segment number and the part index on
+        // every part. A stream with stamps has the same playlist on every
+        // cache. The rules below it are for a stream without stamps.
+        let stamped = available
+            .iter()
+            .any(|(_, _, _, _, _, stamped_part)| stamped_part.is_some());
+        let keyframe_aligned_segments = (stamped || media_kind == LiveMediaKind::Fmp4)
+            && available
+                .iter()
+                .any(|(_, _, _, segment_id, _, _)| segment_id.is_some());
+        let mut first_stamped_parts: BTreeMap<u64, u32> = BTreeMap::new();
         let mut groups: BTreeMap<u64, Vec<(u64, u32, bool, u64)>> = BTreeMap::new();
-        for (seq, duration_ms, keyframe, fmp4_segment_id, available_unix_us) in available {
+        for (seq, duration_ms, keyframe, fmp4_segment_id, available_unix_us, stamped_part) in
+            available
+        {
+            if let (Some(segment_id), Some(stamped_part)) = (fmp4_segment_id, stamped_part) {
+                first_stamped_parts
+                    .entry(segment_id)
+                    .or_insert(stamped_part);
+            }
             let segment_id = if keyframe_aligned_segments {
                 let Some(segment_id) = fmp4_segment_id else {
                     continue;
@@ -5712,7 +5747,11 @@ impl LiveTsCache {
                 available_unix_us,
             ));
         }
-        if keyframe_aligned_segments {
+        if stamped {
+            // A retained window can begin halfway through a segment. The
+            // segment is listed only when its first part is here.
+            groups.retain(|segment_id, _group| first_stamped_parts.get(segment_id) == Some(&0));
+        } else if keyframe_aligned_segments {
             // A retained window can begin halfway through a GOP. Do not
             // advertise that truncated parent as a playable HLS segment.
             groups.retain(|_segment_id, group| {
@@ -5777,12 +5816,18 @@ impl LiveTsCache {
                     })
                     .or_insert(observed_duration_ms);
             }
-            state
+            let observed = state
                 .stream_max_segment_duration_ms
                 .get(&stream_id)
-                .copied()
-                .unwrap_or(fallback_segment_duration_ms)
-                .max(fallback_segment_duration_ms)
+                .copied();
+            match declared_target_ms {
+                // The target duration of a stamped stream is the one that
+                // its contributor declares.
+                Some(declared_ms) if declared_ms > 0 => declared_ms.max(observed.unwrap_or(0)),
+                _ => observed
+                    .unwrap_or(fallback_segment_duration_ms)
+                    .max(fallback_segment_duration_ms),
+            }
         };
         let target_duration = hls_target_duration_from_millis(segment_target_ms);
 
@@ -5794,7 +5839,7 @@ impl LiveTsCache {
         out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{media_sequence}\n"));
         let audio_only_fmp4 = media_kind == LiveMediaKind::Fmp4
             && init.as_deref().is_some_and(fmp4_init_is_audio_only);
-        if keyframe_aligned_segments || audio_only_fmp4 {
+        if (keyframe_aligned_segments && media_kind == LiveMediaKind::Fmp4) || audio_only_fmp4 {
             out.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
         }
         if media_kind == LiveMediaKind::Fmp4 {
@@ -6035,13 +6080,20 @@ impl LiveTsCache {
     }
 
     async fn part_available_unix_us(&self, stream_id: u64, seq: u64) -> Option<u64> {
+        self.part_times_unix_us(stream_id, seq)
+            .await
+            .map(|(available, _)| available)
+    }
+
+    /// When this cache had the part, and when the contributor published it.
+    async fn part_times_unix_us(&self, stream_id: u64, seq: u64) -> Option<(u64, Option<u64>)> {
         self.state
             .read()
             .await
             .stream_parts
             .get(&stream_id)?
             .get(&seq)
-            .map(|part| part.available_unix_us)
+            .map(|part| (part.available_unix_us, part.published_unix_us))
     }
 
     async fn next_part_after_for_stream_id(
@@ -6118,19 +6170,25 @@ impl LiveTsCache {
         }
     }
 
+    /// Hold a playlist reload until the playlist holds the position that the
+    /// reader asks for (`_HLS_msn`, `_HLS_part`).
+    ///
+    /// A position too far ahead of the playlist is refused at once, and a
+    /// position that does not arrive within three target durations ends the
+    /// wait: draft-pantos-hls-rfc8216bis section 6.2.5.2 asks for 400 and 503.
     async fn wait_for_hls_reload_position(
         &self,
         stream_id: u64,
         position: HlsReloadPosition,
-    ) -> bool {
-        let deadline = Instant::now() + Duration::from_millis(HLS_PLAYLIST_WAIT_MS);
+    ) -> HlsReloadOutcome {
+        let target_ms = self.target_duration_ms(stream_id).await;
+        let deadline = Instant::now()
+            + Duration::from_millis(target_ms.saturating_mul(3).max(HLS_PLAYLIST_WAIT_MS));
         let mut updates = self.part_updates.subscribe();
         loop {
-            if self
-                .hls_reload_position_available(stream_id, position)
-                .await
-            {
-                return true;
+            match self.hls_reload_position_state(stream_id, position).await {
+                HlsReloadOutcome::TimedOut => {}
+                outcome => return outcome,
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero()
@@ -6138,9 +6196,30 @@ impl LiveTsCache {
                     .await
                     .is_err()
             {
-                return false;
+                return HlsReloadOutcome::TimedOut;
             }
         }
+    }
+
+    /// Target duration of a stream in milliseconds: what its contributor
+    /// declares, or the nominal segment of the node.
+    async fn target_duration_ms(&self, stream_id: u64) -> u64 {
+        let state = self.state.read().await;
+        let nominal = (self.part_target.as_millis() as u64)
+            .saturating_mul(self.parts_per_segment as u64)
+            .max(1_000);
+        state
+            .stream_declared_ms
+            .get(&stream_id)
+            .map(|(_, target_ms)| u64::from(*target_ms))
+            .or_else(|| {
+                state
+                    .stream_max_segment_duration_ms
+                    .get(&stream_id)
+                    .copied()
+            })
+            .unwrap_or(nominal)
+            .max(1_000)
     }
 
     async fn hls_reload_position_available(
@@ -6148,10 +6227,33 @@ impl LiveTsCache {
         stream_id: u64,
         position: HlsReloadPosition,
     ) -> bool {
+        self.hls_reload_position_state(stream_id, position).await == HlsReloadOutcome::Ready
+    }
+
+    /// Whether the playlist holds a position: `Ready`, not yet (`TimedOut`
+    /// stands for "wait"), or `TooFarAhead`.
+    async fn hls_reload_position_state(
+        &self,
+        stream_id: u64,
+        position: HlsReloadPosition,
+    ) -> HlsReloadOutcome {
+        let ready = |ready: bool| {
+            if ready {
+                HlsReloadOutcome::Ready
+            } else {
+                HlsReloadOutcome::TimedOut
+            }
+        };
         let state = self.state.read().await;
         let Some(parts) = state.stream_parts.get(&stream_id) else {
-            return false;
+            return HlsReloadOutcome::TimedOut;
         };
+        let part_target_ms = state
+            .stream_declared_ms
+            .get(&stream_id)
+            .map(|(part_ms, _)| u64::from(*part_ms))
+            .unwrap_or_else(|| state.stream_part_ms(stream_id))
+            .max(1);
         let keyframe_segments = parts.values().any(|part| part.fmp4_segment_id.is_some());
         let mut segment_parts = BTreeMap::<u64, usize>::new();
         for (sequence, observation) in parts {
@@ -6166,22 +6268,73 @@ impl LiveTsCache {
             *segment_parts.entry(segment).or_default() += 1;
         }
         let Some((&first_segment, _)) = segment_parts.first_key_value() else {
-            return false;
+            return HlsReloadOutcome::TimedOut;
         };
-        let (&last_segment, _) = segment_parts.last_key_value().unwrap();
+        let (&last_segment, &last_parts) = segment_parts.last_key_value().unwrap();
         if position.msn < first_segment || position.msn < last_segment {
-            return true;
+            return HlsReloadOutcome::Ready;
         }
-        let Some(part_count) = segment_parts.get(&position.msn).copied() else {
-            return false;
+        // The last group is the segment that is still open, so the last whole
+        // segment is the one before it. A reader may ask for the segment
+        // after the open one, and no further.
+        if position.msn > last_segment.saturating_add(1) {
+            return HlsReloadOutcome::TooFarAhead;
+        }
+        // The advance part limit: three seconds of parts, or three parts.
+        let advance_parts = if part_target_ms < 1_000 {
+            3_000_u64.div_ceil(part_target_ms)
+        } else {
+            3
         };
         if let Some(part) = position.part {
-            part < part_count
-        } else if keyframe_segments {
-            position.msn < last_segment
-        } else {
-            part_count >= self.parts_per_segment
+            let ahead = if position.msn == last_segment {
+                (part as u64).saturating_sub(last_parts as u64)
+            } else {
+                part as u64
+            };
+            if ahead >= advance_parts {
+                return HlsReloadOutcome::TooFarAhead;
+            }
         }
+        let Some(part_count) = segment_parts.get(&position.msn).copied() else {
+            return HlsReloadOutcome::TimedOut;
+        };
+        if let Some(part) = position.part {
+            ready(part < part_count)
+        } else if keyframe_segments {
+            ready(position.msn < last_segment)
+        } else {
+            ready(part_count >= self.parts_per_segment)
+        }
+    }
+
+    /// Whether a request for a part should wait for it. A part within three
+    /// seconds of the newest part is on its way: a reader asks for the part
+    /// that the playlist hints, and a reader on a far path asks several
+    /// parts ahead. Any other part that the cache does not hold is unknown.
+    async fn part_request_may_wait(&self, stream_id: u64, sequence: u64) -> bool {
+        let Some((_, last)) = self.stream_position_for_id(stream_id).await else {
+            // No part of the stream yet: a copy is on its way to this cache.
+            return true;
+        };
+        let part_ms = {
+            let state = self.state.read().await;
+            state
+                .stream_declared_ms
+                .get(&stream_id)
+                .map(|(part_ms, _)| u64::from(*part_ms))
+                .unwrap_or_else(|| state.stream_part_ms(stream_id))
+                .max(1)
+        };
+        let ahead = PART_WAIT_MS.div_ceil(part_ms).saturating_add(4);
+        let last = last as u64;
+        if sequence > last {
+            return sequence - last <= ahead;
+        }
+        // A part behind the newest one is a hole that a parent can fill while
+        // it is inside the retained window.
+        let window = self.window_parts_for(stream_id).await as u64;
+        last - sequence <= window
     }
 
     async fn next_part_batch_after_blocking_for_stream_id(
@@ -6410,11 +6563,16 @@ impl LiveTsCache {
                         part.fmp4_segment_id
                             .is_some_and(|segment_id| segment_id > segment)
                     });
+                    // A segment is whole when its first part is here: the key
+                    // frame of a stream without stamps, or the part that the
+                    // contributor stamped with index 0.
                     let sequences = parts
                         .iter()
                         .filter_map(|(sequence, part)| {
-                            (part.fmp4_segment_id == Some(segment))
-                                .then_some((*sequence, part.keyframe))
+                            (part.fmp4_segment_id == Some(segment)).then_some((
+                                *sequence,
+                                part.stamped_part.map_or(part.keyframe, |index| index == 0),
+                            ))
                         })
                         .collect::<Vec<_>>();
                     if !segment_is_closed
@@ -6897,7 +7055,12 @@ struct RetainedPartObservation {
     published_unix_us: Option<u64>,
     duration_ms: Option<u32>,
     keyframe: bool,
+    /// Media Sequence Number of the segment of the part: the stamp of the
+    /// contributor, or a number that this cache derived for a stream
+    /// without stamps.
     fmp4_segment_id: Option<u64>,
+    /// Index of the part in its segment, from the stamp of the contributor.
+    stamped_part: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -6920,6 +7083,7 @@ struct MeshPartRecord {
     keyframe_segments: bool,
     published_unix_us: Option<u64>,
     epoch: Option<u64>,
+    stamp: Option<PartStamp>,
 }
 
 impl MeshPartRecord {
@@ -6939,6 +7103,7 @@ impl MeshPartRecord {
                 keyframe_segments: false,
                 published_unix_us: None,
                 epoch: None,
+                stamp: None,
             });
         }
         // A canonical slot holds the complete media object behind a fixed
@@ -6958,8 +7123,54 @@ impl MeshPartRecord {
             keyframe_segments: media_kind == LiveMediaKind::Fmp4,
             published_unix_us: object_published_unix_us(&object),
             epoch: Some(object.key().epoch()),
+            stamp: object_part_stamp(&object),
         })
     }
+}
+
+/// The place of a part in the Media Playlist of its stream, as the
+/// contributor stamped it on the media object.
+///
+/// A cache that numbers segments from the parts it happens to hold numbers
+/// them differently from a cache that joined the stream at another moment.
+/// With the stamp every cache writes the same Media Sequence Numbers, the
+/// same part target and the same target duration.
+/// How a blocking playlist reload ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HlsReloadOutcome {
+    /// The playlist holds the position.
+    Ready,
+    /// The position did not arrive in time.
+    TimedOut,
+    /// The position is further ahead than a reader may ask for.
+    TooFarAhead,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PartStamp {
+    /// Media Sequence Number of the segment of the part.
+    msn: u64,
+    /// Index of the part in its segment.
+    part: u32,
+    /// Longest part of the stream, in milliseconds.
+    part_target_ms: u32,
+    /// Longest segment of the stream so far, in milliseconds.
+    target_duration_ms: u32,
+}
+
+fn object_part_stamp(object: &MediaObject) -> Option<PartStamp> {
+    fn number<T: std::str::FromStr>(object: &MediaObject, key: &str) -> Option<T> {
+        std::str::from_utf8(object.metadata().get(key)?)
+            .ok()?
+            .parse()
+            .ok()
+    }
+    Some(PartStamp {
+        msn: number(object, "hls-msn")?,
+        part: number(object, "hls-part")?,
+        part_target_ms: number::<u32>(object, "hls-part-target-ms").filter(|ms| *ms > 0)?,
+        target_duration_ms: number::<u32>(object, "hls-target-duration-ms").filter(|ms| *ms > 0)?,
+    })
 }
 
 /// When the contributor published a media object, in Unix microseconds.
@@ -7006,6 +7217,9 @@ struct LiveState {
     stream_retained_bytes: HashMap<u64, u64>,
     stream_max_part_duration_ms: HashMap<u64, u32>,
     stream_max_segment_duration_ms: HashMap<u64, u64>,
+    /// Part target and target duration that the contributor declares for a
+    /// stream, in milliseconds, from the stamps of its parts.
+    stream_declared_ms: HashMap<u64, (u32, u32)>,
     stream_inits: HashMap<u64, Bytes>,
     stream_media_kinds: HashMap<u64, LiveMediaKind>,
 }
@@ -7039,6 +7253,7 @@ impl LiveState {
             stream_retained_bytes: HashMap::new(),
             stream_max_part_duration_ms: HashMap::new(),
             stream_max_segment_duration_ms: HashMap::new(),
+            stream_declared_ms: HashMap::new(),
             stream_inits: HashMap::new(),
             stream_media_kinds: HashMap::new(),
         }
@@ -7066,8 +7281,15 @@ impl LiveState {
         duration_ms: Option<u32>,
         keyframe: bool,
         keyframe_segments: bool,
+        stamp: Option<PartStamp>,
         window_parts: usize,
     ) {
+        if let Some(stamp) = stamp {
+            // The contributor only raises what it declares.
+            let declared = self.stream_declared_ms.entry(stream_id).or_insert((0, 0));
+            declared.0 = declared.0.max(stamp.part_target_ms);
+            declared.1 = declared.1.max(stamp.target_duration_ms);
+        }
         if let Some(duration_ms) = duration_ms {
             self.stream_max_part_duration_ms
                 .entry(stream_id)
@@ -7080,14 +7302,17 @@ impl LiveState {
             .get(&stream_id)
             .and_then(|parts| parts.get(&sequence))
             .copied();
-        let fmp4_segment_id = if let Some(existing) = existing {
+        let fmp4_segment_id = if let Some(stamp) = stamp {
+            Some(stamp.msn)
+        } else if let Some(existing) = existing {
             existing.fmp4_segment_id
         } else if keyframe_segments {
             self.assign_fmp4_segment(stream_id, sequence, keyframe)
         } else {
             None
         };
-        let next_keyframe = (keyframe_segments && keyframe && existing.is_none()).then(|| {
+        let derive_segments = keyframe_segments && stamp.is_none();
+        let next_keyframe = (derive_segments && keyframe && existing.is_none()).then(|| {
             self.stream_keyframe_segments
                 .get(&stream_id)
                 .and_then(|keyframes| {
@@ -7112,6 +7337,7 @@ impl LiveState {
                         duration_ms,
                         keyframe,
                         fmp4_segment_id,
+                        stamped_part: stamp.map(|stamp| stamp.part),
                     });
                     bytes as u64
                 } else {
@@ -7270,6 +7496,27 @@ impl LiveState {
     /// covers that time with fewer parts, so it retains fewer of them.
     fn stream_window_parts(&self, stream_id: u64, configured: usize) -> usize {
         let nominal_ms = self.nominal_part_ms;
+        if let Some((part_ms, target_ms)) = self
+            .stream_declared_ms
+            .get(&stream_id)
+            .copied()
+            .filter(|(part_ms, _)| *part_ms > 0 && nominal_ms > 0)
+        {
+            // The contributor declares the part and segment durations of the
+            // stream. The playlist holds the configured length of time, and
+            // at least six whole segments beside the one that is open.
+            let window_ms = (configured as u64)
+                .saturating_mul(nominal_ms)
+                .max(u64::from(target_ms).saturating_mul(PLAYLIST_WINDOW_SEGMENTS));
+            // The parts of a stream are no shorter than three quarters of
+            // the part that it declares, on average.
+            let parts = window_ms
+                .saturating_mul(4)
+                .div_ceil(u64::from(part_ms).saturating_mul(3));
+            return usize::try_from(parts)
+                .unwrap_or(configured)
+                .clamp(MIN_STREAM_WINDOW_PARTS.min(configured), configured);
+        }
         let Some(part_ms) = self
             .stream_max_part_duration_ms
             .get(&stream_id)
@@ -7383,6 +7630,7 @@ impl LiveState {
         self.stream_retained_bytes.remove(&stream_id);
         self.stream_max_part_duration_ms.remove(&stream_id);
         self.stream_max_segment_duration_ms.remove(&stream_id);
+        self.stream_declared_ms.remove(&stream_id);
         self.stream_inits.remove(&stream_id);
         self.stream_media_kinds.remove(&stream_id);
     }
@@ -13897,6 +14145,50 @@ impl AppRouter {
     /// such a part up to a second late. An edge that still lacks a requested
     /// part after a short grace, while newer parts of the stream are stored,
     /// asks its parents for that part directly.
+    /// Apply the delivery directives of a playlist reload (`_HLS_msn`,
+    /// `_HLS_part`): hold the reload until the playlist holds the position.
+    /// Returns the refusal for a request that the server does not hold.
+    async fn hold_playlist_reload(
+        &self,
+        stream_id: u64,
+        query: Option<&str>,
+    ) -> Option<HandlerResponse> {
+        let refuse = |status: StatusCode, text: &'static str| {
+            Some(
+                response(
+                    status,
+                    Some(Bytes::from_static(text.as_bytes())),
+                    Some("text/plain; charset=utf-8"),
+                )
+                .with_no_store(),
+            )
+        };
+        match parse_hls_reload_position(query) {
+            Err(()) => refuse(
+                StatusCode::BAD_REQUEST,
+                "_HLS_msn must be a number, and _HLS_part needs _HLS_msn\n",
+            ),
+            Ok(None) => None,
+            Ok(Some(position)) => {
+                match self
+                    .cache
+                    .wait_for_hls_reload_position(stream_id, position)
+                    .await
+                {
+                    HlsReloadOutcome::Ready => None,
+                    HlsReloadOutcome::TooFarAhead => refuse(
+                        StatusCode::BAD_REQUEST,
+                        "the playlist is not that far ahead\n",
+                    ),
+                    HlsReloadOutcome::TimedOut => refuse(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "the stream did not reach that part in time\n",
+                    ),
+                }
+            }
+        }
+    }
+
     async fn get_part_repairing_holes(&self, stream_id: u64, seq: u64) -> Option<(Bytes, u64)> {
         if self.cache_mesh_role != CacheMeshRole::Edge {
             return self
@@ -14308,10 +14600,9 @@ impl Router for AppRouter {
             "/live/stream.m3u8" => {
                 self.request_replica_for_stream(self.cache.stream_id, "playlist-demand", None)
                     .await;
-                if let Ok(Some(position)) = parse_hls_reload_position(query) {
-                    self.cache
-                        .wait_for_hls_reload_position(self.cache.stream_id, position)
-                        .await;
+                if let Some(refusal) = self.hold_playlist_reload(self.cache.stream_id, query).await
+                {
+                    return Ok(self.record_edge_response(method, path, query, refusal, started));
                 }
                 let playlist = self.cache.playlist().await;
                 let response =
@@ -14399,10 +14690,8 @@ impl Router for AppRouter {
                 if let Some(stream_id) = parse_stream_playlist_path(path) {
                     self.request_replica_for_stream(stream_id, "playlist-demand", None)
                         .await;
-                    if let Ok(Some(position)) = parse_hls_reload_position(query) {
-                        self.cache
-                            .wait_for_hls_reload_position(stream_id, position)
-                            .await;
+                    if let Some(refusal) = self.hold_playlist_reload(stream_id, query).await {
+                        return Ok(self.record_edge_response(method, path, query, refusal, started));
                     }
                     let playlist = self.cache.playlist_for_stream_id(stream_id).await;
                     let response =
@@ -14703,8 +14992,14 @@ impl Router for AppRouter {
                 if let Some((stream_id, seq, requested_kind)) = parse_stream_part_path(path) {
                     self.request_replica_for_stream(stream_id, "playlist-part-demand", None)
                         .await;
-                    if let Some((bytes, hash)) = self.get_part_repairing_holes(stream_id, seq).await
-                    {
+                    let part = if self.cache.part_request_may_wait(stream_id, seq).await {
+                        self.get_part_repairing_holes(stream_id, seq).await
+                    } else {
+                        // Not a part that the playlist names or will name
+                        // soon: answer at once, and hold no request for it.
+                        self.cache.get_part_for_stream_id(stream_id, seq).await
+                    };
+                    if let Some((bytes, hash)) = part {
                         let media_kind = self
                             .cache
                             .media_kind_hint(stream_id)
@@ -14712,11 +15007,14 @@ impl Router for AppRouter {
                             .unwrap_or(requested_kind);
                         let content_type =
                             self.live_media_content_type(stream_id, media_kind).await;
-                        let available_unix_us =
-                            self.cache.part_available_unix_us(stream_id, seq).await;
+                        let times = self.cache.part_times_unix_us(stream_id, seq).await;
                         let response = response(StatusCode::OK, Some(bytes), Some(content_type))
                             .with_etag(hash)
-                            .with_part_available_unix_us(available_unix_us);
+                            .with_immutable_media()
+                            .with_part_available_unix_us(times.map(|(available, _)| available))
+                            .with_part_published_unix_us(
+                                times.and_then(|(_, published)| published),
+                            );
                         return Ok(
                             self.record_edge_response(method, path, query, response, started)
                         );
@@ -14741,7 +15039,8 @@ impl Router for AppRouter {
                             .unwrap_or(requested_kind);
                         let content_type =
                             self.live_media_content_type(stream_id, media_kind).await;
-                        let response = response(StatusCode::OK, Some(bytes), Some(content_type));
+                        let response = response(StatusCode::OK, Some(bytes), Some(content_type))
+                            .with_immutable_media();
                         return Ok(
                             self.record_edge_response(method, path, query, response, started)
                         );
@@ -14783,13 +15082,16 @@ impl Router for AppRouter {
                         let content_type = self
                             .live_media_content_type(self.cache.stream_id, media_kind)
                             .await;
-                        let available_unix_us = self
+                        let times = self
                             .cache
-                            .part_available_unix_us(self.cache.stream_id, seq)
+                            .part_times_unix_us(self.cache.stream_id, seq)
                             .await;
                         let response = response(StatusCode::OK, Some(bytes), Some(content_type))
                             .with_etag(hash)
-                            .with_part_available_unix_us(available_unix_us);
+                            .with_part_available_unix_us(times.map(|(available, _)| available))
+                            .with_part_published_unix_us(
+                                times.and_then(|(_, published)| published),
+                            );
                         return Ok(
                             self.record_edge_response(method, path, query, response, started)
                         );
@@ -15244,6 +15546,8 @@ trait ResponseExt {
     fn with_no_store(self) -> Self;
     fn with_etag(self, etag: u64) -> Self;
     fn with_part_available_unix_us(self, available_unix_us: Option<u64>) -> Self;
+    fn with_part_published_unix_us(self, published_unix_us: Option<u64>) -> Self;
+    fn with_immutable_media(self) -> Self;
 }
 
 impl ResponseExt for HandlerResponse {
@@ -15258,11 +15562,34 @@ impl ResponseExt for HandlerResponse {
         self
     }
 
+    /// A part or a segment never changes under its name. A cache between
+    /// this node and a reader may keep it for as long as a playlist can
+    /// name it.
+    fn with_immutable_media(mut self) -> Self {
+        self.headers.push((
+            "cache-control".into(),
+            "public, max-age=30, immutable".into(),
+        ));
+        self
+    }
+
     fn with_part_available_unix_us(mut self, available_unix_us: Option<u64>) -> Self {
         if let Some(available_unix_us) = available_unix_us {
             self.headers.push((
                 "x-needletail-cache-available-unix-us".into(),
                 available_unix_us.to_string().into(),
+            ));
+        }
+        self
+    }
+
+    /// When the contributor published the part. A reader takes its delay
+    /// from the source from this.
+    fn with_part_published_unix_us(mut self, published_unix_us: Option<u64>) -> Self {
+        if let Some(published_unix_us) = published_unix_us {
+            self.headers.push((
+                "x-needletail-published-unix-us".into(),
+                published_unix_us.to_string().into(),
             ));
         }
         self
@@ -16786,10 +17113,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(tokio::time::timeout(Duration::from_secs(1), waiter)
-            .await
-            .unwrap()
-            .unwrap());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .unwrap()
+                .unwrap(),
+            HlsReloadOutcome::Ready
+        );
     }
 
     #[tokio::test]
@@ -17248,11 +17578,12 @@ mod tests {
                 Some(33),
                 sequence == 5,
                 true,
+                None,
                 4,
             );
         }
-        state.record_part_available(2, 0, 55, 2_000, None, false, false, 4);
-        state.record_part_available(1, 7, 999, 9_999, Some(99), true, true, 4);
+        state.record_part_available(2, 0, 55, 2_000, None, false, false, None, 4);
+        state.record_part_available(1, 7, 999, 9_999, Some(99), true, true, None, 4);
 
         let first = state.stream_parts.get(&1).unwrap();
         assert_eq!(first.keys().copied().collect::<Vec<_>>(), vec![4, 5, 6, 7]);
@@ -24524,6 +24855,18 @@ mod tests {
         keyframe: bool,
         duration_ms: u32,
     ) -> Bytes {
+        encode_test_stamped_fmp4_part(stream_id, epoch, sequence, keyframe, duration_ms, None)
+    }
+
+    /// A published part with the playlist stamp of a contributor.
+    fn encode_test_stamped_fmp4_part(
+        stream_id: u64,
+        epoch: u64,
+        sequence: u64,
+        keyframe: bool,
+        duration_ms: u32,
+        stamp: Option<PartStamp>,
+    ) -> Bytes {
         let init = test_h264_aac_init();
         let media = format!("moof-mdat-{stream_id}-{epoch}-{sequence}");
         let payload = encode_test_fmp4_slot(keyframe.then_some(init.as_slice()), media.as_bytes());
@@ -24546,7 +24889,7 @@ mod tests {
             media_object::ClockConfidence::estimated(1_000_000),
         )
         .unwrap();
-        let object = MediaObject::builder(key, ObjectKind::Media, payload.to_vec())
+        let mut builder = MediaObject::builder(key, ObjectKind::Media, payload.to_vec())
             .with_keyframe(keyframe)
             .with_stage_timestamp(media_object::StageTimestamp::new(
                 Stage::Published,
@@ -24554,10 +24897,216 @@ mod tests {
             ))
             .with_metadata("container", b"fmp4".to_vec())
             .with_metadata("payload-format", b"fmp4-slot-v1".to_vec())
-            .with_metadata("duration-ms", duration_ms.to_string().into_bytes())
-            .build()
-            .unwrap();
+            .with_metadata("duration-ms", duration_ms.to_string().into_bytes());
+        if let Some(stamp) = stamp {
+            builder = builder
+                .with_metadata("hls-msn", stamp.msn.to_string().into_bytes())
+                .with_metadata("hls-part", stamp.part.to_string().into_bytes())
+                .with_metadata(
+                    "hls-part-target-ms",
+                    stamp.part_target_ms.to_string().into_bytes(),
+                )
+                .with_metadata(
+                    "hls-target-duration-ms",
+                    stamp.target_duration_ms.to_string().into_bytes(),
+                );
+        }
+        let object = builder.build().unwrap();
         Bytes::from(media_object::encode(&object).unwrap())
+    }
+
+    /// Forty parts of 200 ms in segments of ten, stamped as a contributor
+    /// stamps them: the first segment is number 1000.
+    async fn commit_stamped_video(cache: &LiveTsCache, parts: u64) {
+        for sequence in 0..parts {
+            let stamp = PartStamp {
+                msn: 1_000 + sequence / 10,
+                part: (sequence % 10) as u32,
+                part_target_ms: 208,
+                target_duration_ms: 2_000,
+            };
+            cache
+                .commit_stream_payload(
+                    77,
+                    encode_test_stamped_fmp4_part(
+                        77,
+                        5,
+                        sequence,
+                        sequence % 10 == 0,
+                        200,
+                        Some(stamp),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn stamped_parts_give_every_cache_the_same_playlist() {
+        // The nodes are sized for 5 ms audio parts.
+        let distributor = LiveTsCache::new(1, Duration::from_millis(5), 200, 2_400, 64).await;
+        let early = LiveTsCache::new(1, Duration::from_millis(5), 200, 2_400, 64).await;
+        let late = LiveTsCache::new(1, Duration::from_millis(5), 200, 2_400, 64).await;
+        commit_stamped_video(&distributor, 36).await;
+        // One edge holds the stream from its first part. The other joined in
+        // the middle of the second segment.
+        for slot in 0..36 {
+            deliver_mesh_part(&distributor, &early, 77, slot).await;
+        }
+        for slot in 14..36 {
+            deliver_mesh_part(&distributor, &late, 77, slot).await;
+        }
+
+        let reference = distributor.playlist_for_stream_id(77).await;
+        assert!(reference.contains("#EXT-X-MEDIA-SEQUENCE:1000\n"));
+        // The contributor declares both durations. They do not follow the
+        // nominal part of the node or the longest part that a cache saw.
+        assert!(reference.contains("#EXT-X-PART-INF:PART-TARGET=0.208\n"));
+        assert!(reference.contains("#EXT-X-TARGETDURATION:2\n"));
+        assert!(reference.contains("PART-HOLD-BACK=0.624,HOLD-BACK=6.000"));
+        assert!(reference.contains("#EXTINF:2.000,\nseg1000.mp4\n"));
+        assert!(reference.contains("#EXTINF:2.000,\nseg1002.mp4\n"));
+        // Segment 1003 is open: it has parts and no EXTINF yet.
+        assert!(reference.contains("URI=\"part35.mp4\""));
+        assert!(!reference.contains("seg1003.mp4"));
+        assert_eq!(early.playlist_for_stream_id(77).await, reference);
+
+        // The late cache lists the same segments under the same numbers. It
+        // leaves out the segment whose first part it does not hold.
+        let joined = late.playlist_for_stream_id(77).await;
+        assert!(joined.contains("#EXT-X-MEDIA-SEQUENCE:1002\n"));
+        assert!(!joined.contains("seg1001.mp4"));
+        let from_1002 = |playlist: &str| {
+            let start = playlist.find("#EXT-X-PART:DURATION=0.200,URI=\"part20.mp4\"");
+            playlist[start.expect("part 20 is listed")..].to_owned()
+        };
+        assert_eq!(from_1002(&joined), from_1002(&reference));
+
+        // A whole segment can be fetched. A segment without its first part
+        // and the open segment cannot.
+        assert!(late.get_segment_for_stream_id(77, 1_002).await.is_some());
+        assert!(late.get_segment_for_stream_id(77, 1_001).await.is_none());
+        assert!(late.get_segment_for_stream_id(77, 1_003).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_stamped_stream_keeps_six_whole_segments_whatever_one_part_lasts() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 2_400, 64).await;
+        commit_stamped_video(&cache, 10).await;
+        // One part of two seconds, as a source that stalls produces. Without
+        // the stamp it shrank the window of the stream to six parts for good.
+        cache
+            .commit_stream_payload(
+                77,
+                encode_test_stamped_fmp4_part(
+                    77,
+                    5,
+                    10,
+                    true,
+                    2_000,
+                    Some(PartStamp {
+                        msn: 1_001,
+                        part: 0,
+                        part_target_ms: 208,
+                        target_duration_ms: 2_000,
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        let state = cache.state.read().await;
+        // Seven segments of 2 s in parts of 208 ms, with room for the short
+        // part that ends each segment.
+        let window = state.stream_window_parts(77, 2_400);
+        assert!((80..=100).contains(&window), "{window}");
+        // An audio stream with 5 ms parts keeps the configured window.
+        assert_eq!(state.stream_window_parts(2_001, 2_400), 2_400);
+    }
+
+    #[tokio::test]
+    async fn a_reload_too_far_ahead_is_refused_and_one_that_never_arrives_ends() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 2_400, 64).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
+        // Segments 1000 to 1002 are whole. Segment 1003 has six parts.
+        commit_stamped_video(&cache, 36).await;
+        let position = |msn: u64, part: Option<usize>| HlsReloadPosition { msn, part };
+        let state = |msn, part| {
+            let cache = Arc::clone(&cache);
+            async move {
+                cache
+                    .hls_reload_position_state(77, position(msn, part))
+                    .await
+            }
+        };
+        assert_eq!(state(1_003, Some(5)).await, HlsReloadOutcome::Ready);
+        // The next part and the next segment are waited for.
+        assert_eq!(state(1_003, Some(6)).await, HlsReloadOutcome::TimedOut);
+        assert_eq!(state(1_004, None).await, HlsReloadOutcome::TimedOut);
+        // An old position returns at once.
+        assert_eq!(state(999, Some(0)).await, HlsReloadOutcome::Ready);
+        // Two segments past the open one, or more than three seconds of
+        // parts ahead, is refused.
+        assert_eq!(state(1_005, None).await, HlsReloadOutcome::TooFarAhead);
+        assert_eq!(state(1_003, Some(40)).await, HlsReloadOutcome::TooFarAhead);
+
+        let get = |uri: &'static str| {
+            let router = router.clone();
+            async move {
+                let started = Instant::now();
+                let request = Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .body(())
+                    .unwrap();
+                (
+                    router.route(request).await.unwrap().status,
+                    started.elapsed(),
+                )
+            }
+        };
+        let (status, took) = get("/live/77/stream.m3u8?_HLS_msn=1005").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(took < Duration::from_millis(500));
+        // `_HLS_part` needs `_HLS_msn`.
+        let (status, _) = get("/live/77/stream.m3u8?_HLS_part=2").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = get("/live/77/stream.m3u8?_HLS_msn=1003&_HLS_part=5").await;
+        assert_eq!(status, StatusCode::OK);
+
+        // A part that the playlist does not name, and will not name soon, is
+        // not waited for. The part that the playlist hints is.
+        assert!(cache.part_request_may_wait(77, 36).await);
+        assert!(cache.part_request_may_wait(77, 40).await);
+        assert!(!cache.part_request_may_wait(77, 999_999).await);
+        let (status, took) = get("/live/77/part999999.mp4").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(took < Duration::from_millis(500), "{took:?}");
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_reload_that_never_arrives_is_answered_503() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 2_400, 64).await;
+        commit_stamped_video(&cache, 36).await;
+        // The stream has stopped. The wait ends after three target durations.
+        let started = Instant::now();
+        let outcome = cache
+            .wait_for_hls_reload_position(
+                77,
+                HlsReloadPosition {
+                    msn: 1_003,
+                    part: Some(6),
+                },
+            )
+            .await;
+        assert_eq!(outcome, HlsReloadOutcome::TimedOut);
+        let waited = started.elapsed();
+        assert!(
+            (Duration::from_millis(5_900)..Duration::from_millis(7_500)).contains(&waited),
+            "{waited:?}"
+        );
     }
 
     /// Copy one stored part from a distributor cache to an edge cache, as the
@@ -24688,6 +25237,7 @@ mod tests {
                 Some(250),
                 sequence % 4 == 0,
                 true,
+                None,
                 64,
             );
         };
@@ -25268,9 +25818,11 @@ mod tests {
                 .unwrap()
         };
         let playlist = "/live/801/stream.m3u8?_HLS_msn=4&_HLS_part=1";
+        // The reader is admitted with a plain reload. This node holds no part
+        // of the stream, so a reload for a position would wait and end.
         assert_eq!(
             router
-                .route(request(playlist, "reader-1"))
+                .route(request("/live/801/stream.m3u8", "reader-1"))
                 .await
                 .unwrap()
                 .status,
@@ -25329,7 +25881,7 @@ mod tests {
             .await;
         assert_eq!(
             router
-                .route(request(playlist, "reader-2"))
+                .route(request("/live/801/stream.m3u8", "reader-2"))
                 .await
                 .unwrap()
                 .status,
