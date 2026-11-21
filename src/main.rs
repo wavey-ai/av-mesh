@@ -14021,6 +14021,18 @@ impl AppRouter {
         let Some(ladder) = self.hls_renditions.ladder_of(stream_id) else {
             return playlist;
         };
+        // The renditions of a ladder must agree on when each segment
+        // starts: a player that changes rendition finds its place in the
+        // new playlist by the programme date and time.
+        let segment_ms = self
+            .cache
+            .state
+            .read()
+            .await
+            .stream_declared_ms
+            .get(&stream_id)
+            .map_or(0, |(_, target_ms)| u64::from(*target_ms));
+        playlist = with_ladder_program_date_time(playlist, segment_ms);
         for rendition in ladder {
             if rendition.stream_id == stream_id
                 || !self
@@ -17235,6 +17247,45 @@ fn part_ends_segment_short(duration_ms: u32, part_target_ms: u32) -> bool {
     part_target_ms > 0 && u64::from(duration_ms) * 100 < u64::from(part_target_ms) * 85
 }
 
+/// Give a rendition of a ladder a programme date and time that every other
+/// rendition has too: the Media Sequence Number of its first segment times
+/// the declared segment duration.
+///
+/// The date of a playlist is otherwise the time at which its contributor
+/// published the first part. The renditions of one ladder are published a
+/// few tenths of a second apart (0.14 s in the lab, 0.26 s on Linode), so
+/// the same segment had a different date in each, and hls.js asked for the
+/// wrong part after every change of rendition. The contributor numbers the
+/// segments of a ladder from one instant, so the number is the same in every
+/// rendition and on every cache.
+fn with_ladder_program_date_time(playlist: String, segment_ms: u64) -> String {
+    const TAG: &str = "#EXT-X-PROGRAM-DATE-TIME:";
+    if segment_ms == 0 {
+        return playlist;
+    }
+    let Some(msn) = playlist
+        .lines()
+        .find_map(|line| line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:"))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    else {
+        return playlist;
+    };
+    let Some(date) = msn
+        .checked_mul(segment_ms)
+        .and_then(|unix_ms| unix_ms.checked_mul(1_000))
+        .and_then(format_hls_program_date_time)
+    else {
+        return playlist;
+    };
+    let Some(start) = playlist.find(TAG) else {
+        return playlist;
+    };
+    let end = playlist[start..]
+        .find('\n')
+        .map_or(playlist.len(), |offset| start + offset);
+    format!("{}{TAG}{date}{}", &playlist[..start], &playlist[end..])
+}
+
 /// The last part that a playlist lists: its Media Sequence Number and its
 /// index in that segment. This is what a Rendition Report carries.
 fn playlist_last_position(playlist: &str) -> Option<(u64, u64)> {
@@ -18809,6 +18860,30 @@ mod tests {
         assert!(telemetry.advertisement_age_ms(&old, now_unix_ms()) >= 120_000);
         let unheard = advertisement("edge-unheard", now_ms - 5_000);
         assert!(telemetry.advertisement_age_ms(&unheard, now_unix_ms()) >= 5_000);
+    }
+
+    #[test]
+    fn the_renditions_of_a_ladder_have_the_date_of_their_segment_number() {
+        let rendition = |published: &str| {
+            format!(
+                "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:897622180\n\
+                 #EXT-X-PROGRAM-DATE-TIME:{published}\n#EXTINF:2.000,\nseg897622180.mp4\n"
+            )
+        };
+        // Two renditions whose first parts were published 262 ms apart.
+        let high = with_ladder_program_date_time(rendition("2026-11-21T07:03:20.412Z"), 2_000);
+        let low = with_ladder_program_date_time(rendition("2026-11-21T07:03:20.150Z"), 2_000);
+        assert_eq!(high, low);
+        assert!(
+            high.contains("#EXT-X-PROGRAM-DATE-TIME:2026-11-21T06:59:20.000Z\n#EXTINF"),
+            "{high}"
+        );
+        // A playlist without a date, or a stream without a declared segment
+        // duration, is left as it is.
+        let plain = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:5\n".to_owned();
+        assert_eq!(with_ladder_program_date_time(plain.clone(), 2_000), plain);
+        let dated = rendition("2026-11-21T07:03:20.412Z");
+        assert_eq!(with_ladder_program_date_time(dated.clone(), 0), dated);
     }
 
     #[test]
