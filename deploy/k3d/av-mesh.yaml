@@ -132,10 +132,6 @@ spec:
             - /etc/av-mesh/tls/tls.key
             - --telemetry-interval-ms
             - "250"
-            - --parts-per-segment
-            - "2"
-            - --window-parts
-            - "24"
             - --slot-kb
             - "2048"
           ports:
@@ -234,10 +230,6 @@ spec:
             - /etc/av-mesh/tls/tls.key
             - --telemetry-interval-ms
             - "250"
-            - --parts-per-segment
-            - "2"
-            - --window-parts
-            - "24"
             - --slot-kb
             - "2048"
           ports:

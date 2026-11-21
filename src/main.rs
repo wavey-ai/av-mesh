@@ -30821,6 +30821,32 @@ mod tests {
     // ---- AM1: the timeline in microseconds ----
 
     #[test]
+    fn the_k3d_nodes_use_the_time_based_defaults() {
+        // Explicit counts of parts win over --segment-ms and --window-ms, so
+        // counts sized for the old 50 ms part made a 60 ms window of 2.5 ms
+        // parts. The manifest pins none.
+        let manifest = include_str!("../deploy/k3d/av-mesh.yaml");
+        let mut nodes = 0;
+        let mut lines = manifest.lines().peekable();
+        while let Some(line) = lines.next() {
+            if line.trim() != "args:" {
+                continue;
+            }
+            let mut argv = vec!["av-mesh".to_string()];
+            while let Some(arg) = lines.peek().and_then(|line| line.trim().strip_prefix("- ")) {
+                argv.push(arg.trim_matches('"').to_string());
+                lines.next();
+            }
+            let args = Args::try_parse_from(&argv).unwrap().normalized().unwrap();
+            assert_eq!(args.part_us, DEFAULT_PART_US, "{argv:?}");
+            assert_eq!(args.parts_per_segment, 400, "{argv:?}");
+            assert_eq!(args.window_parts, 4_800, "{argv:?}");
+            nodes += 1;
+        }
+        assert_eq!(nodes, 2);
+    }
+
+    #[test]
     fn the_node_timeline_defaults_to_the_smallest_parts_and_time_windows() {
         let args = Args::try_parse_from(["av-mesh"])
             .unwrap()
