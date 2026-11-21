@@ -36,7 +36,7 @@ linode = { git = "https://github.com/wavey-ai/linode.git", rev = "df7374666fa153
 message-packetizer = "0.1.0"
 media-object = "0.1.1"
 media-capability = "0.1.1"
-playlists = { git = "https://github.com/wavey-ai/playlists.git", rev = "fc1631cb549b5c47aff24e387b24232cafbcdd48", features = ["mesh"] }
+playlists = { git = "https://github.com/wavey-ai/playlists.git", rev = "483765e6c23d49e74fd0e391d5b74101c96d9280", features = ["mesh"] }
 raptorq-datagram-fec = "0.1.6"
 raptorq-fec-transport = "0.1.4"
 relay-session = { version = "0.1.1", default-features = false }
@@ -64,4 +64,7 @@ ed25519-dalek = "2.2"
 rcgen = "0.13"
 
 [patch.crates-io]
-raptorq-datagram-fec = { path = "../raptor-fec/crates/raptorq-datagram-fec" }
+# The packet sequence tracker of 0.1.6 grows without limit after the first
+# lost or reordered datagram of a flow. The fix is on the branch
+# `bounded-sequence-tracker` of raptor-fec until a release has it.
+raptorq-datagram-fec = { git = "https://github.com/wavey-ai/raptor-fec.git", rev = "68a1840acd6158111738253a1ae71f54642d1ac3" }
