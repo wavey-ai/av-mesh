@@ -2,6 +2,7 @@ mod assignment;
 mod control;
 mod edge_admission;
 mod edge_lifecycle;
+mod edge_udp;
 mod link_telemetry;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -970,6 +971,20 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:12101")]
     media_fec_bind: SocketAddr,
 
+    /// Serve clients RaptorQ FEC UDP on this address: every part that this
+    /// node's cache holds, as LL-HLS serves it (see `client_udp`). Every
+    /// node of a region uses the same port; the assignment API names it.
+    #[arg(long)]
+    client_udp_bind: Option<SocketAddr>,
+
+    /// RaptorQ symbol size of the client UDP datagrams.
+    #[arg(long, default_value_t = av_mesh::client_udp::DEFAULT_SYMBOL_SIZE)]
+    client_udp_symbol_size: u16,
+
+    /// Client UDP subscriptions that this node takes at most.
+    #[arg(long, default_value_t = 4_096)]
+    client_udp_max_subscribers: usize,
+
     #[arg(long, default_value_t = 9444)]
     http_port: u16,
 
@@ -1853,6 +1868,7 @@ async fn main() -> Result<()> {
     .with_parents_silent_after(Duration::from_millis(EDGE_PARENTS_SILENT_MS))
     .with_regional_view_ttl(REGIONAL_VIEW_TTL)
     .with_playlist_demand(playlist_demand)
+    .with_client_udp_port(args.client_udp_bind.map(|bind| bind.port()))
     .with_assignment(
         AssignmentPolicy {
             spread_permille: u32::from(args.assignment_spread_percent.min(100)) * 10,
@@ -1910,6 +1926,26 @@ async fn main() -> Result<()> {
         telemetry_peer_monitor.clone(),
         ingest_shutdown_rx.clone(),
     );
+    let edge_udp_task = if let Some(bind) = args.client_udp_bind {
+        let socket = bind_buffered_udp_ingress(
+            bind,
+            args.udp_socket_buffer_bytes,
+            "edge client UDP",
+        )
+        .await?;
+        Some(tokio::spawn(edge_udp::run_edge_udp(
+            socket,
+            router.clone(),
+            edge_udp::EdgeUdpConfig {
+                symbol_size: args.client_udp_symbol_size,
+                max_subscribers: args.client_udp_max_subscribers,
+            },
+            Arc::clone(&router.edge_udp_stats),
+            ingest_shutdown_rx.clone(),
+        )))
+    } else {
+        None
+    };
     let replication_planner_task = tokio::spawn(run_replication_planner(
         router.clone(),
         Duration::from_millis(args.replication_plan_interval_ms),
@@ -2029,6 +2065,9 @@ async fn main() -> Result<()> {
     let _ = playlist_standby_task.await;
     http_runtime.shutdown_background();
     let _ = replication_planner_task.await;
+    if let Some(task) = edge_udp_task {
+        let _ = task.await;
+    }
     if let Some(task) = telemetry_publisher_task {
         let _ = task.await;
     }
@@ -13529,6 +13568,9 @@ struct AppRouter {
     private_discovery: PrivateDiscoveryStatus,
     operations_snapshot_file: Option<PathBuf>,
     playlist_demand: PlaylistDemand,
+    /// Port of the client UDP service of the nodes of this region.
+    client_udp_port: Option<u16>,
+    edge_udp_stats: Arc<edge_udp::EdgeUdpStats>,
     assignment_policy: AssignmentPolicy,
     steering_ttl_seconds: u64,
     /// An advertisement older than this does not make a cache assignable.
@@ -13611,6 +13653,8 @@ impl AppRouter {
             private_discovery,
             operations_snapshot_file,
             playlist_demand: PlaylistDemand::disabled(),
+            client_udp_port: None,
+            edge_udp_stats: Arc::default(),
             assignment_policy: AssignmentPolicy::default(),
             steering_ttl_seconds: 5,
             assignment_fresh_ms: DEFAULT_TELEMETRY_INTERVAL_MS.saturating_mul(3),
@@ -13621,6 +13665,11 @@ impl AppRouter {
             // told how long one reading serves.
             regional_view_ttl: Duration::ZERO,
         }
+    }
+
+    fn with_client_udp_port(mut self, port: Option<u16>) -> Self {
+        self.client_udp_port = port;
+        self
     }
 
     fn with_playlist_demand(mut self, playlist_demand: PlaylistDemand) -> Self {
@@ -14834,6 +14883,20 @@ impl AppRouter {
                 "max_alternates": self.assignment_policy.max_alternates,
             },
             "caches": caches,
+            "client_udp_port": self.client_udp_port,
+            "client_udp": self.client_udp_port.map(|_| {
+                let stats = &self.edge_udp_stats;
+                serde_json::json!({
+                    "subscriptions": stats.subscriptions.load(Ordering::Relaxed),
+                    "refusals": stats.refusals.load(Ordering::Relaxed),
+                    "moves": stats.moves.load(Ordering::Relaxed),
+                    "parts": stats.parts.load(Ordering::Relaxed),
+                    "gaps": stats.gaps.load(Ordering::Relaxed),
+                    "datagrams": stats.datagrams.load(Ordering::Relaxed),
+                    "bytes": stats.bytes.load(Ordering::Relaxed),
+                    "send_errors": stats.send_errors.load(Ordering::Relaxed),
+                })
+            }),
         });
         response(
             status,
@@ -28029,5 +28092,146 @@ mod tests {
             effective_replication(CacheMeshReplicationArg::All, CacheMeshRole::Distributor),
             ReplicationMode::All
         );
+    }
+
+    /// RaptorQ FEC UDP to a client at an edge: every part that the edge's
+    /// cache holds reaches the client bit for bit as its LL-HLS part, with a
+    /// third of the datagrams lost; a new part follows live; a drain sends
+    /// the client away. Before the client UDP port existed an edge had no
+    /// way to send its cache to a UDP client at all.
+    #[tokio::test]
+    async fn an_edge_sends_its_cached_parts_to_a_udp_client_bit_for_bit() {
+        use av_mesh::client_udp::{
+            Control, ObjectKind as UdpObjectKind, ObjectReceiver, RepairPolicy,
+        };
+        use tokio::time::timeout;
+
+        let cache = LiveTsCache::new(1, Duration::from_millis(250), 4, 32, 64).await;
+        let commit = |sequence: u64| {
+            let cache = Arc::clone(&cache);
+            async move {
+                cache
+                    .commit_stream_payload(
+                        77,
+                        encode_test_canonical_fmp4_bundle_with_duration(
+                            77,
+                            sequence,
+                            (sequence == 0).then_some(b"ftyp-fLaC-moov".as_slice()),
+                            &vec![sequence as u8; 3_000 + sequence as usize * 1_000],
+                            Some(250),
+                            true,
+                        ),
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        for sequence in 0..5 {
+            commit(sequence).await;
+        }
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let edge = socket.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let task = tokio::spawn(edge_udp::run_edge_udp(
+            socket,
+            router.clone(),
+            edge_udp::EdgeUdpConfig {
+                symbol_size: 1_200,
+                max_subscribers: 16,
+            },
+            Arc::default(),
+            shutdown_rx,
+        ));
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let subscribe = Control::Subscribe {
+            stream_id: 77,
+            from_part: Some(0),
+            repair: RepairPolicy {
+                permille: 500,
+                min_symbols: 4,
+            },
+        };
+        client.send_to(&subscribe.encode(), edge).await.unwrap();
+        let mut buf = vec![0_u8; 65_536];
+        let mut receiver = ObjectReceiver::new();
+        let mut parts = BTreeMap::new();
+        let mut init = None;
+        let mut subscribed = None;
+        let mut index = 0_usize;
+        while parts.len() < 5 {
+            let (len, peer) = timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+                .await
+                .expect("the edge sends parts")
+                .unwrap();
+            assert_eq!(peer, edge);
+            if let Some(control) = Control::decode(&buf[..len]) {
+                subscribed = Some(control);
+                continue;
+            }
+            index += 1;
+            if index % 3 == 0 {
+                continue; // a third of the datagrams are lost
+            }
+            if let Some(object) = receiver.push(&buf[..len]) {
+                match object.kind {
+                    UdpObjectKind::Init => init = Some(object.payload),
+                    UdpObjectKind::Part => {
+                        parts.insert(object.part, object.payload);
+                    }
+                    UdpObjectKind::Gap => panic!("no part is missing at the edge"),
+                }
+            }
+        }
+        assert_eq!(
+            subscribed,
+            Some(Control::Subscribed {
+                stream_id: 77,
+                first_part: 0
+            })
+        );
+        assert!(receiver.recovered_objects > 0);
+        let http_init = get_for_tests(&router, "/live/77/init.mp4").await;
+        assert_eq!(init, http_init.body);
+        for (part, payload) in &parts {
+            let http = get_for_tests(&router, &format!("/live/77/part{part}.mp4")).await;
+            assert_eq!(http.status, StatusCode::OK);
+            assert_eq!(Some(payload.clone()), http.body, "part {part}");
+        }
+
+        // A part published now follows live.
+        commit(5).await;
+        let part5 = loop {
+            let (len, _) = timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+                .await
+                .expect("the new part arrives")
+                .unwrap();
+            if let Some(object) = receiver.push(&buf[..len]) {
+                if object.part == 5 && object.kind == UdpObjectKind::Part {
+                    break object.payload;
+                }
+            }
+        };
+        assert_eq!(Some(part5), get_for_tests(&router, "/live/77/part5.mp4").await.body);
+
+        // A draining edge sends its clients to the next cache.
+        router.lifecycle.set_draining(true).await;
+        let moved = timeout(Duration::from_secs(5), async {
+            loop {
+                let (len, _) = client.recv_from(&mut buf).await.unwrap();
+                if let Some(Control::Move { reason, .. }) = Control::decode(&buf[..len]) {
+                    break reason;
+                }
+            }
+        })
+        .await
+        .expect("the client is told to move");
+        assert_eq!(moved, "draining");
+
+        let _ = shutdown_tx.send(());
+        task.await.unwrap().unwrap();
+        mesh.shutdown();
     }
 }
