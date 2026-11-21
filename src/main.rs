@@ -9485,6 +9485,17 @@ struct CacheReplicationSnapshot {
     subscriptions_refused: u64,
     /// Subscriptions that this distributor serves to edges.
     served_subscriptions: Vec<ServedSubscriptionSnapshot>,
+    /// Packet loss on the cache-mesh links of this node, in parts per
+    /// million: what this node measures from each peer, and what each peer
+    /// reports of this node.
+    link_loss: Vec<LinkLossSnapshot>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct LinkLossSnapshot {
+    peer: String,
+    receive_ppm: Option<u32>,
+    send_ppm: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -13107,6 +13118,16 @@ impl AppRouter {
                     warm_parts_pending: served.backfill_parts_pending,
                 })
                 .collect(),
+            link_loss: self
+                .mesh
+                .link_loss()
+                .into_iter()
+                .map(|loss| LinkLossSnapshot {
+                    peer: loss.peer.to_string(),
+                    receive_ppm: loss.receive_ppm,
+                    send_ppm: loss.send_ppm,
+                })
+                .collect(),
         }
     }
 
@@ -14197,6 +14218,7 @@ impl AppRouter {
                 .await;
         }
         let deadline = Instant::now() + Duration::from_millis(PART_WAIT_MS);
+        let mut requests = 0_u32;
         loop {
             let now = Instant::now();
             if now >= deadline {
@@ -14210,13 +14232,20 @@ impl AppRouter {
             {
                 return Some(part);
             }
-            self.repair_stream_hole(stream_id, seq).await;
+            // The first request goes to one parent. A hole that is still
+            // there after it is asked of both.
+            if self
+                .repair_stream_hole(stream_id, seq, if requests == 0 { 1 } else { 2 })
+                .await
+            {
+                requests += 1;
+            }
         }
     }
 
     /// Ask the parents for `seq` when it is a hole behind the stored head of
     /// the stream. Returns whether a request was sent.
-    async fn repair_stream_hole(&self, stream_id: u64, seq: u64) -> bool {
+    async fn repair_stream_hole(&self, stream_id: u64, seq: u64, parents: usize) -> bool {
         let Ok(slot) = usize::try_from(seq) else {
             return false;
         };
@@ -14231,22 +14260,25 @@ impl AppRouter {
         if head <= slot {
             return false;
         }
-        let part_ms = u64::try_from(self.cache.part_target.as_millis())
-            .unwrap_or(u64::MAX)
-            .max(1);
+        // The parts of this stream, not the nominal part of the node: a 4K
+        // stream has parts of 200 ms on a node that is sized for 5 ms audio.
+        let part_ms = self.cache.state.read().await.stream_part_ms(stream_id);
         let window_parts =
-            usize::try_from((EDGE_HOLE_REPAIR_WINDOW_MS / part_ms).max(1)).unwrap_or(usize::MAX);
+            usize::try_from((EDGE_HOLE_REPAIR_WINDOW_MS / part_ms).max(2)).unwrap_or(usize::MAX);
         if head - slot > window_parts {
             return false;
         }
-        let min_interval_ms = EDGE_HOLE_REPAIR_MIN_INTERVAL_MS.max(part_ms);
+        let min_interval_ms = EDGE_HOLE_REPAIR_MIN_INTERVAL_MS.max(part_ms.min(100));
         if !self
             .demand
             .should_repair_hole(stream_id, now_unix_ms(), min_interval_ms)
         {
             return false;
         }
-        match self.mesh.request_replica(stream_id, slot).await {
+        // Ask for the hole and nothing else. A parent that resends every
+        // part from the hole to its newest part doubles its work for each
+        // lost part, and a lossy link then takes the CPU of the parent.
+        match self.mesh.request_parts(stream_id, slot, 1, parents).await {
             Ok(_) => {
                 self.demand
                     .hole_repair_requests
@@ -17987,8 +18019,8 @@ mod tests {
             .should_request_replica(stream_id, now_unix_ms()));
 
         // The newest part and a part beyond it are not holes.
-        assert!(!router.repair_stream_hole(stream_id, 4).await);
-        assert!(!router.repair_stream_hole(stream_id, 5).await);
+        assert!(!router.repair_stream_hole(stream_id, 4, 1).await);
+        assert!(!router.repair_stream_hole(stream_id, 5, 1).await);
 
         let started = Instant::now();
         let (bytes, _hash) = timeout(
@@ -18103,11 +18135,11 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert!(!router.repair_stream_hole(stream_id, 1).await);
+        assert!(!router.repair_stream_hole(stream_id, 1, 1).await);
         // A hole inside the window is requested once, then rate limited.
         let recent = head - window_parts;
-        assert!(router.repair_stream_hole(stream_id, recent).await);
-        assert!(!router.repair_stream_hole(stream_id, recent).await);
+        assert!(router.repair_stream_hole(stream_id, recent, 1).await);
+        assert!(!router.repair_stream_hole(stream_id, recent, 1).await);
         assert_eq!(
             router.demand.hole_repair_requests.load(Ordering::Relaxed),
             1
