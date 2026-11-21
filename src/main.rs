@@ -6085,8 +6085,15 @@ impl LiveTsCache {
                 .copied();
             match declared_target_ms {
                 // The target duration of a stamped stream is the one that
-                // its contributor declares.
-                Some(declared_ms) if declared_ms > 0 => declared_ms.max(observed.unwrap_or(0)),
+                // its contributor declares, and nothing else. One long
+                // segment, after a fault upstream, is longer than the target
+                // while it is in the playlist. It does not raise the target
+                // of the stream for good, and with it the hold-back of every
+                // player.
+                Some(declared_ms) if declared_ms > 0 => {
+                    let _ = observed;
+                    declared_ms
+                }
                 _ => observed
                     .unwrap_or(fallback_segment_duration_ms)
                     .max(fallback_segment_duration_ms),
@@ -26196,6 +26203,39 @@ mod tests {
         assert!(late.get_segment_for_stream_id(77, 1_002).await.is_some());
         assert!(late.get_segment_for_stream_id(77, 1_001).await.is_none());
         assert!(late.get_segment_for_stream_id(77, 1_003).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn one_long_segment_does_not_raise_the_target_duration_of_a_stamped_stream() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 2_400, 64).await;
+        // Segments of 2 s, 6 s (a fault upstream) and 2 s, and an open one.
+        // The contributor declares 2 s on every part.
+        let mut sequence = 0;
+        for (segment, parts) in [(700_u64, 10_u32), (701, 30), (702, 10), (703, 3)] {
+            for part in 0..parts {
+                let stamp = PartStamp {
+                    msn: segment,
+                    part,
+                    part_target_ms: 200,
+                    target_duration_ms: 2_000,
+                };
+                cache
+                    .commit_stream_payload(
+                        77,
+                        encode_test_stamped_fmp4_part(77, 5, sequence, part == 0, 200, Some(stamp)),
+                    )
+                    .await
+                    .unwrap();
+                sequence += 1;
+            }
+        }
+        let playlist = cache.playlist_for_stream_id(77).await;
+        assert!(
+            playlist.contains("#EXTINF:6.000,\nseg701.mp4\n"),
+            "{playlist}"
+        );
+        assert!(playlist.contains("#EXT-X-TARGETDURATION:2\n"), "{playlist}");
+        assert!(playlist.contains("HOLD-BACK=6.000"), "{playlist}");
     }
 
     #[tokio::test]
