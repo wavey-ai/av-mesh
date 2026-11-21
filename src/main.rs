@@ -827,9 +827,24 @@ fn rebox_soundkit_v2_bundle(payload: &[u8], sequence: u64) -> Result<ReboxedLive
             bail!("Soundkit v2 bundle epoch {epoch} frame is truncated");
         }
         if let Ok(header) = FrameHeaderV2::decode(&mut &payload[offset..frame_end]) {
-            bundle_samples = bundle_samples.saturating_add(u64::from(header.frame_count()));
+            let frame_count = u64::from(header.frame_count());
+            bundle_samples = bundle_samples.saturating_add(frame_count);
             if sample_rate == 0 {
                 sample_rate = header.sample_rate();
+            }
+            // The fMP4 boxer writes FLAC on a millisecond clock, each frame
+            // rounded to a whole millisecond: a 2.5 ms frame becomes 3 ms and
+            // the parts overlap. Refuse it rather than publish that timeline.
+            // Opus is on a 48 kHz clock and is made exact below.
+            let rate = u64::from(header.sample_rate());
+            if codec == SoundKitFmp4Codec::Flac
+                && rate > 0
+                && !frame_count.saturating_mul(1_000).is_multiple_of(rate)
+            {
+                bail!(
+                    "Soundkit v2 FLAC frames of {frame_count} samples at {rate} Hz are not a whole \
+                     millisecond; the fMP4 boxer keeps FLAC on a millisecond clock"
+                );
             }
         }
         framed.extend_from_slice(&payload[offset..frame_end]);
@@ -869,14 +884,104 @@ fn rebox_soundkit_v2_bundle(payload: &[u8], sequence: u64) -> Result<ReboxedLive
             reboxed.codec.name()
         );
     }
+    let mut media = reboxed.media;
+    if codec == SoundKitFmp4Codec::Opus && bundle_samples > 0 && sample_rate > 0 {
+        // The boxer takes the start in whole milliseconds and puts the
+        // first packet at that millisecond on its 48 kHz clock, so 2.5 ms
+        // parts would start at 0, 2, 5, 7 ms and overlap or leave gaps. The
+        // packet durations it writes are exact samples; the start is set
+        // here to the exact sample of the part.
+        let decode_time = u128::from(sequence) * u128::from(bundle_samples) * 48_000
+            / u128::from(sample_rate);
+        let decode_time =
+            u64::try_from(decode_time).context("Soundkit v2 publication timeline overflow")?;
+        let mut patched = media.to_vec();
+        set_fmp4_base_media_decode_time(&mut patched, decode_time)?;
+        media = Bytes::from(patched);
+    }
     Ok(ReboxedLiveAudio {
         init: reboxed
             .init
             .context("Soundkit v2 rebox did not return fMP4 initialization")?,
         duration_us: soundkit_duration_us(reboxed.frame_count, reboxed.sample_rate)
             .unwrap_or_else(|| reboxed.duration_ms.saturating_mul(1_000)),
-        media: reboxed.media,
+        media,
     })
+}
+
+/// The boxes directly inside `data`, as (type, start of the box, start of
+/// its payload, end of the box).
+fn fmp4_child_boxes(data: &[u8]) -> Result<Vec<([u8; 4], usize, usize, usize)>> {
+    let mut boxes = Vec::new();
+    let mut offset = 0;
+    while offset < data.len() {
+        let header = data
+            .get(offset..offset + 8)
+            .context("fMP4 box header is truncated")?;
+        let size32 = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+        let kind: [u8; 4] = header[4..8].try_into().unwrap();
+        let (size, payload) = match size32 {
+            0 => (data.len() - offset, offset + 8),
+            1 => {
+                let large = data
+                    .get(offset + 8..offset + 16)
+                    .context("fMP4 large box header is truncated")?;
+                (
+                    usize::try_from(u64::from_be_bytes(large.try_into().unwrap()))
+                        .context("fMP4 box is too large")?,
+                    offset + 16,
+                )
+            }
+            size => (size, offset + 8),
+        };
+        let end = offset.checked_add(size).context("fMP4 box size overflow")?;
+        if size < payload - offset || end > data.len() {
+            bail!("fMP4 box {} has an invalid size", String::from_utf8_lossy(&kind));
+        }
+        boxes.push((kind, offset, payload, end));
+        offset = end;
+    }
+    Ok(boxes)
+}
+
+/// Set the baseMediaDecodeTime of every `tfdt` of an fMP4 fragment.
+fn set_fmp4_base_media_decode_time(media: &mut [u8], decode_time: u64) -> Result<()> {
+    let mut patched = 0;
+    for (kind, _, moof_payload, moof_end) in fmp4_child_boxes(media)? {
+        if &kind != b"moof" {
+            continue;
+        }
+        for (kind, _, traf_payload, traf_end) in
+            fmp4_child_boxes(&media[moof_payload..moof_end])?
+        {
+            if &kind != b"traf" {
+                continue;
+            }
+            let traf = moof_payload + traf_payload..moof_payload + traf_end;
+            for (kind, _, payload, end) in fmp4_child_boxes(&media[traf.clone()])? {
+                if &kind != b"tfdt" {
+                    continue;
+                }
+                let tfdt = &mut media[traf.start + payload..traf.start + end];
+                match tfdt.first() {
+                    Some(0) if tfdt.len() >= 8 => {
+                        let value = u32::try_from(decode_time)
+                            .context("fMP4 decode time does not fit a version 0 tfdt")?;
+                        tfdt[4..8].copy_from_slice(&value.to_be_bytes());
+                    }
+                    Some(1) if tfdt.len() >= 12 => {
+                        tfdt[4..12].copy_from_slice(&decode_time.to_be_bytes());
+                    }
+                    _ => bail!("fMP4 tfdt is malformed"),
+                }
+                patched += 1;
+            }
+        }
+    }
+    if patched == 0 {
+        bail!("fMP4 fragment has no tfdt");
+    }
+    Ok(())
 }
 
 /// `samples` at `sample_rate` in microseconds, rounded: 120 samples at
@@ -31630,6 +31735,118 @@ mod tests {
         // Two 5 ms epochs: 10 ms.
         let reboxed = rebox_soundkit_v2_bundle(&soundkit_v2_test_bundle(2, 240), 3).unwrap();
         assert_eq!(reboxed.duration_us, 10_000);
+    }
+
+    /// The tfdt decode time and the sample durations of the trun of an fMP4
+    /// fragment of one track.
+    fn fmp4_fragment_timeline(media: &[u8]) -> (u64, Vec<u32>) {
+        let find = |data: &[u8], kind: &[u8; 4]| {
+            let (_, _, payload, end) = fmp4_child_boxes(data)
+                .unwrap()
+                .into_iter()
+                .find(|(found, ..)| found == kind)
+                .unwrap_or_else(|| panic!("no {}", String::from_utf8_lossy(kind)));
+            data[payload..end].to_vec()
+        };
+        let traf = find(&find(media, b"moof"), b"traf");
+        let tfdt = find(&traf, b"tfdt");
+        let decode_time = match tfdt[0] {
+            0 => u64::from(u32::from_be_bytes(tfdt[4..8].try_into().unwrap())),
+            _ => u64::from_be_bytes(tfdt[4..12].try_into().unwrap()),
+        };
+        let trun = find(&traf, b"trun");
+        let flags = u32::from_be_bytes([0, trun[1], trun[2], trun[3]]);
+        assert!(flags & 0x100 != 0, "trun carries sample durations");
+        let count = u32::from_be_bytes(trun[4..8].try_into().unwrap()) as usize;
+        let mut offset = 8;
+        if flags & 0x1 != 0 {
+            offset += 4;
+        }
+        if flags & 0x4 != 0 {
+            offset += 4;
+        }
+        let per_sample = [0x100, 0x200, 0x400, 0x800]
+            .iter()
+            .filter(|bit| flags & **bit != 0)
+            .count()
+            * 4;
+        let durations = (0..count)
+            .map(|index| {
+                let at = offset + index * per_sample;
+                u32::from_be_bytes(trun[at..at + 4].try_into().unwrap())
+            })
+            .collect();
+        (decode_time, durations)
+    }
+
+    #[test]
+    fn reboxed_parts_of_two_and_a_half_ms_opus_have_a_contiguous_timeline() {
+        // The boxer took the start of each part in whole ms: 0, 2, 5, 7, 10
+        // ms, so parts of 120 samples overlapped or left gaps of 0.5 ms.
+        let mut next = None;
+        for sequence in 0..6_u64 {
+            let reboxed =
+                rebox_soundkit_v2_bundle(&soundkit_v2_test_bundle(1, 120), sequence).unwrap();
+            let (decode_time, durations) = fmp4_fragment_timeline(&reboxed.media);
+            assert_eq!(decode_time, sequence * 120, "part {sequence}");
+            if let Some(next) = next {
+                assert_eq!(decode_time, next, "part {sequence} follows the last");
+            }
+            assert_eq!(durations, vec![120]);
+            next = Some(decode_time + durations.iter().map(|d| u64::from(*d)).sum::<u64>());
+        }
+        // Bundles of two 5 ms epochs are exact as before.
+        let reboxed = rebox_soundkit_v2_bundle(&soundkit_v2_test_bundle(2, 240), 3).unwrap();
+        assert_eq!(fmp4_fragment_timeline(&reboxed.media), (1_440, vec![240, 240]));
+    }
+
+    #[test]
+    fn a_flac_bundle_of_frames_that_are_not_whole_milliseconds_is_refused() {
+        use frame_header::{EncodingFlag, Endianness};
+        let bundle = |samples: u32| {
+            let mut bundle = Vec::new();
+            bundle.extend_from_slice(SOUNDKIT_V2_BUNDLE_MAGIC);
+            bundle.push(1); // FLAC
+            bundle.extend_from_slice(&1_u64.to_be_bytes());
+            bundle.extend_from_slice(&9_u16.to_be_bytes());
+            bundle.extend_from_slice(&1_u16.to_be_bytes());
+            let packet = vec![0xAA; 8];
+            let header = FrameHeaderV2::new(
+                EncodingFlag::FLAC,
+                packet.len() as u32,
+                samples,
+                48_000,
+                1,
+                16,
+                Endianness::LittleEndian,
+                None,
+                Some(0),
+                None,
+            )
+            .unwrap();
+            let mut frame = Vec::new();
+            header.encode(&mut frame).unwrap();
+            frame.extend_from_slice(&packet);
+            bundle.extend_from_slice(&9_u16.to_be_bytes());
+            bundle.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+            bundle.extend_from_slice(&frame);
+            bundle
+        };
+        // 32 and 120 samples (0.667 and 2.5 ms) cannot be written on the
+        // boxer's millisecond FLAC clock.
+        for samples in [32, 120] {
+            let error = rebox_soundkit_v2_bundle(&bundle(samples), 1)
+                .err()
+                .expect("refused");
+            assert!(
+                error.to_string().contains("not a whole"),
+                "{samples}: {error}"
+            );
+        }
+        // 48 samples are 1 ms: past this check (the test frame itself is
+        // not FLAC, so the rebox fails later, for another reason).
+        let error = rebox_soundkit_v2_bundle(&bundle(48), 1).err().expect("junk");
+        assert!(!error.to_string().contains("not a whole"), "{error}");
     }
 
     #[test]
