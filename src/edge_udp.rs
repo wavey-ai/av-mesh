@@ -457,8 +457,8 @@ async fn part_object(router: &AppRouter, stream_id: u64, part: u64, bytes: Bytes
         datagrams: 0,
         stream_id,
         part,
-        available_unix_us: times.map_or(0, |(available, _)| available),
-        published_unix_us: times.and_then(|(_, published)| published).unwrap_or(0),
+        available_unix_us: times.as_ref().map_or(0, |times| times.available_unix_us),
+        published_unix_us: times.and_then(|times| times.published_unix_us).unwrap_or(0),
         payload: bytes,
     }
 }
