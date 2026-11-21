@@ -13,22 +13,23 @@
 //! sent to it, so a forged source address gets at most an answer smaller than
 //! the request.
 
+use crate::fast_plane::{StreamClasses, TrafficClass};
 use crate::{AppRouter, ParentsLost};
 use av_mesh::client_udp::{
-    block_id, cut_through_block_id, cut_through_symbol_size, encode_block, encode_object,
-    geometry, source_datagram, Control, ObjectKind, PartObject, RepairPolicy, KEEPALIVE,
+    block_id, cut_through_block_id, cut_through_symbol_size, encode_block, encode_object, geometry,
+    source_datagram, Control, ObjectKind, PartObject, RepairPolicy, KEEPALIVE,
     MIN_FIRST_REQUEST_BYTES, SUBSCRIPTION_TTL,
 };
+use bytes::Bytes;
 use playlists::mesh::{chunk_frame_slot, CacheMeshReceiveObserver};
 use raptorq_datagram_fec::DatagramFecHeader;
-use std::collections::BTreeSet;
-use std::sync::OnceLock;
-use bytes::Bytes;
 use std::collections::hash_map::RandomState;
+use std::collections::BTreeSet;
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
@@ -73,6 +74,58 @@ pub(crate) struct EdgeUdpStats {
     pub cut_through_fallbacks: AtomicU64,
     /// Datagrams not sent because the socket was full.
     pub would_block: AtomicU64,
+    /// Cache-mesh datagrams that the cut-through thread could not take in
+    /// time (its queue was full): their client symbols go with the part's
+    /// completion instead.
+    pub cut_through_queue_drops: AtomicU64,
+}
+
+/// The client socket of an edge, or a pair of them on one address: audio
+/// streams' datagrams leave from the audio socket (SO_PRIORITY 6, band 0 of
+/// the host's prio qdisc), video streams' from the video socket, so a 4K
+/// burst never sits ahead of audio in a socket or the host queue. Both read
+/// control: SO_REUSEPORT spreads a client's requests over them.
+#[derive(Clone)]
+pub(crate) struct EdgeSockets {
+    audio: Arc<UdpSocket>,
+    video: Option<Arc<UdpSocket>>,
+    classes: StreamClasses,
+}
+
+impl EdgeSockets {
+    pub(crate) fn single(socket: UdpSocket) -> Self {
+        Self {
+            audio: Arc::new(socket),
+            video: None,
+            classes: StreamClasses::default(),
+        }
+    }
+
+    pub(crate) fn pair(audio: UdpSocket, video: UdpSocket, classes: StreamClasses) -> Self {
+        Self {
+            audio: Arc::new(audio),
+            video: Some(Arc::new(video)),
+            classes,
+        }
+    }
+
+    /// The socket that a stream's datagrams leave from.
+    pub(crate) fn for_stream(&self, stream_id: u64) -> &Arc<UdpSocket> {
+        match (&self.video, self.classes.class(stream_id)) {
+            (Some(video), TrafficClass::Video) => video,
+            _ => &self.audio,
+        }
+    }
+}
+
+async fn recv_optional(
+    socket: Option<&Arc<UdpSocket>>,
+    buffer: &mut [u8],
+) -> std::io::Result<(usize, SocketAddr)> {
+    match socket {
+        Some(socket) => socket.recv_from(buffer).await,
+        None => std::future::pending().await,
+    }
 }
 
 #[derive(Debug)]
@@ -134,27 +187,36 @@ fn subscriber_count(table: &Table) -> usize {
 }
 
 pub(crate) async fn run_edge_udp(
-    socket: UdpSocket,
+    sockets: EdgeSockets,
     router: AppRouter,
     config: EdgeUdpConfig,
     stats: Arc<EdgeUdpStats>,
-    cut_through: Option<Arc<CutThrough>>,
+    cut_through: Vec<Arc<CutThrough>>,
     mut shutdown_rx: watch::Receiver<()>,
 ) -> anyhow::Result<()> {
-    let socket = Arc::new(socket);
     let table: Table = Arc::default();
-    if let Some(cut) = &cut_through {
-        cut.arm(Arc::clone(&socket), Arc::clone(&table), config, Arc::clone(&stats));
+    for cut in &cut_through {
+        cut.arm(
+            sockets.clone(),
+            Arc::clone(&table),
+            config,
+            Arc::clone(&stats),
+        );
     }
     let admitting: Admitting = Arc::default();
     let tokens = Tokens(RandomState::new());
-    let mut buf = vec![0_u8; 2_048];
-    info!(bind = %socket.local_addr()?, "edge client UDP (RaptorQ FEC) listening");
+    let mut audio_buf = vec![0_u8; 2_048];
+    let mut video_buf = vec![0_u8; 2_048];
+    info!(
+        bind = %sockets.audio.local_addr()?,
+        class_sockets = sockets.video.is_some(),
+        "edge client UDP (RaptorQ FEC) listening"
+    );
     loop {
-        let (len, peer) = tokio::select! {
+        let (len, peer, from_video) = tokio::select! {
             _ = shutdown_rx.changed() => return Ok(()),
-            received = socket.recv_from(&mut buf) => match received {
-                Ok(received) => received,
+            received = sockets.audio.recv_from(&mut audio_buf) => match received {
+                Ok((len, peer)) => (len, peer, false),
                 Err(error) => {
                     // An ICMP port unreachable of a departed client surfaces
                     // here on some kernels; it is not fatal.
@@ -162,8 +224,26 @@ pub(crate) async fn run_edge_udp(
                     continue;
                 }
             },
+            received = recv_optional(sockets.video.as_ref(), &mut video_buf) => match received {
+                Ok((len, peer)) => (len, peer, true),
+                Err(error) => {
+                    debug!(error = %error, "edge client UDP receive error");
+                    continue;
+                }
+            },
         };
-        let Some(control) = Control::decode(&buf[..len]) else {
+        // Answer from the socket the request came to; both have the
+        // client's address.
+        let (socket, request) = if from_video {
+            (
+                sockets.video.as_ref().expect("received on it"),
+                &video_buf[..len],
+            )
+        } else {
+            (&sockets.audio, &audio_buf[..len])
+        };
+        let socket = Arc::clone(socket);
+        let Some(control) = Control::decode(request) else {
             continue;
         };
         match control {
@@ -208,8 +288,7 @@ pub(crate) async fn run_edge_udp(
                             // A client that names a part has not yet heard
                             // the edge's answer: it resumes there.
                             if let (Some(part), Some(head)) = (from_part, head) {
-                                if part < subscriber.next_part
-                                    && head.saturating_sub(part) < window
+                                if part < subscriber.next_part && head.saturating_sub(part) < window
                                 {
                                     subscriber.next_part = part;
                                 }
@@ -251,6 +330,7 @@ pub(crate) async fn run_edge_udp(
                 }
                 let admission = admit(
                     Arc::clone(&socket),
+                    sockets.clone(),
                     router.clone(),
                     Arc::clone(&table),
                     config,
@@ -308,6 +388,7 @@ async fn head_part(router: &AppRouter, stream_id: u64) -> Option<u64> {
 #[allow(clippy::too_many_arguments)]
 async fn admit(
     socket: Arc<UdpSocket>,
+    sockets: EdgeSockets,
     router: AppRouter,
     table: Table,
     config: EdgeUdpConfig,
@@ -403,7 +484,7 @@ async fn admit(
     info!(%peer, stream_id, first_part, head, "edge client UDP subscription");
     if start_sender {
         tokio::spawn(run_stream_sender(
-            socket, router, table, config, stats, stream_id,
+            sockets, router, table, config, stats, stream_id,
         ));
     }
 }
@@ -529,7 +610,12 @@ async fn send_init_if_new(
 /// The subscribers due for `part`, after the part has been taken for them.
 /// A subscriber that cut-through carries the part to is passed over, unless
 /// `gap`: a gap goes to every subscriber due.
-fn take_due(table: &Table, stream_id: u64, part: u64, gap: bool) -> Vec<(SocketAddr, RepairPolicy)> {
+fn take_due(
+    table: &Table,
+    stream_id: u64,
+    part: u64,
+    gap: bool,
+) -> Vec<(SocketAddr, RepairPolicy)> {
     let mut table = table.lock().unwrap();
     let Some(entry) = table.get_mut(&stream_id) else {
         return Vec::new();
@@ -570,7 +656,10 @@ async fn deliver(
     }
     let object = match bytes {
         Some(bytes) => {
-            send_init_if_new(socket, router, table, config, stats, stream_id, part, &targets).await;
+            send_init_if_new(
+                socket, router, table, config, stats, stream_id, part, &targets,
+            )
+            .await;
             stats.parts.fetch_add(1, Ordering::Relaxed);
             part_object(router, stream_id, part, bytes).await
         }
@@ -583,7 +672,7 @@ async fn deliver(
 }
 
 async fn run_stream_sender(
-    socket: Arc<UdpSocket>,
+    sockets: EdgeSockets,
     router: AppRouter,
     table: Table,
     config: EdgeUdpConfig,
@@ -594,6 +683,8 @@ async fn run_stream_sender(
     let mut last_sent = Instant::now();
     loop {
         let now = Instant::now();
+        // The stream's class can become known after it started.
+        let socket = Arc::clone(sockets.for_stream(stream_id));
         let head = head_part(&router, stream_id).await;
         let window = router.cache.window_parts_for(stream_id).await as u64;
         // Subscribers that stopped refreshing end; with none left, so does
@@ -604,7 +695,9 @@ async fn run_stream_sender(
             let Some(entry) = guard.get_mut(&stream_id) else {
                 return;
             };
-            entry.subscribers.retain(|_, subscriber| subscriber.expires_at > now);
+            entry
+                .subscribers
+                .retain(|_, subscriber| subscriber.expires_at > now);
             if entry.subscribers.is_empty() {
                 guard.remove(&stream_id);
                 debug!(stream_id, "edge client UDP sender stops: no subscriber");
@@ -617,7 +710,10 @@ async fn run_stream_sender(
                     }
                 }
             }
-            let nexts = entry.subscribers.values().map(|subscriber| subscriber.next_part);
+            let nexts = entry
+                .subscribers
+                .values()
+                .map(|subscriber| subscriber.next_part);
             (
                 nexts.clone().min().unwrap_or(0),
                 nexts.max().unwrap_or(0),
@@ -636,7 +732,12 @@ async fn run_stream_sender(
                         .unwrap_or_default()
                 };
                 stats.moves.fetch_add(peers.len() as u64, Ordering::Relaxed);
-                info!(stream_id, reason, clients = peers.len(), "edge client UDP moves its clients");
+                info!(
+                    stream_id,
+                    reason,
+                    clients = peers.len(),
+                    "edge client UDP moves its clients"
+                );
                 for peer in peers {
                     send_control(
                         &socket,
@@ -678,7 +779,10 @@ async fn run_stream_sender(
                     _ => None,
                 },
             };
-            deliver(&socket, &router, &table, config, &stats, stream_id, part, bytes).await;
+            deliver(
+                &socket, &router, &table, config, &stats, stream_id, part, bytes,
+            )
+            .await;
             last_sent = Instant::now();
             continue;
         }
@@ -689,8 +793,17 @@ async fn run_stream_sender(
             .await
         {
             Ok(Ok(Some((bytes, _)))) => {
-                deliver(&socket, &router, &table, config, &stats, stream_id, part, Some(bytes))
-                    .await;
+                deliver(
+                    &socket,
+                    &router,
+                    &table,
+                    config,
+                    &stats,
+                    stream_id,
+                    part,
+                    Some(bytes),
+                )
+                .await;
                 last_sent = Instant::now();
             }
             Ok(Err(ParentsLost)) => {
@@ -741,7 +854,7 @@ pub(crate) struct CutThrough {
 }
 
 struct CutInner {
-    socket: Arc<UdpSocket>,
+    sockets: EdgeSockets,
     table: Table,
     config: EdgeUdpConfig,
     stats: Arc<EdgeUdpStats>,
@@ -791,13 +904,13 @@ const MAX_PENDING_BLOCKS: usize = 1_024;
 impl CutThrough {
     pub(crate) fn arm(
         &self,
-        socket: Arc<UdpSocket>,
+        sockets: EdgeSockets,
         table: Table,
         config: EdgeUdpConfig,
         stats: Arc<EdgeUdpStats>,
     ) {
         let _ = self.inner.set(CutInner {
-            socket,
+            sockets,
             table,
             config,
             stats,
@@ -808,13 +921,22 @@ impl CutThrough {
 
 /// Send to every client now. `false` if a send found the socket full: the
 /// symbol is then sent again with the part's repair.
-fn send_now(inner: &CutInner, datagram: &[u8], clients: &[(SocketAddr, RepairPolicy)]) -> bool {
+fn send_now(
+    inner: &CutInner,
+    stream_id: u64,
+    datagram: &[u8],
+    clients: &[(SocketAddr, RepairPolicy)],
+) -> bool {
     let mut all = true;
+    let socket = inner.sockets.for_stream(stream_id);
     for (peer, _) in clients {
-        match inner.socket.try_send_to(datagram, *peer) {
+        match socket.try_send_to(datagram, *peer) {
             Ok(sent) => {
                 inner.stats.datagrams.fetch_add(1, Ordering::Relaxed);
-                inner.stats.cut_through_datagrams.fetch_add(1, Ordering::Relaxed);
+                inner
+                    .stats
+                    .cut_through_datagrams
+                    .fetch_add(1, Ordering::Relaxed);
                 inner.stats.bytes.fetch_add(sent as u64, Ordering::Relaxed);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -855,7 +977,13 @@ impl CutState {
 }
 
 /// Forward one mesh source symbol of a chosen route, cut into client symbols.
-fn forward_symbol(inner: &CutInner, route: &mut Route, clients: &[(SocketAddr, RepairPolicy)], esi: u32, data: &[u8]) {
+fn forward_symbol(
+    inner: &CutInner,
+    route: &mut Route,
+    clients: &[(SocketAddr, RepairPolicy)],
+    esi: u32,
+    data: &[u8],
+) {
     let per_mesh = u32::from(route.mesh_symbol / route.client_symbol).max(1);
     let client_size = usize::from(route.client_symbol);
     for (index, piece) in data.chunks(client_size).enumerate() {
@@ -877,7 +1005,7 @@ fn forward_symbol(inner: &CutInner, route: &mut Route, clients: &[(SocketAddr, R
             continue;
         };
         route.sequence = route.sequence.wrapping_add(1);
-        *done = send_now(inner, &datagram, clients);
+        *done = send_now(inner, route.stream_id, &datagram, clients);
     }
 }
 
@@ -906,7 +1034,10 @@ impl CacheMeshReceiveObserver for CutThrough {
         if !state.routes.contains_key(&key) {
             if esi != 0 {
                 // The first symbol names the part; until it arrives, hold.
-                let (_, held) = state.pending.entry(key).or_insert_with(|| (now, Vec::new()));
+                let (_, held) = state
+                    .pending
+                    .entry(key)
+                    .or_insert_with(|| (now, Vec::new()));
                 if held.len() < MAX_PENDING_PER_BLOCK {
                     held.push(datagram.to_vec());
                 }
@@ -914,7 +1045,11 @@ impl CacheMeshReceiveObserver for CutThrough {
             }
             let route = new_route(inner, &mut state, key, &header, &payload[4..], now);
             state.routes.insert(key, route);
-            let held = state.pending.remove(&key).map(|(_, held)| held).unwrap_or_default();
+            let held = state
+                .pending
+                .remove(&key)
+                .map(|(_, held)| held)
+                .unwrap_or_default();
             let state = &mut *state;
             let route = state.routes.get_mut(&key).unwrap();
             if !route.chosen {
@@ -972,7 +1107,9 @@ impl CacheMeshReceiveObserver for CutThrough {
         };
         let state = &mut *state;
         let Some(claim) = state.slots.get_mut(&(stream_id, slot)) else {
-            state.decoded_unclaimed.insert((stream_id, slot), Instant::now());
+            state
+                .decoded_unclaimed
+                .insert((stream_id, slot), Instant::now());
             return;
         };
         if claim.done {
@@ -981,7 +1118,10 @@ impl CacheMeshReceiveObserver for CutThrough {
         claim.done = true;
         let clients = claim.clients.clone();
         let chosen = claim.chosen == key;
-        let route = state.routes.get(&key).filter(|route| route.chosen && chosen);
+        let route = state
+            .routes
+            .get(&key)
+            .filter(|route| route.chosen && chosen);
         let job = match route {
             // The chosen block: the client symbols it never sent, and repair.
             Some(route) => CompleteJob::Chosen {
@@ -996,11 +1136,17 @@ impl CacheMeshReceiveObserver for CutThrough {
             },
             // Another parent's block decoded first: it carries the whole part.
             None => {
-                inner.stats.cut_through_fallbacks.fetch_add(1, Ordering::Relaxed);
+                inner
+                    .stats
+                    .cut_through_fallbacks
+                    .fetch_add(1, Ordering::Relaxed);
                 CompleteJob::Whole
             }
         };
-        inner.stats.cut_through_parts.fetch_add(1, Ordering::Relaxed);
+        inner
+            .stats
+            .cut_through_parts
+            .fetch_add(1, Ordering::Relaxed);
         // Each client's repair as it asks for it now, not when the part began.
         let clients: Vec<(SocketAddr, RepairPolicy)> = {
             let table = inner.table.lock().unwrap();
@@ -1016,13 +1162,88 @@ impl CacheMeshReceiveObserver for CutThrough {
                 .collect()
         };
         let frame = frame.to_vec();
-        let socket = Arc::clone(&inner.socket);
+        let socket = Arc::clone(inner.sockets.for_stream(stream_id));
         let stats = Arc::clone(&inner.stats);
         let max_symbol = inner.config.symbol_size;
         // Encoding a 4K part takes milliseconds: not on the receive task.
         tokio::task::spawn_blocking(move || {
             complete(&socket, &stats, max_symbol, slot, &frame, job, &clients)
         });
+    }
+}
+
+/// Datagrams a cut-through thread holds before it drops one.
+const CUT_LANE_CAPACITY: usize = 65_536;
+
+enum CutEvent {
+    Datagram(SocketAddr, Vec<u8>),
+    Decoded(SocketAddr, Vec<u8>, Vec<u8>),
+}
+
+/// Runs a [`CutThrough`] on a thread of its own: the cache-mesh receive
+/// task only copies each datagram onto a queue, so the per-client sends,
+/// the cut-through state's lock and the completion's spawn never hold back
+/// the decode of the next part. One lane per class: with a class-split
+/// mesh, the audio and the video receive task each feed their own.
+pub(crate) struct CutThroughLane {
+    cut: Arc<CutThrough>,
+    queue: std::sync::mpsc::SyncSender<CutEvent>,
+}
+
+impl CutThroughLane {
+    /// Start the lane's thread. `runtime` is where the completions of
+    /// decoded parts run (they encode on its blocking pool).
+    pub(crate) fn start(
+        cut: Arc<CutThrough>,
+        name: &str,
+        runtime: tokio::runtime::Handle,
+    ) -> std::io::Result<Arc<Self>> {
+        let (queue, events) = std::sync::mpsc::sync_channel::<CutEvent>(CUT_LANE_CAPACITY);
+        let worker = Arc::clone(&cut);
+        std::thread::Builder::new()
+            .name(format!("needletail-cut-{name}"))
+            .spawn(move || {
+                let _runtime = runtime.enter();
+                // Ends when the cache mesh drops its observer.
+                while let Ok(event) = events.recv() {
+                    match event {
+                        CutEvent::Datagram(peer, datagram) => worker.datagram(peer, &datagram),
+                        CutEvent::Decoded(peer, datagram, frame) => {
+                            worker.decoded(peer, &datagram, &frame);
+                        }
+                    }
+                }
+            })?;
+        Ok(Arc::new(Self { cut, queue }))
+    }
+}
+
+impl CacheMeshReceiveObserver for CutThroughLane {
+    fn datagram(&self, peer: SocketAddr, datagram: &[u8]) {
+        let Some(inner) = self.cut.inner.get() else {
+            return;
+        };
+        if self
+            .queue
+            .try_send(CutEvent::Datagram(peer, datagram.to_vec()))
+            .is_err()
+        {
+            inner
+                .stats
+                .cut_through_queue_drops
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn decoded(&self, peer: SocketAddr, datagram: &[u8], frame: &[u8]) {
+        if self.cut.inner.get().is_none() {
+            return;
+        }
+        // A completion is never dropped: the clients of the part wait for
+        // it. The queue is full only far behind, and then this waits.
+        let _ = self
+            .queue
+            .send(CutEvent::Decoded(peer, datagram.to_vec(), frame.to_vec()));
     }
 }
 
@@ -1056,9 +1277,12 @@ fn complete(
             } => {
                 let sources = frame.len().div_ceil(usize::from(*client_symbol));
                 let repair_symbols = repair.repair_symbols(sources as u32);
-                let Ok(datagrams) =
-                    encode_block(frame, cut_through_block_id(slot), *client_symbol, repair_symbols)
-                else {
+                let Ok(datagrams) = encode_block(
+                    frame,
+                    cut_through_block_id(slot),
+                    *client_symbol,
+                    repair_symbols,
+                ) else {
                     continue;
                 };
                 let send = missing

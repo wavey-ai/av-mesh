@@ -1407,6 +1407,33 @@ struct Args {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     client_udp_cut_through: bool,
 
+    /// Run the edge's cut-through on a thread of its own per class, fed by
+    /// a queue, instead of inline on the cache-mesh receive task. Off by
+    /// default: with the class-split mesh the audio cut-through already has
+    /// a receive task of its own, and the thread's wake-up added about
+    /// 0.08 ms at the median to 2.5 ms Opus parts in the loopback test,
+    /// where the cache-fed sender then often sends a one-symbol part first.
+    /// Kept for a lab A/B of the first-run edge stalls under 4K load.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_CUT_THROUGH_THREAD",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    client_udp_cut_through_thread: bool,
+
+    /// Serve clients from a pair of sockets on the client port: audio
+    /// streams from one at SO_PRIORITY 6, video streams from the other, so
+    /// that a 4K burst never sits ahead of audio. Both read control. `false`
+    /// keeps one socket.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_CLASS_SOCKETS",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    client_udp_class_sockets: bool,
+
     /// Client UDP subscriptions that this node takes at most.
     #[arg(long, default_value_t = 4_096)]
     client_udp_max_subscribers: usize,
@@ -1979,6 +2006,40 @@ fn configure_udp_socket_buffers(
     })
 }
 
+/// The edge's client sockets as an audio/video pair on one address.
+fn bind_edge_class_sockets(
+    bind: SocketAddr,
+    buffer_bytes: usize,
+    classes: &fast_plane::StreamClasses,
+) -> Result<edge_udp::EdgeSockets> {
+    let audio = fast_plane::sys::bind_reuseport(bind)
+        .with_context(|| format!("failed to bind edge client UDP on {bind}"))?;
+    let local = audio.local_addr()?;
+    let video = fast_plane::sys::bind_reuseport(local)
+        .with_context(|| format!("failed to bind the video twin of edge client UDP on {local}"))?;
+    fast_plane::sys::set_priority(&audio, fast_plane::sys::AUDIO_SO_PRIORITY)?;
+    for (socket, purpose) in [
+        (&audio, "edge client UDP audio"),
+        (&video, "edge client UDP video"),
+    ] {
+        let state = configure_udp_socket_buffers(socket, buffer_bytes, purpose)?;
+        if !state.target_met() {
+            warn!(
+                purpose,
+                requested_bytes = buffer_bytes,
+                actual_send_bytes = state.send_bytes,
+                "UDP socket buffer target was limited by the operating system"
+            );
+        }
+    }
+    info!(bind = %local, "edge client UDP: an audio and a video socket on one address");
+    Ok(edge_udp::EdgeSockets::pair(
+        UdpSocket::from_std(audio)?,
+        UdpSocket::from_std(video)?,
+        classes.clone(),
+    ))
+}
+
 async fn bind_buffered_udp_ingress(
     bind: SocketAddr,
     requested_bytes: usize,
@@ -2208,17 +2269,42 @@ async fn main() -> Result<()> {
         with_low_latency_mesh_options(mesh_config, args.mesh_sync_on_publish, &hop_journal);
     // An edge with a client UDP port forwards the parts that reach it over
     // the cache mesh to its UDP clients as their datagrams arrive.
-    let edge_cut_through = args
+    // With a class-split mesh each class's receive task feeds a cut-through
+    // of its own, and with --client-udp-cut-through-thread each runs on a
+    // thread of its own rather than inline on the receive task.
+    let mesh_split = args.cache_mesh_class_port_offset > 0;
+    let edge_cut_through: Vec<Arc<edge_udp::CutThrough>> = args
         .client_udp_bind
         .filter(|_| args.client_udp_cut_through)
-        .map(|_| Arc::new(edge_udp::CutThrough::default()));
-    let mesh_config = match &edge_cut_through {
-        Some(cut) => mesh_config.with_receive_observer(Arc::clone(cut) as _),
+        .map(|_| {
+            (0..if mesh_split { 2 } else { 1 })
+                .map(|_| Arc::new(edge_udp::CutThrough::default()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let cut_observer =
+        |class: fast_plane::TrafficClass| -> Result<Option<Arc<dyn CacheMeshReceiveObserver>>> {
+            let Some(cut) = edge_cut_through.get(class.index()) else {
+                return Ok(None);
+            };
+            Ok(Some(if args.client_udp_cut_through_thread {
+                edge_udp::CutThroughLane::start(
+                    Arc::clone(cut),
+                    class.as_str(),
+                    tokio::runtime::Handle::current(),
+                )
+                .context("failed to start a cut-through thread")? as _
+            } else {
+                Arc::clone(cut) as _
+            }))
+        };
+    let mesh_config = match cut_observer(fast_plane::TrafficClass::Audio)? {
+        Some(observer) => mesh_config.with_receive_observer(observer),
         None => mesh_config,
     };
     // Split by class: video playlists on a socket of their own. The class of
     // a stream comes from where it arrived (see `fast_plane::StreamClasses`).
-    let mesh_config = if args.cache_mesh_class_port_offset > 0 {
+    let mesh_config = if mesh_split {
         let classes = cache.stream_classes().clone();
         let marker_classes = classes.clone();
         mesh_config
@@ -2226,9 +2312,7 @@ async fn main() -> Result<()> {
             .with_stream_classifier(Arc::new(move |stream_id| classes.mesh_class(stream_id)))
             .with_class_receive_observer(Some(Arc::new(fast_plane::ClassMarker::new(
                 marker_classes,
-                edge_cut_through
-                    .as_ref()
-                    .map(|cut| Arc::clone(cut) as Arc<dyn CacheMeshReceiveObserver>),
+                cut_observer(fast_plane::TrafficClass::Video)?,
             ))))
     } else {
         mesh_config
@@ -2581,11 +2665,16 @@ async fn main() -> Result<()> {
         ingest_shutdown_rx.clone(),
     );
     let edge_udp_task = if let Some(bind) = args.client_udp_bind {
-        let socket =
-            bind_buffered_udp_ingress(bind, args.udp_socket_buffer_bytes, "edge client UDP")
-                .await?;
+        let sockets = if args.client_udp_class_sockets && fast_plane::sys::supported() {
+            bind_edge_class_sockets(bind, args.udp_socket_buffer_bytes, cache.stream_classes())?
+        } else {
+            edge_udp::EdgeSockets::single(
+                bind_buffered_udp_ingress(bind, args.udp_socket_buffer_bytes, "edge client UDP")
+                    .await?,
+            )
+        };
         Some(tokio::spawn(edge_udp::run_edge_udp(
-            socket,
+            sockets,
             router.clone(),
             edge_udp::EdgeUdpConfig {
                 symbol_size: args.client_udp_symbol_size,
@@ -16601,6 +16690,7 @@ impl AppRouter {
                     "cut_through_datagrams": stats.cut_through_datagrams.load(Ordering::Relaxed),
                     "cut_through_fallbacks": stats.cut_through_fallbacks.load(Ordering::Relaxed),
                     "would_block": stats.would_block.load(Ordering::Relaxed),
+                    "cut_through_queue_drops": stats.cut_through_queue_drops.load(Ordering::Relaxed),
                     "tokens_sent": stats.tokens_sent.load(Ordering::Relaxed),
                     "bad_tokens": stats.bad_tokens.load(Ordering::Relaxed),
                 })
@@ -29987,180 +30077,268 @@ mod tests {
             ("4k-one-frame", 1, 41_667, 70_000, 48),
         ];
         let mut summary = Vec::new();
-        for (name, stream_id, interval_us, media_bytes, parts) in cases {
-            let parent_cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 8_000, 512).await;
-            let edge_cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 8_000, 512).await;
-            let parent_addr = unused_loopback_addr();
-            let edge_addr = unused_loopback_addr();
-            let parent_mesh = CacheMesh::new(
-                Arc::clone(&parent_cache.chunk_cache),
-                CacheMeshConfig::new("dist-a", "uk", parent_addr)
-                    .with_peer(edge_addr)
-                    .with_role(MeshRole::Distributor)
-                    .with_announce_interval(Duration::from_millis(40)),
-            )
-            .start()
-            .await
-            .unwrap();
-            let cut = Arc::new(edge_udp::CutThrough::default());
-            let (applied_tx, mut applied_rx) = mpsc::unbounded_channel();
-            let edge_mesh = Arc::new(
-                CacheMesh::new(
-                    Arc::clone(&edge_cache.chunk_cache),
-                    CacheMeshConfig::new("edge-1", "uk", edge_addr)
-                        .with_peer(parent_addr)
-                        .with_role(MeshRole::Edge)
+        // The class-split path (a mesh split by class, a cut-through per
+        // class, a client socket pair), the same with each cut-through on a
+        // thread of its own, and the single path before them.
+        for (split, lane) in [(true, false), (true, true), (false, false)] {
+            for (name, stream_id, interval_us, media_bytes, parts) in cases {
+                let name = format!(
+                    "{name}{}",
+                    match (split, lane) {
+                        (true, false) => " split",
+                        (true, true) => " split+thread",
+                        _ => " single",
+                    }
+                );
+                let name = name.as_str();
+                let offset = if split { 1_000 } else { 0 };
+                let parent_cache =
+                    LiveTsCache::new(1, Duration::from_millis(5), 200, 8_000, 512).await;
+                let edge_cache =
+                    LiveTsCache::new(1, Duration::from_millis(5), 200, 8_000, 512).await;
+                let parent_addr = unused_loopback_addr();
+                let edge_addr = unused_loopback_addr();
+                // The distributor knows the 4K stream as video.
+                if stream_id == 1 {
+                    parent_cache.stream_classes().mark_video(stream_id);
+                }
+                let classify = |cache: &Arc<LiveTsCache>| {
+                    let classes = cache.stream_classes().clone();
+                    Arc::new(move |stream_id| classes.mesh_class(stream_id))
+                        as playlists::mesh::CacheMeshStreamClassifier
+                };
+                let parent_mesh = CacheMesh::new(
+                    Arc::clone(&parent_cache.chunk_cache),
+                    CacheMeshConfig::new("dist-a", "uk", parent_addr)
+                        .with_peer(edge_addr)
+                        .with_role(MeshRole::Distributor)
                         .with_announce_interval(Duration::from_millis(40))
-                        .with_applied_tx(applied_tx)
-                        .with_receive_observer(Arc::clone(&cut) as _),
+                        .with_class_port_offset(offset)
+                        .with_stream_classifier(classify(&parent_cache)),
                 )
                 .start()
                 .await
-                .unwrap(),
-            );
-            let media = |part: u64| -> Vec<u8> {
-                (0..media_bytes).map(|i| (i as u64 * 31 + part * 7) as u8).collect()
-            };
-            let commit = |part: u64| {
-                let cache = Arc::clone(&parent_cache);
-                let body = media(part);
-                async move {
-                    cache
-                        .commit_stream_payload(
-                            stream_id,
-                            encode_test_canonical_fmp4_bundle_with_duration(
-                                stream_id,
-                                part,
-                                (part == 0).then_some(b"ftyp-moov".as_slice()),
-                                &body,
-                                Some(5),
-                                true,
-                            ),
+                .unwrap();
+                let cuts: Vec<Arc<edge_udp::CutThrough>> = (0..if split { 2 } else { 1 })
+                    .map(|_| Arc::new(edge_udp::CutThrough::default()))
+                    .collect();
+                let observer = |cut: &Arc<edge_udp::CutThrough>,
+                                class: &str|
+                 -> Arc<dyn CacheMeshReceiveObserver> {
+                    if lane {
+                        edge_udp::CutThroughLane::start(
+                            Arc::clone(cut),
+                            class,
+                            tokio::runtime::Handle::current(),
                         )
+                        .unwrap()
+                    } else {
+                        Arc::clone(cut) as _
+                    }
+                };
+                let (applied_tx, mut applied_rx) = mpsc::unbounded_channel();
+                let mut edge_config = CacheMeshConfig::new("edge-1", "uk", edge_addr)
+                    .with_peer(parent_addr)
+                    .with_role(MeshRole::Edge)
+                    .with_announce_interval(Duration::from_millis(40))
+                    .with_applied_tx(applied_tx)
+                    .with_receive_observer(observer(&cuts[0], "audio"));
+                if split {
+                    edge_config = edge_config
+                        .with_class_port_offset(offset)
+                        .with_stream_classifier(classify(&edge_cache))
+                        .with_class_receive_observer(Some(Arc::new(fast_plane::ClassMarker::new(
+                            edge_cache.stream_classes().clone(),
+                            Some(observer(&cuts[1], "video")),
+                        ))));
+                }
+                let edge_mesh = Arc::new(
+                    CacheMesh::new(Arc::clone(&edge_cache.chunk_cache), edge_config)
+                        .start()
                         .await
-                        .unwrap();
-                }
-            };
-            commit(0).await;
-            let router = app_router_for_tests(Arc::clone(&edge_cache), Arc::clone(&edge_mesh));
-            timeout(Duration::from_secs(5), async {
-                while edge_cache.stream_position_for_id(stream_id).await.is_none() {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .expect("the edge receives the stream over the cache mesh");
+                        .unwrap(),
+                );
+                let media = |part: u64| -> Vec<u8> {
+                    (0..media_bytes)
+                        .map(|i| (i as u64 * 31 + part * 7) as u8)
+                        .collect()
+                };
+                let commit = |part: u64| {
+                    let cache = Arc::clone(&parent_cache);
+                    let body = media(part);
+                    async move {
+                        cache
+                            .commit_stream_payload(
+                                stream_id,
+                                encode_test_canonical_fmp4_bundle_with_duration(
+                                    stream_id,
+                                    part,
+                                    (part == 0).then_some(b"ftyp-moov".as_slice()),
+                                    &body,
+                                    Some(5),
+                                    true,
+                                ),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                };
+                commit(0).await;
+                let router = app_router_for_tests(Arc::clone(&edge_cache), Arc::clone(&edge_mesh));
+                timeout(Duration::from_secs(5), async {
+                    while edge_cache.stream_position_for_id(stream_id).await.is_none() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("the edge receives the stream over the cache mesh");
 
-            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let edge = socket.local_addr().unwrap();
-            let stats: Arc<edge_udp::EdgeUdpStats> = Arc::default();
-            let (shutdown_tx, shutdown_rx) = watch::channel(());
-            let task = tokio::spawn(edge_udp::run_edge_udp(
-                socket,
-                router.clone(),
-                edge_udp::EdgeUdpConfig {
-                    symbol_size: 1_200,
-                    max_subscribers: 16,
-                },
-                Arc::clone(&stats),
-                Some(Arc::clone(&cut)),
-                shutdown_rx,
-            ));
-            let client = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-            let subscribe = |token| {
-                Control::Subscribe {
-                    stream_id,
-                    from_part: None,
-                    repair: RepairPolicy::default(),
-                    token,
+                let sockets = if split {
+                    bind_edge_class_sockets(
+                        "127.0.0.1:0".parse().unwrap(),
+                        1 << 20,
+                        edge_cache.stream_classes(),
+                    )
+                    .unwrap()
+                } else {
+                    edge_udp::EdgeSockets::single(UdpSocket::bind("127.0.0.1:0").await.unwrap())
+                };
+                let edge = sockets.for_stream(0).local_addr().unwrap();
+                let stats: Arc<edge_udp::EdgeUdpStats> = Arc::default();
+                let (shutdown_tx, shutdown_rx) = watch::channel(());
+                let task = tokio::spawn(edge_udp::run_edge_udp(
+                    sockets,
+                    router.clone(),
+                    edge_udp::EdgeUdpConfig {
+                        symbol_size: 1_200,
+                        max_subscribers: 16,
+                    },
+                    Arc::clone(&stats),
+                    cuts.clone(),
+                    shutdown_rx,
+                ));
+                let client = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                let subscribe = |token| {
+                    Control::Subscribe {
+                        stream_id,
+                        from_part: None,
+                        repair: RepairPolicy::default(),
+                        token,
+                    }
+                    .encode()
+                };
+                let mut buf = vec![0_u8; 65_536];
+                client.send_to(&subscribe(None), edge).await.unwrap();
+                let token = loop {
+                    let (len, _) = client.recv_from(&mut buf).await.unwrap();
+                    if let Some(Control::Token { token, .. }) = Control::decode(&buf[..len]) {
+                        break token;
+                    }
+                };
+                client.send_to(&subscribe(Some(token)), edge).await.unwrap();
+                loop {
+                    let (len, _) = client.recv_from(&mut buf).await.unwrap();
+                    if matches!(
+                        Control::decode(&buf[..len]),
+                        Some(Control::Subscribed { .. })
+                    ) {
+                        break;
+                    }
                 }
-                .encode()
-            };
-            let mut buf = vec![0_u8; 65_536];
-            client.send_to(&subscribe(None), edge).await.unwrap();
-            let token = loop {
-                let (len, _) = client.recv_from(&mut buf).await.unwrap();
-                if let Some(Control::Token { token, .. }) = Control::decode(&buf[..len]) {
-                    break token;
-                }
-            };
-            client.send_to(&subscribe(Some(token)), edge).await.unwrap();
-            loop {
-                let (len, _) = client.recv_from(&mut buf).await.unwrap();
-                if matches!(Control::decode(&buf[..len]), Some(Control::Subscribed { .. })) {
-                    break;
-                }
-            }
 
-            // The receiver: every part with its arrival time.
-            let receiving = {
-                let client = Arc::clone(&client);
-                tokio::spawn(async move {
-                    let mut receiver = ObjectReceiver::new();
-                    let mut buf = vec![0_u8; 65_536];
-                    let mut arrived = BTreeMap::new();
-                    while arrived.len() < parts as usize {
-                        let Ok(Ok((len, _))) =
-                            timeout(Duration::from_secs(3), client.recv_from(&mut buf)).await
-                        else {
-                            break;
-                        };
-                        if let Some(object) = receiver.push(&buf[..len]) {
-                            if object.kind == UdpObjectKind::Part && object.part >= 1 {
-                                arrived
-                                    .entry(object.part)
-                                    .or_insert((Instant::now(), object.payload));
+                // The receiver: every part with its arrival time.
+                let receiving = {
+                    let client = Arc::clone(&client);
+                    tokio::spawn(async move {
+                        let mut receiver = ObjectReceiver::new();
+                        let mut buf = vec![0_u8; 65_536];
+                        let mut arrived = BTreeMap::new();
+                        while arrived.len() < parts as usize {
+                            let Ok(Ok((len, _))) =
+                                timeout(Duration::from_secs(3), client.recv_from(&mut buf)).await
+                            else {
+                                break;
+                            };
+                            if let Some(object) = receiver.push(&buf[..len]) {
+                                if object.kind == UdpObjectKind::Part && object.part >= 1 {
+                                    arrived
+                                        .entry(object.part)
+                                        .or_insert((Instant::now(), object.payload));
+                                }
                             }
                         }
-                    }
-                    arrived
-                })
-            };
+                        arrived
+                    })
+                };
 
-            // The producer: absolute deadlines at the part interval.
-            let start = Instant::now() + Duration::from_millis(20);
-            let mut published = BTreeMap::new();
-            let mut published_us = HashMap::new();
-            for part in 1..=parts {
-                tokio::time::sleep_until((start + Duration::from_micros(interval_us * part)).into())
+                // The producer: absolute deadlines at the part interval.
+                let start = Instant::now() + Duration::from_millis(20);
+                let mut published = BTreeMap::new();
+                let mut published_us = HashMap::new();
+                for part in 1..=parts {
+                    tokio::time::sleep_until(
+                        (start + Duration::from_micros(interval_us * part)).into(),
+                    )
                     .await;
-                published.insert(part, Instant::now());
-                published_us.insert(part as usize, now_unix_us());
-                commit(part).await;
-            }
-            let producer_ms = start.elapsed().as_secs_f64() * 1e3;
-            let arrived = receiving.await.unwrap();
-            // When the first datagram of each part reached the edge.
-            let mut edge_ms = Vec::new();
-            while let Ok(applied) = applied_rx.try_recv() {
-                if let Some(published) = published_us.get(&applied.slot_id) {
-                    edge_ms.push(applied.rx_first_us.saturating_sub(*published) as f64 / 1e3);
+                    published.insert(part, Instant::now());
+                    published_us.insert(part as usize, now_unix_us());
+                    commit(part).await;
                 }
-            }
-            edge_ms.sort_by(f64::total_cmp);
-            let edge_p50 = edge_ms.get(edge_ms.len() / 2).copied().unwrap_or(-1.0);
-            let edge_p99 = edge_ms.get(edge_ms.len() * 99 / 100).copied().unwrap_or(-1.0);
-            let mut latencies: Vec<f64> = Vec::new();
-            for part in 1..=parts {
-                let (at, payload) = arrived
-                    .get(&part)
-                    .unwrap_or_else(|| panic!("{name}: part {part} did not arrive"));
-                assert_eq!(payload.as_ref(), media(part).as_slice(), "{name}: part {part}");
-                latencies.push(at.duration_since(published[&part]).as_secs_f64() * 1e3);
-            }
-            let http = get_for_tests(&router, &format!("/live/{stream_id}/part{parts}.mp4")).await;
-            assert_eq!(http.body.as_deref(), Some(media(parts).as_slice()));
-            latencies.sort_by(f64::total_cmp);
-            let at = |q: f64| latencies[((latencies.len() - 1) as f64 * q) as usize];
-            // What the edge adds: from the first datagram of a part at the
-            // edge to the part at the client. (What comes before it is the
-            // distributor's publication and the cache mesh.)
-            let added = at(0.5) - edge_p50;
-            let allowed = if media_bytes > 10_000 { 5.0 } else { 1.0 };
-            assert!(added < allowed, "{name}: the edge adds {added:.3} ms at the median");
-            let cut_parts = stats.cut_through_parts.load(Ordering::Relaxed);
-            assert!(cut_parts >= parts * 9 / 10, "{name}: {cut_parts} of {parts} parts cut through");
-            summary.push(format!(
+                let producer_ms = start.elapsed().as_secs_f64() * 1e3;
+                let arrived = receiving.await.unwrap();
+                // When the first datagram of each part reached the edge.
+                let mut edge_ms = Vec::new();
+                while let Ok(applied) = applied_rx.try_recv() {
+                    if let Some(published) = published_us.get(&applied.slot_id) {
+                        edge_ms.push(applied.rx_first_us.saturating_sub(*published) as f64 / 1e3);
+                    }
+                }
+                edge_ms.sort_by(f64::total_cmp);
+                let edge_p50 = edge_ms.get(edge_ms.len() / 2).copied().unwrap_or(-1.0);
+                let edge_p99 = edge_ms
+                    .get(edge_ms.len() * 99 / 100)
+                    .copied()
+                    .unwrap_or(-1.0);
+                let mut latencies: Vec<f64> = Vec::new();
+                for part in 1..=parts {
+                    let (at, payload) = arrived
+                        .get(&part)
+                        .unwrap_or_else(|| panic!("{name}: part {part} did not arrive"));
+                    assert_eq!(
+                        payload.as_ref(),
+                        media(part).as_slice(),
+                        "{name}: part {part}"
+                    );
+                    latencies.push(at.duration_since(published[&part]).as_secs_f64() * 1e3);
+                }
+                let http =
+                    get_for_tests(&router, &format!("/live/{stream_id}/part{parts}.mp4")).await;
+                assert_eq!(http.body.as_deref(), Some(media(parts).as_slice()));
+                latencies.sort_by(f64::total_cmp);
+                let at = |q: f64| latencies[((latencies.len() - 1) as f64 * q) as usize];
+                // What the edge adds: from the first datagram of a part at the
+                // edge to the part at the client. (What comes before it is the
+                // distributor's publication and the cache mesh.)
+                let added = at(0.5) - edge_p50;
+                let allowed = if media_bytes > 10_000 { 5.0 } else { 1.0 };
+                assert!(
+                    added < allowed,
+                    "{name}: the edge adds {added:.3} ms at the median"
+                );
+                let cut_parts = stats.cut_through_parts.load(Ordering::Relaxed);
+                // On a thread, the cut-through of a part of one symbol often
+                // comes after the cache has the part, and the cache-fed sender
+                // sends it; a part of many symbols is cut through all the same.
+                let cut_expected = if lane && media_bytes < 10_000 {
+                    0
+                } else {
+                    parts * 9 / 10
+                };
+                assert!(
+                    cut_parts >= cut_expected,
+                    "{name}: {cut_parts} of {parts} parts cut through"
+                );
+                summary.push(format!(
                 "{name}: {parts} parts, publish to client p50 {:.3} ms p99 {:.3} ms max {:.3} ms, \
                  {cut_parts} cut through, {} fallbacks, producer {producer_ms:.0} ms for {} ms, \
                  first datagram at the edge p50 {edge_p50:.3} p99 {edge_p99:.3} ms after publication",
@@ -30170,10 +30348,19 @@ mod tests {
                 stats.cut_through_fallbacks.load(Ordering::Relaxed),
                 interval_us * parts / 1_000
             ));
-            let _ = shutdown_tx.send(());
-            task.await.unwrap().unwrap();
-            parent_mesh.shutdown();
-            edge_mesh.shutdown();
+                if split && stream_id == 1 {
+                    assert_eq!(
+                        edge_cache.stream_classes().class(stream_id),
+                        fast_plane::TrafficClass::Video,
+                        "the edge learned the 4K stream's class from the class socket"
+                    );
+                    assert!(edge_mesh.class_fec_stats().unwrap().rx_decoded_objects >= parts);
+                }
+                let _ = shutdown_tx.send(());
+                task.await.unwrap().unwrap();
+                parent_mesh.shutdown();
+                edge_mesh.shutdown();
+            }
         }
         println!("{}", summary.join("\n"));
     }
@@ -30219,14 +30406,14 @@ mod tests {
         let edge = socket.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         let task = tokio::spawn(edge_udp::run_edge_udp(
-            socket,
+            edge_udp::EdgeSockets::single(socket),
             router.clone(),
             edge_udp::EdgeUdpConfig {
                 symbol_size: 1_200,
                 max_subscribers: 16,
             },
             Arc::default(),
-            None,
+            Vec::new(),
             shutdown_rx,
         ));
 
@@ -30379,6 +30566,8 @@ mod tests {
         assert_eq!(args.relay_class_port_offset, 1_000);
         assert_eq!(args.cache_mesh_class_port_offset, 1_000);
         assert_eq!(args.relay_class_cpus, ClassCpus::default());
+        assert!(args.client_udp_class_sockets);
+        assert!(!args.client_udp_cut_through_thread);
         let args = Args::try_parse_from([
             "av-mesh",
             "--relay-class-threads",
@@ -30390,8 +30579,12 @@ mod tests {
             "--relay-class-cpus",
             "0,1",
             "--relay-class-realtime=false",
+            "--client-udp-class-sockets=false",
+            "--client-udp-cut-through-thread=true",
         ])
         .unwrap();
+        assert!(!args.client_udp_class_sockets);
+        assert!(args.client_udp_cut_through_thread);
         assert!(!args.relay_class_threads);
         assert!(!args.relay_class_realtime);
         assert_eq!(args.relay_class_port_offset, 0);
@@ -33272,5 +33465,137 @@ mod tests {
         );
         distributor_mesh.shutdown();
         edge_mesh.shutdown();
+    }
+
+    /// Audio parts beside a 4K stream on one cache mesh: with the mesh split
+    /// by class, the 4K parts' encode, send and decode run on the video
+    /// socket's tasks, and the audio parts' time from publication to the
+    /// edge's cache does not take the 4K parts' tail. Both are printed; the
+    /// split one is held to a bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn audio_parts_reach_the_edge_beside_4k_without_its_tail_when_the_mesh_is_split() {
+        use playlists::mesh::{CacheMesh, CacheMeshConfig, CacheMeshRole as MeshRole};
+        let mut report = Vec::new();
+        let mut split_p99 = f64::MAX;
+        for offset in [1_000_u16, 0] {
+            let parent_cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 8_000, 512).await;
+            let edge_cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 8_000, 512).await;
+            parent_cache.stream_classes().mark_video(1);
+            let parent_addr = unused_loopback_addr();
+            let edge_addr = unused_loopback_addr();
+            let classify = |cache: &Arc<LiveTsCache>| {
+                let classes = cache.stream_classes().clone();
+                Arc::new(move |stream_id| classes.mesh_class(stream_id))
+                    as playlists::mesh::CacheMeshStreamClassifier
+            };
+            let parent_mesh = CacheMesh::new(
+                Arc::clone(&parent_cache.chunk_cache),
+                CacheMeshConfig::new("dist-a", "uk", parent_addr)
+                    .with_peer(edge_addr)
+                    .with_role(MeshRole::Distributor)
+                    .with_announce_interval(Duration::from_millis(40))
+                    .with_sync_on_publish(true)
+                    .with_class_port_offset(offset)
+                    .with_stream_classifier(classify(&parent_cache)),
+            )
+            .start()
+            .await
+            .unwrap();
+            let (applied_tx, mut applied_rx) = mpsc::unbounded_channel();
+            let edge_mesh = CacheMesh::new(
+                Arc::clone(&edge_cache.chunk_cache),
+                CacheMeshConfig::new("edge-1", "uk", edge_addr)
+                    .with_peer(parent_addr)
+                    .with_role(MeshRole::Edge)
+                    .with_announce_interval(Duration::from_millis(40))
+                    .with_applied_tx(applied_tx)
+                    .with_class_port_offset(offset)
+                    .with_stream_classifier(classify(&edge_cache)),
+            )
+            .start()
+            .await
+            .unwrap();
+            let commit_cache = Arc::clone(&parent_cache);
+            let commit = move |stream_id: u64, part: u64, bytes: usize| {
+                let cache = Arc::clone(&commit_cache);
+                async move {
+                    let body: Vec<u8> = (0..bytes)
+                        .map(|index| (index as u64 ^ part) as u8)
+                        .collect();
+                    cache
+                        .commit_stream_payload(
+                            stream_id,
+                            encode_test_canonical_fmp4_bundle_with_duration(
+                                stream_id,
+                                part,
+                                (part == 0).then_some(b"ftyp-moov".as_slice()),
+                                &body,
+                                Some(5),
+                                true,
+                            ),
+                        )
+                        .await
+                        .unwrap();
+                }
+            };
+            commit(3001, 0, 60).await;
+            commit(1, 0, 1_000).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            while applied_rx.try_recv().is_ok() {}
+            // 4K: 600 KB frames at 24 fps; audio: 2.5 ms parts, for 1.5 s.
+            let video = {
+                let commit = commit.clone();
+                tokio::spawn(async move {
+                    let start = Instant::now();
+                    for part in 1..=36_u64 {
+                        tokio::time::sleep_until(
+                            (start + Duration::from_micros(41_667 * part)).into(),
+                        )
+                        .await;
+                        commit(1, part, 600_000).await;
+                    }
+                })
+            };
+            let mut published = HashMap::new();
+            let start = Instant::now() + Duration::from_millis(5);
+            for part in 1..=600_u64 {
+                tokio::time::sleep_until((start + Duration::from_micros(2_500 * part)).into())
+                    .await;
+                published.insert(part as usize, now_unix_us());
+                commit(3001, part, 60).await;
+            }
+            video.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let mut latencies = Vec::new();
+            while let Ok(applied) = applied_rx.try_recv() {
+                if applied.stream_id != 3001 {
+                    continue;
+                }
+                if let Some(published) = published.get(&applied.slot_id) {
+                    latencies.push(applied.committed_us.saturating_sub(*published) as f64 / 1e3);
+                }
+            }
+            latencies.sort_by(f64::total_cmp);
+            assert!(
+                latencies.len() >= 590,
+                "{} audio parts applied",
+                latencies.len()
+            );
+            let at = |q: f64| latencies[((latencies.len() - 1) as f64 * q) as usize];
+            report.push(format!(
+                "mesh {}: audio publish to edge cache p50 {:.3} ms p99 {:.3} ms max {:.3} ms beside 4K",
+                if offset > 0 { "split" } else { "single" },
+                at(0.5),
+                at(0.99),
+                at(1.0)
+            ));
+            if offset > 0 {
+                split_p99 = at(0.99);
+            }
+            parent_mesh.shutdown();
+            edge_mesh.shutdown();
+        }
+        println!("{}", report.join("\n"));
+        assert!(split_p99 < 3.0, "{}", report.join("\n"));
     }
 }
