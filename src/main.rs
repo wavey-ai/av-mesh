@@ -891,8 +891,8 @@ fn rebox_soundkit_v2_bundle(payload: &[u8], sequence: u64) -> Result<ReboxedLive
         // parts would start at 0, 2, 5, 7 ms and overlap or leave gaps. The
         // packet durations it writes are exact samples; the start is set
         // here to the exact sample of the part.
-        let decode_time = u128::from(sequence) * u128::from(bundle_samples) * 48_000
-            / u128::from(sample_rate);
+        let decode_time =
+            u128::from(sequence) * u128::from(bundle_samples) * 48_000 / u128::from(sample_rate);
         let decode_time =
             u64::try_from(decode_time).context("Soundkit v2 publication timeline overflow")?;
         let mut patched = media.to_vec();
@@ -936,7 +936,10 @@ fn fmp4_child_boxes(data: &[u8]) -> Result<Vec<([u8; 4], usize, usize, usize)>> 
         };
         let end = offset.checked_add(size).context("fMP4 box size overflow")?;
         if size < payload - offset || end > data.len() {
-            bail!("fMP4 box {} has an invalid size", String::from_utf8_lossy(&kind));
+            bail!(
+                "fMP4 box {} has an invalid size",
+                String::from_utf8_lossy(&kind)
+            );
         }
         boxes.push((kind, offset, payload, end));
         offset = end;
@@ -951,9 +954,7 @@ fn set_fmp4_base_media_decode_time(media: &mut [u8], decode_time: u64) -> Result
         if &kind != b"moof" {
             continue;
         }
-        for (kind, _, traf_payload, traf_end) in
-            fmp4_child_boxes(&media[moof_payload..moof_end])?
-        {
+        for (kind, _, traf_payload, traf_end) in fmp4_child_boxes(&media[moof_payload..moof_end])? {
             if &kind != b"traf" {
                 continue;
             }
@@ -9015,7 +9016,9 @@ impl LiveState {
                 .max(target_us.saturating_mul(PLAYLIST_WINDOW_SEGMENTS));
             // The parts of a stream are no shorter than three quarters of
             // the part that it declares, on average.
-            let parts = window_us.saturating_mul(4).div_ceil(part_us.saturating_mul(3));
+            let parts = window_us
+                .saturating_mul(4)
+                .div_ceil(part_us.saturating_mul(3));
             // At most the configured count of parts. A stream of parts
             // shorter than the nominal one needs more for the same time: the
             // window in parts of the declared length. Never more than the
@@ -31412,16 +31415,9 @@ mod tests {
         assert_eq!(cache_ring_parts(2_500, 400, 4_800, 0), 19_200);
         assert_eq!(cache_ring_parts(2_500, 400, 4_800, 2_500), 19_200);
         for (part_us, window_parts, seconds) in [(500, 24_000, 5), (250, 44_000, 5)] {
-            let cache = LiveTsCache::with_ring(
-                1,
-                Duration::from_micros(2_500),
-                400,
-                4_800,
-                64,
-                2,
-                ring,
-            )
-            .await;
+            let cache =
+                LiveTsCache::with_ring(1, Duration::from_micros(2_500), 400, 4_800, 64, 2, ring)
+                    .await;
             let parts_per_segment = 1_000_000 / part_us;
             commit_timed_stamped_parts(
                 &cache,
@@ -31436,7 +31432,11 @@ mod tests {
                 // 12 s of these parts, or as many as the ring holds beside
                 // the three target durations kept after the window; not the
                 // 4,800 parts (2.4 s, 1.2 s) of the nominal window.
-                assert_eq!(state.stream_window_parts(77, 4_800), window_parts, "{part_us}");
+                assert_eq!(
+                    state.stream_window_parts(77, 4_800),
+                    window_parts,
+                    "{part_us}"
+                );
                 assert!(state.stream_retained_parts(77, 4_800) <= ring, "{part_us}");
             }
             let playlist = cache.playlist_for_stream_id(77).await;
@@ -31444,7 +31444,11 @@ mod tests {
             assert!(playlist.contains("HOLD-BACK=3.000"), "{part_us}");
             // Every committed second is still listed: five whole segments
             // and the open one.
-            assert_eq!(assert_valid_ll_hls(&playlist), seconds as usize, "{part_us}");
+            assert_eq!(
+                assert_valid_ll_hls(&playlist),
+                seconds as usize,
+                "{part_us}"
+            );
             assert!(playlist.contains("#EXT-X-MEDIA-SEQUENCE:0\n"), "{part_us}");
             assert!(
                 playlist_duration_us(&playlist) >= 3 * 1_000_000,
@@ -31466,10 +31470,19 @@ mod tests {
             state
         };
         // Nominal and longer parts keep the configured count at most.
-        assert_eq!(declare(2_500, 1_000_000).stream_window_parts(77, 4_800), 4_800);
-        assert_eq!(declare(33_367, 2_000_000).stream_window_parts(77, 4_800), 560);
+        assert_eq!(
+            declare(2_500, 1_000_000).stream_window_parts(77, 4_800),
+            4_800
+        );
+        assert_eq!(
+            declare(33_367, 2_000_000).stream_window_parts(77, 4_800),
+            560
+        );
         // 1 ms parts: 12 s.
-        assert_eq!(declare(1_000, 1_000_000).stream_window_parts(77, 4_800), 12_000);
+        assert_eq!(
+            declare(1_000, 1_000_000).stream_window_parts(77, 4_800),
+            12_000
+        );
         // A ring of four nominal windows only: still three target durations
         // for 0.25 ms parts, where the ring holds them.
         let mut state = declare(250, 1_000_000);
@@ -31490,7 +31503,10 @@ mod tests {
 
     #[test]
     fn the_ring_holds_the_window_of_the_shortest_part() {
-        let args = Args::try_parse_from(["av-mesh"]).unwrap().normalized().unwrap();
+        let args = Args::try_parse_from(["av-mesh"])
+            .unwrap()
+            .normalized()
+            .unwrap();
         assert_eq!(args.min_part_us, 250);
         assert_eq!(args.ring_parts, 60_000);
         let args = Args::try_parse_from(["av-mesh", "--min-part-us", "0"])
@@ -31808,7 +31824,10 @@ mod tests {
         }
         // Bundles of two 5 ms epochs are exact as before.
         let reboxed = rebox_soundkit_v2_bundle(&soundkit_v2_test_bundle(2, 240), 3).unwrap();
-        assert_eq!(fmp4_fragment_timeline(&reboxed.media), (1_440, vec![240, 240]));
+        assert_eq!(
+            fmp4_fragment_timeline(&reboxed.media),
+            (1_440, vec![240, 240])
+        );
     }
 
     #[test]
@@ -31856,7 +31875,9 @@ mod tests {
         }
         // 48 samples are 1 ms: past this check (the test frame itself is
         // not FLAC, so the rebox fails later, for another reason).
-        let error = rebox_soundkit_v2_bundle(&bundle(48), 1).err().expect("junk");
+        let error = rebox_soundkit_v2_bundle(&bundle(48), 1)
+            .err()
+            .expect("junk");
         assert!(!error.to_string().contains("not a whole"), "{error}");
     }
 

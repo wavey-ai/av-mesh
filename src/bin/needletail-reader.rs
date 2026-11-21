@@ -461,7 +461,8 @@ impl HttpClient {
 
     fn forget(&mut self, authority: &str) {
         self.connections.remove(authority);
-        self.lanes.retain(|(lane_authority, _), _| lane_authority != authority);
+        self.lanes
+            .retain(|(lane_authority, _), _| lane_authority != authority);
     }
 }
 
@@ -2104,9 +2105,15 @@ mod tests {
         assert_eq!(connections_for(250, 256), 1);
         // 0.5 ms parts: 500 parts on two connections; 0.25 ms parts: 1,000
         // on four.
-        assert_eq!(pipeline_depth_for(near, 500, 250, DEFAULT_PIPELINE_LIMIT), 500);
+        assert_eq!(
+            pipeline_depth_for(near, 500, 250, DEFAULT_PIPELINE_LIMIT),
+            500
+        );
         assert_eq!(connections_for(500, 256), 2);
-        assert_eq!(pipeline_depth_for(near, 250, 250, DEFAULT_PIPELINE_LIMIT), 1_000);
+        assert_eq!(
+            pipeline_depth_for(near, 250, 250, DEFAULT_PIPELINE_LIMIT),
+            1_000
+        );
         assert_eq!(connections_for(1_000, 256), 4);
         // An explicit lower limit still caps it (and the report says so).
         assert_eq!(pipeline_depth_for(near, 250, 250, 256), 256);
