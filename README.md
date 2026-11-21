@@ -292,10 +292,18 @@ remembered, sized for parts down to 0.25 ms).
 The window of a playlist is a length of time. A stream whose parts are longer
 covers the same time with fewer parts, and the node keeps only four of those
 windows in memory. One node that is sized for 2.5 ms audio parts can therefore
-hold 4K video. The ring of the cache is four windows of nominal parts for each
-playlist slot: 19,200 entries per slot at the defaults, and ten times that at
-0.25 ms parts, so give a node with sub-millisecond parts fewer
-`--playlist-slots` or a shorter `--window-ms`.
+hold 4K video. A stream whose parts are shorter than the nominal part covers
+it with more parts. `--min-part-us` (default 250, `AV_LL_HLS_MIN_PART_US`)
+sizes the ring of each playlist slot for the shortest part that a node
+accepts: the window (at least seven segments) and three target durations after
+it, in parts that short, and never less than four windows of nominal parts. At
+the defaults that is 60,000 entries per slot (about 7 MB of index per slot,
+before media), where four nominal windows were 19,200. A stream of 0.5 ms PCM
+then keeps a 12 s playlist and one of 0.25 ms PCM 11 s, where both were cut to
+4,800 parts (2.4 s and 1.2 s, under the 3 s HOLD-BACK). `--min-part-us 0`
+keeps the old ring; a stream of shorter parts then keeps three target
+durations, or what the ring holds. Give a node with sub-millisecond nominal
+parts fewer `--playlist-slots` or a shorter `--window-ms`.
 
 `--mesh-max-symbol-size` lets a large part use a multiple of
 `--mesh-symbol-size`, so that it is at most about 64 datagrams. A 5 ms audio

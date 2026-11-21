@@ -143,11 +143,56 @@ const DEFAULT_SEGMENT_MS: u64 = 1_000;
 /// The playlist window, which sizes the ring of the cache.
 const DEFAULT_WINDOW_MS: u64 = 12_000;
 
+/// Parts of a stream kept after its playlist window: three target
+/// durations, in parts no shorter than three quarters of the declared part.
+fn parts_after_window(part_us: u64, target_us: u64) -> usize {
+    usize::try_from(
+        target_us
+            .saturating_mul(3)
+            .saturating_mul(4)
+            .div_ceil(part_us.max(1).saturating_mul(3)),
+    )
+    .unwrap_or(usize::MAX)
+}
+
+/// The shortest part that the cache ring of a node is sized for unless
+/// `--min-part-us` says otherwise: 12 PCM samples at 48 kHz.
+const DEFAULT_MIN_PART_US: u64 = 250;
+
 /// Parts of `part_us` that cover `ms` milliseconds, at least one.
 fn parts_in_ms(ms: u64, part_us: u64) -> usize {
     usize::try_from(ms.saturating_mul(1_000).div_ceil(part_us.max(1)))
         .unwrap_or(usize::MAX)
         .max(1)
+}
+
+/// Slots of the cache ring of one playlist.
+///
+/// Four windows of nominal parts, as before. When the node accepts parts
+/// shorter than its nominal part (`min_part_us`), the ring also holds, in
+/// parts that short, the playlist window (and at least seven segments) and
+/// the three target durations after it that a slow reader may still ask
+/// for. A target duration is the nominal segment, and at least one second.
+/// So 0.25 ms PCM on a node of 2.5 ms parts keeps a playlist of its own
+/// length of time, not 4,800 parts of 1.2 s.
+fn cache_ring_parts(
+    part_us: u64,
+    parts_per_segment: usize,
+    window_parts: usize,
+    min_part_us: u64,
+) -> usize {
+    let nominal = window_parts.saturating_mul(4).max(32);
+    if min_part_us == 0 || min_part_us >= part_us {
+        return nominal;
+    }
+    let window_us = (window_parts as u64).saturating_mul(part_us);
+    let target_us = (parts_per_segment as u64)
+        .saturating_mul(part_us)
+        .max(1_000_000);
+    let held_us = window_us
+        .max(target_us.saturating_mul(PLAYLIST_WINDOW_SEGMENTS))
+        .saturating_add(target_us.saturating_mul(3));
+    nominal.max(usize::try_from(held_us.div_ceil(min_part_us)).unwrap_or(usize::MAX))
 }
 const HLS_PLAYLIST_WAIT_MS: u64 = 3_000;
 const LLHLS_TAIL_WAIT_MS: u64 = 250;
@@ -1287,6 +1332,20 @@ struct Args {
     #[arg(skip)]
     window_parts: usize,
 
+    /// The shortest part that a stream may carry on this node, in
+    /// microseconds. The cache ring of each playlist slot holds the window
+    /// and three target durations after it in parts this short, so a stream
+    /// of 0.25 ms PCM on a node of 2.5 ms nominal parts keeps a playlist as
+    /// long in time as any other. At the defaults that is 60,000 slots of
+    /// about 110 bytes of index per playlist slot. 0 sizes the ring for four
+    /// windows of nominal parts only, as before.
+    #[arg(long, env = "AV_LL_HLS_MIN_PART_US", default_value_t = DEFAULT_MIN_PART_US)]
+    min_part_us: u64,
+
+    /// Slots of the cache ring of one playlist, resolved by `normalized`.
+    #[arg(skip)]
+    ring_parts: usize,
+
     /// A floor for PART-HOLD-BACK in milliseconds. PART-HOLD-BACK is three
     /// part targets, or this floor when it is larger. 0 keeps three part
     /// targets.
@@ -1311,7 +1370,8 @@ struct Args {
     /// distributor hold every stream that passes through them, so this is
     /// the number of streams of a region. An edge holds one playlist less
     /// for its readers: one slot is the default stream of the node. A slot
-    /// costs under 1 MB of index until it holds media.
+    /// costs about 112 bytes of index per ring entry until it holds media:
+    /// about 7 MB with the ring of the defaults (see --min-part-us).
     #[arg(
         long,
         env = "NEEDLETAIL_PLAYLIST_SLOTS",
@@ -1866,13 +1926,14 @@ async fn main() -> Result<()> {
     );
     #[cfg(not(feature = "private-subnet-discovery"))]
     let private_discovery_status = PrivateDiscoveryStatus::unavailable();
-    let cache = LiveTsCache::with_slots(
+    let cache = LiveTsCache::with_ring(
         args.stream_id,
         Duration::from_micros(args.part_us),
         args.parts_per_segment,
         args.window_parts,
         args.slot_kb,
         args.playlist_slots.max(2),
+        args.ring_parts,
     )
     .await;
     cache.set_canonical_gap_hold(Duration::from_millis(args.canonical_gap_hold_ms));
@@ -2503,6 +2564,13 @@ impl Args {
         let response_parts = self.response_ms.map_or(1, |response_ms| {
             response_ms.saturating_mul(1_000) / self.part_us
         });
+        self.ring_parts = cache_ring_parts(
+            self.part_us,
+            self.parts_per_segment,
+            self.window_parts,
+            self.min_part_us,
+        );
+        // A stream of nominal parts retains four windows of them.
         let retained_cache_parts = self.window_parts.saturating_mul(4).max(32) as u64;
         if response_parts > retained_cache_parts {
             bail!(
@@ -5356,6 +5424,7 @@ struct LiveTsCache {
 }
 
 impl LiveTsCache {
+    #[cfg(test)]
     async fn new(
         stream_id: u64,
         part_target: Duration,
@@ -5374,7 +5443,9 @@ impl LiveTsCache {
         .await
     }
 
-    /// A live cache that holds at most `playlist_slots` streams.
+    /// A live cache that holds at most `playlist_slots` streams, with a ring
+    /// of four windows of nominal parts.
+    #[cfg(test)]
     async fn with_slots(
         stream_id: u64,
         part_target: Duration,
@@ -5383,10 +5454,34 @@ impl LiveTsCache {
         slot_kb: usize,
         playlist_slots: usize,
     ) -> Arc<Self> {
+        Self::with_ring(
+            stream_id,
+            part_target,
+            parts_per_segment,
+            window_parts,
+            slot_kb,
+            playlist_slots,
+            window_parts.saturating_mul(4).max(32),
+        )
+        .await
+    }
+
+    /// A live cache that holds at most `playlist_slots` streams in rings of
+    /// `ring_parts` slots, at least four windows of nominal parts.
+    async fn with_ring(
+        stream_id: u64,
+        part_target: Duration,
+        parts_per_segment: usize,
+        window_parts: usize,
+        slot_kb: usize,
+        playlist_slots: usize,
+        ring_parts: usize,
+    ) -> Arc<Self> {
+        let ring_parts = ring_parts.max(window_parts.saturating_mul(4).max(32));
         let options = CacheOptions {
             num_playlists: playlist_slots.max(1),
             max_segments: 1,
-            max_parts_per_segment: window_parts.saturating_mul(4).max(32),
+            max_parts_per_segment: ring_parts,
             buffer_size_kb: slot_kb,
             ..CacheOptions::default()
         };
@@ -5399,6 +5494,7 @@ impl LiveTsCache {
         let mut state = LiveState::new();
         state.segment_seed_parts = parts_per_segment.max(1) as u64;
         state.nominal_part_us = duration_us(part_target).max(1);
+        state.ring_parts = ring_parts;
         Arc::new(Self {
             chunk_cache,
             stream_id,
@@ -8466,6 +8562,9 @@ struct LiveState {
     /// Nominal part duration of the node in microseconds, which sizes the
     /// cache ring. Zero gives every stream the configured window in parts.
     nominal_part_us: u64,
+    /// Slots of the cache ring of one playlist. Zero is four configured
+    /// windows, the ring of a node that does not size it for short parts.
+    ring_parts: usize,
     stream_retained_bytes: HashMap<u64, u64>,
     /// Longest part of each stream in microseconds.
     stream_max_part_duration_us: HashMap<u64, u32>,
@@ -8511,6 +8610,7 @@ impl LiveState {
             stream_keyframe_segments: HashMap::new(),
             segment_seed_parts: 0,
             nominal_part_us: 0,
+            ring_parts: 0,
             stream_retained_bytes: HashMap::new(),
             stream_max_part_duration_us: HashMap::new(),
             stream_max_segment_duration_us: HashMap::new(),
@@ -8760,32 +8860,48 @@ impl LiveState {
 
     /// Parts in the playlist window of one stream.
     ///
-    /// The configured window counts nominal parts, and the node sizes its
-    /// cache ring for it. The window is a length of time. A stream whose parts
-    /// are longer than the nominal part, such as 4K video beside 5 ms audio,
-    /// covers that time with fewer parts, so it retains fewer of them.
+    /// The configured window counts nominal parts, and the window is a
+    /// length of time. A stream whose parts are longer than the nominal part,
+    /// such as 4K video beside 2.5 ms audio, covers that time with fewer
+    /// parts, so it retains fewer of them. A stream whose parts are shorter,
+    /// such as 0.25 ms PCM, covers it with more, up to what the cache ring
+    /// holds beside the parts kept after the window.
     fn stream_window_parts(&self, stream_id: u64, configured: usize) -> usize {
         let nominal_us = self.nominal_part_us;
+        let ring = self.ring_parts_for(configured);
         if let Some((part_us, target_us)) = self
             .stream_declared_us
             .get(&stream_id)
             .copied()
             .filter(|(part_us, _)| *part_us > 0 && nominal_us > 0)
         {
+            let part_us = u64::from(part_us);
+            let target_us = u64::from(target_us);
             // The contributor declares the part and segment durations of the
             // stream. The playlist holds the configured length of time, and
             // at least six whole segments beside the one that is open.
             let window_us = (configured as u64)
                 .saturating_mul(nominal_us)
-                .max(u64::from(target_us).saturating_mul(PLAYLIST_WINDOW_SEGMENTS));
+                .max(target_us.saturating_mul(PLAYLIST_WINDOW_SEGMENTS));
             // The parts of a stream are no shorter than three quarters of
             // the part that it declares, on average.
-            let parts = window_us
-                .saturating_mul(4)
-                .div_ceil(u64::from(part_us).saturating_mul(3));
-            return usize::try_from(parts)
-                .unwrap_or(configured)
-                .clamp(MIN_STREAM_WINDOW_PARTS.min(configured), configured);
+            let parts = window_us.saturating_mul(4).div_ceil(part_us.saturating_mul(3));
+            // At most the configured count of parts. A stream of parts
+            // shorter than the nominal one needs more for the same time: the
+            // window in parts of the declared length. Never more than the
+            // ring holds beside the parts kept after the window.
+            let most = if part_us < nominal_us {
+                window_us.div_ceil(part_us).max(configured as u64)
+            } else {
+                configured as u64
+            }
+            .min(ring.saturating_sub(parts_after_window(part_us, target_us)) as u64);
+            // At least three target durations, which the playlist of a live
+            // stream must cover (RFC 8216bis), when the ring holds them.
+            let least = (MIN_STREAM_WINDOW_PARTS.min(configured) as u64)
+                .max(target_us.saturating_mul(3).div_ceil(part_us))
+                .min(ring as u64);
+            return usize::try_from(parts.clamp(least, most.max(least))).unwrap_or(configured);
         }
         let Some(part_us) = self
             .stream_max_part_duration_us
@@ -8794,13 +8910,26 @@ impl LiveState {
         else {
             return configured;
         };
-        if nominal_us == 0 || part_us <= nominal_us {
+        if nominal_us == 0 || part_us == nominal_us {
             return configured;
         }
         let window_us = (configured as u64).saturating_mul(nominal_us);
-        usize::try_from(window_us.div_ceil(part_us))
-            .unwrap_or(configured)
-            .clamp(MIN_STREAM_WINDOW_PARTS.min(configured), configured)
+        let parts = usize::try_from(window_us.div_ceil(part_us)).unwrap_or(usize::MAX);
+        if part_us < nominal_us {
+            // A stream without stamps keeps four of its windows in the
+            // ring, as a stream of nominal parts does.
+            return parts.min(ring / 4).max(configured);
+        }
+        parts.clamp(MIN_STREAM_WINDOW_PARTS.min(configured), configured)
+    }
+
+    /// Slots of the cache ring of one playlist.
+    fn ring_parts_for(&self, configured: usize) -> usize {
+        if self.ring_parts > 0 {
+            self.ring_parts
+        } else {
+            configured.saturating_mul(4).max(32)
+        }
     }
 
     /// Whether the parts of a stream make a playlist that a player accepts.
@@ -8832,17 +8961,16 @@ impl LiveState {
     /// has left the playlist must still be there for a reader that is slow.
     fn stream_retained_parts(&self, stream_id: u64, configured: usize) -> usize {
         let window = self.stream_window_parts(stream_id, configured);
-        match self.stream_declared_us.get(&stream_id) {
+        let retained = match self.stream_declared_us.get(&stream_id) {
             Some((part_us, target_us)) if *part_us > 0 => {
-                let after = u64::from(*target_us)
-                    .saturating_mul(3)
-                    .saturating_mul(4)
-                    .div_ceil(u64::from(*part_us).saturating_mul(3));
-                window.saturating_add(usize::try_from(after).unwrap_or(window))
+                let after = parts_after_window(u64::from(*part_us), u64::from(*target_us));
+                window.saturating_add(after)
             }
             // A stream without stamps keeps four windows, as the ring does.
             _ => window.saturating_mul(4),
-        }
+        };
+        // A part that the ring has overwritten is not retained.
+        retained.min(self.ring_parts_for(configured))
     }
 
     /// Longest part of a stream seen so far, or the nominal part of the
@@ -31031,6 +31159,130 @@ mod tests {
             assert!(playlist.contains("#EXTINF:1.000,\nseg1.bin"), "{part_us}");
             assert_eq!(assert_valid_ll_hls(&playlist), 2, "{part_us}");
         }
+    }
+
+    /// Microseconds that a playlist covers: its whole segments and the parts
+    /// of the open one.
+    fn playlist_duration_us(playlist: &str) -> u64 {
+        use playlists::m3u8_manifest::parse_seconds_us;
+        let mut whole_us = 0;
+        let mut open_us = 0;
+        for line in playlist.lines() {
+            if let Some(value) = line.strip_prefix("#EXTINF:") {
+                whole_us += parse_seconds_us(value.trim_end_matches(',')).expect("EXTINF");
+                open_us = 0;
+            } else if let Some(rest) = line.strip_prefix("#EXT-X-PART:DURATION=") {
+                open_us += parse_seconds_us(rest.split(',').next().unwrap()).expect("DURATION");
+            }
+        }
+        whole_us + open_us
+    }
+
+    #[tokio::test]
+    async fn short_pcm_parts_on_a_node_of_two_and_a_half_ms_parts_keep_a_window_in_time() {
+        // The default node: 2.5 ms nominal parts, 1 s segments, a 12 s
+        // window, and a ring sized for parts down to 0.25 ms.
+        let ring = cache_ring_parts(2_500, 400, 4_800, DEFAULT_MIN_PART_US);
+        assert_eq!(ring, 60_000);
+        assert_eq!(cache_ring_parts(2_500, 400, 4_800, 0), 19_200);
+        assert_eq!(cache_ring_parts(2_500, 400, 4_800, 2_500), 19_200);
+        for (part_us, window_parts, seconds) in [(500, 24_000, 5), (250, 44_000, 5)] {
+            let cache = LiveTsCache::with_ring(
+                1,
+                Duration::from_micros(2_500),
+                400,
+                4_800,
+                64,
+                2,
+                ring,
+            )
+            .await;
+            let parts_per_segment = 1_000_000 / part_us;
+            commit_timed_stamped_parts(
+                &cache,
+                77,
+                part_us,
+                parts_per_segment,
+                parts_per_segment * seconds + 3,
+            )
+            .await;
+            {
+                let state = cache.state.read().await;
+                // 12 s of these parts, or as many as the ring holds beside
+                // the three target durations kept after the window; not the
+                // 4,800 parts (2.4 s, 1.2 s) of the nominal window.
+                assert_eq!(state.stream_window_parts(77, 4_800), window_parts, "{part_us}");
+                assert!(state.stream_retained_parts(77, 4_800) <= ring, "{part_us}");
+            }
+            let playlist = cache.playlist_for_stream_id(77).await;
+            assert!(playlist.contains("#EXT-X-TARGETDURATION:1\n"), "{part_us}");
+            assert!(playlist.contains("HOLD-BACK=3.000"), "{part_us}");
+            // Every committed second is still listed: five whole segments
+            // and the open one.
+            assert_eq!(assert_valid_ll_hls(&playlist), seconds as usize, "{part_us}");
+            assert!(playlist.contains("#EXT-X-MEDIA-SEQUENCE:0\n"), "{part_us}");
+            assert!(
+                playlist_duration_us(&playlist) >= 3 * 1_000_000,
+                "{part_us}: {} µs",
+                playlist_duration_us(&playlist)
+            );
+            // Parts are listed for the last three target durations only.
+            assert!(!playlist.contains("URI=\"part0.bin\""), "{part_us}");
+        }
+    }
+
+    #[test]
+    fn the_window_of_a_stream_of_short_parts_follows_time_up_to_the_ring() {
+        let declare = |part_us: u32, target_us: u32| {
+            let mut state = LiveState::new();
+            state.nominal_part_us = 2_500;
+            state.ring_parts = 60_000;
+            state.stream_declared_us.insert(77, (part_us, target_us));
+            state
+        };
+        // Nominal and longer parts keep the configured count at most.
+        assert_eq!(declare(2_500, 1_000_000).stream_window_parts(77, 4_800), 4_800);
+        assert_eq!(declare(33_367, 2_000_000).stream_window_parts(77, 4_800), 560);
+        // 1 ms parts: 12 s.
+        assert_eq!(declare(1_000, 1_000_000).stream_window_parts(77, 4_800), 12_000);
+        // A ring of four nominal windows only: still three target durations
+        // for 0.25 ms parts, where the ring holds them.
+        let mut state = declare(250, 1_000_000);
+        state.ring_parts = 19_200;
+        let window = state.stream_window_parts(77, 4_800);
+        assert_eq!(window, 12_000);
+        assert!(state.stream_retained_parts(77, 4_800) <= 19_200);
+        // A stream without stamps of short parts keeps four of its windows
+        // in the ring.
+        let mut state = LiveState::new();
+        state.nominal_part_us = 2_500;
+        state.ring_parts = 60_000;
+        state.stream_max_part_duration_us.insert(77, 250);
+        assert_eq!(state.stream_window_parts(77, 4_800), 15_000);
+        state.ring_parts = 0;
+        assert_eq!(state.stream_window_parts(77, 4_800), 4_800);
+    }
+
+    #[test]
+    fn the_ring_holds_the_window_of_the_shortest_part() {
+        let args = Args::try_parse_from(["av-mesh"]).unwrap().normalized().unwrap();
+        assert_eq!(args.min_part_us, 250);
+        assert_eq!(args.ring_parts, 60_000);
+        let args = Args::try_parse_from(["av-mesh", "--min-part-us", "0"])
+            .unwrap()
+            .normalized()
+            .unwrap();
+        assert_eq!(args.ring_parts, 19_200);
+        let args = Args::try_parse_from(["av-mesh", "--min-part-us", "1000"])
+            .unwrap()
+            .normalized()
+            .unwrap();
+        assert_eq!(args.ring_parts, 19_200);
+        let args = Args::try_parse_from(["av-mesh", "--min-part-us", "500"])
+            .unwrap()
+            .normalized()
+            .unwrap();
+        assert_eq!(args.ring_parts, 30_000);
     }
 
     #[tokio::test]
