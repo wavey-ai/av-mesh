@@ -577,6 +577,8 @@ struct ReaderReport {
     stall_events: Vec<Stall>,
     max_behind_ms: i64,
     max_gap_ms: u64,
+    /// Caches that the steering manifest defined as pathway clones.
+    pathway_clones: u64,
     /// Largest number of part requests on their way at one time.
     pipeline_depth: usize,
     /// Shortest round trip of a playlist reload.
@@ -866,6 +868,32 @@ impl Reader {
             if let Ok(reload) = steering.join(reload) {
                 self.master.steering = Some(reload);
             }
+        }
+        // A pathway clone defines a cache that the Multivariant Playlist did
+        // not name: the URIs of its base pathway with another host.
+        for clone in manifest["PATHWAY-CLONES"].as_array().into_iter().flatten() {
+            let (Some(id), Some(base), Some(host)) = (
+                clone["ID"].as_str(),
+                clone["BASE-ID"].as_str(),
+                clone["URI-REPLACEMENT"]["HOST"].as_str(),
+            ) else {
+                continue;
+            };
+            if self.master.caches.iter().any(|cache| cache.name == id) {
+                continue;
+            }
+            let Some(base) = self.master.caches.iter().find(|cache| cache.name == base) else {
+                continue;
+            };
+            let (_, port) = base.playlist.host_port();
+            self.master.caches.push(CacheTarget {
+                name: id.to_owned(),
+                playlist: Url {
+                    authority: format!("{host}:{port}"),
+                    path_and_query: base.playlist.path_and_query.clone(),
+                },
+            });
+            self.report.pathway_clones += 1;
         }
         let first = manifest["PATHWAY-PRIORITY"]
             .as_array()

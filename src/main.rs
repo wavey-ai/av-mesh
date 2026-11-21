@@ -167,6 +167,11 @@ const MIN_BITRATE_WINDOW_MS: u64 = 4_000;
 /// How often a node without its own measurement of a playlist asks what
 /// rate the region advertises for it.
 const PLAYLIST_RATE_LOOKUP_INTERVAL_MS: u64 = 500;
+/// Edges of a region that hold a playlist while it has readers.
+const DEFAULT_PLAYLIST_COPIES: usize = 2;
+/// An edge that holds this many playlists takes no standby copy: the slots
+/// that are left are for playlists that its own readers ask for.
+const STANDBY_PLAYLIST_LIMIT: usize = 10;
 /// Most playlists that an edge holds for its readers at one time. The live
 /// cache has 16 playlist slots, and one is the default stream of the node.
 const MAX_EDGE_PLAYLISTS: usize = 15;
@@ -1081,6 +1086,29 @@ struct Args {
     )]
     cache_mesh_warm_kbps: u64,
 
+    /// Entry point of a neighbouring region, as NAME=URL, for example
+    /// `us-east=https://entry.us-east.example:443`. Repeat it. The
+    /// Multivariant Playlist of this region lists each as the last pathway,
+    /// so a reader that loses every cache of this region, or the region
+    /// itself, moves to the neighbour.
+    #[arg(
+        long = "failover-entry",
+        env = "NEEDLETAIL_FAILOVER_ENTRIES",
+        value_delimiter = ','
+    )]
+    failover_entries: Vec<String>,
+
+    /// Edges of a region that hold each playlist that has readers. With two,
+    /// a second edge takes a copy of a playlist as soon as one edge has a
+    /// reader for it, so a reader whose cache fails moves to a cache that
+    /// holds the playlist already. One keeps a copy only where readers are.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_PLAYLIST_COPIES",
+        default_value_t = DEFAULT_PLAYLIST_COPIES
+    )]
+    playlist_copies: usize,
+
     /// Receive and send buffer of the cache-mesh socket. It must hold the
     /// largest part once for each parent. Zero uses --udp-socket-buffer-bytes.
     #[arg(
@@ -1613,6 +1641,19 @@ async fn main() -> Result<()> {
         playlist_demand.clone(),
         ingest_shutdown_rx.clone(),
     ));
+    let playlist_standby_task = tokio::spawn(run_playlist_standby(
+        Arc::clone(&mesh_handle),
+        edge_load.clone(),
+        playlist_demand.clone(),
+        telemetry_aggregator.clone(),
+        StandbyConfig {
+            node_id: node_id.clone(),
+            region: args.region.clone(),
+            copies: args.playlist_copies,
+            fresh_ms: args.telemetry_interval_ms.saturating_mul(3).max(3_000),
+        },
+        ingest_shutdown_rx.clone(),
+    ));
 
     #[cfg(feature = "private-subnet-discovery")]
     let private_subnet_discovery = if args.private_subnet_discovery {
@@ -1749,6 +1790,7 @@ async fn main() -> Result<()> {
         args.operations_snapshot_file.clone(),
     )
     .with_hls_renditions(args.hls_renditions.clone(), args.hls_rendition_stale_ms)
+    .with_failover_entries(&args.failover_entries)
     .with_playlist_demand(playlist_demand)
     .with_assignment(
         AssignmentPolicy {
@@ -1907,6 +1949,7 @@ async fn main() -> Result<()> {
     let _ = media_fec_ingest_task.await;
     let _ = mesh_applied_task.await;
     let _ = playlist_demand_task.await;
+    let _ = playlist_standby_task.await;
     let _ = replication_planner_task.await;
     if let Some(task) = telemetry_publisher_task {
         let _ = task.await;
@@ -9613,6 +9656,176 @@ async fn run_mesh_applied_parts(
 
 /// Renew the playlist subscriptions of an edge while they have readers, and
 /// release each one when its readers have gone.
+#[derive(Debug, Clone)]
+struct StandbyConfig {
+    node_id: String,
+    region: String,
+    /// Edges of the region that hold each playlist that has readers.
+    copies: usize,
+    /// Age below which the advertisement of a node counts.
+    fresh_ms: u64,
+}
+
+/// What one edge of a region advertises about one playlist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StandbyHolder {
+    node_id: String,
+    sessions: u64,
+}
+
+/// Rank of an edge for the standby copy of a playlist. Every edge computes
+/// the same rank from the two names, so the edges of a region agree on who
+/// takes the copy without a word between them.
+fn standby_rank(node_id: &str, stream_id: u64) -> u64 {
+    // FNV-1a, which is the same in every build of every node.
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in stream_id
+        .to_be_bytes()
+        .iter()
+        .chain(node_id.as_bytes().iter())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // The last bytes of similar names differ little: mix once more.
+    hash ^ (hash >> 29)
+}
+
+/// Whether this edge holds a standby copy of a playlist.
+///
+/// `holders` are the edges of the region that hold the playlist, with their
+/// readers. `edges` are all the edges that can take a copy. A playlist with
+/// readers is held by `copies` edges: the edges with readers, and then the
+/// edges without readers in rank order.
+fn wants_standby_copy(
+    node_id: &str,
+    stream_id: u64,
+    copies: usize,
+    holders: &[StandbyHolder],
+    edges: &[String],
+) -> bool {
+    let with_readers = holders
+        .iter()
+        .filter(|holder| holder.sessions > 0)
+        .map(|holder| holder.node_id.as_str())
+        .collect::<Vec<_>>();
+    if with_readers.is_empty() || with_readers.contains(&node_id) {
+        // Nobody reads the playlist, or this edge holds it for its readers.
+        return false;
+    }
+    let wanted = copies.saturating_sub(with_readers.len());
+    if wanted == 0 {
+        return false;
+    }
+    let mut candidates = edges
+        .iter()
+        .map(String::as_str)
+        .filter(|edge| !with_readers.contains(edge))
+        .collect::<Vec<_>>();
+    if !candidates.contains(&node_id) {
+        candidates.push(node_id);
+    }
+    candidates.sort_by_key(|edge| std::cmp::Reverse(standby_rank(edge, stream_id)));
+    candidates.dedup();
+    candidates
+        .iter()
+        .take(wanted)
+        .any(|candidate| *candidate == node_id)
+}
+
+/// Keep a standby copy of each playlist that another edge of the region has
+/// readers for and too few edges hold.
+///
+/// A standby copy is demand like a reader: this task touches the playlist
+/// on each sweep, and the copy is released by the idle rule when the reason
+/// for it has gone.
+async fn run_playlist_standby(
+    mesh: Arc<CacheMeshHandle>,
+    edge_load: EdgeLoad,
+    demand: PlaylistDemand,
+    telemetry: TelemetryAggregator,
+    config: StandbyConfig,
+    mut shutdown_rx: watch::Receiver<()>,
+) {
+    if !demand.config.enabled || config.copies < 2 {
+        return;
+    }
+    let mut ticker = interval(Duration::from_millis(PLAYLIST_DEMAND_SWEEP_MS));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => return,
+            _ = ticker.tick() => {}
+        }
+        let now_ms = now_unix_ms();
+        let own_sessions = edge_load.egress.sessions_by_playlist();
+        let mut holders: HashMap<u64, Vec<StandbyHolder>> = HashMap::new();
+        let mut edges = vec![config.node_id.clone()];
+        for snapshot in telemetry.snapshots.read().await.values() {
+            let Some(edge) = snapshot.edge_service.as_ref() else {
+                continue;
+            };
+            if snapshot.node.node_id == config.node_id
+                || snapshot.node.region != config.region
+                || edge.cache_mesh_role != "edge"
+                || edge.draining
+                || snapshot.node.draining
+                || now_ms.saturating_sub(snapshot.updated_unix_ms) > config.fresh_ms
+            {
+                continue;
+            }
+            edges.push(snapshot.node.node_id.clone());
+            for playlist in &edge.playlists {
+                holders
+                    .entry(playlist.stream_id)
+                    .or_default()
+                    .push(StandbyHolder {
+                        node_id: snapshot.node.node_id.clone(),
+                        sessions: playlist.sessions,
+                    });
+            }
+        }
+        for (stream_id, mut stream_holders) in holders {
+            let sessions = own_sessions.get(&stream_id).copied().unwrap_or(0);
+            if sessions > 0 {
+                continue;
+            }
+            stream_holders.push(StandbyHolder {
+                node_id: config.node_id.clone(),
+                sessions,
+            });
+            if !wants_standby_copy(
+                &config.node_id,
+                stream_id,
+                config.copies,
+                &stream_holders,
+                &edges,
+            ) {
+                continue;
+            }
+            let held = demand.streams.len();
+            if !demand.streams.contains_key(&stream_id) && held >= STANDBY_PLAYLIST_LIMIT {
+                continue;
+            }
+            let touch = demand.touch(stream_id, now_ms);
+            if touch.new {
+                match mesh.subscribe(stream_id, 0, demand.config.warm_parts).await {
+                    Ok(parents) => info!(
+                        stream_id,
+                        parents = parents.len(),
+                        "this edge takes a standby copy of a playlist that another edge serves"
+                    ),
+                    Err(error) => warn!(
+                        stream_id,
+                        error = %error,
+                        "failed to subscribe to a standby copy"
+                    ),
+                }
+            }
+        }
+    }
+}
+
 async fn run_playlist_demand(
     cache: Arc<LiveTsCache>,
     mesh: Arc<CacheMeshHandle>,
@@ -12994,6 +13207,8 @@ struct AppRouter {
     hls_failover_bandwidth_bps: u64,
     hls_renditions: Arc<HlsRenditionCatalog>,
     hls_rendition_stale_ms: u64,
+    /// Entry points of neighbouring regions: pathway name and base URL.
+    failover_entries: Arc<Vec<(String, String)>>,
     edge_load: EdgeLoad,
     edge_lifecycle_config: EdgeLifecycleConfig,
     edge_lifecycle: Arc<StdMutex<EdgeLifecyclePlanner>>,
@@ -13066,6 +13281,7 @@ impl AppRouter {
             hls_failover_bandwidth_bps: hls_failover_bandwidth_bps.max(1),
             hls_renditions: Arc::new(HlsRenditionCatalog::default()),
             hls_rendition_stale_ms: DEFAULT_HLS_RENDITION_STALE_MS,
+            failover_entries: Arc::new(Vec::new()),
             edge_load,
             edge_lifecycle_config: edge_lifecycle_config.normalized(),
             edge_lifecycle: Arc::new(StdMutex::new(EdgeLifecyclePlanner::default())),
@@ -13096,6 +13312,24 @@ impl AppRouter {
         self.assignment_policy = policy;
         self.steering_ttl_seconds = steering_ttl_seconds.max(1);
         self.assignment_fresh_ms = telemetry_interval_ms.saturating_mul(3).max(3_000);
+        self
+    }
+
+    /// Entry points of neighbouring regions, each as `NAME=URL`. An entry
+    /// whose name is not a valid pathway name or whose URL is not HTTP is
+    /// left out.
+    fn with_failover_entries(mut self, entries: &[String]) -> Self {
+        let parsed = entries
+            .iter()
+            .filter_map(|entry| {
+                let (name, url) = entry.split_once('=')?;
+                let (name, url) = (name.trim(), url.trim().trim_end_matches('/'));
+                (is_valid_pathway_id(name)
+                    && (url.starts_with("https://") || url.starts_with("http://")))
+                .then(|| (name.to_owned(), url.to_owned()))
+            })
+            .collect::<Vec<_>>();
+        self.failover_entries = Arc::new(parsed);
         self
     }
 
@@ -13638,6 +13872,7 @@ impl AppRouter {
         };
 
         let mut variants = Vec::new();
+        let mut failover_pathways: Vec<String> = Vec::new();
         if let Some(configured) = self.hls_renditions.variants(stream_id) {
             let configured = configured.to_vec();
             let mut active = Vec::with_capacity(configured.len());
@@ -13701,6 +13936,32 @@ impl AppRouter {
                     variants.push(variant);
                 }
             }
+            // The neighbouring regions come last: one pathway for each, which
+            // a reader uses when no cache of this region answers. The entry
+            // point of the neighbour sends the reader on to one of its caches.
+            if steer && pin.is_none() {
+                for (name, base_url) in self.failover_entries.iter() {
+                    let mut request = String::from("assign=1");
+                    if let Some(session_id) = session_id {
+                        request.push_str("&sid=");
+                        request.push_str(&percent_encode_query_value(session_id));
+                    }
+                    let uri = format!("{base_url}{media_path}?{request}");
+                    let Ok(variant) = VariantStream::new(uri, bandwidth_bps) else {
+                        continue;
+                    };
+                    let variant = match codecs.as_deref() {
+                        Some(codecs) => variant.with_codecs(codecs).ok(),
+                        None => Some(variant),
+                    };
+                    if let Some(variant) =
+                        variant.and_then(|variant| variant.with_pathway_id(name.clone()).ok())
+                    {
+                        variants.push(variant);
+                        failover_pathways.push(name.clone());
+                    }
+                }
+            }
         }
 
         let Ok(mut playlist) = MultivariantPlaylist::new(variants) else {
@@ -13708,7 +13969,14 @@ impl AppRouter {
             return edge_overloaded_response(&alternatives);
         };
         if steer {
-            let steering = ContentSteering::new(steering_uri(session_id, pin.as_deref()))
+            // The steering request names the pathways of this playlist, so
+            // that the manifest can define any other cache as a clone.
+            let known = caches
+                .iter()
+                .map(|cache| cache.node_id.as_str())
+                .chain(failover_pathways.iter().map(String::as_str))
+                .collect::<Vec<_>>();
+            let steering = ContentSteering::new(steering_uri(session_id, pin.as_deref(), &known))
                 .and_then(|steering| steering.with_initial_pathway(caches[0].node_id.clone()));
             if let Ok(steered) =
                 steering.and_then(|steering| playlist.clone().with_content_steering(steering))
@@ -13717,6 +13985,51 @@ impl AppRouter {
             }
         }
         playlist_response(playlist.render(), gzip).with_no_store()
+    }
+
+    /// Redirect a playlist request to the cache that this region assigns the
+    /// reader. `None` when this node is that cache, or when no cache is free.
+    async fn assigned_playlist_redirect(
+        &self,
+        stream_id: u64,
+        path: &str,
+        query: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Option<HandlerResponse> {
+        let session = session_id
+            .map(str::to_owned)
+            .or_else(|| query_value(query, "sid").and_then(percent_decode_query_value));
+        let (assignment, _) = self
+            .assign_reader(
+                ReaderRequest {
+                    stream_id,
+                    session: session.as_deref(),
+                    pin: None,
+                    current: None,
+                },
+                true,
+            )
+            .await;
+        let caches = assignment.ok()?.caches;
+        let first = caches.first()?;
+        if first.node_id == self.node.node_id {
+            return None;
+        }
+        // The reader keeps its session and its place. It is assigned now.
+        let forwarded = query.map(|query| {
+            query
+                .split('&')
+                .filter(|pair| *pair != "assign=1")
+                .collect::<Vec<_>>()
+                .join("&")
+        });
+        let location = playback_request_url(&first.playback_base_url, path, forwarded.as_deref())?;
+        let alternatives = caches
+            .iter()
+            .skip(1)
+            .filter_map(|cache| playback_request_url(&cache.playback_base_url, path, None))
+            .collect::<Vec<_>>();
+        Some(drain_redirect_response(&location, &alternatives))
     }
 
     /// The Content Steering manifest of a stream. A player reloads it every
@@ -13747,35 +14060,81 @@ impl AppRouter {
                 true,
             )
             .await;
-        let priority = match assignment {
-            Ok(assignment) => assignment
-                .caches
-                .into_iter()
-                .map(|cache| cache.node_id)
-                .filter(|node_id| is_valid_pathway_id(node_id))
-                .collect::<Vec<_>>(),
+        // The pathways that the Multivariant Playlist of the reader named.
+        let known = query_value(query, "p")
+            .and_then(percent_decode_query_value)
+            .map(|list| {
+                list.split(',')
+                    .filter(|pathway| is_valid_pathway_id(pathway))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut clones = Vec::new();
+        let mut priority = match assignment {
+            Ok(assignment) => {
+                let mut priority = Vec::new();
+                for cache in assignment.caches {
+                    if !is_valid_pathway_id(&cache.node_id) {
+                        continue;
+                    }
+                    if known.is_empty() || known.contains(&cache.node_id) {
+                        priority.push(cache.node_id);
+                        continue;
+                    }
+                    // A cache that the reader has no URI for: one that joined
+                    // the region, or took a copy, after the reader started.
+                    // It is defined as a clone of a pathway that the reader
+                    // has, with the host of the cache.
+                    let base = current
+                        .as_ref()
+                        .filter(|current| known.contains(current))
+                        .or_else(|| known.first());
+                    let host = url_host(&cache.playback_base_url);
+                    if let (Some(base), Some(host)) = (base, host) {
+                        clones.push(serde_json::json!({
+                            "BASE-ID": base,
+                            "ID": cache.node_id,
+                            "URI-REPLACEMENT": { "HOST": host },
+                        }));
+                        priority.push(cache.node_id);
+                    }
+                }
+                priority
+            }
             Err(AssignmentError::UnknownPinnedCache) => {
                 return response(StatusCode::NOT_FOUND, None, None).with_no_store();
             }
             // No cache admits a reader now. The player keeps its pathway.
-            Err(AssignmentError::NoCacheAvailable) => current.into_iter().collect(),
+            Err(AssignmentError::NoCacheAvailable) => current.clone().into_iter().collect(),
         };
+        // The neighbouring regions stay last in every list, so that a reader
+        // has somewhere to go when this region does not answer at all.
+        for (name, _) in self.failover_entries.iter() {
+            if pin.is_none() && known.contains(name) && !priority.contains(name) {
+                priority.push(name.clone());
+            }
+        }
         if priority.is_empty() {
             let mut unavailable =
                 response(StatusCode::SERVICE_UNAVAILABLE, None, None).with_no_store();
             unavailable.headers.push(("retry-after".into(), "1".into()));
             return unavailable;
         }
-        let manifest = serde_json::json!({
+        let known_refs = known.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut manifest = serde_json::json!({
             "VERSION": 1,
             "TTL": self.steering_ttl_seconds,
-            "RELOAD-URI": steering_uri(session_id, pin.as_deref()),
+            "RELOAD-URI": steering_uri(session_id, pin.as_deref(), &known_refs),
             "PATHWAY-PRIORITY": priority,
         });
+        if !clones.is_empty() {
+            manifest["PATHWAY-CLONES"] = serde_json::Value::Array(clones);
+        }
         response(
             StatusCode::OK,
             Some(Bytes::from(manifest.to_string())),
-            Some("application/json"),
+            Some("application/vnd.apple.steering-list"),
         )
         .with_no_store()
     }
@@ -14847,6 +15206,24 @@ impl Router for AppRouter {
                             self.record_edge_response(method, path, query, response, started)
                         );
                     }
+                    // A reader that comes from another region asks this
+                    // entry point for the playlist itself. It is sent to the
+                    // cache that this region assigns it.
+                    if query_value(query, "assign") == Some("1") {
+                        if let Some(response) = self
+                            .assigned_playlist_redirect(
+                                stream_id,
+                                path,
+                                query,
+                                session_id.as_deref(),
+                            )
+                            .await
+                        {
+                            return Ok(
+                                self.record_edge_response(method, path, query, response, started)
+                            );
+                        }
+                    }
                     if let Some(refusal) = self.hold_playlist_reload(stream_id, query).await {
                         return Ok(self.record_edge_response(method, path, query, refusal, started));
                     }
@@ -15845,10 +16222,14 @@ fn parse_steering_path(path: &str, default_stream_id: u64) -> Option<u64> {
 /// The Content Steering manifest URI, relative to the Multivariant Playlist.
 /// It carries the session, so that every reload gives the same reader the
 /// same order of caches, and the pin of a pinned reader.
-fn steering_uri(session_id: Option<&str>, pin: Option<&str>) -> String {
+/// URI of the Content Steering manifest. `known` are the pathways of the
+/// Multivariant Playlist of the reader: the manifest defines any other cache
+/// as a clone of one of them.
+fn steering_uri(session_id: Option<&str>, pin: Option<&str>, known: &[&str]) -> String {
     let mut uri = String::from("steering.json");
     let mut separator = '?';
-    for (name, value) in [("sid", session_id), ("cache", pin)] {
+    let known = (!known.is_empty()).then(|| known.join(","));
+    for (name, value) in [("sid", session_id), ("cache", pin), ("p", known.as_deref())] {
         let Some(value) = value else {
             continue;
         };
@@ -15856,9 +16237,25 @@ fn steering_uri(session_id: Option<&str>, pin: Option<&str>) -> String {
         separator = '&';
         uri.push_str(name);
         uri.push('=');
-        uri.push_str(&percent_encode_query_value(value));
+        uri.push_str(&percent_encode_query_value(value).replace("%2C", ","));
     }
     uri
+}
+
+/// Host of an `http` or `https` URL, without the port.
+fn url_host(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority = rest.split('/').next()?;
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        bracketed.split(']').next()?
+    } else {
+        authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host)
+    };
+    (!host.is_empty()).then(|| host.to_owned())
 }
 
 fn percent_encode_query_value(value: &str) -> String {
@@ -20155,7 +20552,7 @@ mod tests {
             "#EXT-X-STREAM-INF:BANDWIDTH=4000000,PATHWAY-ID=\"edge-b\"\n\
              https://edge-b.example/live/801/stream.m3u8"
         ));
-        assert!(body.contains("#EXT-X-CONTENT-STEERING:SERVER-URI=\"steering.json\",PATHWAY-ID="));
+        assert!(body.contains("#EXT-X-CONTENT-STEERING:SERVER-URI=\"steering.json?p="));
         mesh.shutdown();
     }
 
@@ -25147,6 +25544,58 @@ mod tests {
         assert!(late.get_segment_for_stream_id(77, 1_003).await.is_none());
     }
 
+    #[test]
+    fn one_edge_without_readers_takes_the_standby_copy() {
+        let edges = ["edge-1", "edge-2", "edge-3", "edge-4"]
+            .map(str::to_owned)
+            .to_vec();
+        let holder = |node: &str, sessions| StandbyHolder {
+            node_id: node.to_owned(),
+            sessions,
+        };
+        // edge-1 has readers of playlist 7. Exactly one other edge wants the
+        // second copy, and every edge agrees which.
+        let holders = vec![holder("edge-1", 3)];
+        let wanting = edges
+            .iter()
+            .filter(|edge| wants_standby_copy(edge, 7, 2, &holders, &edges))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(wanting.len(), 1, "{wanting:?}");
+        assert_ne!(wanting[0], "edge-1");
+        // Another playlist can have its standby copy on another edge.
+        let spread = (1..40_u64)
+            .map(|stream| {
+                edges
+                    .iter()
+                    .find(|edge| wants_standby_copy(edge, stream, 2, &holders, &edges))
+                    .cloned()
+                    .unwrap()
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(spread.len(), 3, "{spread:?}");
+
+        // The standby edge holds its copy: it still wants it.
+        let standby = wanting[0].clone();
+        let holders = vec![holder("edge-1", 3), holder(&standby, 0)];
+        assert!(wants_standby_copy(&standby, 7, 2, &holders, &edges));
+        // Two edges have readers: no standby copy is needed.
+        let other = edges
+            .iter()
+            .find(|edge| **edge != "edge-1" && **edge != standby)
+            .unwrap();
+        let holders = vec![holder("edge-1", 3), holder(other, 1), holder(&standby, 0)];
+        assert!(!wants_standby_copy(&standby, 7, 2, &holders, &edges));
+        // Nobody reads the playlist: no copy is kept for it.
+        let holders = vec![holder("edge-1", 0), holder(&standby, 0)];
+        assert!(!wants_standby_copy(&standby, 7, 2, &holders, &edges));
+        // One copy: no standby.
+        let holders = vec![holder("edge-1", 3)];
+        assert!(edges
+            .iter()
+            .all(|edge| !wants_standby_copy(edge, 7, 1, &holders, &edges)));
+    }
+
     #[tokio::test]
     async fn a_copy_that_fills_newest_first_never_grows_at_its_front() {
         let distributor = LiveTsCache::new(1, Duration::from_millis(5), 200, 2_400, 64).await;
@@ -25213,6 +25662,56 @@ mod tests {
             .is_some());
         // Much older media has gone.
         assert!(cache.get_segment_for_stream_id(77, 1_000).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_neighbouring_region_is_the_last_pathway_and_sends_the_reader_to_its_cache() {
+        let (router, mesh) = entry_point_for_tests(vec![
+            reader_cache_snapshot_for_tests("edge-b", 200, Some(500)),
+            reader_cache_snapshot_for_tests("edge-c", 0, None),
+        ])
+        .await;
+        let router = router.with_failover_entries(&[
+            "us-east=https://entry.us-east.example:19444/".to_owned(),
+            "not a name=https://ignored.example".to_owned(),
+        ]);
+        let master = body_text(get_for_tests(&router, "/live/801/master.m3u8?sid=reader-1").await);
+        let variants = master
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .collect::<Vec<_>>();
+        // The caches of this region first, the neighbour last.
+        assert_eq!(variants[0], "https://edge-b.example/live/801/stream.m3u8");
+        assert_eq!(
+            variants.last().copied(),
+            Some("https://entry.us-east.example:19444/live/801/stream.m3u8?assign=1&sid=reader-1")
+        );
+        assert!(master.contains("PATHWAY-ID=\"us-east\""));
+        assert!(!master.contains("ignored.example"));
+        let steering = master
+            .lines()
+            .find(|line| line.starts_with("#EXT-X-CONTENT-STEERING:"))
+            .unwrap();
+        assert!(steering.contains(",us-east\""), "{steering}");
+
+        // The steering manifest keeps the neighbour as the last pathway.
+        let uri = "/live/801/steering.json?sid=reader-1&p=edge-b,edge-c,test-node,us-east";
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&get_for_tests(&router, uri).await.body.unwrap()).unwrap();
+        let priority = manifest["PATHWAY-PRIORITY"].as_array().unwrap();
+        assert_eq!(priority.last().unwrap(), "us-east");
+        assert_eq!(priority[0], "edge-b");
+
+        // The entry point of the neighbour is asked for the playlist itself
+        // and sends the reader to the cache that it assigns.
+        let request = "/live/801/stream.m3u8?assign=1&sid=far-reader&_HLS_msn=4";
+        let redirect = get_for_tests(&router, request).await;
+        assert_eq!(redirect.status, StatusCode::TEMPORARY_REDIRECT);
+        assert!(redirect.headers.iter().any(|(name, value)| {
+            name == "location"
+                && value == "https://edge-b.example/live/801/stream.m3u8?sid=far-reader&_HLS_msn=4"
+        }));
+        mesh.shutdown();
     }
 
     #[tokio::test]
@@ -25930,15 +26429,52 @@ mod tests {
         // The holder is assigned. The other two caches are the failover order.
         assert_eq!(variants[0], "https://edge-b.example/live/801/stream.m3u8");
         assert_eq!(variants.len(), 3);
-        assert!(master.contains(
-            "#EXT-X-CONTENT-STEERING:SERVER-URI=\"steering.json?sid=reader-1\",PATHWAY-ID=\"edge-b\""
-        ));
+        // The steering request names the pathways that the reader was given.
+        let steering = master
+            .lines()
+            .find(|line| line.starts_with("#EXT-X-CONTENT-STEERING:"))
+            .unwrap();
+        assert!(steering.contains("SERVER-URI=\"steering.json?sid=reader-1&p=edge-b,"));
+        assert!(steering.ends_with(",PATHWAY-ID=\"edge-b\""));
         assert!(master.contains("PATHWAY-ID=\"edge-c\""));
         assert!(master.contains("PATHWAY-ID=\"test-node\""));
 
+        // A cache that the reader was not given is defined as a clone of a
+        // pathway that it has, with the host of the cache.
+        let manifest = get_for_tests(
+            &router,
+            "/live/801/steering.json?sid=reader-1&p=edge-b&_HLS_pathway=edge-b",
+        )
+        .await;
+        assert!(manifest
+            .content_type
+            .as_deref()
+            .is_some_and(|kind| kind == "application/vnd.apple.steering-list"));
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest.body.unwrap()).unwrap();
+        assert_eq!(manifest["PATHWAY-PRIORITY"][0], "edge-b");
+        let clones = manifest["PATHWAY-CLONES"].as_array().unwrap();
+        let clone = clones
+            .iter()
+            .find(|clone| clone["ID"] == "edge-c")
+            .expect("edge-c is a clone");
+        assert_eq!(clone["BASE-ID"], "edge-b");
+        assert_eq!(clone["URI-REPLACEMENT"]["HOST"], "edge-c.example");
+        assert!(manifest["PATHWAY-PRIORITY"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|pathway| pathway == "edge-c"));
+        assert_eq!(
+            manifest["RELOAD-URI"],
+            "steering.json?sid=reader-1&p=edge-b"
+        );
+
         let steering = get_for_tests(&router, "/live/801/steering.json?sid=reader-1").await;
         assert_eq!(steering.status, StatusCode::OK);
-        assert_eq!(steering.content_type.as_deref(), Some("application/json"));
+        assert_eq!(
+            steering.content_type.as_deref(),
+            Some("application/vnd.apple.steering-list")
+        );
         let steering: serde_json::Value = serde_json::from_str(&body_text(steering)).unwrap();
         assert_eq!(steering["VERSION"], 1);
         assert_eq!(steering["TTL"], 5);
@@ -26230,9 +26766,22 @@ mod tests {
         assert_eq!(parse_steering_path("/live/steering.json", 1), Some(1));
         assert_eq!(parse_steering_path("/live/77/stream.m3u8", 1), None);
         assert_eq!(parse_steering_path("/live/a/b/steering.json", 1), None);
-        assert_eq!(steering_uri(None, None), "steering.json");
+        assert_eq!(steering_uri(None, None, &[]), "steering.json");
         assert_eq!(
-            steering_uri(Some("a b&c"), Some("lon-edge-1")),
+            steering_uri(Some("s"), None, &["edge-1", "us-east"]),
+            "steering.json?sid=s&p=edge-1,us-east"
+        );
+        assert_eq!(
+            url_host("https://10.90.0.24:19444/live").as_deref(),
+            Some("10.90.0.24")
+        );
+        assert_eq!(
+            url_host("https://edge.example/live").as_deref(),
+            Some("edge.example")
+        );
+        assert_eq!(url_host("ftp://edge.example"), None);
+        assert_eq!(
+            steering_uri(Some("a b&c"), Some("lon-edge-1"), &[]),
             "steering.json?sid=a%20b%26c&cache=lon-edge-1"
         );
         assert_eq!(playback_stream_ids("/live/77/part3.mp4", None, 1), vec![77]);
