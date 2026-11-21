@@ -24,7 +24,7 @@ use av_mesh::relay_ingress::{
 };
 use av_mesh::udp_fec::UdpFecReceiver;
 use bytes::Bytes;
-use media_object::{ObjectKey, PayloadHash};
+use media_object::ObjectKey;
 use raptorq_datagram_fec::MediaDatagramRole;
 use relay_session::RelayLimits;
 use serde::Serialize;
@@ -61,6 +61,9 @@ pub struct RelayClassConfig {
     /// Audio at SCHED_FIFO 10, video at nice -10, where the host allows.
     pub realtime: bool,
     pub tee_capacity: usize,
+    /// Tests: the tee of this class panics on its first datagram.
+    #[cfg(test)]
+    pub test_tee_panic: Option<TrafficClass>,
 }
 
 impl Default for RelayClassConfig {
@@ -70,6 +73,8 @@ impl Default for RelayClassConfig {
             cpus: [None, None],
             realtime: true,
             tee_capacity: DEFAULT_TEE_CAPACITY,
+            #[cfg(test)]
+            test_tee_panic: None,
         }
     }
 }
@@ -263,8 +268,8 @@ enum TeeKind {
         forwarded: Option<(SocketAddr, u64)>,
         video_kind: bool,
     },
-    /// Anything else: legacy RQD2, AEP1, control, or an RLS1 datagram that
-    /// did not pass. The tee runs today's path for it.
+    /// Anything that is not RLS1: legacy RQD2, AEP1, native-audio control.
+    /// The tee runs today's path for it.
     Unchecked,
 }
 
@@ -275,20 +280,32 @@ struct PlannedSend {
     role: MediaDatagramRole,
 }
 
+/// A source symbol held back from a warm repair-only child, buffered for
+/// its promotion once the batch's sends are done.
+#[derive(Debug, Clone, Copy)]
+struct PlannedWarm {
+    message: u16,
+    path: u16,
+    object: u64,
+    expires_at_us: u64,
+}
+
 /// The sends of one drained batch, by source socket.
 pub(crate) struct ForwardPlan {
     groups: Vec<Vec<PlannedSend>>,
     retry: Vec<(usize, PlannedSend)>,
+    warm: Vec<PlannedWarm>,
     first: [Option<(SocketAddr, u64)>; RECV_BATCH],
 }
 
 impl ForwardPlan {
-    fn new(groups: usize) -> Self {
+    fn new(groups: usize, warm_paths: usize) -> Self {
         Self {
             groups: (0..groups)
                 .map(|_| Vec::with_capacity(RECV_BATCH))
                 .collect(),
             retry: Vec::with_capacity(RECV_BATCH),
+            warm: Vec::with_capacity(RECV_BATCH * warm_paths),
             first: [None; RECV_BATCH],
         }
     }
@@ -298,12 +315,14 @@ impl ForwardPlan {
             group.clear();
         }
         self.retry.clear();
+        self.warm.clear();
         self.first = [None; RECV_BATCH];
     }
 }
 
-fn view_object_key(view: &RlsView<'_>) -> Option<ObjectKey> {
-    ObjectKey::new(
+/// The warm-buffer identity of the object of a symbol, read in place.
+pub(crate) fn view_object_id(view: &RlsView<'_>) -> u64 {
+    crate::warm_object_id(
         view.tenant,
         view.stream,
         view.track,
@@ -311,25 +330,18 @@ fn view_object_key(view: &RlsView<'_>) -> Option<ObjectKey> {
         view.group,
         view.object,
         view.version,
-        PayloadHash::from_bytes(*view.payload_hash),
+        view.payload_hash,
     )
-    .ok()
 }
 
 impl RelayDownstreamForwarder {
     /// Plan the sends of one admitted symbol: every path whose lane takes
     /// its role, in compiled order. A source symbol held back from a warm
-    /// repair-only child is kept for a later promotion, as `forward` does.
-    fn plan_fast(
-        &self,
-        class: TrafficClass,
-        message: usize,
-        view: &RlsView<'_>,
-        datagram: &[u8],
-        now_us: u64,
-        plan: &mut ForwardPlan,
-    ) {
+    /// repair-only child is noted, and kept for a later promotion only once
+    /// the batch is sent (`buffer_fast_warm`), as `forward` keeps it.
+    fn plan_fast(&self, message: usize, view: &RlsView<'_>, plan: &mut ForwardPlan) {
         let role = view.role;
+        let mut object = None;
         for (index, path) in self.paths.iter().enumerate() {
             let promoted = path.promoted.load(Ordering::Relaxed);
             let failover_source = promoted
@@ -344,19 +356,44 @@ impl RelayDownstreamForwarder {
                 continue;
             }
             if path.role == RelayForwardRole::Repair && matches!(role, MediaDatagramRole::Source) {
-                if let Some(key) = view_object_key(view) {
-                    self.buffer_warm_source_class(
-                        path,
-                        &key,
-                        view.deadline_us,
-                        datagram,
-                        now_us,
-                        class == TrafficClass::Video,
-                    );
-                }
+                plan.warm.push(PlannedWarm {
+                    message: message as u16,
+                    path: index as u16,
+                    object: *object.get_or_insert_with(|| view_object_id(view)),
+                    expires_at_us: view.deadline_us,
+                });
             }
             self.filtered_datagrams.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Buffer the batch's held-back sources, in the warm buffers of the
+    /// thread's class.
+    fn buffer_fast_warm(
+        &self,
+        class: TrafficClass,
+        batch: &RecvBatch,
+        plan: &ForwardPlan,
+        now_us: u64,
+    ) {
+        for warm in &plan.warm {
+            self.buffer_warm_source_class(
+                &self.paths[usize::from(warm.path)],
+                class,
+                warm.object,
+                warm.expires_at_us,
+                batch.data(usize::from(warm.message)),
+                now_us,
+            );
+        }
+    }
+
+    /// Repair-only children, whose held-back sources a plan notes.
+    fn warm_paths(&self) -> usize {
+        self.paths
+            .iter()
+            .filter(|path| path.role == RelayForwardRole::Repair)
+            .count()
     }
 
     fn class_fd(&self, class: TrafficClass, group: usize) -> std::os::fd::RawFd {
@@ -386,6 +423,7 @@ impl RelayDownstreamForwarder {
             groups,
             retry,
             first,
+            ..
         } = plan;
         for (group, sends) in groups.iter().enumerate() {
             if sends.is_empty() {
@@ -503,10 +541,9 @@ impl ClassThread {
             .collect();
         let mut batch = RecvBatch::new();
         let mut dedup = FirstArrival::new(DEDUP_CAPACITY);
-        let mut plan = ForwardPlan::new(
-            self.forwarder
-                .as_ref()
-                .map_or(0, |forwarder| forwarder.socket_groups.len()),
+        let mut plan = self.forwarder.as_ref().map_or_else(
+            || ForwardPlan::new(0, 0),
+            |forwarder| ForwardPlan::new(forwarder.socket_groups.len(), forwarder.warm_paths()),
         );
         let mut pending = Vec::with_capacity(RECV_BATCH);
         let mut kernel_dropped = vec![0_u32; self.sockets.len()];
@@ -606,9 +643,12 @@ impl ClassThread {
                 pending.push(unchecked);
                 continue;
             }
+            // An RLS1 datagram that is malformed, or that its peer's session
+            // does not admit, is counted and dropped here: the tee could only
+            // reject it, and a flood of them must not fill the tee ahead of
+            // admitted symbols.
             let Ok(view) = RlsView::parse(received.data, self.limits) else {
                 self.stats.invalid.fetch_add(1, Ordering::Relaxed);
-                pending.push(unchecked);
                 continue;
             };
             let admitted = self.admissions.get(&peer).is_some_and(|admission| {
@@ -616,7 +656,6 @@ impl ClassThread {
             });
             if !admitted {
                 self.stats.not_admitted.fetch_add(1, Ordering::Relaxed);
-                pending.push(unchecked);
                 continue;
             }
             self.failover.observe(path, view.role, now);
@@ -636,7 +675,7 @@ impl ClassThread {
                 continue;
             }
             if let Some(forwarder) = &self.forwarder {
-                forwarder.plan_fast(class, message, &view, received.data, now_us, plan);
+                forwarder.plan_fast(message, &view, plan);
             }
             pending.push(Pending {
                 admitted: Some(view.is_video_kind()),
@@ -645,6 +684,9 @@ impl ClassThread {
         }
         if let Some(forwarder) = &self.forwarder {
             forwarder.send_fast_plan(class, batch, plan, &self.stats);
+            // Held-back sources are kept only once every child has its
+            // datagrams, in this class's own buffers.
+            forwarder.buffer_fast_warm(class, batch, plan, now_us);
         }
         // The tee copies come after every child has its datagrams.
         for entry in pending.drain(..) {
@@ -708,10 +750,14 @@ struct Tee {
     failover: Arc<FailoverInputs>,
     classes: StreamClasses,
     snapshots: Arc<StdMutex<[RelayIngressSnapshot; 2]>>,
+    stats: Arc<FastPlaneStats>,
     /// The audio tee also rotates the cache and retires idle streams, as
     /// the single ingest loop did.
     housekeeping: bool,
     reported_deadline_drops: u64,
+    /// Tests: the tee panics on its first datagram.
+    #[cfg(test)]
+    panic_on_item: bool,
 }
 
 impl Tee {
@@ -748,7 +794,7 @@ impl Tee {
 
     fn publish(&self) {
         let snapshot = self.dispatch.receiver().snapshot();
-        let merged = {
+        let mut merged = {
             let mut snapshots = self
                 .snapshots
                 .lock()
@@ -756,6 +802,12 @@ impl Tee {
             snapshots[self.class.index()] = snapshot;
             merge_snapshots(&snapshots)
         };
+        // RLS1 datagrams that the threads dropped as malformed or not
+        // admitted never reach a dispatch; they count as its rejections did.
+        let dropped = self.stats.invalid.load(Ordering::Relaxed)
+            + self.stats.not_admitted.load(Ordering::Relaxed);
+        merged.counters.datagrams_received += dropped;
+        merged.counters.datagrams_rejected += dropped;
         self.cache.update_relay_runtime(
             merged,
             self.forwarder
@@ -819,6 +871,8 @@ impl Tee {
     }
 
     async fn process(&mut self, item: TeeItem) {
+        #[cfg(test)]
+        assert!(!self.panic_on_item, "test: the tee panics");
         let started = Instant::now();
         match item.kind {
             TeeKind::Admitted {
@@ -862,8 +916,8 @@ impl Tee {
         {
             return;
         }
-        // Legacy RQD2, or an RLS1 datagram that the thread did not admit:
-        // the dispatch counts its rejection. Nothing here forwards.
+        // Legacy RQD2 (RLS1 never comes here: the thread admits it or drops
+        // it). Nothing here forwards.
         let _ = process_udp_fec_ingest_datagram_inner(
             item.peer,
             &item.bytes,
@@ -1015,6 +1069,7 @@ pub async fn run_relay_class_ingest(
     let RelayIngestRuntime {
         dispatch,
         secondary_socket: _,
+        class_twins: _,
         forwarder,
         audio_epochs,
         failover_controller,
@@ -1047,7 +1102,7 @@ pub async fn run_relay_class_ingest(
     }
     let mut dispatches = [Some(dispatch), Some(video_dispatch)];
     let mut threads = Vec::new();
-    let mut tees = Vec::new();
+    let mut tees = tokio::task::JoinSet::new();
     for class in TrafficClass::ALL {
         let class_sockets = std::mem::take(&mut by_class[class.index()]);
         if class_sockets.is_empty() {
@@ -1068,12 +1123,19 @@ pub async fn run_relay_class_ingest(
             cpu: config.cpus[class.index()],
             realtime: config.realtime,
         };
-        threads.push(
-            std::thread::Builder::new()
-                .name(format!("needletail-fast-{}", class.as_str()))
-                .spawn(move || thread.run())
-                .context("failed to start a fast-plane thread")?,
-        );
+        match std::thread::Builder::new()
+            .name(format!("needletail-fast-{}", class.as_str()))
+            .spawn(move || thread.run())
+        {
+            Ok(handle) => threads.push(handle),
+            Err(error) => {
+                // The threads already started stop before the error returns.
+                stop.store(true, Ordering::Relaxed);
+                join_threads(threads).await;
+                tees.shutdown().await;
+                return Err(error).context("failed to start a fast-plane thread");
+            }
+        }
         let tee = Tee {
             class,
             cache: Arc::clone(&cache),
@@ -1091,10 +1153,13 @@ pub async fn run_relay_class_ingest(
             failover: Arc::clone(&failover),
             classes: cache.stream_classes().clone(),
             snapshots: Arc::clone(&snapshots),
+            stats: Arc::clone(&stats),
             housekeeping: class == TrafficClass::Audio,
             reported_deadline_drops: 0,
+            #[cfg(test)]
+            panic_on_item: config.test_tee_panic == Some(class),
         };
-        tees.push(tokio::spawn(tee.run(rx)));
+        tees.spawn(async move { (class, tee.run(rx).await) });
     }
     let controller = failover_controller.map(|controller| {
         tokio::spawn(run_failover_controller(
@@ -1114,23 +1179,54 @@ pub async fn run_relay_class_ingest(
         "RelaySession ingest runs on the fast plane"
     );
 
-    let _ = shutdown_rx.changed().await;
-    stop.store(true, Ordering::Relaxed);
-    for thread in threads {
-        let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+    // Until shutdown, a tee that ends is an error of the whole ingest: the
+    // threads would forward on while nothing commits, so they stop, and the
+    // error goes to the caller as the single loop's did.
+    let mut result = tokio::select! {
+        _ = shutdown_rx.changed() => Ok(()),
+        Some(ended) = tees.join_next() => Err(tee_ended(ended)),
+    };
+    if let Err(error) = &result {
+        tracing::error!(
+            error = %format!("{error:#}"),
+            "a fast-plane tee ended: RelaySession ingest stops"
+        );
+        if let Some(controller) = &controller {
+            controller.abort();
+        }
     }
-    let mut result = Ok(());
-    for tee in tees {
-        match tee.await {
-            Ok(Err(error)) => result = Err(error),
-            Err(error) => result = Err(anyhow::anyhow!("a fast-plane tee ended: {error}")),
-            Ok(Ok(())) => {}
+    stop.store(true, Ordering::Relaxed);
+    join_threads(threads).await;
+    // With the threads gone the tees' channels close and they end.
+    while let Some(ended) = tees.join_next().await {
+        if !matches!(ended, Ok((_, Ok(())))) && result.is_ok() {
+            result = Err(tee_ended(ended));
         }
     }
     if let Some(controller) = controller {
         let _ = controller.await;
     }
-    cache.rotate_if_due(true).await?;
+    if result.is_ok() {
+        cache.rotate_if_due(true).await?;
+    }
     info!("UDP-FEC mesh byte ingest shutting down");
     result
+}
+
+async fn join_threads(threads: Vec<std::thread::JoinHandle<()>>) {
+    for thread in threads {
+        let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+    }
+}
+
+/// Why a tee ended: its error, a panic, or (before shutdown) its channel
+/// closing.
+fn tee_ended(ended: Result<(TrafficClass, Result<()>), tokio::task::JoinError>) -> anyhow::Error {
+    match ended {
+        Ok((class, Ok(()))) => anyhow::anyhow!("the fast-plane {} tee ended", class.as_str()),
+        Ok((class, Err(error))) => {
+            error.context(format!("the fast-plane {} tee failed", class.as_str()))
+        }
+        Err(error) => anyhow::anyhow!("a fast-plane tee ended: {error}"),
+    }
 }

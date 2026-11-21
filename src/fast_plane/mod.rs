@@ -118,8 +118,24 @@ impl ClassMarker {
     }
 }
 
+/// The stream of a cache-mesh datagram that is the first source symbol of
+/// its block, which begins with the chunk frame that names the part.
+fn first_symbol_stream(datagram: &[u8]) -> Option<u64> {
+    let header = raptorq_datagram_fec::DatagramFecHeader::decode(datagram).ok()?;
+    let payload = header.payload(datagram).ok()?;
+    if payload.len() < 4 || payload[1..4] != [0, 0, 0] {
+        return None;
+    }
+    playlists::mesh::chunk_frame_slot(&payload[4..]).map(|(stream_id, _)| stream_id)
+}
+
 impl playlists::mesh::CacheMeshReceiveObserver for ClassMarker {
     fn datagram(&self, peer: std::net::SocketAddr, datagram: &[u8]) {
+        // Marked on the first symbol, before the observer behind it (the
+        // edge's cut-through) picks the socket that the part leaves from.
+        if let Some(stream_id) = first_symbol_stream(datagram) {
+            self.classes.mark_video(stream_id);
+        }
         if let Some(inner) = &self.inner {
             inner.datagram(peer, datagram);
         }

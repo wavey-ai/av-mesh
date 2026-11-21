@@ -104,7 +104,7 @@ use tokio::{
     time::{interval, sleep, MissedTickBehavior},
 };
 use tokio_tungstenite::{tungstenite::Message as WebSocketMessage, WebSocketStream};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use web_service::{
     load_default_tls_base64, load_tls_base64_from_paths, read_length_prefixed_frame,
     write_length_prefixed_frame, BodyStream, H2H3Server, HandlerResponse, HandlerResult,
@@ -2455,6 +2455,26 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    // A relay or distributor with the single loop still reads its video
+    // class ports, where a parent with class threads sends its video.
+    let relay_class_twins = if class_ingest || !args.relay_controlled_local {
+        Vec::new()
+    } else {
+        let secondary = args.relay_secondary_bind;
+        let (primary, offset, buffer_bytes) = (
+            args.fec_bind,
+            args.relay_class_port_offset,
+            args.udp_socket_buffer_bytes,
+        );
+        let twins = fast_path::on_media(media, async move {
+            bind_single_loop_class_twins(primary, secondary, offset, buffer_bytes).await
+        })
+        .await?;
+        for (_, socket) in &twins {
+            fast_path_report.tune_receive_socket(socket, "relay video class ingest");
+        }
+        twins
+    };
     let relay_dispatch = configured_relay_udp_dispatch(&args, &node_id)?;
     let relay_forwards = args.relay_forwards.clone();
     let forward_class_offset =
@@ -2507,11 +2527,21 @@ async fn main() -> Result<()> {
     let relay_ingest_runtime = RelayIngestRuntime {
         dispatch: relay_dispatch,
         secondary_socket: relay_secondary_socket,
+        class_twins: relay_class_twins,
         forwarder: relay_forwarder,
         audio_epochs: Some(audio_epoch_tx.clone()),
         failover_controller: relay_failover_controller,
         failover_heartbeat: Duration::from_millis(args.relay_failover_heartbeat_ms),
         link_telemetry: Some(link_telemetry),
+    };
+    // `..Default::default()` fills the fields that exist only in tests.
+    #[allow(clippy::needless_update)]
+    let relay_class_config = fast_plane::relay::RelayClassConfig {
+        port_offset: args.relay_class_port_offset,
+        cpus: args.relay_class_cpus.0,
+        realtime: args.relay_class_realtime,
+        tee_capacity: args.relay_class_tee_capacity,
+        ..Default::default()
     };
     let fec_ingest_task = match (fec_socket, class_sockets) {
         (Some(socket), _) => fast_path::spawn_media(
@@ -2530,12 +2560,7 @@ async fn main() -> Result<()> {
                 Arc::clone(&cache),
                 ingest_shutdown_rx.clone(),
                 relay_ingest_runtime,
-                fast_plane::relay::RelayClassConfig {
-                    port_offset: args.relay_class_port_offset,
-                    cpus: args.relay_class_cpus.0,
-                    realtime: args.relay_class_realtime,
-                    tee_capacity: args.relay_class_tee_capacity,
-                },
+                relay_class_config,
             ),
         ),
         (None, None) => unreachable!("the relay ingest binds one kind of socket"),
@@ -2665,7 +2690,17 @@ async fn main() -> Result<()> {
         ingest_shutdown_rx.clone(),
     );
     let edge_udp_task = if let Some(bind) = args.client_udp_bind {
-        let sockets = if args.client_udp_class_sockets && fast_plane::sys::supported() {
+        // The pair sends by the class of a stream, which an edge learns only
+        // from the class socket of a split cache mesh: without the split
+        // every stream would look like audio and its 4K would leave from the
+        // audio socket, ahead of the audio in band 0. One socket then.
+        let class_sockets = args.client_udp_class_sockets && fast_plane::sys::supported();
+        if class_sockets && !mesh_split {
+            info!(
+                "edge client UDP: one socket, as --client-udp-class-sockets needs the cache mesh split by class (--cache-mesh-class-port-offset)"
+            );
+        }
+        let sockets = if class_sockets && mesh_split {
             bind_edge_class_sockets(bind, args.udp_socket_buffer_bytes, cache.stream_classes())?
         } else {
             edge_udp::EdgeSockets::single(
@@ -2791,12 +2826,31 @@ async fn main() -> Result<()> {
     }
     println!("health:  https://127.0.0.1:{}/up", args.http_port);
 
-    tokio::signal::ctrl_c().await?;
+    // The relay ingest ends only at shutdown. If it ends before (an error,
+    // or a fast-plane tee that failed), the node no longer takes or commits
+    // media: it shuts down with the error, so that its supervisor restarts it.
+    let mut fec_ingest_task = fec_ingest_task;
+    let ingest_failure = tokio::select! {
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            None
+        }
+        ended = &mut fec_ingest_task => Some(match ended {
+            Ok(Ok(())) => anyhow::anyhow!("the RelaySession ingest ended"),
+            Ok(Err(error)) => error.context("the RelaySession ingest failed"),
+            Err(error) => anyhow::anyhow!("the RelaySession ingest ended: {error}"),
+        }),
+    };
+    if let Some(error) = &ingest_failure {
+        error!(error = %format!("{error:#}"), "shutting down");
+    }
     mesh_handle.shutdown();
     let _ = ingest_shutdown_tx.send(());
     let _ = handle.shutdown_tx.send(());
     let _ = handle.finished_rx.await;
-    let _ = fec_ingest_task.await;
+    if ingest_failure.is_none() {
+        let _ = fec_ingest_task.await;
+    }
     for task in relay_failover_listener_tasks {
         let _ = task.await;
     }
@@ -2830,7 +2884,10 @@ async fn main() -> Result<()> {
     for task in telemetry_collector_tasks {
         let _ = task.await;
     }
-    Ok(())
+    match ingest_failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// Give the calling thread a lower priority than the threads that carry the
@@ -3653,21 +3710,73 @@ struct RelayForwardSnapshot {
     failover_last_transition_unix_ms: u64,
 }
 
-#[derive(Debug)]
-struct WarmSourceDatagram {
-    object_key: media_object::ObjectKey,
-    expires_at_us: u64,
-    wire: Bytes,
-    /// Arrived on the video class (fast plane): replayed to the child's
-    /// video port from the video twin socket.
-    video: bool,
+/// The identity of a buffered object: a hash of its key's fields. Computed
+/// from an `ObjectKey`, or from the RLS1 header in place on the fast plane
+/// (no allocation); both give the same value.
+#[allow(clippy::too_many_arguments)]
+fn warm_object_id(
+    tenant: &str,
+    stream: &str,
+    track: &str,
+    epoch: u64,
+    group: u64,
+    object: u64,
+    version: u32,
+    payload_hash: &[u8; 32],
+) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::hash::DefaultHasher::new();
+    hasher.write(tenant.as_bytes());
+    hasher.write_u8(0xff);
+    hasher.write(stream.as_bytes());
+    hasher.write_u8(0xff);
+    hasher.write(track.as_bytes());
+    hasher.write_u8(0xff);
+    hasher.write_u64(epoch);
+    hasher.write_u64(group);
+    hasher.write_u64(object);
+    hasher.write_u32(version);
+    hasher.write(payload_hash);
+    hasher.finish()
 }
 
+fn warm_object_id_of_key(key: &media_object::ObjectKey) -> u64 {
+    warm_object_id(
+        key.tenant(),
+        key.stream(),
+        key.track(),
+        key.epoch(),
+        key.group(),
+        key.object(),
+        key.version(),
+        key.payload_hash().as_bytes(),
+    )
+}
+
+/// The capacity a warm-source buffer is given when first used: a whole RLS1
+/// datagram, so that a reused buffer never grows.
+const WARM_SOURCE_SLOT_BYTES: usize = 1_536;
+
+#[derive(Debug)]
+struct WarmSourceDatagram {
+    object: u64,
+    expires_at_us: u64,
+    wire: Vec<u8>,
+}
+
+/// The source datagrams held back from a warm repair-only child, replayed
+/// to it on promotion. A forwarder keeps one per child and class, touched
+/// only by that class's thread (or the single receive loop) and a replay.
+/// Datagram buffers are reused, and expiry and the bounds work from the
+/// front, so a push costs O(1) amortised and, once warm, allocates nothing.
 #[derive(Debug, Default)]
 struct WarmSourceReplayBuffer {
     datagrams: VecDeque<WarmSourceDatagram>,
-    object_order: VecDeque<media_object::ObjectKey>,
+    /// The objects held, oldest first, with how many datagrams each has.
+    object_order: VecDeque<(u64, usize)>,
     bytes: usize,
+    /// Buffers of datagrams that left, for the next pushes.
+    spare: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Default)]
@@ -3682,11 +3791,23 @@ struct WarmSourceBufferMutation {
     evicted_bytes: usize,
 }
 
+impl WarmSourceBufferMutation {
+    fn removed_datagrams(&self) -> usize {
+        self.expired_datagrams
+            .saturating_add(self.retired_datagrams)
+            .saturating_add(self.evicted_datagrams)
+    }
+
+    fn removed_bytes(&self) -> usize {
+        self.expired_bytes
+            .saturating_add(self.retired_bytes)
+            .saturating_add(self.evicted_bytes)
+    }
+}
+
 #[derive(Debug, Default)]
 struct WarmSourceReplayBatch {
-    datagrams: Vec<Bytes>,
-    /// For each datagram: whether it is of the video class.
-    video: Vec<bool>,
+    datagrams: Vec<Vec<u8>>,
     bytes: usize,
     expired_datagrams: usize,
     expired_bytes: usize,
@@ -3694,23 +3815,27 @@ struct WarmSourceReplayBatch {
 
 impl WarmSourceReplayBuffer {
     #[cfg_attr(not(test), allow(dead_code))]
-    fn push(
+    fn push_key(
         &mut self,
         object_key: &media_object::ObjectKey,
         expires_at_us: u64,
         wire: &[u8],
         now_us: u64,
     ) -> WarmSourceBufferMutation {
-        self.push_class(object_key, expires_at_us, wire, now_us, false)
+        self.push(
+            warm_object_id_of_key(object_key),
+            expires_at_us,
+            wire,
+            now_us,
+        )
     }
 
-    fn push_class(
+    fn push(
         &mut self,
-        object_key: &media_object::ObjectKey,
+        object: u64,
         expires_at_us: u64,
         wire: &[u8],
         now_us: u64,
-        video: bool,
     ) -> WarmSourceBufferMutation {
         let mut mutation = WarmSourceBufferMutation::default();
         self.remove_expired(now_us, &mut mutation);
@@ -3718,22 +3843,34 @@ impl WarmSourceReplayBuffer {
             return mutation;
         }
 
-        if !self.object_order.contains(object_key) {
-            self.object_order.push_back(object_key.clone());
+        // Most pushes are of the newest object.
+        match self
+            .object_order
+            .iter_mut()
+            .rev()
+            .find(|(id, _)| *id == object)
+        {
+            Some((_, count)) => *count += 1,
+            None => self.object_order.push_back((object, 1)),
         }
+        let mut buffer = self
+            .spare
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(wire.len().max(WARM_SOURCE_SLOT_BYTES)));
+        buffer.clear();
+        buffer.extend_from_slice(wire);
         self.bytes = self.bytes.saturating_add(wire.len());
         self.datagrams.push_back(WarmSourceDatagram {
-            object_key: object_key.clone(),
+            object,
             expires_at_us,
-            wire: Bytes::copy_from_slice(wire),
-            video,
+            wire: buffer,
         });
         mutation.added_datagrams = 1;
         mutation.added_bytes = wire.len();
 
         while self.object_order.len() > RELAY_WARM_SOURCE_REPLAY_MAX_OBJECTS_PER_CHILD {
-            if let Some(oldest) = self.object_order.pop_front() {
-                self.remove_object(&oldest, &mut mutation);
+            if let Some((oldest, count)) = self.object_order.pop_front() {
+                self.remove_object(oldest, count, &mut mutation);
             }
         }
         while self.datagrams.len() > RELAY_WARM_SOURCE_REPLAY_MAX_DATAGRAMS_PER_CHILD
@@ -3742,16 +3879,9 @@ impl WarmSourceReplayBuffer {
             let Some(evicted) = self.datagrams.pop_front() else {
                 break;
             };
-            self.bytes = self.bytes.saturating_sub(evicted.wire.len());
             mutation.evicted_datagrams = mutation.evicted_datagrams.saturating_add(1);
             mutation.evicted_bytes = mutation.evicted_bytes.saturating_add(evicted.wire.len());
-            if !self
-                .datagrams
-                .iter()
-                .any(|entry| entry.object_key == evicted.object_key)
-            {
-                self.object_order.retain(|key| key != &evicted.object_key);
-            }
+            self.release(evicted);
         }
         mutation
     }
@@ -3765,7 +3895,6 @@ impl WarmSourceReplayBuffer {
             } else {
                 batch.bytes = batch.bytes.saturating_add(datagram.wire.len());
                 batch.datagrams.push(datagram.wire);
-                batch.video.push(datagram.video);
             }
         }
         self.object_order.clear();
@@ -3773,41 +3902,83 @@ impl WarmSourceReplayBuffer {
         batch
     }
 
+    /// Drop the expired datagrams at the front. One that expires behind a
+    /// live one waits for it to leave (or for a replay, which skips it).
     fn remove_expired(&mut self, now_us: u64, mutation: &mut WarmSourceBufferMutation) {
-        let mut retained = VecDeque::with_capacity(self.datagrams.len());
-        while let Some(datagram) = self.datagrams.pop_front() {
-            if datagram.expires_at_us <= now_us {
-                self.bytes = self.bytes.saturating_sub(datagram.wire.len());
-                mutation.expired_datagrams = mutation.expired_datagrams.saturating_add(1);
-                mutation.expired_bytes = mutation.expired_bytes.saturating_add(datagram.wire.len());
-            } else {
-                retained.push_back(datagram);
-            }
+        while self
+            .datagrams
+            .front()
+            .is_some_and(|datagram| datagram.expires_at_us <= now_us)
+        {
+            let Some(datagram) = self.datagrams.pop_front() else {
+                break;
+            };
+            mutation.expired_datagrams = mutation.expired_datagrams.saturating_add(1);
+            mutation.expired_bytes = mutation.expired_bytes.saturating_add(datagram.wire.len());
+            self.release(datagram);
         }
-        self.datagrams = retained;
-        self.object_order.retain(|key| {
-            self.datagrams
-                .iter()
-                .any(|datagram| &datagram.object_key == key)
-        });
     }
 
-    fn remove_object(
-        &mut self,
-        object_key: &media_object::ObjectKey,
-        mutation: &mut WarmSourceBufferMutation,
-    ) {
-        let mut retained = VecDeque::with_capacity(self.datagrams.len());
-        while let Some(datagram) = self.datagrams.pop_front() {
-            if &datagram.object_key == object_key {
-                self.bytes = self.bytes.saturating_sub(datagram.wire.len());
-                mutation.retired_datagrams = mutation.retired_datagrams.saturating_add(1);
-                mutation.retired_bytes = mutation.retired_bytes.saturating_add(datagram.wire.len());
-            } else {
-                retained.push_back(datagram);
+    /// Account for a datagram that left, and keep its buffer.
+    fn release(&mut self, datagram: WarmSourceDatagram) {
+        self.bytes = self.bytes.saturating_sub(datagram.wire.len());
+        if let Some(index) = self
+            .object_order
+            .iter()
+            .position(|(id, _)| *id == datagram.object)
+        {
+            let count = &mut self.object_order[index].1;
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.object_order.remove(index);
             }
         }
-        self.datagrams = retained;
+        if self.spare.len() < RELAY_WARM_SOURCE_REPLAY_MAX_DATAGRAMS_PER_CHILD {
+            self.spare.push(datagram.wire);
+        }
+    }
+
+    /// Remove the `count` datagrams of an object that has left
+    /// `object_order`: from the front while they lead, then by one pass.
+    fn remove_object(
+        &mut self,
+        object: u64,
+        mut count: usize,
+        mutation: &mut WarmSourceBufferMutation,
+    ) {
+        let mut retire = |buffer: &mut Self, datagram: WarmSourceDatagram| {
+            buffer.bytes = buffer.bytes.saturating_sub(datagram.wire.len());
+            mutation.retired_datagrams = mutation.retired_datagrams.saturating_add(1);
+            mutation.retired_bytes = mutation.retired_bytes.saturating_add(datagram.wire.len());
+            if buffer.spare.len() < RELAY_WARM_SOURCE_REPLAY_MAX_DATAGRAMS_PER_CHILD {
+                buffer.spare.push(datagram.wire);
+            }
+        };
+        while count > 0
+            && self
+                .datagrams
+                .front()
+                .is_some_and(|datagram| datagram.object == object)
+        {
+            if let Some(datagram) = self.datagrams.pop_front() {
+                retire(self, datagram);
+                count -= 1;
+            }
+        }
+        if count == 0 {
+            return;
+        }
+        // Interleaved with other objects: one pass, in place.
+        for _ in 0..self.datagrams.len() {
+            let Some(datagram) = self.datagrams.pop_front() else {
+                break;
+            };
+            if datagram.object == object {
+                retire(self, datagram);
+            } else {
+                self.datagrams.push_back(datagram);
+            }
+        }
     }
 }
 
@@ -3823,7 +3994,11 @@ struct RelayForwardPath {
     video_target: SocketAddr,
     role: RelayForwardRole,
     promoted: AtomicBool,
-    warm_sources: StdMutex<WarmSourceReplayBuffer>,
+    /// Warm sources by traffic class ([`fast_plane::TrafficClass::index`]):
+    /// each class's thread holds only its own lock, so a 4K symbol's
+    /// buffering never holds an audio one back, and audio objects never
+    /// push a 4K object out. The single receive loop uses the audio one.
+    warm_sources: [StdMutex<WarmSourceReplayBuffer>; 2],
 }
 
 struct RelayDownstreamForwarder {
@@ -3976,7 +4151,7 @@ impl RelayDownstreamForwarder {
                 video_target,
                 role: endpoint.role,
                 promoted: AtomicBool::new(false),
-                warm_sources: StdMutex::new(WarmSourceReplayBuffer::default()),
+                warm_sources: Default::default(),
             });
         }
         Ok(Some(Arc::new(Self {
@@ -4343,40 +4518,51 @@ impl RelayDownstreamForwarder {
         datagram: &[u8],
         now_us: u64,
     ) {
-        self.buffer_warm_source_class(path, object_key, expires_at_us, datagram, now_us, false);
+        self.buffer_warm_source_class(
+            path,
+            fast_plane::TrafficClass::Audio,
+            warm_object_id_of_key(object_key),
+            expires_at_us,
+            datagram,
+            now_us,
+        );
     }
 
+    /// Keep a source datagram held back from a warm repair-only child, in
+    /// the child's buffer of `class`.
     fn buffer_warm_source_class(
         &self,
         path: &RelayForwardPath,
-        object_key: &media_object::ObjectKey,
+        class: fast_plane::TrafficClass,
+        object: u64,
         expires_at_us: u64,
         datagram: &[u8],
         now_us: u64,
-        video: bool,
     ) {
-        let mutation = path
-            .warm_sources
+        let mutation = path.warm_sources[class.index()]
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push_class(object_key, expires_at_us, datagram, now_us, video);
-        self.warm_source_buffered_datagrams
-            .fetch_add(mutation.added_datagrams as u64, Ordering::Relaxed);
-        self.warm_source_buffered_bytes
-            .fetch_add(mutation.added_bytes as u64, Ordering::Relaxed);
+            .push(object, expires_at_us, datagram, now_us);
+        self.record_warm_source_mutation(&mutation);
+    }
+
+    fn record_warm_source_mutation(&self, mutation: &WarmSourceBufferMutation) {
+        if mutation.added_datagrams > 0 {
+            self.warm_source_buffered_datagrams
+                .fetch_add(mutation.added_datagrams as u64, Ordering::Relaxed);
+            self.warm_source_buffered_bytes
+                .fetch_add(mutation.added_bytes as u64, Ordering::Relaxed);
+        }
+        if mutation.removed_datagrams() == 0 {
+            return;
+        }
         atomic_saturating_sub(
             &self.warm_source_buffered_datagrams,
-            mutation
-                .expired_datagrams
-                .saturating_add(mutation.retired_datagrams)
-                .saturating_add(mutation.evicted_datagrams) as u64,
+            mutation.removed_datagrams() as u64,
         );
         atomic_saturating_sub(
             &self.warm_source_buffered_bytes,
-            mutation
-                .expired_bytes
-                .saturating_add(mutation.retired_bytes)
-                .saturating_add(mutation.evicted_bytes) as u64,
+            mutation.removed_bytes() as u64,
         );
         self.warm_source_expired_datagrams
             .fetch_add(mutation.expired_datagrams as u64, Ordering::Relaxed);
@@ -4386,66 +4572,53 @@ impl RelayDownstreamForwarder {
             .fetch_add(mutation.evicted_datagrams as u64, Ordering::Relaxed);
     }
 
+    /// Replay the warm sources of a promoted child: the audio ones first,
+    /// from the audio socket to the child's port, then the video ones from
+    /// the video twin to the child's video port, each class in as few
+    /// `sendmmsg` calls as the kernel takes.
     async fn replay_warm_sources(&self, target: SocketAddr) {
         let Some(path) = self.paths.iter().find(|path| path.target == target) else {
             return;
         };
-        let batch = path
-            .warm_sources
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take_live(now_unix_us());
-        let removed_datagrams = batch
-            .datagrams
-            .len()
-            .saturating_add(batch.expired_datagrams);
-        let removed_bytes = batch.bytes.saturating_add(batch.expired_bytes);
-        atomic_saturating_sub(
-            &self.warm_source_buffered_datagrams,
-            removed_datagrams as u64,
-        );
-        atomic_saturating_sub(&self.warm_source_buffered_bytes, removed_bytes as u64);
-        self.warm_source_expired_datagrams
-            .fetch_add(batch.expired_datagrams as u64, Ordering::Relaxed);
-        let mut batch = batch;
-        if let Some(twin) = self.video_sockets.get(path.group) {
-            // Video-class sources go back the way they came: from the video
-            // twin to the child's video port.
-            let mut audio = Vec::with_capacity(batch.datagrams.len());
-            for (datagram, video) in batch.datagrams.drain(..).zip(batch.video.drain(..)) {
-                if !video {
-                    audio.push(datagram);
-                    continue;
-                }
-                let started = Instant::now();
-                match twin.send_to(&datagram, path.video_target).await {
-                    Ok(sent) if sent == datagram.len() => {
-                        self.record_forward_success(
-                            MediaDatagramRole::Source,
-                            sent,
-                            started.elapsed(),
-                        );
-                        self.warm_source_replayed_datagrams
-                            .fetch_add(1, Ordering::Relaxed);
-                        self.warm_source_replayed_bytes
-                            .fetch_add(sent as u64, Ordering::Relaxed);
-                    }
-                    _ => {
-                        self.errors.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
+        for class in fast_plane::TrafficClass::ALL {
+            let batch = path.warm_sources[class.index()]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take_live(now_unix_us());
+            let removed_datagrams = batch
+                .datagrams
+                .len()
+                .saturating_add(batch.expired_datagrams);
+            let removed_bytes = batch.bytes.saturating_add(batch.expired_bytes);
+            atomic_saturating_sub(
+                &self.warm_source_buffered_datagrams,
+                removed_datagrams as u64,
+            );
+            atomic_saturating_sub(&self.warm_source_buffered_bytes, removed_bytes as u64);
+            self.warm_source_expired_datagrams
+                .fetch_add(batch.expired_datagrams as u64, Ordering::Relaxed);
+            if batch.datagrams.is_empty() {
+                continue;
             }
-            batch.datagrams = audio;
+            // Video sources go back the way they came: from the video twin
+            // to the child's video port.
+            let (socket, class_target) = match (class, self.video_sockets.get(path.group)) {
+                (fast_plane::TrafficClass::Video, Some(twin)) => (twin, path.video_target),
+                _ => (&path.socket, path.target),
+            };
+            self.replay_batch(socket, class_target, &batch.datagrams)
+                .await;
         }
+    }
 
-        // The whole replay goes out in as few calls as the kernel takes;
-        // what it does not take is sent one by one, waiting if need be.
+    /// Send a replay in as few calls as the kernel takes; what it does not
+    /// take is sent one by one, waiting if need be.
+    async fn replay_batch(&self, socket: &UdpSocket, target: SocketAddr, datagrams: &[Vec<u8>]) {
         let mut replayed = 0;
-        if self.batch.load(Ordering::Relaxed) && !batch.datagrams.is_empty() {
+        if self.batch.load(Ordering::Relaxed) {
             let started = Instant::now();
-            let datagrams = &batch.datagrams;
-            replayed = fast_path::try_send_batch(&path.socket, datagrams.len(), |index| {
-                (&datagrams[index][..], path.target)
+            replayed = fast_path::try_send_batch(socket, datagrams.len(), |index| {
+                (&datagrams[index][..], target)
             })
             .unwrap_or(0);
             let elapsed = started.elapsed();
@@ -4457,9 +4630,9 @@ impl RelayDownstreamForwarder {
                     .fetch_add(datagram.len() as u64, Ordering::Relaxed);
             }
         }
-        for datagram in batch.datagrams.into_iter().skip(replayed) {
+        for datagram in &datagrams[replayed..] {
             let started = Instant::now();
-            match path.socket.send_to(&datagram, path.target).await {
+            match socket.send_to(datagram, target).await {
                 Ok(sent) if sent == datagram.len() => {
                     self.record_forward_success(MediaDatagramRole::Source, sent, started.elapsed());
                     self.warm_source_replayed_datagrams
@@ -5070,6 +5243,12 @@ async fn run_relay_failover_listener(
 struct RelayIngestRuntime {
     dispatch: RelayUdpDispatch,
     secondary_socket: Option<UdpSocket>,
+    /// The video-class ports (each relay port plus the class offset) of a
+    /// node that runs the single receive loop: a parent with class threads
+    /// sends video there whatever this node runs (see
+    /// `bind_single_loop_class_twins`). Unused by the fast plane, which
+    /// binds its own.
+    class_twins: Vec<(RelayIngressParentPath, UdpSocket)>,
     forwarder: Option<Arc<RelayDownstreamForwarder>>,
     audio_epochs: Option<broadcast::Sender<AudioEpochDatagram>>,
     failover_controller: Option<RelayFailoverController>,
@@ -5092,6 +5271,7 @@ async fn run_udp_fec_ingest(
     let RelayIngestRuntime {
         dispatch: mut relay_dispatch,
         secondary_socket: relay_secondary_socket,
+        class_twins,
         forwarder: relay_forwarder,
         audio_epochs,
         failover_controller: mut relay_failover_controller,
@@ -5104,6 +5284,7 @@ async fn run_udp_fec_ingest(
     cache.update_relay_ingress(relay_dispatch.receiver().snapshot());
     let mut buf = vec![0u8; 65_536];
     let mut relay_secondary_buf = vec![0u8; 65_536];
+    let mut relay_twin_buf = vec![0u8; 65_536];
     let mut rotate = interval(Duration::from_millis(10));
     rotate.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut expire_fec = interval(Duration::from_secs(1));
@@ -5242,8 +5423,129 @@ async fn run_udp_fec_ingest(
                     cache.update_relay_failover_controller(controller.snapshot());
                 }
             }
+            received = recv_class_twins(&class_twins, &mut relay_twin_buf) => {
+                let (len, peer, path) = received?;
+                let observation = process_class_twin_datagram(
+                    peer,
+                    path,
+                    &relay_twin_buf[..len],
+                    &cache,
+                    &mut receiver,
+                    &mut relay_dispatch,
+                    relay_forwarder.as_deref(),
+                    link_telemetry.as_deref(),
+                ).await?;
+                if let (Some(controller), Some(observation)) =
+                    (relay_failover_controller.as_mut(), observation)
+                {
+                    controller.observe(path, observation, Instant::now());
+                    cache.update_relay_failover_controller(controller.snapshot());
+                }
+            }
         }
     }
+}
+
+/// Bind the video-class twins of the relay ports for a node that runs the
+/// single receive loop. A parent with class threads sends a child's video to
+/// the child's port plus the offset without knowing what the child runs, so
+/// a node with its class threads off (or without the fast plane) still
+/// reads there, and turning the flag off on one node never drops its video.
+/// A port that cannot be bound is reported and skipped.
+async fn bind_single_loop_class_twins(
+    primary: SocketAddr,
+    secondary: Option<SocketAddr>,
+    offset: u16,
+    buffer_bytes: usize,
+) -> Vec<(RelayIngressParentPath, UdpSocket)> {
+    let mut twins = Vec::new();
+    if offset == 0 {
+        return twins;
+    }
+    for (path, bind) in [
+        (RelayIngressParentPath::Primary, Some(primary)),
+        (RelayIngressParentPath::Secondary, secondary),
+    ] {
+        let Some(bind) = bind.filter(|bind| bind.port() != 0) else {
+            continue;
+        };
+        let twin = match fast_plane::class_addr(bind, fast_plane::TrafficClass::Video, offset) {
+            Ok(twin) => twin,
+            Err(error) => {
+                warn!(%bind, error = %error, "no video class port for the single receive loop");
+                continue;
+            }
+        };
+        match bind_buffered_udp_ingress(twin, buffer_bytes, "RelaySession video class ingest").await
+        {
+            Ok(socket) => {
+                info!(bind = %twin, ?path, "RelaySession video class port read by the single receive loop");
+                twins.push((path, socket));
+            }
+            Err(error) => warn!(
+                bind = %twin,
+                error = %format!("{error:#}"),
+                "could not bind the video class port: video that a parent sends there is lost"
+            ),
+        }
+    }
+    twins
+}
+
+/// Receive from whichever video-class twin is ready.
+async fn recv_class_twins(
+    twins: &[(RelayIngressParentPath, UdpSocket)],
+    buffer: &mut [u8],
+) -> std::io::Result<(usize, SocketAddr, RelayIngressParentPath)> {
+    if twins.is_empty() {
+        return std::future::pending().await;
+    }
+    std::future::poll_fn(|cx| {
+        for (path, socket) in twins {
+            let mut read = tokio::io::ReadBuf::new(buffer);
+            match socket.poll_recv_from(cx, &mut read) {
+                std::task::Poll::Ready(Ok(peer)) => {
+                    return std::task::Poll::Ready(Ok((read.filled().len(), peer, *path)));
+                }
+                std::task::Poll::Ready(Err(error)) => return std::task::Poll::Ready(Err(error)),
+                std::task::Poll::Pending => {}
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await
+}
+
+/// One datagram of a video-class twin in the single receive loop: what the
+/// relay port of its path does with a RelaySession or RQD2 datagram.
+#[allow(clippy::too_many_arguments)]
+async fn process_class_twin_datagram(
+    peer: SocketAddr,
+    path: RelayIngressParentPath,
+    datagram: &[u8],
+    cache: &Arc<LiveTsCache>,
+    receiver: &mut UdpFecReceiver,
+    relay_dispatch: &mut RelayUdpDispatch,
+    relay_forwarder: Option<&RelayDownstreamForwarder>,
+    link_telemetry: Option<&LinkTelemetry>,
+) -> Result<Option<RelayDatagramObservation>> {
+    if let Some(telemetry) = link_telemetry {
+        match path {
+            RelayIngressParentPath::Primary => telemetry.record_primary_bytes(peer, datagram.len()),
+            RelayIngressParentPath::Secondary => {
+                telemetry.record_secondary_bytes(peer, datagram.len());
+            }
+        }
+    }
+    process_udp_fec_ingest_datagram(
+        peer,
+        datagram,
+        cache,
+        receiver,
+        relay_dispatch,
+        relay_forwarder,
+    )
+    .await
 }
 
 async fn process_relay_audio_epoch_datagram(
@@ -26961,6 +27263,7 @@ mod tests {
             RelayIngestRuntime {
                 dispatch: empty_relay_udp_dispatch(),
                 secondary_socket: None,
+                class_twins: Vec::new(),
                 forwarder: None,
                 audio_epochs: None,
                 failover_controller: None,
@@ -27222,7 +27525,7 @@ mod tests {
                 &payload,
             )
             .unwrap();
-            let mutation = buffer.push(&key, now_us + 1_000_000, &payload, now_us);
+            let mutation = buffer.push_key(&key, now_us + 1_000_000, &payload, now_us);
             retired += mutation.retired_datagrams;
         }
 
@@ -27241,6 +27544,132 @@ mod tests {
             RELAY_WARM_SOURCE_REPLAY_MAX_OBJECTS_PER_CHILD
         );
         assert_eq!(buffer.bytes, 0);
+    }
+
+    /// The warm buffer's bounds keep their accounting with objects
+    /// interleaved (several streams of a class), an object retired from the
+    /// middle, eviction by count, and expiry from the front; and it reuses
+    /// the buffers of the datagrams that left.
+    #[test]
+    fn warm_source_buffer_bounds_interleaved_objects_and_reuses_buffers() {
+        let now_us = 1_000_000;
+        let live = now_us + 1_000_000;
+        let mut buffer = WarmSourceReplayBuffer::default();
+        let check = |buffer: &WarmSourceReplayBuffer| {
+            let counted: usize = buffer.object_order.iter().map(|(_, count)| count).sum();
+            assert_eq!(counted, buffer.datagrams.len());
+            let bytes: usize = buffer
+                .datagrams
+                .iter()
+                .map(|datagram| datagram.wire.len())
+                .sum();
+            assert_eq!(bytes, buffer.bytes);
+            assert!(buffer.object_order.iter().all(|(_, count)| *count > 0));
+        };
+        // Objects 1 and 2 interleaved, then 3, 4 and 5: 1 is retired from
+        // among 2's datagrams.
+        let mut retired = 0;
+        for round in 0..3 {
+            for object in [1_u64, 2] {
+                retired += buffer
+                    .push(object, live, &[object as u8; 100], now_us + round)
+                    .retired_datagrams;
+            }
+        }
+        for object in 3..=5_u64 {
+            retired += buffer
+                .push(object, live, &[object as u8; 100], now_us)
+                .retired_datagrams;
+            check(&buffer);
+        }
+        assert_eq!(retired, 3);
+        assert_eq!(
+            buffer
+                .object_order
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4, 5]
+        );
+        assert!(buffer.datagrams.iter().all(|datagram| datagram.object != 1));
+        assert_eq!(buffer.spare.len(), 3);
+
+        // One object of more datagrams than the bound: the oldest are
+        // evicted, one for one.
+        let mut buffer = WarmSourceReplayBuffer::default();
+        let mut evicted = 0;
+        for symbol in 0..RELAY_WARM_SOURCE_REPLAY_MAX_DATAGRAMS_PER_CHILD + 10 {
+            evicted += buffer
+                .push(9, live, &symbol.to_be_bytes(), now_us)
+                .evicted_datagrams;
+        }
+        assert_eq!(evicted, 10);
+        assert_eq!(
+            buffer.datagrams.len(),
+            RELAY_WARM_SOURCE_REPLAY_MAX_DATAGRAMS_PER_CHILD
+        );
+        assert_eq!(
+            buffer.object_order.iter().copied().collect::<Vec<_>>(),
+            vec![(9, RELAY_WARM_SOURCE_REPLAY_MAX_DATAGRAMS_PER_CHILD)]
+        );
+        // Past the bound one buffer goes round: each push takes the one
+        // that the last eviction freed.
+        assert_eq!(buffer.spare.len(), 1);
+        check(&buffer);
+
+        // Expiry from the front: the datagrams of an expired object go at
+        // the next push, the live one stays.
+        let mut buffer = WarmSourceReplayBuffer::default();
+        for _ in 0..5 {
+            buffer.push(1, now_us + 10, &[1; 50], now_us);
+        }
+        buffer.push(2, live, &[2; 50], now_us);
+        let mutation = buffer.push(3, live, &[3; 50], now_us + 10);
+        assert_eq!(mutation.expired_datagrams, 5);
+        assert_eq!(mutation.expired_bytes, 250);
+        assert_eq!(
+            buffer
+                .object_order
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        check(&buffer);
+        // Not pushed when already expired.
+        assert_eq!(buffer.push(4, now_us, &[4; 50], now_us).added_datagrams, 0);
+        let batch = buffer.take_live(now_us + 10);
+        assert_eq!(batch.datagrams, vec![vec![2_u8; 50], vec![3_u8; 50]]);
+        assert_eq!(buffer.bytes, 0);
+        assert!(buffer.object_order.is_empty());
+    }
+
+    /// The fast plane reads a warm object's identity from the RLS1 header
+    /// in place; the single loop from the decoded key. Both are the same.
+    #[test]
+    fn a_warm_object_has_one_identity_from_a_key_or_a_header() {
+        let envelope = encode_test_canonical_opaque_object(4001, 7, &[3_u8; 120]);
+        let object = media_object::decode(&envelope).unwrap();
+        let (sources, _) = fast_test_symbols(
+            &envelope,
+            relay_session::MediaPriority::Audio,
+            400,
+            48,
+            0,
+            now_unix_us() + 1_000_000,
+        );
+        let view =
+            fast_plane::view::RlsView::parse(&sources[0], relay_session::RelayLimits::default())
+                .unwrap();
+        assert_eq!(
+            fast_plane::relay::view_object_id(&view),
+            warm_object_id_of_key(object.key())
+        );
+        let other = encode_test_canonical_opaque_object(4001, 8, &[3_u8; 120]);
+        assert_ne!(
+            warm_object_id_of_key(media_object::decode(&other).unwrap().key()),
+            warm_object_id_of_key(object.key())
+        );
     }
 
     #[tokio::test]
@@ -27460,6 +27889,7 @@ mod tests {
             RelayIngestRuntime {
                 dispatch: empty_relay_udp_dispatch(),
                 secondary_socket: None,
+                class_twins: Vec::new(),
                 forwarder: None,
                 audio_epochs: None,
                 failover_controller: None,
@@ -27589,6 +28019,7 @@ mod tests {
             RelayIngestRuntime {
                 dispatch,
                 secondary_socket: Some(secondary_ingest),
+                class_twins: Vec::new(),
                 forwarder: None,
                 audio_epochs: None,
                 failover_controller: None,
@@ -28445,13 +28876,18 @@ mod tests {
         }
     }
 
+    /// A free loopback port in 24000-24999. A test's class-split mesh binds
+    /// the port plus 1000 as well, so those (25000-25999) are never handed
+    /// out here, and must be free too.
     fn unused_loopback_addr() -> SocketAddr {
-        static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(24_000);
+        static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 
         loop {
-            let port = NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let port =
+                24_000 + NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 1_000;
             let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-            if std::net::UdpSocket::bind(addr).is_ok() {
+            let class = SocketAddr::from((Ipv4Addr::LOCALHOST, port + 1_000));
+            if std::net::UdpSocket::bind(addr).is_ok() && std::net::UdpSocket::bind(class).is_ok() {
                 return addr;
             }
         }
@@ -30029,7 +30465,10 @@ mod tests {
     #[tokio::test]
     async fn the_client_reads_a_slot_as_the_edge_does() {
         let cache = LiveTsCache::new(1, Duration::from_millis(250), 4, 32, 64).await;
-        for (stream_id, sequence, init) in [(77_u64, 0_u64, Some(b"ftyp-moov".as_slice())), (77, 1, None)] {
+        for (stream_id, sequence, init) in [
+            (77_u64, 0_u64, Some(b"ftyp-moov".as_slice())),
+            (77, 1, None),
+        ] {
             cache
                 .commit_stream_payload(
                     stream_id,
@@ -30050,11 +30489,14 @@ mod tests {
                 .await
                 .unwrap();
             let edge = LiveSlotPayload::decode_for_stream(slot.clone(), stream_id);
-            let (media, client_init) =
-                av_mesh::client_udp::slot_media(&slot, stream_id).expect("the client reads the slot");
+            let (media, client_init) = av_mesh::client_udp::slot_media(&slot, stream_id)
+                .expect("the client reads the slot");
             assert_eq!(media, edge.media());
             assert_eq!(client_init, edge.init());
-            assert!(av_mesh::client_udp::slot_media(&slot, stream_id + 1).is_none() || !slot.starts_with(b"AVMOBJS1"));
+            assert!(
+                av_mesh::client_udp::slot_media(&slot, stream_id + 1).is_none()
+                    || !slot.starts_with(b"AVMOBJS1")
+            );
         }
     }
 
@@ -30065,7 +30507,9 @@ mod tests {
     /// the edge's LL-HLS part, and through the cut-through path.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn small_parts_reach_a_udp_client_cut_through_at_their_rate() {
-        use av_mesh::client_udp::{Control, ObjectKind as UdpObjectKind, ObjectReceiver, RepairPolicy};
+        use av_mesh::client_udp::{
+            Control, ObjectKind as UdpObjectKind, ObjectReceiver, RepairPolicy,
+        };
         use playlists::mesh::{CacheMesh, CacheMeshConfig, CacheMeshRole as MeshRole};
         use tokio::time::timeout;
 
@@ -30365,6 +30809,261 @@ mod tests {
         println!("{}", summary.join("\n"));
     }
 
+    /// An audio stream's cut-through beside a 4K one at the same edge, both
+    /// with a UDP client: with the mesh split by class each class has its
+    /// own receive task, cut-through and client socket, so the 4K parts'
+    /// cut-through bursts do not hold the audio parts back. The audio
+    /// publish-to-client latency is printed for the split and the single
+    /// path; the split one is held to a bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn audio_cut_through_is_not_held_behind_a_4k_cut_through() {
+        use av_mesh::client_udp::{
+            Control, ObjectKind as UdpObjectKind, ObjectReceiver, RepairPolicy,
+        };
+        use playlists::mesh::{CacheMesh, CacheMeshConfig, CacheMeshRole as MeshRole};
+        use tokio::time::timeout;
+
+        const VIDEO: u64 = 1;
+        const AUDIO: u64 = 3001;
+        const AUDIO_PARTS: u64 = 400;
+        const VIDEO_PART_BYTES: usize = 200_000;
+        let mut report = Vec::new();
+        let mut split_p99 = f64::MAX;
+        let mut single_p99 = 0.0_f64;
+        for split in [true, false] {
+            let offset = if split { 1_000 } else { 0 };
+            let parent_cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 8_000, 512).await;
+            let edge_cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 8_000, 512).await;
+            parent_cache.stream_classes().mark_video(VIDEO);
+            let parent_addr = unused_loopback_addr();
+            let edge_addr = unused_loopback_addr();
+            let classify = |cache: &Arc<LiveTsCache>| {
+                let classes = cache.stream_classes().clone();
+                Arc::new(move |stream_id| classes.mesh_class(stream_id))
+                    as playlists::mesh::CacheMeshStreamClassifier
+            };
+            let parent_mesh = CacheMesh::new(
+                Arc::clone(&parent_cache.chunk_cache),
+                CacheMeshConfig::new("dist-a", "uk", parent_addr)
+                    .with_peer(edge_addr)
+                    .with_role(MeshRole::Distributor)
+                    .with_announce_interval(Duration::from_millis(40))
+                    .with_sync_on_publish(true)
+                    .with_socket_buffer_bytes(8 << 20)
+                    .with_class_port_offset(offset)
+                    .with_stream_classifier(classify(&parent_cache)),
+            )
+            .start()
+            .await
+            .unwrap();
+            let cuts: Vec<Arc<edge_udp::CutThrough>> = (0..if split { 2 } else { 1 })
+                .map(|_| Arc::new(edge_udp::CutThrough::default()))
+                .collect();
+            let mut edge_config = CacheMeshConfig::new("edge-1", "uk", edge_addr)
+                .with_peer(parent_addr)
+                .with_role(MeshRole::Edge)
+                .with_announce_interval(Duration::from_millis(40))
+                .with_socket_buffer_bytes(8 << 20)
+                .with_receive_observer(Arc::clone(&cuts[0]) as _);
+            if split {
+                edge_config = edge_config
+                    .with_class_port_offset(offset)
+                    .with_stream_classifier(classify(&edge_cache))
+                    .with_class_receive_observer(Some(Arc::new(fast_plane::ClassMarker::new(
+                        edge_cache.stream_classes().clone(),
+                        Some(Arc::clone(&cuts[1]) as _),
+                    ))));
+            }
+            let edge_mesh = Arc::new(
+                CacheMesh::new(Arc::clone(&edge_cache.chunk_cache), edge_config)
+                    .start()
+                    .await
+                    .unwrap(),
+            );
+            let commit_cache = Arc::clone(&parent_cache);
+            let commit = move |stream_id: u64, part: u64, bytes: usize| {
+                let cache = Arc::clone(&commit_cache);
+                async move {
+                    let body: Vec<u8> = (0..bytes)
+                        .map(|index| ((index as u64 * 31) ^ part) as u8)
+                        .collect();
+                    cache
+                        .commit_stream_payload(
+                            stream_id,
+                            encode_test_canonical_fmp4_bundle_with_duration(
+                                stream_id,
+                                part,
+                                (part == 0).then_some(b"ftyp-moov".as_slice()),
+                                &body,
+                                Some(5),
+                                true,
+                            ),
+                        )
+                        .await
+                        .unwrap();
+                }
+            };
+            commit(AUDIO, 0, 60).await;
+            commit(VIDEO, 0, 1_000).await;
+            let router = app_router_for_tests(Arc::clone(&edge_cache), Arc::clone(&edge_mesh));
+            timeout(Duration::from_secs(5), async {
+                while edge_cache.stream_position_for_id(AUDIO).await.is_none()
+                    || edge_cache.stream_position_for_id(VIDEO).await.is_none()
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the edge receives both streams");
+            let sockets = if split {
+                bind_edge_class_sockets(
+                    "127.0.0.1:0".parse().unwrap(),
+                    4 << 20,
+                    edge_cache.stream_classes(),
+                )
+                .unwrap()
+            } else {
+                edge_udp::EdgeSockets::single(UdpSocket::bind("127.0.0.1:0").await.unwrap())
+            };
+            let edge = sockets.for_stream(AUDIO).local_addr().unwrap();
+            let stats: Arc<edge_udp::EdgeUdpStats> = Arc::default();
+            let (shutdown_tx, shutdown_rx) = watch::channel(());
+            let task = tokio::spawn(edge_udp::run_edge_udp(
+                sockets,
+                router.clone(),
+                edge_udp::EdgeUdpConfig {
+                    symbol_size: 1_200,
+                    max_subscribers: 16,
+                },
+                Arc::clone(&stats),
+                cuts.clone(),
+                shutdown_rx,
+            ));
+            // One client per stream.
+            let mut clients = Vec::new();
+            for stream_id in [AUDIO, VIDEO] {
+                let client = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                let _ = SockRef::from(client.as_ref()).set_recv_buffer_size(8 << 20);
+                let subscribe = |token| {
+                    Control::Subscribe {
+                        stream_id,
+                        from_part: None,
+                        repair: RepairPolicy::default(),
+                        token,
+                    }
+                    .encode()
+                };
+                let mut buf = vec![0_u8; 65_536];
+                client.send_to(&subscribe(None), edge).await.unwrap();
+                let token = loop {
+                    let (len, _) = client.recv_from(&mut buf).await.unwrap();
+                    if let Some(Control::Token { token, .. }) = Control::decode(&buf[..len]) {
+                        break token;
+                    }
+                };
+                client.send_to(&subscribe(Some(token)), edge).await.unwrap();
+                loop {
+                    let (len, _) = client.recv_from(&mut buf).await.unwrap();
+                    if matches!(
+                        Control::decode(&buf[..len]),
+                        Some(Control::Subscribed { .. })
+                    ) {
+                        break;
+                    }
+                }
+                clients.push(client);
+            }
+            let receive = |client: Arc<UdpSocket>, parts: u64| {
+                tokio::spawn(async move {
+                    let mut receiver = ObjectReceiver::new();
+                    let mut buf = vec![0_u8; 65_536];
+                    let mut arrived = BTreeMap::new();
+                    while (arrived.len() as u64) < parts {
+                        let Ok(Ok((len, _))) =
+                            timeout(Duration::from_secs(2), client.recv_from(&mut buf)).await
+                        else {
+                            break;
+                        };
+                        if let Some(object) = receiver.push(&buf[..len]) {
+                            if object.kind == UdpObjectKind::Part && object.part >= 1 {
+                                arrived.entry(object.part).or_insert_with(Instant::now);
+                            }
+                        }
+                    }
+                    arrived
+                })
+            };
+            let audio_receiving = receive(Arc::clone(&clients[0]), AUDIO_PARTS);
+            let video_receiving = receive(Arc::clone(&clients[1]), 24);
+            // 4K frames at 24 fps; audio: 2.5 ms parts, for 1 s.
+            let video = {
+                let commit = commit.clone();
+                tokio::spawn(async move {
+                    let start = Instant::now();
+                    for part in 1..=24_u64 {
+                        tokio::time::sleep_until(
+                            (start + Duration::from_micros(41_667 * part)).into(),
+                        )
+                        .await;
+                        commit(VIDEO, part, VIDEO_PART_BYTES).await;
+                    }
+                })
+            };
+            let mut published = BTreeMap::new();
+            let start = Instant::now() + Duration::from_millis(5);
+            for part in 1..=AUDIO_PARTS {
+                tokio::time::sleep_until((start + Duration::from_micros(2_500 * part)).into())
+                    .await;
+                published.insert(part, Instant::now());
+                commit(AUDIO, part, 60).await;
+            }
+            video.await.unwrap();
+            let arrived = audio_receiving.await.unwrap();
+            let video_arrived = video_receiving.await.unwrap();
+            let mut latencies: Vec<f64> = published
+                .iter()
+                .filter_map(|(part, at)| {
+                    arrived
+                        .get(part)
+                        .map(|arrived| arrived.duration_since(*at).as_secs_f64() * 1e3)
+                })
+                .collect();
+            latencies.sort_by(f64::total_cmp);
+            let name = if split { "split" } else { "single" };
+            assert!(
+                latencies.len() as u64 >= AUDIO_PARTS * 98 / 100,
+                "{name}: {} of {AUDIO_PARTS} audio parts reached the client",
+                latencies.len()
+            );
+            let at = |q: f64| latencies[((latencies.len() - 1) as f64 * q) as usize];
+            report.push(format!(
+                "{name}: audio publish to UDP client p50 {:.3} ms p99 {:.3} ms max {:.3} ms beside a 4K client ({} 4K parts, {} parts cut through)",
+                at(0.5),
+                at(0.99),
+                at(1.0),
+                video_arrived.len(),
+                stats.cut_through_parts.load(Ordering::Relaxed),
+            ));
+            if split {
+                split_p99 = at(0.99);
+                assert!(video_arrived.len() >= 20, "{}", report.join("\n"));
+            } else {
+                single_p99 = at(0.99);
+            }
+            let _ = shutdown_tx.send(());
+            task.await.unwrap().unwrap();
+            parent_mesh.shutdown();
+            edge_mesh.shutdown();
+        }
+        println!("{}", report.join("\n"));
+        assert!(split_p99 < 3.0, "{}", report.join("\n"));
+        assert!(
+            split_p99 * 2.0 < single_p99,
+            "the class path does not isolate the audio:\n{}",
+            report.join("\n")
+        );
+    }
+
     /// RaptorQ FEC UDP to a client at an edge: every part that the edge's
     /// cache holds reaches the client bit for bit as its LL-HLS part, with a
     /// third of the datagrams lost; a new part follows live; a drain sends
@@ -30431,7 +31130,10 @@ mod tests {
         let mut buf = vec![0_u8; 65_536];
         // A first request gets a token and nothing else: an address that
         // does not receive cannot be sent media.
-        client.send_to(&subscribe(None).encode(), edge).await.unwrap();
+        client
+            .send_to(&subscribe(None).encode(), edge)
+            .await
+            .unwrap();
         let (len, _) = timeout(Duration::from_secs(2), client.recv_from(&mut buf))
             .await
             .unwrap()
@@ -30442,7 +31144,9 @@ mod tests {
         };
         assert!(len <= subscribe(None).encode().len());
         assert!(
-            timeout(Duration::from_millis(300), client.recv_from(&mut buf)).await.is_err(),
+            timeout(Duration::from_millis(300), client.recv_from(&mut buf))
+                .await
+                .is_err(),
             "nothing follows a token"
         );
         // A wrong token gets another token, not media.
@@ -30451,8 +31155,14 @@ mod tests {
             .await
             .unwrap();
         let (len, _) = client.recv_from(&mut buf).await.unwrap();
-        assert!(matches!(Control::decode(&buf[..len]), Some(Control::Token { .. })));
-        client.send_to(&subscribe(Some(token)).encode(), edge).await.unwrap();
+        assert!(matches!(
+            Control::decode(&buf[..len]),
+            Some(Control::Token { .. })
+        ));
+        client
+            .send_to(&subscribe(Some(token)).encode(), edge)
+            .await
+            .unwrap();
         let mut receiver = ObjectReceiver::new();
         let mut parts = BTreeMap::new();
         let mut init = None;
@@ -30513,7 +31223,10 @@ mod tests {
                 }
             }
         };
-        assert_eq!(Some(part5), get_for_tests(&router, "/live/77/part5.mp4").await.body);
+        assert_eq!(
+            Some(part5),
+            get_for_tests(&router, "/live/77/part5.mp4").await.body
+        );
 
         // A draining edge sends its clients to the next cache.
         router.lifecycle.set_draining(true).await;
@@ -32688,6 +33401,7 @@ mod tests {
         primary_audio: SocketAddr,
         primary_video: Option<SocketAddr>,
         secondary_audio: SocketAddr,
+        secondary_video: Option<SocketAddr>,
         primary_sender: UdpSocket,
         secondary_sender: UdpSocket,
         forwarder: Option<Arc<RelayDownstreamForwarder>>,
@@ -32730,24 +33444,33 @@ mod tests {
         children: &[(SocketAddr, RelayForwardRole)],
         tee_capacity: usize,
     ) -> FastRelay {
-        let primary_sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let secondary_sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        start_fast_relay_with(
+            secondary_path,
+            children,
+            fast_plane::relay::RelayClassConfig {
+                port_offset: offset,
+                cpus: [None, None],
+                realtime: false,
+                tee_capacity,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// A relay's dispatch with the two contributor lanes bound: the primary
+    /// sender on the primary path, the secondary on `secondary_path`.
+    fn fast_test_dispatch(
+        primary_sender: SocketAddr,
+        secondary_sender: SocketAddr,
+        secondary_path: ParentPath,
+    ) -> RelayUdpDispatch {
         let generation = TopologyGeneration::new(FAST_GENERATION).unwrap();
         let subscription_id = SubscriptionId::new(FAST_SUBSCRIPTION).unwrap();
         let mut dispatch = empty_relay_udp_dispatch();
         for (session_id, peer, peer_id, path) in [
-            (
-                1,
-                primary_sender.local_addr().unwrap(),
-                "contrib-primary",
-                ParentPath::Primary,
-            ),
-            (
-                2,
-                secondary_sender.local_addr().unwrap(),
-                "contrib-secondary",
-                secondary_path,
-            ),
+            (1, primary_sender, "contrib-primary", ParentPath::Primary),
+            (2, secondary_sender, "contrib-secondary", secondary_path),
         ] {
             dispatch
                 .bind_controlled_peer(
@@ -32768,6 +33491,22 @@ mod tests {
                 )
                 .unwrap();
         }
+        dispatch
+    }
+
+    async fn start_fast_relay_with(
+        secondary_path: ParentPath,
+        children: &[(SocketAddr, RelayForwardRole)],
+        config: fast_plane::relay::RelayClassConfig,
+    ) -> FastRelay {
+        let offset = config.port_offset;
+        let primary_sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let secondary_sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let dispatch = fast_test_dispatch(
+            primary_sender.local_addr().unwrap(),
+            secondary_sender.local_addr().unwrap(),
+            secondary_path,
+        );
         let endpoints: Vec<RelayForwardEndpoint> = children
             .iter()
             .map(|(target, role)| RelayForwardEndpoint {
@@ -32810,6 +33549,10 @@ mod tests {
             RelayIngressParentPath::Secondary,
         )
         .unwrap();
+        let secondary_video = find(
+            fast_plane::TrafficClass::Video,
+            RelayIngressParentPath::Secondary,
+        );
         let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
         cache.set_hop_journal(Arc::new(HopJournal::new("relay-london", 4_096)));
         if let Some(forwarder) = &forwarder {
@@ -32823,18 +33566,14 @@ mod tests {
             RelayIngestRuntime {
                 dispatch,
                 secondary_socket: None,
+                class_twins: Vec::new(),
                 forwarder: forwarder.clone(),
                 audio_epochs: None,
                 failover_controller: None,
                 failover_heartbeat: Duration::from_millis(100),
                 link_telemetry: None,
             },
-            fast_plane::relay::RelayClassConfig {
-                port_offset: offset,
-                cpus: [None, None],
-                realtime: false,
-                tee_capacity,
-            },
+            config,
         ));
         // The threads run once the ingest task has started them.
         let threads = if offset > 0 { 2 } else { 1 };
@@ -32852,6 +33591,7 @@ mod tests {
             primary_audio,
             primary_video,
             secondary_audio,
+            secondary_video,
             primary_sender,
             secondary_sender,
             forwarder,
@@ -32866,6 +33606,31 @@ mod tests {
         max_source_symbols: u16,
         repair: u32,
         deadline_us: u64,
+    ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        fast_test_symbols_in(
+            envelope,
+            priority,
+            symbol_size,
+            max_source_symbols,
+            repair,
+            deadline_us,
+            FAST_GENERATION,
+            FAST_SUBSCRIPTION,
+        )
+    }
+
+    /// The symbols of an object for a session of `generation` and
+    /// `subscription`.
+    #[allow(clippy::too_many_arguments)]
+    fn fast_test_symbols_in(
+        envelope: &[u8],
+        priority: relay_session::MediaPriority,
+        symbol_size: u16,
+        max_source_symbols: u16,
+        repair: u32,
+        deadline_us: u64,
+        generation: u64,
+        subscription: u64,
     ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
         use relay_session::{
             encode_datagram, AdaptiveFecController, AdaptiveFecPolicy, CongestionConfig,
@@ -32891,8 +33656,8 @@ mod tests {
         let encoded = encoder
             .encode_object(
                 &object,
-                TopologyGeneration::new(FAST_GENERATION).unwrap(),
-                SubscriptionId::new(FAST_SUBSCRIPTION).unwrap(),
+                TopologyGeneration::new(generation).unwrap(),
+                SubscriptionId::new(subscription).unwrap(),
                 MediaDeadline::from_micros(deadline_us),
                 priority,
             )
@@ -33260,14 +34025,22 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fast_plane_audio_is_not_held_behind_a_4k_object() {
         let (child_audio, child_video) = bind_class_pair(1_000).await;
+        // A warm repair-only child beside it, as the secondary relay's
+        // distributor links are: every source symbol of both classes is
+        // held back for it, on the class threads.
+        let (warm_child, _warm_child_video) = bind_class_pair(1_000).await;
         let relay = start_fast_relay(
             1_000,
             ParentPath::Secondary,
-            &[(child_audio.local_addr().unwrap(), RelayForwardRole::All)],
+            &[
+                (child_audio.local_addr().unwrap(), RelayForwardRole::All),
+                (warm_child.local_addr().unwrap(), RelayForwardRole::Repair),
+            ],
             65_536,
         )
         .await;
-        let deadline = now_unix_us() + 10_000_000;
+        // Far enough ahead for a debug build to encode the 4K objects first.
+        let deadline = now_unix_us() + 300_000_000;
         let mut video = Vec::new();
         for sequence in 0..4_u64 {
             let envelope = encode_test_canonical_fmp4_bundle_with_duration(
@@ -33294,7 +34067,6 @@ mod tests {
         // The first 4K object, the audio datagram right behind it, then
         // the rest of the 4K burst. Plain threads send and receive, so that
         // the test's runtime measures nothing of its own.
-        let sender_addr = relay.primary_sender.local_addr().unwrap();
         let video_port = relay.primary_video.unwrap();
         let audio_port = relay.primary_audio;
         let child_audio = child_audio.into_std().unwrap();
@@ -33330,10 +34102,12 @@ mod tests {
             }
             (last, received)
         });
-        drop(relay.primary_sender);
+        // The primary's own socket, on a plain thread (not dropped and bound
+        // again, which another test could take the port in between).
+        let sender = relay.primary_sender.into_std().unwrap();
+        sender.set_nonblocking(false).unwrap();
         let audio_symbol = audio[0].clone();
         let audio_sent = std::thread::spawn(move || {
-            let sender = std::net::UdpSocket::bind(sender_addr).unwrap();
             let _ = SockRef::from(&sender).set_send_buffer_size(4 << 20);
             for symbol in &video[..400] {
                 sender.send_to(symbol, video_port).unwrap();
@@ -33358,16 +34132,447 @@ mod tests {
             "the audio datagram left before the 4K burst's last symbol"
         );
         let latency = audio_arrived.duration_since(audio_sent);
+        let burst = video_done.unwrap().duration_since(audio_sent);
         eprintln!(
-            "audio forward behind 4K: {latency:?}; 4K burst done {:?} after the audio was sent",
-            video_done.unwrap().duration_since(audio_sent)
+            "audio forward behind 4K: {latency:?}; 4K burst done {burst:?} after the audio was sent"
         );
+        // The audio datagram came in behind 400 of the 4K symbols and ahead
+        // of 1,200 more. Forwarded behind the 400 (one loop, or the audio
+        // thread waiting on the video one), it would take about a quarter of
+        // the burst; on its own thread it takes a small part of it, in any
+        // build. A release build is held to the design's bound as well.
+        assert!(
+            latency * 10 < burst,
+            "audio {latency:?} against a 4K burst of {burst:?}"
+        );
+        assert!(latency < Duration::from_millis(20), "{latency:?}");
         if !cfg!(debug_assertions) {
             assert!(latency < Duration::from_millis(1), "{latency:?}");
         }
+        // Each class keeps its own warm sources for the repair-only child:
+        // the 4K objects are all there, and the audio object did not push
+        // any of them out.
+        let forwarder = relay.forwarder.as_ref().unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while forwarder.snapshot().warm_source_buffered_datagrams < video_count as u64 + 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("both classes' sources are held for the warm child");
+        let held = |class: fast_plane::TrafficClass| {
+            let buffer = forwarder.paths[1].warm_sources[class.index()]
+                .lock()
+                .unwrap();
+            (buffer.object_order.len(), buffer.datagrams.len())
+        };
+        assert_eq!(held(fast_plane::TrafficClass::Video), (4, video_count));
+        assert_eq!(held(fast_plane::TrafficClass::Audio), (1, 1));
         let FastRelay {
             shutdown_tx, task, ..
         } = relay;
+        let _ = shutdown_tx.send(());
+        task.await.unwrap().unwrap();
+    }
+
+    /// The session checks are the only authentication before the forward:
+    /// a symbol of another generation or subscription, of a path its
+    /// session may not carry, from an unbound peer, or malformed, reaches no
+    /// child and no tee. A flood of them leaves the tee free for the
+    /// admitted symbols.
+    #[tokio::test]
+    async fn fast_plane_forwards_and_tees_nothing_that_a_session_does_not_admit() {
+        let (child, child_video) = bind_class_pair(1_000).await;
+        let relay = start_fast_relay(
+            1_000,
+            ParentPath::Secondary,
+            &[(child.local_addr().unwrap(), RelayForwardRole::All)],
+            // A tee of a few datagrams, which the flood must not fill.
+            4,
+        )
+        .await;
+        let deadline = now_unix_us() + 5_000_000;
+        let envelope = encode_test_canonical_opaque_object(4001, 0, &[1_u8; 120]);
+        let symbols = |generation, subscription| {
+            fast_test_symbols_in(
+                &envelope,
+                relay_session::MediaPriority::Audio,
+                400,
+                48,
+                1,
+                deadline,
+                generation,
+                subscription,
+            )
+        };
+        let (wrong_generation, _) = symbols(FAST_GENERATION + 1, FAST_SUBSCRIPTION);
+        let (wrong_subscription, _) = symbols(FAST_GENERATION, FAST_SUBSCRIPTION + 1);
+        let (sources, repairs) = symbols(FAST_GENERATION, FAST_SUBSCRIPTION);
+        assert_eq!((sources.len(), repairs.len()), (1, 1));
+        let stranger = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let rounds = 40_u64;
+        for _ in 0..rounds {
+            for symbol in [&wrong_generation[0], &wrong_subscription[0], &repairs[0]] {
+                // The primary's session carries sources only: its repair
+                // (secondary intent) is refused as well.
+                relay
+                    .primary_sender
+                    .send_to(symbol, relay.primary_audio)
+                    .await
+                    .unwrap();
+            }
+            // The secondary's session carries repair only.
+            relay
+                .secondary_sender
+                .send_to(&sources[0], relay.secondary_audio)
+                .await
+                .unwrap();
+            // No session at all.
+            stranger
+                .send_to(&sources[0], relay.primary_audio)
+                .await
+                .unwrap();
+            stranger
+                .send_to(&sources[0], relay.primary_video.unwrap())
+                .await
+                .unwrap();
+        }
+        let malformed = &sources[0][..sources[0].len() - 1];
+        relay
+            .primary_sender
+            .send_to(malformed, relay.primary_audio)
+            .await
+            .unwrap();
+        let refused = rounds * 6;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let stats = relay.stats();
+                if stats.not_admitted == refused && stats.invalid == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{:?}", relay.stats()));
+        assert_nothing_more(&child).await;
+        assert_nothing_more(&child_video).await;
+        let stats = relay.stats();
+        assert_eq!(stats.audio_forwarded + stats.video_forwarded, 0);
+        assert_eq!(stats.tee_dropped, 0, "nothing refused reached the tee");
+        assert_eq!(stats.duplicates, 0);
+
+        // An admitted symbol after all that: forwarded once and committed.
+        relay
+            .primary_sender
+            .send_to(&sources[0], relay.primary_audio)
+            .await
+            .unwrap();
+        let received = receive_all(&child, 1).await;
+        assert_eq!(received[0].0, sources[0]);
+        wait_for_part(&relay.cache, 4001, 0).await;
+        assert_nothing_more(&child).await;
+        assert_eq!(relay.stats().tee_dropped, 0);
+        let snapshot = relay.cache.relay_ingress_snapshot();
+        assert!(
+            snapshot.datagrams_rejected > refused,
+            "{} rejected",
+            snapshot.datagrams_rejected
+        );
+        relay.stop().await;
+    }
+
+    /// A warm repair-only child takes repair only; the source symbols held
+    /// back for it are kept by class, and on promotion the audio ones go to
+    /// its port first, then the video ones from the same address to its
+    /// video port. New sources then go to it directly.
+    #[tokio::test]
+    async fn fast_plane_replays_a_warm_childs_sources_by_class_on_promotion() {
+        use fast_plane::sys::{enable_receive_metadata, RecvBatch};
+        let (child_audio, child_video) = bind_class_pair(1_000).await;
+        for socket in [&child_audio, &child_video] {
+            enable_receive_metadata(socket).unwrap();
+        }
+        let target = child_audio.local_addr().unwrap();
+        let relay = start_fast_relay(
+            1_000,
+            ParentPath::PromotedSecondary,
+            &[(target, RelayForwardRole::Repair)],
+            1_024,
+        )
+        .await;
+        let forwarder = Arc::clone(relay.forwarder.as_ref().unwrap());
+        let deadline = now_unix_us() + 5_000_000;
+        let mut audio_sources = Vec::new();
+        let mut audio_repairs = Vec::new();
+        for sequence in 0..3_u64 {
+            let envelope =
+                encode_test_canonical_opaque_object(4001, sequence, &[sequence as u8; 120]);
+            let (sources, repairs) = fast_test_symbols(
+                &envelope,
+                relay_session::MediaPriority::Audio,
+                400,
+                48,
+                1,
+                deadline,
+            );
+            audio_sources.extend(sources);
+            audio_repairs.extend(repairs);
+        }
+        let video_envelope = encode_test_canonical_fmp4_bundle_with_duration(
+            1,
+            0,
+            None,
+            &deterministic_video_payload(6_000),
+            None,
+            true,
+        );
+        let (video_sources, video_repairs) = fast_test_symbols(
+            &video_envelope,
+            relay_session::MediaPriority::VideoKey,
+            400,
+            48,
+            2,
+            deadline,
+        );
+        assert!(video_sources.len() > 10);
+        for symbol in &audio_sources {
+            relay
+                .primary_sender
+                .send_to(symbol, relay.primary_audio)
+                .await
+                .unwrap();
+        }
+        for symbol in &video_sources {
+            relay
+                .primary_sender
+                .send_to(symbol, relay.primary_video.unwrap())
+                .await
+                .unwrap();
+        }
+        for symbol in &audio_repairs {
+            relay
+                .secondary_sender
+                .send_to(symbol, relay.secondary_audio)
+                .await
+                .unwrap();
+        }
+        for symbol in &video_repairs {
+            relay
+                .secondary_sender
+                .send_to(symbol, relay.secondary_video.unwrap())
+                .await
+                .unwrap();
+        }
+        // Repair only, each class to its port.
+        let sorted = |mut datagrams: Vec<Vec<u8>>| {
+            datagrams.sort();
+            datagrams
+        };
+        let received = |items: Vec<(Vec<u8>, SocketAddr)>| {
+            sorted(items.into_iter().map(|(bytes, _)| bytes).collect())
+        };
+        assert_eq!(
+            received(receive_all(&child_audio, audio_repairs.len()).await),
+            sorted(audio_repairs.clone())
+        );
+        assert_eq!(
+            received(receive_all(&child_video, video_repairs.len()).await),
+            sorted(video_repairs.clone())
+        );
+        assert_nothing_more(&child_audio).await;
+        assert_nothing_more(&child_video).await;
+        let held = (audio_sources.len() + video_sources.len()) as u64;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while forwarder.snapshot().warm_source_buffered_datagrams < held {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the sources are held for the warm child");
+        for (class, count) in [
+            (fast_plane::TrafficClass::Audio, audio_sources.len()),
+            (fast_plane::TrafficClass::Video, video_sources.len()),
+        ] {
+            assert_eq!(
+                forwarder.paths[0].warm_sources[class.index()]
+                    .lock()
+                    .unwrap()
+                    .datagrams
+                    .len(),
+                count,
+                "{class:?}"
+            );
+        }
+
+        assert_eq!(
+            forwarder.apply_failover_mode(target, FailoverForwardMode::SourceAndRepair, false),
+            Some(true)
+        );
+        forwarder.replay_warm_sources(target).await;
+        // Both classes from the one source address, each to its port, the
+        // audio queued at the child before any of the video.
+        let source = forwarder.paths[0].socket.local_addr().unwrap();
+        let mut batch = RecvBatch::new();
+        let mut drain = |socket: &UdpSocket, expected: usize| {
+            let mut datagrams = Vec::new();
+            let mut times = Vec::new();
+            while datagrams.len() < expected {
+                let count = batch.recv(socket).unwrap();
+                assert!(count > 0, "received {} of {expected}", datagrams.len());
+                for index in 0..count {
+                    let message = batch.get(index);
+                    assert_eq!(message.peer, Some(source));
+                    datagrams.push(message.data.to_vec());
+                    times.push(message.kernel_us.expect("a kernel receive time"));
+                }
+            }
+            (sorted(datagrams), times)
+        };
+        let (audio, audio_times) = drain(&child_audio, audio_sources.len());
+        let (video, video_times) = drain(&child_video, video_sources.len());
+        assert_eq!(audio, sorted(audio_sources.clone()));
+        assert_eq!(video, sorted(video_sources.clone()));
+        assert!(
+            audio_times.iter().max() <= video_times.iter().min(),
+            "the audio sources are replayed first"
+        );
+        let snapshot = forwarder.snapshot();
+        assert_eq!(snapshot.warm_source_replayed_datagrams, held);
+        assert_eq!(snapshot.warm_source_buffered_datagrams, 0);
+
+        // Promoted: a new source goes straight to the child.
+        let next = fast_audio_symbols(4001, 3, deadline);
+        relay
+            .primary_sender
+            .send_to(&next[0], relay.primary_audio)
+            .await
+            .unwrap();
+        assert_eq!(receive_all(&child_audio, 1).await[0].0, next[0]);
+        relay.stop().await;
+    }
+
+    /// A tee that fails ends the ingest with its error, without a shutdown,
+    /// and the threads stop forwarding: nothing would commit behind them.
+    #[tokio::test]
+    async fn fast_plane_ingest_stops_when_a_tee_fails() {
+        let (child, _) = bind_class_pair(1_000).await;
+        let relay = start_fast_relay_with(
+            ParentPath::Secondary,
+            &[(child.local_addr().unwrap(), RelayForwardRole::All)],
+            fast_plane::relay::RelayClassConfig {
+                port_offset: 1_000,
+                cpus: [None, None],
+                realtime: false,
+                tee_capacity: 1_024,
+                test_tee_panic: Some(fast_plane::TrafficClass::Audio),
+            },
+        )
+        .await;
+        let deadline = now_unix_us() + 5_000_000;
+        let first = fast_audio_symbols(4001, 0, deadline);
+        relay
+            .primary_sender
+            .send_to(&first[0], relay.primary_audio)
+            .await
+            .unwrap();
+        // Forwarded before the tee took it.
+        assert_eq!(receive_all(&child, 1).await[0].0, first[0]);
+        let FastRelay {
+            task,
+            shutdown_tx,
+            primary_sender,
+            primary_audio,
+            ..
+        } = relay;
+        let ended = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("the ingest ends without a shutdown")
+            .unwrap();
+        let error = ended.expect_err("a failed tee is an error of the ingest");
+        assert!(format!("{error:#}").contains("tee"), "{error:#}");
+        let next = fast_audio_symbols(4001, 1, deadline);
+        let _ = primary_sender.send_to(&next[0], primary_audio).await;
+        assert_nothing_more(&child).await;
+        drop(shutdown_tx);
+    }
+
+    /// A relay that runs the single receive loop (class threads off) still
+    /// reads its video class port, where a parent with class threads sends
+    /// video, and forwards and commits what arrives there.
+    #[tokio::test]
+    async fn the_single_receive_loop_reads_the_video_class_port() {
+        let (child, _) = bind_class_pair(1_000).await;
+        let primary_sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let secondary_sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let dispatch = fast_test_dispatch(
+            primary_sender.local_addr().unwrap(),
+            secondary_sender.local_addr().unwrap(),
+            ParentPath::Secondary,
+        );
+        // A relay port whose video twin is free.
+        let (ingest, twin_holder) = bind_class_pair(1_000).await;
+        let ingest_addr = ingest.local_addr().unwrap();
+        drop(twin_holder);
+        let twins = bind_single_loop_class_twins(ingest_addr, None, 1_000, 1 << 20).await;
+        assert_eq!(twins.len(), 1);
+        let twin_addr = twins[0].1.local_addr().unwrap();
+        assert_eq!(twin_addr.port(), ingest_addr.port() + 1_000);
+        // Port 0 has no twin, and an offset of 0 binds none.
+        assert!(
+            bind_single_loop_class_twins(unused_loopback_addr(), None, 0, 1 << 20)
+                .await
+                .is_empty()
+        );
+        let forwarder = RelayDownstreamForwarder::bind(&[RelayForwardEndpoint {
+            bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            target: child.local_addr().unwrap(),
+            role: RelayForwardRole::All,
+        }])
+        .await
+        .unwrap();
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let task = tokio::spawn(run_udp_fec_ingest(
+            ingest,
+            Arc::clone(&cache),
+            shutdown_rx,
+            RelayIngestRuntime {
+                dispatch,
+                secondary_socket: None,
+                class_twins: twins,
+                forwarder,
+                audio_epochs: None,
+                failover_controller: None,
+                failover_heartbeat: Duration::from_millis(100),
+                link_telemetry: None,
+            },
+        ));
+        let deadline = now_unix_us() + 5_000_000;
+        let envelope =
+            encode_test_canonical_fmp4_bundle_with_duration(1, 0, None, &[7_u8; 3_000], None, true);
+        let (video, _) = fast_test_symbols(
+            &envelope,
+            relay_session::MediaPriority::VideoKey,
+            400,
+            48,
+            0,
+            deadline,
+        );
+        for symbol in &video {
+            primary_sender.send_to(symbol, twin_addr).await.unwrap();
+        }
+        // The single loop forwards to the child's one port.
+        let mut received: Vec<Vec<u8>> = receive_all(&child, video.len())
+            .await
+            .into_iter()
+            .map(|(bytes, _)| bytes)
+            .collect();
+        received.sort();
+        let mut expected = video.clone();
+        expected.sort();
+        assert_eq!(received, expected);
+        wait_for_part(&cache, 1, 0).await;
         let _ = shutdown_tx.send(());
         task.await.unwrap().unwrap();
     }
@@ -33398,6 +34603,25 @@ mod tests {
             true,
             &journal,
         );
+        // Behind the marker (where the edge's cut-through is): the class of
+        // the video stream when its first datagram comes through.
+        struct ClassAtFirstDatagram {
+            classes: fast_plane::StreamClasses,
+            first: StdMutex<Option<fast_plane::TrafficClass>>,
+        }
+        impl CacheMeshReceiveObserver for ClassAtFirstDatagram {
+            fn datagram(&self, _peer: SocketAddr, _datagram: &[u8]) {
+                self.first
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(|| self.classes.class(1));
+            }
+            fn decoded(&self, _peer: SocketAddr, _datagram: &[u8], _frame: &[u8]) {}
+        }
+        let probe = Arc::new(ClassAtFirstDatagram {
+            classes: edge.stream_classes().clone(),
+            first: StdMutex::new(None),
+        });
         let edge_mesh = CacheMesh::new(
             Arc::clone(&edge.chunk_cache),
             CacheMeshConfig::new("class-edge", "uk", edge_addr)
@@ -33407,7 +34631,7 @@ mod tests {
                 .with_stream_classifier(classify(&edge))
                 .with_class_receive_observer(Some(Arc::new(fast_plane::ClassMarker::new(
                     edge.stream_classes().clone(),
-                    None,
+                    Some(Arc::clone(&probe) as Arc<dyn CacheMeshReceiveObserver>),
                 )))),
         )
         .start()
@@ -33463,8 +34687,60 @@ mod tests {
             edge.stream_classes().class(77),
             fast_plane::TrafficClass::Audio
         );
+        // Marked on the first symbol, before the cut-through behind the
+        // marker chose the socket of the first part, not after its decode.
+        assert_eq!(
+            *probe.first.lock().unwrap(),
+            Some(fast_plane::TrafficClass::Video)
+        );
         distributor_mesh.shutdown();
         edge_mesh.shutdown();
+    }
+
+    /// An edge's client socket pair: one address, a video stream's
+    /// datagrams from the video socket, an audio stream's from the socket at
+    /// SO_PRIORITY 6, which a prio qdisc puts in band 0.
+    #[tokio::test]
+    async fn edge_class_sockets_send_video_and_audio_from_their_own_sockets() {
+        fn priority(socket: &UdpSocket) -> i32 {
+            use std::os::fd::AsRawFd;
+            let mut value: libc::c_int = -1;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: a valid fd and an int-sized out buffer.
+            let result = unsafe {
+                libc::getsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_PRIORITY,
+                    std::ptr::from_mut(&mut value).cast(),
+                    &mut len,
+                )
+            };
+            assert_eq!(result, 0);
+            value
+        }
+        let classes = fast_plane::StreamClasses::default();
+        let sockets =
+            bind_edge_class_sockets("127.0.0.1:0".parse().unwrap(), 1 << 20, &classes).unwrap();
+        // Until the edge knows a stream as video, it leaves as audio.
+        assert!(Arc::ptr_eq(sockets.for_stream(1), sockets.for_stream(3001)));
+        classes.mark_video(1);
+        let video = Arc::clone(sockets.for_stream(1));
+        let audio = Arc::clone(sockets.for_stream(3001));
+        assert!(!Arc::ptr_eq(&video, &audio));
+        assert_eq!(video.local_addr().unwrap(), audio.local_addr().unwrap());
+        assert_eq!(priority(&audio), fast_plane::sys::AUDIO_SO_PRIORITY);
+        assert_eq!(priority(&video), 0);
+        // A client sees both classes come from the one address.
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let to = client.local_addr().unwrap();
+        audio.send_to(b"audio", to).await.unwrap();
+        video.send_to(b"video", to).await.unwrap();
+        let mut buf = [0_u8; 16];
+        for _ in 0..2 {
+            let (_, from) = client.recv_from(&mut buf).await.unwrap();
+            assert_eq!(from, audio.local_addr().unwrap());
+        }
     }
 
     /// Audio parts beside a 4K stream on one cache mesh: with the mesh split
@@ -33477,6 +34753,7 @@ mod tests {
         use playlists::mesh::{CacheMesh, CacheMeshConfig, CacheMeshRole as MeshRole};
         let mut report = Vec::new();
         let mut split_p99 = f64::MAX;
+        let mut single_p99 = 0.0_f64;
         for offset in [1_000_u16, 0] {
             let parent_cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 8_000, 512).await;
             let edge_cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 8_000, 512).await;
@@ -33495,6 +34772,7 @@ mod tests {
                     .with_role(MeshRole::Distributor)
                     .with_announce_interval(Duration::from_millis(40))
                     .with_sync_on_publish(true)
+                    .with_socket_buffer_bytes(8 << 20)
                     .with_class_port_offset(offset)
                     .with_stream_classifier(classify(&parent_cache)),
             )
@@ -33509,6 +34787,7 @@ mod tests {
                     .with_role(MeshRole::Edge)
                     .with_announce_interval(Duration::from_millis(40))
                     .with_applied_tx(applied_tx)
+                    .with_socket_buffer_bytes(8 << 20)
                     .with_class_port_offset(offset)
                     .with_stream_classifier(classify(&edge_cache)),
             )
@@ -33542,7 +34821,8 @@ mod tests {
             commit(1, 0, 1_000).await;
             tokio::time::sleep(Duration::from_millis(300)).await;
             while applied_rx.try_recv().is_ok() {}
-            // 4K: 600 KB frames at 24 fps; audio: 2.5 ms parts, for 1.5 s.
+            // 4K: 400 KB frames at 24 fps (within the edge's 512 KB slots,
+            // so that they reach it); audio: 2.5 ms parts, for 1.5 s.
             let video = {
                 let commit = commit.clone();
                 tokio::spawn(async move {
@@ -33552,7 +34832,7 @@ mod tests {
                             (start + Duration::from_micros(41_667 * part)).into(),
                         )
                         .await;
-                        commit(1, part, 600_000).await;
+                        commit(1, part, 400_000).await;
                     }
                 })
             };
@@ -33566,6 +34846,14 @@ mod tests {
             }
             video.await.unwrap();
             tokio::time::sleep(Duration::from_millis(200)).await;
+            let video_at_edge = edge_cache
+                .stream_position_for_id(1)
+                .await
+                .map_or(0, |(_, last)| last);
+            assert!(
+                video_at_edge >= 30,
+                "the 4K reached the edge up to part {video_at_edge}"
+            );
             let mut latencies = Vec::new();
             while let Ok(applied) = applied_rx.try_recv() {
                 if applied.stream_id != 3001 {
@@ -33576,10 +34864,13 @@ mod tests {
                 }
             }
             latencies.sort_by(f64::total_cmp);
+            // The single mesh, the baseline, can lose a few audio parts under
+            // the 4K load; the split one may not.
             assert!(
-                latencies.len() >= 590,
-                "{} audio parts applied",
-                latencies.len()
+                latencies.len() >= if offset > 0 { 590 } else { 500 },
+                "{} audio parts applied ({})",
+                latencies.len(),
+                if offset > 0 { "split" } else { "single" }
             );
             let at = |q: f64| latencies[((latencies.len() - 1) as f64 * q) as usize];
             report.push(format!(
@@ -33591,11 +34882,20 @@ mod tests {
             ));
             if offset > 0 {
                 split_p99 = at(0.99);
+            } else {
+                single_p99 = at(0.99);
             }
             parent_mesh.shutdown();
             edge_mesh.shutdown();
         }
         println!("{}", report.join("\n"));
         assert!(split_p99 < 3.0, "{}", report.join("\n"));
+        // The split is what keeps the 4K tail off the audio: on one socket
+        // the audio p99 is several times the split one.
+        assert!(
+            split_p99 * 1.5 < single_p99,
+            "the split does not isolate the audio:\n{}",
+            report.join("\n")
+        );
     }
 }
