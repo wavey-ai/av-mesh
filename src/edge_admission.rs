@@ -10,7 +10,10 @@ pub const DEFAULT_ADMISSION_PERCENT: u8 = 85;
 pub const DEFAULT_RECOVERY_PERCENT: u8 = 75;
 pub const DEFAULT_WINDOW_SECONDS: u64 = 10;
 pub const DEFAULT_MIN_SUSTAINED_SECONDS: u64 = 3;
-pub const DEFAULT_SESSION_IDLE_SECONDS: u64 = 60;
+/// A live reader asks for a part or a playlist several times a second. One
+/// that has asked for nothing for this long has gone, and its share of the
+/// node is free for another reader.
+pub const DEFAULT_SESSION_IDLE_SECONDS: u64 = 15;
 pub const DEFAULT_MAX_SESSIONS: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

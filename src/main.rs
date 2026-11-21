@@ -158,7 +158,7 @@ const EDGE_HOLE_REPAIR_WINDOW_MS: u64 = 500;
 const PLAYLIST_DEMAND_SWEEP_MS: u64 = 500;
 /// Longest wait for the first parts of a playlist that an edge has just
 /// subscribed to, before it answers the request that created the demand.
-const PLAYLIST_WARM_WAIT_MS: u64 = 1_500;
+const PLAYLIST_WARM_WAIT_MS: u64 = 4_000;
 const ASSIGNMENT_PATH: &str = "/api/assignment";
 /// Shortest stretch of a playlist over which its bit rate is measured. A
 /// copy that is still warming holds a second or less, and one key frame in
@@ -4982,6 +4982,7 @@ impl LiveTsCache {
                 state.stream_max_part_duration_ms.remove(&stream_id);
                 state.stream_max_segment_duration_ms.remove(&stream_id);
                 state.stream_declared_ms.remove(&stream_id);
+                state.stream_playlist_floor.remove(&stream_id);
                 state.stream_inits.remove(&stream_id);
                 state.stream_media_kinds.remove(&stream_id);
                 if stream_id == self.stream_id {
@@ -5367,7 +5368,11 @@ impl LiveTsCache {
         if window_parts >= self.window_parts {
             return;
         }
-        let retained = window_parts.saturating_mul(4);
+        let retained = self
+            .state
+            .read()
+            .await
+            .stream_retained_parts(stream_id, self.window_parts);
         if let Some(expired) = newest.checked_sub(retained) {
             self.chunk_cache
                 .clear_for_stream_id(stream_id, expired)
@@ -5392,18 +5397,15 @@ impl LiveTsCache {
 
     /// Wait until a playlist that this node has just subscribed to has parts
     /// to serve, or the wait ends. Returns whether parts are present.
+    /// Wait until a new copy of a playlist can be played: it lists a whole
+    /// segment, which a player needs before it starts. A cache that answers
+    /// with the first part alone gives a player an empty playlist: hls.js
+    /// counts that as a failure of the cache, and ffmpeg ends.
     async fn wait_for_playlist_copy(&self, stream_id: u64, wait: Duration) -> bool {
         let deadline = Instant::now() + wait;
         let mut updates = self.part_updates.subscribe();
         loop {
-            if self
-                .state
-                .read()
-                .await
-                .stream_parts
-                .get(&stream_id)
-                .is_some_and(|parts| !parts.is_empty())
-            {
+            if self.state.read().await.playlist_is_playable(stream_id) {
                 return true;
             }
             let now = Instant::now();
@@ -5751,6 +5753,18 @@ impl LiveTsCache {
             // A retained window can begin halfway through a segment. The
             // segment is listed only when its first part is here.
             groups.retain(|segment_id, _group| first_stamped_parts.get(segment_id) == Some(&0));
+            // A playlist never grows at its front. The first segment that a
+            // reader was shown stays the first until it leaves the window.
+            if groups.len() >= 2 {
+                let mut state = self.state.write().await;
+                let first = *groups.keys().next().expect("a group");
+                let floor = *state
+                    .stream_playlist_floor
+                    .entry(stream_id)
+                    .or_insert(first);
+                drop(state);
+                groups.retain(|segment_id, _group| *segment_id >= floor);
+            }
         } else if keyframe_aligned_segments {
             // A retained window can begin halfway through a GOP. Do not
             // advertise that truncated parent as a playable HLS segment.
@@ -7220,6 +7234,10 @@ struct LiveState {
     /// Part target and target duration that the contributor declares for a
     /// stream, in milliseconds, from the stamps of its parts.
     stream_declared_ms: HashMap<u64, (u32, u32)>,
+    /// First segment that this cache has listed in the playlist of a stream.
+    /// A new copy is filled newest part first, and the playlist must not
+    /// grow at its front: a Media Sequence Number never goes down.
+    stream_playlist_floor: HashMap<u64, u64>,
     stream_inits: HashMap<u64, Bytes>,
     stream_media_kinds: HashMap<u64, LiveMediaKind>,
 }
@@ -7254,6 +7272,7 @@ impl LiveState {
             stream_max_part_duration_ms: HashMap::new(),
             stream_max_segment_duration_ms: HashMap::new(),
             stream_declared_ms: HashMap::new(),
+            stream_playlist_floor: HashMap::new(),
             stream_inits: HashMap::new(),
             stream_media_kinds: HashMap::new(),
         }
@@ -7296,7 +7315,13 @@ impl LiveState {
                 .and_modify(|maximum| *maximum = (*maximum).max(duration_ms))
                 .or_insert(duration_ms);
         }
-        let window_parts = self.stream_window_parts(stream_id, window_parts);
+        // The record of a part outlives its place in the playlist, so that a
+        // segment that has just left the playlist can still be put together.
+        let window_parts = if stamp.is_some() || self.stream_declared_ms.contains_key(&stream_id) {
+            self.stream_retained_parts(stream_id, window_parts)
+        } else {
+            self.stream_window_parts(stream_id, window_parts)
+        };
         let existing = self
             .stream_parts
             .get(&stream_id)
@@ -7533,6 +7558,48 @@ impl LiveState {
             .clamp(MIN_STREAM_WINDOW_PARTS.min(configured), configured)
     }
 
+    /// Whether the parts of a stream make a playlist that a player accepts.
+    /// A stamped stream needs one whole segment: its first part, and a part
+    /// of a later segment. A stream without stamps needs one part.
+    fn playlist_is_playable(&self, stream_id: u64) -> bool {
+        let Some(parts) = self.stream_parts.get(&stream_id) else {
+            return false;
+        };
+        let mut whole_segment = None;
+        let mut stamped = false;
+        for part in parts.values() {
+            let (Some(msn), Some(index)) = (part.fmp4_segment_id, part.stamped_part) else {
+                continue;
+            };
+            stamped = true;
+            if index == 0 && whole_segment.is_none() {
+                whole_segment = Some(msn);
+            }
+            if whole_segment.is_some_and(|first| msn > first) {
+                return true;
+            }
+        }
+        !stamped && !parts.is_empty()
+    }
+
+    /// Parts of a stream that a cache keeps in all: the playlist window, and
+    /// three target durations after it, for which a part or a segment that
+    /// has left the playlist must still be there for a reader that is slow.
+    fn stream_retained_parts(&self, stream_id: u64, configured: usize) -> usize {
+        let window = self.stream_window_parts(stream_id, configured);
+        match self.stream_declared_ms.get(&stream_id) {
+            Some((part_ms, target_ms)) if *part_ms > 0 => {
+                let after = u64::from(*target_ms)
+                    .saturating_mul(3)
+                    .saturating_mul(4)
+                    .div_ceil(u64::from(*part_ms).saturating_mul(3));
+                window.saturating_add(usize::try_from(after).unwrap_or(window))
+            }
+            // A stream without stamps keeps four windows, as the ring does.
+            _ => window.saturating_mul(4),
+        }
+    }
+
     /// Longest part of a stream seen so far, or the nominal part of the node.
     fn stream_part_ms(&self, stream_id: u64) -> u64 {
         self.stream_max_part_duration_ms
@@ -7631,6 +7698,7 @@ impl LiveState {
         self.stream_max_part_duration_ms.remove(&stream_id);
         self.stream_max_segment_duration_ms.remove(&stream_id);
         self.stream_declared_ms.remove(&stream_id);
+        self.stream_playlist_floor.remove(&stream_id);
         self.stream_inits.remove(&stream_id);
         self.stream_media_kinds.remove(&stream_id);
     }
@@ -13336,6 +13404,52 @@ impl AppRouter {
 
     /// Bit rate that a reader of the playlist is entitled to: the highest
     /// rate that a cache of the region advertises for it.
+    /// Whether a stream exists: this node holds parts of it, or a cache of
+    /// the region advertises its playlist. A request for another stream is
+    /// answered 404, so that a player reports it and does not reload for
+    /// ever.
+    async fn stream_is_known(&self, stream_id: u64) -> bool {
+        // Only a regional cache knows which streams its region has: an edge
+        // that takes copies on demand, or a distributor, which receives
+        // every stream. Another node fetches a stream when it is asked.
+        let regional_cache = match self.cache_mesh_role {
+            CacheMeshRole::Edge => self.playlist_demand.config.enabled,
+            CacheMeshRole::Distributor => true,
+            _ => false,
+        };
+        if !regional_cache || stream_id == self.cache.stream_id {
+            return true;
+        }
+        if self
+            .cache
+            .state
+            .read()
+            .await
+            .stream_parts
+            .get(&stream_id)
+            .is_some_and(|parts| !parts.is_empty())
+        {
+            return true;
+        }
+        let local = self.local_mesh_snapshot().await;
+        let (snapshots, _) = self.telemetry.snapshots_with_local(local).await;
+        snapshots
+            .iter()
+            .filter(|snapshot| snapshot.node.region == self.node.region)
+            .filter_map(|snapshot| snapshot.edge_service.as_ref())
+            .flat_map(|edge| edge.playlists.iter())
+            .any(|playlist| playlist.stream_id == stream_id)
+    }
+
+    fn unknown_stream_response() -> HandlerResponse {
+        response(
+            StatusCode::NOT_FOUND,
+            Some(Bytes::from_static(b"No such stream in this region.\n")),
+            Some("text/plain; charset=utf-8"),
+        )
+        .with_no_store()
+    }
+
     async fn regional_playlist_bps(&self, stream_id: u64) -> Option<u64> {
         let local = self.local_mesh_snapshot().await;
         let (snapshots, _) = self.telemetry.snapshots_with_local(local).await;
@@ -13472,6 +13586,11 @@ impl AppRouter {
         gzip: bool,
     ) -> HandlerResponse {
         let stream_id = parse_stream_playlist_path(media_path).unwrap_or(self.cache.stream_id);
+        if parse_stream_playlist_path(media_path).is_some()
+            && !self.stream_is_known(stream_id).await
+        {
+            return Self::unknown_stream_response();
+        }
         let pin = query_value(query, "cache")
             .and_then(percent_decode_query_value)
             .filter(|pin| !pin.is_empty());
@@ -14722,6 +14841,12 @@ impl Router for AppRouter {
                 if let Some(stream_id) = parse_stream_playlist_path(path) {
                     self.request_replica_for_stream(stream_id, "playlist-demand", None)
                         .await;
+                    if !self.stream_is_known(stream_id).await {
+                        let response = Self::unknown_stream_response();
+                        return Ok(
+                            self.record_edge_response(method, path, query, response, started)
+                        );
+                    }
                     if let Some(refusal) = self.hold_playlist_reload(stream_id, query).await {
                         return Ok(self.record_edge_response(method, path, query, refusal, started));
                     }
@@ -25020,6 +25145,95 @@ mod tests {
         assert!(late.get_segment_for_stream_id(77, 1_002).await.is_some());
         assert!(late.get_segment_for_stream_id(77, 1_001).await.is_none());
         assert!(late.get_segment_for_stream_id(77, 1_003).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_copy_that_fills_newest_first_never_grows_at_its_front() {
+        let distributor = LiveTsCache::new(1, Duration::from_millis(5), 200, 2_400, 64).await;
+        let edge = LiveTsCache::new(1, Duration::from_millis(5), 200, 2_400, 64).await;
+        commit_stamped_video(&distributor, 36).await;
+
+        // The warm-up of a new copy sends the newest parts first: the open
+        // segment 1003 arrives before anything else.
+        for slot in (30..36).rev() {
+            deliver_mesh_part(&distributor, &edge, 77, slot).await;
+        }
+        // Parts of an open segment are not a playlist that a player accepts.
+        assert!(!edge.state.read().await.playlist_is_playable(77));
+        assert!(
+            !edge
+                .wait_for_playlist_copy(77, Duration::from_millis(30))
+                .await
+        );
+
+        // Segment 1002 arrives. The playlist has a whole segment now.
+        for slot in (20..30).rev() {
+            deliver_mesh_part(&distributor, &edge, 77, slot).await;
+        }
+        assert!(
+            edge.wait_for_playlist_copy(77, Duration::from_millis(30))
+                .await
+        );
+        let first = edge.playlist_for_stream_id(77).await;
+        assert!(first.contains("#EXT-X-MEDIA-SEQUENCE:1002\n"));
+        assert!(first.contains("seg1002.mp4"));
+
+        // Older segments still arrive. The playlist that a reader has seen
+        // does not grow at its front: the Media Sequence Number stays.
+        for slot in (0..20).rev() {
+            deliver_mesh_part(&distributor, &edge, 77, slot).await;
+        }
+        let later = edge.playlist_for_stream_id(77).await;
+        assert!(later.contains("#EXT-X-MEDIA-SEQUENCE:1002\n"));
+        assert!(!later.contains("seg1001.mp4"));
+        // The older parts are in the cache for a reader that asks for them.
+        assert!(edge.get_segment_for_stream_id(77, 1_001).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_segment_that_left_the_playlist_can_still_be_fetched() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 2_400, 64).await;
+        // Seven target durations are the playlist. Three more are kept.
+        commit_stamped_video(&cache, 200).await;
+        let playlist = cache.playlist_for_stream_id(77).await;
+        let first_listed = playlist
+            .lines()
+            .find_map(|line| line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:"))
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap();
+        assert!(first_listed > 1_002, "{first_listed}");
+        assert!(!playlist.contains(&format!("seg{}.mp4", first_listed - 1)));
+        assert!(cache
+            .get_segment_for_stream_id(77, first_listed - 1)
+            .await
+            .is_some());
+        assert!(cache
+            .get_segment_for_stream_id(77, first_listed - 2)
+            .await
+            .is_some());
+        // Much older media has gone.
+        assert!(cache.get_segment_for_stream_id(77, 1_000).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_regional_cache_answers_404_for_a_stream_that_its_region_does_not_have() {
+        let (mut router, mesh) = entry_point_for_tests(vec![reader_cache_snapshot_for_tests(
+            "edge-b",
+            100,
+            Some(500),
+        )])
+        .await;
+        router.cache_mesh_role = CacheMeshRole::Distributor;
+        // Stream 801 is advertised by a cache of the region.
+        let known = get_for_tests(&router, "/live/801/master.m3u8?sid=reader").await;
+        assert_eq!(known.status, StatusCode::OK);
+        for path in ["/live/999/master.m3u8?sid=reader", "/live/999/stream.m3u8"] {
+            let started = Instant::now();
+            let unknown = get_for_tests(&router, path).await;
+            assert_eq!(unknown.status, StatusCode::NOT_FOUND, "{path}");
+            assert!(started.elapsed() < Duration::from_millis(500), "{path}");
+        }
+        mesh.shutdown();
     }
 
     #[tokio::test]
