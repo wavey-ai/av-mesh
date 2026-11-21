@@ -1254,6 +1254,45 @@ impl RelayUdpDispatch {
         Ok(())
     }
 
+    /// A dispatch with the same parent sessions and peer bindings and no
+    /// receive state. The fast plane gives each traffic class a receive task
+    /// of its own, and each task its own copy, so that a video object's
+    /// assembly never holds an audio object back.
+    pub fn twin(&self) -> Result<Self, RelayIngressError> {
+        let mut receiver = RelayObjectReceiver::new(self.receiver.config)?;
+        let mut sessions = self.receiver.sessions.values().cloned().collect::<Vec<_>>();
+        sessions.sort_by_key(|session| session.session_id);
+        for session in sessions {
+            receiver.register_parent_session_inner(session)?;
+        }
+        Ok(Self {
+            receiver,
+            sessions_by_peer: self.sessions_by_peer.clone(),
+            controlled_announcement_sessions: self.controlled_announcement_sessions.clone(),
+        })
+    }
+
+    /// What each bound peer may send: the checks of a symbol against its
+    /// session (generation, subscription and parent path) that the fast plane
+    /// makes before it forwards, without decoding.
+    #[must_use]
+    pub fn peer_admissions(&self) -> HashMap<SocketAddr, PeerAdmission> {
+        self.sessions_by_peer
+            .iter()
+            .filter_map(|(peer, session_id)| {
+                let session = self.receiver.sessions.get(session_id)?;
+                Some((
+                    *peer,
+                    PeerAdmission {
+                        generation: session.generation.get(),
+                        subscription_id: session.subscription_id.get(),
+                        parent_path: session.parent_path,
+                    },
+                ))
+            })
+            .collect()
+    }
+
     /// Classify legacy RQD2 framing separately from RLS1 relay-session framing.
     pub fn push(
         &mut self,
@@ -1285,6 +1324,29 @@ impl RelayUdpDispatch {
         self.receiver
             .push_wire_datagram(session_id, datagram, now_us)
             .map(RelayUdpDispatchOutcome::Relay)
+    }
+}
+
+/// The session of one bound peer, as the fast plane checks it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeerAdmission {
+    pub generation: u64,
+    pub subscription_id: u64,
+    pub parent_path: ParentPath,
+}
+
+impl PeerAdmission {
+    /// The checks of `validate_session_symbol`, on raw header fields.
+    #[must_use]
+    pub const fn admits(
+        &self,
+        generation: u64,
+        subscription_id: u64,
+        intent: raptorq_datagram_fec::MediaPathIntent,
+    ) -> bool {
+        self.generation == generation
+            && self.subscription_id == subscription_id
+            && self.parent_path.permits(intent)
     }
 }
 
