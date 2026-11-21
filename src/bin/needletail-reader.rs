@@ -729,6 +729,9 @@ impl Reader {
         // region. Its round trip is measured anew.
         self.round_trip = None;
         self.http.tcp_round_trip = None;
+        // A player loads the playlist of a cache before it asks the cache
+        // for a part.
+        self.playlist_due = Instant::now();
         self.report.moves.push(Move {
             at_ms: self.elapsed_ms(),
             part,
@@ -1120,6 +1123,34 @@ impl Reader {
                             default_duration_ms = (*duration).max(1);
                         }
                         durations.retain(|sequence, _| *sequence + 4_096 > next);
+                        // A player plays what the playlist lists. When the
+                        // part that the reader waits for is overdue, and the
+                        // playlist lists later parts and not this one, the
+                        // part will not come: it was lost before the region,
+                        // or this cache began its copy after it. The reader
+                        // goes on from the next part that is listed. It
+                        // waited for each lost part in turn, 1.5 s or more
+                        // for each.
+                        if let Some(skip_to) = part_after_a_hole(
+                            &loaded.parts,
+                            next,
+                            part_started.elapsed() >= self.timeout(),
+                        ) {
+                            for pending in inflight.drain(..) {
+                                pending.handle.abort();
+                            }
+                            for sequence in next..skip_to {
+                                scheduled_ms += durations
+                                    .get(&sequence)
+                                    .copied()
+                                    .unwrap_or(default_duration_ms);
+                            }
+                            self.report.parts_missing += skip_to - next;
+                            next = skip_to;
+                            request_next = next;
+                            part_started = Instant::now();
+                            failed = 0;
+                        }
                     }
                     Ok(None) => {}
                     Err(error) => {
@@ -1652,6 +1683,20 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// The part that a reader goes on from when the part that it waits for will
+/// not come: the first listed part after `wanted`, when `wanted` is overdue
+/// and the playlist does not list it.
+fn part_after_a_hole(listed: &[(u64, u64)], wanted: u64, overdue: bool) -> Option<u64> {
+    if !overdue || listed.iter().any(|(sequence, _)| *sequence == wanted) {
+        return None;
+    }
+    listed
+        .iter()
+        .map(|(sequence, _)| *sequence)
+        .filter(|sequence| *sequence > wanted)
+        .min()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1722,6 +1767,19 @@ mod tests {
         .unwrap();
         assert_eq!(plain.caches[0].name, "10.0.0.1:19444");
         assert!(parse_master("#EXTM3U\n", &base).is_err());
+    }
+
+    #[test]
+    fn a_reader_goes_on_from_the_next_listed_part_after_a_hole() {
+        let listed = [(3_790, 208), (3_791, 208), (3_792, 125)];
+        // Parts 3741 to 3789 were lost while the region had no source.
+        assert_eq!(part_after_a_hole(&listed, 3_741, true), Some(3_790));
+        // A part that is not overdue is waited for.
+        assert_eq!(part_after_a_hole(&listed, 3_741, false), None);
+        // A listed part will come, and so will the part after the newest.
+        assert_eq!(part_after_a_hole(&listed, 3_791, true), None);
+        assert_eq!(part_after_a_hole(&listed, 3_793, true), None);
+        assert_eq!(part_after_a_hole(&[], 3_741, true), None);
     }
 
     #[test]
