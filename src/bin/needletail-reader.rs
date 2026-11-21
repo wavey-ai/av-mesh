@@ -5,6 +5,12 @@
 //! that follow it. The reader then reads the parts of the media playlist from
 //! the assigned cache, one request for each part, as a player does.
 //!
+//! A part request waits at the cache until the part exists. A reader on a
+//! path with delay therefore asks for several parts ahead (`--pipeline`):
+//! with one request at a time it receives one part for each round trip, and
+//! a round trip is longer than a 5 ms part on any real network. By default
+//! the reader measures the round trip and asks far enough ahead to cover it.
+//!
 //! It moves to another cache in three cases, and records each move:
 //!
 //! - the cache fails: a request times out, the connection breaks, or the part
@@ -14,19 +20,25 @@
 //!   cache first.
 //!
 //! The report says, for each reader, which cache served each part, every
-//! move, and whether a part arrived after the moment a player with the given
-//! buffer would have needed it. A run with `--readers N` is N sessions.
+//! move, and what a player with the given buffer would have shown: each
+//! stall and its length, the time to the first part, and the time from the
+//! moment the contributor published a part to its arrival. A run with
+//! `--readers N` is N sessions.
+//!
+//! `--read-kbps` and `--freeze-after-seconds` make a reader that reads
+//! slowly, or that stops reading and keeps its connections open.
 
 use anyhow::{anyhow, bail, Context, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use http::{header::HeaderValue, Request, StatusCode};
 use http_body_util::{BodyExt, Empty};
 use hyper::client::conn::http2::SendRequest;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
@@ -72,9 +84,15 @@ struct Args {
     buffer_ms: u64,
 
     /// Time allowed for one part request, including the wait at the cache for
-    /// a part that is not published yet.
+    /// a part that is not published yet. The reader adds four round trips of
+    /// its path to it, so that a far reader does not take delay for failure.
     #[arg(long, default_value_t = 1_500)]
     request_timeout_ms: u64,
+
+    /// Time allowed for the first answer of an entry point or of a cache,
+    /// which includes the TCP and TLS handshakes.
+    #[arg(long, default_value_t = 8_000)]
+    connect_timeout_ms: u64,
 
     /// Give up a part that no cache supplies within this time and read on.
     #[arg(long, default_value_t = 6_000)]
@@ -92,6 +110,25 @@ struct Args {
     /// Start this many parts behind the newest part of the playlist.
     #[arg(long, default_value_t = 1)]
     start_back_parts: u64,
+
+    /// Parts requested at one time. 0 measures the round trip to the cache
+    /// and asks far enough ahead to cover it. 1 is one request at a time.
+    #[arg(long, default_value_t = 0)]
+    pipeline: usize,
+
+    /// Largest number of parts requested at one time.
+    #[arg(long, default_value_t = 256)]
+    pipeline_limit: usize,
+
+    /// Read response bodies at this rate at most, in kbit/s. 0 reads at the
+    /// speed of the network.
+    #[arg(long, default_value_t = 0)]
+    read_kbps: u64,
+
+    /// Stop reading after this many seconds and keep the connections open
+    /// until the run ends, as a player that hangs does. 0 never stops.
+    #[arg(long, default_value_t = 0)]
+    freeze_after_seconds: u64,
 
     /// Certificate authority that signs the node certificates.
     #[arg(long)]
@@ -195,6 +232,73 @@ struct HttpResponse {
     status: StatusCode,
     headers: http::HeaderMap,
     body: Bytes,
+    /// When the last byte of the body arrived.
+    arrived: Instant,
+    arrived_unix_us: u64,
+}
+
+/// How a reader takes bytes off its connections.
+#[derive(Debug)]
+struct Pace {
+    /// Bits per second at most. 0 is no limit.
+    read_bps: u64,
+    /// The reader has stopped reading.
+    frozen: AtomicBool,
+    /// When the reader last took bytes off a connection, in microseconds
+    /// since `epoch`. A cache that still sends is slow, not dead.
+    last_bytes_us: AtomicU64,
+    epoch: Instant,
+}
+
+impl Pace {
+    fn last_bytes(&self) -> Instant {
+        self.epoch + Duration::from_micros(self.last_bytes_us.load(Ordering::Relaxed))
+    }
+
+    async fn took(&self, bytes: usize) {
+        self.last_bytes_us
+            .store(self.epoch.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if self.frozen.load(Ordering::Relaxed) {
+            std::future::pending::<()>().await;
+        }
+        if self.read_bps > 0 {
+            let micros = (bytes as u64).saturating_mul(8_000_000) / self.read_bps;
+            tokio::time::sleep(Duration::from_micros(micros)).await;
+        }
+    }
+}
+
+async fn fetch(
+    mut sender: SendRequest<Empty<Bytes>>,
+    request: Request<Empty<Bytes>>,
+    pace: Arc<Pace>,
+) -> Result<HttpResponse> {
+    let response = sender.send_request(request).await?;
+    let (parts, mut body) = response.into_parts();
+    let mut bytes = BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        if let Ok(data) = frame?.into_data() {
+            pace.took(data.len()).await;
+            bytes.extend_from_slice(&data);
+        }
+    }
+    Ok(HttpResponse {
+        status: parts.status,
+        headers: parts.headers,
+        body: bytes.freeze(),
+        arrived: Instant::now(),
+        arrived_unix_us: now_unix_us(),
+    })
+}
+
+/// A part request that is on its way.
+struct Pending {
+    part: u64,
+    /// Index of the cache that the request went to.
+    cache: usize,
+    authority: String,
+    started: Instant,
+    handle: tokio::task::JoinHandle<Result<HttpResponse>>,
 }
 
 /// One HTTP/2 connection for each cache, as a player keeps.
@@ -203,6 +307,12 @@ struct HttpClient {
     server_name: Option<String>,
     session: String,
     connections: HashMap<String, SendRequest<Empty<Bytes>>>,
+    pace: Arc<Pace>,
+    /// Time allowed for the TCP, TLS and HTTP/2 handshakes of a new
+    /// connection.
+    connect_timeout: Duration,
+    /// Shortest TCP handshake so far: one round trip.
+    tcp_round_trip: Option<Duration>,
 }
 
 impl HttpClient {
@@ -214,9 +324,12 @@ impl HttpClient {
             self.connections.remove(&url.authority);
         }
         let (host, port) = url.host_port();
+        let asked = Instant::now();
         let tcp = TcpStream::connect((host.as_str(), port))
             .await
             .with_context(|| format!("connect {}", url.authority))?;
+        let took = asked.elapsed();
+        self.tcp_round_trip = Some(self.tcp_round_trip.map_or(took, |best| best.min(took)));
         tcp.set_nodelay(true)?;
         let name = self.server_name.clone().unwrap_or(host);
         let server_name = rustls::pki_types::ServerName::try_from(name)
@@ -254,24 +367,40 @@ impl HttpClient {
         }
     }
 
-    async fn get_once(&mut self, url: &Url) -> Result<HttpResponse> {
-        let mut sender = self.connection(url).await?;
-        let request = Request::builder()
+    fn request(&self, url: &Url) -> Result<Request<Empty<Bytes>>> {
+        Ok(Request::builder()
             .method("GET")
             .uri(format!("https://{}{}", url.authority, url.path_and_query))
             .header(
                 "cmcd-session",
                 HeaderValue::from_str(&format!("sid=\"{}\"", self.session))?,
             )
-            .body(Empty::<Bytes>::new())?;
-        let response = sender.send_request(request).await?;
-        let (parts, body) = response.into_parts();
-        let body = body.collect().await?.to_bytes();
-        Ok(HttpResponse {
-            status: parts.status,
-            headers: parts.headers,
-            body,
-        })
+            .body(Empty::<Bytes>::new())?)
+    }
+
+    async fn get_once(&mut self, url: &Url) -> Result<HttpResponse> {
+        let sender = self.connection(url).await?;
+        fetch(sender, self.request(url)?, self.pace.clone()).await
+    }
+
+    /// Send a request and return at once. The response is awaited later, so
+    /// that several requests are on their way on one connection.
+    async fn start(&mut self, url: &Url) -> Result<tokio::task::JoinHandle<Result<HttpResponse>>> {
+        let sender = tokio::time::timeout(self.connect_timeout, self.connection(url))
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "no connection to {} after {} ms",
+                    url.authority,
+                    self.connect_timeout.as_millis()
+                )
+            })??;
+        let request = self.request(url)?;
+        Ok(tokio::spawn(fetch(sender, request, self.pace.clone())))
+    }
+
+    fn forget(&mut self, authority: &str) {
+        self.connections.remove(authority);
     }
 }
 
@@ -389,6 +518,15 @@ struct Move {
     detail: String,
 }
 
+/// One stop of the player.
+#[derive(Debug, Clone, Serialize)]
+struct Stall {
+    /// Milliseconds since the reader started.
+    at_ms: u64,
+    part: u64,
+    ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct PartRecord {
     part: u64,
@@ -414,16 +552,46 @@ struct ReaderReport {
     assigned: Vec<String>,
     first_cache: String,
     final_cache: String,
+    /// Time to the first part.
     startup_ms: u64,
+    /// Time until the reader held `buffer_ms` of media and a player would
+    /// have started to play.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    playback_start_ms: Option<u64>,
     first_part: u64,
     last_part: u64,
     parts_received: u64,
     parts_missing: u64,
     bytes: u64,
-    /// Parts that arrived later than the playout buffer allows.
+    /// Parts that arrived later than the playout buffer allows, against a
+    /// schedule that never moves.
     underruns: u64,
+    /// Times that a player with this buffer would have stopped: a part that
+    /// arrived after its moment to play. The player then plays that much
+    /// later, so one stall is one event however many parts were late.
+    stalls: u64,
+    stalled_ms: u64,
+    longest_stall_ms: u64,
+    /// The first 64 stalls.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    stall_events: Vec<Stall>,
     max_behind_ms: i64,
     max_gap_ms: u64,
+    /// Largest number of part requests on their way at one time.
+    pipeline_depth: usize,
+    /// Shortest round trip of a playlist reload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    round_trip_ms: Option<f64>,
+    /// From the moment the contributor published a part to its arrival.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latency_p50_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latency_p99_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latency_max_ms: Option<f64>,
+    /// The reader stopped reading at this time, on purpose.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frozen_at_ms: Option<u64>,
     request_errors: u64,
     rejections: u64,
     parts_by_cache: BTreeMap<String, u64>,
@@ -466,15 +634,51 @@ struct Reader {
     steering_due: Instant,
     playlist_due: Instant,
     rejected_in_a_row: usize,
+    /// Shortest playlist round trip so far.
+    round_trip: Option<Duration>,
 }
 
 impl Reader {
+    /// Parts to ask for at one time: enough to cover a round trip and a
+    /// little more, so that a part is on its way before the reader needs it.
+    fn pipeline_depth(&self, part_ms: u64) -> usize {
+        let limit = self.args.pipeline_limit.max(1);
+        if self.args.pipeline > 0 {
+            return self.args.pipeline.min(limit);
+        }
+        let round_trip_ms = self.path_round_trip().as_millis() as u64;
+        let ahead = (round_trip_ms * 3 / 2) / part_ms.max(1) + 2;
+        (ahead as usize).clamp(2, limit)
+    }
+
     fn elapsed_ms(&self) -> u64 {
         self.started.elapsed().as_millis() as u64
     }
 
+    /// The round trip to the caches: the shorter of the best playlist
+    /// reload and the best TCP handshake.
+    fn path_round_trip(&self) -> Duration {
+        match (self.round_trip, self.http.tcp_round_trip) {
+            (Some(a), Some(b)) => a.min(b),
+            (a, b) => a.or(b).unwrap_or(Duration::ZERO),
+        }
+    }
+
+    /// A part can take several round trips on a new connection, while TCP
+    /// still opens its window.
     fn timeout(&self) -> Duration {
-        Duration::from_millis(self.args.request_timeout_ms)
+        Duration::from_millis(self.args.request_timeout_ms) + self.path_round_trip() * 4
+    }
+
+    /// Time allowed for a request to `url`: longer when it needs a new
+    /// connection.
+    fn timeout_for(&self, url: &Url) -> Duration {
+        if self.http.connections.contains_key(&url.authority) {
+            self.timeout()
+        } else {
+            self.timeout()
+                .max(Duration::from_millis(self.args.connect_timeout_ms))
+        }
     }
 
     fn current_name(&self) -> String {
@@ -492,7 +696,7 @@ impl Reader {
             if let Some(cache) = &self.args.cache {
                 url = url.with_query("cache", cache);
             }
-            match self.http.get(&url, self.timeout()).await {
+            match self.http.get(&url, self.timeout_for(&url)).await {
                 Ok(response) if response.status == StatusCode::OK => {
                     let body = String::from_utf8_lossy(&response.body).into_owned();
                     self.master = parse_master(&body, &url)?;
@@ -571,7 +775,30 @@ impl Reader {
 
     async fn load_playlist(&mut self, part: u64) -> Result<Option<MediaPlaylist>> {
         let url = self.master.caches[self.current].playlist.clone();
-        let response = self.http.get(&url, self.timeout()).await?;
+        let reused = self.http.connections.contains_key(&url.authority);
+        let asked = Instant::now();
+        let response = self.http.get(&url, self.timeout_for(&url)).await?;
+        self.playlist_response(url, reused.then_some(asked), response, part)
+            .await
+    }
+
+    /// Act on the answer to a playlist request: the parts of the playlist, a
+    /// redirect of a draining cache, or a refusal.
+    async fn playlist_response(
+        &mut self,
+        url: Url,
+        asked_on_open_connection: Option<Instant>,
+        response: HttpResponse,
+        part: u64,
+    ) -> Result<Option<MediaPlaylist>> {
+        if let Some(asked) = asked_on_open_connection {
+            let took = response.arrived.duration_since(asked);
+            let round_trip = self.round_trip.map_or(took, |best| best.min(took));
+            self.round_trip = Some(round_trip);
+            // The handshakes of a new connection are three round trips.
+            let _ = round_trip;
+            self.http.connect_timeout = self.timeout();
+        }
         match response.status {
             StatusCode::OK => {
                 self.rejected_in_a_row = 0;
@@ -728,20 +955,85 @@ impl Reader {
 
         let mut schedule: Option<(Instant, u64)> = None;
         let mut scheduled_ms = 0_u64;
+        // How much later the player plays than its first schedule: the sum
+        // of its stalls.
+        let mut shift_ms = 0_u64;
+        let mut in_stall = false;
+        let mut stall_run_ms = 0_u64;
+        // When the player started, in milliseconds after the first part.
+        let mut play_from_ms: Option<u64> = None;
         let mut last_arrival: Option<Instant> = None;
         let mut latencies = Vec::new();
+        let mut publish_latencies = Vec::new();
         let mut digest = 0xcbf2_9ce4_8422_2325_u64;
         let mut failed = 0_usize;
         let mut part_started = Instant::now();
+        let mut inflight: VecDeque<Pending> = VecDeque::new();
+        let mut request_next = next;
+        let mut catching_up = false;
+        #[allow(clippy::type_complexity)]
+        let mut reload: Option<(
+            Url,
+            Option<Instant>,
+            Instant,
+            tokio::task::JoinHandle<Result<HttpResponse>>,
+        )> = None;
+        let freeze_at = (self.args.freeze_after_seconds > 0)
+            .then(|| self.started + Duration::from_secs(self.args.freeze_after_seconds));
 
         while Instant::now() < deadline {
+            if freeze_at.is_some_and(|at| Instant::now() >= at) {
+                // Stop reading. The connections and the requests stay open.
+                self.http.pace.frozen.store(true, Ordering::Relaxed);
+                self.report.frozen_at_ms = Some(self.elapsed_ms());
+                tokio::time::sleep_until(deadline.into()).await;
+                break;
+            }
             if self.args.steering && Instant::now() >= self.steering_due {
                 self.poll_steering(next).await;
             }
-            if Instant::now() >= self.playlist_due {
+            // The playlist is reloaded beside the parts, so that a reload
+            // never holds a part back.
+            if reload.is_none() && Instant::now() >= self.playlist_due {
                 self.playlist_due =
                     Instant::now() + Duration::from_millis(self.args.playlist_interval_ms);
-                match self.load_playlist(next).await {
+                let url = self.master.caches[self.current].playlist.clone();
+                let reused = self.http.connections.contains_key(&url.authority);
+                match self.http.start(&url).await {
+                    Ok(handle) => {
+                        reload = Some((url, reused.then(Instant::now), Instant::now(), handle))
+                    }
+                    Err(error) => {
+                        failed += 1;
+                        self.fail_over(next, failed, format!("playlist: {error:#}"))
+                            .await;
+                        continue;
+                    }
+                }
+            }
+            let reload_done = reload.as_ref().is_some_and(|(_, _, asked, handle)| {
+                handle.is_finished() || asked.elapsed() > self.timeout()
+            });
+            if reload_done {
+                let (url, asked_open, _, handle) = reload.take().expect("reload");
+                let result = if handle.is_finished() {
+                    match handle.await {
+                        Ok(Ok(response)) => {
+                            self.playlist_response(url, asked_open, response, next)
+                                .await
+                        }
+                        Ok(Err(error)) => {
+                            self.http.forget(&url.authority);
+                            Err(error)
+                        }
+                        Err(join) => Err(anyhow!("playlist task failed: {join}")),
+                    }
+                } else {
+                    handle.abort();
+                    self.http.forget(&url.authority);
+                    Err(anyhow!("timeout after {} ms", self.timeout().as_millis()))
+                };
+                match result {
                     Ok(Some(loaded)) => {
                         for (sequence, duration) in &loaded.parts {
                             durations.insert(*sequence, *duration);
@@ -761,14 +1053,106 @@ impl Reader {
                 }
             }
 
+            // Requests that went to a cache that the reader has left are of
+            // no use.
+            if inflight
+                .front()
+                .is_some_and(|pending| pending.cache != self.current)
+            {
+                for pending in inflight.drain(..) {
+                    pending.handle.abort();
+                }
+                request_next = next;
+            }
             let playlist_url = self.master.caches[self.current].playlist.clone();
-            let part_url = playlist_url.join(&format!("part{next}.{extension}"))?;
-            let outcome = self.http.get(&part_url, self.timeout()).await;
+            // A reader that is behind the cache asks further ahead: the parts
+            // exist, so only the link limits how fast it catches up.
+            let depth = if catching_up && self.args.pipeline == 0 {
+                (self.pipeline_depth(default_duration_ms) * 4).min(self.args.pipeline_limit.max(1))
+            } else {
+                self.pipeline_depth(default_duration_ms)
+            };
+            let mut start_error = None;
+            while inflight.len() < depth {
+                let part_url = playlist_url.join(&format!("part{request_next}.{extension}"))?;
+                match self.http.start(&part_url).await {
+                    Ok(handle) => {
+                        inflight.push_back(Pending {
+                            part: request_next,
+                            cache: self.current,
+                            authority: part_url.authority.clone(),
+                            started: Instant::now(),
+                            handle,
+                        });
+                        request_next += 1;
+                    }
+                    Err(error) => {
+                        start_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            self.report.pipeline_depth = self.report.pipeline_depth.max(inflight.len());
+
+            let outcome = match inflight.pop_front() {
+                Some(mut pending) => {
+                    debug_assert_eq!(pending.part, next);
+                    // The time allowed runs from the moment the reader began
+                    // to wait for this part, not from the moment it asked.
+                    // A cache that still sends bytes is slow, not dead: the
+                    // time runs again from the last bytes.
+                    let end = freeze_at.unwrap_or(deadline).min(deadline);
+                    let waited = loop {
+                        let limit = pending
+                            .started
+                            .max(part_started)
+                            .max(self.http.pace.last_bytes())
+                            + self.timeout();
+                        match tokio::time::timeout_at(limit.min(end).into(), &mut pending.handle)
+                            .await
+                        {
+                            Ok(result) => break Ok(result),
+                            Err(_) if Instant::now() >= end => break Err(true),
+                            Err(_)
+                                if self.http.pace.last_bytes() + self.timeout()
+                                    > Instant::now() => {}
+                            Err(_) => break Err(false),
+                        }
+                    };
+                    match waited {
+                        Ok(Ok(result)) => {
+                            if result.is_err() {
+                                self.http.forget(&pending.authority);
+                            }
+                            result
+                        }
+                        Ok(Err(join)) => Err(anyhow!("request task failed: {join}")),
+                        Err(true) => {
+                            // The run or the reading ends here. Keep the
+                            // request open.
+                            inflight.push_front(pending);
+                            continue;
+                        }
+                        Err(false) => {
+                            pending.handle.abort();
+                            // A request that timed out can leave a stalled
+                            // connection.
+                            self.http.forget(&pending.authority);
+                            Err(anyhow!("timeout after {} ms", self.timeout().as_millis()))
+                        }
+                    }
+                }
+                None => Err(start_error.unwrap_or_else(|| anyhow!("no request was sent"))),
+            };
             let response = match outcome {
                 Ok(response) if response.status == StatusCode::OK && !response.body.is_empty() => {
                     response
                 }
                 Ok(response) if response.status == StatusCode::TOO_MANY_REQUESTS => {
+                    for pending in inflight.drain(..) {
+                        pending.handle.abort();
+                    }
+                    request_next = next;
                     self.report.rejections += 1;
                     let alternate = response
                         .headers
@@ -793,6 +1177,10 @@ impl Reader {
                     continue;
                 }
                 other => {
+                    for pending in inflight.drain(..) {
+                        pending.handle.abort();
+                    }
+                    request_next = next;
                     let detail = match other {
                         Ok(response) => format!("part {next} answered {}", response.status),
                         Err(error) => format!("part {next}: {error:#}"),
@@ -804,6 +1192,7 @@ impl Reader {
                         scheduled_ms +=
                             durations.get(&next).copied().unwrap_or(default_duration_ms);
                         next += 1;
+                        request_next = next;
                         part_started = Instant::now();
                         failed = 0;
                         continue;
@@ -814,31 +1203,86 @@ impl Reader {
             };
             failed = 0;
 
-            let arrival = Instant::now();
+            let arrival = response.arrived;
             let (origin, _) = *schedule.get_or_insert((arrival, next));
             if self.report.parts_received == 0 {
-                self.report.startup_ms = self.elapsed_ms();
+                self.report.startup_ms = arrival.duration_since(self.started).as_millis() as u64;
             }
-            let behind_ms = arrival.duration_since(origin).as_millis() as i64 - scheduled_ms as i64;
+            let since_origin_ms = arrival.duration_since(origin).as_millis() as i64;
+            let behind_ms = since_origin_ms - scheduled_ms as i64;
             self.report.max_behind_ms = self.report.max_behind_ms.max(behind_ms);
             if behind_ms > self.args.buffer_ms as i64 {
                 self.report.underruns += 1;
+            }
+            // A player starts when it holds `buffer_ms` of media. From then
+            // on it shows a part at its place in the schedule, plus every
+            // stall so far.
+            let part_ms = durations.get(&next).copied().unwrap_or(default_duration_ms);
+            if play_from_ms.is_none() && scheduled_ms + part_ms >= self.args.buffer_ms {
+                play_from_ms = Some(since_origin_ms.max(0) as u64);
+                self.report.playback_start_ms =
+                    Some(arrival.duration_since(self.started).as_millis() as u64);
+            }
+            let late_ms = match play_from_ms {
+                Some(play_from_ms) => {
+                    since_origin_ms - (play_from_ms + scheduled_ms + shift_ms) as i64
+                }
+                None => 0,
+            };
+            if late_ms > 0 {
+                let late_ms = late_ms as u64;
+                shift_ms += late_ms;
+                self.report.stalled_ms += late_ms;
+                if in_stall {
+                    stall_run_ms += late_ms;
+                    let recorded = self.report.stalls as usize == self.report.stall_events.len();
+                    if let Some(event) = self.report.stall_events.last_mut().filter(|_| recorded) {
+                        event.ms = stall_run_ms;
+                    }
+                } else {
+                    self.report.stalls += 1;
+                    stall_run_ms = late_ms;
+                    if self.report.stall_events.len() < 64 {
+                        self.report.stall_events.push(Stall {
+                            at_ms: arrival.duration_since(self.started).as_millis() as u64,
+                            part: next,
+                            ms: late_ms,
+                        });
+                    }
+                }
+                self.report.longest_stall_ms = self.report.longest_stall_ms.max(stall_run_ms);
+                in_stall = true;
+            } else {
+                in_stall = false;
             }
             if let Some(last) = last_arrival {
                 self.report.max_gap_ms = self
                     .report
                     .max_gap_ms
-                    .max(arrival.duration_since(last).as_millis() as u64);
+                    .max(arrival.saturating_duration_since(last).as_millis() as u64);
             }
             last_arrival = Some(arrival);
-            let cache_latency_ms = response
-                .headers
-                .get("x-needletail-cache-available-unix-us")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok())
-                .map(|available| (now_unix_us() as f64 - available as f64) / 1_000.0);
+            let header_u64 = |name: &str| {
+                response
+                    .headers
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+            };
+            let cache_latency_ms = header_u64("x-needletail-cache-available-unix-us")
+                .map(|available| (response.arrived_unix_us as f64 - available as f64) / 1_000.0);
             if let Some(latency) = cache_latency_ms {
                 latencies.push(latency);
+                // The part waited at the cache for longer than a round trip
+                // and four parts: the reader is behind the live edge.
+                let live_ms = self.path_round_trip().as_millis() as f64
+                    + 4.0 * default_duration_ms as f64
+                    + 50.0;
+                catching_up = latency > live_ms;
+            }
+            if let Some(published) = header_u64("x-needletail-published-unix-us") {
+                publish_latencies
+                    .push((response.arrived_unix_us as f64 - published as f64) / 1_000.0);
             }
             let etag = response
                 .headers
@@ -859,7 +1303,7 @@ impl Reader {
                     part: next,
                     cache,
                     bytes: response.body.len(),
-                    at_ms: self.elapsed_ms(),
+                    at_ms: arrival.duration_since(self.started).as_millis() as u64,
                     behind_ms,
                     cache_latency_ms,
                     etag,
@@ -869,7 +1313,16 @@ impl Reader {
             next += 1;
             part_started = Instant::now();
         }
+        // Requests still on their way stay open until the reader goes.
+        drop(inflight);
 
+        self.report.round_trip_ms = self
+            .round_trip
+            .map(|value| (value.as_micros() as f64 / 1_000.0 * 10.0).round() / 10.0);
+        publish_latencies.sort_by(f64::total_cmp);
+        self.report.latency_p50_ms = percentile(&publish_latencies, 50.0);
+        self.report.latency_p99_ms = percentile(&publish_latencies, 99.0);
+        self.report.latency_max_ms = percentile(&publish_latencies, 100.0);
         self.report.final_cache = self.current_name();
         latencies.sort_by(f64::total_cmp);
         self.report.cache_latency_p50_ms = percentile(&latencies, 50.0);
@@ -892,9 +1345,25 @@ struct Summary {
     parts_received: u64,
     parts_missing: u64,
     underruns: u64,
+    /// Readers that had at least one stall.
+    readers_stalled: usize,
+    stalls: u64,
+    stalled_ms: u64,
+    longest_stall_ms: u64,
     max_behind_ms: i64,
+    startup_ms_p50: Option<f64>,
+    startup_ms_p99: Option<f64>,
+    startup_ms_max: Option<f64>,
+    playback_start_ms_p50: Option<f64>,
+    playback_start_ms_max: Option<f64>,
+    /// Over the readers: the median, and the worst, of each reader's 99th
+    /// percentile from publication to arrival.
+    latency_p99_ms_median: Option<f64>,
+    latency_p99_ms_worst: Option<f64>,
+    latency_p50_ms_median: Option<f64>,
     moves: usize,
     rejections: u64,
+    request_errors: u64,
     /// Readers on each cache when the run ended.
     readers_by_final_cache: BTreeMap<String, usize>,
     /// Readers that each cache was first assigned.
@@ -956,6 +1425,14 @@ async fn main() -> Result<()> {
                     server_name: args.server_name.clone(),
                     session: session.clone(),
                     connections: HashMap::new(),
+                    pace: Arc::new(Pace {
+                        read_bps: args.read_kbps * 1_000,
+                        frozen: AtomicBool::new(false),
+                        last_bytes_us: AtomicU64::new(0),
+                        epoch: Instant::now(),
+                    }),
+                    connect_timeout: Duration::from_millis(args.connect_timeout_ms),
+                    tcp_round_trip: None,
                 },
                 master_url: Url {
                     authority: String::new(),
@@ -972,6 +1449,7 @@ async fn main() -> Result<()> {
                 steering_due: now,
                 playlist_due: now,
                 rejected_in_a_row: 0,
+                round_trip: None,
                 args,
             };
             reader.run().await
@@ -991,9 +1469,22 @@ async fn main() -> Result<()> {
         parts_received: 0,
         parts_missing: 0,
         underruns: 0,
+        readers_stalled: reports.iter().filter(|report| report.stalls > 0).count(),
+        stalls: 0,
+        stalled_ms: 0,
+        longest_stall_ms: 0,
         max_behind_ms: 0,
+        startup_ms_p50: None,
+        startup_ms_p99: None,
+        startup_ms_max: None,
+        playback_start_ms_p50: None,
+        playback_start_ms_max: None,
+        latency_p99_ms_median: None,
+        latency_p99_ms_worst: None,
+        latency_p50_ms_median: None,
         moves: 0,
         rejections: 0,
+        request_errors: 0,
         readers_by_final_cache: BTreeMap::new(),
         readers_by_first_cache: BTreeMap::new(),
         parts_by_cache: BTreeMap::new(),
@@ -1002,6 +1493,10 @@ async fn main() -> Result<()> {
         summary.parts_received += report.parts_received;
         summary.parts_missing += report.parts_missing;
         summary.underruns += report.underruns;
+        summary.stalls += report.stalls;
+        summary.stalled_ms += report.stalled_ms;
+        summary.longest_stall_ms = summary.longest_stall_ms.max(report.longest_stall_ms);
+        summary.request_errors += report.request_errors;
         summary.max_behind_ms = summary.max_behind_ms.max(report.max_behind_ms);
         summary.moves += report.moves.len();
         summary.rejections += report.rejections;
@@ -1021,6 +1516,45 @@ async fn main() -> Result<()> {
             *summary.parts_by_cache.entry(cache.clone()).or_default() += parts;
         }
     }
+    let sorted = |values: Vec<f64>| {
+        let mut values = values;
+        values.sort_by(f64::total_cmp);
+        values
+    };
+    let startups = sorted(
+        reports
+            .iter()
+            .filter(|report| report.parts_received > 0)
+            .map(|report| report.startup_ms as f64)
+            .collect(),
+    );
+    summary.startup_ms_p50 = percentile(&startups, 50.0);
+    summary.startup_ms_p99 = percentile(&startups, 99.0);
+    summary.startup_ms_max = percentile(&startups, 100.0);
+    let play_starts = sorted(
+        reports
+            .iter()
+            .filter_map(|report| report.playback_start_ms)
+            .map(|value| value as f64)
+            .collect(),
+    );
+    summary.playback_start_ms_p50 = percentile(&play_starts, 50.0);
+    summary.playback_start_ms_max = percentile(&play_starts, 100.0);
+    let p99s = sorted(
+        reports
+            .iter()
+            .filter_map(|report| report.latency_p99_ms)
+            .collect(),
+    );
+    summary.latency_p99_ms_median = percentile(&p99s, 50.0);
+    summary.latency_p99_ms_worst = percentile(&p99s, 100.0);
+    let p50s = sorted(
+        reports
+            .iter()
+            .filter_map(|report| report.latency_p50_ms)
+            .collect(),
+    );
+    summary.latency_p50_ms_median = percentile(&p50s, 50.0);
     let all_ok = summary.readers_ok == readers;
     let json = serde_json::to_vec_pretty(&Report {
         summary,
