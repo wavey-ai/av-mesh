@@ -206,7 +206,7 @@ dependencies = [
  "media-capability",
  "media-object",
  "message-packetizer",
- "playlists 0.1.6 (git+https://github.com/wavey-ai/playlists.git?rev=973139ae5fbdd8cbb9c6fc8b2cc9d81ac24146ad)",
+ "playlists 0.2.0",
  "raptorq-datagram-fec",
  "raptorq-fec-transport",
  "rcgen",
@@ -257,7 +257,7 @@ dependencies = [
  "hyper-util",
  "mime_guess",
  "percent-encoding",
- "playlists 0.1.6 (git+https://github.com/wavey-ai/playlists.git)",
+ "playlists 0.1.6",
  "quinn",
  "regex",
  "rustls 0.23.42",
@@ -2876,16 +2876,13 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "playlists"
 version = "0.1.6"
-source = "git+https://github.com/wavey-ai/playlists.git?rev=973139ae5fbdd8cbb9c6fc8b2cc9d81ac24146ad#973139ae5fbdd8cbb9c6fc8b2cc9d81ac24146ad"
+source = "git+https://github.com/wavey-ai/playlists.git#32c5c81130ba059282eed1cb647099ed41e592a0"
 dependencies = [
  "access-unit 0.1.5",
+ "arc-swap",
  "bytes",
  "chrono",
  "flate2",
- "libc",
- "raptorq",
- "raptorq-datagram-fec",
- "socket2 0.6.5",
  "thiserror 1.0.69",
  "tls-helpers 0.2.0",
  "tokio",
@@ -2895,14 +2892,17 @@ dependencies = [
 
 [[package]]
 name = "playlists"
-version = "0.1.6"
-source = "git+https://github.com/wavey-ai/playlists.git#32c5c81130ba059282eed1cb647099ed41e592a0"
+version = "0.2.0"
+source = "git+https://github.com/wavey-ai/playlists.git?rev=ff09196e86abc1bfbe0f6dda854cb178efcab8ec#ff09196e86abc1bfbe0f6dda854cb178efcab8ec"
 dependencies = [
  "access-unit 0.1.5",
- "arc-swap",
  "bytes",
  "chrono",
  "flate2",
+ "libc",
+ "raptorq",
+ "raptorq-datagram-fec",
+ "socket2 0.6.5",
  "thiserror 1.0.69",
  "tls-helpers 0.2.0",
  "tokio",
