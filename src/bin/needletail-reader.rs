@@ -47,6 +47,13 @@ use tokio_rustls::TlsConnector;
 
 /// Least time of parts that a reader asks for at one time by default.
 const DEFAULT_MIN_INFLIGHT_MS: u64 = 250;
+/// Most part requests on their way at one time by default: 250 ms of
+/// 0.25 ms parts, and a little more.
+const DEFAULT_PIPELINE_LIMIT: usize = 1_024;
+/// Requests that one HTTP/2 connection carries at one time by default: the
+/// concurrent streams that an av-mesh cache allows on a connection
+/// (web-service H2_MAX_CONCURRENT_STREAMS).
+const DEFAULT_STREAMS_PER_CONNECTION: usize = 256;
 
 #[derive(Debug, Clone, Parser)]
 #[command(
@@ -120,9 +127,19 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     pipeline: usize,
 
-    /// Largest number of parts requested at one time.
-    #[arg(long, default_value_t = 256)]
+    /// Largest number of parts requested at one time. The default holds
+    /// 250 ms of 0.25 ms parts. A report says `pipeline_limited` when the
+    /// limit cut the --min-inflight-ms window.
+    #[arg(long, default_value_t = DEFAULT_PIPELINE_LIMIT)]
     pipeline_limit: usize,
+
+    /// Most requests on one HTTP/2 connection at one time. A deeper
+    /// pipeline opens more connections to the same cache and spreads the
+    /// parts over them, since a cache allows 256 concurrent streams on a
+    /// connection and queues the rest. One stream is kept for the playlist
+    /// reload.
+    #[arg(long, default_value_t = DEFAULT_STREAMS_PER_CONNECTION)]
+    streams_per_connection: usize,
 
     /// With --pipeline 0, ask for at least this many milliseconds of parts
     /// at one time, within --pipeline-limit: at 2.5 ms parts a round trip
@@ -316,7 +333,11 @@ struct HttpClient {
     connector: TlsConnector,
     server_name: Option<String>,
     session: String,
+    /// The first connection to each cache, which carries the playlist.
     connections: HashMap<String, SendRequest<Empty<Bytes>>>,
+    /// Further connections to a cache for a deep pipeline of parts, by
+    /// cache and lane (1 and up).
+    lanes: HashMap<(String, usize), SendRequest<Empty<Bytes>>>,
     pace: Arc<Pace>,
     /// Time allowed for the TCP, TLS and HTTP/2 handshakes of a new
     /// connection.
@@ -327,11 +348,26 @@ struct HttpClient {
 
 impl HttpClient {
     async fn connection(&mut self, url: &Url) -> Result<SendRequest<Empty<Bytes>>> {
-        if let Some(connection) = self.connections.get(&url.authority) {
+        self.connection_on(url, 0).await
+    }
+
+    /// The connection of `lane` to the cache of `url`. Lane 0 is the first
+    /// connection, which also carries the playlist.
+    async fn connection_on(&mut self, url: &Url, lane: usize) -> Result<SendRequest<Empty<Bytes>>> {
+        let existing = if lane == 0 {
+            self.connections.get(&url.authority)
+        } else {
+            self.lanes.get(&(url.authority.clone(), lane))
+        };
+        if let Some(connection) = existing {
             if !connection.is_closed() {
                 return Ok(connection.clone());
             }
-            self.connections.remove(&url.authority);
+            if lane == 0 {
+                self.connections.remove(&url.authority);
+            } else {
+                self.lanes.remove(&(url.authority.clone(), lane));
+            }
         }
         let (host, port) = url.host_port();
         let asked = Instant::now();
@@ -356,8 +392,13 @@ impl HttpClient {
         tokio::spawn(async move {
             let _ = connection.await;
         });
-        self.connections
-            .insert(url.authority.clone(), sender.clone());
+        if lane == 0 {
+            self.connections
+                .insert(url.authority.clone(), sender.clone());
+        } else {
+            self.lanes
+                .insert((url.authority.clone(), lane), sender.clone());
+        }
         Ok(sender)
     }
 
@@ -366,12 +407,12 @@ impl HttpClient {
         match result {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(error)) => {
-                self.connections.remove(&url.authority);
+                self.forget(&url.authority);
                 Err(error)
             }
             Err(_) => {
                 // A request that timed out can leave a stalled connection.
-                self.connections.remove(&url.authority);
+                self.forget(&url.authority);
                 Err(anyhow!("timeout after {} ms", timeout.as_millis()))
             }
         }
@@ -396,7 +437,16 @@ impl HttpClient {
     /// Send a request and return at once. The response is awaited later, so
     /// that several requests are on their way on one connection.
     async fn start(&mut self, url: &Url) -> Result<tokio::task::JoinHandle<Result<HttpResponse>>> {
-        let sender = tokio::time::timeout(self.connect_timeout, self.connection(url))
+        self.start_on(url, 0).await
+    }
+
+    /// [`Self::start`] on the connection of `lane`.
+    async fn start_on(
+        &mut self,
+        url: &Url,
+        lane: usize,
+    ) -> Result<tokio::task::JoinHandle<Result<HttpResponse>>> {
+        let sender = tokio::time::timeout(self.connect_timeout, self.connection_on(url, lane))
             .await
             .map_err(|_| {
                 anyhow!(
@@ -411,6 +461,7 @@ impl HttpClient {
 
     fn forget(&mut self, authority: &str) {
         self.connections.remove(authority);
+        self.lanes.retain(|(lane_authority, _), _| lane_authority != authority);
     }
 }
 
@@ -660,6 +711,11 @@ struct ReaderReport {
     entry_refusals: u64,
     /// Largest number of part requests on their way at one time.
     pipeline_depth: usize,
+    /// Most HTTP/2 connections to one cache that carried them.
+    pipeline_connections: usize,
+    /// Whether --pipeline-limit kept the requests on their way below the
+    /// --min-inflight-ms window.
+    pipeline_limited: bool,
     /// Shortest round trip of a playlist reload.
     #[serde(skip_serializing_if = "Option::is_none")]
     round_trip_ms: Option<f64>,
@@ -1283,10 +1339,33 @@ impl Reader {
             // took the 404 for a failure and left its cache. Two seconds of
             // parts is the most that it asks ahead.
             let depth = depth.min(parts_in_two_seconds(default_duration_us));
+            if self.args.pipeline == 0 && !self.report.pipeline_limited {
+                let wanted = pipeline_depth_for(
+                    self.path_round_trip(),
+                    default_duration_us,
+                    self.args.min_inflight_ms,
+                    usize::MAX,
+                );
+                if wanted > self.args.pipeline_limit.max(2) {
+                    self.report.pipeline_limited = true;
+                    eprintln!(
+                        "needletail-reader: --pipeline-limit {} cuts the in-flight window to \
+                         {} us of {} us parts ({wanted} parts wanted)",
+                        self.args.pipeline_limit,
+                        self.args.pipeline_limit.max(2) as u64 * default_duration_us,
+                        default_duration_us
+                    );
+                }
+            }
+            // Spread the parts over enough connections that none carries
+            // more requests than a cache allows on one.
+            let lanes = connections_for(depth, self.args.streams_per_connection);
+            self.report.pipeline_connections = self.report.pipeline_connections.max(lanes);
             let mut start_error = None;
             while inflight.len() < depth {
                 let part_url = playlist_url.join(&format!("part{request_next}.{extension}"))?;
-                match self.http.start(&part_url).await {
+                let lane = (request_next % lanes as u64) as usize;
+                match self.http.start_on(&part_url, lane).await {
                     Ok(handle) => {
                         inflight.push_back(Pending {
                             part: request_next,
@@ -1588,6 +1667,8 @@ struct Summary {
     underruns: u64,
     /// Readers that had at least one stall.
     readers_stalled: usize,
+    /// Readers whose --pipeline-limit cut the --min-inflight-ms window.
+    readers_pipeline_limited: usize,
     stalls: u64,
     stalled_ms: u64,
     stalled_us: u64,
@@ -1668,6 +1749,7 @@ async fn main() -> Result<()> {
                     server_name: args.server_name.clone(),
                     session: session.clone(),
                     connections: HashMap::new(),
+                    lanes: HashMap::new(),
                     pace: Arc::new(Pace {
                         read_bps: args.read_kbps * 1_000,
                         frozen: AtomicBool::new(false),
@@ -1715,6 +1797,10 @@ async fn main() -> Result<()> {
         parts_missing: 0,
         underruns: 0,
         readers_stalled: reports.iter().filter(|report| report.stalls > 0).count(),
+        readers_pipeline_limited: reports
+            .iter()
+            .filter(|report| report.pipeline_limited)
+            .count(),
         stalls: 0,
         stalled_ms: 0,
         stalled_us: 0,
@@ -1837,6 +1923,15 @@ fn pipeline_depth_for(
     usize::try_from(ahead.max(window))
         .unwrap_or(usize::MAX)
         .clamp(2, limit.max(2))
+}
+
+/// Connections to one cache that carry `depth` part requests and one
+/// playlist reload with at most `streams_per_connection` requests each.
+fn connections_for(depth: usize, streams_per_connection: usize) -> usize {
+    depth
+        .saturating_add(1)
+        .div_ceil(streams_per_connection.max(2))
+        .max(1)
 }
 
 /// Parts of `part_us` in two seconds, and no fewer than two.
@@ -1990,13 +2085,35 @@ mod tests {
     #[test]
     fn a_reader_keeps_at_least_a_quarter_second_of_parts_in_flight() {
         let near = Duration::from_millis(1);
+        // With the default limit, every part size down to 0.25 ms has
+        // 250 ms of parts on their way, on connections of at most 256
+        // requests each (one kept for the playlist reload).
+        for part_us in [41_708, 5_000, 2_500, 1_000, 500, 250] {
+            let depth = pipeline_depth_for(near, part_us, 250, DEFAULT_PIPELINE_LIMIT);
+            assert!(depth as u64 * part_us >= 250_000, "{part_us} µs: {depth}");
+            let lanes = connections_for(depth, DEFAULT_STREAMS_PER_CONNECTION);
+            assert!(
+                (depth + 1).div_ceil(lanes) <= DEFAULT_STREAMS_PER_CONNECTION,
+                "{part_us} µs: {depth} parts on {lanes} connections"
+            );
+        }
         // 2.5 ms parts: 100 parts are 250 ms; a round trip alone asks for 2.
         assert_eq!(pipeline_depth_for(near, 2_500, 250, 256), 100);
-        // 1 ms parts: 250 parts.
+        // 1 ms parts: 250 parts, on one connection.
         assert_eq!(pipeline_depth_for(near, 1_000, 250, 256), 250);
-        // 0.25 ms parts: 1,000 parts, within the limit.
+        assert_eq!(connections_for(250, 256), 1);
+        // 0.5 ms parts: 500 parts on two connections; 0.25 ms parts: 1,000
+        // on four.
+        assert_eq!(pipeline_depth_for(near, 500, 250, DEFAULT_PIPELINE_LIMIT), 500);
+        assert_eq!(connections_for(500, 256), 2);
+        assert_eq!(pipeline_depth_for(near, 250, 250, DEFAULT_PIPELINE_LIMIT), 1_000);
+        assert_eq!(connections_for(1_000, 256), 4);
+        // An explicit lower limit still caps it (and the report says so).
         assert_eq!(pipeline_depth_for(near, 250, 250, 256), 256);
         assert_eq!(pipeline_depth_for(near, 250, 250, 2_000), 1_000);
+        // Exactly 256 requests and a reload need two connections.
+        assert_eq!(connections_for(255, 256), 1);
+        assert_eq!(connections_for(256, 256), 2);
         // A far reader covers its round trip and a half when that is more.
         let far = Duration::from_millis(400);
         assert_eq!(pipeline_depth_for(far, 2_500, 250, 1_000), 242);
