@@ -1046,7 +1046,10 @@ struct Args {
     /// and replay warm sources to a promoted child the same way. Children
     /// with binds of their own keep one send each, since a child knows its
     /// parent by the source address. Applies with
-    /// --relay-forward-nonblocking.
+    /// --relay-forward-nonblocking. Inert when no two children share a bind,
+    /// as in the Linode deploy, which gives every carrier link its own
+    /// (ECMP-hunted) source port: /api/mesh reports
+    /// mesh_transport.fast_path.relay_forward_batch_effective.
     #[arg(
         long,
         env = "NEEDLETAIL_RELAY_FORWARD_BATCH",
@@ -2144,6 +2147,16 @@ async fn main() -> Result<()> {
     if let Some(forwarder) = &relay_forwarder {
         forwarder.set_nonblocking(args.relay_forward_nonblocking);
         forwarder.set_batch(args.relay_forward_batch);
+        fast_path_report.record_relay_forward_sockets(
+            forwarder.socket_groups.len(),
+            forwarder.shared_socket_count(),
+        );
+        if args.relay_forward_batch && forwarder.shared_socket_count() == 0 {
+            info!(
+                children = forwarder.paths.len(),
+                "relay forward batching is on but inert: every child has a source socket of its own"
+            );
+        }
         forwarder.configure_buffers(args.udp_socket_buffer_bytes);
         forwarder.set_hop_journal(Arc::clone(&hop_journal));
     }
@@ -3665,6 +3678,13 @@ impl RelayDownstreamForwarder {
         }
         self.filtered_datagrams.fetch_add(1, Ordering::Relaxed);
         false
+    }
+
+    /// Source sockets whose children are served by one batched send.
+    fn shared_socket_count(&self) -> usize {
+        (0..self.socket_groups.len())
+            .filter(|group| self.group_is_batched(*group))
+            .count()
     }
 
     /// Whether the children of a source socket are served by one batched
@@ -11927,6 +11947,13 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
             "av_mesh_fast_path_relay_forward_batch",
             "Whether relay forwarding batches the children of a shared socket into one sendmmsg.",
             f64::from(u8::from(snapshot.mesh_transport.fast_path.relay_forward_batch)),
+        ),
+        (
+            "av_mesh_fast_path_relay_forward_batch_effective",
+            "Whether relay forward batching applies: it is on and a source socket serves more than one child.",
+            f64::from(u8::from(
+                snapshot.mesh_transport.fast_path.relay_forward_batch_effective,
+            )),
         ),
         (
             "av_mesh_fast_path_busy_poll_microseconds",
@@ -29941,6 +29968,62 @@ mod tests {
                 .expect("every child must receive every datagram")
                 .unwrap();
         (buf[..len].to_vec(), from)
+    }
+
+    #[tokio::test]
+    async fn relay_forward_batching_is_inert_when_every_child_has_its_own_bind() {
+        // The Linode deploy renders one carrier link per child, each with a
+        // source port of its own (often ECMP-hunted):
+        // --relay-forward <relay ip>:<port of the link>=<child>,<lane>.
+        let mut receivers = Vec::new();
+        let mut endpoints = Vec::new();
+        for lane in ["all", "source", "repair"] {
+            let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            endpoints.push(
+                parse_relay_forward_endpoint(&format!(
+                    "{}={},{lane}",
+                    unused_loopback_addr(),
+                    receiver.local_addr().unwrap()
+                ))
+                .unwrap(),
+            );
+            receivers.push(receiver);
+        }
+        let forwarder = RelayDownstreamForwarder::bind(&endpoints)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(forwarder.batch.load(Ordering::Relaxed));
+        assert_eq!(forwarder.socket_groups.len(), 3);
+        assert_eq!(forwarder.shared_socket_count(), 0);
+        let report = fast_path::FastPath::new(0, true);
+        report.record_relay_forward_sockets(
+            forwarder.socket_groups.len(),
+            forwarder.shared_socket_count(),
+        );
+        let snapshot = report.snapshot();
+        assert!(snapshot.relay_forward_batch);
+        assert!(!snapshot.relay_forward_batch_effective);
+        assert_eq!(snapshot.relay_forward_sockets, 3);
+
+        // Every child gets a send of its own, as without the setting.
+        for path in &forwarder.paths {
+            path.socket.writable().await.unwrap();
+        }
+        take_relay_forward_attempts(&forwarder);
+        forwarder
+            .forward(b"datagram-1", MediaDatagramRole::Source, None, None)
+            .await;
+        let attempts = take_relay_forward_attempts(&forwarder);
+        assert!(!attempts.is_empty());
+        assert!(attempts
+            .iter()
+            .all(|(_, attempt)| *attempt == RelayForwardAttempt::Immediate));
+
+        // Children that share a bind are where it takes effect.
+        let (shared, _receivers, _bind) =
+            relay_forward_shared_children(&[RelayForwardRole::All; 2]).await;
+        assert_eq!(shared.shared_socket_count(), 1);
     }
 
     #[tokio::test]

@@ -26,8 +26,19 @@ pub const MAX_BATCH_MESSAGES: usize = 32;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct FastPathSnapshot {
     /// Datagrams to several children that share a source socket leave in one
-    /// `sendmmsg` call.
+    /// `sendmmsg` call. This is the setting; see
+    /// `relay_forward_batch_effective` for whether any socket is shared.
     pub relay_forward_batch: bool,
+    /// Whether the setting does anything on this node: it is on and at
+    /// least one source socket of the relay forwarder serves more than one
+    /// child. A relay whose children each have a bind of their own (the
+    /// Linode deploy gives every carrier link its own, ECMP-hunted, source
+    /// port) sends one datagram per call as before, and reports false.
+    pub relay_forward_batch_effective: bool,
+    /// Source sockets of the relay forwarder that serve more than one child.
+    pub relay_forward_shared_sockets: usize,
+    /// Source sockets of the relay forwarder.
+    pub relay_forward_sockets: usize,
     /// The busy-poll budget asked for, in µs. Zero is off.
     pub busy_poll_us: u32,
     /// Sockets that took the busy-poll budget.
@@ -140,6 +151,16 @@ impl FastPath {
                     .push(format!("{purpose}: {reason}"));
             }
         }
+    }
+
+    /// Record the source sockets of the relay forwarder: how many there are
+    /// and how many serve more than one child, which is where a batched
+    /// forward takes effect.
+    pub fn record_relay_forward_sockets(&self, sockets: usize, shared_sockets: usize) {
+        let mut snapshot = self.lock();
+        snapshot.relay_forward_sockets = sockets;
+        snapshot.relay_forward_shared_sockets = shared_sockets;
+        snapshot.relay_forward_batch_effective = snapshot.relay_forward_batch && shared_sockets > 0;
     }
 
     pub fn record_media_cpu(&self, cpu: usize, pinned: Result<(), String>) {
@@ -611,6 +632,17 @@ mod tests {
         fast_path.tune_receive_socket(&socket, "test socket");
         let snapshot = fast_path.snapshot();
         assert!(snapshot.relay_forward_batch);
+        // On, but no shared source socket: inert.
+        assert!(!snapshot.relay_forward_batch_effective);
+        fast_path.record_relay_forward_sockets(3, 0);
+        assert!(!fast_path.snapshot().relay_forward_batch_effective);
+        fast_path.record_relay_forward_sockets(2, 1);
+        assert!(fast_path.snapshot().relay_forward_batch_effective);
+        // Off: never effective.
+        let unbatched = FastPath::new(50, false);
+        unbatched.record_relay_forward_sockets(2, 1);
+        assert!(!unbatched.snapshot().relay_forward_batch_effective);
+        let snapshot = fast_path.snapshot();
         assert_eq!(snapshot.busy_poll_us, 50);
         assert_eq!(
             snapshot.busy_poll_applied.len() + snapshot.busy_poll_denied.len(),
