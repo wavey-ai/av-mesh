@@ -8,10 +8,13 @@ MISSION_CONTROL_DIST ?= $(abspath $(NEEDLETAIL_ROOT)/mission-control/dist)
 RUST_LOG ?= info
 HOST ?= local.infidelity.io
 STREAM_ID ?= 1
-PART_MS ?= 50
-# The node's own part, in microseconds. PART_MS stays for the Needletail
-# stack targets, which pass it on to their own processes.
+# The node's own part, in microseconds: 2.5 ms, the smallest by default.
 PART_US ?= 2500
+# A part in whole milliseconds for the Needletail stack targets, which pass
+# it on to their own processes. Empty: only PART_US is passed on, and a
+# stack that does not read PART_US keeps its own default.
+PART_MS ?=
+STACK_PART_ARGS = PART_US=$(PART_US) $(if $(PART_MS),PART_MS=$(PART_MS))
 
 TLS_DIR ?= ../tls/$(HOST)
 CERT ?= $(TLS_DIR)/fullchain.pem
@@ -46,7 +49,7 @@ help:
 	@printf '%s\n' '  make k3d-down         Delete the local k3d mesh cluster'
 	@printf '%s\n' '  make test              Run cargo test --locked'
 	@printf '%s\n' ''
-	@printf '%s\n' 'Common overrides: STREAM_ID=1 PART_US=2500 PART_MS=50 RUST_LOG=info HOST=local.infidelity.io'
+	@printf '%s\n' 'Common overrides: STREAM_ID=1 PART_US=2500 PART_MS=<whole ms, stack targets only> RUST_LOG=info HOST=local.infidelity.io'
 
 service:
 	AV_LL_HLS_PART_US=$(PART_US) RUST_LOG=$(RUST_LOG) NEEDLETAIL_MISSION_CONTROL_DIST=$(MISSION_CONTROL_DIST) \
@@ -85,13 +88,13 @@ mission-control-clean:
 	$(MAKE) -C $(NEEDLETAIL_ROOT)/mission-control clean DIST=$(MISSION_CONTROL_DIST)
 
 local-stack:
-	$(MAKE) -C $(NEEDLETAIL_ROOT) local HOST=$(HOST) STREAM_ID=$(STREAM_ID) PART_MS=$(PART_MS) RUST_LOG=$(RUST_LOG) STACK_ARGS="$(STACK_ARGS)"
+	$(MAKE) -C $(NEEDLETAIL_ROOT) local HOST=$(HOST) STREAM_ID=$(STREAM_ID) $(STACK_PART_ARGS) RUST_LOG=$(RUST_LOG) STACK_ARGS="$(STACK_ARGS)"
 
 local-stack-debug:
-	$(MAKE) -C $(NEEDLETAIL_ROOT) local-debug HOST=$(HOST) STREAM_ID=$(STREAM_ID) PART_MS=$(PART_MS) RUST_LOG=$(RUST_LOG) STACK_ARGS="$(STACK_ARGS)"
+	$(MAKE) -C $(NEEDLETAIL_ROOT) local-debug HOST=$(HOST) STREAM_ID=$(STREAM_ID) $(STACK_PART_ARGS) RUST_LOG=$(RUST_LOG) STACK_ARGS="$(STACK_ARGS)"
 
 local-stack-fast:
-	$(MAKE) -C $(NEEDLETAIL_ROOT) local-fast HOST=$(HOST) STREAM_ID=$(STREAM_ID) PART_MS=$(PART_MS) RUST_LOG=$(RUST_LOG) STACK_ARGS="$(STACK_ARGS)"
+	$(MAKE) -C $(NEEDLETAIL_ROOT) local-fast HOST=$(HOST) STREAM_ID=$(STREAM_ID) $(STACK_PART_ARGS) RUST_LOG=$(RUST_LOG) STACK_ARGS="$(STACK_ARGS)"
 
 realtime-benchmark:
 	./scripts/realtime-benchmark.sh
