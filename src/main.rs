@@ -5946,6 +5946,10 @@ impl LiveTsCache {
             )
         };
         let part_target = f64::from(part_target_ms) / 1_000.0;
+        // The hint names the part after the last part that is listed.
+        let next_part = available
+            .last()
+            .map_or(next_part, |(sequence, ..)| sequence + 1);
 
         // The contributor stamps the segment number and the part index on
         // every part. A stream with stamps has the same playlist on every
@@ -6031,9 +6035,21 @@ impl LiveTsCache {
                     .map(|(segment_id, _group)| *segment_id)
             })
             .flatten();
+        // A contributor cuts a part short only for the key frame that starts
+        // the next segment. The segment of a short part is whole as soon as
+        // the part is here: the playlist does not show a short part at the
+        // end of an open segment, which only the last part of a segment may
+        // be, and a player that reads segments has it one part sooner.
+        let open_segment_ended_short = stamped
+            && groups
+                .last_key_value()
+                .and_then(|(_segment_id, group)| group.last())
+                .is_some_and(|(_sequence, duration_ms, _keyframe, _available_unix_us)| {
+                    part_ends_segment_short(*duration_ms, part_target_ms)
+                });
         let segment_is_complete = |segment_id: u64, group_len: usize| {
             if keyframe_aligned_segments {
-                Some(segment_id) != open_segment_id
+                Some(segment_id) != open_segment_id || open_segment_ended_short
             } else {
                 group_len == self.parts_per_segment
             }
@@ -6827,10 +6843,25 @@ impl LiveTsCache {
             let state = self.state.read().await;
             match state.stream_parts.get(&stream_id) {
                 Some(parts) if parts.values().any(|part| part.fmp4_segment_id.is_some()) => {
-                    let segment_is_closed = parts.values().any(|part| {
-                        part.fmp4_segment_id
-                            .is_some_and(|segment_id| segment_id > segment)
-                    });
+                    let declared_part_ms = state
+                        .stream_declared_ms
+                        .get(&stream_id)
+                        .map_or(0, |(part_ms, _)| *part_ms);
+                    let ended_short = parts
+                        .iter()
+                        .filter(|(_sequence, part)| part.fmp4_segment_id == Some(segment))
+                        .max_by_key(|(sequence, _part)| **sequence)
+                        .is_some_and(|(_sequence, part)| {
+                            part.stamped_part.is_some()
+                                && part.duration_ms.is_some_and(|duration_ms| {
+                                    part_ends_segment_short(duration_ms, declared_part_ms)
+                                })
+                        });
+                    let segment_is_closed = ended_short
+                        || parts.values().any(|part| {
+                            part.fmp4_segment_id
+                                .is_some_and(|segment_id| segment_id > segment)
+                        });
                     // A segment is whole when its first part is here: the key
                     // frame of a stream without stamps, or the part that the
                     // contributor stamped with index 0.
@@ -17063,6 +17094,12 @@ fn hls_renditions_unavailable_response(alternatives: &[String]) -> HandlerRespon
     response
 }
 
+/// Whether a stamped part is the short last part of its segment: shorter
+/// than 85% of the declared part target, which a playlist allows only there.
+fn part_ends_segment_short(duration_ms: u32, part_target_ms: u32) -> bool {
+    part_target_ms > 0 && u64::from(duration_ms) * 100 < u64::from(part_target_ms) * 85
+}
+
 /// The last part that a playlist lists: its Media Sequence Number and its
 /// index in that segment. This is what a Rendition Report carries.
 fn playlist_last_position(playlist: &str) -> Option<(u64, u64)> {
@@ -26178,6 +26215,59 @@ mod tests {
         assert!(late.get_segment_for_stream_id(77, 1_003).await.is_none());
     }
 
+    #[tokio::test]
+    async fn a_short_part_completes_its_segment_at_once() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 2_400, 64).await;
+        // Two segments of nine parts of 208 ms and one of 125 ms, as a
+        // contributor cuts a group of 48 frames. Then the short part of a
+        // third segment, before any part of a fourth has arrived.
+        let mut sequence = 0;
+        for segment in 0..3_u64 {
+            for part in 0..10_u32 {
+                let stamp = PartStamp {
+                    msn: 500 + segment,
+                    part,
+                    part_target_ms: 208,
+                    target_duration_ms: 2_000,
+                };
+                cache
+                    .commit_stream_payload(
+                        77,
+                        encode_test_stamped_fmp4_part(
+                            77,
+                            5,
+                            sequence,
+                            part == 0,
+                            if part == 9 { 125 } else { 208 },
+                            Some(stamp),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                sequence += 1;
+                if segment == 2 && part == 8 {
+                    // Nine whole parts: the third segment is still open.
+                    let open = cache.playlist_for_stream_id(77).await;
+                    assert!(!open.contains("seg502.mp4"), "{open}");
+                    assert!(cache.get_segment_for_stream_id(77, 502).await.is_none());
+                }
+            }
+        }
+        let playlist = cache.playlist_for_stream_id(77).await;
+        // The short part is listed, and its segment with it.
+        assert!(
+            playlist.ends_with(
+                "#EXT-X-PART:DURATION=0.125,URI=\"part29.mp4\"\n#EXTINF:1.997,\nseg502.mp4\n\
+                 #EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part30.mp4\"\n"
+            ),
+            "{playlist}"
+        );
+        assert!(cache.get_segment_for_stream_id(77, 502).await.is_some());
+        assert!(part_ends_segment_short(125, 208));
+        assert!(!part_ends_segment_short(200, 208));
+        assert!(!part_ends_segment_short(5, 0));
+    }
+
     #[test]
     fn one_edge_without_readers_takes_the_standby_copy() {
         let edges = ["edge-1", "edge-2", "edge-3", "edge-4"]
@@ -26616,8 +26706,17 @@ mod tests {
             .unwrap();
         let playlist = edge.playlist_for_stream_id(77).await;
         assert!(playlist.contains("#EXT-X-PART:DURATION=0.250,URI=\"part4.mp4\",INDEPENDENT=YES"));
-        assert!(!playlist.contains("part5.mp4\""), "{playlist}");
+        assert!(
+            !playlist.contains("URI=\"part5.mp4\"\n#EXT") && !playlist.contains("part5.mp4\","),
+            "{playlist}"
+        );
         assert!(!playlist.contains("DURATION=0.005"), "{playlist}");
+        // The hint names the part that is not listed yet. It named part 6,
+        // and a player then saw part 5 appear after a hint that skipped it.
+        assert!(
+            playlist.ends_with("#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part5.mp4\"\n"),
+            "{playlist}"
+        );
 
         edge.observe_mesh_part(77, 5).await.unwrap();
         let playlist = edge.playlist_for_stream_id(77).await;
