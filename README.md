@@ -331,7 +331,14 @@ Within a rule the choice is a rendezvous hash of the session, weighted by free
 capacity. A cache with a stale advertisement, a draining cache and a full
 cache are not assigned. The age of an advertisement is the time since this
 node received a new one: the clocks of two nodes are not compared, and a node
-whose clock is seconds wrong assigns and is assigned like any other. A new reader is also not assigned to a cache that has
+whose clock is seconds wrong assigns and is assigned like any other.
+
+The relay lanes are different. A relay object carries its deadline as a time
+of day, `--relay-deadline-ms` after its publication on the clock of the
+contributor, and each relay and distributor compares it with its own clock.
+A node whose clock is more than the deadline ahead of the contributor drops
+every object. Keep the clocks of contributors, relays and distributors within
+a fraction of a second of each other. A new reader is also not assigned to a cache that has
 less room than the bit rate of the playlist: a cache can have room for an
 audio reader and not for a 4K reader. `--assignment-alternates` (default 2)
 sets the number of caches after the first.
