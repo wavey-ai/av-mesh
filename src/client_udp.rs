@@ -438,15 +438,118 @@ impl PartObject {
     }
 }
 
-/// Block id of a part: its number, modulo 2^31, with the init objects in the
-/// upper half of the space, so that an init never shares a block id with a
-/// part that is in flight.
+/// Block id of an object that the edge encodes itself (a part sent from its
+/// cache, a gap, an init segment): the part number in its own quarter of the
+/// block id space, so that it never shares a block id with the cut-through
+/// block of the same part ([`cut_through_block_id`]).
 pub fn block_id(kind: ObjectKind, part: u64) -> u32 {
-    let low = (part & 0x7fff_ffff) as u32;
+    let low = (part & 0x3fff_ffff) as u32;
     match kind {
         ObjectKind::Init => low | 0x8000_0000,
-        ObjectKind::Part | ObjectKind::Gap => low,
+        ObjectKind::Part | ObjectKind::Gap => low | 0x4000_0000,
     }
+}
+
+/// Block id of the cut-through block of a part: the cache-mesh block that
+/// carried the part to the edge, forwarded as it arrives.
+pub fn cut_through_block_id(part: u64) -> u32 {
+    (part & 0x3fff_ffff) as u32
+}
+
+/// The bytes of the LL-HLS part, and the init segment if the slot carries
+/// one, of a cache slot as the edge stores it. The same rules as the edge's
+/// own slot decoding (`LiveSlotPayload` in the av-mesh binary).
+pub fn slot_media(payload: &Bytes, stream_id: u64) -> Option<(Bytes, Option<Bytes>)> {
+    const CANONICAL: &[u8; 8] = b"AVMOBJS1";
+    const CANONICAL_HEADER: usize = 40;
+    let be32 = |range: std::ops::Range<usize>| -> Option<usize> {
+        Some(u32::from_be_bytes(payload.get(range)?.try_into().ok()?) as usize)
+    };
+    if payload.starts_with(CANONICAL) {
+        if payload.len() < CANONICAL_HEADER || payload[17..20] != [0, 0, 0] {
+            return None;
+        }
+        if u64::from_be_bytes(payload[8..16].try_into().ok()?) != stream_id || payload[16] > 2 {
+            return None;
+        }
+        if be32(20..24)? != payload.len() - CANONICAL_HEADER
+            || !payload[CANONICAL_HEADER..].starts_with(&media_object::WIRE_MAGIC)
+        {
+            return None;
+        }
+        let range = |offset: usize, len: usize| {
+            let end = offset.checked_add(len)?;
+            (offset >= CANONICAL_HEADER && end <= payload.len()).then(|| payload.slice(offset..end))
+        };
+        let (init_offset, init_len) = (be32(24..28)?, be32(28..32)?);
+        let init = if init_len == 0 {
+            if init_offset != 0 {
+                return None;
+            }
+            None
+        } else {
+            Some(range(init_offset, init_len)?)
+        };
+        if init.is_some() && payload[16] != 0 {
+            return None;
+        }
+        return Some((range(be32(32..36)?, be32(36..40)?)?, init));
+    }
+    if payload.starts_with(&media_object::WIRE_MAGIC) {
+        let object = media_object::decode(payload).ok()?;
+        if object.key().stream() != stream_id.to_string() {
+            return None;
+        }
+        let body = Bytes::copy_from_slice(object.payload());
+        let meta = |key: &str, value: &[u8]| {
+            object
+                .metadata()
+                .get(key)
+                .is_some_and(|found| found.as_slice() == value)
+        };
+        return match object.kind() {
+            media_object::ObjectKind::Media
+                if meta("container", b"fmp4") && meta("payload-format", b"fmp4-slot-v1") =>
+            {
+                fmp4_slot(&body)
+            }
+            media_object::ObjectKind::Media => Some((body, None)),
+            _ => None,
+        };
+    }
+    fmp4_slot(payload).or_else(|| Some((payload.clone(), None)))
+}
+
+fn fmp4_slot(payload: &Bytes) -> Option<(Bytes, Option<Bytes>)> {
+    const MAGIC: &[u8; 8] = b"AVFMP4S1";
+    const HEADER: usize = 16;
+    if payload.len() < HEADER || !payload.starts_with(MAGIC) {
+        return None;
+    }
+    let init_len = u32::from_be_bytes(payload[8..12].try_into().ok()?) as usize;
+    let media_len = u32::from_be_bytes(payload[12..16].try_into().ok()?) as usize;
+    let init_end = HEADER.checked_add(init_len)?;
+    let media_end = init_end.checked_add(media_len)?;
+    if media_end != payload.len() {
+        return None;
+    }
+    let init = (init_len > 0).then(|| payload.slice(HEADER..init_end));
+    Some((payload.slice(init_end..media_end), init))
+}
+
+/// The object of a cut-through block: the cache-mesh chunk frame of a part.
+fn cut_through_object(frame: &[u8]) -> Option<PartObject> {
+    let (stream_id, slot, payload) = playlists::mesh::chunk_frame_payload(frame)?;
+    let (media, _init) = slot_media(&payload, stream_id)?;
+    Some(PartObject {
+        kind: ObjectKind::Part,
+        datagrams: 0,
+        stream_id,
+        part: slot,
+        available_unix_us: 0,
+        published_unix_us: 0,
+        payload: media,
+    })
 }
 
 /// Source symbols and symbol size of an object of `length` bytes: as few
@@ -485,8 +588,9 @@ pub fn encode_object(
 struct BlockCount {
     received: u32,
     source_symbols: u32,
-    /// Known once the block is decoded.
+    /// Known once the block is decoded; 0 for a cut-through block.
     sent: Option<u32>,
+    decoded: bool,
     first_seen: Instant,
 }
 
@@ -558,17 +662,22 @@ impl ObjectReceiver {
                 received: 0,
                 source_symbols: u32::from(header.source_symbols),
                 sent: None,
+                decoded: false,
                 first_seen: Instant::now(),
             });
             count.received += 1;
         }
         let seen = self.blocks.get(&header.block_id).map_or(0, |count| count.received);
         match self.decoder.push_datagram(datagram) {
-            Ok(Some(bytes)) => match PartObject::decode(Bytes::from(bytes)) {
+            Ok(Some(bytes)) => match decode_any_object(bytes) {
                 Ok(object) => {
                     self.objects += 1;
                     if let Some(count) = self.blocks.get_mut(&header.block_id) {
+                        // A cut-through object does not say how many
+                        // datagrams were sent (0): its source symbols and
+                        // the repair of the client's own policy.
                         count.sent = Some(object.datagrams);
+                        count.decoded = true;
                     }
                     if seen < u32::from(header.source_symbols) || !source_symbol {
                         // Decoded with fewer than all source symbols, or
@@ -603,11 +712,15 @@ impl ObjectReceiver {
             .collect();
         for block in settled {
             let count = self.blocks.remove(&block).unwrap();
+            let expected = count.source_symbols + policy.repair_symbols(count.source_symbols);
             let sent = match count.sent {
-                Some(sent) => sent,
+                Some(sent) if sent > 0 => sent,
+                Some(_) => expected,
                 None => {
-                    self.lost_objects += 1;
-                    count.source_symbols + policy.repair_symbols(count.source_symbols)
+                    if !count.decoded {
+                        self.lost_objects += 1;
+                    }
+                    expected
                 }
             };
             let received = count.received.min(sent);
@@ -631,6 +744,80 @@ impl ObjectReceiver {
         self.window_sent = 0;
         Some(loss)
     }
+}
+
+fn decode_any_object(bytes: Vec<u8>) -> Result<PartObject, ObjectError> {
+    if bytes.starts_with(OBJECT_MAGIC) {
+        return PartObject::decode(Bytes::from(bytes));
+    }
+    cut_through_object(&bytes).ok_or(ObjectError("not a part object or a chunk frame"))
+}
+
+/// Client symbol size of a cut-through block: the largest divisor of the
+/// mesh symbol size that fits `max`, so that each mesh source symbol is
+/// forwarded at once as a whole number of client symbols. `None` when no
+/// divisor of at least 256 bytes fits.
+pub fn cut_through_symbol_size(mesh_symbol_size: u16, max: u16) -> Option<u16> {
+    let mesh = u32::from(mesh_symbol_size);
+    if mesh <= u32::from(max) {
+        return Some(mesh_symbol_size);
+    }
+    (1..=mesh)
+        .filter(|parts| mesh % parts == 0)
+        .map(|parts| mesh / parts)
+        .find(|size| *size <= u32::from(max))
+        .filter(|size| *size >= 256)
+        .map(|size| size as u16)
+}
+
+/// One client source datagram of a cut-through block: source symbol `esi`
+/// of a block of `transfer_length` bytes in symbols of `symbol_size`. `data`
+/// is the symbol's bytes, padded with zeros to the symbol size as RaptorQ
+/// pads the end of a block.
+pub fn source_datagram(
+    block_id: u32,
+    transfer_length: u32,
+    packet_sequence: u32,
+    symbol_size: u16,
+    esi: u32,
+    data: &[u8],
+) -> Option<Vec<u8>> {
+    let source_symbols = u16::try_from(transfer_length.div_ceil(u32::from(symbol_size))).ok()?;
+    let mut payload = Vec::with_capacity(4 + usize::from(symbol_size));
+    payload.push(0);
+    payload.extend_from_slice(&esi.to_be_bytes()[1..]);
+    payload.extend_from_slice(&data[..data.len().min(usize::from(symbol_size))]);
+    payload.resize(4 + usize::from(symbol_size), 0);
+    let header = DatagramFecHeader::raptorq(
+        block_id,
+        transfer_length,
+        packet_sequence,
+        source_symbols,
+        symbol_size,
+        &payload,
+    )
+    .ok()?;
+    let mut datagram = vec![0_u8; raptorq_datagram_fec::HEADER_LEN];
+    header.encode(&mut datagram).ok()?;
+    datagram.extend_from_slice(&payload);
+    Some(datagram)
+}
+
+/// Encode a whole block exactly as a cut-through block is cut: `frame` in
+/// symbols of `symbol_size`, under `block_id`, with `repair` repair symbols.
+/// Its source datagrams carry the same symbols as [`source_datagram`].
+pub fn encode_block(
+    frame: &[u8],
+    block_id: u32,
+    symbol_size: u16,
+    repair: u32,
+) -> Result<Vec<Vec<u8>>, raptorq_datagram_fec::DatagramFecError> {
+    let sources = frame.len().div_ceil(usize::from(symbol_size)).max(1);
+    DatagramFecEncoder::new()
+        .with_symbol_size(symbol_size)
+        .with_source_symbols(u16::try_from(sources).unwrap_or(u16::MAX))
+        .with_initial_block_id(block_id)
+        .encode_object_with_repair_symbols(frame, repair)
 }
 
 /// Whether a datagram carries a source symbol: the RaptorQ encoding symbol
@@ -872,9 +1059,107 @@ mod tests {
         assert_eq!(receiver.lost_objects, 0);
     }
 
+    /// A cache-mesh chunk frame as a parent sends it (playlists `MeshFrame`).
+    fn chunk_frame(stream: u64, slot: u64, payload: &[u8]) -> Vec<u8> {
+        let node = b"lon-dist-a";
+        let mut frame = Vec::new();
+        frame.extend_from_slice(b"PLMESH1\0");
+        frame.push(2);
+        frame.push(2);
+        frame.extend_from_slice(&(node.len() as u16).to_be_bytes());
+        frame.extend_from_slice(node);
+        frame.extend_from_slice(&stream.to_be_bytes());
+        frame.extend_from_slice(&slot.to_be_bytes());
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    fn fmp4_slot_payload(init: &[u8], media: &[u8]) -> Vec<u8> {
+        let mut slot = b"AVFMP4S1".to_vec();
+        slot.extend_from_slice(&(init.len() as u32).to_be_bytes());
+        slot.extend_from_slice(&(media.len() as u32).to_be_bytes());
+        slot.extend_from_slice(init);
+        slot.extend_from_slice(media);
+        slot
+    }
+
+    #[test]
+    fn the_symbols_cut_from_a_frame_are_the_symbols_the_encoder_makes() {
+        let frame = chunk_frame(1, 9, &vec![7_u8; 50_000]);
+        for size in [900_u16, 1_000, 1_200] {
+            let encoded = encode_block(&frame, 33, size, 4).unwrap();
+            let sources = frame.len().div_ceil(usize::from(size));
+            for esi in 0..sources {
+                let start = esi * usize::from(size);
+                let end = (start + usize::from(size)).min(frame.len());
+                let cut = source_datagram(33, frame.len() as u32, 0, size, esi as u32, &frame[start..end])
+                    .unwrap();
+                assert_eq!(cut[HEADER_LEN_FOR_TESTS..], encoded[esi][HEADER_LEN_FOR_TESTS..], "esi {esi}");
+            }
+        }
+        assert_eq!(cut_through_symbol_size(16_000, 1_200), Some(1_000));
+        assert_eq!(cut_through_symbol_size(900, 1_200), Some(900));
+        assert_eq!(cut_through_symbol_size(1_801, 1_200), None);
+    }
+
+    #[test]
+    fn a_cut_through_part_decodes_to_its_ll_hls_bytes_with_loss() {
+        // A 4K part in 16 kB mesh symbols, cut into 1,000-byte client
+        // symbols as they arrive; a fifth of them lost; the edge's repair
+        // after the block decodes completes it.
+        let media: Vec<u8> = (0..400_000_u32).map(|i| (i * 7) as u8).collect();
+        let frame = chunk_frame(1, 812, &fmp4_slot_payload(b"ftyp-moov", &media));
+        let mesh_symbol = 16_000_usize;
+        let client = cut_through_symbol_size(mesh_symbol as u16, 1_200).unwrap();
+        let block = cut_through_block_id(812);
+        let mut receiver = ObjectReceiver::new();
+        let mut sent = 0_u32;
+        let mut decoded = None;
+        for mesh_esi in 0..frame.len().div_ceil(mesh_symbol) {
+            let start = mesh_esi * mesh_symbol;
+            let symbol = &frame[start..(start + mesh_symbol).min(frame.len())];
+            for (index, piece) in symbol.chunks(usize::from(client)).enumerate() {
+                let esi = (mesh_esi * mesh_symbol / usize::from(client) + index) as u32;
+                let datagram =
+                    source_datagram(block, frame.len() as u32, sent, client, esi, piece).unwrap();
+                sent += 1;
+                if sent % 5 == 0 {
+                    continue;
+                }
+                decoded = decoded.or(receiver.push(&datagram));
+            }
+        }
+        assert!(decoded.is_none(), "a fifth of the source symbols is missing");
+        let sources = frame.len().div_ceil(usize::from(client)) as u32;
+        let repair = RepairPolicy::for_loss(0.2, RepairPolicy::default()).repair_symbols(sources);
+        let encoded = encode_block(&frame, block, client, repair).unwrap();
+        for datagram in &encoded[sources as usize..] {
+            decoded = decoded.or(receiver.push(datagram));
+        }
+        let decoded = decoded.expect("the repair completes the block");
+        assert_eq!(decoded.part, 812);
+        assert_eq!(decoded.stream_id, 1);
+        assert_eq!(decoded.payload.as_ref(), media.as_slice());
+    }
+
+    #[test]
+    fn slot_media_reads_every_slot_form() {
+        let fmp4 = Bytes::from(fmp4_slot_payload(b"init", b"media"));
+        assert_eq!(
+            slot_media(&fmp4, 1),
+            Some((Bytes::from_static(b"media"), Some(Bytes::from_static(b"init"))))
+        );
+        let ts = Bytes::from_static(b"\x47raw-ts");
+        assert_eq!(slot_media(&ts, 1), Some((ts.clone(), None)));
+    }
+
+    const HEADER_LEN_FOR_TESTS: usize = raptorq_datagram_fec::HEADER_LEN;
+
     #[test]
     fn init_and_part_objects_do_not_share_a_block() {
         assert_ne!(block_id(ObjectKind::Init, 5), block_id(ObjectKind::Part, 5));
         assert_eq!(block_id(ObjectKind::Gap, 5), block_id(ObjectKind::Part, 5));
+        assert_ne!(block_id(ObjectKind::Part, 5), cut_through_block_id(5));
     }
 }

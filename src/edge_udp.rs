@@ -15,9 +15,14 @@
 
 use crate::{AppRouter, ParentsLost};
 use av_mesh::client_udp::{
-    encode_object, Control, ObjectKind, PartObject, RepairPolicy, KEEPALIVE,
+    block_id, cut_through_block_id, cut_through_symbol_size, encode_block, encode_object,
+    geometry, source_datagram, Control, ObjectKind, PartObject, RepairPolicy, KEEPALIVE,
     MIN_FIRST_REQUEST_BYTES, SUBSCRIPTION_TTL,
 };
+use playlists::mesh::{chunk_frame_slot, CacheMeshReceiveObserver};
+use raptorq_datagram_fec::DatagramFecHeader;
+use std::collections::BTreeSet;
+use std::sync::OnceLock;
 use bytes::Bytes;
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
@@ -61,26 +66,35 @@ pub(crate) struct EdgeUdpStats {
     pub send_errors: AtomicU64,
     pub tokens_sent: AtomicU64,
     pub bad_tokens: AtomicU64,
+    /// Parts forwarded cut-through, and their datagrams.
+    pub cut_through_parts: AtomicU64,
+    pub cut_through_datagrams: AtomicU64,
+    /// Cut-through parts completed from another parent's block.
+    pub cut_through_fallbacks: AtomicU64,
+    /// Datagrams not sent because the socket was full.
+    pub would_block: AtomicU64,
 }
 
 #[derive(Debug)]
-struct Subscriber {
+pub(crate) struct Subscriber {
     repair: RepairPolicy,
     expires_at: Instant,
     /// The next part that this subscriber needs.
     next_part: u64,
     /// The init segment last sent to it.
     init: Option<Bytes>,
+    /// Parts that cut-through carries to it: the cache sender skips them.
+    cut_slots: BTreeSet<u64>,
 }
 
 #[derive(Debug, Default)]
-struct StreamEntry {
+pub(crate) struct StreamEntry {
     subscribers: HashMap<SocketAddr, Subscriber>,
     /// A sender task runs for the stream.
     running: bool,
 }
 
-type Table = Arc<Mutex<HashMap<u64, StreamEntry>>>;
+pub(crate) type Table = Arc<Mutex<HashMap<u64, StreamEntry>>>;
 /// Subscriptions that are being admitted: a client repeats its request
 /// until it is answered, and the repeats must not admit it twice.
 type Admitting = Arc<Mutex<HashSet<(SocketAddr, u64)>>>;
@@ -124,10 +138,14 @@ pub(crate) async fn run_edge_udp(
     router: AppRouter,
     config: EdgeUdpConfig,
     stats: Arc<EdgeUdpStats>,
+    cut_through: Option<Arc<CutThrough>>,
     mut shutdown_rx: watch::Receiver<()>,
 ) -> anyhow::Result<()> {
     let socket = Arc::new(socket);
     let table: Table = Arc::default();
+    if let Some(cut) = &cut_through {
+        cut.arm(Arc::clone(&socket), Arc::clone(&table), config, Arc::clone(&stats));
+    }
     let admitting: Admitting = Arc::default();
     let tokens = Tokens(RandomState::new());
     let mut buf = vec![0_u8; 2_048];
@@ -367,6 +385,7 @@ async fn admit(
                 expires_at: Instant::now() + SUBSCRIPTION_TTL,
                 next_part: first_part,
                 init: None,
+                cut_slots: BTreeSet::new(),
             },
         );
         !std::mem::replace(&mut entry.running, true)
@@ -508,7 +527,9 @@ async fn send_init_if_new(
 }
 
 /// The subscribers due for `part`, after the part has been taken for them.
-fn take_due(table: &Table, stream_id: u64, part: u64) -> Vec<(SocketAddr, RepairPolicy)> {
+/// A subscriber that cut-through carries the part to is passed over, unless
+/// `gap`: a gap goes to every subscriber due.
+fn take_due(table: &Table, stream_id: u64, part: u64, gap: bool) -> Vec<(SocketAddr, RepairPolicy)> {
     let mut table = table.lock().unwrap();
     let Some(entry) = table.get_mut(&stream_id) else {
         return Vec::new();
@@ -517,9 +538,17 @@ fn take_due(table: &Table, stream_id: u64, part: u64) -> Vec<(SocketAddr, Repair
         .subscribers
         .iter_mut()
         .filter(|(_, subscriber)| subscriber.next_part == part)
-        .map(|(peer, subscriber)| {
+        .filter_map(|(peer, subscriber)| {
             subscriber.next_part = part + 1;
-            (*peer, subscriber.repair)
+            let cut = subscriber.cut_slots.remove(&part);
+            while subscriber
+                .cut_slots
+                .first()
+                .is_some_and(|slot| *slot < subscriber.next_part)
+            {
+                subscriber.cut_slots.pop_first();
+            }
+            (!cut || gap).then_some((*peer, subscriber.repair))
         })
         .collect()
 }
@@ -535,7 +564,7 @@ async fn deliver(
     part: u64,
     bytes: Option<Bytes>,
 ) {
-    let targets = take_due(table, stream_id, part);
+    let targets = take_due(table, stream_id, part, bytes.is_none());
     if targets.is_empty() {
         return;
     }
@@ -687,4 +716,430 @@ async fn run_stream_sender(
             }
         }
     }
+}
+
+// ------------------------------------------------------------------ cut-through
+
+/// Forwards the parts that reach this edge over the cache mesh to its UDP
+/// clients as their datagrams arrive.
+///
+/// The cache mesh sends a part as one systematic RaptorQ block of a chunk
+/// frame, so each source symbol is a slice of the frame. When a source symbol
+/// arrives it is sent on at once, cut into client symbols (a divisor of the
+/// mesh symbol size that fits a client datagram), with no wait for the rest
+/// of the block and no timer. When the edge has decoded the block, it sends
+/// each client the source symbols that it never received and the repair of
+/// the client's policy, from the same frame in the same symbols. A part is
+/// cut through from the first parent block that names it; if another
+/// parent's block of the part decodes first, that block completes it.
+///
+/// It is registered with the cache mesh at start, before the client socket
+/// exists, and armed by [`run_edge_udp`].
+#[derive(Default)]
+pub(crate) struct CutThrough {
+    inner: OnceLock<CutInner>,
+}
+
+struct CutInner {
+    socket: Arc<UdpSocket>,
+    table: Table,
+    config: EdgeUdpConfig,
+    stats: Arc<EdgeUdpStats>,
+    state: Mutex<CutState>,
+}
+
+#[derive(Default)]
+struct CutState {
+    /// Each block of a parent seen: where its symbols go.
+    routes: HashMap<(SocketAddr, u32), Route>,
+    /// Datagrams of blocks whose first symbol (which names the part) has not
+    /// arrived yet.
+    pending: HashMap<(SocketAddr, u32), Vec<Vec<u8>>>,
+    /// Each part claimed for cut-through.
+    slots: HashMap<(u64, u64), SlotState>,
+    pruned_at: Option<Instant>,
+}
+
+struct Route {
+    stream_id: u64,
+    slot: u64,
+    /// This block carries the part to the clients.
+    chosen: bool,
+    client_symbol: u16,
+    mesh_symbol: u16,
+    transfer_length: u32,
+    forwarded: Vec<bool>,
+    sequence: u32,
+    seen_at: Instant,
+}
+
+struct SlotState {
+    chosen: (SocketAddr, u32),
+    done: bool,
+    clients: Vec<(SocketAddr, RepairPolicy)>,
+    seen_at: Instant,
+}
+
+const CUT_STATE_TTL: Duration = Duration::from_secs(5);
+const MAX_PENDING_PER_BLOCK: usize = 512;
+const MAX_PENDING_BLOCKS: usize = 1_024;
+
+impl CutThrough {
+    pub(crate) fn arm(
+        &self,
+        socket: Arc<UdpSocket>,
+        table: Table,
+        config: EdgeUdpConfig,
+        stats: Arc<EdgeUdpStats>,
+    ) {
+        let _ = self.inner.set(CutInner {
+            socket,
+            table,
+            config,
+            stats,
+            state: Mutex::new(CutState::default()),
+        });
+    }
+}
+
+fn send_now(inner: &CutInner, datagram: &[u8], clients: &[(SocketAddr, RepairPolicy)]) {
+    for (peer, _) in clients {
+        match inner.socket.try_send_to(datagram, *peer) {
+            Ok(sent) => {
+                inner.stats.datagrams.fetch_add(1, Ordering::Relaxed);
+                inner.stats.cut_through_datagrams.fetch_add(1, Ordering::Relaxed);
+                inner.stats.bytes.fetch_add(sent as u64, Ordering::Relaxed);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                inner.stats.would_block.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                inner.stats.send_errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+impl CutState {
+    fn prune(&mut self, now: Instant) {
+        if self
+            .pruned_at
+            .is_some_and(|at| now.duration_since(at) < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.pruned_at = Some(now);
+        self.routes
+            .retain(|_, route| now.duration_since(route.seen_at) < CUT_STATE_TTL);
+        self.slots
+            .retain(|_, slot| now.duration_since(slot.seen_at) < CUT_STATE_TTL);
+        self.pending.retain(|key, _| !self.routes.contains_key(key));
+        if self.pending.len() > MAX_PENDING_BLOCKS {
+            self.pending.clear();
+        }
+    }
+}
+
+/// Forward one mesh source symbol of a chosen route, cut into client symbols.
+fn forward_symbol(inner: &CutInner, route: &mut Route, clients: &[(SocketAddr, RepairPolicy)], esi: u32, data: &[u8]) {
+    let per_mesh = u32::from(route.mesh_symbol / route.client_symbol);
+    let client_size = usize::from(route.client_symbol);
+    for (index, piece) in data.chunks(client_size).enumerate() {
+        let client_esi = esi * per_mesh + index as u32;
+        let Some(done) = route.forwarded.get_mut(client_esi as usize) else {
+            break;
+        };
+        if *done {
+            continue;
+        }
+        let Some(datagram) = source_datagram(
+            cut_through_block_id(route.slot),
+            route.transfer_length,
+            route.sequence,
+            route.client_symbol,
+            client_esi,
+            piece,
+        ) else {
+            continue;
+        };
+        route.sequence = route.sequence.wrapping_add(1);
+        *done = true;
+        send_now(inner, &datagram, clients);
+    }
+}
+
+impl CacheMeshReceiveObserver for CutThrough {
+    fn datagram(&self, peer: SocketAddr, datagram: &[u8]) {
+        let Some(inner) = self.inner.get() else {
+            return;
+        };
+        let Ok(header) = DatagramFecHeader::decode(datagram) else {
+            return;
+        };
+        let Ok(payload) = header.payload(datagram) else {
+            return;
+        };
+        if payload.len() < 4 {
+            return;
+        }
+        let esi = u32::from_be_bytes([0, payload[1], payload[2], payload[3]]);
+        if esi >= u32::from(header.source_symbols) {
+            return; // a mesh repair symbol: the edge sends its own repair
+        }
+        let key = (peer, header.block_id);
+        let now = Instant::now();
+        let mut state = inner.state.lock().unwrap();
+        state.prune(now);
+        if !state.routes.contains_key(&key) {
+            if esi != 0 {
+                // The first symbol names the part; until it arrives, hold.
+                let held = state.pending.entry(key).or_default();
+                if held.len() < MAX_PENDING_PER_BLOCK {
+                    held.push(datagram.to_vec());
+                }
+                return;
+            }
+            let route = new_route(inner, &mut state, key, &header, &payload[4..], now);
+            state.routes.insert(key, route);
+            let held = state.pending.remove(&key).unwrap_or_default();
+            let state = &mut *state;
+            let route = state.routes.get_mut(&key).unwrap();
+            if !route.chosen {
+                return;
+            }
+            let clients = state
+                .slots
+                .get(&(route.stream_id, route.slot))
+                .map(|slot| slot.clients.clone())
+                .unwrap_or_default();
+            forward_symbol(inner, route, &clients, 0, &payload[4..]);
+            for earlier in held {
+                if let Ok(header) = DatagramFecHeader::decode(&earlier) {
+                    if let Ok(payload) = header.payload(&earlier) {
+                        if payload.len() >= 4 {
+                            let esi = u32::from_be_bytes([0, payload[1], payload[2], payload[3]]);
+                            forward_symbol(inner, route, &clients, esi, &payload[4..]);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        let state = &mut *state;
+        let route = state.routes.get_mut(&key).unwrap();
+        route.seen_at = now;
+        if !route.chosen {
+            return;
+        }
+        let Some(slot) = state.slots.get(&(route.stream_id, route.slot)) else {
+            return;
+        };
+        if slot.done {
+            return;
+        }
+        let clients = slot.clients.clone();
+        forward_symbol(inner, route, &clients, esi, &payload[4..]);
+    }
+
+    fn decoded(&self, peer: SocketAddr, datagram: &[u8], frame: &[u8]) {
+        let Some(inner) = self.inner.get() else {
+            return;
+        };
+        let Ok(header) = DatagramFecHeader::decode(datagram) else {
+            return;
+        };
+        let key = (peer, header.block_id);
+        let mut state = inner.state.lock().unwrap();
+        let (stream_id, slot) = match state.routes.get(&key) {
+            Some(route) => (route.stream_id, route.slot),
+            None => match chunk_frame_slot(frame) {
+                Some(found) => found,
+                None => return,
+            },
+        };
+        let state = &mut *state;
+        let Some(claim) = state.slots.get_mut(&(stream_id, slot)) else {
+            return;
+        };
+        if claim.done {
+            return;
+        }
+        claim.done = true;
+        let clients = claim.clients.clone();
+        let chosen = claim.chosen == key;
+        let route = state.routes.get(&key).filter(|route| route.chosen && chosen);
+        let job = match route {
+            // The chosen block: the client symbols it never sent, and repair.
+            Some(route) => CompleteJob::Chosen {
+                client_symbol: route.client_symbol,
+                missing: route
+                    .forwarded
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, sent)| !**sent)
+                    .map(|(esi, _)| esi)
+                    .collect(),
+            },
+            // Another parent's block decoded first: it carries the whole part.
+            None => {
+                inner.stats.cut_through_fallbacks.fetch_add(1, Ordering::Relaxed);
+                CompleteJob::Whole
+            }
+        };
+        inner.stats.cut_through_parts.fetch_add(1, Ordering::Relaxed);
+        let frame = frame.to_vec();
+        let socket = Arc::clone(&inner.socket);
+        let stats = Arc::clone(&inner.stats);
+        let max_symbol = inner.config.symbol_size;
+        // Encoding a 4K part takes milliseconds: not on the receive task.
+        tokio::task::spawn_blocking(move || {
+            complete(&socket, &stats, max_symbol, slot, &frame, job, &clients)
+        });
+    }
+}
+
+enum CompleteJob {
+    Chosen {
+        client_symbol: u16,
+        missing: Vec<usize>,
+    },
+    Whole,
+}
+
+fn complete(
+    socket: &UdpSocket,
+    stats: &EdgeUdpStats,
+    max_symbol: u16,
+    slot: u64,
+    frame: &[u8],
+    job: CompleteJob,
+    clients: &[(SocketAddr, RepairPolicy)],
+) {
+    let mut groups: HashMap<RepairPolicy, Vec<SocketAddr>> = HashMap::new();
+    for (peer, repair) in clients {
+        groups.entry(*repair).or_default().push(*peer);
+    }
+    for (repair, peers) in groups {
+        let (datagrams, send): (Vec<Vec<u8>>, Vec<usize>) = match &job {
+            CompleteJob::Chosen {
+                client_symbol,
+                missing,
+                ..
+            } => {
+                let sources = frame.len().div_ceil(usize::from(*client_symbol));
+                let repair_symbols = repair.repair_symbols(sources as u32);
+                let Ok(datagrams) =
+                    encode_block(frame, cut_through_block_id(slot), *client_symbol, repair_symbols)
+                else {
+                    continue;
+                };
+                let send = missing
+                    .iter()
+                    .copied()
+                    .chain(sources..datagrams.len())
+                    .collect();
+                (datagrams, send)
+            }
+            CompleteJob::Whole => {
+                let (sources, symbol) = geometry(frame.len(), max_symbol);
+                let Ok(datagrams) = encode_block(
+                    frame,
+                    block_id(ObjectKind::Part, slot),
+                    symbol,
+                    repair.repair_symbols(sources),
+                ) else {
+                    continue;
+                };
+                let send = (0..datagrams.len()).collect();
+                (datagrams, send)
+            }
+        };
+        for index in send {
+            let Some(datagram) = datagrams.get(index) else {
+                continue;
+            };
+            for peer in &peers {
+                match socket.try_send_to(datagram, *peer) {
+                    Ok(sent) => {
+                        stats.datagrams.fetch_add(1, Ordering::Relaxed);
+                        stats.cut_through_datagrams.fetch_add(1, Ordering::Relaxed);
+                        stats.bytes.fetch_add(sent as u64, Ordering::Relaxed);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        stats.would_block.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        stats.send_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The route of a new block, from its first source symbol, which names the
+/// part. The first block of a part that has subscribers due for it is
+/// chosen and claims the part for them.
+fn new_route(
+    inner: &CutInner,
+    state: &mut CutState,
+    key: (SocketAddr, u32),
+    header: &DatagramFecHeader,
+    first_symbol: &[u8],
+    now: Instant,
+) -> Route {
+    let (stream_id, slot) = chunk_frame_slot(first_symbol).unwrap_or((u64::MAX, u64::MAX));
+    let client_symbol = cut_through_symbol_size(header.symbol_size, inner.config.symbol_size);
+    let mut route = Route {
+        stream_id,
+        slot,
+        chosen: false,
+        client_symbol: client_symbol.unwrap_or(1),
+        mesh_symbol: header.symbol_size,
+        transfer_length: header.transfer_length,
+        forwarded: Vec::new(),
+        sequence: 0,
+        seen_at: now,
+    };
+    if stream_id == u64::MAX
+        || client_symbol.is_none()
+        || state.slots.contains_key(&(stream_id, slot))
+    {
+        return route;
+    }
+    let clients: Vec<(SocketAddr, RepairPolicy)> = {
+        let mut table = inner.table.lock().unwrap();
+        let Some(entry) = table.get_mut(&stream_id) else {
+            return route;
+        };
+        entry
+            .subscribers
+            .iter_mut()
+            .filter(|(_, subscriber)| subscriber.next_part <= slot)
+            .map(|(peer, subscriber)| {
+                subscriber.cut_slots.insert(slot);
+                (*peer, subscriber.repair)
+            })
+            .collect()
+    };
+    if clients.is_empty() {
+        return route;
+    }
+    route.chosen = true;
+    route.forwarded = vec![
+        false;
+        header
+            .transfer_length
+            .div_ceil(u32::from(route.client_symbol)) as usize
+    ];
+    state.slots.insert(
+        (stream_id, slot),
+        SlotState {
+            chosen: key,
+            done: false,
+            clients,
+            seen_at: now,
+        },
+    );
+    route
 }

@@ -1668,6 +1668,15 @@ async fn main() -> Result<()> {
             args.udp_socket_buffer_bytes
         })
         .with_applied_tx(mesh_applied_tx);
+    // An edge with a client UDP port forwards the parts that reach it over
+    // the cache mesh to its UDP clients as their datagrams arrive.
+    let edge_cut_through = args
+        .client_udp_bind
+        .map(|_| Arc::new(edge_udp::CutThrough::default()));
+    let mesh_config = match &edge_cut_through {
+        Some(cut) => mesh_config.with_receive_observer(Arc::clone(cut) as _),
+        None => mesh_config,
+    };
     let mesh_handle = Arc::new(
         CacheMesh::new(Arc::clone(&cache.chunk_cache), mesh_config)
             .start()
@@ -1941,6 +1950,7 @@ async fn main() -> Result<()> {
                 max_subscribers: args.client_udp_max_subscribers,
             },
             Arc::clone(&router.edge_udp_stats),
+            edge_cut_through.clone(),
             ingest_shutdown_rx.clone(),
         )))
     } else {
@@ -14895,6 +14905,12 @@ impl AppRouter {
                     "datagrams": stats.datagrams.load(Ordering::Relaxed),
                     "bytes": stats.bytes.load(Ordering::Relaxed),
                     "send_errors": stats.send_errors.load(Ordering::Relaxed),
+                    "cut_through_parts": stats.cut_through_parts.load(Ordering::Relaxed),
+                    "cut_through_datagrams": stats.cut_through_datagrams.load(Ordering::Relaxed),
+                    "cut_through_fallbacks": stats.cut_through_fallbacks.load(Ordering::Relaxed),
+                    "would_block": stats.would_block.load(Ordering::Relaxed),
+                    "tokens_sent": stats.tokens_sent.load(Ordering::Relaxed),
+                    "bad_tokens": stats.bad_tokens.load(Ordering::Relaxed),
                 })
             }),
         });
@@ -28142,6 +28158,7 @@ mod tests {
                 max_subscribers: 16,
             },
             Arc::default(),
+            None,
             shutdown_rx,
         ));
 
