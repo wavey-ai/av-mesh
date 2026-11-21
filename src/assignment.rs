@@ -61,6 +61,12 @@ pub struct CacheCandidate {
     pub session_charge_bps: Option<u64>,
     /// When the cache wrote the advertisement that this record comes from.
     pub updated_unix_ms: u64,
+    /// Rank of the cache for the standby copy of the playlist
+    /// (`standby_rank`). The caches after the first are the failover order
+    /// of a reader, and with this they are in the order in which the edges
+    /// take standby copies: the first alternate is the edge that holds the
+    /// copy. `None` orders the alternates by the session, like the first.
+    pub failover_rank: Option<u64>,
 }
 
 impl CacheCandidate {
@@ -255,23 +261,37 @@ pub fn assign(
     if let Some(cache) = sticky {
         caches.push(assigned(cache, AssignmentReason::Sticky));
     }
-    for (tier, _, cache) in ranked {
+    let mut ranked = ranked;
+    if caches.is_empty() && !ranked.is_empty() {
+        let (tier, _, cache) = ranked.remove(0);
+        let reason = match tier {
+            0 => AssignmentReason::HoldsPlaylist,
+            1 => AssignmentReason::NewCopy,
+            _ => AssignmentReason::Spill,
+        };
+        caches.push(assigned(cache, reason));
+    }
+    // The caches after the first are where the reader goes when its cache
+    // fails. A cache that holds the playlist comes first, and then the
+    // caches in the order in which they take the standby copy, so that the
+    // reader finds a warm copy at its first alternate. The readers of one
+    // playlist share this order. Admission at the alternate sends on the
+    // readers that do not fit.
+    ranked.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| right.2.failover_rank.cmp(&left.2.failover_rank))
+            .then_with(|| right.1.total_cmp(&left.1))
+            .then_with(|| left.2.node_id.cmp(&right.2.node_id))
+    });
+    for (_tier, _, cache) in ranked {
         if caches.len() > policy.max_alternates {
             break;
         }
         if caches.iter().any(|chosen| chosen.node_id == cache.node_id) {
             continue;
         }
-        let reason = if !caches.is_empty() {
-            AssignmentReason::Alternate
-        } else {
-            match tier {
-                0 => AssignmentReason::HoldsPlaylist,
-                1 => AssignmentReason::NewCopy,
-                _ => AssignmentReason::Spill,
-            }
-        };
-        caches.push(assigned(cache, reason));
+        caches.push(assigned(cache, AssignmentReason::Alternate));
     }
     if caches.is_empty() {
         return Err(AssignmentError::NoCacheAvailable);
@@ -290,6 +310,25 @@ fn assigned(cache: &CacheCandidate, reason: AssignmentReason) -> AssignedCache {
         load_permille: cache.load_permille,
         holds_playlist: cache.holds_playlist(),
     }
+}
+
+/// Rank of an edge for the standby copy of a playlist. Every node computes
+/// the same rank from the two names, so the edges of a region agree on who
+/// takes the copy, and the entry points on where a reader goes next, without
+/// a word between them.
+pub fn standby_rank(node_id: &str, stream_id: u64) -> u64 {
+    // FNV-1a, which is the same in every build of every node.
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in stream_id
+        .to_be_bytes()
+        .iter()
+        .chain(node_id.as_bytes().iter())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // The last bytes of similar names differ little: mix once more.
+    hash ^ (hash >> 29)
 }
 
 /// Weighted rendezvous score of a cache for a session. The cache with the
@@ -348,7 +387,55 @@ mod tests {
             free_bps: None,
             session_charge_bps: None,
             updated_unix_ms: 0,
+            failover_rank: None,
         }
+    }
+
+    #[test]
+    fn the_first_alternate_of_every_reader_is_the_standby_edge() {
+        // No edge holds the playlist yet. The edges rank for its standby
+        // copy in the order edge-3, edge-1, edge-4, edge-2.
+        let ranks = [
+            ("edge-1", 30),
+            ("edge-2", 10),
+            ("edge-3", 40),
+            ("edge-4", 20),
+        ];
+        let caches = ranks
+            .iter()
+            .map(|(name, rank)| CacheCandidate {
+                failover_rank: Some(*rank),
+                ..cache(name, 100, None)
+            })
+            .collect::<Vec<_>>();
+        let mut first = HashMap::<String, usize>::new();
+        for index in 0..400 {
+            let session = format!("session-{index}");
+            let assignment =
+                assign(request(&session), AssignmentPolicy::default(), &caches).unwrap();
+            let names = assignment
+                .caches
+                .iter()
+                .map(|cache| cache.node_id.as_str())
+                .collect::<Vec<_>>();
+            *first.entry(names[0].to_owned()).or_default() += 1;
+            // The alternates are the other edges in standby order.
+            let expected = ["edge-3", "edge-1", "edge-4", "edge-2"]
+                .into_iter()
+                .filter(|name| *name != names[0])
+                .take(2)
+                .collect::<Vec<_>>();
+            assert_eq!(&names[1..], expected.as_slice(), "{session}");
+        }
+        // The first cache of a reader is still spread by its session.
+        assert_eq!(first.len(), 4);
+        assert!(first.values().all(|count| *count > 60), "{first:?}");
+        // An edge that holds the playlist comes before the standby order.
+        let mut held = caches.clone();
+        held[1].head_part = Some(900);
+        let assignment = assign(request("session-7"), AssignmentPolicy::default(), &held).unwrap();
+        assert_eq!(assignment.caches[0].node_id, "edge-2");
+        assert_eq!(assignment.caches[1].node_id, "edge-3");
     }
 
     #[test]

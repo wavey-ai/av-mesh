@@ -1086,6 +1086,14 @@ impl Reader {
             });
             if reload_done {
                 let (url, asked_open, _, handle) = reload.take().expect("reload");
+                // A reload that was sent to a cache that the reader has left
+                // says nothing about the cache that it reads now. Its
+                // timeout made a reader leave the warm cache that it had
+                // just moved to.
+                if url.authority != self.master.caches[self.current].playlist.authority {
+                    handle.abort();
+                    continue;
+                }
                 let result = if handle.is_finished() {
                     match handle.await {
                         Ok(Ok(response)) => {

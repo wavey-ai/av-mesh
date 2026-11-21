@@ -6,8 +6,8 @@ mod link_telemetry;
 
 use anyhow::{anyhow, bail, Context, Result};
 use assignment::{
-    assign, AssignedCache, Assignment, AssignmentError, AssignmentPolicy, AssignmentRequest,
-    CacheCandidate,
+    assign, standby_rank, AssignedCache, Assignment, AssignmentError, AssignmentPolicy,
+    AssignmentRequest, CacheCandidate,
 };
 use async_trait::async_trait;
 use av_mesh::relay_ingress::{
@@ -9928,24 +9928,6 @@ struct StandbyHolder {
     sessions: u64,
 }
 
-/// Rank of an edge for the standby copy of a playlist. Every edge computes
-/// the same rank from the two names, so the edges of a region agree on who
-/// takes the copy without a word between them.
-fn standby_rank(node_id: &str, stream_id: u64) -> u64 {
-    // FNV-1a, which is the same in every build of every node.
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in stream_id
-        .to_be_bytes()
-        .iter()
-        .chain(node_id.as_bytes().iter())
-    {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    // The last bytes of similar names differ little: mix once more.
-    hash ^ (hash >> 29)
-}
-
 /// Whether this edge holds a standby copy of a playlist.
 ///
 /// `holders` are the edges of the region that hold the playlist, with their
@@ -14028,6 +14010,7 @@ impl AppRouter {
                             .and_then(|stream| stream.latest_mesh_part)
                     });
                 Some(CacheCandidate {
+                    failover_rank: Some(standby_rank(&snapshot.node.node_id, stream_id)),
                     node_id: snapshot.node.node_id.clone(),
                     region: snapshot.node.region.clone(),
                     // This node can always name itself with a relative URI.
