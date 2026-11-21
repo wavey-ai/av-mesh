@@ -534,6 +534,72 @@ struct Stall {
     at_ms: u64,
     part: u64,
     ms: u64,
+    /// The stop in microseconds: a stop of a few 0.25 ms parts is less
+    /// than a millisecond.
+    us: u64,
+}
+
+/// How late a part may be and still count as on time: half of the part,
+/// and at most a millisecond. A part of 2 ms or more keeps the millisecond
+/// of the schedule that was kept in whole milliseconds; a 0.25 ms part that
+/// is 0.75 ms late is three parts of silence, and a stall.
+fn stall_threshold_us(part_us: u64) -> u64 {
+    (part_us / 2).clamp(1, 1_000)
+}
+
+/// The stalls of a player that plays each part at its place in the
+/// schedule, later by every stall so far.
+#[derive(Debug, Default)]
+struct StallTracker {
+    /// How much later the player plays than its first schedule.
+    shift_us: u64,
+    stalled_us: u64,
+    in_stall: bool,
+    run_us: u64,
+}
+
+impl StallTracker {
+    /// A part of `part_us` arrived `late_us` after its moment to play.
+    fn observe(
+        &mut self,
+        report: &mut ReaderReport,
+        late_us: i64,
+        part_us: u64,
+        at_ms: u64,
+        part: u64,
+    ) {
+        if late_us < stall_threshold_us(part_us) as i64 {
+            self.in_stall = false;
+            return;
+        }
+        let late_us = late_us as u64;
+        self.shift_us += late_us;
+        self.stalled_us += late_us;
+        report.stalled_ms = self.stalled_us / 1_000;
+        report.stalled_us = self.stalled_us;
+        if self.in_stall {
+            self.run_us += late_us;
+            let recorded = report.stalls as usize == report.stall_events.len();
+            if let Some(event) = report.stall_events.last_mut().filter(|_| recorded) {
+                event.ms = self.run_us / 1_000;
+                event.us = self.run_us;
+            }
+        } else {
+            report.stalls += 1;
+            self.run_us = late_us;
+            if report.stall_events.len() < 64 {
+                report.stall_events.push(Stall {
+                    at_ms,
+                    part,
+                    ms: late_us / 1_000,
+                    us: late_us,
+                });
+            }
+        }
+        report.longest_stall_ms = report.longest_stall_ms.max(self.run_us / 1_000);
+        report.longest_stall_us = report.longest_stall_us.max(self.run_us);
+        self.in_stall = true;
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -580,7 +646,9 @@ struct ReaderReport {
     /// later, so one stall is one event however many parts were late.
     stalls: u64,
     stalled_ms: u64,
+    stalled_us: u64,
     longest_stall_ms: u64,
+    longest_stall_us: u64,
     /// The first 64 stalls.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     stall_events: Vec<Stall>,
@@ -1058,12 +1126,9 @@ impl Reader {
         // The schedule is kept in microseconds, so that parts of 2.5 ms or
         // less add up exactly.
         let mut scheduled_us = 0_u64;
-        // How much later the player plays than its first schedule: the sum
-        // of its stalls.
-        let mut shift_us = 0_u64;
-        let mut stalled_us = 0_u64;
-        let mut in_stall = false;
-        let mut stall_run_us = 0_u64;
+        // How much later the player plays than its first schedule (the sum
+        // of its stalls), and the stall in progress.
+        let mut stalls = StallTracker::default();
         // When the player started, in microseconds after the first part.
         let mut play_from_us: Option<u64> = None;
         let mut last_arrival: Option<Instant> = None;
@@ -1420,40 +1485,17 @@ impl Reader {
             }
             let late_us = match play_from_us {
                 Some(play_from_us) => {
-                    since_origin_us - (play_from_us + scheduled_us + shift_us) as i64
+                    since_origin_us - (play_from_us + scheduled_us + stalls.shift_us) as i64
                 }
                 None => 0,
             };
-            // A part less than a millisecond late is on time, as it was
-            // when the schedule was kept in whole milliseconds.
-            if late_us >= 1_000 {
-                let late_us = late_us as u64;
-                shift_us += late_us;
-                stalled_us += late_us;
-                self.report.stalled_ms = stalled_us / 1_000;
-                if in_stall {
-                    stall_run_us += late_us;
-                    let recorded = self.report.stalls as usize == self.report.stall_events.len();
-                    if let Some(event) = self.report.stall_events.last_mut().filter(|_| recorded) {
-                        event.ms = stall_run_us / 1_000;
-                    }
-                } else {
-                    self.report.stalls += 1;
-                    stall_run_us = late_us;
-                    if self.report.stall_events.len() < 64 {
-                        self.report.stall_events.push(Stall {
-                            at_ms: arrival.duration_since(self.started).as_millis() as u64,
-                            part: next,
-                            ms: late_us / 1_000,
-                        });
-                    }
-                }
-                self.report.longest_stall_ms =
-                    self.report.longest_stall_ms.max(stall_run_us / 1_000);
-                in_stall = true;
-            } else {
-                in_stall = false;
-            }
+            stalls.observe(
+                &mut self.report,
+                late_us,
+                part_us,
+                arrival.duration_since(self.started).as_millis() as u64,
+                next,
+            );
             if let Some(last) = last_arrival {
                 self.report.max_gap_ms = self
                     .report
@@ -1548,7 +1590,9 @@ struct Summary {
     readers_stalled: usize,
     stalls: u64,
     stalled_ms: u64,
+    stalled_us: u64,
     longest_stall_ms: u64,
+    longest_stall_us: u64,
     max_behind_ms: i64,
     startup_ms_p50: Option<f64>,
     startup_ms_p99: Option<f64>,
@@ -1673,7 +1717,9 @@ async fn main() -> Result<()> {
         readers_stalled: reports.iter().filter(|report| report.stalls > 0).count(),
         stalls: 0,
         stalled_ms: 0,
+        stalled_us: 0,
         longest_stall_ms: 0,
+        longest_stall_us: 0,
         max_behind_ms: 0,
         startup_ms_p50: None,
         startup_ms_p99: None,
@@ -1696,7 +1742,9 @@ async fn main() -> Result<()> {
         summary.underruns += report.underruns;
         summary.stalls += report.stalls;
         summary.stalled_ms += report.stalled_ms;
+        summary.stalled_us += report.stalled_us;
         summary.longest_stall_ms = summary.longest_stall_ms.max(report.longest_stall_ms);
+        summary.longest_stall_us = summary.longest_stall_us.max(report.longest_stall_us);
         summary.request_errors += report.request_errors;
         summary.max_behind_ms = summary.max_behind_ms.max(report.max_behind_ms);
         summary.moves += report.moves.len();
@@ -1956,6 +2004,41 @@ mod tests {
         assert_eq!(pipeline_depth_for(near, 200_000, 250, 256), 2);
         // The old behaviour: no time window.
         assert_eq!(pipeline_depth_for(near, 2_500, 0, 256), 2);
+    }
+
+    #[test]
+    fn a_part_late_by_less_than_a_millisecond_is_a_stall_when_it_is_short() {
+        // 0.25 ms parts 0.75 ms late: three parts of silence, a stall.
+        let mut report = ReaderReport::default();
+        let mut stalls = StallTracker::default();
+        stalls.observe(&mut report, 750, 250, 10, 40);
+        assert_eq!(report.stalls, 1);
+        assert_eq!(report.stalled_us, 750);
+        assert_eq!(report.stalled_ms, 0);
+        assert_eq!(report.stall_events[0].us, 750);
+        assert_eq!(stalls.shift_us, 750);
+        // The next part is late by the same run: the same stall, longer.
+        stalls.observe(&mut report, 300, 250, 11, 41);
+        assert_eq!(report.stalls, 1);
+        assert_eq!(report.longest_stall_us, 1_050);
+        assert_eq!(report.stall_events[0].ms, 1);
+        // On time ends it; within half a part is on time.
+        stalls.observe(&mut report, 124, 250, 12, 42);
+        stalls.observe(&mut report, 125, 250, 13, 43);
+        assert_eq!(report.stalls, 2);
+        assert_eq!(report.stalled_us, 1_175);
+
+        // A part of 2 ms or more keeps the millisecond of slack it had.
+        let mut report = ReaderReport::default();
+        let mut stalls = StallTracker::default();
+        stalls.observe(&mut report, 999, 2_500, 0, 1);
+        stalls.observe(&mut report, 999, 41_708, 0, 2);
+        assert_eq!(report.stalls, 0);
+        stalls.observe(&mut report, 1_000, 2_500, 0, 3);
+        assert_eq!(report.stalls, 1);
+        assert_eq!(stall_threshold_us(1_000), 500);
+        assert_eq!(stall_threshold_us(500), 250);
+        assert_eq!(stall_threshold_us(1), 1);
     }
 
     #[test]
