@@ -35,6 +35,7 @@ use http::{header::HeaderValue, Request, StatusCode};
 use http_body_util::{BodyExt, Empty};
 use hyper::client::conn::http2::SendRequest;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use playlists::m3u8_manifest::parse_seconds_us;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
@@ -43,6 +44,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
+
+/// Least time of parts that a reader asks for at one time by default.
+const DEFAULT_MIN_INFLIGHT_MS: u64 = 250;
 
 #[derive(Debug, Clone, Parser)]
 #[command(
@@ -119,6 +123,12 @@ struct Args {
     /// Largest number of parts requested at one time.
     #[arg(long, default_value_t = 256)]
     pipeline_limit: usize,
+
+    /// With --pipeline 0, ask for at least this many milliseconds of parts
+    /// at one time, within --pipeline-limit: at 2.5 ms parts a round trip
+    /// alone asks for a handful, and one slow answer then stalls the reader.
+    #[arg(long, default_value_t = DEFAULT_MIN_INFLIGHT_MS)]
+    min_inflight_ms: u64,
 
     /// Read response bodies at this rate at most, in kbit/s. 0 reads at the
     /// speed of the network.
@@ -469,10 +479,11 @@ fn parse_master(body: &str, base: &Url) -> Result<MasterPlaylist> {
 
 #[derive(Debug, Clone, Default)]
 struct MediaPlaylist {
-    /// Part sequence and duration in milliseconds, oldest first.
+    /// Part sequence and duration in microseconds, oldest first.
     parts: Vec<(u64, u64)>,
     extension: String,
-    part_target_ms: u64,
+    /// PART-TARGET in microseconds.
+    part_target_us: u64,
 }
 
 fn part_sequence(uri: &str) -> Option<(u64, &str)> {
@@ -487,20 +498,18 @@ fn parse_media(body: &str) -> MediaPlaylist {
     let mut playlist = MediaPlaylist::default();
     for line in body.lines().map(str::trim) {
         if line.starts_with("#EXT-X-PART-INF:") {
-            playlist.part_target_ms = attribute(line, "PART-TARGET")
-                .and_then(|value| value.parse::<f64>().ok())
-                .map_or(0, |seconds| (seconds * 1_000.0).round() as u64);
+            playlist.part_target_us = attribute(line, "PART-TARGET")
+                .and_then(parse_seconds_us)
+                .unwrap_or(0);
         } else if line.starts_with("#EXT-X-PART:") {
             let Some((sequence, extension)) = attribute(line, "URI").and_then(part_sequence) else {
                 continue;
             };
-            let duration_ms = attribute(line, "DURATION")
-                .and_then(|value| value.parse::<f64>().ok())
-                .map_or(playlist.part_target_ms, |seconds| {
-                    (seconds * 1_000.0).round() as u64
-                });
+            let duration_us = attribute(line, "DURATION")
+                .and_then(parse_seconds_us)
+                .unwrap_or(playlist.part_target_us);
             playlist.extension = extension.to_owned();
-            playlist.parts.push((sequence, duration_ms));
+            playlist.parts.push((sequence, duration_us));
         }
     }
     playlist
@@ -650,14 +659,17 @@ struct Reader {
 impl Reader {
     /// Parts to ask for at one time: enough to cover a round trip and a
     /// little more, so that a part is on its way before the reader needs it.
-    fn pipeline_depth(&self, part_ms: u64) -> usize {
+    fn pipeline_depth(&self, part_us: u64) -> usize {
         let limit = self.args.pipeline_limit.max(1);
         if self.args.pipeline > 0 {
             return self.args.pipeline.min(limit);
         }
-        let round_trip_ms = self.path_round_trip().as_millis() as u64;
-        let ahead = (round_trip_ms * 3 / 2) / part_ms.max(1) + 2;
-        (ahead as usize).clamp(2, limit)
+        pipeline_depth_for(
+            self.path_round_trip(),
+            part_us,
+            self.args.min_inflight_ms,
+            limit,
+        )
     }
 
     fn elapsed_ms(&self) -> u64 {
@@ -1028,10 +1040,10 @@ impl Reader {
         }
         let extension = playlist.extension.clone();
         let mut durations: HashMap<u64, u64> = playlist.parts.iter().copied().collect();
-        let mut default_duration_ms = playlist
+        let mut default_duration_us = playlist
             .parts
             .last()
-            .map_or(playlist.part_target_ms, |(_, duration)| *duration)
+            .map_or(playlist.part_target_us, |(_, duration)| *duration)
             .max(1);
         let newest = playlist.parts.last().map_or(0, |(sequence, _)| *sequence);
         let oldest = playlist.parts.first().map_or(0, |(sequence, _)| *sequence);
@@ -1043,14 +1055,17 @@ impl Reader {
         self.playlist_due = Instant::now() + Duration::from_millis(self.args.playlist_interval_ms);
 
         let mut schedule: Option<(Instant, u64)> = None;
-        let mut scheduled_ms = 0_u64;
+        // The schedule is kept in microseconds, so that parts of 2.5 ms or
+        // less add up exactly.
+        let mut scheduled_us = 0_u64;
         // How much later the player plays than its first schedule: the sum
         // of its stalls.
-        let mut shift_ms = 0_u64;
+        let mut shift_us = 0_u64;
+        let mut stalled_us = 0_u64;
         let mut in_stall = false;
-        let mut stall_run_ms = 0_u64;
-        // When the player started, in milliseconds after the first part.
-        let mut play_from_ms: Option<u64> = None;
+        let mut stall_run_us = 0_u64;
+        // When the player started, in microseconds after the first part.
+        let mut play_from_us: Option<u64> = None;
         let mut last_arrival: Option<Instant> = None;
         let mut latencies = Vec::new();
         let mut publish_latencies = Vec::new();
@@ -1136,7 +1151,7 @@ impl Reader {
                             durations.insert(*sequence, *duration);
                         }
                         if let Some((_, duration)) = loaded.parts.last() {
-                            default_duration_ms = (*duration).max(1);
+                            default_duration_us = (*duration).max(1);
                         }
                         durations.retain(|sequence, _| *sequence + 4_096 > next);
                         // A player plays what the playlist lists. When the
@@ -1156,10 +1171,10 @@ impl Reader {
                                 pending.handle.abort();
                             }
                             for sequence in next..skip_to {
-                                scheduled_ms += durations
+                                scheduled_us += durations
                                     .get(&sequence)
                                     .copied()
-                                    .unwrap_or(default_duration_ms);
+                                    .unwrap_or(default_duration_us);
                             }
                             self.report.parts_missing += skip_to - next;
                             next = skip_to;
@@ -1193,16 +1208,16 @@ impl Reader {
             // A reader that is behind the cache asks further ahead: the parts
             // exist, so only the link limits how fast it catches up.
             let depth = if catching_up && self.args.pipeline == 0 {
-                (self.pipeline_depth(default_duration_ms) * 4).min(self.args.pipeline_limit.max(1))
+                (self.pipeline_depth(default_duration_us) * 4).min(self.args.pipeline_limit.max(1))
             } else {
-                self.pipeline_depth(default_duration_ms)
+                self.pipeline_depth(default_duration_us)
             };
             // A cache holds a request for a part that is up to three seconds
             // ahead of its newest part, and answers 404 for one further
             // ahead. A reader that catches up asked 20 parts of 200 ms ahead,
             // took the 404 for a failure and left its cache. Two seconds of
             // parts is the most that it asks ahead.
-            let depth = depth.min(parts_in_two_seconds(default_duration_ms));
+            let depth = depth.min(parts_in_two_seconds(default_duration_us));
             let mut start_error = None;
             while inflight.len() < depth {
                 let part_url = playlist_url.join(&format!("part{request_next}.{extension}"))?;
@@ -1348,10 +1363,10 @@ impl Reader {
                                     durations.insert(*sequence, *duration);
                                 }
                                 for sequence in next..skip_to {
-                                    scheduled_ms += durations
+                                    scheduled_us += durations
                                         .get(&sequence)
                                         .copied()
-                                        .unwrap_or(default_duration_ms);
+                                        .unwrap_or(default_duration_us);
                                 }
                                 self.report.parts_missing += skip_to - next;
                                 next = skip_to;
@@ -1366,8 +1381,8 @@ impl Reader {
                     if part_started.elapsed() >= Duration::from_millis(self.args.abandon_ms) {
                         // No cache has the part. Count it as missing and read on.
                         self.report.parts_missing += 1;
-                        scheduled_ms +=
-                            durations.get(&next).copied().unwrap_or(default_duration_ms);
+                        scheduled_us +=
+                            durations.get(&next).copied().unwrap_or(default_duration_us);
                         next += 1;
                         request_next = next;
                         part_started = Instant::now();
@@ -1385,49 +1400,56 @@ impl Reader {
             if self.report.parts_received == 0 {
                 self.report.startup_ms = arrival.duration_since(self.started).as_millis() as u64;
             }
-            let since_origin_ms = arrival.duration_since(origin).as_millis() as i64;
-            let behind_ms = since_origin_ms - scheduled_ms as i64;
+            let since_origin_us = arrival.duration_since(origin).as_micros() as i64;
+            let behind_us = since_origin_us - scheduled_us as i64;
+            let behind_ms = behind_us.div_euclid(1_000);
             self.report.max_behind_ms = self.report.max_behind_ms.max(behind_ms);
-            if behind_ms > self.args.buffer_ms as i64 {
+            if behind_us > self.args.buffer_ms.saturating_mul(1_000) as i64 {
                 self.report.underruns += 1;
             }
             // A player starts when it holds `buffer_ms` of media. From then
             // on it shows a part at its place in the schedule, plus every
             // stall so far.
-            let part_ms = durations.get(&next).copied().unwrap_or(default_duration_ms);
-            if play_from_ms.is_none() && scheduled_ms + part_ms >= self.args.buffer_ms {
-                play_from_ms = Some(since_origin_ms.max(0) as u64);
+            let part_us = durations.get(&next).copied().unwrap_or(default_duration_us);
+            if play_from_us.is_none()
+                && scheduled_us + part_us >= self.args.buffer_ms.saturating_mul(1_000)
+            {
+                play_from_us = Some(since_origin_us.max(0) as u64);
                 self.report.playback_start_ms =
                     Some(arrival.duration_since(self.started).as_millis() as u64);
             }
-            let late_ms = match play_from_ms {
-                Some(play_from_ms) => {
-                    since_origin_ms - (play_from_ms + scheduled_ms + shift_ms) as i64
+            let late_us = match play_from_us {
+                Some(play_from_us) => {
+                    since_origin_us - (play_from_us + scheduled_us + shift_us) as i64
                 }
                 None => 0,
             };
-            if late_ms > 0 {
-                let late_ms = late_ms as u64;
-                shift_ms += late_ms;
-                self.report.stalled_ms += late_ms;
+            // A part less than a millisecond late is on time, as it was
+            // when the schedule was kept in whole milliseconds.
+            if late_us >= 1_000 {
+                let late_us = late_us as u64;
+                shift_us += late_us;
+                stalled_us += late_us;
+                self.report.stalled_ms = stalled_us / 1_000;
                 if in_stall {
-                    stall_run_ms += late_ms;
+                    stall_run_us += late_us;
                     let recorded = self.report.stalls as usize == self.report.stall_events.len();
                     if let Some(event) = self.report.stall_events.last_mut().filter(|_| recorded) {
-                        event.ms = stall_run_ms;
+                        event.ms = stall_run_us / 1_000;
                     }
                 } else {
                     self.report.stalls += 1;
-                    stall_run_ms = late_ms;
+                    stall_run_us = late_us;
                     if self.report.stall_events.len() < 64 {
                         self.report.stall_events.push(Stall {
                             at_ms: arrival.duration_since(self.started).as_millis() as u64,
                             part: next,
-                            ms: late_ms,
+                            ms: late_us / 1_000,
                         });
                     }
                 }
-                self.report.longest_stall_ms = self.report.longest_stall_ms.max(stall_run_ms);
+                self.report.longest_stall_ms =
+                    self.report.longest_stall_ms.max(stall_run_us / 1_000);
                 in_stall = true;
             } else {
                 in_stall = false;
@@ -1453,7 +1475,7 @@ impl Reader {
                 // The part waited at the cache for longer than a round trip
                 // and four parts: the reader is behind the live edge.
                 let live_ms = self.path_round_trip().as_millis() as f64
-                    + 4.0 * default_duration_ms as f64
+                    + 4.0 * default_duration_us as f64 / 1_000.0
                     + 50.0;
                 catching_up = latency > live_ms;
             }
@@ -1486,7 +1508,7 @@ impl Reader {
                     etag,
                 });
             }
-            scheduled_ms += durations.get(&next).copied().unwrap_or(default_duration_ms);
+            scheduled_us += durations.get(&next).copied().unwrap_or(default_duration_us);
             next += 1;
             part_started = Instant::now();
         }
@@ -1751,9 +1773,27 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Parts of `part_ms` in two seconds, and no fewer than two.
-fn parts_in_two_seconds(part_ms: u64) -> usize {
-    usize::try_from(2_000 / part_ms.max(1))
+/// Parts to ask for at one time with --pipeline 0: a round trip and a half
+/// of parts of `part_us`, and two more, and no less than `min_inflight_ms`
+/// of parts; between two and `limit`.
+fn pipeline_depth_for(
+    round_trip: Duration,
+    part_us: u64,
+    min_inflight_ms: u64,
+    limit: usize,
+) -> usize {
+    let part_us = part_us.max(1);
+    let round_trip_us = round_trip.as_micros().min(u128::from(u64::MAX)) as u64;
+    let ahead = (round_trip_us * 3 / 2) / part_us + 2;
+    let window = min_inflight_ms.saturating_mul(1_000).div_ceil(part_us);
+    usize::try_from(ahead.max(window))
+        .unwrap_or(usize::MAX)
+        .clamp(2, limit.max(2))
+}
+
+/// Parts of `part_us` in two seconds, and no fewer than two.
+fn parts_in_two_seconds(part_us: u64) -> usize {
+    usize::try_from(2_000_000 / part_us.max(1))
         .unwrap_or(usize::MAX)
         .max(2)
 }
@@ -1846,10 +1886,12 @@ mod tests {
 
     #[test]
     fn a_reader_asks_no_more_than_two_seconds_ahead() {
-        assert_eq!(parts_in_two_seconds(200), 10);
-        assert_eq!(parts_in_two_seconds(5), 400);
-        assert_eq!(parts_in_two_seconds(2_000), 2);
-        assert_eq!(parts_in_two_seconds(0), 2_000);
+        assert_eq!(parts_in_two_seconds(200_000), 10);
+        assert_eq!(parts_in_two_seconds(5_000), 400);
+        assert_eq!(parts_in_two_seconds(2_500), 800);
+        assert_eq!(parts_in_two_seconds(250), 8_000);
+        assert_eq!(parts_in_two_seconds(2_000_000), 2);
+        assert_eq!(parts_in_two_seconds(0), 2_000_000);
     }
 
     #[test]
@@ -1866,6 +1908,57 @@ mod tests {
     }
 
     #[test]
+    fn media_playlist_durations_are_exact_microseconds() {
+        // 2.5 ms Opus, 1 ms, 0.5 ms and 0.25 ms PCM, and a 23.976 fps frame:
+        // no rounding to whole milliseconds, which made 2.5 ms parts 3 ms
+        // and 0.25 ms parts 0.
+        let playlist = parse_media(
+            "#EXTM3U\n#EXT-X-PART-INF:PART-TARGET=0.0025\n\
+             #EXT-X-PART:DURATION=0.0025,URI=\"part1.bin\"\n\
+             #EXT-X-PART:DURATION=0.001,URI=\"part2.bin\"\n\
+             #EXT-X-PART:DURATION=0.0005,URI=\"part3.bin\"\n\
+             #EXT-X-PART:DURATION=0.00025,URI=\"part4.bin\"\n\
+             #EXT-X-PART:DURATION=0.041708,URI=\"part5.bin\"\n\
+             #EXT-X-PART:URI=\"part6.bin\"\n",
+        );
+        assert_eq!(playlist.part_target_us, 2_500);
+        assert_eq!(
+            playlist.parts,
+            vec![
+                (1, 2_500),
+                (2, 1_000),
+                (3, 500),
+                (4, 250),
+                (5, 41_708),
+                // A part without a duration has the part target.
+                (6, 2_500),
+            ]
+        );
+        // Four hundred 2.5 ms parts make one second exactly.
+        let second: u64 = std::iter::repeat_n(2_500_u64, 400).sum();
+        assert_eq!(second, 1_000_000);
+    }
+
+    #[test]
+    fn a_reader_keeps_at_least_a_quarter_second_of_parts_in_flight() {
+        let near = Duration::from_millis(1);
+        // 2.5 ms parts: 100 parts are 250 ms; a round trip alone asks for 2.
+        assert_eq!(pipeline_depth_for(near, 2_500, 250, 256), 100);
+        // 1 ms parts: 250 parts.
+        assert_eq!(pipeline_depth_for(near, 1_000, 250, 256), 250);
+        // 0.25 ms parts: 1,000 parts, within the limit.
+        assert_eq!(pipeline_depth_for(near, 250, 250, 256), 256);
+        assert_eq!(pipeline_depth_for(near, 250, 250, 2_000), 1_000);
+        // A far reader covers its round trip and a half when that is more.
+        let far = Duration::from_millis(400);
+        assert_eq!(pipeline_depth_for(far, 2_500, 250, 1_000), 242);
+        // 200 ms video parts: a round trip and two, at least two.
+        assert_eq!(pipeline_depth_for(near, 200_000, 250, 256), 2);
+        // The old behaviour: no time window.
+        assert_eq!(pipeline_depth_for(near, 2_500, 0, 256), 2);
+    }
+
+    #[test]
     fn media_playlist_parts_carry_sequence_and_duration() {
         let playlist = parse_media(
             "#EXTM3U\n#EXT-X-PART-INF:PART-TARGET=0.250\n\
@@ -1874,9 +1967,9 @@ mod tests {
              #EXTINF:1.000,\nseg10.mp4\n\
              #EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part42.mp4\"\n",
         );
-        assert_eq!(playlist.parts, vec![(40, 250), (41, 200)]);
+        assert_eq!(playlist.parts, vec![(40, 250_000), (41, 200_000)]);
         assert_eq!(playlist.extension, "mp4");
-        assert_eq!(playlist.part_target_ms, 250);
+        assert_eq!(playlist.part_target_us, 250_000);
         assert_eq!(part_sequence("part7.bin"), Some((7, "bin")));
         assert_eq!(part_sequence("seg7.mp4"), None);
         assert_eq!(
