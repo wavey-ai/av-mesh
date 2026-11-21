@@ -192,6 +192,7 @@ dependencies = [
  "discovery",
  "ed25519-dalek",
  "flate2",
+ "frame-header",
  "futures-util",
  "h3",
  "h3-quinn",

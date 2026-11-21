@@ -43,6 +43,7 @@ use edge_lifecycle::{
     EdgeLifecycleAction, EdgeLifecycleConfig, EdgeLifecycleNode, EdgeLifecyclePlanner,
 };
 use flate2::{write::GzEncoder, Compression};
+use frame_header::FrameHeaderV2;
 use futures_util::{future::join_all, SinkExt, StreamExt};
 use h3_webtransport::server::{AcceptedBi, WebTransportSession};
 use hop_journal::{HopEvent, HopJournal, HopQuery, HopStage, DEFAULT_HOP_JOURNAL_CAPACITY};
@@ -53,6 +54,7 @@ use link_telemetry::{LinkObservation, LinkTelemetry};
 use linode::{regions::REGIONS as LINODE_REGIONS, LinodeClient};
 use media_object::{MediaObject, ObjectKind, Stage, WIRE_MAGIC};
 use playlists::chunk_cache::{ChunkCache, PutIfAbsentResult};
+use playlists::m3u8_manifest::push_seconds;
 use playlists::mesh::{
     AppliedSlot, CacheMesh, CacheMeshConfig, CacheMeshFecStats, CacheMeshHandle, CacheMeshRole,
     CacheMeshSendObserver, ReplicationMode,
@@ -132,6 +134,20 @@ const RELAY_WARM_SOURCE_REPLAY_MAX_BYTES_PER_CHILD: usize = 4 * 1024 * 1024;
 // The reliable subscription/catalog lane will supply this for late joins. The
 // local transition path starts each canonical stream at object zero.
 const PART_WAIT_MS: u64 = 3_000;
+/// Nominal part of a node unless `--part-us` says otherwise: one 2.5 ms
+/// Opus frame, 120 samples at 48 kHz.
+const DEFAULT_PART_US: u64 = 2_500;
+/// Nominal segment of a stream without stamps.
+const DEFAULT_SEGMENT_MS: u64 = 1_000;
+/// The playlist window, which sizes the ring of the cache.
+const DEFAULT_WINDOW_MS: u64 = 12_000;
+
+/// Parts of `part_us` that cover `ms` milliseconds, at least one.
+fn parts_in_ms(ms: u64, part_us: u64) -> usize {
+    usize::try_from(ms.saturating_mul(1_000).div_ceil(part_us.max(1)))
+        .unwrap_or(usize::MAX)
+        .max(1)
+}
 const HLS_PLAYLIST_WAIT_MS: u64 = 3_000;
 const LLHLS_TAIL_WAIT_MS: u64 = 250;
 const MAX_LLHLS_TAIL_PARTS: usize = 200;
@@ -159,8 +175,47 @@ const CACHE_MESH_ANNOUNCE_MS: u64 = 100;
 /// playlist reload that it would otherwise hold, so that a reader moves at
 /// once and does not wait out its own timeout.
 const EDGE_PARENTS_SILENT_MS: u64 = 400;
-/// Minimum time between two hole repair requests for one stream.
+/// Minimum time between two hole repair requests for one stream: ten parts
+/// of the stream, from 5 ms up to this, and no less than one part of up to
+/// 100 ms.
 const EDGE_HOLE_REPAIR_MIN_INTERVAL_MS: u64 = 50;
+/// Shortest interval between two hole repair requests for one stream.
+const EDGE_HOLE_REPAIR_MIN_INTERVAL_FLOOR_US: u64 = 5_000;
+/// Shortest grace before a missing part is a hole: both parents deliver
+/// within about a millisecond of each other.
+const EDGE_HOLE_REPAIR_MIN_GRACE_US: u64 = 3_000;
+/// Most holes in a row that one repair request asks for.
+const EDGE_HOLE_REPAIR_MAX_RUN: u32 = 64;
+
+/// Time an edge waits for a part that is not here before it asks a parent
+/// for it: three parts of the stream, from 3 ms to 15 ms. At 5 ms parts
+/// that is the 15 ms that it always was; at 2.5 ms it is PART-HOLD-BACK.
+fn edge_hole_repair_grace(part_us: u64) -> Duration {
+    Duration::from_micros(part_us.saturating_mul(3).clamp(
+        EDGE_HOLE_REPAIR_MIN_GRACE_US,
+        EDGE_HOLE_REPAIR_GRACE_MS * 1_000,
+    ))
+}
+
+/// Minimum time between two hole repair requests for a stream with parts
+/// of `part_us`. 50 ms at 5 ms parts, as before; shorter for smaller parts,
+/// whose holes come more often at the same loss.
+fn edge_hole_repair_min_interval(part_us: u64) -> Duration {
+    let interval_us = part_us
+        .saturating_mul(10)
+        .clamp(
+            EDGE_HOLE_REPAIR_MIN_INTERVAL_FLOOR_US,
+            EDGE_HOLE_REPAIR_MIN_INTERVAL_MS * 1_000,
+        )
+        .max(part_us.min(100_000));
+    Duration::from_micros(interval_us)
+}
+
+/// Parts of `part_us` in the hole repair window, at least two.
+fn edge_hole_repair_window_parts(part_us: u64) -> usize {
+    usize::try_from((EDGE_HOLE_REPAIR_WINDOW_MS * 1_000 / part_us.max(1)).max(2))
+        .unwrap_or(usize::MAX)
+}
 /// A parent answers a repair request with every part from the hole to its
 /// newest part. Holes older than this window are left to the once-a-second
 /// replica request, so one repair answer stays small.
@@ -179,6 +234,27 @@ const HOP_JOURNAL_REPLIES_PER_PART: u32 = 4;
 /// Most parts one advance of the contiguous watermark journals, so that a
 /// released hold of many parts cannot stall a commit.
 const HOP_JOURNAL_MAX_WATERMARK_PARTS: usize = 1_024;
+/// Seconds of parts that the hop journal holds by default.
+const DEFAULT_HOP_JOURNAL_SECONDS: u64 = 30;
+/// Events that one part makes on one node, at most, in the common case: the
+/// relay stages, the commit and the watermark, a mesh send for each of two
+/// children, and a few replies.
+const HOP_JOURNAL_EVENTS_PER_PART: u64 = 8;
+/// Most events that a journal sized from time holds: about 90 MB.
+const MAX_TIMED_HOP_JOURNAL_CAPACITY: usize = 1 << 20;
+
+/// Capacity of a hop journal that holds `seconds` of parts of `part_us`:
+/// never less than the fixed default of 262,144 events, which was sized for
+/// 200 parts a second, and never more than about 90 MB of events.
+fn hop_journal_capacity_for(part_us: u64, seconds: u64) -> usize {
+    let parts_per_second = 1_000_000_u64.div_ceil(part_us.max(1));
+    let events = parts_per_second
+        .saturating_mul(HOP_JOURNAL_EVENTS_PER_PART)
+        .saturating_mul(seconds);
+    usize::try_from(events)
+        .unwrap_or(usize::MAX)
+        .clamp(DEFAULT_HOP_JOURNAL_CAPACITY, MAX_TIMED_HOP_JOURNAL_CAPACITY)
+}
 /// Shortest stretch of a playlist over which its bit rate is measured. A
 /// copy that is still warming holds a second or less, and one key frame in
 /// that second reads as a much higher rate than the stream has.
@@ -650,7 +726,9 @@ impl LiveSlotPayload {
 struct ReboxedLiveAudio {
     init: Bytes,
     media: Bytes,
-    duration_ms: u32,
+    /// Duration of the part in microseconds, from the sample counts and
+    /// the sample rate of its SoundKit frames.
+    duration_us: u32,
 }
 
 fn rebox_soundkit_v2_bundle(payload: &[u8], sequence: u64) -> Result<ReboxedLiveAudio> {
@@ -678,6 +756,10 @@ fn rebox_soundkit_v2_bundle(payload: &[u8], sequence: u64) -> Result<ReboxedLive
 
     let mut offset = SOUNDKIT_V2_BUNDLE_HEADER_LEN;
     let mut framed = Vec::new();
+    // The samples and sample rate of the epochs, from the SoundKit frame
+    // header that starts each of them.
+    let mut bundle_samples = 0_u64;
+    let mut sample_rate = 0_u32;
     for epoch in 0..epoch_count {
         let entry_header_end = offset
             .checked_add(6)
@@ -698,6 +780,12 @@ fn rebox_soundkit_v2_bundle(payload: &[u8], sequence: u64) -> Result<ReboxedLive
         if frame_end > payload.len() {
             bail!("Soundkit v2 bundle epoch {epoch} frame is truncated");
         }
+        if let Ok(header) = FrameHeaderV2::decode(&mut &payload[offset..frame_end]) {
+            bundle_samples = bundle_samples.saturating_add(u64::from(header.frame_count()));
+            if sample_rate == 0 {
+                sample_rate = header.sample_rate();
+            }
+        }
         framed.extend_from_slice(&payload[offset..frame_end]);
         offset = frame_end;
     }
@@ -705,10 +793,20 @@ fn rebox_soundkit_v2_bundle(payload: &[u8], sequence: u64) -> Result<ReboxedLive
         bail!("Soundkit v2 bundle has trailing bytes");
     }
 
-    let start_pts_ms = sequence
-        .checked_mul(epoch_count)
-        .and_then(|value| value.checked_mul(SOUNDKIT_V2_EPOCH_DURATION_MS))
-        .context("Soundkit v2 publication timeline overflow")?;
+    // The publication timeline: every part of the stream holds as many
+    // samples as this one. A bundle whose frame headers cannot be read keeps
+    // the old timeline of 5 ms epochs.
+    let start_pts_ms = if bundle_samples > 0 && sample_rate > 0 {
+        sequence
+            .checked_mul(bundle_samples)
+            .and_then(|samples| samples.checked_mul(1_000))
+            .map(|millis| millis / u64::from(sample_rate))
+    } else {
+        sequence
+            .checked_mul(epoch_count)
+            .and_then(|value| value.checked_mul(SOUNDKIT_V2_EPOCH_DURATION_MS))
+    }
+    .context("Soundkit v2 publication timeline overflow")?;
     let reboxed = rebox_soundkit_v2(
         &framed,
         ReboxOptions {
@@ -729,9 +827,24 @@ fn rebox_soundkit_v2_bundle(payload: &[u8], sequence: u64) -> Result<ReboxedLive
         init: reboxed
             .init
             .context("Soundkit v2 rebox did not return fMP4 initialization")?,
+        duration_us: soundkit_duration_us(reboxed.frame_count, reboxed.sample_rate)
+            .unwrap_or_else(|| reboxed.duration_ms.saturating_mul(1_000)),
         media: reboxed.media,
-        duration_ms: reboxed.duration_ms,
     })
+}
+
+/// `samples` at `sample_rate` in microseconds, rounded: 120 samples at
+/// 48 kHz are 2500 µs. `None` for no samples or no rate.
+fn soundkit_duration_us(samples: u64, sample_rate: u32) -> Option<u32> {
+    let sample_rate = u64::from(sample_rate);
+    if samples == 0 || sample_rate == 0 {
+        return None;
+    }
+    let us = samples
+        .saturating_mul(1_000_000)
+        .saturating_add(sample_rate / 2)
+        / sample_rate;
+    u32::try_from(us).ok()
 }
 
 fn encode_fmp4_slot(init: &[u8], media: &[u8]) -> Result<Bytes> {
@@ -856,13 +969,20 @@ struct Args {
     mesh_sync_on_publish: bool,
 
     /// Part events that the hop journal keeps in memory and serves on
-    /// /api/hops. Zero turns the journal off.
+    /// /api/hops. Zero turns the journal off. Unset, the journal holds
+    /// --hop-journal-seconds of parts of --part-us (see
+    /// `hop_journal_capacity_for`).
+    #[arg(long, env = "NEEDLETAIL_HOP_JOURNAL_CAPACITY")]
+    hop_journal_capacity: Option<usize>,
+
+    /// Seconds of parts that the hop journal holds when
+    /// --hop-journal-capacity is not given.
     #[arg(
         long,
-        env = "NEEDLETAIL_HOP_JOURNAL_CAPACITY",
-        default_value_t = DEFAULT_HOP_JOURNAL_CAPACITY
+        env = "NEEDLETAIL_HOP_JOURNAL_SECONDS",
+        default_value_t = DEFAULT_HOP_JOURNAL_SECONDS
     )]
-    hop_journal_capacity: usize,
+    hop_journal_seconds: u64,
 
     /// Forward a RelaySession datagram to every downstream child with a
     /// non-blocking send first, and wait only for the children whose socket
@@ -1087,19 +1207,59 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_STREAM_ID)]
     stream_id: u64,
 
-    #[arg(long, env = "AV_LL_HLS_PART_MS", default_value_t = 50)]
-    part_ms: u64,
+    /// Nominal part of the node in microseconds: the PART-TARGET of a stream
+    /// that declares none, and the unit in which segments and windows given
+    /// as time are counted. Default 2500, one 2.5 ms Opus frame. Wins over
+    /// --part-ms when both are given.
+    #[arg(long = "part-us", env = "AV_LL_HLS_PART_US")]
+    part_us_arg: Option<u64>,
+
+    /// The nominal part in whole milliseconds. Kept as an alias of
+    /// --part-us.
+    #[arg(long, env = "AV_LL_HLS_PART_MS")]
+    part_ms: Option<u64>,
+
+    /// The nominal part in microseconds, resolved from --part-us and
+    /// --part-ms by `normalized`.
+    #[arg(skip)]
+    part_us: u64,
 
     /// Default duration represented by one blocking LL-HLS tail response.
-    /// The cache remains at part-ms granularity.
+    /// The cache remains at part granularity.
     #[arg(long, env = "AV_LL_HLS_RESPONSE_MS")]
     response_ms: Option<u64>,
 
-    #[arg(long, default_value_t = 4)]
+    /// Nominal segment of a stream without stamps, in milliseconds. Counted
+    /// in parts of --part-us. --parts-per-segment wins when given.
+    #[arg(long, env = "AV_LL_HLS_SEGMENT_MS", default_value_t = DEFAULT_SEGMENT_MS)]
+    segment_ms: u64,
+
+    /// The playlist window and the ring of the cache, in milliseconds.
+    /// Counted in parts of --part-us. --window-parts wins when given.
+    #[arg(long, env = "AV_LL_HLS_WINDOW_MS", default_value_t = DEFAULT_WINDOW_MS)]
+    window_ms: u64,
+
+    /// Parts in a nominal segment. Overrides --segment-ms.
+    #[arg(long = "parts-per-segment")]
+    parts_per_segment_arg: Option<usize>,
+
+    /// Parts in the playlist window. Overrides --window-ms.
+    #[arg(long = "window-parts")]
+    window_parts_arg: Option<usize>,
+
+    /// Parts in a nominal segment, resolved by `normalized`.
+    #[arg(skip)]
     parts_per_segment: usize,
 
-    #[arg(long, default_value_t = 24)]
+    /// Parts in the playlist window, resolved by `normalized`.
+    #[arg(skip)]
     window_parts: usize,
+
+    /// A floor for PART-HOLD-BACK in milliseconds. PART-HOLD-BACK is three
+    /// part targets, or this floor when it is larger. 0 keeps three part
+    /// targets.
+    #[arg(long, env = "AV_LL_HLS_PART_HOLD_BACK_MS", default_value_t = 0)]
+    part_hold_back_ms: u64,
 
     /// How long one unrecovered canonical object may hold back the contiguous
     /// watermark that gates cache-mesh replication before the watermark skips
@@ -1655,7 +1815,7 @@ async fn main() -> Result<()> {
     let private_discovery_status = PrivateDiscoveryStatus::unavailable();
     let cache = LiveTsCache::with_slots(
         args.stream_id,
-        Duration::from_millis(args.part_ms),
+        Duration::from_micros(args.part_us),
         args.parts_per_segment,
         args.window_parts,
         args.slot_kb,
@@ -1663,6 +1823,7 @@ async fn main() -> Result<()> {
     )
     .await;
     cache.set_canonical_gap_hold(Duration::from_millis(args.canonical_gap_hold_ms));
+    cache.set_part_hold_back_floor(Duration::from_millis(args.part_hold_back_ms));
     let link_telemetry = Arc::new(LinkTelemetry::new(
         node_id.clone(),
         args.relay_primary_peer
@@ -1671,7 +1832,11 @@ async fn main() -> Result<()> {
             .map(|peer| (args.relay_secondary_id.clone(), peer)),
     ));
     cache.set_link_telemetry(Arc::clone(&link_telemetry));
-    let hop_journal = Arc::new(HopJournal::new(node_id.clone(), args.hop_journal_capacity));
+    let hop_journal = Arc::new(HopJournal::new(
+        node_id.clone(),
+        args.hop_journal_capacity
+            .unwrap_or_else(|| hop_journal_capacity_for(args.part_us, args.hop_journal_seconds)),
+    ));
     cache.set_hop_journal(Arc::clone(&hop_journal));
 
     let mesh_transport = MeshTransportConfigSnapshot {
@@ -1900,8 +2065,10 @@ async fn main() -> Result<()> {
     };
     let router = AppRouter::new(
         Arc::clone(&cache),
-        usize::try_from(args.response_ms.unwrap_or(args.part_ms) / args.part_ms)
-            .context("LL-HLS response part count exceeds this platform")?,
+        usize::try_from(args.response_ms.map_or(1, |response_ms| {
+            response_ms.saturating_mul(1_000) / args.part_us
+        }))
+        .context("LL-HLS response part count exceeds this platform")?,
         Arc::clone(&mesh_handle),
         audio_epoch_tx.clone(),
         mesh_transport,
@@ -2203,20 +2370,40 @@ impl Args {
     }
 
     fn normalized(mut self) -> Result<Self> {
-        if self.part_ms == 0 {
-            bail!("--part-ms must be at least 1");
+        self.part_us = match (self.part_us_arg, self.part_ms) {
+            (Some(part_us), _) => part_us,
+            (None, Some(part_ms)) => part_ms.saturating_mul(1_000),
+            (None, None) => DEFAULT_PART_US,
+        };
+        if self.part_us == 0 {
+            bail!("--part-us (or --part-ms) must be at least 1");
+        }
+        if self.part_us > u64::from(u32::MAX) {
+            bail!("--part-us must be at most {} µs", u32::MAX);
         }
         if let Some(response_ms) = self.response_ms {
-            if response_ms < self.part_ms || !response_ms.is_multiple_of(self.part_ms) {
-                bail!("--response-ms must be a positive multiple of --part-ms");
+            let response_us = response_ms.saturating_mul(1_000);
+            if response_us < self.part_us || !response_us.is_multiple_of(self.part_us) {
+                bail!("--response-ms must be a positive multiple of the part");
             }
-            if response_ms / self.part_ms > MAX_LLHLS_TAIL_PARTS as u64 {
+            if response_us / self.part_us > MAX_LLHLS_TAIL_PARTS as u64 {
                 bail!("--response-ms may contain at most {MAX_LLHLS_TAIL_PARTS} parts");
             }
         }
-        self.parts_per_segment = self.parts_per_segment.max(1);
-        self.window_parts = self.window_parts.max(self.parts_per_segment * 3).max(6);
-        let response_parts = self.response_ms.unwrap_or(self.part_ms) / self.part_ms;
+        // Segments and windows are lengths of time. An explicit count of
+        // parts is kept as given, as before.
+        self.parts_per_segment = self
+            .parts_per_segment_arg
+            .unwrap_or_else(|| parts_in_ms(self.segment_ms.max(1), self.part_us))
+            .max(1);
+        self.window_parts = self
+            .window_parts_arg
+            .unwrap_or_else(|| parts_in_ms(self.window_ms.max(1), self.part_us))
+            .max(self.parts_per_segment * 3)
+            .max(6);
+        let response_parts = self.response_ms.map_or(1, |response_ms| {
+            response_ms.saturating_mul(1_000) / self.part_us
+        });
         let retained_cache_parts = self.window_parts.saturating_mul(4).max(32) as u64;
         if response_parts > retained_cache_parts {
             bail!(
@@ -4836,10 +5023,12 @@ struct HlsReloadPosition {
 /// Convert the canonical gap hold into parts at the configured part cadence.
 /// A zero hold disables gap skipping; any other hold is at least one part.
 fn canonical_gap_hold_parts(hold_ms: u64, part_target: Duration) -> u64 {
-    let part_ms = u64::try_from(part_target.as_millis())
-        .unwrap_or(u64::MAX)
-        .max(1);
-    hold_ms.div_ceil(part_ms)
+    // A node with no part target counts the hold in milliseconds.
+    let part_us = match duration_us(part_target) {
+        0 => 1_000,
+        part_us => part_us,
+    };
+    hold_ms.saturating_mul(1_000).div_ceil(part_us)
 }
 
 struct LiveTsCache {
@@ -4853,6 +5042,9 @@ struct LiveTsCache {
     canonical_commit_locks: StdMutex<HashMap<u64, Arc<AsyncMutex<()>>>>,
     canonical_gap_hold_ms: AtomicU64,
     canonical_gap_hold_parts: AtomicU64,
+    /// A floor for PART-HOLD-BACK in microseconds; zero keeps three part
+    /// targets.
+    part_hold_back_floor_us: AtomicU64,
     canonical_gap_skips: AtomicU64,
     canonical_gap_idle_flushes: AtomicU64,
     canonical_gap_skipped_parts: AtomicU64,
@@ -4914,9 +5106,7 @@ impl LiveTsCache {
         let (part_updates, _) = watch::channel(0);
         let mut state = LiveState::new();
         state.segment_seed_parts = parts_per_segment.max(1) as u64;
-        state.nominal_part_ms = u64::try_from(part_target.as_millis())
-            .unwrap_or(u64::MAX)
-            .max(1);
+        state.nominal_part_us = duration_us(part_target).max(1);
         Arc::new(Self {
             chunk_cache,
             stream_id,
@@ -4931,6 +5121,7 @@ impl LiveTsCache {
                 DEFAULT_CANONICAL_GAP_HOLD_MS,
                 part_target,
             )),
+            part_hold_back_floor_us: AtomicU64::new(0),
             canonical_gap_skips: AtomicU64::new(0),
             canonical_gap_idle_flushes: AtomicU64::new(0),
             canonical_gap_skipped_parts: AtomicU64::new(0),
@@ -5097,6 +5288,21 @@ impl LiveTsCache {
         );
     }
 
+    /// Configure a floor for PART-HOLD-BACK. Zero keeps three part targets.
+    fn set_part_hold_back_floor(&self, floor: Duration) {
+        self.part_hold_back_floor_us
+            .store(duration_us(floor), Ordering::Relaxed);
+    }
+
+    /// PART-HOLD-BACK for a part target: three part targets, or the
+    /// configured floor when it is larger. RFC 8216bis asks for at least
+    /// two part targets and recommends three.
+    fn part_hold_back_us(&self, part_target_us: u64) -> u64 {
+        part_target_us
+            .saturating_mul(3)
+            .max(self.part_hold_back_floor_us.load(Ordering::Relaxed))
+    }
+
     fn canonical_gap_skip_snapshot(&self) -> CanonicalGapSkipSnapshot {
         CanonicalGapSkipSnapshot {
             hold_ms: self.canonical_gap_hold_ms.load(Ordering::Relaxed),
@@ -5127,7 +5333,9 @@ impl LiveTsCache {
         if hold_ms == 0 {
             return;
         }
-        let hold_parts = hold_ms.div_ceil(self.state.read().await.stream_part_ms(stream_id));
+        let hold_parts = hold_ms
+            .saturating_mul(1_000)
+            .div_ceil(self.state.read().await.stream_part_us(stream_id));
         if hold_parts == 0 {
             return;
         }
@@ -5416,13 +5624,13 @@ impl LiveTsCache {
         state.last_committed_seq = Some(part.seq);
         state.last_committed_unix_ms = Some(part.committed_unix_ms);
         state.last_committed_bytes = Some(part.bytes);
-        state.last_committed_duration_ms = Some(part.duration_ms);
+        state.last_committed_duration_us = Some(part.duration_us);
         state.record_part_available(
             self.stream_id,
             part.seq,
             part.bytes,
             now_unix_us(),
-            u32::try_from(part.duration_ms).ok(),
+            u32::try_from(part.duration_us).ok(),
             false,
             false,
             None,
@@ -5432,7 +5640,7 @@ impl LiveTsCache {
             stream_id = self.stream_id,
             sequence = part.seq,
             bytes = part.bytes,
-            duration_ms = part.duration_ms,
+            duration_us = part.duration_us,
             "committed mesh byte part"
         );
         drop(state);
@@ -5522,9 +5730,9 @@ impl LiveTsCache {
                 state.stream_parts.remove(&stream_id);
                 state.stream_keyframe_segments.remove(&stream_id);
                 state.stream_retained_bytes.remove(&stream_id);
-                state.stream_max_part_duration_ms.remove(&stream_id);
-                state.stream_max_segment_duration_ms.remove(&stream_id);
-                state.stream_declared_ms.remove(&stream_id);
+                state.stream_max_part_duration_us.remove(&stream_id);
+                state.stream_max_segment_duration_us.remove(&stream_id);
+                state.stream_declared_us.remove(&stream_id);
                 state.stream_playlist_floor.remove(&stream_id);
                 state.stream_init_scanned.remove(&stream_id);
                 state.stream_inits.remove(&stream_id);
@@ -5533,7 +5741,7 @@ impl LiveTsCache {
                     state.last_committed_seq = None;
                     state.last_committed_unix_ms = None;
                     state.last_committed_bytes = None;
-                    state.last_committed_duration_ms = None;
+                    state.last_committed_duration_us = None;
                 }
                 info!(
                     stream_id,
@@ -5556,17 +5764,10 @@ impl LiveTsCache {
             let media_bytes = reboxed_audio
                 .as_ref()
                 .map_or_else(|| object.payload().len(), |reboxed| reboxed.media.len());
-            let media_duration_ms = reboxed_audio
+            let media_duration_us = reboxed_audio
                 .as_ref()
-                .map(|reboxed| reboxed.duration_ms)
-                .or_else(|| {
-                    object
-                        .metadata()
-                        .get("duration-ms")
-                        .and_then(|value| std::str::from_utf8(value).ok())
-                        .and_then(|value| value.parse::<u32>().ok())
-                        .filter(|duration_ms| *duration_ms > 0)
-                });
+                .map(|reboxed| reboxed.duration_us)
+                .or_else(|| object_duration_us(&object));
             let is_fmp4 = object
                 .metadata()
                 .get("container")
@@ -5705,13 +5906,13 @@ impl LiveTsCache {
                 Some(state.last_committed_seq.map_or(seq, |last| last.max(seq)));
             state.last_committed_unix_ms = Some(now_ms);
             state.last_committed_bytes = Some(media_bytes);
-            state.last_committed_duration_ms = media_duration_ms.map(u64::from);
+            state.last_committed_duration_us = media_duration_us.map(u64::from);
             state.record_part_available(
                 stream_id,
                 seq,
                 cached_bytes,
                 now_unix_us(),
-                media_duration_ms,
+                media_duration_us,
                 object.is_keyframe(),
                 media_kind == LiveMediaKind::Fmp4,
                 object_part_stamp(&object),
@@ -5770,7 +5971,7 @@ impl LiveTsCache {
         state.last_committed_seq = Some(state.last_committed_seq.map_or(seq, |last| last.max(seq)));
         state.last_committed_unix_ms = Some(now_ms);
         state.last_committed_bytes = Some(media_bytes);
-        state.last_committed_duration_ms = None;
+        state.last_committed_duration_us = None;
         state.record_part_available(
             stream_id,
             seq,
@@ -5873,7 +6074,7 @@ impl LiveTsCache {
             sequence,
             bytes.len(),
             now_unix_us(),
-            record.duration_ms,
+            record.duration_us,
             record.keyframe,
             record.keyframe_segments,
             record.stamp,
@@ -5950,16 +6151,23 @@ impl LiveTsCache {
 
     /// Measured bit rate of a playlist over its retained parts.
     async fn playlist_bitrate_bps(&self, stream_id: u64) -> Option<u64> {
-        let nominal_ms = self.part_target.as_millis().clamp(1, u128::from(u32::MAX)) as u64;
         let state = self.state.read().await;
-        state.playlist_bitrate_bps(stream_id, nominal_ms, self.min_bitrate_window_ms())
+        state.playlist_bitrate_bps(
+            stream_id,
+            self.nominal_part_us(),
+            self.min_bitrate_window_ms(),
+        )
+    }
+
+    /// The nominal part of the node in microseconds, at least one.
+    fn nominal_part_us(&self) -> u64 {
+        duration_us(self.part_target).max(1)
     }
 
     /// The bit rate of a playlist is measured over at least four seconds, or
     /// over half of the window of a node with a shorter window.
     fn min_bitrate_window_ms(&self) -> u64 {
-        let window_ms = (self.window_parts as u64)
-            .saturating_mul(self.part_target.as_millis().clamp(1, u128::from(u32::MAX)) as u64);
+        let window_ms = (self.window_parts as u64).saturating_mul(self.nominal_part_us()) / 1_000;
         MIN_BITRATE_WINDOW_MS.min(window_ms / 2)
     }
 
@@ -6246,12 +6454,11 @@ impl LiveTsCache {
         }
 
         let next_part = available.last().copied().unwrap_or(0) + 1;
-        let nominal_part_duration_ms =
-            self.part_target.as_millis().clamp(1, u32::MAX as u128) as u32;
-        let (part_target_ms, declared_target_ms, available) = {
+        let nominal_part_duration_us = u32::try_from(self.nominal_part_us()).unwrap_or(u32::MAX);
+        let (part_target_us, declared_target_us, available) = {
             let state = self.state.read().await;
             let observations = state.stream_parts.get(&stream_id);
-            let declared = state.stream_declared_ms.get(&stream_id).copied();
+            let declared = state.stream_declared_us.get(&stream_id).copied();
             // A part that the cache mesh has just written has no playlist
             // entry for a moment. Listing it now would give it the nominal
             // duration of the node and no independent flag. It is listed
@@ -6266,22 +6473,22 @@ impl LiveTsCache {
             // A stamped stream has the part target that its contributor
             // declares. Another stream has its longest part, and no less
             // than the nominal part of the node.
-            let part_target_ms = match declared {
-                Some((part_ms, _)) if part_ms > 0 => part_ms,
+            let part_target_us = match declared {
+                Some((part_us, _)) if part_us > 0 => part_us,
                 _ => state
-                    .stream_max_part_duration_ms
+                    .stream_max_part_duration_us
                     .get(&stream_id)
                     .copied()
-                    .unwrap_or(nominal_part_duration_ms)
-                    .max(nominal_part_duration_ms),
+                    .unwrap_or(nominal_part_duration_us)
+                    .max(nominal_part_duration_us),
             };
             let available = available
                 .into_iter()
                 .map(|sequence| {
-                    let duration_ms = observations
+                    let duration_us = observations
                         .and_then(|parts| parts.get(&sequence))
-                        .and_then(|part| part.duration_ms)
-                        .unwrap_or(nominal_part_duration_ms);
+                        .and_then(|part| part.duration_us)
+                        .unwrap_or(nominal_part_duration_us);
                     let keyframe = observations
                         .and_then(|parts| parts.get(&sequence))
                         .is_some_and(|part| part.keyframe);
@@ -6300,7 +6507,7 @@ impl LiveTsCache {
                         .unwrap_or_default();
                     (
                         sequence,
-                        duration_ms,
+                        duration_us,
                         keyframe,
                         fmp4_segment_id,
                         available_unix_us,
@@ -6309,12 +6516,11 @@ impl LiveTsCache {
                 })
                 .collect::<Vec<_>>();
             (
-                part_target_ms,
-                declared.map(|(_, target_ms)| u64::from(target_ms)),
+                part_target_us,
+                declared.map(|(_, target_us)| u64::from(target_us)),
                 available,
             )
         };
-        let part_target = f64::from(part_target_ms) / 1_000.0;
         // The hint names the part after the last part that is listed.
         let next_part = available
             .last()
@@ -6332,7 +6538,7 @@ impl LiveTsCache {
                 .any(|(_, _, _, segment_id, _, _)| segment_id.is_some());
         let mut first_stamped_parts: BTreeMap<u64, u32> = BTreeMap::new();
         let mut groups: BTreeMap<u64, Vec<(u64, u32, bool, u64)>> = BTreeMap::new();
-        for (seq, duration_ms, keyframe, fmp4_segment_id, available_unix_us, stamped_part) in
+        for (seq, duration_us, keyframe, fmp4_segment_id, available_unix_us, stamped_part) in
             available
         {
             if let (Some(segment_id), Some(stamped_part)) = (fmp4_segment_id, stamped_part) {
@@ -6350,7 +6556,7 @@ impl LiveTsCache {
             };
             groups.entry(segment_id).or_default().push((
                 seq,
-                duration_ms,
+                duration_us,
                 keyframe,
                 available_unix_us,
             ));
@@ -6376,7 +6582,7 @@ impl LiveTsCache {
             // advertise that truncated parent as a playable HLS segment.
             groups.retain(|_segment_id, group| {
                 group.first().is_some_and(
-                    |(_sequence, _duration_ms, keyframe, _available_unix_us)| *keyframe,
+                    |(_sequence, _duration_us, keyframe, _available_unix_us)| *keyframe,
                 )
             });
         } else if groups.len() > 1 {
@@ -6389,7 +6595,7 @@ impl LiveTsCache {
                 if groups
                     .get(&first_segment)
                     .and_then(|group| group.first())
-                    .is_some_and(|(sequence, _duration_ms, _keyframe, _available_unix_us)| {
+                    .is_some_and(|(sequence, _duration_us, _keyframe, _available_unix_us)| {
                         *sequence != expected_first_sequence
                     })
                 {
@@ -6413,8 +6619,8 @@ impl LiveTsCache {
             && groups
                 .last_key_value()
                 .and_then(|(_segment_id, group)| group.last())
-                .is_some_and(|(_sequence, duration_ms, _keyframe, _available_unix_us)| {
-                    part_ends_segment_short(*duration_ms, part_target_ms)
+                .is_some_and(|(_sequence, duration_us, _keyframe, _available_unix_us)| {
+                    part_ends_segment_short(*duration_us, part_target_us)
                 });
         let segment_is_complete = |segment_id: u64, group_len: usize| {
             if keyframe_aligned_segments {
@@ -6423,52 +6629,52 @@ impl LiveTsCache {
                 group_len == self.parts_per_segment
             }
         };
-        let observed_segment_duration_ms = groups
+        let observed_segment_duration_us = groups
             .iter()
             .filter(|(segment_id, group)| segment_is_complete(**segment_id, group.len()))
             .map(|(_segment_id, group)| {
                 group
                     .iter()
-                    .map(|(_sequence, duration_ms, _keyframe, _available_unix_us)| {
-                        u64::from(*duration_ms)
+                    .map(|(_sequence, duration_us, _keyframe, _available_unix_us)| {
+                        u64::from(*duration_us)
                     })
                     .sum::<u64>()
             })
             .max();
-        let fallback_segment_duration_ms =
-            u64::from(nominal_part_duration_ms) * self.parts_per_segment as u64;
-        let segment_target_ms = {
+        let fallback_segment_duration_us =
+            u64::from(nominal_part_duration_us) * self.parts_per_segment as u64;
+        let segment_target_us = {
             let mut state = self.state.write().await;
-            if let Some(observed_duration_ms) = observed_segment_duration_ms {
+            if let Some(observed_duration_us) = observed_segment_duration_us {
                 state
-                    .stream_max_segment_duration_ms
+                    .stream_max_segment_duration_us
                     .entry(stream_id)
-                    .and_modify(|duration_ms| {
-                        *duration_ms = (*duration_ms).max(observed_duration_ms);
+                    .and_modify(|duration_us| {
+                        *duration_us = (*duration_us).max(observed_duration_us);
                     })
-                    .or_insert(observed_duration_ms);
+                    .or_insert(observed_duration_us);
             }
             let observed = state
-                .stream_max_segment_duration_ms
+                .stream_max_segment_duration_us
                 .get(&stream_id)
                 .copied();
-            match declared_target_ms {
+            match declared_target_us {
                 // The target duration of a stamped stream is the one that
                 // its contributor declares, and nothing else. One long
                 // segment, after a fault upstream, is longer than the target
                 // while it is in the playlist. It does not raise the target
                 // of the stream for good, and with it the hold-back of every
                 // player.
-                Some(declared_ms) if declared_ms > 0 => {
+                Some(declared_us) if declared_us > 0 => {
                     let _ = observed;
-                    declared_ms
+                    declared_us
                 }
                 _ => observed
-                    .unwrap_or(fallback_segment_duration_ms)
-                    .max(fallback_segment_duration_ms),
+                    .unwrap_or(fallback_segment_duration_us)
+                    .max(fallback_segment_duration_us),
             }
         };
-        let target_duration = hls_target_duration_from_millis(segment_target_ms);
+        let target_duration = hls_target_duration_from_micros(segment_target_us);
 
         let mut out = String::new();
         out.push_str("#EXTM3U\n");
@@ -6491,22 +6697,21 @@ impl LiveTsCache {
                 );
             }
         }
-        out.push_str(&format!("#EXT-X-PART-INF:PART-TARGET={part_target:.3}\n"));
-        out.push_str(&format!(
-            "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={:.3},HOLD-BACK={:.3}\n",
-            part_target * 3.0,
-            (target_duration as f64 * 3.0).max(3.0)
-        ));
+        push_part_inf_and_server_control(
+            &mut out,
+            u64::from(part_target_us),
+            self.part_hold_back_us(u64::from(part_target_us)),
+            target_duration,
+        );
         let program_date_time = groups
             .values()
             .next()
             .and_then(|group| group.first())
-            .filter(|(_sequence, _duration_ms, _keyframe, available_unix_us)| {
+            .filter(|(_sequence, _duration_us, _keyframe, available_unix_us)| {
                 *available_unix_us > 0
             })
-            .and_then(|(_sequence, duration_ms, _keyframe, available_unix_us)| {
-                let start_unix_us =
-                    available_unix_us.saturating_sub(u64::from(*duration_ms).saturating_mul(1_000));
+            .and_then(|(_sequence, duration_us, _keyframe, available_unix_us)| {
+                let start_unix_us = available_unix_us.saturating_sub(u64::from(*duration_us));
                 format_hls_program_date_time(start_unix_us)
             });
         if let Some(program_date_time) = program_date_time {
@@ -6518,16 +6723,15 @@ impl LiveTsCache {
             .last_key_value()
             .map(|(segment, _group)| *segment)
             .unwrap_or(0);
-        let parted_window_segments = (target_duration.saturating_mul(3_000))
-            .div_ceil(segment_target_ms.max(1))
+        let parted_window_segments = (target_duration.saturating_mul(3_000_000))
+            .div_ceil(segment_target_us.max(1))
             .max(1);
         let first_parted_segment =
             last_segment.saturating_sub(parted_window_segments.saturating_sub(1));
         for (segment, group) in groups {
-            let mut duration = 0.0;
-            for (seq, duration_ms, keyframe, _available_unix_us) in &group {
-                let part_duration = f64::from(*duration_ms) / 1_000.0;
-                duration += part_duration;
+            let mut segment_duration_us = 0_u64;
+            for (seq, duration_us, keyframe, _available_unix_us) in &group {
+                segment_duration_us = segment_duration_us.saturating_add(u64::from(*duration_us));
                 if segment < first_parted_segment {
                     continue;
                 }
@@ -6537,12 +6741,14 @@ impl LiveTsCache {
                     } else {
                         ""
                     };
-                out.push_str(&format!(
-                    "#EXT-X-PART:DURATION={part_duration:.3},URI=\"part{seq}.{extension}\"{independent}\n"
-                ));
+                out.push_str("#EXT-X-PART:DURATION=");
+                push_seconds(&mut out, u64::from(*duration_us));
+                out.push_str(&format!(",URI=\"part{seq}.{extension}\"{independent}\n"));
             }
             if segment_is_complete(segment, group.len()) {
-                out.push_str(&format!("#EXTINF:{duration:.3},\n"));
+                out.push_str("#EXTINF:");
+                push_seconds(&mut out, segment_duration_us);
+                out.push_str(",\n");
                 out.push_str(&format!("seg{segment}.{extension}\n"));
             }
         }
@@ -6589,43 +6795,37 @@ impl LiveTsCache {
         media_kind: LiveMediaKind,
         include_map: bool,
     ) -> String {
-        let part_target = self.part_target.as_secs_f64();
-        let target_duration = hls_target_duration_from_millis(
-            (self.part_target.as_millis() as u64) * self.parts_per_segment as u64,
-        );
         let extension = media_kind.extension();
-        let map = if include_map {
-            "#EXT-X-MAP:URI=\"init.mp4\"\n"
-        } else {
-            ""
-        };
         let preload_hint = if media_kind == LiveMediaKind::Fmp4 && !include_map {
             String::new()
         } else {
             format!("#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part{next_part}.{extension}\"\n")
         };
-        format!(
-            "#EXTM3U\n#EXT-X-VERSION:10\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:0\n{map}#EXT-X-PART-INF:PART-TARGET={part_target:.3}\n#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={:.3},HOLD-BACK={:.3}\n{preload_hint}",
-            part_target * 3.0,
-            (target_duration as f64 * 3.0).max(3.0)
-        )
+        let mut out = self.waiting_playlist(include_map);
+        out.push_str(&preload_hint);
+        out
     }
 
     fn waiting_playlist(&self, include_map: bool) -> String {
-        let part_target = self.part_target.as_secs_f64();
-        let target_duration = hls_target_duration_from_millis(
-            (self.part_target.as_millis() as u64) * self.parts_per_segment as u64,
+        let part_target_us = self.nominal_part_us();
+        let target_duration = hls_target_duration_from_micros(
+            part_target_us.saturating_mul(self.parts_per_segment as u64),
         );
         let map = if include_map {
             "#EXT-X-MAP:URI=\"init.mp4\"\n"
         } else {
             ""
         };
-        format!(
-            "#EXTM3U\n#EXT-X-VERSION:10\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:0\n{map}#EXT-X-PART-INF:PART-TARGET={part_target:.3}\n#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={:.3},HOLD-BACK={:.3}\n",
-            part_target * 3.0,
-            (target_duration as f64 * 3.0).max(3.0)
-        )
+        let mut out = format!(
+            "#EXTM3U\n#EXT-X-VERSION:10\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:0\n{map}"
+        );
+        push_part_inf_and_server_control(
+            &mut out,
+            part_target_us,
+            self.part_hold_back_us(part_target_us),
+            target_duration,
+        );
+        out
     }
 
     async fn remember_media_kind(&self, stream_id: u64, media_kind: LiveMediaKind) {
@@ -6918,21 +7118,21 @@ impl LiveTsCache {
     /// declares, or the nominal segment of the node.
     async fn target_duration_ms(&self, stream_id: u64) -> u64 {
         let state = self.state.read().await;
-        let nominal = (self.part_target.as_millis() as u64)
-            .saturating_mul(self.parts_per_segment as u64)
-            .max(1_000);
-        state
-            .stream_declared_ms
+        let nominal_us = self
+            .nominal_part_us()
+            .saturating_mul(self.parts_per_segment as u64);
+        let target_us = state
+            .stream_declared_us
             .get(&stream_id)
-            .map(|(_, target_ms)| u64::from(*target_ms))
+            .map(|(_, target_us)| u64::from(*target_us))
             .or_else(|| {
                 state
-                    .stream_max_segment_duration_ms
+                    .stream_max_segment_duration_us
                     .get(&stream_id)
                     .copied()
             })
-            .unwrap_or(nominal)
-            .max(1_000)
+            .unwrap_or(nominal_us);
+        (target_us / 1_000).max(1_000)
     }
 
     #[cfg(test)]
@@ -6962,12 +7162,7 @@ impl LiveTsCache {
         let Some(parts) = state.stream_parts.get(&stream_id) else {
             return HlsReloadOutcome::TimedOut;
         };
-        let part_target_ms = state
-            .stream_declared_ms
-            .get(&stream_id)
-            .map(|(part_ms, _)| u64::from(*part_ms))
-            .unwrap_or_else(|| state.stream_part_ms(stream_id))
-            .max(1);
+        let part_target_us = state.stream_part_target_us(stream_id);
         let keyframe_segments = parts.values().any(|part| part.fmp4_segment_id.is_some());
         let mut segment_parts = BTreeMap::<u64, usize>::new();
         for (sequence, observation) in parts {
@@ -6995,8 +7190,8 @@ impl LiveTsCache {
             return HlsReloadOutcome::TooFarAhead;
         }
         // The advance part limit: three seconds of parts, or three parts.
-        let advance_parts = if part_target_ms < 1_000 {
-            3_000_u64.div_ceil(part_target_ms)
+        let advance_parts = if part_target_us < 1_000_000 {
+            3_000_000_u64.div_ceil(part_target_us)
         } else {
             3
         };
@@ -7031,16 +7226,11 @@ impl LiveTsCache {
             // No part of the stream yet: a copy is on its way to this cache.
             return true;
         };
-        let part_ms = {
-            let state = self.state.read().await;
-            state
-                .stream_declared_ms
-                .get(&stream_id)
-                .map(|(part_ms, _)| u64::from(*part_ms))
-                .unwrap_or_else(|| state.stream_part_ms(stream_id))
-                .max(1)
-        };
-        let ahead = PART_WAIT_MS.div_ceil(part_ms).saturating_add(4);
+        let part_us = self.state.read().await.stream_part_target_us(stream_id);
+        let ahead = PART_WAIT_MS
+            .saturating_mul(1_000)
+            .div_ceil(part_us)
+            .saturating_add(4);
         let last = last as u64;
         if sequence > last {
             return sequence - last <= ahead;
@@ -7273,18 +7463,18 @@ impl LiveTsCache {
             let state = self.state.read().await;
             match state.stream_parts.get(&stream_id) {
                 Some(parts) if parts.values().any(|part| part.fmp4_segment_id.is_some()) => {
-                    let declared_part_ms = state
-                        .stream_declared_ms
+                    let declared_part_us = state
+                        .stream_declared_us
                         .get(&stream_id)
-                        .map_or(0, |(part_ms, _)| *part_ms);
+                        .map_or(0, |(part_us, _)| *part_us);
                     let ended_short = parts
                         .iter()
                         .filter(|(_sequence, part)| part.fmp4_segment_id == Some(segment))
                         .max_by_key(|(sequence, _part)| **sequence)
                         .is_some_and(|(_sequence, part)| {
                             part.stamped_part.is_some()
-                                && part.duration_ms.is_some_and(|duration_ms| {
-                                    part_ends_segment_short(duration_ms, declared_part_ms)
+                                && part.duration_us.is_some_and(|duration_us| {
+                                    part_ends_segment_short(duration_us, declared_part_us)
                                 })
                         });
                     let segment_is_closed = ended_short
@@ -7350,7 +7540,9 @@ impl LiveTsCache {
         let current_part_bytes = state.current.len();
         let latest_local_part = state.last_committed_seq;
         let latest_local_part_bytes = state.last_committed_bytes;
-        let latest_local_part_duration_ms = state.last_committed_duration_ms;
+        let latest_local_part_duration_us = state.last_committed_duration_us;
+        let latest_local_part_duration_ms = latest_local_part_duration_us
+            .map(|duration_us| duration_us.saturating_add(500) / 1_000);
         let subscription_base_object = state
             .stream_subscription_base_object
             .get(&self.stream_id)
@@ -7384,7 +7576,8 @@ impl LiveTsCache {
         StatsSnapshot {
             stream_id: self.stream_id,
             stream_id_text: stream_id_text(self.stream_id),
-            part_target_ms: self.part_target.as_millis() as u64,
+            part_target_ms: self.nominal_part_us().saturating_add(500) / 1_000,
+            part_target_us: self.nominal_part_us(),
             parts_per_segment: self.parts_per_segment,
             window_parts: self.window_parts,
             datagrams_received,
@@ -7393,6 +7586,7 @@ impl LiveTsCache {
             latest_local_part,
             latest_local_part_bytes,
             latest_local_part_duration_ms,
+            latest_local_part_duration_us,
             latest_mesh_part,
             canonical_epoch,
             canonical_epoch_activation_delay_us,
@@ -7476,8 +7670,7 @@ impl LiveTsCache {
     }
 
     async fn stream_is_locally_fresh(&self, stream_id: u64) -> bool {
-        let stale_after_ms =
-            stream_stale_threshold_ms(self.part_target.as_millis() as u64, self.window_parts);
+        let stale_after_ms = stream_stale_threshold_ms(self.nominal_part_us(), self.window_parts);
         let canonical_head = {
             let state = self.state.read().await;
             let Some(last_ingest_unix_ms) = state.stream_last_ingest_unix_ms.get(&stream_id) else {
@@ -7504,8 +7697,7 @@ impl LiveTsCache {
         if stream_ids.is_empty() {
             return false;
         }
-        let stale_after_ms =
-            stream_stale_threshold_ms(self.part_target.as_millis() as u64, self.window_parts);
+        let stale_after_ms = stream_stale_threshold_ms(self.nominal_part_us(), self.window_parts);
         let now_ms = now_unix_ms();
         let state = self.state.read().await;
         stream_ids.iter().all(|stream_id| {
@@ -7535,7 +7727,7 @@ impl LiveTsCache {
     ) -> Vec<StreamTelemetry> {
         let mut streams = Vec::new();
         let now_ms = now_unix_ms();
-        let nominal_part_ms = self.part_target.as_millis().clamp(1, u128::from(u32::MAX)) as u64;
+        let nominal_part_us = self.nominal_part_us();
         let (
             canonical_epochs,
             canonical_epoch_activation_delays_us,
@@ -7551,7 +7743,7 @@ impl LiveTsCache {
                 state.stream_subscription_base_object.clone(),
                 state.stream_latest_canonical_object.clone(),
                 state.stream_last_ingest_unix_ms.clone(),
-                state.retained_stream_summaries(nominal_part_ms, self.min_bitrate_window_ms()),
+                state.retained_stream_summaries(nominal_part_us, self.min_bitrate_window_ms()),
             )
         };
         for (stream_id, retained) in retained_streams {
@@ -7653,10 +7845,11 @@ impl LiveTsCache {
                         .map(|last| now_ms.saturating_sub(*last))
                 },
                 stale_threshold_ms: Some(stream_stale_threshold_ms(
-                    default_stats.part_target_ms,
+                    default_stats.nominal_part_us(),
                     default_stats.window_parts,
                 )),
                 mesh_lag_parts: None,
+                part_target_us: retained.part_us.or(Some(default_stats.nominal_part_us())),
                 bitrate_bps: retained.bitrate_bps,
             });
         }
@@ -7784,7 +7977,8 @@ struct RetainedPartObservation {
     published_unix_us: Option<u64>,
     /// When this node wrote the part into its ChunkCache.
     committed_unix_us: Option<u64>,
-    duration_ms: Option<u32>,
+    /// Duration of the part in microseconds.
+    duration_us: Option<u32>,
     keyframe: bool,
     /// Media Sequence Number of the segment of the part: the stamp of the
     /// contributor, or a number that this cache derived for a stream
@@ -7801,6 +7995,8 @@ struct RetainedStreamSummary {
     retained_bytes: u64,
     retained_parts: u64,
     bitrate_bps: Option<u64>,
+    /// The part of the stream in microseconds.
+    part_us: Option<u64>,
 }
 
 /// The playlist entry that one cached part describes for itself.
@@ -7808,7 +8004,8 @@ struct RetainedStreamSummary {
 struct MeshPartRecord {
     media_kind: LiveMediaKind,
     init: Option<Bytes>,
-    duration_ms: Option<u32>,
+    /// Duration of the part in microseconds.
+    duration_us: Option<u32>,
     keyframe: bool,
     /// The part belongs to a stream whose segments start at key frames.
     keyframe_segments: bool,
@@ -7829,7 +8026,7 @@ impl MeshPartRecord {
             return Some(Self {
                 media_kind,
                 init,
-                duration_ms: None,
+                duration_us: None,
                 keyframe: false,
                 keyframe_segments: false,
                 published_unix_us: None,
@@ -7840,16 +8037,10 @@ impl MeshPartRecord {
         // A canonical slot holds the complete media object behind a fixed
         // index. The object names its own duration, key frame and times.
         let object = media_object::decode(bytes.get(CANONICAL_LIVE_SLOT_HEADER_LEN..)?).ok()?;
-        let duration_ms = object
-            .metadata()
-            .get("duration-ms")
-            .and_then(|value| std::str::from_utf8(value).ok())
-            .and_then(|value| value.parse::<u32>().ok())
-            .filter(|duration_ms| *duration_ms > 0);
         Some(Self {
             media_kind,
             init,
-            duration_ms,
+            duration_us: object_duration_us(&object),
             keyframe: object.is_keyframe(),
             keyframe_segments: media_kind == LiveMediaKind::Fmp4,
             published_unix_us: object_published_unix_us(&object),
@@ -7883,24 +8074,62 @@ struct PartStamp {
     msn: u64,
     /// Index of the part in its segment.
     part: u32,
-    /// Longest part of the stream, in milliseconds.
-    part_target_ms: u32,
-    /// Longest segment of the stream so far, in milliseconds.
-    target_duration_ms: u32,
+    /// Longest part of the stream, in microseconds.
+    part_target_us: u32,
+    /// Longest segment of the stream so far, in microseconds.
+    target_duration_us: u32,
+}
+
+fn object_metadata_number<T: std::str::FromStr>(object: &MediaObject, key: &str) -> Option<T> {
+    std::str::from_utf8(object.metadata().get(key)?)
+        .ok()?
+        .parse()
+        .ok()
+}
+
+/// A time of the object metadata in microseconds: the exact `<name>-us` key
+/// that a current contributor writes, else the whole-millisecond
+/// `<name>-ms` key of an older one. Zero is no value.
+fn object_metadata_us(object: &MediaObject, us_key: &str, ms_key: &str) -> Option<u32> {
+    object_metadata_number::<u32>(object, us_key)
+        .filter(|us| *us > 0)
+        .or_else(|| {
+            object_metadata_number::<u32>(object, ms_key)
+                .filter(|ms| *ms > 0)
+                .map(|ms| ms.saturating_mul(1_000))
+        })
+}
+
+/// Duration of a media object in microseconds: `duration-us`, else
+/// `duration-samples` at `sample-rate` (rounded to the microsecond), else
+/// `duration-ms`.
+fn object_duration_us(object: &MediaObject) -> Option<u32> {
+    object_metadata_number::<u32>(object, "duration-us")
+        .filter(|us| *us > 0)
+        .or_else(|| {
+            let samples = object_metadata_number::<u64>(object, "duration-samples")?;
+            let rate =
+                object_metadata_number::<u64>(object, "sample-rate").filter(|rate| *rate > 0)?;
+            let us = samples.saturating_mul(1_000_000).saturating_add(rate / 2) / rate;
+            u32::try_from(us).ok().filter(|us| *us > 0)
+        })
+        .or_else(|| {
+            object_metadata_number::<u32>(object, "duration-ms")
+                .filter(|ms| *ms > 0)
+                .map(|ms| ms.saturating_mul(1_000))
+        })
 }
 
 fn object_part_stamp(object: &MediaObject) -> Option<PartStamp> {
-    fn number<T: std::str::FromStr>(object: &MediaObject, key: &str) -> Option<T> {
-        std::str::from_utf8(object.metadata().get(key)?)
-            .ok()?
-            .parse()
-            .ok()
-    }
     Some(PartStamp {
-        msn: number(object, "hls-msn")?,
-        part: number(object, "hls-part")?,
-        part_target_ms: number::<u32>(object, "hls-part-target-ms").filter(|ms| *ms > 0)?,
-        target_duration_ms: number::<u32>(object, "hls-target-duration-ms").filter(|ms| *ms > 0)?,
+        msn: object_metadata_number(object, "hls-msn")?,
+        part: object_metadata_number(object, "hls-part")?,
+        part_target_us: object_metadata_us(object, "hls-part-target-us", "hls-part-target-ms")?,
+        target_duration_us: object_metadata_us(
+            object,
+            "hls-target-duration-us",
+            "hls-target-duration-ms",
+        )?,
     })
 }
 
@@ -7927,7 +8156,7 @@ struct LiveState {
     last_committed_seq: Option<u64>,
     last_committed_unix_ms: Option<u64>,
     last_committed_bytes: Option<usize>,
-    last_committed_duration_ms: Option<u64>,
+    last_committed_duration_us: Option<u64>,
     stream_next_seq: HashMap<u64, u64>,
     stream_canonical_epoch: HashMap<u64, u64>,
     stream_canonical_epoch_activation_delay_us: HashMap<u64, u64>,
@@ -7942,15 +8171,17 @@ struct LiveState {
     /// times number its segments alike when the key-frame interval is nominal.
     /// Zero starts at segment zero.
     segment_seed_parts: u64,
-    /// Nominal part duration of the node, which sizes the cache ring. Zero
-    /// gives every stream the configured window in parts.
-    nominal_part_ms: u64,
+    /// Nominal part duration of the node in microseconds, which sizes the
+    /// cache ring. Zero gives every stream the configured window in parts.
+    nominal_part_us: u64,
     stream_retained_bytes: HashMap<u64, u64>,
-    stream_max_part_duration_ms: HashMap<u64, u32>,
-    stream_max_segment_duration_ms: HashMap<u64, u64>,
+    /// Longest part of each stream in microseconds.
+    stream_max_part_duration_us: HashMap<u64, u32>,
+    /// Longest whole segment of each stream in microseconds.
+    stream_max_segment_duration_us: HashMap<u64, u64>,
     /// Part target and target duration that the contributor declares for a
-    /// stream, in milliseconds, from the stamps of its parts.
-    stream_declared_ms: HashMap<u64, (u32, u32)>,
+    /// stream, in microseconds, from the stamps of its parts.
+    stream_declared_us: HashMap<u64, (u32, u32)>,
     /// First segment that this cache has listed in the playlist of a stream.
     /// A new copy is filled newest part first, and the playlist must not
     /// grow at its front: a Media Sequence Number never goes down.
@@ -7977,7 +8208,7 @@ impl LiveState {
             last_committed_seq: None,
             last_committed_unix_ms: None,
             last_committed_bytes: None,
-            last_committed_duration_ms: None,
+            last_committed_duration_us: None,
             stream_next_seq: HashMap::new(),
             stream_canonical_epoch: HashMap::new(),
             stream_canonical_epoch_activation_delay_us: HashMap::new(),
@@ -7987,11 +8218,11 @@ impl LiveState {
             stream_parts: HashMap::new(),
             stream_keyframe_segments: HashMap::new(),
             segment_seed_parts: 0,
-            nominal_part_ms: 0,
+            nominal_part_us: 0,
             stream_retained_bytes: HashMap::new(),
-            stream_max_part_duration_ms: HashMap::new(),
-            stream_max_segment_duration_ms: HashMap::new(),
-            stream_declared_ms: HashMap::new(),
+            stream_max_part_duration_us: HashMap::new(),
+            stream_max_segment_duration_us: HashMap::new(),
+            stream_declared_us: HashMap::new(),
             stream_playlist_floor: HashMap::new(),
             stream_init_scanned: HashMap::new(),
             stream_inits: HashMap::new(),
@@ -8018,7 +8249,7 @@ impl LiveState {
         sequence: u64,
         bytes: usize,
         available_unix_us: u64,
-        duration_ms: Option<u32>,
+        duration_us: Option<u32>,
         keyframe: bool,
         keyframe_segments: bool,
         stamp: Option<PartStamp>,
@@ -8026,19 +8257,19 @@ impl LiveState {
     ) {
         if let Some(stamp) = stamp {
             // The contributor only raises what it declares.
-            let declared = self.stream_declared_ms.entry(stream_id).or_insert((0, 0));
-            declared.0 = declared.0.max(stamp.part_target_ms);
-            declared.1 = declared.1.max(stamp.target_duration_ms);
+            let declared = self.stream_declared_us.entry(stream_id).or_insert((0, 0));
+            declared.0 = declared.0.max(stamp.part_target_us);
+            declared.1 = declared.1.max(stamp.target_duration_us);
         }
-        if let Some(duration_ms) = duration_ms {
-            self.stream_max_part_duration_ms
+        if let Some(duration_us) = duration_us {
+            self.stream_max_part_duration_us
                 .entry(stream_id)
-                .and_modify(|maximum| *maximum = (*maximum).max(duration_ms))
-                .or_insert(duration_ms);
+                .and_modify(|maximum| *maximum = (*maximum).max(duration_us))
+                .or_insert(duration_us);
         }
         // The record of a part outlives its place in the playlist, so that a
         // segment that has just left the playlist can still be put together.
-        let window_parts = if stamp.is_some() || self.stream_declared_ms.contains_key(&stream_id) {
+        let window_parts = if stamp.is_some() || self.stream_declared_us.contains_key(&stream_id) {
             self.stream_retained_parts(stream_id, window_parts)
         } else {
             self.stream_window_parts(stream_id, window_parts)
@@ -8081,7 +8312,7 @@ impl LiveState {
                         available_unix_us,
                         published_unix_us: None,
                         committed_unix_us: None,
-                        duration_ms,
+                        duration_us,
                         keyframe,
                         fmp4_segment_id,
                         stamped_part: stamp.map(|stamp| stamp.part),
@@ -8242,40 +8473,40 @@ impl LiveState {
     /// are longer than the nominal part, such as 4K video beside 5 ms audio,
     /// covers that time with fewer parts, so it retains fewer of them.
     fn stream_window_parts(&self, stream_id: u64, configured: usize) -> usize {
-        let nominal_ms = self.nominal_part_ms;
-        if let Some((part_ms, target_ms)) = self
-            .stream_declared_ms
+        let nominal_us = self.nominal_part_us;
+        if let Some((part_us, target_us)) = self
+            .stream_declared_us
             .get(&stream_id)
             .copied()
-            .filter(|(part_ms, _)| *part_ms > 0 && nominal_ms > 0)
+            .filter(|(part_us, _)| *part_us > 0 && nominal_us > 0)
         {
             // The contributor declares the part and segment durations of the
             // stream. The playlist holds the configured length of time, and
             // at least six whole segments beside the one that is open.
-            let window_ms = (configured as u64)
-                .saturating_mul(nominal_ms)
-                .max(u64::from(target_ms).saturating_mul(PLAYLIST_WINDOW_SEGMENTS));
+            let window_us = (configured as u64)
+                .saturating_mul(nominal_us)
+                .max(u64::from(target_us).saturating_mul(PLAYLIST_WINDOW_SEGMENTS));
             // The parts of a stream are no shorter than three quarters of
             // the part that it declares, on average.
-            let parts = window_ms
+            let parts = window_us
                 .saturating_mul(4)
-                .div_ceil(u64::from(part_ms).saturating_mul(3));
+                .div_ceil(u64::from(part_us).saturating_mul(3));
             return usize::try_from(parts)
                 .unwrap_or(configured)
                 .clamp(MIN_STREAM_WINDOW_PARTS.min(configured), configured);
         }
-        let Some(part_ms) = self
-            .stream_max_part_duration_ms
+        let Some(part_us) = self
+            .stream_max_part_duration_us
             .get(&stream_id)
-            .map(|part_ms| u64::from(*part_ms))
+            .map(|part_us| u64::from(*part_us))
         else {
             return configured;
         };
-        if nominal_ms == 0 || part_ms <= nominal_ms {
+        if nominal_us == 0 || part_us <= nominal_us {
             return configured;
         }
-        let window_ms = (configured as u64).saturating_mul(nominal_ms);
-        usize::try_from(window_ms.div_ceil(part_ms))
+        let window_us = (configured as u64).saturating_mul(nominal_us);
+        usize::try_from(window_us.div_ceil(part_us))
             .unwrap_or(configured)
             .clamp(MIN_STREAM_WINDOW_PARTS.min(configured), configured)
     }
@@ -8309,12 +8540,12 @@ impl LiveState {
     /// has left the playlist must still be there for a reader that is slow.
     fn stream_retained_parts(&self, stream_id: u64, configured: usize) -> usize {
         let window = self.stream_window_parts(stream_id, configured);
-        match self.stream_declared_ms.get(&stream_id) {
-            Some((part_ms, target_ms)) if *part_ms > 0 => {
-                let after = u64::from(*target_ms)
+        match self.stream_declared_us.get(&stream_id) {
+            Some((part_us, target_us)) if *part_us > 0 => {
+                let after = u64::from(*target_us)
                     .saturating_mul(3)
                     .saturating_mul(4)
-                    .div_ceil(u64::from(*part_ms).saturating_mul(3));
+                    .div_ceil(u64::from(*part_us).saturating_mul(3));
                 window.saturating_add(usize::try_from(after).unwrap_or(window))
             }
             // A stream without stamps keeps four windows, as the ring does.
@@ -8322,11 +8553,23 @@ impl LiveState {
         }
     }
 
-    /// Longest part of a stream seen so far, or the nominal part of the node.
-    fn stream_part_ms(&self, stream_id: u64) -> u64 {
-        self.stream_max_part_duration_ms
+    /// Longest part of a stream seen so far, or the nominal part of the
+    /// node, in microseconds.
+    fn stream_part_us(&self, stream_id: u64) -> u64 {
+        self.stream_max_part_duration_us
             .get(&stream_id)
-            .map_or(self.nominal_part_ms, |part_ms| u64::from(*part_ms))
+            .map_or(self.nominal_part_us, |part_us| u64::from(*part_us))
+            .max(1)
+    }
+
+    /// The part target of a stream in microseconds: what its contributor
+    /// declares, else its longest part, else the nominal part of the node.
+    fn stream_part_target_us(&self, stream_id: u64) -> u64 {
+        self.stream_declared_us
+            .get(&stream_id)
+            .map(|(part_us, _)| u64::from(*part_us))
+            .filter(|part_us| *part_us > 0)
+            .unwrap_or_else(|| self.stream_part_us(stream_id))
             .max(1)
     }
 
@@ -8373,23 +8616,23 @@ impl LiveState {
     fn playlist_bitrate_bps(
         &self,
         stream_id: u64,
-        nominal_part_ms: u64,
+        nominal_part_us: u64,
         min_window_ms: u64,
     ) -> Option<u64> {
         let parts = self.stream_parts.get(&stream_id)?;
-        let (bytes, duration_ms) = parts.values().fold((0_u64, 0_u64), |(bytes, ms), part| {
+        let (bytes, duration_us) = parts.values().fold((0_u64, 0_u64), |(bytes, us), part| {
             (
                 bytes.saturating_add(part.bytes as u64),
-                ms.saturating_add(part.duration_ms.map_or(nominal_part_ms, u64::from)),
+                us.saturating_add(part.duration_us.map_or(nominal_part_us, u64::from)),
             )
         });
-        (duration_ms > 0 && duration_ms >= min_window_ms && bytes > 0)
-            .then(|| bytes.saturating_mul(8_000).saturating_div(duration_ms))
+        (duration_us > 0 && duration_us >= min_window_ms.saturating_mul(1_000) && bytes > 0)
+            .then(|| bytes.saturating_mul(8_000_000).saturating_div(duration_us))
     }
 
     fn retained_stream_summaries(
         &self,
-        nominal_part_ms: u64,
+        nominal_part_us: u64,
         min_bitrate_window_ms: u64,
     ) -> HashMap<u64, RetainedStreamSummary> {
         self.stream_parts
@@ -8409,9 +8652,10 @@ impl LiveState {
                         retained_parts: parts.len() as u64,
                         bitrate_bps: self.playlist_bitrate_bps(
                             *stream_id,
-                            nominal_part_ms,
+                            nominal_part_us,
                             min_bitrate_window_ms,
                         ),
+                        part_us: Some(self.stream_part_target_us(*stream_id)),
                     },
                 ))
             })
@@ -8437,9 +8681,9 @@ impl LiveState {
         self.stream_parts.remove(&stream_id);
         self.stream_keyframe_segments.remove(&stream_id);
         self.stream_retained_bytes.remove(&stream_id);
-        self.stream_max_part_duration_ms.remove(&stream_id);
-        self.stream_max_segment_duration_ms.remove(&stream_id);
-        self.stream_declared_ms.remove(&stream_id);
+        self.stream_max_part_duration_us.remove(&stream_id);
+        self.stream_max_segment_duration_us.remove(&stream_id);
+        self.stream_declared_us.remove(&stream_id);
         self.stream_playlist_floor.remove(&stream_id);
         self.stream_init_scanned.remove(&stream_id);
         self.stream_inits.remove(&stream_id);
@@ -8456,15 +8700,11 @@ impl LiveState {
         let seq = self.next_seq;
         self.next_seq += 1;
         let data = std::mem::take(&mut self.current);
-        let duration_ms = now
-            .duration_since(self.current_started)
-            .as_millis()
-            .max(1)
-            .min(u128::from(u64::MAX)) as u64;
+        let duration_us = duration_us(now.duration_since(self.current_started)).max(1);
         let part = PendingPart {
             seq,
             bytes: data.len(),
-            duration_ms,
+            duration_us,
             committed_unix_ms: now_ms,
             data,
         };
@@ -8477,7 +8717,7 @@ impl LiveState {
 struct PendingPart {
     seq: u64,
     bytes: usize,
-    duration_ms: u64,
+    duration_us: u64,
     committed_unix_ms: u64,
     data: Vec<u8>,
 }
@@ -8487,7 +8727,13 @@ struct StatsSnapshot {
     stream_id: u64,
     #[serde(default)]
     stream_id_text: String,
+    /// The nominal part of the node in whole milliseconds, rounded. Kept
+    /// for readers of the old telemetry; `part_target_us` is exact.
     part_target_ms: u64,
+    /// The nominal part of the node in microseconds. Zero from a node that
+    /// predates it: use `part_target_ms`.
+    #[serde(default)]
+    part_target_us: u64,
     parts_per_segment: usize,
     window_parts: usize,
     datagrams_received: u64,
@@ -8496,6 +8742,8 @@ struct StatsSnapshot {
     latest_local_part: Option<u64>,
     latest_local_part_bytes: Option<usize>,
     latest_local_part_duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_local_part_duration_us: Option<u64>,
     latest_mesh_part: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     canonical_epoch: Option<u64>,
@@ -8510,6 +8758,18 @@ struct StatsSnapshot {
     mesh_peers: Vec<String>,
     latest_local_part_age_ms: Option<u64>,
     last_ingest_age_ms: Option<u64>,
+}
+
+impl StatsSnapshot {
+    /// The nominal part in microseconds, from the exact field or from the
+    /// whole milliseconds of a node that predates it.
+    fn nominal_part_us(&self) -> u64 {
+        if self.part_target_us > 0 {
+            self.part_target_us
+        } else {
+            self.part_target_ms.saturating_mul(1_000)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -9873,6 +10133,10 @@ struct StreamTelemetry {
     stale_threshold_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mesh_lag_parts: Option<u64>,
+    /// The part of the stream in microseconds, which turns a lag in parts
+    /// into a lag in time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    part_target_us: Option<u64>,
     /// Measured bit rate of the playlist over its retained parts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     bitrate_bps: Option<u64>,
@@ -9898,10 +10162,11 @@ impl StreamTelemetry {
             datagrams_received: stats.datagrams_received,
             last_ingest_age_ms: stats.last_ingest_age_ms,
             stale_threshold_ms: Some(stream_stale_threshold_ms(
-                stats.part_target_ms,
+                stats.nominal_part_us(),
                 stats.window_parts,
             )),
             mesh_lag_parts: None,
+            part_target_us: Some(stats.nominal_part_us()),
             bitrate_bps: None,
         }
     }
@@ -9926,16 +10191,27 @@ impl StreamTelemetry {
         self.contiguous_object.or(self.latest_mesh_part)
     }
 
+    /// A replica is lagging when it is more than 30 ms of parts behind the
+    /// head, or, with no part duration known, more than six parts.
     fn lagging(&self) -> bool {
-        self.mesh_lag_parts
-            .is_some_and(|lag| lag > MESH_STREAM_LAG_WARN_PARTS)
+        self.mesh_lag_parts.is_some_and(|lag| {
+            match self.part_target_us.filter(|part_us| *part_us > 0) {
+                Some(part_us) => lag.saturating_mul(part_us) > MESH_STREAM_LAG_WARN_US,
+                None => lag > MESH_STREAM_LAG_WARN_PARTS,
+            }
+        })
     }
 }
 
-fn stream_stale_threshold_ms(part_target_ms: u64, window_parts: usize) -> u64 {
-    part_target_ms
-        .saturating_mul(window_parts as u64)
-        .max(MESH_MIN_STALE_INGEST_ALERT_MS)
+/// A replica this far behind the head of its stream is lagging: six parts
+/// of 5 ms, as the alarm was first set. `MESH_STREAM_LAG_WARN_PARTS` is the
+/// alarm for a stream whose part duration is not known.
+const MESH_STREAM_LAG_WARN_US: u64 = 30_000;
+
+/// The ingest silence after which a stream is stale: its window, and no
+/// less than five seconds.
+fn stream_stale_threshold_ms(part_target_us: u64, window_parts: usize) -> u64 {
+    (part_target_us.saturating_mul(window_parts as u64) / 1_000).max(MESH_MIN_STALE_INGEST_ALERT_MS)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -10041,7 +10317,7 @@ impl NodeLifecycle {
 #[derive(Debug, Clone, Default)]
 struct DemandTracker {
     last_replica_request_unix_ms: Arc<DashMap<u64, AtomicU64>>,
-    last_hole_repair_unix_ms: Arc<DashMap<u64, AtomicU64>>,
+    last_hole_repair_unix_us: Arc<DashMap<u64, AtomicU64>>,
     hole_repair_requests: Arc<AtomicU64>,
     last_rate_lookup_unix_ms: Arc<DashMap<u64, AtomicU64>>,
 }
@@ -10071,12 +10347,15 @@ impl DemandTracker {
     }
 
     /// Rate limit for the targeted repair of a hole in a live stream.
-    fn should_repair_hole(&self, stream_id: u64, now_ms: u64, min_interval_ms: u64) -> bool {
+    /// Whether a hole repair request for the stream may go now, in
+    /// microseconds, so that the interval can follow parts shorter than a
+    /// millisecond.
+    fn should_repair_hole(&self, stream_id: u64, now_us: u64, min_interval_us: u64) -> bool {
         Self::interval_elapsed(
-            &self.last_hole_repair_unix_ms,
+            &self.last_hole_repair_unix_us,
             stream_id,
-            now_ms,
-            min_interval_ms,
+            now_us,
+            min_interval_us,
         )
     }
 
@@ -12658,7 +12937,7 @@ fn derive_mesh_alerts(
 
     if let Some(age_ms) = local_stream.last_ingest_age_ms {
         let stale_threshold_ms =
-            stream_stale_threshold_ms(local_stream.part_target_ms, local_stream.window_parts);
+            stream_stale_threshold_ms(local_stream.nominal_part_us(), local_stream.window_parts);
         if local_stream.latest_local_part.is_some() && age_ms > stale_threshold_ms {
             alerts.push(MeshAlert {
                 level: "warn",
@@ -14461,23 +14740,23 @@ impl AppRouter {
         // A reader asks for each part and reloads the playlist now and then.
         // The parts of a stream that this node does not hold yet are not
         // known: its first readers are charged their bit rate alone.
-        let part_ms = {
+        let part_us = {
             let state = self.cache.state.read().await;
             state
-                .stream_declared_ms
+                .stream_declared_us
                 .get(&stream_id)
-                .map(|(part_ms, _)| u64::from(*part_ms))
+                .map(|(part_us, _)| u64::from(*part_us))
                 .or_else(|| {
                     state
-                        .stream_max_part_duration_ms
+                        .stream_max_part_duration_us
                         .get(&stream_id)
-                        .map(|part_ms| u64::from(*part_ms))
+                        .map(|part_us| u64::from(*part_us))
                 })
         };
-        if let Some(part_ms) = part_ms.filter(|part_ms| *part_ms > 0) {
+        if let Some(part_us) = part_us.filter(|part_us| *part_us > 0) {
             self.edge_load
                 .egress
-                .set_playlist_request_rate(stream_id, 1_000_u64.div_ceil(part_ms) + 2);
+                .set_playlist_request_rate(stream_id, playlist_request_rate(part_us));
         } else if self
             .edge_load
             .egress
@@ -14627,9 +14906,9 @@ impl AppRouter {
             .state
             .read()
             .await
-            .stream_declared_ms
+            .stream_declared_us
             .get(&stream_id)
-            .map_or(0, |(_, target_ms)| u64::from(*target_ms));
+            .map_or(0, |(_, target_us)| u64::from(*target_us) / 1_000);
         playlist = with_ladder_program_date_time(playlist, segment_ms);
         for rendition in ladder {
             if rendition.stream_id == stream_id
@@ -15965,7 +16244,8 @@ impl AppRouter {
                     None => Err(ParentsLost),
                 };
             }
-            let wait_until = (now + Duration::from_millis(EDGE_HOLE_REPAIR_GRACE_MS)).min(deadline);
+            let part_us = self.cache.state.read().await.stream_part_us(stream_id);
+            let wait_until = (now + edge_hole_repair_grace(part_us)).min(deadline);
             if let Some(part) = self
                 .cache
                 .get_part_until_for_stream_id(stream_id, seq, wait_until)
@@ -16002,24 +16282,42 @@ impl AppRouter {
             return false;
         }
         // The parts of this stream, not the nominal part of the node: a 4K
-        // stream has parts of 200 ms on a node that is sized for 5 ms audio.
-        let part_ms = self.cache.state.read().await.stream_part_ms(stream_id);
-        let window_parts =
-            usize::try_from((EDGE_HOLE_REPAIR_WINDOW_MS / part_ms).max(2)).unwrap_or(usize::MAX);
+        // stream has parts of 200 ms on a node that is sized for 2.5 ms audio.
+        let part_us = self.cache.state.read().await.stream_part_us(stream_id);
+        let window_parts = edge_hole_repair_window_parts(part_us);
         if head - slot > window_parts {
             return false;
         }
-        let min_interval_ms = EDGE_HOLE_REPAIR_MIN_INTERVAL_MS.max(part_ms.min(100));
-        if !self
-            .demand
-            .should_repair_hole(stream_id, now_unix_ms(), min_interval_ms)
-        {
+        if !self.demand.should_repair_hole(
+            stream_id,
+            now_unix_us(),
+            duration_us(edge_hole_repair_min_interval(part_us)),
+        ) {
             return false;
         }
-        // Ask for the hole and nothing else. A parent that resends every
-        // part from the hole to its newest part doubles its work for each
-        // lost part, and a lossy link then takes the CPU of the parent.
-        match self.mesh.request_parts(stream_id, slot, 1, parents).await {
+        // Ask for the hole and the parts missing right behind it, and
+        // nothing else. A parent that resends every part from the hole to
+        // its newest part doubles its work for each lost part, and a lossy
+        // link then takes the CPU of the parent. A burst of loss at small
+        // parts is a run of holes, and the rate limit would leave all but
+        // the first of them to the replica request.
+        let mut count = 1_u32;
+        while count < EDGE_HOLE_REPAIR_MAX_RUN
+            && slot + (count as usize) < head
+            && self
+                .cache
+                .chunk_cache
+                .get_for_stream_id(stream_id, slot + count as usize)
+                .await
+                .is_none()
+        {
+            count += 1;
+        }
+        match self
+            .mesh
+            .request_parts(stream_id, slot, count, parents)
+            .await
+        {
             Ok(_) => {
                 self.demand
                     .hole_repair_requests
@@ -16134,12 +16432,8 @@ impl AppRouter {
         {
             return Some(self.cache.replica_request_from_slot(stream_id).await);
         }
-        let part_ms = u64::try_from(self.cache.part_target.as_millis())
-            .unwrap_or(u64::MAX)
-            .max(1);
         let window_ms = hold_ms.max(EDGE_HOLE_REPAIR_WINDOW_MS);
-        let window_parts =
-            usize::try_from(window_ms.div_ceil(part_ms).max(1)).unwrap_or(usize::MAX);
+        let window_parts = parts_in_ms(window_ms, self.cache.nominal_part_us());
         self.cache
             .recent_replica_request_from_slot(stream_id, window_parts)
             .await
@@ -16600,18 +16894,11 @@ impl Router for AppRouter {
                         response
                             .headers
                             .push(("x-part-count".into(), part_count.to_string().into()));
-                        let part_duration_ms = self.cache.part_target.as_millis();
-                        response.headers.push((
-                            "x-part-duration-ms".into(),
-                            part_duration_ms.to_string().into(),
-                        ));
-                        response.headers.push((
-                            "x-response-duration-ms".into(),
-                            part_duration_ms
-                                .saturating_mul(part_count as u128)
-                                .to_string()
-                                .into(),
-                        ));
+                        push_part_duration_headers(
+                            &mut response.headers,
+                            self.cache.nominal_part_us(),
+                            part_count,
+                        );
                         response
                     };
                     read.finish(bytes_len);
@@ -16699,18 +16986,11 @@ impl Router for AppRouter {
                     tail_response
                         .headers
                         .push(("x-part-count".into(), part_count.to_string().into()));
-                    let part_duration_ms = self.cache.part_target.as_millis();
-                    tail_response.headers.push((
-                        "x-part-duration-ms".into(),
-                        part_duration_ms.to_string().into(),
-                    ));
-                    tail_response.headers.push((
-                        "x-response-duration-ms".into(),
-                        part_duration_ms
-                            .saturating_mul(part_count as u128)
-                            .to_string()
-                            .into(),
-                    ));
+                    push_part_duration_headers(
+                        &mut tail_response.headers,
+                        self.cache.nominal_part_us(),
+                        part_count,
+                    );
                     tail_response
                         .headers
                         .push(("x-av-stream-id".into(), stream_id.to_string().into()));
@@ -17905,8 +18185,72 @@ fn hls_renditions_unavailable_response(alternatives: &[String]) -> HandlerRespon
 
 /// Whether a stamped part is the short last part of its segment: shorter
 /// than 85% of the declared part target, which a playlist allows only there.
-fn part_ends_segment_short(duration_ms: u32, part_target_ms: u32) -> bool {
-    part_target_ms > 0 && u64::from(duration_ms) * 100 < u64::from(part_target_ms) * 85
+/// EXT-X-TARGETDURATION for a segment of `duration_us`: whole seconds,
+/// rounded to the nearest, at least one.
+fn hls_target_duration_from_micros(duration_us: u64) -> u64 {
+    // Whole milliseconds rounded the same way give the same seconds.
+    hls_target_duration_from_millis(duration_us / 1_000)
+}
+
+/// The EXT-X-PART-INF and EXT-X-SERVER-CONTROL lines of a playlist, with
+/// exact decimal seconds from microseconds: a 2.5 ms part target is
+/// `0.0025`, 250 µs is `0.00025`.
+fn push_part_inf_and_server_control(
+    out: &mut String,
+    part_target_us: u64,
+    part_hold_back_us: u64,
+    target_duration: u64,
+) {
+    out.push_str("#EXT-X-PART-INF:PART-TARGET=");
+    push_seconds(out, part_target_us);
+    out.push_str("\n#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=");
+    push_seconds(out, part_hold_back_us);
+    out.push_str(",HOLD-BACK=");
+    push_seconds(
+        out,
+        target_duration.saturating_mul(3_000_000).max(3_000_000),
+    );
+    out.push('\n');
+}
+
+/// The part duration headers of a tail response: whole milliseconds as
+/// before (`x-part-duration-ms`, `x-response-duration-ms`), and the exact
+/// microseconds (`x-part-duration-us`, `x-response-duration-us`).
+fn push_part_duration_headers(
+    headers: &mut Vec<(
+        std::borrow::Cow<'static, str>,
+        std::borrow::Cow<'static, str>,
+    )>,
+    part_us: u64,
+    part_count: usize,
+) {
+    let response_us = part_us.saturating_mul(part_count as u64);
+    headers.push((
+        "x-part-duration-ms".into(),
+        (part_us / 1_000).to_string().into(),
+    ));
+    headers.push((
+        "x-response-duration-ms".into(),
+        (response_us / 1_000).to_string().into(),
+    ));
+    headers.push(("x-part-duration-us".into(), part_us.to_string().into()));
+    headers.push((
+        "x-response-duration-us".into(),
+        response_us.to_string().into(),
+    ));
+}
+
+/// Requests a second that one reader of a playlist with parts of `part_us`
+/// makes: one for each part, and two playlist reloads.
+fn playlist_request_rate(part_us: u64) -> u64 {
+    1_000_000_u64.div_ceil(part_us.max(1)) + 2
+}
+
+/// Whether a part is shorter than 85% of the part target, which RFC 8216bis
+/// allows only for the last part of a segment. In microseconds, so that a
+/// 2.5 ms part is compared with a 2.5 ms target and not a rounded one.
+fn part_ends_segment_short(duration_us: u32, part_target_us: u32) -> bool {
+    part_target_us > 0 && u64::from(duration_us) * 100 < u64::from(part_target_us) * 85
 }
 
 /// Give a rendition of a ladder a programme date and time that every other
@@ -19664,8 +20008,8 @@ mod tests {
         );
         assert_eq!(cache.get_segment_for_stream_id(77, 1).await, None);
         assert_eq!(
-            cache.state.read().await.last_committed_duration_ms,
-            Some(35)
+            cache.state.read().await.last_committed_duration_us,
+            Some(35_000)
         );
     }
 
@@ -19719,7 +20063,7 @@ mod tests {
         let first = state.stream_parts.get(&1).unwrap();
         assert_eq!(first.keys().copied().collect::<Vec<_>>(), vec![4, 5, 6, 7]);
         assert_eq!(first.get(&7).unwrap().available_unix_us, 1_007);
-        assert_eq!(first.get(&7).unwrap().duration_ms, Some(33));
+        assert_eq!(first.get(&7).unwrap().duration_us, Some(33));
         assert!(first.get(&5).unwrap().keyframe);
         assert_eq!(first.get(&5).unwrap().fmp4_segment_id, Some(0));
         assert_eq!(state.stream_retained_bytes.get(&1), Some(&62));
@@ -21335,11 +21679,28 @@ mod tests {
             .to_string()
             .contains("--response-ms must be a positive multiple"));
 
-        let error = Args::try_parse_from(["av-mesh", "--part-ms", "5", "--response-ms", "500"])
+        let error = Args::try_parse_from([
+            "av-mesh",
+            "--part-ms",
+            "5",
+            "--response-ms",
+            "500",
+            "--parts-per-segment",
+            "4",
+            "--window-parts",
+            "24",
+        ])
+        .unwrap()
+        .normalized()
+        .unwrap_err();
+        assert!(error.to_string().contains("increase --window-parts"));
+        // The default window is a length of time, 12 s, and holds the
+        // response at any part size.
+        let args = Args::try_parse_from(["av-mesh", "--part-ms", "5", "--response-ms", "500"])
             .unwrap()
             .normalized()
-            .unwrap_err();
-        assert!(error.to_string().contains("increase --window-parts"));
+            .unwrap();
+        assert_eq!(args.window_parts, 2_400);
     }
 
     #[test]
@@ -23060,6 +23421,7 @@ mod tests {
             last_ingest_age_ms: Some(250),
             stale_threshold_ms: Some(5_000),
             mesh_lag_parts: None,
+            part_target_us: None,
             bitrate_bps: None,
         }];
         telemetry.ingest_snapshot(remote).await;
@@ -23117,6 +23479,7 @@ mod tests {
             last_ingest_age_ms: Some(6_000),
             stale_threshold_ms: Some(5_000),
             mesh_lag_parts: None,
+            part_target_us: None,
             bitrate_bps: None,
         }];
         telemetry.ingest_snapshot(remote).await;
@@ -23165,6 +23528,7 @@ mod tests {
             last_ingest_age_ms: Some(250),
             stale_threshold_ms: Some(5_000),
             mesh_lag_parts: None,
+            part_target_us: None,
             bitrate_bps: None,
         }];
         let mut lagging =
@@ -23188,6 +23552,7 @@ mod tests {
             last_ingest_age_ms: Some(250),
             stale_threshold_ms: Some(5_000),
             mesh_lag_parts: None,
+            part_target_us: None,
             bitrate_bps: None,
         }];
         telemetry.ingest_snapshot(head).await;
@@ -23251,6 +23616,7 @@ mod tests {
                 last_ingest_age_ms: Some(10),
                 stale_threshold_ms: Some(5_000),
                 mesh_lag_parts: None,
+                part_target_us: None,
                 bitrate_bps: None,
             }];
             telemetry.ingest_snapshot(remote).await;
@@ -23309,6 +23675,7 @@ mod tests {
             last_ingest_age_ms: Some(20),
             stale_threshold_ms: Some(5_000),
             mesh_lag_parts: None,
+            part_target_us: None,
             bitrate_bps: None,
         }];
         let mut restarted_relay = telemetry_snapshot_for_tests(
@@ -23340,6 +23707,7 @@ mod tests {
             last_ingest_age_ms: Some(20),
             stale_threshold_ms: Some(5_000),
             mesh_lag_parts: None,
+            part_target_us: None,
             bitrate_bps: None,
         }];
         telemetry.ingest_snapshot(head).await;
@@ -24071,6 +24439,7 @@ mod tests {
             last_ingest_age_ms: Some(250),
             stale_threshold_ms: Some(5_000),
             mesh_lag_parts: None,
+            part_target_us: None,
             bitrate_bps: None,
         }];
 
@@ -24465,6 +24834,7 @@ mod tests {
             last_ingest_age_ms: Some(250),
             stale_threshold_ms: Some(5_000),
             mesh_lag_parts: None,
+            part_target_us: None,
             bitrate_bps: None,
         }];
         telemetry.ingest_snapshot(remote).await;
@@ -27056,6 +27426,7 @@ mod tests {
                 stream_id,
                 stream_id_text: stream_id_text(stream_id),
                 part_target_ms: 500,
+                part_target_us: 500_000,
                 parts_per_segment: 2,
                 window_parts: 6,
                 datagrams_received: 10,
@@ -27064,6 +27435,7 @@ mod tests {
                 latest_local_part: Some(1),
                 latest_local_part_bytes: Some(1024),
                 latest_local_part_duration_ms: Some(500),
+                latest_local_part_duration_us: Some(500_000),
                 latest_mesh_part: Some(1),
                 canonical_epoch: Some(1),
                 canonical_epoch_activation_delay_us: Some(250_000),
@@ -27174,13 +27546,15 @@ mod tests {
             builder = builder
                 .with_metadata("hls-msn", stamp.msn.to_string().into_bytes())
                 .with_metadata("hls-part", stamp.part.to_string().into_bytes())
+                // The whole-millisecond keys of a contributor that predates
+                // the microsecond ones.
                 .with_metadata(
                     "hls-part-target-ms",
-                    stamp.part_target_ms.to_string().into_bytes(),
+                    (stamp.part_target_us / 1_000).to_string().into_bytes(),
                 )
                 .with_metadata(
                     "hls-target-duration-ms",
-                    stamp.target_duration_ms.to_string().into_bytes(),
+                    (stamp.target_duration_us / 1_000).to_string().into_bytes(),
                 );
         }
         let object = builder.build().unwrap();
@@ -27194,8 +27568,8 @@ mod tests {
             let stamp = PartStamp {
                 msn: 1_000 + sequence / 10,
                 part: (sequence % 10) as u32,
-                part_target_ms: 208,
-                target_duration_ms: 2_000,
+                part_target_us: 208_000,
+                target_duration_us: 2_000_000,
             };
             cache
                 .commit_stream_payload(
@@ -27273,8 +27647,8 @@ mod tests {
                 let stamp = PartStamp {
                     msn: segment,
                     part,
-                    part_target_ms: 200,
-                    target_duration_ms: 2_000,
+                    part_target_us: 200_000,
+                    target_duration_us: 2_000_000,
                 };
                 cache
                     .commit_stream_payload(
@@ -27307,8 +27681,8 @@ mod tests {
                 let stamp = PartStamp {
                     msn: 500 + segment,
                     part,
-                    part_target_ms: 208,
-                    target_duration_ms: 2_000,
+                    part_target_us: 208_000,
+                    target_duration_us: 2_000_000,
                 };
                 cache
                     .commit_stream_payload(
@@ -27594,8 +27968,8 @@ mod tests {
                     Some(PartStamp {
                         msn: 1_001,
                         part: 0,
-                        part_target_ms: 208,
-                        target_duration_ms: 2_000,
+                        part_target_us: 208_000,
+                        target_duration_us: 2_000_000,
                     }),
                 ),
             )
@@ -27966,8 +28340,8 @@ mod tests {
             .unwrap();
         assert!(warming.playlist_bitrate_bps(77).await.is_some());
         // The gap hold of one second is four video parts, not 200.
-        assert_eq!(cache.state.read().await.stream_part_ms(77), 250);
-        assert_eq!(cache.state.read().await.stream_part_ms(2001), 5);
+        assert_eq!(cache.state.read().await.stream_part_us(77), 250_000);
+        assert_eq!(cache.state.read().await.stream_part_us(2001), 5_000);
     }
 
     #[test]
@@ -28859,8 +29233,14 @@ mod tests {
             .unwrap();
         assert!(args.mesh_sync_on_publish);
         assert!(args.relay_forward_nonblocking);
-        assert_eq!(args.hop_journal_capacity, DEFAULT_HOP_JOURNAL_CAPACITY);
+        // Unset, the journal holds 30 s of 2.5 ms parts, and no less than
+        // the fixed default.
+        assert_eq!(args.hop_journal_capacity, None);
         assert_eq!(DEFAULT_HOP_JOURNAL_CAPACITY, 262_144);
+        assert_eq!(
+            hop_journal_capacity_for(args.part_us, args.hop_journal_seconds),
+            DEFAULT_HOP_JOURNAL_CAPACITY
+        );
 
         let args = Args::try_parse_from([
             "av-mesh",
@@ -28875,7 +29255,7 @@ mod tests {
         .unwrap();
         assert!(!args.mesh_sync_on_publish);
         assert!(!args.relay_forward_nonblocking);
-        assert_eq!(args.hop_journal_capacity, 0);
+        assert_eq!(args.hop_journal_capacity, Some(0));
 
         let args = Args::try_parse_from(["av-mesh", "--mesh-sync-on-publish", "true"]).unwrap();
         assert!(args.mesh_sync_on_publish);
@@ -29638,5 +30018,586 @@ mod tests {
             "the runtime stalled for {longest_gap_us} us of a {took_us} us read"
         );
         mesh.shutdown();
+    }
+
+    // ---- AM1: the timeline in microseconds ----
+
+    #[test]
+    fn the_node_timeline_defaults_to_the_smallest_parts_and_time_windows() {
+        let args = Args::try_parse_from(["av-mesh"])
+            .unwrap()
+            .normalized()
+            .unwrap();
+        assert_eq!(args.part_us, 2_500);
+        assert_eq!(args.segment_ms, 1_000);
+        assert_eq!(args.window_ms, 12_000);
+        // A second of 2.5 ms parts, and twelve seconds of them.
+        assert_eq!(args.parts_per_segment, 400);
+        assert_eq!(args.window_parts, 4_800);
+        assert_eq!(args.part_hold_back_ms, 0);
+
+        // --part-ms is an alias in whole milliseconds; segments and windows
+        // stay lengths of time.
+        let args = Args::try_parse_from(["av-mesh", "--part-ms", "5"])
+            .unwrap()
+            .normalized()
+            .unwrap();
+        assert_eq!(args.part_us, 5_000);
+        assert_eq!(args.parts_per_segment, 200);
+        assert_eq!(args.window_parts, 2_400);
+
+        // --part-us wins over --part-ms.
+        let args = Args::try_parse_from(["av-mesh", "--part-ms", "5", "--part-us", "250"])
+            .unwrap()
+            .normalized()
+            .unwrap();
+        assert_eq!(args.part_us, 250);
+        assert_eq!(args.parts_per_segment, 4_000);
+        assert_eq!(args.window_parts, 48_000);
+
+        // Explicit counts win, as the deploy passes them today.
+        let args = Args::try_parse_from([
+            "av-mesh",
+            "--part-ms",
+            "5",
+            "--parts-per-segment",
+            "200",
+            "--window-parts",
+            "2400",
+            "--segment-ms",
+            "2000",
+            "--window-ms",
+            "60000",
+        ])
+        .unwrap()
+        .normalized()
+        .unwrap();
+        assert_eq!(args.parts_per_segment, 200);
+        assert_eq!(args.window_parts, 2_400);
+
+        let args = Args::try_parse_from([
+            "av-mesh",
+            "--part-us",
+            "1000",
+            "--segment-ms",
+            "2000",
+            "--window-ms",
+            "6000",
+            "--part-hold-back-ms",
+            "250",
+        ])
+        .unwrap()
+        .normalized()
+        .unwrap();
+        assert_eq!(args.parts_per_segment, 2_000);
+        assert_eq!(args.window_parts, 6_000);
+        assert_eq!(args.part_hold_back_ms, 250);
+
+        assert!(Args::try_parse_from(["av-mesh", "--part-us", "0"])
+            .unwrap()
+            .normalized()
+            .is_err());
+        // A tail response is a whole number of parts.
+        assert!(Args::try_parse_from(["av-mesh", "--response-ms", "5"])
+            .unwrap()
+            .normalized()
+            .is_ok());
+        assert!(
+            Args::try_parse_from(["av-mesh", "--part-us", "3000", "--response-ms", "10"])
+                .unwrap()
+                .normalized()
+                .is_err()
+        );
+    }
+
+    fn encode_test_timed_opaque_part(
+        stream_id: u64,
+        sequence: u64,
+        metadata: &[(&str, String)],
+    ) -> Bytes {
+        let payload = format!("opaque-part-{stream_id}-{sequence}").into_bytes();
+        let key = media_object::ObjectKey::for_payload(
+            "default",
+            stream_id.to_string(),
+            "opaque-audio",
+            0,
+            0,
+            sequence,
+            1,
+            &payload,
+        )
+        .unwrap();
+        let mut builder = MediaObject::builder(key, ObjectKind::Media, payload.clone())
+            .with_metadata("container", b"opaque".to_vec())
+            .with_metadata("payload-format", b"opaque-part-v1".to_vec())
+            .with_metadata("content-type", b"application/octet-stream".to_vec())
+            .with_metadata("file-extension", b"bin".to_vec());
+        for (name, value) in metadata {
+            builder = builder.with_metadata(*name, value.clone().into_bytes());
+        }
+        Bytes::from(media_object::encode(&builder.build().unwrap()).unwrap())
+    }
+
+    fn timed_test_object(metadata: &[(&str, &str)]) -> MediaObject {
+        let payload = b"part".to_vec();
+        let key = media_object::ObjectKey::for_payload(
+            "default",
+            "77",
+            "opaque-audio",
+            0,
+            0,
+            1,
+            1,
+            &payload,
+        )
+        .unwrap();
+        let mut builder = MediaObject::builder(key, ObjectKind::Media, payload);
+        for (name, value) in metadata {
+            builder = builder.with_metadata(*name, value.as_bytes().to_vec());
+        }
+        builder.build().unwrap()
+    }
+
+    #[test]
+    fn part_durations_and_stamps_prefer_the_exact_microsecond_keys() {
+        // 2.5 ms Opus: the old key rounds to 3 ms; the new one is exact.
+        let object = timed_test_object(&[("duration-ms", "3"), ("duration-us", "2500")]);
+        assert_eq!(object_duration_us(&object), Some(2_500));
+        // Samples at a rate, rounded to the microsecond.
+        let object = timed_test_object(&[
+            ("duration-ms", "0"),
+            ("duration-samples", "12"),
+            ("sample-rate", "48000"),
+        ]);
+        assert_eq!(object_duration_us(&object), Some(250));
+        let object = timed_test_object(&[("duration-samples", "44"), ("sample-rate", "44100")]);
+        assert_eq!(object_duration_us(&object), Some(998));
+        // An older contributor: whole milliseconds.
+        let object = timed_test_object(&[("duration-ms", "5")]);
+        assert_eq!(object_duration_us(&object), Some(5_000));
+        // A zero is no value.
+        let object = timed_test_object(&[("duration-us", "0"), ("duration-ms", "0")]);
+        assert_eq!(object_duration_us(&object), None);
+
+        let stamp = |keys: &[(&str, &str)]| {
+            let mut all = vec![("hls-msn", "7"), ("hls-part", "3")];
+            all.extend_from_slice(keys);
+            object_part_stamp(&timed_test_object(&all))
+        };
+        assert_eq!(
+            stamp(&[
+                ("hls-part-target-ms", "3"),
+                ("hls-part-target-us", "2500"),
+                ("hls-target-duration-ms", "1000"),
+                ("hls-target-duration-us", "1000000"),
+            ]),
+            Some(PartStamp {
+                msn: 7,
+                part: 3,
+                part_target_us: 2_500,
+                target_duration_us: 1_000_000,
+            })
+        );
+        // A 0.25 ms part target that the old key rounds to 0 is kept.
+        assert_eq!(
+            stamp(&[
+                ("hls-part-target-ms", "0"),
+                ("hls-part-target-us", "250"),
+                ("hls-target-duration-ms", "1000"),
+            ])
+            .map(|stamp| (stamp.part_target_us, stamp.target_duration_us)),
+            Some((250, 1_000_000))
+        );
+        assert_eq!(
+            stamp(&[
+                ("hls-part-target-ms", "5"),
+                ("hls-target-duration-ms", "1000")
+            ])
+            .map(|stamp| (stamp.part_target_us, stamp.target_duration_us)),
+            Some((5_000, 1_000_000))
+        );
+        assert_eq!(stamp(&[("hls-part-target-ms", "0")]), None);
+    }
+
+    /// The RFC 8216bis rules for parts that a standard player relies on.
+    /// Returns the number of whole segments.
+    fn assert_valid_ll_hls(playlist: &str) -> usize {
+        use playlists::m3u8_manifest::parse_seconds_us;
+        let attribute = |line: &str, name: &str| -> Option<String> {
+            line.split(|c| c == ':' || c == ',')
+                .find_map(|field| field.strip_prefix(&format!("{name}=")))
+                .map(str::to_owned)
+        };
+        let mut part_target_us = None;
+        let mut target_duration = None;
+        let mut segment_parts: Vec<u64> = Vec::new();
+        let mut whole_segments = 0;
+        for line in playlist.lines() {
+            if let Some(value) = line.strip_prefix("#EXT-X-TARGETDURATION:") {
+                target_duration = value.parse::<u64>().ok();
+            } else if line.starts_with("#EXT-X-PART-INF:") {
+                part_target_us = attribute(line, "PART-TARGET").and_then(|v| parse_seconds_us(&v));
+            } else if line.starts_with("#EXT-X-SERVER-CONTROL:") {
+                let hold_back = attribute(line, "PART-HOLD-BACK")
+                    .and_then(|v| parse_seconds_us(&v))
+                    .expect("PART-HOLD-BACK");
+                assert!(hold_back >= 2 * part_target_us.expect("PART-TARGET first"));
+            } else if line.starts_with("#EXT-X-PART:") {
+                segment_parts.push(
+                    attribute(line, "DURATION")
+                        .and_then(|v| parse_seconds_us(&v))
+                        .expect("DURATION"),
+                );
+            } else if let Some(value) = line.strip_prefix("#EXTINF:") {
+                let extinf_us = parse_seconds_us(value.trim_end_matches(',')).expect("EXTINF");
+                let target = target_duration.expect("TARGETDURATION");
+                assert!((extinf_us + 500_000) / 1_000_000 <= target, "{line}");
+                if !segment_parts.is_empty() {
+                    let part_target_us = part_target_us.unwrap();
+                    assert_eq!(segment_parts.iter().sum::<u64>(), extinf_us, "{line}");
+                    let last = segment_parts.len() - 1;
+                    for (index, part_us) in segment_parts.iter().enumerate() {
+                        assert!(*part_us <= part_target_us);
+                        if index != last {
+                            assert!(part_us * 100 >= part_target_us * 85);
+                        }
+                    }
+                }
+                segment_parts.clear();
+                whole_segments += 1;
+            }
+        }
+        whole_segments
+    }
+
+    async fn commit_timed_stamped_parts(
+        cache: &LiveTsCache,
+        stream_id: u64,
+        part_us: u64,
+        parts_per_segment: u64,
+        parts: u64,
+    ) {
+        for sequence in 0..parts {
+            let metadata = [
+                ("duration-ms", (part_us / 1_000).to_string()),
+                ("duration-us", part_us.to_string()),
+                ("hls-msn", (sequence / parts_per_segment).to_string()),
+                ("hls-part", (sequence % parts_per_segment).to_string()),
+                ("hls-part-target-ms", (part_us / 1_000).to_string()),
+                ("hls-part-target-us", part_us.to_string()),
+                ("hls-target-duration-ms", "1000".to_string()),
+                ("hls-target-duration-us", "1000000".to_string()),
+            ];
+            cache
+                .commit_stream_payload(
+                    stream_id,
+                    encode_test_timed_opaque_part(stream_id, sequence, &metadata),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_playlist_of_two_and_a_half_millisecond_opus_parts_is_exact_and_valid() {
+        let cache =
+            LiveTsCache::with_slots(1, Duration::from_micros(2_500), 400, 4_800, 64, 2).await;
+        // Two whole segments of one second and the start of a third.
+        commit_timed_stamped_parts(&cache, 77, 2_500, 400, 810).await;
+        let playlist = cache.playlist_for_stream_id(77).await;
+        assert!(playlist.contains("#EXT-X-TARGETDURATION:1\n"), "{playlist}");
+        assert!(playlist.contains("#EXT-X-PART-INF:PART-TARGET=0.0025\n"));
+        assert!(playlist.contains("PART-HOLD-BACK=0.0075,HOLD-BACK=3.000"));
+        assert!(playlist.contains("#EXT-X-PART:DURATION=0.0025,URI=\"part809.bin\""));
+        // 400 parts of 2.5 ms are one second exactly, where 400 parts of a
+        // rounded 3 ms were 1.2 s.
+        assert!(playlist.contains("#EXTINF:1.000,\nseg0.bin"));
+        assert!(playlist.contains("#EXTINF:1.000,\nseg1.bin"));
+        assert!(!playlist.contains("DURATION=0.003"));
+        assert_eq!(assert_valid_ll_hls(&playlist), 2);
+        // The gap hold of one second is 400 parts of this stream, not 334.
+        assert_eq!(cache.state.read().await.stream_part_us(77), 2_500);
+        assert_eq!(cache.state.read().await.stream_part_target_us(77), 2_500);
+
+        // A floor for PART-HOLD-BACK, for players that need more room.
+        cache.set_part_hold_back_floor(Duration::from_millis(250));
+        cache.invalidate_cached_playlist(77);
+        let playlist = cache.playlist_for_stream_id(77).await;
+        assert!(
+            playlist.contains("PART-HOLD-BACK=0.250,HOLD-BACK=3.000"),
+            "{playlist}"
+        );
+        assert_eq!(assert_valid_ll_hls(&playlist), 2);
+    }
+
+    #[tokio::test]
+    async fn playlists_of_one_half_and_quarter_millisecond_pcm_parts_are_valid() {
+        for (part_us, rendered) in [(1_000, "0.001"), (500, "0.0005"), (250, "0.00025")] {
+            let parts_per_segment = 1_000_000 / part_us;
+            let cache = LiveTsCache::with_slots(
+                1,
+                Duration::from_micros(part_us),
+                parts_per_segment as usize,
+                (parts_per_segment * 3) as usize,
+                64,
+                2,
+            )
+            .await;
+            commit_timed_stamped_parts(
+                &cache,
+                77,
+                part_us,
+                parts_per_segment,
+                parts_per_segment * 2 + 3,
+            )
+            .await;
+            let playlist = cache.playlist_for_stream_id(77).await;
+            assert!(
+                playlist.contains(&format!("#EXT-X-PART-INF:PART-TARGET={rendered}\n")),
+                "{part_us}"
+            );
+            assert!(playlist.contains(&format!("#EXT-X-PART:DURATION={rendered},")));
+            assert!(!playlist.contains("=0.000,"), "{part_us}");
+            assert!(playlist.contains("#EXTINF:1.000,\nseg1.bin"), "{part_us}");
+            assert_eq!(assert_valid_ll_hls(&playlist), 2, "{part_us}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stream_without_stamps_has_segments_of_nominal_two_and_a_half_ms_parts() {
+        let cache =
+            LiveTsCache::with_slots(1, Duration::from_micros(2_500), 400, 4_800, 64, 2).await;
+        for sequence in 0..803 {
+            cache
+                .commit_stream_payload(
+                    77,
+                    encode_test_canonical_opaque_object(77, sequence, b"pcm"),
+                )
+                .await
+                .unwrap();
+        }
+        let playlist = cache.playlist_for_stream_id(77).await;
+        assert!(
+            playlist.contains("#EXT-X-PART-INF:PART-TARGET=0.0025\n"),
+            "{playlist}"
+        );
+        assert!(playlist.contains("#EXTINF:1.000,\nseg0.bin"));
+        assert!(playlist.contains("#EXTINF:1.000,\nseg1.bin"));
+        assert_eq!(assert_valid_ll_hls(&playlist), 2);
+        // The empty and waiting playlists of the node are exact too.
+        let waiting = cache.waiting_playlist(false);
+        assert!(waiting.contains("PART-TARGET=0.0025\n"));
+        assert!(waiting.contains("PART-HOLD-BACK=0.0075,HOLD-BACK=3.000\n"));
+        assert!(waiting.contains("#EXT-X-TARGETDURATION:1\n"));
+    }
+
+    #[test]
+    fn the_short_part_rule_compares_exact_durations() {
+        // 2.5 ms against a 2.5 ms target: not short. Rounded, 3 ms against
+        // a truncated 2 ms target was never short and 2 against 3 always.
+        assert!(!part_ends_segment_short(2_500, 2_500));
+        assert!(!part_ends_segment_short(2_125, 2_500));
+        assert!(part_ends_segment_short(2_124, 2_500));
+        assert!(!part_ends_segment_short(250, 250));
+        assert!(part_ends_segment_short(200, 250));
+        assert!(!part_ends_segment_short(1, 0));
+    }
+
+    #[test]
+    fn time_windows_follow_the_part_duration() {
+        // The canonical gap hold of one second.
+        assert_eq!(
+            canonical_gap_hold_parts(1_000, Duration::from_micros(2_500)),
+            400
+        );
+        assert_eq!(
+            canonical_gap_hold_parts(1_000, Duration::from_micros(250)),
+            4_000
+        );
+        // Admission: a request for every part and two playlist reloads.
+        assert_eq!(playlist_request_rate(5_000), 202);
+        assert_eq!(playlist_request_rate(2_500), 402);
+        assert_eq!(playlist_request_rate(1_000), 1_002);
+        assert_eq!(playlist_request_rate(250), 4_002);
+        // Hole repair: unchanged at 5 ms parts, in time below them.
+        assert_eq!(edge_hole_repair_grace(5_000), Duration::from_millis(15));
+        assert_eq!(edge_hole_repair_grace(2_500), Duration::from_micros(7_500));
+        assert_eq!(edge_hole_repair_grace(250), Duration::from_millis(3));
+        assert_eq!(edge_hole_repair_grace(200_000), Duration::from_millis(15));
+        assert_eq!(
+            edge_hole_repair_min_interval(5_000),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            edge_hole_repair_min_interval(2_500),
+            Duration::from_millis(25)
+        );
+        assert_eq!(edge_hole_repair_min_interval(250), Duration::from_millis(5));
+        assert_eq!(
+            edge_hole_repair_min_interval(200_000),
+            Duration::from_millis(100)
+        );
+        assert_eq!(edge_hole_repair_window_parts(5_000), 100);
+        assert_eq!(edge_hole_repair_window_parts(2_500), 200);
+        assert_eq!(edge_hole_repair_window_parts(250), 2_000);
+        assert_eq!(edge_hole_repair_window_parts(1_000_000), 2);
+        // The stale threshold is the window, at least five seconds.
+        assert_eq!(stream_stale_threshold_ms(2_500, 4_800), 12_000);
+        assert_eq!(stream_stale_threshold_ms(250, 48_000), 12_000);
+        assert_eq!(stream_stale_threshold_ms(2_500, 24), 5_000);
+        // The hop journal holds 30 s of parts, from 262,144 events to 1 Mi.
+        assert_eq!(hop_journal_capacity_for(5_000, 30), 262_144);
+        assert_eq!(hop_journal_capacity_for(1_000, 30), 262_144);
+        assert_eq!(hop_journal_capacity_for(500, 30), 480_000);
+        assert_eq!(hop_journal_capacity_for(250, 30), 960_000);
+        assert_eq!(hop_journal_capacity_for(100, 30), 1 << 20);
+    }
+
+    #[test]
+    fn a_replica_lags_by_time_not_by_parts() {
+        let mut stream = StreamTelemetry::from_stats(
+            "edge".into(),
+            &StatsSnapshot {
+                stream_id: 77,
+                stream_id_text: stream_id_text(77),
+                part_target_ms: 3,
+                part_target_us: 2_500,
+                parts_per_segment: 400,
+                window_parts: 4_800,
+                datagrams_received: 0,
+                bytes_received: 0,
+                current_part_bytes: 0,
+                latest_local_part: None,
+                latest_local_part_bytes: None,
+                latest_local_part_duration_ms: None,
+                latest_local_part_duration_us: None,
+                latest_mesh_part: Some(1),
+                canonical_epoch: None,
+                canonical_epoch_activation_delay_us: None,
+                contiguous_object: None,
+                head_object: None,
+                gap_count: None,
+                mesh_peers: Vec::new(),
+                latest_local_part_age_ms: None,
+                last_ingest_age_ms: None,
+            },
+        );
+        assert_eq!(stream.part_target_us, Some(2_500));
+        assert_eq!(stream.stale_threshold_ms, Some(12_000));
+        // Ten parts of 2.5 ms are 25 ms: not lagging. Six parts of 5 ms
+        // were the alarm, and still are.
+        stream.mesh_lag_parts = Some(10);
+        assert!(!stream.lagging());
+        stream.mesh_lag_parts = Some(13);
+        assert!(stream.lagging());
+        stream.part_target_us = Some(5_000);
+        stream.mesh_lag_parts = Some(6);
+        assert!(!stream.lagging());
+        stream.mesh_lag_parts = Some(7);
+        assert!(stream.lagging());
+        // A node that predates the field counts parts.
+        stream.part_target_us = None;
+        assert!(stream.lagging());
+        stream.mesh_lag_parts = Some(6);
+        assert!(!stream.lagging());
+        // Telemetry of an old node has no part_target_us.
+        let old: StatsSnapshot = serde_json::from_value(serde_json::json!({
+            "stream_id": 1, "part_target_ms": 5, "parts_per_segment": 4,
+            "window_parts": 24, "datagrams_received": 0, "bytes_received": 0,
+            "current_part_bytes": 0, "latest_local_part": null,
+            "latest_local_part_bytes": null, "latest_local_part_duration_ms": null,
+            "latest_mesh_part": null, "mesh_peers": [],
+            "latest_local_part_age_ms": null, "last_ingest_age_ms": null
+        }))
+        .unwrap();
+        assert_eq!(old.nominal_part_us(), 5_000);
+    }
+
+    #[test]
+    fn tail_responses_carry_exact_part_durations() {
+        let mut headers = Vec::new();
+        push_part_duration_headers(&mut headers, 2_500, 8);
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.to_string())
+        };
+        assert_eq!(header("x-part-duration-ms").as_deref(), Some("2"));
+        assert_eq!(header("x-response-duration-ms").as_deref(), Some("20"));
+        assert_eq!(header("x-part-duration-us").as_deref(), Some("2500"));
+        assert_eq!(header("x-response-duration-us").as_deref(), Some("20000"));
+    }
+
+    fn soundkit_v2_test_bundle(epochs: u64, samples: u32) -> Vec<u8> {
+        use frame_header::{EncodingFlag, Endianness};
+        let mut bundle = Vec::new();
+        bundle.extend_from_slice(SOUNDKIT_V2_BUNDLE_MAGIC);
+        bundle.push(2); // Opus
+        bundle.extend_from_slice(&epochs.to_be_bytes());
+        bundle.extend_from_slice(&9_u16.to_be_bytes());
+        bundle.extend_from_slice(&1_u16.to_be_bytes());
+        // One CELT fullband frame per epoch: config 28 is 2.5 ms, 29 is
+        // 5 ms, code 0, mono.
+        let config: u8 = match samples {
+            120 => 28,
+            240 => 29,
+            _ => panic!("test frames are 120 or 240 samples"),
+        };
+        for epoch in 0..epochs {
+            let packet = vec![config << 3, 0xAA, 0xBB, 0xCC];
+            let header = FrameHeaderV2::new(
+                EncodingFlag::Opus,
+                packet.len() as u32,
+                samples,
+                48_000,
+                1,
+                16,
+                Endianness::LittleEndian,
+                None,
+                Some(epoch * u64::from(samples)),
+                None,
+            )
+            .unwrap();
+            let mut frame = Vec::new();
+            header.encode(&mut frame).unwrap();
+            frame.extend_from_slice(&packet);
+            bundle.extend_from_slice(&9_u16.to_be_bytes());
+            bundle.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+            bundle.extend_from_slice(&frame);
+        }
+        bundle
+    }
+
+    #[test]
+    fn a_soundkit_bundle_takes_its_duration_from_its_frame_headers() {
+        assert_eq!(soundkit_duration_us(120, 48_000), Some(2_500));
+        assert_eq!(soundkit_duration_us(12, 48_000), Some(250));
+        assert_eq!(soundkit_duration_us(0, 48_000), None);
+        // One 2.5 ms Opus epoch: 2500 µs, where 5 ms epochs were assumed.
+        let reboxed = rebox_soundkit_v2_bundle(&soundkit_v2_test_bundle(1, 120), 3).unwrap();
+        assert_eq!(reboxed.duration_us, 2_500);
+        assert!(!reboxed.media.is_empty());
+        // Two 5 ms epochs: 10 ms.
+        let reboxed = rebox_soundkit_v2_bundle(&soundkit_v2_test_bundle(2, 240), 3).unwrap();
+        assert_eq!(reboxed.duration_us, 10_000);
+    }
+
+    #[test]
+    fn udp_fec_flow_windows_are_lengths_of_time() {
+        use av_mesh::udp_fec::UdpFecReceiverConfig;
+        let default = UdpFecReceiverConfig::default();
+        // 0.25 ms objects: 250 ms decoding, 1 s remembered.
+        assert_eq!(default.max_active_objects_per_flow, 1_000);
+        assert_eq!(default.max_completed_objects_per_flow, 4_000);
+        assert_eq!(default.max_tracked_sequence_gaps_per_flow, 4_000);
+        let five_ms = UdpFecReceiverConfig::for_object_interval(Duration::from_millis(5));
+        // Never below the windows that 5 ms objects had.
+        assert_eq!(five_ms.max_active_objects_per_flow, 50);
+        assert_eq!(five_ms.max_completed_objects_per_flow, 200);
+        assert_eq!(five_ms.max_tracked_sequence_gaps_per_flow, 1_024);
+        let slow = UdpFecReceiverConfig::for_object_interval(Duration::from_millis(200));
+        assert_eq!(slow.max_active_objects_per_flow, 32);
+        assert_eq!(slow.max_completed_objects_per_flow, 64);
     }
 }

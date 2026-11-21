@@ -42,7 +42,7 @@ The first implementation keeps the mesh transport intentionally small:
   default with `--cache-mesh-max-children`.
 - Replication follows each stream's contiguous watermark. A canonical object the
   relay never recovers holds that watermark for `--canonical-gap-hold-ms`
-  (default 1000, converted to parts with `--part-ms`). The watermark then skips
+  (default 1000, converted to parts of the stream, in microseconds). The watermark then skips
   the lost parts and replication continues. Keep the hold at or above the
   contributor relay media deadline. A value of 0 disables skipping.
 - Optional `private-subnet-discovery` support can add mesh peers discovered on a
@@ -252,10 +252,48 @@ fragments. A node needs `net.ipv4.ipfrag_time=1`,
 service with `MALLOC_MMAP_THRESHOLD_=65536`, `MALLOC_TRIM_THRESHOLD_=1048576`
 and `MALLOC_ARENA_MAX=2`, or glibc keeps the memory of freed 4K parts.
 
-The window of a playlist is a length of time: `--window-parts` nominal parts
-of `--part-ms`. A stream whose parts are longer covers the same time with
-fewer parts, and the node keeps only four of those windows in memory. One node
-that is sized for 5 ms audio parts can therefore hold 4K video.
+### Part, segment and window: time, in microseconds
+
+The node's timeline is held in microseconds, so that the smallest parts are
+exact: a 2.5 ms Opus part (120 samples at 48 kHz) is 2500 µs, a 48-sample PCM
+part 1000 µs, a 12-sample part 250 µs.
+
+- `--part-us` (env `AV_LL_HLS_PART_US`, default 2500) is the nominal part of
+  the node. `--part-ms` (env `AV_LL_HLS_PART_MS`) is kept as an alias in whole
+  milliseconds; `--part-us` wins when both are given.
+- `--segment-ms` (default 1000) and `--window-ms` (default 12000) are the
+  nominal segment and the playlist window as lengths of time. The old counts
+  `--parts-per-segment` and `--window-parts` still work and win when given.
+- `--part-hold-back-ms` (default 0) is a floor for PART-HOLD-BACK, which is
+  otherwise three part targets.
+
+A contributor declares each part's duration with the metadata key
+`duration-us` (or `duration-samples` and `sample-rate`) and its playlist stamp
+with `hls-part-target-us` and `hls-target-duration-us`. A node prefers those
+and falls back to the old whole-millisecond keys (`duration-ms`,
+`hls-part-target-ms`, `hls-target-duration-ms`). Playlists render PART-TARGET,
+PART-HOLD-BACK, EXT-X-PART DURATION and EXTINF as exact decimal seconds with up
+to six decimals (`0.0025`, `0.001`, `0.00025`, `1.000`), and the parts of a
+segment add up to its EXTINF exactly. Tail responses carry
+`x-part-duration-us` and `x-response-duration-us` beside the millisecond
+headers.
+
+The windows that were counted in parts are lengths of time: the canonical gap
+hold, the edge hole repair grace (three parts, 3 to 15 ms), minimum interval
+(ten parts, 5 to 50 ms) and window (500 ms), the exact-part wait ahead limit
+(3 s), the stale threshold, the replica lag alarm (30 ms), the admission charge
+of a reader (one request a part plus two reloads a second), the hop journal
+(`--hop-journal-seconds`, default 30, unless `--hop-journal-capacity` is
+given) and the per-flow windows of the UDP FEC ingest (250 ms decoding, 1 s
+remembered, sized for parts down to 0.25 ms).
+
+The window of a playlist is a length of time. A stream whose parts are longer
+covers the same time with fewer parts, and the node keeps only four of those
+windows in memory. One node that is sized for 2.5 ms audio parts can therefore
+hold 4K video. The ring of the cache is four windows of nominal parts for each
+playlist slot: 19,200 entries per slot at the defaults, and ten times that at
+0.25 ms parts, so give a node with sub-millisecond parts fewer
+`--playlist-slots` or a shorter `--window-ms`.
 
 `--mesh-max-symbol-size` lets a large part use a multiple of
 `--mesh-symbol-size`, so that it is at most about 64 datagrams. A 5 ms audio
@@ -596,8 +634,8 @@ the decimal-string playlist/stream id as `streamId`. The blocking tail route is
 commit without a polling sleep. A bounded wait can return `204` when the stream
 has not arrived. That request also creates mesh demand.
 
-The cache and replication unit remains `--part-ms` (or
-`AV_LL_HLS_PART_MS`). Set `--response-ms` or `AV_LL_HLS_RESPONSE_MS` to make
+The cache and replication unit remains the part (`--part-us`, or
+`--part-ms`). Set `--response-ms` or `AV_LL_HLS_RESPONSE_MS` to make
 the tail combine consecutive units by default. For example, 5 ms cache units
 and `AV_LL_HLS_RESPONSE_MS=200` return 40 ordered units per blocking response.
 Controlled clients can override the service default with `parts=<count>` for

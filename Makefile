@@ -9,6 +9,9 @@ RUST_LOG ?= info
 HOST ?= local.infidelity.io
 STREAM_ID ?= 1
 PART_MS ?= 50
+# The node's own part, in microseconds. PART_MS stays for the Needletail
+# stack targets, which pass it on to their own processes.
+PART_US ?= 2500
 
 TLS_DIR ?= ../tls/$(HOST)
 CERT ?= $(TLS_DIR)/fullchain.pem
@@ -43,31 +46,31 @@ help:
 	@printf '%s\n' '  make k3d-down         Delete the local k3d mesh cluster'
 	@printf '%s\n' '  make test              Run cargo test --locked'
 	@printf '%s\n' ''
-	@printf '%s\n' 'Common overrides: STREAM_ID=1 PART_MS=50 RUST_LOG=info HOST=local.infidelity.io'
+	@printf '%s\n' 'Common overrides: STREAM_ID=1 PART_US=2500 PART_MS=50 RUST_LOG=info HOST=local.infidelity.io'
 
 service:
-	AV_LL_HLS_PART_MS=$(PART_MS) RUST_LOG=$(RUST_LOG) NEEDLETAIL_MISSION_CONTROL_DIST=$(MISSION_CONTROL_DIST) \
+	AV_LL_HLS_PART_US=$(PART_US) RUST_LOG=$(RUST_LOG) NEEDLETAIL_MISSION_CONTROL_DIST=$(MISSION_CONTROL_DIST) \
 	$(CARGO) run --bin av-mesh -- \
 		--cert $(CERT) \
 		--key $(KEY) \
 		--stream-id $(STREAM_ID) \
-		--part-ms $(PART_MS) \
+		--part-us $(PART_US) \
 		$(MESH_ARGS)
 
 service-release:
-	AV_LL_HLS_PART_MS=$(PART_MS) RUST_LOG=$(RUST_LOG) NEEDLETAIL_MISSION_CONTROL_DIST=$(MISSION_CONTROL_DIST) \
+	AV_LL_HLS_PART_US=$(PART_US) RUST_LOG=$(RUST_LOG) NEEDLETAIL_MISSION_CONTROL_DIST=$(MISSION_CONTROL_DIST) \
 	$(CARGO) run --bin av-mesh --release -- \
 		--cert $(CERT) \
 		--key $(KEY) \
 		--stream-id $(STREAM_ID) \
-		--part-ms $(PART_MS) \
+		--part-us $(PART_US) \
 		$(MESH_ARGS)
 
 uk:
-	$(MAKE) service-release MESH_ARGS="--region uk --node-id uk-local --mesh-bind 127.0.0.1:29101 --peer 127.0.0.1:29201 --http-port 19444 --playback-base-url https://$(HOST):19444/live --fec-bind 127.0.0.1:22001 --media-fec-bind 127.0.0.1:22101 --telemetry-bind 127.0.0.1:27300 --telemetry-peer 127.0.0.1:27301 --telemetry-dns-name $(HOST) --telemetry-interval-ms 250 --parts-per-segment 2 --window-parts 24 --slot-kb 2048"
+	$(MAKE) service-release MESH_ARGS="--region uk --node-id uk-local --mesh-bind 127.0.0.1:29101 --peer 127.0.0.1:29201 --http-port 19444 --playback-base-url https://$(HOST):19444/live --fec-bind 127.0.0.1:22001 --media-fec-bind 127.0.0.1:22101 --telemetry-bind 127.0.0.1:27300 --telemetry-peer 127.0.0.1:27301 --telemetry-dns-name $(HOST) --telemetry-interval-ms 250 --slot-kb 2048"
 
 us:
-	$(MAKE) service-release MESH_ARGS="--region us --node-id us-local --mesh-bind 127.0.0.1:29201 --peer 127.0.0.1:29101 --http-port 19445 --playback-base-url https://$(HOST):19445/live --fec-bind 127.0.0.1:22002 --media-fec-bind 127.0.0.1:22102 --telemetry-bind 127.0.0.1:27301 --telemetry-peer 127.0.0.1:27300 --telemetry-dns-name $(HOST) --telemetry-interval-ms 250 --parts-per-segment 2 --window-parts 24 --slot-kb 2048"
+	$(MAKE) service-release MESH_ARGS="--region us --node-id us-local --mesh-bind 127.0.0.1:29201 --peer 127.0.0.1:29101 --http-port 19445 --playback-base-url https://$(HOST):19445/live --fec-bind 127.0.0.1:22002 --media-fec-bind 127.0.0.1:22102 --telemetry-bind 127.0.0.1:27301 --telemetry-peer 127.0.0.1:27300 --telemetry-dns-name $(HOST) --telemetry-interval-ms 250 --slot-kb 2048"
 
 mission-control-build:
 	$(MAKE) -C $(NEEDLETAIL_ROOT)/mission-control build DIST=$(MISSION_CONTROL_DIST)
