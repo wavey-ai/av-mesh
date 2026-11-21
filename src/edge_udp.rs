@@ -987,6 +987,20 @@ impl CacheMeshReceiveObserver for CutThrough {
             }
         };
         inner.stats.cut_through_parts.fetch_add(1, Ordering::Relaxed);
+        // Each client's repair as it asks for it now, not when the part began.
+        let clients: Vec<(SocketAddr, RepairPolicy)> = {
+            let table = inner.table.lock().unwrap();
+            let current = table.get(&stream_id);
+            clients
+                .into_iter()
+                .map(|(peer, repair)| {
+                    let repair = current
+                        .and_then(|entry| entry.subscribers.get(&peer))
+                        .map_or(repair, |subscriber| subscriber.repair);
+                    (peer, repair)
+                })
+                .collect()
+        };
         let frame = frame.to_vec();
         let socket = Arc::clone(&inner.socket);
         let stats = Arc::clone(&inner.stats);

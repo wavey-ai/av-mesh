@@ -1023,6 +1023,12 @@ struct Args {
     #[arg(long, default_value_t = av_mesh::client_udp::DEFAULT_SYMBOL_SIZE)]
     client_udp_symbol_size: u16,
 
+    /// Forward the parts that reach this node over the cache mesh to its UDP
+    /// clients as their datagrams arrive (`true`), or only once each part is
+    /// in the cache (`false`).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    client_udp_cut_through: bool,
+
     /// Client UDP subscriptions that this node takes at most.
     #[arg(long, default_value_t = 4_096)]
     client_udp_max_subscribers: usize,
@@ -1719,6 +1725,7 @@ async fn main() -> Result<()> {
     // the cache mesh to its UDP clients as their datagrams arrive.
     let edge_cut_through = args
         .client_udp_bind
+        .filter(|_| args.client_udp_cut_through)
         .map(|_| Arc::new(edge_udp::CutThrough::default()));
     let mesh_config = match &edge_cut_through {
         Some(cut) => mesh_config.with_receive_observer(Arc::clone(cut) as _),

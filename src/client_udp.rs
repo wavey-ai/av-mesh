@@ -641,7 +641,10 @@ pub struct ObjectReceiver {
 
 /// A block is counted for loss once its datagrams have had this long to
 /// arrive.
-const LOSS_SETTLE: Duration = Duration::from_millis(500);
+const LOSS_SETTLE: Duration = Duration::from_millis(150);
+/// The loss that a client plans for until it has measured its path: a new
+/// path may already be lossy.
+pub const UNMEASURED_LOSS: f64 = 0.02;
 const SETTLED_MEMORY: usize = 8_192;
 
 impl ObjectReceiver {
