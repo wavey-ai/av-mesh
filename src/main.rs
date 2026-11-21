@@ -1164,9 +1164,14 @@ struct Args {
     relay_forward_batch: bool,
 
     /// SO_BUSY_POLL budget in µs for the sockets that receive media: the
-    /// relay ingest sockets and the cache-mesh socket. 0 turns it off.
-    /// Raising it needs CAP_NET_ADMIN; a refusal is reported in
-    /// /api/mesh (mesh_transport.fast_path) and the node runs without it.
+    /// relay ingest sockets and the cache-mesh socket. 0 (the default)
+    /// turns it off. The node receives after epoll reports a socket
+    /// readable, so the budget only adds one NAPI poll to the last receive
+    /// of each drain; the wait busy-polls only when the host sets
+    /// net.core.busy_poll (reported as host_busy_poll_us). Kept for a lab
+    /// A/B; no gain has been measured. Raising it needs CAP_NET_ADMIN; a
+    /// refusal is reported in /api/mesh (mesh_transport.fast_path) and the
+    /// node runs without it.
     #[arg(
         long,
         env = "NEEDLETAIL_BUSY_POLL_US",
@@ -30367,14 +30372,20 @@ mod tests {
     }
 
     #[test]
-    fn the_fast_path_flags_default_on_and_children_may_share_a_bind() {
+    fn the_fast_path_flags_and_children_may_share_a_bind() {
         let args = Args::try_parse_from(["av-mesh"])
             .unwrap()
             .normalized()
             .unwrap();
         assert!(args.relay_forward_batch);
-        assert_eq!(args.busy_poll_us, 50);
+        // Busy polling is off until a measurement shows that it helps.
+        assert_eq!(args.busy_poll_us, 0);
         assert_eq!(args.media_cpu, None);
+        let args = Args::try_parse_from(["av-mesh", "--busy-poll-us", "50"])
+            .unwrap()
+            .normalized()
+            .unwrap();
+        assert_eq!(args.busy_poll_us, 50);
 
         let args = Args::try_parse_from([
             "av-mesh",

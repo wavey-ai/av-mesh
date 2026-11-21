@@ -3,7 +3,9 @@
 //! thread pinned to one processor.
 //!
 //! Everything here is a setting with the faster behaviour as its default,
-//! except the pinned thread, which is off unless `--media-cpu` names a CPU.
+//! except the pinned thread, which is off unless `--media-cpu` names a CPU,
+//! and busy polling, which is off unless `--busy-poll-us` asks for it (see
+//! [`DEFAULT_BUSY_POLL_US`] for why).
 //! What the host allowed is recorded in a [`FastPathSnapshot`] that the node
 //! reports beside its mesh transport settings, so a lab run can see whether
 //! busy polling or the pinning actually took effect.
@@ -15,8 +17,18 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::net::UdpSocket;
 
-/// The default busy-poll budget for sockets that carry media, in µs.
-pub const DEFAULT_BUSY_POLL_US: u32 = 50;
+/// The default busy-poll budget for sockets that carry media, in µs: off.
+///
+/// The per-socket budget (SO_BUSY_POLL) is used inside a receive call that
+/// finds the queue empty, and only once for a non-blocking socket. The
+/// runtime receives after epoll has reported the socket readable, so the
+/// queue is not empty and the wait for the next datagram does not poll;
+/// only the last receive of each drain, which finds the queue empty, costs
+/// one extra NAPI poll. The wait itself busy-polls only with the host's
+/// `net.core.busy_poll` (reported as `host_busy_poll_us`), which the
+/// deploy does not set. So the budget is a setting for a lab A/B, off until
+/// a measurement shows a gain.
+pub const DEFAULT_BUSY_POLL_US: u32 = 0;
 
 /// Messages handed to the kernel in one `sendmmsg` call. A relay rarely has
 /// more children than this; longer batches are sent in several calls.
