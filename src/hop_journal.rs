@@ -23,8 +23,9 @@ pub const DEFAULT_HOP_JOURNAL_CAPACITY: usize = 262_144;
 const SEEN_TABLE_SLOTS: usize = 16_384;
 
 /// Events copied out of the ring under one hold of its lock when the journal
-/// is read, so that a reader never holds back the media for long.
-const READ_CHUNK_EVENTS: usize = 4_096;
+/// is read, so that a reader never holds back the media for long. The copy
+/// is a plain copy of about 90 KB; the filter runs after the lock is released.
+const READ_CHUNK_EVENTS: usize = 1_024;
 
 /// Where a part was when an event was recorded. The names are the stage
 /// names of the journal format and must not change.
@@ -232,12 +233,16 @@ impl HopJournal {
     }
 
     /// The matching events, oldest first. The ring is copied in chunks, so
-    /// recorders wait for at most one chunk.
+    /// recorders wait for at most the copy of one chunk.
+    ///
+    /// A read of a full ring copies and sorts hundreds of thousands of
+    /// events: call it off the async runtime (`spawn_blocking`).
     pub fn events(&self, query: HopQuery) -> Vec<HopEvent> {
         let mut out = Vec::new();
         if self.capacity == 0 {
             return out;
         }
+        let mut chunk: Vec<HopEvent> = Vec::with_capacity(READ_CHUNK_EVENTS);
         // Read no further than the end of the ring when the read began, so
         // that a busy node cannot keep the reader going for ever.
         let mut bounds: Option<(u64, u64)> = None;
@@ -254,12 +259,10 @@ impl HopJournal {
             let end = limit.min(start + READ_CHUNK_EVENTS as u64);
             let from = (start - base) as usize;
             let to = (end - base) as usize;
-            out.extend(
-                ring.events
-                    .range(from..to)
-                    .filter(|event| query.matches(event)),
-            );
+            chunk.clear();
+            chunk.extend(ring.events.range(from..to));
             drop(ring);
+            out.extend(chunk.iter().filter(|event| query.matches(event)));
             bounds = Some((end, limit));
         }
         // Stages recorded after the fact, from times carried with the part,
@@ -269,6 +272,7 @@ impl HopJournal {
     }
 
     /// The matching events as NDJSON, one event per line, oldest first.
+    /// Like [`Self::events`], it belongs off the async runtime.
     pub fn render_ndjson(&self, query: HopQuery) -> String {
         let events = self.events(query);
         let node = serde_json::to_string(&self.node).unwrap_or_else(|_| "\"\"".to_owned());

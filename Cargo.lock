@@ -205,7 +205,7 @@ dependencies = [
  "media-capability",
  "media-object",
  "message-packetizer",
- "playlists 0.1.6 (git+https://github.com/wavey-ai/playlists.git?rev=978e596982a92135bc470f443ec58747577a4610)",
+ "playlists 0.1.6 (git+https://github.com/wavey-ai/playlists.git?rev=3317b2937f93ddea59b75ec00dac4ac073756112)",
  "raptorq-datagram-fec",
  "raptorq-fec-transport",
  "rcgen",
@@ -2875,7 +2875,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "playlists"
 version = "0.1.6"
-source = "git+https://github.com/wavey-ai/playlists.git?rev=978e596982a92135bc470f443ec58747577a4610#978e596982a92135bc470f443ec58747577a4610"
+source = "git+https://github.com/wavey-ai/playlists.git?rev=3317b2937f93ddea59b75ec00dac4ac073756112#3317b2937f93ddea59b75ec00dac4ac073756112"
 dependencies = [
  "access-unit 0.1.5",
  "bytes",

@@ -5622,7 +5622,11 @@ impl LiveTsCache {
                 )
                 .await
                 .map_err(|err| anyhow!("canonical stream cache write failed: {err}"))?;
-            let committed_us = now_unix_us();
+            // The time the cache stored with the slot, which a reader woken
+            // by the write already reports.
+            let committed_us = self
+                .part_written_unix_us(stream_id, seq)
+                .unwrap_or_else(now_unix_us);
             if write_result == PutIfAbsentResult::HashConflict {
                 bail!(
                     "canonical media-object identity conflict for stream {stream_id} sequence {seq}"
@@ -6691,20 +6695,46 @@ impl LiveTsCache {
             .map(|times| times.available_unix_us)
     }
 
+    /// When the ChunkCache wrote the retained part. The cache stores the
+    /// time before the part becomes readable, so it is there for a reader
+    /// that the write woke, before this node has recorded the part.
+    fn part_written_unix_us(&self, stream_id: u64, seq: u64) -> Option<u64> {
+        self.chunk_cache
+            .written_unix_us_for_stream_id(stream_id, usize::try_from(seq).ok()?)
+    }
+
     /// When this cache had the part, when it wrote it, and when the
     /// contributor published it.
+    ///
+    /// A reader blocked on a part is woken by the cache write, which comes
+    /// before this node records the part (on an edge, before the applied
+    /// part reaches `observe_mesh_part`). The commit time then comes from the
+    /// cache, and stands in for the time the cache had the part.
     async fn part_times_unix_us(&self, stream_id: u64, seq: u64) -> Option<PartTimes> {
-        self.state
+        let written_unix_us = self.part_written_unix_us(stream_id, seq);
+        let recorded = self
+            .state
             .read()
             .await
             .stream_parts
-            .get(&stream_id)?
-            .get(&seq)
+            .get(&stream_id)
+            .and_then(|parts| parts.get(&seq))
             .map(|part| PartTimes {
                 available_unix_us: part.available_unix_us,
                 published_unix_us: part.published_unix_us,
                 committed_unix_us: part.committed_unix_us,
-            })
+            });
+        match recorded {
+            Some(times) => Some(PartTimes {
+                committed_unix_us: written_unix_us.or(times.committed_unix_us),
+                ..times
+            }),
+            None => written_unix_us.map(|written_unix_us| PartTimes {
+                available_unix_us: written_unix_us,
+                published_unix_us: None,
+                committed_unix_us: Some(written_unix_us),
+            }),
+        }
     }
 
     /// Stamp a part response with the time it is handed to the server, and
@@ -10249,7 +10279,17 @@ struct ServedSubscriptionSnapshot {
 
 /// Journal the cache-mesh hops of a part that a parent delivered, from the
 /// times that the mesh carried with it.
-fn journal_mesh_applied(cache: &LiveTsCache, applied: &AppliedSlot) {
+/// When the cache mesh wrote an applied part into the edge cache. The time
+/// that the cache stored with the slot is the one that a part response
+/// reports, so the journal uses it too; the time measured by the mesh after
+/// the write is the fallback for a slot that has since been replaced.
+fn mesh_applied_committed_us(cache: &LiveTsCache, applied: &AppliedSlot) -> u64 {
+    cache
+        .part_written_unix_us(applied.stream_id, applied.slot_id as u64)
+        .unwrap_or(applied.committed_us)
+}
+
+fn journal_mesh_applied(cache: &LiveTsCache, applied: &AppliedSlot, committed_us: u64) {
     let Some(journal) = cache.hops() else {
         return;
     };
@@ -10267,7 +10307,7 @@ fn journal_mesh_applied(cache: &LiveTsCache, applied: &AppliedSlot) {
         );
     }
     journal.record(
-        HopEvent::new(HopStage::EdgeCommitted, stream, seq, applied.committed_us).with_peer(parent),
+        HopEvent::new(HopStage::EdgeCommitted, stream, seq, committed_us).with_peer(parent),
     );
 }
 
@@ -10313,13 +10353,10 @@ async fn run_mesh_applied_parts(
                 None => return,
             },
         };
-        journal_mesh_applied(&cache, &applied);
+        let committed_us = mesh_applied_committed_us(&cache, &applied);
+        journal_mesh_applied(&cache, &applied, committed_us);
         if cache
-            .observe_mesh_part(
-                applied.stream_id,
-                applied.slot_id,
-                Some(applied.committed_us),
-            )
+            .observe_mesh_part(applied.stream_id, applied.slot_id, Some(committed_us))
             .await
             .is_none()
         {
@@ -13983,7 +14020,12 @@ struct ReaderRequest<'a> {
 impl AppRouter {
     /// `GET /api/hops?since_us=<t>&stream=<id>`: the hop journal of this
     /// node as NDJSON, oldest first. It reads no cache and is no session.
-    fn hops_response(&self, query: Option<&str>) -> HandlerResponse {
+    ///
+    /// A full journal is hundreds of thousands of events to copy, sort and
+    /// format, tens of milliseconds of CPU. That runs on a blocking thread,
+    /// so the runtime workers keep serving relay ingest, the mesh and part
+    /// replies while the journal is collected during a measurement.
+    async fn hops_response(&self, query: Option<&str>) -> HandlerResponse {
         let since_us = query_value(query, "since_us");
         let stream = query_value(query, "stream");
         let parsed = (
@@ -14000,12 +14042,24 @@ impl AppRouter {
             )
             .with_no_store();
         };
-        let body = self
-            .cache
-            .hop_journal
-            .get()
-            .map(|journal| journal.render_ndjson(HopQuery { since_us, stream }))
-            .unwrap_or_default();
+        let body = match self.cache.hop_journal.get() {
+            Some(journal) if journal.is_enabled() => {
+                let journal = Arc::clone(journal);
+                match tokio::task::spawn_blocking(move || {
+                    journal.render_ndjson(HopQuery { since_us, stream })
+                })
+                .await
+                {
+                    Ok(body) => body,
+                    Err(err) => {
+                        warn!(error = %err, "hop journal read failed");
+                        return response(StatusCode::INTERNAL_SERVER_ERROR, None, None)
+                            .with_no_store();
+                    }
+                }
+            }
+            _ => String::new(),
+        };
         response(
             StatusCode::OK,
             Some(Bytes::from(body)),
@@ -16266,7 +16320,7 @@ impl Router for AppRouter {
             ASSIGNMENT_PATH => Ok(self
                 .assignment_api_response(query, session_id.as_deref())
                 .await),
-            HOPS_PATH => Ok(self.hops_response(query)),
+            HOPS_PATH => Ok(self.hops_response(query).await),
             "/api/stats" => {
                 let json = serde_json::to_vec(&self.cache.stats(&self.mesh).await)
                     .map_err(|err| ServerError::Handler(Box::new(err)))?;
@@ -28982,62 +29036,80 @@ mod tests {
         mesh.shutdown();
     }
 
-    #[tokio::test]
-    async fn the_journals_of_a_distributor_and_an_edge_join_on_each_part() {
-        use tokio::time::timeout;
+    /// A distributor and an edge on loopback, each with a journal, with the
+    /// edge's router and its applied-part task running.
+    struct HopMeshPair {
+        distributor: Arc<LiveTsCache>,
+        edge: Arc<LiveTsCache>,
+        router: AppRouter,
+        distributor_addr: SocketAddr,
+        edge_addr: SocketAddr,
+        distributor_mesh: CacheMeshHandle,
+        edge_mesh: Arc<CacheMeshHandle>,
+        shutdown_tx: watch::Sender<()>,
+    }
 
-        let distributor_addr = unused_loopback_addr();
-        let edge_addr = unused_loopback_addr();
-        let distributor = journaled_test_cache("distributor").await;
-        let edge = journaled_test_cache("edge").await;
-        let distributor_journal = Arc::clone(distributor.hop_journal.get().unwrap());
-        let mut distributor_config = with_low_latency_mesh_options(
-            CacheMeshConfig::new("hop-distributor", "uk", distributor_addr)
-                .with_role(CacheMeshRole::Distributor)
-                .with_peer(edge_addr),
-            true,
-            &distributor_journal,
-        );
-        distributor_config.sync_interval = Duration::from_millis(50);
-        let distributor_mesh =
-            CacheMesh::new(Arc::clone(&distributor.chunk_cache), distributor_config)
+    impl HopMeshPair {
+        /// The distributor knows the edge from its configuration, so the
+        /// first tick of its sync task, at start, chooses the edge as a
+        /// child. With a long `sync_interval` no other tick comes during a
+        /// test: a part reaches the edge only if it is sent on publication.
+        async fn start(sync_on_publish: bool, sync_interval: Duration) -> Self {
+            let distributor_addr = unused_loopback_addr();
+            let edge_addr = unused_loopback_addr();
+            let distributor = journaled_test_cache("distributor").await;
+            let edge = journaled_test_cache("edge").await;
+            let distributor_journal = Arc::clone(distributor.hop_journal.get().unwrap());
+            let mut distributor_config = with_low_latency_mesh_options(
+                CacheMeshConfig::new("hop-distributor", "uk", distributor_addr)
+                    .with_role(CacheMeshRole::Distributor)
+                    .with_peer(edge_addr),
+                sync_on_publish,
+                &distributor_journal,
+            );
+            distributor_config.sync_interval = sync_interval;
+            let (applied_tx, applied_rx) = mpsc::unbounded_channel();
+            let edge_mesh = Arc::new(
+                CacheMesh::new(
+                    Arc::clone(&edge.chunk_cache),
+                    CacheMeshConfig::new("hop-edge", "uk", edge_addr)
+                        .with_role(CacheMeshRole::Edge)
+                        .with_peer(distributor_addr)
+                        .with_applied_tx(applied_tx),
+                )
                 .start()
                 .await
-                .unwrap();
-        let (applied_tx, applied_rx) = mpsc::unbounded_channel();
-        let edge_mesh = Arc::new(
-            CacheMesh::new(
-                Arc::clone(&edge.chunk_cache),
-                CacheMeshConfig::new("hop-edge", "uk", edge_addr)
-                    .with_role(CacheMeshRole::Edge)
-                    .with_peer(distributor_addr)
-                    .with_applied_tx(applied_tx),
-            )
-            .start()
-            .await
-            .unwrap(),
-        );
-        let router = app_router_for_tests(Arc::clone(&edge), Arc::clone(&edge_mesh));
-        let (shutdown_tx, shutdown_rx) = watch::channel(());
-        tokio::spawn(run_mesh_applied_parts(
-            Arc::clone(&edge),
-            router.edge_load.clone(),
-            applied_rx,
-            shutdown_rx,
-        ));
-        // Let a sync tick choose the edge as a child.
-        timeout(Duration::from_secs(3), async {
-            while distributor_mesh.peers().await.is_empty() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                .unwrap(),
+            );
+            let distributor_mesh =
+                CacheMesh::new(Arc::clone(&distributor.chunk_cache), distributor_config)
+                    .start()
+                    .await
+                    .unwrap();
+            let router = app_router_for_tests(Arc::clone(&edge), Arc::clone(&edge_mesh));
+            let (shutdown_tx, shutdown_rx) = watch::channel(());
+            tokio::spawn(run_mesh_applied_parts(
+                Arc::clone(&edge),
+                router.edge_load.clone(),
+                applied_rx,
+                shutdown_rx,
+            ));
+            // Let the first tick run.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Self {
+                distributor,
+                edge,
+                router,
+                distributor_addr,
+                edge_addr,
+                distributor_mesh,
+                edge_mesh,
+                shutdown_tx,
             }
-        })
-        .await
-        .unwrap();
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        }
 
-        let stream_id = 77;
-        for sequence in 0..4_u64 {
-            distributor
+        async fn commit(&self, stream_id: u64, sequence: u64) {
+            self.distributor
                 .commit_stream_payload(
                     stream_id,
                     encode_test_published_fmp4_part(stream_id, 5, sequence, sequence == 0, 5),
@@ -29045,16 +29117,37 @@ mod tests {
                 .await
                 .unwrap();
         }
+
+        fn shutdown(self) {
+            let _ = self.shutdown_tx.send(());
+            self.distributor_mesh.shutdown();
+            self.edge_mesh.shutdown();
+        }
+    }
+
+    #[tokio::test]
+    async fn the_journals_of_a_distributor_and_an_edge_join_on_each_part() {
+        use tokio::time::timeout;
+
+        // No tick after the first one: every part must leave on publication.
+        let pair = HopMeshPair::start(true, Duration::from_secs(60)).await;
+        let (distributor, edge, router) = (&pair.distributor, &pair.edge, &pair.router);
+        let stream_id = 77;
+        for sequence in 0..4_u64 {
+            pair.commit(stream_id, sequence).await;
+            // Apart, so that each part is a publication of its own.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         timeout(Duration::from_secs(3), async {
-            while hop_events(&edge, HopStage::EdgePlaylist, stream_id).len() < 4 {
+            while hop_events(edge, HopStage::EdgePlaylist, stream_id).len() < 4 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .expect("the edge must put every part in its playlist");
+        .expect("the edge must put every part in its playlist without a tick");
         for sequence in 0..4_u64 {
             let response =
-                get_for_tests(&router, &format!("/live/{stream_id}/part{sequence}.mp4")).await;
+                get_for_tests(router, &format!("/live/{stream_id}/part{sequence}.mp4")).await;
             assert_eq!(response.status, StatusCode::OK);
             let committed: u64 = hop_header(&response, "x-needletail-edge-committed-unix-us")
                 .unwrap()
@@ -29076,37 +29169,226 @@ mod tests {
                 .min()
                 .unwrap_or_else(|| panic!("no {} event for part {sequence}", stage.as_str()))
         };
+        let mut latencies = Vec::new();
         for sequence in 0..4_u64 {
             // One clock on one host, so the hops are in order.
             let hops = [
-                first(&distributor, HopStage::Committed, sequence),
-                first(&distributor, HopStage::Watermark, sequence),
-                first(&distributor, HopStage::MeshSent, sequence),
-                first(&edge, HopStage::MeshFirst, sequence),
-                first(&edge, HopStage::MeshDecoded, sequence),
-                first(&edge, HopStage::EdgeCommitted, sequence),
-                first(&edge, HopStage::EdgePlaylist, sequence),
-                first(&edge, HopStage::Reply, sequence),
+                first(distributor, HopStage::Committed, sequence),
+                first(distributor, HopStage::Watermark, sequence),
+                first(distributor, HopStage::MeshSent, sequence),
+                first(edge, HopStage::MeshFirst, sequence),
+                first(edge, HopStage::MeshDecoded, sequence),
+                first(edge, HopStage::EdgeCommitted, sequence),
+                first(edge, HopStage::EdgePlaylist, sequence),
+                first(edge, HopStage::Reply, sequence),
             ];
             assert!(
                 hops.windows(2).all(|pair| pair[0] <= pair[1]),
                 "hops of part {sequence} out of order: {hops:?}"
             );
-            // Sent on publication, not at the next 50 ms tick.
-            assert!(
-                hops[5] - hops[0] < 40_000,
-                "part {sequence} took {} us from commit to the edge",
-                hops[5] - hops[0]
-            );
+            latencies.push(hops[5] - hops[0]);
         }
-        let sent = hop_events(&distributor, HopStage::MeshSent, stream_id);
-        assert!(sent.iter().all(|event| event.peer == Some(edge_addr)));
-        let received = hop_events(&edge, HopStage::MeshFirst, stream_id);
+        // Sent on publication: a part is at the edge within a few
+        // milliseconds of its commit, as the specification asks.
+        latencies.sort_unstable();
+        assert!(
+            latencies[latencies.len() / 2] < 5_000,
+            "commit to edge, us: {latencies:?}"
+        );
+        assert!(
+            latencies.iter().all(|latency| *latency < 25_000),
+            "commit to edge, us: {latencies:?}"
+        );
+        let sent = hop_events(distributor, HopStage::MeshSent, stream_id);
+        assert!(sent.iter().all(|event| event.peer == Some(pair.edge_addr)));
+        let received = hop_events(edge, HopStage::MeshFirst, stream_id);
         assert!(received
             .iter()
-            .all(|event| event.peer == Some(distributor_addr)));
-        let _ = shutdown_tx.send(());
-        distributor_mesh.shutdown();
-        edge_mesh.shutdown();
+            .all(|event| event.peer == Some(pair.distributor_addr)));
+        pair.shutdown();
+    }
+
+    #[tokio::test]
+    async fn without_sync_on_publish_a_part_waits_for_the_tick() {
+        // The only tick that runs is the first one, before the part.
+        let pair = HopMeshPair::start(false, Duration::from_secs(60)).await;
+        let stream_id = 78;
+        pair.commit(stream_id, 0).await;
+        assert_eq!(
+            hop_events(&pair.distributor, HopStage::Committed, stream_id).len(),
+            1
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            hop_events(&pair.distributor, HopStage::MeshSent, stream_id).is_empty(),
+            "the distributor sent a part between ticks"
+        );
+        assert!(hop_events(&pair.edge, HopStage::EdgeCommitted, stream_id).is_empty());
+        assert!(pair
+            .edge
+            .chunk_cache
+            .get_for_stream_id(stream_id, 0)
+            .await
+            .is_none());
+        pair.shutdown();
+    }
+
+    /// A reader blocked on the next part is woken by the cache write. On an
+    /// edge that happens before the applied part reaches
+    /// `observe_mesh_part`, and the response must still say when the part
+    /// was committed.
+    #[tokio::test]
+    async fn a_reader_blocked_on_a_part_is_told_when_the_edge_committed_it() {
+        let distributor = journaled_test_cache("distributor").await;
+        let edge = journaled_test_cache("edge").await;
+        let stream_id = 77;
+        for sequence in 0..2_u64 {
+            distributor
+                .commit_stream_payload(
+                    stream_id,
+                    encode_test_published_fmp4_part(stream_id, 5, sequence, sequence == 0, 5),
+                )
+                .await
+                .unwrap();
+        }
+        let slot = |sequence: usize| {
+            let distributor = Arc::clone(&distributor);
+            async move {
+                distributor
+                    .chunk_cache
+                    .get_for_stream_id(stream_id, sequence)
+                    .await
+                    .unwrap()
+                    .0
+            }
+        };
+        // Part 0 arrived as the mesh delivers it: written, then recorded.
+        edge.chunk_cache
+            .add_for_stream_id(stream_id, 0, slot(0).await)
+            .await
+            .unwrap();
+        edge.observe_mesh_part(stream_id, 0, None).await.unwrap();
+        let part_one = slot(1).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&edge.chunk_cache)).await;
+        let router = app_router_for_tests(Arc::clone(&edge), Arc::clone(&mesh));
+
+        let part_path = format!("/live/{stream_id}/part1.mp4");
+        let mut written_after = 0;
+        let (response, ()) = tokio::join!(get_for_tests(&router, &part_path), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            written_after = now_unix_us();
+            // The mesh writes part 1; nothing records it in the
+            // playlist state before the reader answers.
+            edge.chunk_cache
+                .add_for_stream_id(stream_id, 1, part_one)
+                .await
+                .unwrap();
+        });
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(edge
+            .state
+            .read()
+            .await
+            .stream_parts
+            .get(&stream_id)
+            .is_none_or(|parts| !parts.contains_key(&1)));
+        let committed: u64 = hop_header(&response, "x-needletail-edge-committed-unix-us")
+            .expect("the edge-committed header of a part the reader waited for")
+            .parse()
+            .unwrap();
+        assert_eq!(
+            Some(committed),
+            edge.chunk_cache.written_unix_us_for_stream_id(stream_id, 1)
+        );
+        let reply: u64 = hop_header(&response, "x-needletail-reply-unix-us")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(written_after <= committed && committed <= reply);
+        assert!(hop_header(&response, "x-needletail-cache-available-unix-us").is_some());
+
+        // When the applied part is recorded, the journal and later responses
+        // report the same commit time.
+        let parent: SocketAddr = "10.0.0.9:7000".parse().unwrap();
+        let applied = AppliedSlot {
+            stream_id,
+            slot_id: 1,
+            bytes: 0,
+            rx_first_us: 0,
+            decoded_us: 0,
+            committed_us: reply,
+            parent,
+        };
+        let journaled = mesh_applied_committed_us(&edge, &applied);
+        assert_eq!(journaled, committed);
+        journal_mesh_applied(&edge, &applied, journaled);
+        edge.observe_mesh_part(stream_id, 1, Some(journaled))
+            .await
+            .unwrap();
+        let events = hop_events(&edge, HopStage::EdgeCommitted, stream_id);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].t_us, committed);
+        let again = get_for_tests(&router, &format!("/live/{stream_id}/part1.mp4")).await;
+        assert_eq!(
+            hop_header(&again, "x-needletail-edge-committed-unix-us"),
+            Some(committed.to_string().as_str())
+        );
+        mesh.shutdown();
+    }
+
+    /// Collecting a full journal must not stop the runtime: on a runtime
+    /// with one thread, another task keeps running while the journal is
+    /// copied, sorted and formatted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn hops_api_renders_a_full_journal_off_the_runtime_thread() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        let cache = canonical_gap_test_cache().await;
+        let journal = Arc::new(HopJournal::new("edge-full", DEFAULT_HOP_JOURNAL_CAPACITY));
+        for sequence in 0..DEFAULT_HOP_JOURNAL_CAPACITY as u64 {
+            journal.record(
+                HopEvent::new(HopStage::Reply, 77, sequence, 1_000_000 + sequence)
+                    .with_peer(Some("10.0.0.2:12001".parse().unwrap())),
+            );
+        }
+        cache.set_hop_journal(Arc::clone(&journal));
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
+
+        let done = Arc::new(AtomicBool::new(false));
+        let longest_gap_us = Arc::new(AtomicU64::new(0));
+        let ticker = tokio::spawn({
+            let done = Arc::clone(&done);
+            let longest_gap_us = Arc::clone(&longest_gap_us);
+            async move {
+                let mut last = Instant::now();
+                while !done.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                    let now = Instant::now();
+                    let gap = now.duration_since(last).as_micros() as u64;
+                    longest_gap_us.fetch_max(gap, Ordering::Relaxed);
+                    last = now;
+                }
+            }
+        });
+        tokio::task::yield_now().await;
+        let started = Instant::now();
+        let response = get_for_tests(&router, "/api/hops").await;
+        let took_us = started.elapsed().as_micros() as u64;
+        done.store(true, Ordering::Release);
+        ticker.await.unwrap();
+
+        assert_eq!(response.status, StatusCode::OK);
+        let body = response.body.unwrap();
+        assert_eq!(
+            body.iter().filter(|byte| **byte == b'\n').count(),
+            DEFAULT_HOP_JOURNAL_CAPACITY
+        );
+        let longest_gap_us = longest_gap_us.load(Ordering::Relaxed);
+        assert!(
+            longest_gap_us * 2 < took_us,
+            "the runtime stalled for {longest_gap_us} us of a {took_us} us read"
+        );
+        mesh.shutdown();
     }
 }
