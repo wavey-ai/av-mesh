@@ -13823,14 +13823,31 @@ impl AppRouter {
 
     /// Subscribe this edge to a playlist when the first reader asks for it,
     /// and hold the request until the copy has parts to serve.
-    async fn ensure_playlist_copy(&self, stream_id: u64) {
+    ///
+    /// The answer is `false` when every playlist slot of this edge holds a
+    /// playlist that has readers. The edge cannot serve this one, and the
+    /// reader must be sent to another edge.
+    async fn ensure_playlist_copy(&self, stream_id: u64) -> bool {
         if !self.playlist_demand.config.enabled {
-            return;
+            return true;
         }
         let now_ms = now_unix_ms();
         let touch = self.playlist_demand.touch(stream_id, now_ms);
         if touch.refused {
-            return;
+            let refused = self
+                .playlist_demand
+                .subscriptions_refused
+                .load(Ordering::Relaxed);
+            if refused.is_power_of_two() {
+                warn!(
+                    stream_id,
+                    slots = self.playlist_demand.config.max_playlists,
+                    refused,
+                    "every playlist slot of this edge holds a playlist that has readers: \
+                     the readers of this stream are sent to another edge (see --playlist-slots)"
+                );
+            }
+            return false;
         }
         if touch.new {
             match self
@@ -13859,6 +13876,7 @@ impl AppRouter {
                 )
                 .await;
         }
+        true
     }
 
     /// Give admission a bit rate for a playlist that this node has not
@@ -13961,7 +13979,17 @@ impl AppRouter {
             }
         }
         for stream_id in stream_ids {
-            self.ensure_playlist_copy(stream_id).await;
+            if !self.ensure_playlist_copy(stream_id).await {
+                // This edge has no slot for one more playlist. Without this
+                // answer the reader would wait for a playlist that never
+                // comes: the other edges of its session have slots.
+                let alternatives = self.alternate_cache_urls(reader, path, query).await;
+                if let Some(session_id) = session_id {
+                    self.edge_load.egress.release_session(session_id);
+                }
+                self.edge_load.record_rejection();
+                return Some(playlist_slots_full_response(&alternatives));
+            }
             self.keep_ladder_warm(stream_id).await;
         }
         None
@@ -17185,6 +17213,16 @@ fn parents_lost_response(alternatives: &[String]) -> HandlerResponse {
     response
 }
 
+/// The answer of an edge whose playlist slots all hold a playlist that has
+/// readers, to a reader of one more playlist.
+fn playlist_slots_full_response(alternatives: &[String]) -> HandlerResponse {
+    let mut response = edge_overloaded_response(alternatives);
+    response.body = Some(Bytes::from_static(
+        b"This edge holds as many playlists as it has slots. Use another edge.\n",
+    ));
+    response
+}
+
 fn edge_overloaded_response(alternatives: &[String]) -> HandlerResponse {
     let mut response = response(
         StatusCode::TOO_MANY_REQUESTS,
@@ -19470,6 +19508,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_edge_without_a_free_playlist_slot_sends_the_reader_away() {
+        use playlists::mesh::{CacheMesh, CacheMeshConfig};
+
+        let cache = canonical_gap_test_cache().await;
+        let mesh = Arc::new(
+            CacheMesh::new(
+                Arc::clone(&cache.chunk_cache),
+                CacheMeshConfig::new("full-edge", "uk", unused_loopback_addr()),
+            )
+            .start()
+            .await
+            .unwrap(),
+        );
+        for sequence in 0..=2_u64 {
+            commit_canonical_gap_test_part(&cache, 77, sequence).await;
+        }
+        let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh))
+            .with_playlist_demand(PlaylistDemand::new(PlaylistDemandConfig {
+                enabled: true,
+                lease: Duration::from_millis(3_000),
+                idle: Duration::from_millis(10_000),
+                warm_parts: 8,
+                max_playlists: 1,
+            }));
+
+        // The one slot goes to the first playlist that a reader asks for.
+        assert!(router
+            .playback_admission_response("/live/77/stream.m3u8", None, Some("first"))
+            .await
+            .is_none());
+        // A reader of a second playlist is answered at once, with the answer
+        // that sends it to another edge. It was held for nothing before.
+        let started = Instant::now();
+        let refused = router
+            .playback_admission_response("/live/78/stream.m3u8", None, Some("second"))
+            .await
+            .expect("the edge has no slot for a second playlist");
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(std::str::from_utf8(refused.body.as_ref().unwrap())
+            .unwrap()
+            .contains("as many playlists as it has slots"));
+        assert!(refused
+            .headers
+            .iter()
+            .any(|(name, value)| name == "retry-after" && value == "1"));
+        // The playlist that has readers is still served, to any reader.
+        assert!(router
+            .playback_admission_response("/live/77/stream.m3u8", None, Some("third"))
+            .await
+            .is_none());
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
     async fn edge_repairs_a_recent_hole_without_waiting_for_the_replica_interval() {
         use playlists::mesh::{CacheMesh, CacheMeshConfig};
         use tokio::time::timeout;
@@ -19497,6 +19590,11 @@ mod tests {
                 .await
                 .unwrap(),
         );
+
+        // Two nodes that have just started exchange what they hold. Let that
+        // pass: a hole that is made during it is filled by that exchange,
+        // and this test is about the request of the edge.
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         // The parent holds parts 0 to 4. The edge lost part 2 from the mesh.
         let hole = 2_u64;
