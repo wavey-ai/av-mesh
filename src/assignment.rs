@@ -55,6 +55,12 @@ pub struct CacheCandidate {
     pub head_part: Option<u64>,
     /// Bit rate that the cache can still admit, when it advertises it.
     pub free_bps: Option<u64>,
+    /// What one more session of the playlist costs this cache, in bits per
+    /// second: its bit rate, or the share of the cache that its requests
+    /// take. `None` uses the bit rate of the playlist in the request.
+    pub session_charge_bps: Option<u64>,
+    /// When the cache wrote the advertisement that this record comes from.
+    pub updated_unix_ms: u64,
 }
 
 impl CacheCandidate {
@@ -202,7 +208,10 @@ pub fn assign(
     let healthy = |cache: &CacheCandidate| cache.fresh && !cache.draining && !stalled(cache);
     // A cache with some room can still be too full for this playlist: a 4K
     // reader does not fit where an audio reader does.
-    let has_room = |cache: &CacheCandidate| match (cache.free_bps, request.playlist_bps) {
+    let has_room = |cache: &CacheCandidate| match (
+        cache.free_bps,
+        cache.session_charge_bps.or(request.playlist_bps),
+    ) {
         (Some(free), Some(needed)) => free >= needed,
         _ => true,
     };
@@ -337,7 +346,38 @@ mod tests {
             load_permille,
             head_part,
             free_bps: None,
+            session_charge_bps: None,
+            updated_unix_ms: 0,
         }
+    }
+
+    #[test]
+    fn a_cache_is_judged_by_what_a_session_costs_that_cache() {
+        // An Opus playlist is 96 kbit/s. Its readers ask for 200 parts a
+        // second, which costs a small cache 2.2 Mbit/s of its capacity.
+        let mut caches = vec![
+            cache("edge-a", 900, Some(10)),
+            cache("edge-b", 100, Some(10)),
+        ];
+        caches[0].free_bps = Some(1_000_000);
+        caches[0].session_charge_bps = Some(2_244_444);
+        caches[1].free_bps = Some(80_000_000);
+        caches[1].session_charge_bps = Some(2_244_444);
+        let assignment = assign(
+            AssignmentRequest {
+                playlist_bps: Some(96_000),
+                ..request("reader")
+            },
+            AssignmentPolicy::default(),
+            &caches,
+        )
+        .unwrap();
+        // edge-a has room for the bits and not for the requests.
+        assert_eq!(assignment.caches[0].node_id, "edge-b");
+        assert!(assignment
+            .caches
+            .iter()
+            .all(|cache| cache.node_id != "edge-a"));
     }
 
     fn request(session: &str) -> AssignmentRequest<'_> {

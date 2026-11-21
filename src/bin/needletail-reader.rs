@@ -579,6 +579,8 @@ struct ReaderReport {
     max_gap_ms: u64,
     /// Caches that the steering manifest defined as pathway clones.
     pathway_clones: u64,
+    /// Times that no entry point gave the reader a cache.
+    entry_refusals: u64,
     /// Largest number of part requests on their way at one time.
     pipeline_depth: usize,
     /// Shortest round trip of a playlist reload.
@@ -723,6 +725,10 @@ impl Reader {
     fn record_move(&mut self, part: u64, to: usize, reason: &str, detail: String) {
         let from = self.current_name();
         self.current = to;
+        // The next cache can be on another path, for example in another
+        // region. Its round trip is measured anew.
+        self.round_trip = None;
+        self.http.tcp_round_trip = None;
         self.report.moves.push(Move {
             at_ms: self.elapsed_ms(),
             part,
@@ -960,12 +966,18 @@ impl Reader {
         let deadline = self.started + Duration::from_secs(self.args.duration_seconds);
         // An entry point can answer 503 while the region has no cache with
         // room. A player retries.
+        // The wait doubles from half a second to eight seconds, as the retry
+        // policy of a player does, so that a crowd that a full region has
+        // refused does not ask it again all at once.
+        let mut wait = Duration::from_millis(500);
         loop {
             match self.load_master().await {
                 Ok(()) => break,
-                Err(error) if Instant::now() + Duration::from_secs(1) < deadline => {
+                Err(error) if Instant::now() + wait + Duration::from_secs(1) < deadline => {
                     let _ = error;
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    self.report.entry_refusals += 1;
+                    tokio::time::sleep(wait).await;
+                    wait = (wait * 2).min(Duration::from_secs(8));
                 }
                 Err(error) => return Err(error.context("no assignment")),
             }

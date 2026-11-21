@@ -167,10 +167,16 @@ const MIN_BITRATE_WINDOW_MS: u64 = 4_000;
 /// How often a node without its own measurement of a playlist asks what
 /// rate the region advertises for it.
 const PLAYLIST_RATE_LOOKUP_INTERVAL_MS: u64 = 500;
-/// Requests a second that one worker thread of a small node answers with its
-/// processor full. Measured on a 1 vCPU node: forty readers of 5 ms parts,
-/// 8,080 requests a second over HTTP/2 and TLS, took 76% of the processor.
-const DEFAULT_REQUESTS_PER_WORKER: u64 = 9_000;
+/// Requests a second that one worker thread of a small node is charged for.
+/// Measured on a 1 vCPU node: forty readers of 5 ms parts, 8,080 requests a
+/// second over HTTP/2 and TLS, took 76% of the processor, and sixty readers
+/// all stalled. With 8,000 and admission at 85% a node admits 33 such
+/// readers, which leaves room for readers on far paths, who cost more, and
+/// for the connections of a crowd.
+const DEFAULT_REQUESTS_PER_WORKER: u64 = 8_000;
+/// How long an entry point uses one reading of the advertisements of its
+/// region.
+const REGIONAL_VIEW_TTL: Duration = Duration::from_millis(100);
 /// Edges of a region that hold a playlist while it has readers.
 const DEFAULT_PLAYLIST_COPIES: usize = 2;
 /// An edge that holds this many playlists takes no standby copy: the slots
@@ -1105,10 +1111,14 @@ struct Args {
     /// Requests that this node answers in a second when its processor is
     /// full. A session is charged the larger of its bit rate and the share of
     /// the node that its requests take, so a node admits about forty readers
-    /// of 5 ms parts for each vCPU. Zero takes 9,000 for each worker thread,
-    /// which is what a Nanode measures.
+    /// of 5 ms parts for each vCPU. Zero takes 8,000 for each worker thread.
     #[arg(long, env = "NEEDLETAIL_EGRESS_REQUEST_CAPACITY", default_value_t = 0)]
     egress_request_capacity: u64,
+
+    /// Threads that serve readers, beside the threads that carry the media.
+    /// Zero takes as many as the media has.
+    #[arg(long, env = "NEEDLETAIL_HTTP_WORKER_THREADS", default_value_t = 0)]
+    http_worker_threads: usize,
 
     /// Edges of a region that hold each playlist that has readers. With two,
     /// a second edge takes a copy of a playlist as soon as one edge has a
@@ -1804,6 +1814,7 @@ async fn main() -> Result<()> {
     )
     .with_hls_renditions(args.hls_renditions.clone(), args.hls_rendition_stale_ms)
     .with_failover_entries(&args.failover_entries)
+    .with_regional_view_ttl(REGIONAL_VIEW_TTL)
     .with_playlist_demand(playlist_demand)
     .with_assignment(
         AssignmentPolicy {
@@ -1882,7 +1893,23 @@ async fn main() -> Result<()> {
             .with_raw_tcp_handler(Box::new(router.clone()));
     }
     let server = server_builder.with_router(Box::new(router)).build()?;
-    let handle = server.start().await?;
+    // Readers are served on threads of their own. A crowd of readers costs
+    // processor for each connection, and on the threads that carry the media
+    // it held the media back: a distributor that two thousand readers asked
+    // at once fell behind its relays and lost parts for the whole region.
+    // On one vCPU the kernel now shares the processor between the two, and
+    // the threads of the readers have the lower priority.
+    let http_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(args.http_worker_threads())
+        .thread_name("needletail-http")
+        .on_thread_start(lower_thread_priority)
+        .enable_all()
+        .build()
+        .context("failed to start the runtime that serves readers")?;
+    let handle = http_runtime
+        .spawn(async move { server.start().await })
+        .await
+        .context("the HTTP server task ended")??;
     let _ = handle.ready_rx.await;
 
     println!("node:    {} ({})", node_id, args.region);
@@ -1963,6 +1990,7 @@ async fn main() -> Result<()> {
     let _ = mesh_applied_task.await;
     let _ = playlist_demand_task.await;
     let _ = playlist_standby_task.await;
+    http_runtime.shutdown_background();
     let _ = replication_planner_task.await;
     if let Some(task) = telemetry_publisher_task {
         let _ = task.await;
@@ -1988,9 +2016,38 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Give the calling thread a lower priority than the threads that carry the
+/// media. On Linux a nice value belongs to the thread.
+fn lower_thread_priority() {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `nice` has no memory effects. A failure leaves the
+        // priority as it was.
+        let _ = unsafe { libc::nice(5) };
+    }
+}
+
 impl Args {
+    /// Threads that serve readers: the configured number, or as many as the
+    /// media has.
+    fn http_worker_threads(&self) -> usize {
+        if self.http_worker_threads > 0 {
+            return self.http_worker_threads;
+        }
+        std::env::var("TOKIO_WORKER_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|workers| *workers > 0)
+            .or_else(|| {
+                std::thread::available_parallelism()
+                    .ok()
+                    .map(std::num::NonZero::get)
+            })
+            .unwrap_or(1)
+    }
+
     /// Requests a second that the node answers with its processor full:
-    /// the configured number, or 9,000 for each worker thread.
+    /// the configured number, or 8,000 for each worker thread.
     fn egress_request_capacity(&self) -> u64 {
         if self.egress_request_capacity > 0 {
             return self.egress_request_capacity;
@@ -5058,6 +5115,7 @@ impl LiveTsCache {
                 state.stream_max_segment_duration_ms.remove(&stream_id);
                 state.stream_declared_ms.remove(&stream_id);
                 state.stream_playlist_floor.remove(&stream_id);
+                state.stream_init_scanned.remove(&stream_id);
                 state.stream_inits.remove(&stream_id);
                 state.stream_media_kinds.remove(&stream_id);
                 if stream_id == self.stream_id {
@@ -6115,7 +6173,22 @@ impl LiveTsCache {
         }
 
         let (stream_idx, last) = self.stream_position_for_id(stream_id).await?;
-        let first = self.chunk_cache.retained_start(last);
+        // A stream without an initialization section, such as opaque audio,
+        // has none in any part. Each part is looked at once: without this
+        // mark every request for the Multivariant Playlist of such a stream
+        // decoded its whole window, which was most of the processor of an
+        // entry point that two thousand readers asked at once.
+        let scanned = self
+            .state
+            .read()
+            .await
+            .stream_init_scanned
+            .get(&stream_id)
+            .copied();
+        let first = self
+            .chunk_cache
+            .retained_start(last)
+            .max(scanned.map_or(0, |slot| slot.saturating_add(1)));
         for seq in (first..=last).rev() {
             let Some((bytes, _hash)) = self.chunk_cache.get(stream_idx, seq).await else {
                 continue;
@@ -6126,6 +6199,11 @@ impl LiveTsCache {
                 return Some(init);
             }
         }
+        self.state
+            .write()
+            .await
+            .stream_init_scanned
+            .insert(stream_id, last);
         None
     }
 
@@ -6311,6 +6389,7 @@ impl LiveTsCache {
             .max(1_000)
     }
 
+    #[cfg(test)]
     async fn hls_reload_position_available(
         &self,
         stream_id: u64,
@@ -7313,6 +7392,9 @@ struct LiveState {
     /// A new copy is filled newest part first, and the playlist must not
     /// grow at its front: a Media Sequence Number never goes down.
     stream_playlist_floor: HashMap<u64, u64>,
+    /// Newest slot of a stream that was searched for an initialization
+    /// section and held none.
+    stream_init_scanned: HashMap<u64, usize>,
     stream_inits: HashMap<u64, Bytes>,
     stream_media_kinds: HashMap<u64, LiveMediaKind>,
 }
@@ -7348,6 +7430,7 @@ impl LiveState {
             stream_max_segment_duration_ms: HashMap::new(),
             stream_declared_ms: HashMap::new(),
             stream_playlist_floor: HashMap::new(),
+            stream_init_scanned: HashMap::new(),
             stream_inits: HashMap::new(),
             stream_media_kinds: HashMap::new(),
         }
@@ -7774,6 +7857,7 @@ impl LiveState {
         self.stream_max_segment_duration_ms.remove(&stream_id);
         self.stream_declared_ms.remove(&stream_id);
         self.stream_playlist_floor.remove(&stream_id);
+        self.stream_init_scanned.remove(&stream_id);
         self.stream_inits.remove(&stream_id);
         self.stream_media_kinds.remove(&stream_id);
     }
@@ -8707,6 +8791,10 @@ struct EdgeServiceSnapshot {
     /// Load in thousandths of the admission limit of this cache.
     #[serde(default)]
     load_permille: u32,
+    /// Requests that this cache answers in a second with its processor
+    /// full. Zero when it charges a session its bit rate alone.
+    #[serde(default)]
+    egress_request_capacity: u64,
     /// Playlists that this cache holds, with their readers.
     #[serde(default)]
     playlists: Vec<PlaylistHolding>,
@@ -8725,6 +8813,9 @@ struct PlaylistHolding {
     /// Playback sessions that read this playlist from this cache.
     #[serde(default)]
     sessions: u64,
+    /// Requests that one reader of the playlist makes in a second.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_rate: Option<u64>,
 }
 
 impl EdgeServiceSnapshot {
@@ -8766,6 +8857,7 @@ impl EdgeServiceSnapshot {
             session_limit: load.egress.session_limit,
             committed_bps: load.egress.committed_bps,
             load_permille: load.egress.load_permille,
+            egress_request_capacity: 0,
             playlists: Vec::new(),
             draining: node.draining,
         }
@@ -13258,6 +13350,14 @@ struct AppRouter {
     /// the time. It keeps a session on its cache when the session asks again
     /// without naming the cache that it uses.
     remembered_assignments: Arc<DashMap<String, (String, u64)>>,
+    /// Capacity that this entry point has given away at each cache since
+    /// the advertisement of the cache that it last read: the time of that
+    /// advertisement, and the bits per second.
+    pending_assignments: Arc<DashMap<String, (u64, u64)>>,
+    /// The advertisements of the region as this node last read them.
+    #[allow(clippy::type_complexity)]
+    regional_view: Arc<tokio::sync::Mutex<Option<(Instant, Arc<Vec<MeshSnapshot>>)>>>,
+    regional_view_ttl: Duration,
 }
 
 /// A request that the entry point answers for a reader.
@@ -13327,6 +13427,11 @@ impl AppRouter {
             steering_ttl_seconds: 5,
             assignment_fresh_ms: DEFAULT_TELEMETRY_INTERVAL_MS.saturating_mul(3),
             remembered_assignments: Arc::new(DashMap::new()),
+            pending_assignments: Arc::new(DashMap::new()),
+            regional_view: Arc::new(tokio::sync::Mutex::new(None)),
+            // A router reads the region afresh for each request unless it is
+            // told how long one reading serves.
+            regional_view_ttl: Duration::ZERO,
         }
     }
 
@@ -13365,6 +13470,11 @@ impl AppRouter {
         self
     }
 
+    fn with_regional_view_ttl(mut self, ttl: Duration) -> Self {
+        self.regional_view_ttl = ttl;
+        self
+    }
+
     fn with_hls_renditions(mut self, renditions: Vec<HlsRenditionSpec>, stale_ms: u64) -> Self {
         self.hls_renditions = Arc::new(HlsRenditionCatalog::new(renditions));
         self.hls_rendition_stale_ms = stale_ms.max(1);
@@ -13397,6 +13507,7 @@ impl AppRouter {
             self.playback_base_url.clone(),
             cache_mesh_role_label(self.cache_mesh_role),
         );
+        edge_service.egress_request_capacity = self.edge_load.egress.request_capacity_per_sec();
         edge_service.playlists = snapshot
             .streams
             .iter()
@@ -13414,6 +13525,10 @@ impl AppRouter {
                         .measured_playlist_bps(stream.stream_id)
                         .or(stream.bitrate_bps),
                     sessions: sessions.get(&stream.stream_id).copied().unwrap_or(0),
+                    request_rate: self
+                        .edge_load
+                        .egress
+                        .playlist_request_rate(stream.stream_id),
                 })
             })
             .collect();
@@ -13580,6 +13695,19 @@ impl AppRouter {
             self.edge_load
                 .egress
                 .set_playlist_request_rate(stream_id, 1_000_u64.div_ceil(part_ms) + 2);
+        } else if self
+            .edge_load
+            .egress
+            .playlist_request_rate(stream_id)
+            .is_none()
+        {
+            // A copy that is on its way has no part yet. The caches of the
+            // region that hold the playlist say how often a reader asks.
+            if let Some(rate) = self.regional_request_rate(stream_id).await {
+                self.edge_load
+                    .egress
+                    .set_playlist_request_rate(stream_id, rate);
+            }
         }
         if self
             .edge_load
@@ -13647,9 +13775,25 @@ impl AppRouter {
     /// playlist. The advertisement of each cache names the playlists that it
     /// holds, its load against its admission limit, and whether it drains.
     async fn cache_candidates(&self, stream_id: u64) -> Vec<CacheCandidate> {
-        let local = self.local_mesh_snapshot().await;
-        let (snapshots, _) = self.telemetry.snapshots_with_local(local).await;
+        let snapshots = self.regional_snapshots().await;
         let now_ms = now_unix_ms();
+        // What the region knows of the playlist: its highest measured bit
+        // rate, and how often one of its readers asks.
+        let holdings = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.node.region == self.node.region)
+            .filter_map(|snapshot| snapshot.edge_service.as_ref())
+            .flat_map(|edge| edge.playlists.iter())
+            .filter(|playlist| playlist.stream_id == stream_id)
+            .collect::<Vec<_>>();
+        let regional_bps = holdings
+            .iter()
+            .filter_map(|playlist| playlist.bitrate_bps)
+            .max();
+        let regional_rate = holdings
+            .iter()
+            .filter_map(|playlist| playlist.request_rate)
+            .max();
         snapshots
             .iter()
             .filter_map(|snapshot| {
@@ -13685,11 +13829,37 @@ impl AppRouter {
                     load_permille: edge.load_permille,
                     head_part,
                     // A node that does not advertise its limit is judged by
-                    // its load alone.
+                    // its load alone. Readers that this entry point has sent
+                    // to the cache since the cache last wrote its
+                    // advertisement are not in it yet: they count here.
                     free_bps: (edge.egress_admission_bps > 0).then(|| {
                         edge.egress_admission_bps
                             .saturating_sub(edge.egress_observed_bps.max(edge.committed_bps))
+                            .saturating_sub(if is_local {
+                                0
+                            } else {
+                                self.pending_assignments
+                                    .get(&snapshot.node.node_id)
+                                    .filter(|pending| pending.0 == snapshot.updated_unix_ms)
+                                    .map_or(0, |pending| pending.1)
+                            })
                     }),
+                    // The larger of the bit rate of the playlist and the
+                    // share of this cache that the requests of a reader take.
+                    session_charge_bps: {
+                        let requests = regional_rate
+                            .filter(|_| edge.egress_request_capacity > 0)
+                            .map(|rate| {
+                                (u128::from(edge.egress_capacity_bps) * u128::from(rate)
+                                    / u128::from(edge.egress_request_capacity))
+                                .min(u128::from(u64::MAX)) as u64
+                            });
+                        match (regional_bps, requests) {
+                            (Some(bps), Some(requests)) => Some(bps.max(requests)),
+                            (bps, requests) => bps.or(requests),
+                        }
+                    },
+                    updated_unix_ms: snapshot.updated_unix_ms,
                 })
             })
             .collect()
@@ -13724,8 +13894,7 @@ impl AppRouter {
         {
             return true;
         }
-        let local = self.local_mesh_snapshot().await;
-        let (snapshots, _) = self.telemetry.snapshots_with_local(local).await;
+        let snapshots = self.regional_snapshots().await;
         snapshots
             .iter()
             .filter(|snapshot| snapshot.node.region == self.node.region)
@@ -13743,9 +13912,44 @@ impl AppRouter {
         .with_no_store()
     }
 
-    async fn regional_playlist_bps(&self, stream_id: u64) -> Option<u64> {
+    /// The advertisements of every node that this node hears, with its own.
+    ///
+    /// An entry point reads them for every reader that it assigns. Writing
+    /// its own advertisement and copying the others costs about a
+    /// millisecond, and a crowd of two thousand readers in one second took
+    /// the whole processor of a distributor, which then fell behind with the
+    /// parts for its edges. The view is therefore kept for a tenth of a
+    /// second: a crowd shares it.
+    async fn regional_snapshots(&self) -> Arc<Vec<MeshSnapshot>> {
+        let mut view = self.regional_view.lock().await;
+        if let Some((at, snapshots)) = view.as_ref() {
+            if at.elapsed() < self.regional_view_ttl {
+                return Arc::clone(snapshots);
+            }
+        }
         let local = self.local_mesh_snapshot().await;
         let (snapshots, _) = self.telemetry.snapshots_with_local(local).await;
+        let snapshots = Arc::new(snapshots);
+        *view = Some((Instant::now(), Arc::clone(&snapshots)));
+        snapshots
+    }
+
+    /// Requests that a reader of a playlist makes in a second, from the
+    /// advertisements of the caches of the region that hold it.
+    async fn regional_request_rate(&self, stream_id: u64) -> Option<u64> {
+        let snapshots = self.regional_snapshots().await;
+        snapshots
+            .iter()
+            .filter(|snapshot| snapshot.node.region == self.node.region)
+            .filter_map(|snapshot| snapshot.edge_service.as_ref())
+            .flat_map(|edge| edge.playlists.iter())
+            .filter(|playlist| playlist.stream_id == stream_id)
+            .filter_map(|playlist| playlist.request_rate)
+            .max()
+    }
+
+    async fn regional_playlist_bps(&self, stream_id: u64) -> Option<u64> {
+        let snapshots = self.regional_snapshots().await;
         snapshots
             .iter()
             .filter(|snapshot| snapshot.node.region == self.node.region)
@@ -13787,6 +13991,29 @@ impl AppRouter {
             self.assignment_policy,
             &candidates,
         );
+        // A reader that is placed now takes capacity that the cache has not
+        // advertised as taken. Count it until the cache advertises again, so
+        // that a crowd is not all sent to the cache that was free a moment
+        // ago.
+        if let (true, None, None, Ok(assignment)) =
+            (remember, remembered.as_ref(), reader.current, &assignment)
+        {
+            if let Some(candidate) = assignment.caches.first().and_then(|first| {
+                candidates
+                    .iter()
+                    .find(|cache| cache.node_id == first.node_id)
+            }) {
+                let charge = candidate.session_charge_bps.or(playlist_bps).unwrap_or(0);
+                let mut pending = self
+                    .pending_assignments
+                    .entry(candidate.node_id.clone())
+                    .or_insert((candidate.updated_unix_ms, 0));
+                if pending.0 != candidate.updated_unix_ms {
+                    *pending = (candidate.updated_unix_ms, 0);
+                }
+                pending.1 = pending.1.saturating_add(charge);
+            }
+        }
         if let (true, Some(key), Ok(assignment)) = (remember, key, &assignment) {
             if !assignment.pinned {
                 if self.remembered_assignments.len() >= MAX_REMEMBERED_ASSIGNMENTS {
@@ -20167,6 +20394,7 @@ mod tests {
             session_limit: 0,
             committed_bps: 0,
             load_permille: 0,
+            egress_request_capacity: 0,
             playlists: Vec::new(),
             draining: false,
         });
@@ -25657,6 +25885,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_search_for_an_initialization_section_looks_at_each_part_once() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 2_400, 64).await;
+        // An opaque audio stream: no part carries an initialization section.
+        for sequence in 0..300_u64 {
+            cache
+                .commit_stream_payload(2_001, Bytes::from(vec![sequence as u8; 64]))
+                .await
+                .unwrap();
+        }
+        assert!(cache.get_init_for_stream_id(2_001).await.is_none());
+        assert_eq!(
+            cache.state.read().await.stream_init_scanned.get(&2_001),
+            Some(&299)
+        );
+        // New parts arrive. Only they are looked at.
+        for sequence in 300..310_u64 {
+            cache
+                .commit_stream_payload(2_001, Bytes::from(vec![sequence as u8; 64]))
+                .await
+                .unwrap();
+        }
+        assert!(cache.get_init_for_stream_id(2_001).await.is_none());
+        assert_eq!(
+            cache.state.read().await.stream_init_scanned.get(&2_001),
+            Some(&309)
+        );
+        // A stream that starts again is searched again.
+        cache.forget_mesh_stream(2_001).await;
+        assert!(!cache
+            .state
+            .read()
+            .await
+            .stream_init_scanned
+            .contains_key(&2_001));
+    }
+
+    #[tokio::test]
     async fn a_copy_that_fills_newest_first_never_grows_at_its_front() {
         let distributor = LiveTsCache::new(1, Duration::from_millis(5), 200, 2_400, 64).await;
         let edge = LiveTsCache::new(1, Duration::from_millis(5), 200, 2_400, 64).await;
@@ -26430,6 +26695,7 @@ mod tests {
         edge.load_permille = load_permille;
         edge.playlists = head_part
             .map(|head_part| PlaylistHolding {
+                request_rate: None,
                 stream_id: 801,
                 head_part,
                 bitrate_bps: Some(16_000_000),

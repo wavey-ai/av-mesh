@@ -242,6 +242,21 @@ impl EdgeAdmission {
             .remove(&stream_id);
     }
 
+    /// Requests that a reader of a playlist makes in a second, when known.
+    pub fn playlist_request_rate(&self, stream_id: u64) -> Option<u64> {
+        self.inner
+            .playlist_request_rate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&stream_id)
+            .copied()
+    }
+
+    /// Requests that this node answers in a second with its processor full.
+    pub fn request_capacity_per_sec(&self) -> u64 {
+        self.inner.config.request_capacity_per_sec
+    }
+
     /// The highest bit rate that this node has measured for a playlist.
     pub fn measured_playlist_bps(&self, stream_id: u64) -> Option<u64> {
         self.inner
