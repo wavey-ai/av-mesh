@@ -2375,6 +2375,8 @@ struct HlsRenditionSpec {
 #[derive(Debug, Clone, Default)]
 struct HlsRenditionCatalog {
     by_master_stream: HashMap<u64, Vec<HlsRenditionSpec>>,
+    /// The ladder that each rendition belongs to, by its stream.
+    master_of: HashMap<u64, u64>,
 }
 
 impl HlsRenditionCatalog {
@@ -2386,12 +2388,27 @@ impl HlsRenditionCatalog {
                 .or_default()
                 .push(rendition);
         }
-        for variants in by_master_stream.values_mut() {
+        let mut master_of = HashMap::new();
+        for (master_stream_id, variants) in by_master_stream.iter_mut() {
             variants.sort_by_key(|variant| {
                 (std::cmp::Reverse(variant.bandwidth_bps), variant.stream_id)
             });
+            for variant in variants.iter() {
+                master_of
+                    .entry(variant.stream_id)
+                    .or_insert(*master_stream_id);
+            }
         }
-        Self { by_master_stream }
+        Self {
+            by_master_stream,
+            master_of,
+        }
+    }
+
+    /// The renditions of the ladder that a stream is one rendition of.
+    fn ladder_of(&self, stream_id: u64) -> Option<&[HlsRenditionSpec]> {
+        self.variants(*self.master_of.get(&stream_id)?)
+            .filter(|ladder| ladder.len() > 1)
     }
 
     fn variants(&self, master_stream_id: u64) -> Option<&[HlsRenditionSpec]> {
@@ -13767,8 +13784,90 @@ impl AppRouter {
         }
         for stream_id in stream_ids {
             self.ensure_playlist_copy(stream_id).await;
+            self.keep_ladder_warm(stream_id).await;
         }
         None
+    }
+
+    /// Hold every rendition of a ladder while a reader reads one of them.
+    ///
+    /// A player changes rendition when its network changes, and that is when
+    /// it can least afford the wait for a copy to warm. The other renditions
+    /// are demand like the one that is read: they are released together when
+    /// the last reader of the ladder has gone.
+    async fn keep_ladder_warm(&self, stream_id: u64) {
+        if !self.playlist_demand.config.enabled {
+            return;
+        }
+        let Some(ladder) = self.hls_renditions.ladder_of(stream_id) else {
+            return;
+        };
+        let now_ms = now_unix_ms();
+        for rendition in ladder {
+            if rendition.stream_id == stream_id {
+                continue;
+            }
+            let touch = self.playlist_demand.touch(rendition.stream_id, now_ms);
+            if !touch.new {
+                continue;
+            }
+            match self
+                .mesh
+                .subscribe(
+                    rendition.stream_id,
+                    0,
+                    self.playlist_demand.config.warm_parts,
+                )
+                .await
+            {
+                Ok(parents) => info!(
+                    stream_id = rendition.stream_id,
+                    read = stream_id,
+                    parents = parents.len(),
+                    "this edge holds a rendition of a ladder that has a reader"
+                ),
+                Err(error) => warn!(
+                    stream_id = rendition.stream_id,
+                    error = %error,
+                    "failed to subscribe to a rendition of a ladder"
+                ),
+            }
+        }
+    }
+
+    /// Add a Rendition Report for each other rendition of the ladder that
+    /// this cache holds live. A player that changes rendition asks for the
+    /// playlist of the new one with a blocking reload at the reported
+    /// position, and does not have to load it twice.
+    async fn with_rendition_reports(&self, stream_id: u64, mut playlist: String) -> String {
+        let Some(ladder) = self.hls_renditions.ladder_of(stream_id) else {
+            return playlist;
+        };
+        for rendition in ladder {
+            if rendition.stream_id == stream_id
+                || !self
+                    .cache
+                    .stream_is_locally_fresh(rendition.stream_id)
+                    .await
+                || !self
+                    .cache
+                    .state
+                    .read()
+                    .await
+                    .playlist_is_playable(rendition.stream_id)
+            {
+                continue;
+            }
+            let other = self.cache.playlist_for_stream_id(rendition.stream_id).await;
+            let Some((msn, part)) = playlist_last_position(&other) else {
+                continue;
+            };
+            playlist.push_str(&format!(
+                "#EXT-X-RENDITION-REPORT:URI=\"../{}/stream.m3u8\",LAST-MSN={msn},LAST-PART={part}\n",
+                rendition.stream_id
+            ));
+        }
+        playlist
     }
 
     /// The caches of this region as an entry point sees them, for one
@@ -14191,6 +14290,33 @@ impl AppRouter {
             if variants.is_empty() {
                 self.edge_load.record_rejection();
                 return hls_renditions_unavailable_response(&alternatives);
+            }
+            // The whole ladder again for each neighbouring region.
+            if steer && pin.is_none() {
+                for (name, base_url) in self.failover_entries.iter() {
+                    let mut request = String::from("assign=1");
+                    if let Some(session_id) = session_id {
+                        request.push_str("&sid=");
+                        request.push_str(&percent_encode_query_value(session_id));
+                    }
+                    let mut listed = false;
+                    for (rendition, codecs) in &active {
+                        let uri = format!(
+                            "{base_url}/live/{}/stream.m3u8?{request}",
+                            rendition.stream_id
+                        );
+                        if let Some(variant) =
+                            make_hls_rendition_variant(uri, *rendition, codecs.as_deref())
+                                .and_then(|variant| variant.with_pathway_id(name.clone()).ok())
+                        {
+                            variants.push(variant);
+                            listed = true;
+                        }
+                    }
+                    if listed {
+                        failover_pathways.push(name.clone());
+                    }
+                }
             }
         } else {
             let codecs = self
@@ -15514,6 +15640,7 @@ impl Router for AppRouter {
                         return Ok(self.record_edge_response(method, path, query, refusal, started));
                     }
                     let playlist = self.cache.playlist_for_stream_id(stream_id).await;
+                    let playlist = self.with_rendition_reports(stream_id, playlist).await;
                     let response =
                         playlist_response(Bytes::from(playlist), gzip_playlists).with_no_store();
                     return Ok(self.record_edge_response(method, path, query, response, started));
@@ -16849,6 +16976,26 @@ fn hls_renditions_unavailable_response(alternatives: &[String]) -> HandlerRespon
         ));
     }
     response
+}
+
+/// The last part that a playlist lists: its Media Sequence Number and its
+/// index in that segment. This is what a Rendition Report carries.
+fn playlist_last_position(playlist: &str) -> Option<(u64, u64)> {
+    let mut msn: Option<u64> = None;
+    let mut parts_in_segment = 0u64;
+    let mut last = None;
+    for line in playlist.lines() {
+        if let Some(value) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+            msn = value.trim().parse().ok();
+        } else if line.starts_with("#EXT-X-PART:") {
+            last = Some((msn?, parts_in_segment));
+            parts_in_segment += 1;
+        } else if !line.starts_with('#') && !line.trim().is_empty() {
+            msn = Some(msn? + 1);
+            parts_in_segment = 0;
+        }
+    }
+    last
 }
 
 fn make_hls_rendition_variant(
@@ -18272,7 +18419,65 @@ mod tests {
         ));
         assert!(!playlist.contains("/live/79/stream.m3u8"));
 
+        // Each rendition reports the position of the other live renditions.
+        for (read, other) in [(77, 78), (78, 77)] {
+            let response = router
+                .route(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(format!("/live/{read}/stream.m3u8"))
+                        .body(())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status, StatusCode::OK);
+            let playlist = String::from_utf8(response.body.unwrap().to_vec()).unwrap();
+            assert!(
+                playlist.contains(&format!(
+                    "#EXT-X-RENDITION-REPORT:URI=\"../{other}/stream.m3u8\",LAST-MSN=0,LAST-PART=0\n"
+                )),
+                "{playlist}"
+            );
+            assert!(!playlist.contains(&format!("URI=\"../{read}/stream.m3u8\"")));
+        }
+
         mesh.shutdown();
+    }
+
+    #[test]
+    fn the_last_position_of_a_playlist_is_its_last_listed_part() {
+        let open = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:40\n#EXTINF:2.000,\nseg40.mp4\n\
+            #EXT-X-PART:DURATION=0.2,URI=\"part10.mp4\"\n\
+            #EXT-X-PART:DURATION=0.2,URI=\"part11.mp4\"\n#EXTINF:0.4,\nseg41.mp4\n\
+            #EXT-X-PART:DURATION=0.2,URI=\"part12.mp4\"\n\
+            #EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part13.mp4\"\n";
+        assert_eq!(playlist_last_position(open), Some((42, 0)));
+        // The last segment is complete: its last part is the position.
+        let closed = open.replace("#EXT-X-PART:DURATION=0.2,URI=\"part12.mp4\"\n", "");
+        assert_eq!(playlist_last_position(&closed), Some((41, 1)));
+        assert_eq!(
+            playlist_last_position("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:40\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_stream_knows_the_ladder_that_it_is_a_rendition_of() {
+        let catalog = HlsRenditionCatalog::new(vec![
+            parse_hls_rendition_spec("77:77:18000000:16000000:3840x2160:59940").unwrap(),
+            parse_hls_rendition_spec("77:78:8000000:7000000:1920x1080:59940").unwrap(),
+            parse_hls_rendition_spec("90:90:8000000:7000000:1920x1080:59940").unwrap(),
+        ]);
+        let ladder = catalog.ladder_of(78).unwrap();
+        assert_eq!(
+            ladder.iter().map(|item| item.stream_id).collect::<Vec<_>>(),
+            vec![77, 78]
+        );
+        assert!(catalog.ladder_of(77).is_some());
+        // One rendition is not a ladder, and neither is an unknown stream.
+        assert!(catalog.ladder_of(90).is_none());
+        assert!(catalog.ladder_of(5).is_none());
     }
 
     #[tokio::test]
