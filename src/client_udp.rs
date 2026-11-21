@@ -149,7 +149,11 @@ impl RepairPolicy {
         if !(loss > 0.0) {
             return base.bounded();
         }
-        let planned = (loss * 1.5 + 0.002).min(0.3);
+        // Planned in steps, so that clients on similar paths share one
+        // encoding of each part at the edge.
+        const STEPS: [f64; 10] = [0.005, 0.01, 0.02, 0.03, 0.05, 0.08, 0.12, 0.18, 0.25, 0.3];
+        let wanted = (loss * 1.5 + 0.002).min(0.3);
+        let planned = STEPS.iter().copied().find(|step| *step >= wanted).unwrap_or(0.3);
         Self {
             loss_ppm: ((planned * 1e6).ceil() as u32).max(base.loss_ppm),
             ..base
@@ -537,6 +541,27 @@ fn fmp4_slot(payload: &Bytes) -> Option<(Bytes, Option<Bytes>)> {
     Some((payload.slice(init_end..media_end), init))
 }
 
+/// When the contributor published the part of a cache slot, in µs since
+/// the epoch: the `Published` stage timestamp of its media object, if the
+/// slot carries one.
+pub fn slot_published_unix_us(payload: &Bytes) -> Option<u64> {
+    let envelope = if payload.starts_with(b"AVMOBJS1") {
+        payload.get(40..)?
+    } else if payload.starts_with(&media_object::WIRE_MAGIC) {
+        payload.as_ref()
+    } else {
+        return None;
+    };
+    let object = media_object::decode(envelope).ok()?;
+    object
+        .stage_timestamps()
+        .iter()
+        .find(|timestamp| timestamp.stage() == media_object::Stage::Published)
+        .and_then(|timestamp| u64::try_from(timestamp.timestamp().unix_time_ns()).ok())
+        .map(|ns| ns / 1_000)
+        .filter(|us| *us > 0)
+}
+
 /// The object of a cut-through block: the cache-mesh chunk frame of a part.
 fn cut_through_object(frame: &[u8]) -> Option<PartObject> {
     let (stream_id, slot, payload) = playlists::mesh::chunk_frame_payload(frame)?;
@@ -547,7 +572,7 @@ fn cut_through_object(frame: &[u8]) -> Option<PartObject> {
         stream_id,
         part: slot,
         available_unix_us: 0,
-        published_unix_us: 0,
+        published_unix_us: slot_published_unix_us(&payload).unwrap_or(0),
         payload: media,
     })
 }
@@ -597,7 +622,10 @@ struct BlockCount {
 /// The receiving half of a client: datagrams in, objects out.
 #[derive(Debug, Default)]
 pub struct ObjectReceiver {
-    decoder: DatagramFecDecoder,
+    /// One decoder for each quarter of the block id space (cut-through,
+    /// edge-encoded parts, -, init): a decoder forgets blocks far below the
+    /// last one it decoded, and the spaces must not prune each other.
+    decoders: [DatagramFecDecoder; 4],
     blocks: HashMap<u32, BlockCount>,
     /// Blocks counted already, so that a late datagram does not count one
     /// again.
@@ -620,7 +648,10 @@ pub struct ObjectReceiver {
 
 /// A block is counted for loss once its datagrams have had this long to
 /// arrive.
-const LOSS_SETTLE: Duration = Duration::from_millis(500);
+const LOSS_SETTLE: Duration = Duration::from_millis(150);
+/// The loss that a client plans for until it has measured its path: a new
+/// path may already be lossy.
+pub const UNMEASURED_LOSS: f64 = 0.02;
 const SETTLED_MEMORY: usize = 8_192;
 
 impl ObjectReceiver {
@@ -634,7 +665,7 @@ impl ObjectReceiver {
     /// Start receiving from another edge: its symbols of a part differ from
     /// those of the last edge, and must not meet them in one decoder.
     pub fn new_flow(&mut self) {
-        self.decoder = DatagramFecDecoder::new();
+        self.decoders = Default::default();
         self.blocks.clear();
         self.settled.clear();
         self.settled_order.clear();
@@ -668,7 +699,8 @@ impl ObjectReceiver {
             count.received += 1;
         }
         let seen = self.blocks.get(&header.block_id).map_or(0, |count| count.received);
-        match self.decoder.push_datagram(datagram) {
+        let space = (header.block_id >> 30) as usize;
+        match self.decoders[space].push_datagram(datagram) {
             Ok(Some(bytes)) => match decode_any_object(bytes) {
                 Ok(object) => {
                     self.objects += 1;
@@ -683,6 +715,17 @@ impl ObjectReceiver {
                         // Decoded with fewer than all source symbols, or
                         // completed by a repair symbol.
                         self.recovered_objects += 1;
+                    }
+                    if space == 1 && object.kind == ObjectKind::Part {
+                        // The edge sent the whole part again (another
+                        // parent's block decoded first): the cut-through
+                        // block of the part will not complete, and is not
+                        // loss.
+                        let cut = cut_through_block_id(object.part);
+                        if self.blocks.remove(&cut).is_some() {
+                            self.settled.insert(cut);
+                            self.settled_order.push_back(cut);
+                        }
                     }
                     Some(object)
                 }
@@ -1152,6 +1195,33 @@ mod tests {
         );
         let ts = Bytes::from_static(b"\x47raw-ts");
         assert_eq!(slot_media(&ts, 1), Some((ts.clone(), None)));
+    }
+
+    #[test]
+    fn a_block_of_another_space_does_not_make_the_client_forget_a_cut_through_block() {
+        // Part 500 is being cut through (high block ids are far above it);
+        // an init (block 0x8000_0000 | 501) and a part sent whole
+        // (0x4000_0000 | 499) complete meanwhile. Part 500 still decodes.
+        let frame = chunk_frame(1, 500, &fmp4_slot_payload(b"", &vec![9_u8; 20_000]));
+        let cut = encode_block(&frame, cut_through_block_id(500), 1_000, 4).unwrap();
+        let mut receiver = ObjectReceiver::new();
+        for datagram in &cut[..10] {
+            assert!(receiver.push(datagram).is_none());
+        }
+        let init = PartObject {
+            kind: ObjectKind::Init,
+            ..object(501, 900)
+        };
+        assert!(encode_object(&init, DEFAULT_SYMBOL_SIZE, RepairPolicy::default())
+            .unwrap()
+            .iter()
+            .any(|datagram| receiver.push(datagram).is_some()));
+        assert!(encode_object(&object(499, 900), DEFAULT_SYMBOL_SIZE, RepairPolicy::default())
+            .unwrap()
+            .iter()
+            .any(|datagram| receiver.push(datagram).is_some()));
+        let decoded = cut[10..].iter().find_map(|datagram| receiver.push(datagram));
+        assert_eq!(decoded.expect("the cut-through block completes").part, 500);
     }
 
     const HEADER_LEN_FOR_TESTS: usize = raptorq_datagram_fec::HEADER_LEN;

@@ -489,7 +489,12 @@ async fn main() -> Result<()> {
     };
     // The edge left last, with the token that it gave, for an UNSUB.
     let mut leaving: Option<(SocketAddr, u64)> = None;
-    let mut repair = base_repair;
+    // Until the path is measured, plan for some loss.
+    let mut repair = if args.fixed_repair {
+        base_repair
+    } else {
+        RepairPolicy::for_loss(av_mesh::client_udp::UNMEASURED_LOSS, base_repair)
+    };
     let mut loss_estimate: Option<f64> = None;
     let mut loss_samples: Vec<f64> = Vec::new();
     let mut repair_changes = 0_u64;
@@ -581,7 +586,7 @@ async fn main() -> Result<()> {
         let mut last_datagram = Instant::now();
         // Until the cache answers, the request is repeated often.
         let mut next_refresh = Instant::now() + Duration::from_millis(300);
-        let mut next_loss_check = Instant::now() + Duration::from_millis(500);
+        let mut next_loss_check = Instant::now() + Duration::from_millis(150);
         let mut subscribed = false;
 
         loop {
@@ -606,7 +611,7 @@ async fn main() -> Result<()> {
                 continue 'caches;
             }
             if now >= next_loss_check {
-                next_loss_check = now + Duration::from_millis(500);
+                next_loss_check = now + Duration::from_millis(150);
                 if let Some(loss) = receiver.take_loss(repair) {
                     loss_samples.push(loss);
                     // Rise at once, fall slowly.
