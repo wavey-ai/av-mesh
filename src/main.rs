@@ -3,6 +3,7 @@ mod control;
 mod edge_admission;
 mod edge_lifecycle;
 mod edge_udp;
+mod fast_path;
 mod hop_journal;
 mod link_telemetry;
 
@@ -995,6 +996,37 @@ struct Args {
     )]
     relay_forward_nonblocking: bool,
 
+    /// Hand a datagram to every child that shares a source socket (children
+    /// given the same non-zero --relay-forward bind) in one `sendmmsg` call,
+    /// and replay warm sources to a promoted child the same way. Children
+    /// with binds of their own keep one send each, since a child knows its
+    /// parent by the source address. Applies with
+    /// --relay-forward-nonblocking.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_FORWARD_BATCH",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_forward_batch: bool,
+
+    /// SO_BUSY_POLL budget in µs for the sockets that receive media: the
+    /// relay ingest sockets and the cache-mesh socket. 0 turns it off.
+    /// Raising it needs CAP_NET_ADMIN; a refusal is reported in
+    /// /api/mesh (mesh_transport.fast_path) and the node runs without it.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_BUSY_POLL_US",
+        default_value_t = fast_path::DEFAULT_BUSY_POLL_US
+    )]
+    busy_poll_us: u32,
+
+    /// Run the relay ingest and the cache mesh on a runtime of one thread
+    /// pinned to this CPU, apart from the readers and the rest of the node.
+    /// Unset, they share the main runtime as before.
+    #[arg(long, env = "NEEDLETAIL_MEDIA_CPU")]
+    media_cpu: Option<usize>,
+
     #[arg(long, default_value_t = DEFAULT_MESH_FEC_REPAIR_SYMBOLS)]
     mesh_repair_symbols: u32,
 
@@ -1613,6 +1645,10 @@ struct UdpSocketBufferState {
     send_bytes: usize,
     receive_request_succeeded: bool,
     send_request_succeeded: bool,
+    /// The host limit (net.core.rmem_max / wmem_max) capped the request and
+    /// the node raised the buffers past it with SO_RCVBUFFORCE /
+    /// SO_SNDBUFFORCE.
+    forced: bool,
 }
 
 impl UdpSocketBufferState {
@@ -1665,18 +1701,34 @@ fn configure_udp_socket_buffers(
             false
         }
     };
-    let receive_bytes = socket_ref
-        .recv_buffer_size()
-        .context("failed to read the configured UDP receive-buffer size")?;
-    let send_bytes = socket_ref
-        .send_buffer_size()
-        .context("failed to read the configured UDP send-buffer size")?;
+    let read_sizes = || -> Result<(usize, usize)> {
+        Ok((
+            socket_ref
+                .recv_buffer_size()
+                .context("failed to read the configured UDP receive-buffer size")?,
+            socket_ref
+                .send_buffer_size()
+                .context("failed to read the configured UDP send-buffer size")?,
+        ))
+    };
+    let (mut receive_bytes, mut send_bytes) = read_sizes()?;
+    // A host with the stock limits caps both buffers at about 200 KB, which
+    // a burst of small parts to every child fills. A node with
+    // CAP_NET_ADMIN may go past the limit; without it nothing changes.
+    let mut forced = false;
+    if (receive_bytes < requested_bytes || send_bytes < requested_bytes)
+        && fast_path::force_socket_buffers(socket, requested_bytes)
+    {
+        (receive_bytes, send_bytes) = read_sizes()?;
+        forced = true;
+    }
     Ok(UdpSocketBufferState {
         requested_bytes,
         receive_bytes,
         send_bytes,
         receive_request_succeeded,
         send_request_succeeded,
+        forced,
     })
 }
 
@@ -1697,6 +1749,7 @@ async fn bind_buffered_udp_ingress(
             requested_bytes = state.requested_bytes,
             actual_receive_bytes = state.receive_bytes,
             actual_send_bytes = state.send_bytes,
+            forced_past_host_limit = state.forced,
             "UDP socket buffers configured"
         );
     } else {
@@ -1839,14 +1892,39 @@ async fn main() -> Result<()> {
     ));
     cache.set_hop_journal(Arc::clone(&hop_journal));
 
-    let mesh_transport = MeshTransportConfigSnapshot {
+    let mut mesh_transport = MeshTransportConfigSnapshot {
         sync_interval_ms: args.mesh_sync_interval_ms,
         sync_on_publish: args.mesh_sync_on_publish,
         min_repair_symbols: args.mesh_repair_symbols,
         repair_ratio: args.mesh_repair_ratio,
         max_repair_symbols: args.mesh_max_repair_symbols,
         symbol_size: args.mesh_symbol_size,
+        fast_path: fast_path::FastPathSnapshot::default(),
     };
+    let fast_path_report = fast_path::FastPath::new(args.busy_poll_us, args.relay_forward_batch);
+    // With --media-cpu the relay ingest and the cache mesh run on a thread
+    // of their own, pinned when the host allows it. Their sockets are bound
+    // there too, so the media thread also drives their readiness.
+    let media_runtime = match args.media_cpu {
+        Some(cpu) => {
+            let (runtime, pinned) =
+                fast_path::MediaRuntime::start(cpu).context("failed to start the media thread")?;
+            match &pinned {
+                Ok(()) => info!(
+                    cpu,
+                    "relay ingest and cache mesh run on a thread pinned to this CPU"
+                ),
+                Err(error) => warn!(
+                    cpu,
+                    error, "media thread could not be pinned; it runs unpinned"
+                ),
+            }
+            fast_path_report.record_media_cpu(cpu, pinned);
+            Some(runtime)
+        }
+        None => None,
+    };
+    let media = media_runtime.as_ref().map(fast_path::MediaRuntime::handle);
     let cache_mesh_region = args
         .cache_mesh_region
         .clone()
@@ -1889,12 +1967,15 @@ async fn main() -> Result<()> {
         Some(cut) => mesh_config.with_receive_observer(Arc::clone(cut) as _),
         None => mesh_config,
     };
+    let mesh_chunk_cache = Arc::clone(&cache.chunk_cache);
     let mesh_handle = Arc::new(
-        CacheMesh::new(Arc::clone(&cache.chunk_cache), mesh_config)
-            .start()
-            .await
-            .context("failed to start cache mesh")?,
+        fast_path::on_media(media, async move {
+            CacheMesh::new(mesh_chunk_cache, mesh_config).start().await
+        })
+        .await?
+        .context("failed to start cache mesh")?,
     );
+    fast_path_report.tune_receive_socket_at(mesh_handle.local_addr(), "cache mesh");
     let playlist_demand = PlaylistDemand::new(PlaylistDemandConfig {
         enabled: replication == ReplicationMode::Demand && cache_mesh_role == CacheMeshRole::Edge,
         lease: Duration::from_millis(args.cache_mesh_lease_ms.max(100)),
@@ -1966,29 +2047,43 @@ async fn main() -> Result<()> {
         None
     };
 
-    let fec_socket = bind_buffered_udp_ingress(
-        args.fec_bind,
-        args.udp_socket_buffer_bytes,
-        "UDP-FEC mesh byte ingest",
-    )
-    .await?;
-    info!(bind = %fec_socket.local_addr()?, "UDP-FEC mesh byte ingest listening");
-    let relay_secondary_socket = if let Some(bind) = args.relay_secondary_bind {
-        let socket = bind_buffered_udp_ingress(
-            bind,
+    let fec_socket = fast_path::on_media(
+        media,
+        bind_buffered_udp_ingress(
+            args.fec_bind,
             args.udp_socket_buffer_bytes,
-            "secondary RelaySession repair ingest",
+            "UDP-FEC mesh byte ingest",
+        ),
+    )
+    .await??;
+    info!(bind = %fec_socket.local_addr()?, "UDP-FEC mesh byte ingest listening");
+    fast_path_report.tune_receive_socket(&fec_socket, "relay primary ingest");
+    let relay_secondary_socket = if let Some(bind) = args.relay_secondary_bind {
+        let socket = fast_path::on_media(
+            media,
+            bind_buffered_udp_ingress(
+                bind,
+                args.udp_socket_buffer_bytes,
+                "secondary RelaySession repair ingest",
+            ),
         )
-        .await?;
+        .await??;
         info!(bind = %socket.local_addr()?, "secondary RelaySession repair ingest listening");
+        fast_path_report.tune_receive_socket(&socket, "relay secondary ingest");
         Some(socket)
     } else {
         None
     };
     let relay_dispatch = configured_relay_udp_dispatch(&args, &node_id)?;
-    let relay_forwarder = RelayDownstreamForwarder::bind(&args.relay_forwards).await?;
+    let relay_forwards = args.relay_forwards.clone();
+    let relay_forwarder = fast_path::on_media(media, async move {
+        RelayDownstreamForwarder::bind(&relay_forwards).await
+    })
+    .await??;
     if let Some(forwarder) = &relay_forwarder {
         forwarder.set_nonblocking(args.relay_forward_nonblocking);
+        forwarder.set_batch(args.relay_forward_batch);
+        forwarder.configure_buffers(args.udp_socket_buffer_bytes);
         forwarder.set_hop_journal(Arc::clone(&hop_journal));
     }
     cache.update_relay_forward(
@@ -2016,20 +2111,23 @@ async fn main() -> Result<()> {
             }),
     );
     let (audio_epoch_tx, _) = broadcast::channel(AUDIO_EPOCH_BROADCAST_CAPACITY);
-    let fec_ingest_task = tokio::spawn(run_udp_fec_ingest(
-        fec_socket,
-        Arc::clone(&cache),
-        ingest_shutdown_rx.clone(),
-        RelayIngestRuntime {
-            dispatch: relay_dispatch,
-            secondary_socket: relay_secondary_socket,
-            forwarder: relay_forwarder,
-            audio_epochs: Some(audio_epoch_tx.clone()),
-            failover_controller: relay_failover_controller,
-            failover_heartbeat: Duration::from_millis(args.relay_failover_heartbeat_ms),
-            link_telemetry: Some(link_telemetry),
-        },
-    ));
+    let fec_ingest_task = fast_path::spawn_media(
+        media,
+        run_udp_fec_ingest(
+            fec_socket,
+            Arc::clone(&cache),
+            ingest_shutdown_rx.clone(),
+            RelayIngestRuntime {
+                dispatch: relay_dispatch,
+                secondary_socket: relay_secondary_socket,
+                forwarder: relay_forwarder,
+                audio_epochs: Some(audio_epoch_tx.clone()),
+                failover_controller: relay_failover_controller,
+                failover_heartbeat: Duration::from_millis(args.relay_failover_heartbeat_ms),
+                link_telemetry: Some(link_telemetry),
+            },
+        ),
+    );
 
     let media_fec_socket = bind_buffered_udp_ingress(
         args.media_fec_bind,
@@ -2063,6 +2161,7 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    mesh_transport.fast_path = fast_path_report.snapshot();
     let router = AppRouter::new(
         Arc::clone(&cache),
         usize::try_from(args.response_ms.map_or(1, |response_ms| {
@@ -2505,7 +2604,6 @@ impl Args {
                 self.relay_max_downstream_children
             );
         }
-        let mut relay_forward_binds = HashSet::with_capacity(self.relay_forwards.len());
         let mut relay_forward_targets = HashSet::with_capacity(self.relay_forwards.len());
         for forward in &self.relay_forwards {
             if forward.bind == forward.target {
@@ -2520,9 +2618,8 @@ impl Args {
                     forward.bind
                 );
             }
-            if !relay_forward_binds.insert(forward.bind) {
-                bail!("duplicate RelaySession forward bind {}", forward.bind);
-            }
+            // Children given the same bind share one source socket, which
+            // lets one sendmmsg reach all of them (--relay-forward-batch).
             if !relay_forward_targets.insert(forward.target) {
                 bail!("duplicate RelaySession forward target {}", forward.target);
             }
@@ -3249,7 +3346,11 @@ impl WarmSourceReplayBuffer {
 }
 
 struct RelayForwardPath {
-    socket: UdpSocket,
+    /// The source socket. Children given the same non-zero bind share one
+    /// socket, so one `sendmmsg` reaches all of them.
+    socket: Arc<UdpSocket>,
+    /// Index into `RelayDownstreamForwarder::socket_groups`.
+    group: usize,
     target: SocketAddr,
     role: RelayForwardRole,
     promoted: AtomicBool,
@@ -3258,6 +3359,8 @@ struct RelayForwardPath {
 
 struct RelayDownstreamForwarder {
     paths: Vec<RelayForwardPath>,
+    /// The paths of each source socket, in path order.
+    socket_groups: Vec<Vec<usize>>,
     source_datagrams: AtomicU64,
     repair_datagrams: AtomicU64,
     bytes: AtomicU64,
@@ -3284,6 +3387,9 @@ struct RelayDownstreamForwarder {
     /// Send to every child with a non-blocking send first, and await only
     /// the children whose socket was full.
     nonblocking: AtomicBool,
+    /// Hand one datagram to every child of a shared source socket, and a
+    /// warm-source replay to its child, in one `sendmmsg` call.
+    batch: AtomicBool,
     hop_journal: OnceLock<Arc<HopJournal>>,
     /// Children whose non-blocking send a test reports as full, as a bit
     /// set of path indexes.
@@ -3299,6 +3405,9 @@ struct RelayDownstreamForwarder {
 enum RelayForwardAttempt {
     /// A non-blocking send that the kernel took.
     Immediate,
+    /// Part of one `sendmmsg` to the children of a shared socket, which the
+    /// kernel took.
+    Batched,
     /// A non-blocking send that found the socket full.
     WouldBlock,
     /// A send that the forwarder waited for.
@@ -3311,21 +3420,41 @@ impl RelayDownstreamForwarder {
             return Ok(None);
         }
         let mut paths = Vec::with_capacity(endpoints.len());
-        for endpoint in endpoints {
-            let socket = UdpSocket::bind(endpoint.bind).await.with_context(|| {
-                format!(
-                    "failed to bind RelaySession downstream source {} for {}",
-                    endpoint.bind, endpoint.target
-                )
-            })?;
+        let mut socket_groups: Vec<Vec<usize>> = Vec::new();
+        // Sockets by bind address. Port 0 asks for a socket of its own each
+        // time; a fixed address given twice is one shared socket.
+        let mut shared: HashMap<SocketAddr, (Arc<UdpSocket>, usize)> = HashMap::new();
+        for (index, endpoint) in endpoints.iter().enumerate() {
+            let existing = (endpoint.bind.port() != 0)
+                .then(|| shared.get(&endpoint.bind).cloned())
+                .flatten();
+            let (socket, group) = if let Some((socket, group)) = existing {
+                socket_groups[group].push(index);
+                (socket, group)
+            } else {
+                let socket = Arc::new(UdpSocket::bind(endpoint.bind).await.with_context(|| {
+                    format!(
+                        "failed to bind RelaySession downstream source {} for {}",
+                        endpoint.bind, endpoint.target
+                    )
+                })?);
+                let group = socket_groups.len();
+                socket_groups.push(vec![index]);
+                if endpoint.bind.port() != 0 {
+                    shared.insert(endpoint.bind, (Arc::clone(&socket), group));
+                }
+                (socket, group)
+            };
             info!(
                 bind = %socket.local_addr()?,
                 target = %endpoint.target,
                 role = ?endpoint.role,
+                shared_with = socket_groups[group].len() - 1,
                 "RelaySession subscribed downstream forwarding path ready"
             );
             paths.push(RelayForwardPath {
                 socket,
+                group,
                 target: endpoint.target,
                 role: endpoint.role,
                 promoted: AtomicBool::new(false),
@@ -3334,6 +3463,7 @@ impl RelayDownstreamForwarder {
         }
         Ok(Some(Arc::new(Self {
             paths,
+            socket_groups,
             source_datagrams: AtomicU64::new(0),
             repair_datagrams: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
@@ -3358,6 +3488,7 @@ impl RelayDownstreamForwarder {
             failover_demotions_applied: AtomicU64::new(0),
             failover_last_transition_unix_ms: AtomicU64::new(0),
             nonblocking: AtomicBool::new(true),
+            batch: AtomicBool::new(true),
             hop_journal: OnceLock::new(),
             #[cfg(test)]
             test_would_block: AtomicU64::new(0),
@@ -3374,31 +3505,33 @@ impl RelayDownstreamForwarder {
         expires_at_us: Option<u64>,
     ) {
         let nonblocking = self.nonblocking.load(Ordering::Relaxed);
+        let batch = nonblocking && self.batch.load(Ordering::Relaxed);
         // Children whose socket was full for a non-blocking send. They are
         // served, in order, once every other child has the datagram. Empty
         // in the normal case, so it costs no allocation.
         let mut deferred: Vec<usize> = Vec::new();
         let mut first_child: Option<(SocketAddr, u64)> = None;
+        // Shared sockets already served by one batched send, as a bit set of
+        // group indexes.
+        let mut batched_groups = 0_u64;
         for (index, path) in self.paths.iter().enumerate() {
-            let promoted = path.promoted.load(Ordering::Relaxed);
-            let failover_source = promoted
-                && path.role == RelayForwardRole::Repair
-                && matches!(role, MediaDatagramRole::Source);
-            if !(path.role.permits(role) || failover_source) {
-                if path.role == RelayForwardRole::Repair
-                    && matches!(role, MediaDatagramRole::Source)
-                {
-                    if let (Some(object_key), Some(expires_at_us)) = (object_key, expires_at_us) {
-                        self.buffer_warm_source(
-                            path,
-                            object_key,
-                            expires_at_us,
-                            datagram,
-                            now_unix_us(),
-                        );
-                    }
+            if batch && self.group_is_batched(path.group) {
+                let bit = 1_u64 << path.group;
+                if batched_groups & bit == 0 {
+                    batched_groups |= bit;
+                    self.forward_group(
+                        path.group,
+                        datagram,
+                        role,
+                        object_key,
+                        expires_at_us,
+                        &mut deferred,
+                        &mut first_child,
+                    );
                 }
-                self.filtered_datagrams.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if !self.admits(path, datagram, role, object_key, expires_at_us) {
                 continue;
             }
             let started = Instant::now();
@@ -3437,6 +3570,114 @@ impl RelayDownstreamForwarder {
         }
         if let (Some((child, sent_us)), Some(object_key)) = (first_child, object_key) {
             self.journal_forward(object_key, child, sent_us);
+        }
+    }
+
+    /// Whether a path takes a datagram of this role. A source datagram held
+    /// back from a warm repair-only child is kept for a later promotion.
+    fn admits(
+        &self,
+        path: &RelayForwardPath,
+        datagram: &[u8],
+        role: MediaDatagramRole,
+        object_key: Option<&media_object::ObjectKey>,
+        expires_at_us: Option<u64>,
+    ) -> bool {
+        let promoted = path.promoted.load(Ordering::Relaxed);
+        let failover_source = promoted
+            && path.role == RelayForwardRole::Repair
+            && matches!(role, MediaDatagramRole::Source);
+        if path.role.permits(role) || failover_source {
+            return true;
+        }
+        if path.role == RelayForwardRole::Repair && matches!(role, MediaDatagramRole::Source) {
+            if let (Some(object_key), Some(expires_at_us)) = (object_key, expires_at_us) {
+                self.buffer_warm_source(path, object_key, expires_at_us, datagram, now_unix_us());
+            }
+        }
+        self.filtered_datagrams.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+
+    /// Whether the children of a source socket are served by one batched
+    /// send: several of them share it, and they fit one call.
+    fn group_is_batched(&self, group: usize) -> bool {
+        let members = self.socket_groups[group].len();
+        group < 64 && members > 1 && members <= fast_path::MAX_BATCH_MESSAGES
+    }
+
+    /// Hand a datagram to every child of one shared socket in one
+    /// `sendmmsg`. Children the kernel did not take in that call get a
+    /// non-blocking send of their own, and a full socket is waited for
+    /// after every other child has the datagram, as in the unbatched path.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_group(
+        &self,
+        group: usize,
+        datagram: &[u8],
+        role: MediaDatagramRole,
+        object_key: Option<&media_object::ObjectKey>,
+        expires_at_us: Option<u64>,
+        deferred: &mut Vec<usize>,
+        first_child: &mut Option<(SocketAddr, u64)>,
+    ) {
+        let mut eligible = [0_usize; fast_path::MAX_BATCH_MESSAGES];
+        let mut count = 0;
+        for &index in &self.socket_groups[group] {
+            let path = &self.paths[index];
+            if !self.admits(path, datagram, role, object_key, expires_at_us) {
+                continue;
+            }
+            #[cfg(test)]
+            if self.test_would_block.load(Ordering::Relaxed) & (1_u64 << (index % 64)) != 0 {
+                self.record_forward_attempt(index, RelayForwardAttempt::WouldBlock);
+                deferred.push(index);
+                continue;
+            }
+            eligible[count] = index;
+            count += 1;
+        }
+        if count == 0 {
+            return;
+        }
+        let eligible = &eligible[..count];
+        let socket = &self.paths[eligible[0]].socket;
+        let started = Instant::now();
+        let sent = match fast_path::try_send_batch(socket, count, |slot| {
+            (datagram, self.paths[eligible[slot]].target)
+        }) {
+            Ok(sent) => sent,
+            // Full before the first child, or the first child failed: each
+            // child gets its own attempt below, which waits or reports.
+            Err(_) => 0,
+        };
+        let elapsed = started.elapsed();
+        for &index in &eligible[..sent] {
+            let path = &self.paths[index];
+            self.record_forward_attempt(index, RelayForwardAttempt::Batched);
+            if self.finish_forward(path, role, datagram.len(), Ok(datagram.len()), elapsed)
+                && first_child.is_none()
+            {
+                *first_child = Some((path.target, now_unix_us()));
+            }
+        }
+        for &index in &eligible[sent..] {
+            let path = &self.paths[index];
+            let started = Instant::now();
+            match self.try_send_on_path(index, path, datagram) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    self.record_forward_attempt(index, RelayForwardAttempt::WouldBlock);
+                    deferred.push(index);
+                }
+                result => {
+                    self.record_forward_attempt(index, RelayForwardAttempt::Immediate);
+                    if self.finish_forward(path, role, datagram.len(), result, started.elapsed())
+                        && first_child.is_none()
+                    {
+                        *first_child = Some((path.target, now_unix_us()));
+                    }
+                }
+            }
         }
     }
 
@@ -3523,6 +3764,38 @@ impl RelayDownstreamForwarder {
         self.nonblocking.store(nonblocking, Ordering::Relaxed);
     }
 
+    fn set_batch(&self, batch: bool) {
+        self.batch.store(batch, Ordering::Relaxed);
+    }
+
+    /// Apply the node's buffer target to every source socket. The children
+    /// of a relay are fed from these sockets, so a burst for all of them has
+    /// to fit.
+    fn configure_buffers(&self, requested_bytes: usize) {
+        for members in &self.socket_groups {
+            let path = &self.paths[members[0]];
+            match configure_udp_socket_buffers(
+                &path.socket,
+                requested_bytes,
+                "RelaySession downstream forwarding",
+            ) {
+                Ok(state) if state.target_met() => {}
+                Ok(state) => warn!(
+                    target = %path.target,
+                    requested_bytes,
+                    actual_receive_bytes = state.receive_bytes,
+                    actual_send_bytes = state.send_bytes,
+                    "UDP socket buffer target was limited by the operating system"
+                ),
+                Err(error) => warn!(
+                    target = %path.target,
+                    error = %error,
+                    "could not configure the RelaySession forwarding socket buffers"
+                ),
+            }
+        }
+    }
+
     fn set_hop_journal(&self, journal: Arc<HopJournal>) {
         let _ = self.hop_journal.set(journal);
     }
@@ -3588,7 +3861,26 @@ impl RelayDownstreamForwarder {
         self.warm_source_expired_datagrams
             .fetch_add(batch.expired_datagrams as u64, Ordering::Relaxed);
 
-        for datagram in batch.datagrams {
+        // The whole replay goes out in as few calls as the kernel takes;
+        // what it does not take is sent one by one, waiting if need be.
+        let mut replayed = 0;
+        if self.batch.load(Ordering::Relaxed) && !batch.datagrams.is_empty() {
+            let started = Instant::now();
+            let datagrams = &batch.datagrams;
+            replayed = fast_path::try_send_batch(&path.socket, datagrams.len(), |index| {
+                (&datagrams[index][..], path.target)
+            })
+            .unwrap_or(0);
+            let elapsed = started.elapsed();
+            for datagram in &datagrams[..replayed] {
+                self.record_forward_success(MediaDatagramRole::Source, datagram.len(), elapsed);
+                self.warm_source_replayed_datagrams
+                    .fetch_add(1, Ordering::Relaxed);
+                self.warm_source_replayed_bytes
+                    .fetch_add(datagram.len() as u64, Ordering::Relaxed);
+            }
+        }
+        for datagram in batch.datagrams.into_iter().skip(replayed) {
             let started = Instant::now();
             match path.socket.send_to(&datagram, path.target).await {
                 Ok(sent) if sent == datagram.len() => {
@@ -9104,6 +9396,9 @@ struct MeshTransportConfigSnapshot {
     repair_ratio: f32,
     max_repair_symbols: u32,
     symbol_size: u16,
+    /// Batched relay sends, busy polling and the media thread: what was
+    /// asked for and what the host allowed.
+    fast_path: fast_path::FastPathSnapshot,
 }
 
 impl Default for MeshTransportConfigSnapshot {
@@ -9115,6 +9410,7 @@ impl Default for MeshTransportConfigSnapshot {
             repair_ratio: DEFAULT_MESH_FEC_REPAIR_RATIO,
             max_repair_symbols: DEFAULT_MESH_FEC_MAX_REPAIR_SYMBOLS,
             symbol_size: DEFAULT_MESH_FEC_SYMBOL_SIZE,
+            fast_path: fast_path::FastPathSnapshot::default(),
         }
     }
 }
@@ -11493,6 +11789,31 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
             "av_mesh_transport_fec_symbol_bytes",
             "Configured cache-mesh FEC symbol size in bytes.",
             snapshot.mesh_transport.symbol_size as f64,
+        ),
+        (
+            "av_mesh_fast_path_relay_forward_batch",
+            "Whether relay forwarding batches the children of a shared socket into one sendmmsg.",
+            f64::from(u8::from(snapshot.mesh_transport.fast_path.relay_forward_batch)),
+        ),
+        (
+            "av_mesh_fast_path_busy_poll_microseconds",
+            "Requested SO_BUSY_POLL budget for media sockets.",
+            f64::from(snapshot.mesh_transport.fast_path.busy_poll_us),
+        ),
+        (
+            "av_mesh_fast_path_busy_poll_applied_sockets",
+            "Media sockets that took the SO_BUSY_POLL budget.",
+            snapshot.mesh_transport.fast_path.busy_poll_applied.len() as f64,
+        ),
+        (
+            "av_mesh_fast_path_busy_poll_denied_sockets",
+            "Media sockets where the kernel refused SO_BUSY_POLL (needs CAP_NET_ADMIN).",
+            snapshot.mesh_transport.fast_path.busy_poll_denied.len() as f64,
+        ),
+        (
+            "av_mesh_fast_path_media_cpu_pinned",
+            "Whether the relay ingest and cache mesh run on a thread pinned to --media-cpu.",
+            f64::from(u8::from(snapshot.mesh_transport.fast_path.media_cpu_pinned)),
         ),
     ] {
         push_prometheus_metric_header(&mut output, name, help, "gauge");
@@ -21755,6 +22076,7 @@ mod tests {
             send_bytes: 212_992,
             receive_request_succeeded: true,
             send_request_succeeded: true,
+            forced: false,
         };
         assert!(!state.target_met());
     }
@@ -29451,6 +29773,349 @@ mod tests {
                     .count();
                 assert!(awaited < 100, "{awaited} sends were awaited");
             }
+        }
+    }
+
+    /// A forwarder whose children all share one source socket, as when the
+    /// topology gives every child of a relay the same --relay-forward bind.
+    async fn relay_forward_shared_children(
+        roles: &[RelayForwardRole],
+    ) -> (Arc<RelayDownstreamForwarder>, Vec<UdpSocket>, SocketAddr) {
+        let bind = unused_loopback_addr();
+        let mut receivers = Vec::with_capacity(roles.len());
+        let mut endpoints = Vec::with_capacity(roles.len());
+        for role in roles {
+            let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            endpoints.push(RelayForwardEndpoint {
+                bind,
+                target: receiver.local_addr().unwrap(),
+                role: *role,
+            });
+            receivers.push(receiver);
+        }
+        let forwarder = RelayDownstreamForwarder::bind(&endpoints)
+            .await
+            .unwrap()
+            .unwrap();
+        (forwarder, receivers, bind)
+    }
+
+    async fn receive_relay_test_datagram_from(receiver: &UdpSocket) -> (Vec<u8>, SocketAddr) {
+        let mut buf = [0_u8; 2_048];
+        let (len, from) =
+            tokio::time::timeout(Duration::from_secs(2), receiver.recv_from(&mut buf))
+                .await
+                .expect("every child must receive every datagram")
+                .unwrap();
+        (buf[..len].to_vec(), from)
+    }
+
+    #[tokio::test]
+    async fn relay_forward_batches_the_children_of_a_shared_socket_into_one_call() {
+        let (forwarder, receivers, bind) =
+            relay_forward_shared_children(&[RelayForwardRole::All; 3]).await;
+        assert!(forwarder.batch.load(Ordering::Relaxed));
+        assert_eq!(forwarder.socket_groups, vec![vec![0, 1, 2]]);
+        // Let the reactor see that the socket is writable.
+        forwarder.paths[0].socket.writable().await.unwrap();
+        take_relay_forward_attempts(&forwarder);
+
+        forwarder
+            .forward(b"datagram-1", MediaDatagramRole::Source, None, None)
+            .await;
+        assert_eq!(
+            take_relay_forward_attempts(&forwarder),
+            vec![
+                (0, RelayForwardAttempt::Batched),
+                (1, RelayForwardAttempt::Batched),
+                (2, RelayForwardAttempt::Batched),
+            ]
+        );
+        for receiver in &receivers {
+            // Each child sees the one address it knows its parent by.
+            assert_eq!(
+                receive_relay_test_datagram_from(receiver).await,
+                (b"datagram-1".to_vec(), bind)
+            );
+        }
+
+        // A full child is left out of the batch and waited for after the
+        // others have the datagram.
+        forwarder.test_would_block.store(0b010, Ordering::Relaxed);
+        forwarder
+            .forward(b"datagram-2", MediaDatagramRole::Source, None, None)
+            .await;
+        assert_eq!(
+            take_relay_forward_attempts(&forwarder),
+            vec![
+                (1, RelayForwardAttempt::WouldBlock),
+                (0, RelayForwardAttempt::Batched),
+                (2, RelayForwardAttempt::Batched),
+                (1, RelayForwardAttempt::Awaited),
+            ]
+        );
+        for receiver in &receivers {
+            assert_eq!(receive_relay_test_datagram(receiver).await, b"datagram-2");
+        }
+        forwarder.test_would_block.store(0, Ordering::Relaxed);
+
+        // With the flag off each child gets a send of its own.
+        forwarder.set_batch(false);
+        forwarder
+            .forward(b"datagram-3", MediaDatagramRole::Source, None, None)
+            .await;
+        assert_eq!(
+            take_relay_forward_attempts(&forwarder),
+            vec![
+                (0, RelayForwardAttempt::Immediate),
+                (1, RelayForwardAttempt::Immediate),
+                (2, RelayForwardAttempt::Immediate),
+            ]
+        );
+        // Batching needs the non-blocking path; awaited sends stay one by one.
+        forwarder.set_batch(true);
+        forwarder.set_nonblocking(false);
+        forwarder
+            .forward(b"datagram-4", MediaDatagramRole::Source, None, None)
+            .await;
+        assert_eq!(
+            take_relay_forward_attempts(&forwarder),
+            vec![
+                (0, RelayForwardAttempt::Awaited),
+                (1, RelayForwardAttempt::Awaited),
+                (2, RelayForwardAttempt::Awaited),
+            ]
+        );
+        for receiver in &receivers {
+            assert_eq!(receive_relay_test_datagram(receiver).await, b"datagram-3");
+            assert_eq!(receive_relay_test_datagram(receiver).await, b"datagram-4");
+        }
+        let snapshot = forwarder.snapshot();
+        assert_eq!(snapshot.source_datagrams, 4 * 3);
+        assert_eq!(snapshot.errors, 0);
+    }
+
+    #[tokio::test]
+    async fn relay_forward_batch_keeps_roles_order_and_every_datagram() {
+        // A source child, a repair child and a child that takes both, on one
+        // shared socket, next to a child with a socket of its own.
+        let shared_bind = unused_loopback_addr();
+        let mut receivers = Vec::new();
+        let mut endpoints = Vec::new();
+        for (bind, role) in [
+            (shared_bind, RelayForwardRole::Source),
+            (
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                RelayForwardRole::All,
+            ),
+            (shared_bind, RelayForwardRole::Repair),
+            (shared_bind, RelayForwardRole::All),
+        ] {
+            let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            endpoints.push(RelayForwardEndpoint {
+                bind,
+                target: receiver.local_addr().unwrap(),
+                role,
+            });
+            receivers.push(receiver);
+        }
+        let forwarder = RelayDownstreamForwarder::bind(&endpoints)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(forwarder.socket_groups, vec![vec![0, 2, 3], vec![1]]);
+        let wants = |child: usize, sequence: u64| match child {
+            0 => sequence % 3 != 0,
+            2 => sequence % 3 == 0,
+            _ => true,
+        };
+        let mut expected_total = 0_u64;
+        for round in 0..20_u64 {
+            for index in 0..50_u64 {
+                let sequence = round * 50 + index;
+                let role = if sequence % 3 == 0 {
+                    MediaDatagramRole::Repair
+                } else {
+                    MediaDatagramRole::Source
+                };
+                forwarder
+                    .forward(
+                        format!("batched-{sequence:06}").as_bytes(),
+                        role,
+                        None,
+                        None,
+                    )
+                    .await;
+                expected_total += (0..4).filter(|child| wants(*child, sequence)).count() as u64;
+            }
+            for (child, receiver) in receivers.iter().enumerate() {
+                for index in 0..50_u64 {
+                    let sequence = round * 50 + index;
+                    if wants(child, sequence) {
+                        assert_eq!(
+                            receive_relay_test_datagram(receiver).await,
+                            format!("batched-{sequence:06}").into_bytes(),
+                            "child {child}"
+                        );
+                    }
+                }
+            }
+        }
+        let attempts = take_relay_forward_attempts(&forwarder);
+        assert!(attempts
+            .iter()
+            .any(|(index, attempt)| *index == 0 && *attempt == RelayForwardAttempt::Batched));
+        assert!(attempts
+            .iter()
+            .all(|(index, attempt)| *index != 1 || *attempt != RelayForwardAttempt::Batched));
+        let snapshot = forwarder.snapshot();
+        assert_eq!(
+            snapshot.source_datagrams + snapshot.repair_datagrams,
+            expected_total
+        );
+        assert_eq!(snapshot.errors, 0);
+    }
+
+    #[tokio::test]
+    async fn warm_sources_replay_to_a_promoted_child_in_one_batch_or_one_by_one() {
+        for batch in [true, false] {
+            let (forwarder, receivers, _) =
+                relay_forward_shared_children(&[RelayForwardRole::All, RelayForwardRole::Repair])
+                    .await;
+            forwarder.set_batch(batch);
+            forwarder.paths[0].socket.writable().await.unwrap();
+            let expires = now_unix_us() + 5_000_000;
+            // Ten objects of ten symbols; the warm buffer keeps the newest
+            // objects, more datagrams than one sendmmsg call carries.
+            let payload = |object: u64, symbol: u64| format!("warm-{object:03}-{symbol:02}");
+            for object in 0..10_u64 {
+                let key = media_object::ObjectKey::for_payload(
+                    "default",
+                    "1",
+                    "muxed-fmp4",
+                    1,
+                    0,
+                    object,
+                    1,
+                    b"object",
+                )
+                .unwrap();
+                for symbol in 0..10_u64 {
+                    forwarder
+                        .forward(
+                            payload(object, symbol).as_bytes(),
+                            MediaDatagramRole::Source,
+                            Some(&key),
+                            Some(expires),
+                        )
+                        .await;
+                }
+            }
+            for object in 0..10_u64 {
+                for symbol in 0..10_u64 {
+                    assert_eq!(
+                        receive_relay_test_datagram(&receivers[0]).await,
+                        payload(object, symbol).into_bytes()
+                    );
+                }
+            }
+            let buffered = forwarder.snapshot().warm_source_buffered_datagrams;
+            let kept_objects = RELAY_WARM_SOURCE_REPLAY_MAX_OBJECTS_PER_CHILD as u64;
+            assert_eq!(buffered, kept_objects * 10);
+            assert!(buffered as usize > fast_path::MAX_BATCH_MESSAGES);
+            let target = receivers[1].local_addr().unwrap();
+            assert_eq!(
+                forwarder.apply_failover_mode(target, FailoverForwardMode::SourceAndRepair, false),
+                Some(true)
+            );
+            forwarder.replay_warm_sources(target).await;
+            for object in (10 - kept_objects)..10 {
+                for symbol in 0..10_u64 {
+                    assert_eq!(
+                        receive_relay_test_datagram(&receivers[1]).await,
+                        payload(object, symbol).into_bytes(),
+                        "batch={batch}"
+                    );
+                }
+            }
+            let snapshot = forwarder.snapshot();
+            assert_eq!(snapshot.warm_source_replayed_datagrams, buffered);
+            assert_eq!(snapshot.warm_source_buffered_datagrams, 0);
+            assert_eq!(snapshot.errors, 0);
+        }
+    }
+
+    #[test]
+    fn the_fast_path_flags_default_on_and_children_may_share_a_bind() {
+        let args = Args::try_parse_from(["av-mesh"])
+            .unwrap()
+            .normalized()
+            .unwrap();
+        assert!(args.relay_forward_batch);
+        assert_eq!(args.busy_poll_us, 50);
+        assert_eq!(args.media_cpu, None);
+
+        let args = Args::try_parse_from([
+            "av-mesh",
+            "--relay-forward-batch=false",
+            "--busy-poll-us",
+            "0",
+            "--media-cpu",
+            "2",
+        ])
+        .unwrap()
+        .normalized()
+        .unwrap();
+        assert!(!args.relay_forward_batch);
+        assert_eq!(args.busy_poll_us, 0);
+        assert_eq!(args.media_cpu, Some(2));
+        assert!(Args::try_parse_from(["av-mesh", "--relay-forward-batch"]).is_err());
+
+        // Two children with one bind share a socket; one target twice is
+        // still refused.
+        let args = Args::try_parse_from([
+            "av-mesh",
+            "--relay-forward",
+            "127.0.0.1:7100=127.0.0.1:7201,all",
+            "--relay-forward",
+            "127.0.0.1:7100=127.0.0.1:7202,repair",
+        ])
+        .unwrap()
+        .normalized()
+        .unwrap();
+        assert_eq!(args.relay_forwards.len(), 2);
+        let error = Args::try_parse_from([
+            "av-mesh",
+            "--relay-forward",
+            "127.0.0.1:7100=127.0.0.1:7201,all",
+            "--relay-forward",
+            "127.0.0.1:7101=127.0.0.1:7201,repair",
+        ])
+        .unwrap()
+        .normalized()
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("duplicate RelaySession forward target"));
+    }
+
+    #[tokio::test]
+    async fn socket_buffers_past_the_host_limit_are_forced_or_left_as_they_were() {
+        let limit = std::fs::read_to_string("/proc/sys/net/core/rmem_max")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(212_992);
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // Linux reports twice the value it was asked for, so ask for more
+        // than twice the limit to be capped.
+        let requested = limit * 4;
+        let state = configure_udp_socket_buffers(&socket, requested, "test").unwrap();
+        if state.forced {
+            assert!(state.receive_bytes >= requested);
+            assert!(state.send_bytes >= requested);
+        } else {
+            // Unprivileged: the kernel limit stands.
+            assert!(state.receive_bytes < requested);
         }
     }
 
