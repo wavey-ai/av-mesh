@@ -182,9 +182,20 @@ const DEFAULT_PLAYLIST_COPIES: usize = 2;
 /// An edge that holds this many playlists takes no standby copy: the slots
 /// that are left are for playlists that its own readers ask for.
 const STANDBY_PLAYLIST_LIMIT: usize = 10;
-/// Most playlists that an edge holds for its readers at one time. The live
-/// cache has 16 playlist slots, and one is the default stream of the node.
-const MAX_EDGE_PLAYLISTS: usize = 15;
+
+/// The standby limit of an edge that holds at most `max_playlists`.
+fn standby_playlist_limit(max_playlists: usize) -> usize {
+    (max_playlists * STANDBY_PLAYLIST_LIMIT / MAX_EDGE_PLAYLISTS).max(1)
+}
+/// A stream that has had no part for this long gives up its playlist slot
+/// to a new stream when the node is full.
+const STREAM_SLOT_IDLE_MS: u64 = 10_000;
+/// Playlist slots of the live cache of a node, unless `--playlist-slots`
+/// says otherwise.
+const DEFAULT_PLAYLIST_SLOTS: usize = 16;
+/// Most playlists that an edge holds for its readers at one time, with the
+/// default number of slots. One slot is the default stream of the node.
+const MAX_EDGE_PLAYLISTS: usize = DEFAULT_PLAYLIST_SLOTS - 1;
 /// Segments that the playlist of a stamped stream holds at least: six whole
 /// segments, which a player that does not use parts needs, and the open one.
 const PLAYLIST_WINDOW_SEGMENTS: u64 = 7;
@@ -1036,6 +1047,18 @@ struct Args {
     #[arg(long, default_value_t = 2048)]
     slot_kb: usize,
 
+    /// Playlists that this node can hold at one time. A relay and a
+    /// distributor hold every stream that passes through them, so this is
+    /// the number of streams of a region. An edge holds one playlist less
+    /// for its readers: one slot is the default stream of the node. A slot
+    /// costs under 1 MB of index until it holds media.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_PLAYLIST_SLOTS",
+        default_value_t = DEFAULT_PLAYLIST_SLOTS
+    )]
+    playlist_slots: usize,
+
     #[arg(long, default_value = "eu")]
     continent: String,
 
@@ -1562,12 +1585,13 @@ async fn main() -> Result<()> {
     );
     #[cfg(not(feature = "private-subnet-discovery"))]
     let private_discovery_status = PrivateDiscoveryStatus::unavailable();
-    let cache = LiveTsCache::new(
+    let cache = LiveTsCache::with_slots(
         args.stream_id,
         Duration::from_millis(args.part_ms),
         args.parts_per_segment,
         args.window_parts,
         args.slot_kb,
+        args.playlist_slots.max(2),
     )
     .await;
     cache.set_canonical_gap_hold(Duration::from_millis(args.canonical_gap_hold_ms));
@@ -1632,7 +1656,7 @@ async fn main() -> Result<()> {
         } else {
             args.window_parts
         },
-        max_playlists: MAX_EDGE_PLAYLISTS,
+        max_playlists: args.playlist_slots.max(2) - 1,
     });
 
     let control_packets = packetize_control_message(&MeshControlMessage {
@@ -4558,6 +4582,9 @@ struct LiveTsCache {
     canonical_gap_last_log_unix_ms: AtomicU64,
     part_updates: watch::Sender<u64>,
     playlist_cache: Vec<StdRwLock<Option<CachedPlaylist>>>,
+    /// Parts of streams that found every playlist slot in use by a live
+    /// stream.
+    stream_slot_refusals: AtomicU64,
     relay_ingress: StdRwLock<RelaySessionIngressSnapshot>,
     relay_failover_controller: StdRwLock<RelayFailoverControllerSnapshot>,
     relay_processing: AtomicDurationHistogram,
@@ -4573,8 +4600,28 @@ impl LiveTsCache {
         window_parts: usize,
         slot_kb: usize,
     ) -> Arc<Self> {
+        Self::with_slots(
+            stream_id,
+            part_target,
+            parts_per_segment,
+            window_parts,
+            slot_kb,
+            DEFAULT_PLAYLIST_SLOTS,
+        )
+        .await
+    }
+
+    /// A live cache that holds at most `playlist_slots` streams.
+    async fn with_slots(
+        stream_id: u64,
+        part_target: Duration,
+        parts_per_segment: usize,
+        window_parts: usize,
+        slot_kb: usize,
+        playlist_slots: usize,
+    ) -> Arc<Self> {
         let options = CacheOptions {
-            num_playlists: 16,
+            num_playlists: playlist_slots.max(1),
             max_segments: 1,
             max_parts_per_segment: window_parts.saturating_mul(4).max(32),
             buffer_size_kb: slot_kb,
@@ -4611,6 +4658,7 @@ impl LiveTsCache {
             canonical_gap_last_log_unix_ms: AtomicU64::new(0),
             part_updates,
             playlist_cache,
+            stream_slot_refusals: AtomicU64::new(0),
             relay_ingress: StdRwLock::new(RelaySessionIngressSnapshot::default()),
             relay_failover_controller: StdRwLock::new(RelayFailoverControllerSnapshot::default()),
             relay_processing: AtomicDurationHistogram::default(),
@@ -5069,6 +5117,7 @@ impl LiveTsCache {
         validated_object: Option<MediaObject>,
     ) -> Result<u64> {
         let bytes = payload.len();
+        self.make_room_for(stream_id).await?;
         // Stream commits and retirement share this lock so a newly arriving
         // object cannot race cache/state removal for the same stream.
         let commit_lock = self.canonical_commit_lock(stream_id);
@@ -5568,6 +5617,40 @@ impl LiveTsCache {
             )
             .await;
         }
+    }
+
+    /// Refuse a stream that has no playlist slot while every slot holds a
+    /// live stream.
+    ///
+    /// The chunk cache gives a new stream the slot of another stream when
+    /// none is free. With one stream more than slots, each part of the
+    /// stream without a slot took the slot of a live stream, whose next part
+    /// took the slot of another: every stream of the node lost its window
+    /// again and again. A full node now keeps what it has. A stream that
+    /// has had no part for `STREAM_SLOT_IDLE_MS` gives up its slot.
+    async fn make_room_for(&self, stream_id: u64) -> Result<()> {
+        if self.chunk_cache.get_stream_idx(stream_id).await.is_some() {
+            return Ok(());
+        }
+        let slots = self.chunk_cache.options.num_playlists;
+        if self.chunk_cache.stream_ids().await.len() < slots {
+            return Ok(());
+        }
+        self.retire_streams_idle_before(now_unix_ms().saturating_sub(STREAM_SLOT_IDLE_MS))
+            .await;
+        if self.chunk_cache.stream_ids().await.len() < slots {
+            return Ok(());
+        }
+        let refused = self.stream_slot_refusals.fetch_add(1, Ordering::Relaxed) + 1;
+        if refused <= 4 || refused.is_power_of_two() {
+            warn!(
+                stream_id,
+                slots,
+                refused,
+                "every playlist slot holds a live stream: the parts of this stream are refused (see --playlist-slots)"
+            );
+        }
+        bail!("no playlist slot is free for stream {stream_id}: all {slots} hold a live stream")
     }
 
     async fn retire_streams_idle_before(&self, cutoff_unix_ms: u64) -> usize {
@@ -9945,7 +10028,9 @@ async fn run_playlist_standby(
                 continue;
             }
             let held = demand.streams.len();
-            if !demand.streams.contains_key(&stream_id) && held >= STANDBY_PLAYLIST_LIMIT {
+            if !demand.streams.contains_key(&stream_id)
+                && held >= standby_playlist_limit(demand.config.max_playlists)
+            {
                 continue;
             }
             let touch = demand.touch(stream_id, now_ms);
@@ -18460,6 +18545,62 @@ mod tests {
             playlist_last_position("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:40\n"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn a_node_holds_as_many_streams_as_it_has_playlist_slots() {
+        let commit = |cache: Arc<LiveTsCache>, stream_id: u64| async move {
+            cache
+                .commit_stream_payload(
+                    stream_id,
+                    encode_test_canonical_fmp4_bundle_with_duration(
+                        stream_id,
+                        0,
+                        Some(&test_h264_aac_init()),
+                        b"moof-mdat-av",
+                        Some(250),
+                        true,
+                    ),
+                )
+                .await
+                .is_ok()
+        };
+        // The default: sixteen slots, and one is the stream of the node.
+        let cache = LiveTsCache::new(1, Duration::from_millis(250), 4, 32, 64).await;
+        let mut held = 0;
+        for stream_id in 100..140 {
+            if commit(Arc::clone(&cache), stream_id).await {
+                held += 1;
+            }
+        }
+        assert_eq!(held, 15);
+        // The streams that were there first are the ones that it holds, and
+        // each still has its part. Twenty-five were refused.
+        for stream_id in 100..115 {
+            assert!(cache.stream_position_for_id(stream_id).await.is_some());
+        }
+        assert!(cache.stream_position_for_id(115).await.is_none());
+        assert_eq!(cache.stream_slot_refusals.load(Ordering::Relaxed), 25);
+        // A stream that has gone idle gives its slot to a new stream.
+        cache.state.write().await.stream_last_ingest_unix_ms.insert(
+            107,
+            now_unix_ms().saturating_sub(STREAM_SLOT_IDLE_MS + 1_000),
+        );
+        assert!(commit(Arc::clone(&cache), 200).await);
+        assert!(cache.stream_position_for_id(200).await.is_some());
+        assert!(cache.stream_position_for_id(107).await.is_none());
+        assert!(cache.stream_position_for_id(100).await.is_some());
+        // Forty slots hold all forty streams.
+        let cache = LiveTsCache::with_slots(1, Duration::from_millis(250), 4, 32, 64, 41).await;
+        let mut held = 0;
+        for stream_id in 100..140 {
+            if commit(Arc::clone(&cache), stream_id).await {
+                held += 1;
+            }
+        }
+        assert_eq!(held, 40);
+        assert_eq!(standby_playlist_limit(15), 10);
+        assert_eq!(standby_playlist_limit(63), 42);
     }
 
     #[test]
