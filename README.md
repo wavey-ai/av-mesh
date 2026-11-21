@@ -237,11 +237,20 @@ lets the Media Sequence Number go down. A blocking reload (`_HLS_msn`,
 `_HLS_part`) is answered 400 when it asks too far ahead and 503 after three
 target durations. A stream or a part that does not exist is answered 404 at
 once. Each rendition of a ladder reports the others with
-`EXT-X-RENDITION-REPORT`.
+`EXT-X-RENDITION-REPORT`, and carries the date of its Media Sequence Number
+times the segment duration as `EXT-X-PROGRAM-DATE-TIME`, so that a segment
+has one date in every rendition and on every cache.
 
 A node measures the loss of each cache-network peer and reports it. A sender
 protects each object by the measured loss of the path. An edge asks one
 parent for a missing part, and for that part only.
+
+A 4K part travels over the cache network in symbols of up to 16 kB, which IP
+fragments. A node needs `net.ipv4.ipfrag_time=1`,
+`net.ipv4.ipfrag_high_thresh=67108864` and `net.ipv4.ipfrag_max_dist=0`, or
+2% loss or a few milliseconds of jitter on that network stops 4K. Run a
+service with `MALLOC_MMAP_THRESHOLD_=65536`, `MALLOC_TRIM_THRESHOLD_=1048576`
+and `MALLOC_ARENA_MAX=2`, or glibc keeps the memory of freed 4K parts.
 
 The window of a playlist is a length of time: `--window-parts` nominal parts
 of `--part-ms`. A stream whose parts are longer covers the same time with
@@ -320,12 +329,19 @@ The rules, in order:
 
 Within a rule the choice is a rendezvous hash of the session, weighted by free
 capacity. A cache with a stale advertisement, a draining cache and a full
-cache are not assigned. A new reader is also not assigned to a cache that has
+cache are not assigned. The age of an advertisement is the time since this
+node received a new one: the clocks of two nodes are not compared, and a node
+whose clock is seconds wrong assigns and is assigned like any other. A new reader is also not assigned to a cache that has
 less room than the bit rate of the playlist: a cache can have room for an
 audio reader and not for a 4K reader. `--assignment-alternates` (default 2)
 sets the number of caches after the first.
 
 ### Drain and failure
+
+The nodes of the cache network say hello every 100 ms. An edge that has heard
+no parent for 400 ms has lost its source. It answers playlist and part
+requests with 503 and the other caches, and does not hold a request until the
+reader gives up. It still serves the parts that it holds.
 
 `POST /api/control/drain-node` with `{"node_id": "<node>"}` drains a cache, and
 `/api/control/resume-node` ends the drain. A draining cache:
