@@ -126,6 +126,12 @@ struct Args {
     /// for the burst. `false`: one copy and at most two more rows, as before.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     compact_burst_rows: bool,
+    /// Write one line for each part received, in part order: part number,
+    /// arrival time (Unix µs), bytes, publication and availability times as
+    /// the object carries them. With --write-parts, a measurement tool can
+    /// find each part's bytes (the lengths give the offsets).
+    #[arg(long)]
+    arrivals: Option<PathBuf>,
 }
 
 fn now_unix_us() -> u64 {
@@ -579,6 +585,7 @@ async fn main() -> Result<()> {
         None => None,
     };
     let mut written_parts: BTreeMap<u64, Bytes> = BTreeMap::new();
+    let mut arrivals: BTreeMap<u64, (u64, usize, u64, u64)> = BTreeMap::new();
 
     let mut current: Option<String> = None;
     let mut skip: BTreeSet<String> = BTreeSet::new();
@@ -1014,6 +1021,12 @@ async fn main() -> Result<()> {
                                 arrival_us.saturating_sub(available_unix_us) as f64 / 1_000.0,
                             );
                         }
+                        if args.arrivals.is_some() {
+                            arrivals.insert(
+                                part,
+                                (arrival_us, payload.len(), published_unix_us, available_unix_us),
+                            );
+                        }
                         if parts_out.is_some() {
                             written_parts.insert(part, payload.clone());
                         }
@@ -1038,6 +1051,13 @@ async fn main() -> Result<()> {
     drop(verify_tx);
     let verify = verifier.await.ok();
 
+    if let Some(path) = &args.arrivals {
+        let mut text = String::from("part,arrival_unix_us,bytes,published_unix_us,available_unix_us\n");
+        for (part, (arrival, bytes, published, available)) in &arrivals {
+            text.push_str(&format!("{part},{arrival},{bytes},{published},{available}\n"));
+        }
+        std::fs::write(path, text).with_context(|| format!("write {}", path.display()))?;
+    }
     if let Some(file) = parts_out.as_mut() {
         use std::io::Write;
         for payload in written_parts.values() {
