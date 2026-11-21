@@ -202,7 +202,9 @@ An edge holds a playlist only while it has readers for it.
   streams of a region. A node whose slots all hold a live stream refuses the
   parts of a new stream and names it in a warning; a stream that has had no
   part for 10 s gives up its slot. An edge holds one playlist less than the
-  slots for its readers, and does not subscribe to one more.
+  slots for its readers. It does not subscribe to one more: it answers that
+  reader 429 with the other caches, as it does for a reader that it cannot
+  admit.
 - A playlist that has readers is held by `--playlist-copies` edges (default
   2). The edge that ranks first for the playlist, by a hash of the stream and
   the edge names, takes the standby copy. A reader whose cache fails finds
