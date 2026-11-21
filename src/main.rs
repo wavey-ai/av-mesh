@@ -393,6 +393,9 @@ const CANONICAL_LIVE_SLOT_HEADER_LEN: usize = 40;
 const TELEMETRY_TAG: [u8; 4] = *b"AVMT";
 const CONTROL_TAG: [u8; 4] = *b"AVMC";
 const DEFAULT_TELEMETRY_STALE_MS: u64 = 30_000;
+/// The most that the clock of a node is taken to be wrong by. A first
+/// advertisement that says it is older than this is old.
+const MAX_CLOCK_ERROR_MS: u64 = 60_000;
 const RAW_MESH_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MESH_STORAGE_WARN_PCT: u64 = 85;
 const MESH_STORAGE_ERROR_PCT: u64 = 95;
@@ -10024,7 +10027,7 @@ async fn run_playlist_standby(
                 || edge.cache_mesh_role != "edge"
                 || edge.draining
                 || snapshot.node.draining
-                || now_ms.saturating_sub(snapshot.updated_unix_ms) > config.fresh_ms
+                || telemetry.advertisement_age_ms(snapshot, now_ms) > config.fresh_ms
             {
                 continue;
             }
@@ -10131,6 +10134,10 @@ struct TelemetryAggregator {
     snapshots: Arc<RwLock<HashMap<String, MeshSnapshot>>>,
     stale_nodes: Arc<RwLock<Vec<TelemetryNodeHealth>>>,
     stale_after_ms: u64,
+    /// For each node: the time that its newest advertisement carries, on
+    /// its own clock, and when this node received that advertisement, on
+    /// this clock.
+    heard: Arc<StdRwLock<HashMap<String, (u64, u64)>>>,
 }
 
 impl Default for TelemetryAggregator {
@@ -10145,6 +10152,27 @@ impl TelemetryAggregator {
             snapshots: Arc::new(RwLock::new(HashMap::new())),
             stale_nodes: Arc::new(RwLock::new(Vec::new())),
             stale_after_ms,
+            heard: Arc::new(StdRwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Age of the advertisement of a node, in milliseconds.
+    ///
+    /// It is the time since this node received a new advertisement from the
+    /// other node, on this node's clock. The time that the advertisement
+    /// carries is from the clock of the sender: an entry point whose clock
+    /// was 4 s ahead took every edge of its region for stale and refused
+    /// every reader, and an edge whose clock was 4 s behind was never given
+    /// one. A node that this aggregator has not heard from directly is
+    /// judged by the time in its advertisement.
+    fn advertisement_age_ms(&self, snapshot: &MeshSnapshot, now_ms: u64) -> u64 {
+        let heard = self
+            .heard
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match heard.get(&snapshot.node.node_id) {
+            Some((_, received_ms)) => now_ms.saturating_sub(*received_ms),
+            None => now_ms.saturating_sub(snapshot.updated_unix_ms),
         }
     }
 
@@ -10160,6 +10188,30 @@ impl TelemetryAggregator {
 
     async fn ingest_snapshot(&self, snapshot: MeshSnapshot) {
         let node_id = snapshot.node.node_id.clone();
+        {
+            // A repeat of the advertisement that is already held is not
+            // news: only a new one shows that the node is there.
+            let mut heard = self
+                .heard
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let written_ms = snapshot.updated_unix_ms;
+            match heard.get_mut(&node_id) {
+                Some((held_ms, _)) if *held_ms == written_ms => {}
+                Some(entry) => *entry = (written_ms, now_unix_ms()),
+                None => {
+                    // The first advertisement of a node is as old as it
+                    // says, when that is older than a clock can be wrong.
+                    let now_ms = now_unix_ms();
+                    let received_ms = if now_ms.saturating_sub(written_ms) > MAX_CLOCK_ERROR_MS {
+                        written_ms
+                    } else {
+                        now_ms
+                    };
+                    heard.insert(node_id.clone(), (written_ms, received_ms));
+                }
+            }
+        }
         self.snapshots
             .write()
             .await
@@ -14048,7 +14100,7 @@ impl AppRouter {
                         .or_else(|| is_local.then(String::new)),
                     serves_readers: edge.cache_mesh_role == "edge",
                     fresh: is_local
-                        || now_ms.saturating_sub(snapshot.updated_unix_ms)
+                        || self.telemetry.advertisement_age_ms(snapshot, now_ms)
                             <= self.assignment_fresh_ms,
                     draining: edge.draining || snapshot.node.draining,
                     overloaded: edge.egress_overloaded,
@@ -18721,6 +18773,42 @@ mod tests {
         assert_eq!(held, 40);
         assert_eq!(standby_playlist_limit(15), 10);
         assert_eq!(standby_playlist_limit(63), 42);
+    }
+
+    #[tokio::test]
+    async fn the_age_of_an_advertisement_does_not_depend_on_the_clock_of_its_sender() {
+        let telemetry = TelemetryAggregator::new(30_000);
+        let advertisement = |node: &str, written_ms: u64| {
+            let mut snapshot =
+                telemetry_snapshot_for_tests(node, "uk-lon", "eu", 51.5, -0.1, Vec::new(), 7);
+            snapshot.updated_unix_ms = written_ms;
+            snapshot
+        };
+        let now_ms = now_unix_ms();
+        // The clock of one edge is 4 s behind, and that of another 4 s ahead.
+        let behind = advertisement("edge-behind", now_ms - 4_000);
+        let ahead = advertisement("edge-ahead", now_ms + 4_000);
+        telemetry.ingest_snapshot(behind.clone()).await;
+        telemetry.ingest_snapshot(ahead.clone()).await;
+        assert!(telemetry.advertisement_age_ms(&behind, now_unix_ms()) < 200);
+        assert!(telemetry.advertisement_age_ms(&ahead, now_unix_ms()) < 200);
+
+        // The same advertisement again is not news: its age goes on.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        telemetry.ingest_snapshot(behind.clone()).await;
+        assert!(telemetry.advertisement_age_ms(&behind, now_unix_ms()) >= 120);
+        // A new one is.
+        let newer = advertisement("edge-behind", now_ms - 3_500);
+        telemetry.ingest_snapshot(newer.clone()).await;
+        assert!(telemetry.advertisement_age_ms(&newer, now_unix_ms()) < 100);
+
+        // A first advertisement that is two minutes old is old, and a node
+        // that was never heard is judged by what its advertisement says.
+        let old = advertisement("edge-old", now_ms - 120_000);
+        telemetry.ingest_snapshot(old.clone()).await;
+        assert!(telemetry.advertisement_age_ms(&old, now_unix_ms()) >= 120_000);
+        let unheard = advertisement("edge-unheard", now_ms - 5_000);
+        assert!(telemetry.advertisement_age_ms(&unheard, now_unix_ms()) >= 5_000);
     }
 
     #[test]
