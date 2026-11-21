@@ -10487,21 +10487,26 @@ impl StreamTelemetry {
         self.contiguous_object.or(self.latest_mesh_part)
     }
 
-    /// A replica is lagging when it is more than 30 ms of parts behind the
-    /// head, or, with no part duration known, more than six parts.
+    /// A replica is lagging when it is more than six parts behind the head
+    /// and those parts are more than 30 ms. Small parts need the time: six
+    /// parts of 0.25 ms are 1.5 ms. Long parts need the count: one video
+    /// frame of 33 ms, or one 200 ms part, is the routine difference
+    /// between two snapshots that were not taken at the same moment.
     fn lagging(&self) -> bool {
         self.mesh_lag_parts.is_some_and(|lag| {
-            match self.part_target_us.filter(|part_us| *part_us > 0) {
-                Some(part_us) => lag.saturating_mul(part_us) > MESH_STREAM_LAG_WARN_US,
-                None => lag > MESH_STREAM_LAG_WARN_PARTS,
-            }
+            lag > MESH_STREAM_LAG_WARN_PARTS
+                && self
+                    .part_target_us
+                    .filter(|part_us| *part_us > 0)
+                    .is_none_or(|part_us| lag.saturating_mul(part_us) > MESH_STREAM_LAG_WARN_US)
         })
     }
 }
 
-/// A replica this far behind the head of its stream is lagging: six parts
-/// of 5 ms, as the alarm was first set. `MESH_STREAM_LAG_WARN_PARTS` is the
-/// alarm for a stream whose part duration is not known.
+/// A replica this far behind the head of its stream, and more than
+/// `MESH_STREAM_LAG_WARN_PARTS` parts, is lagging: six parts of 5 ms, as the
+/// alarm was first set. A stream whose part duration is not known counts
+/// parts alone.
 const MESH_STREAM_LAG_WARN_US: u64 = 30_000;
 
 /// The ingest silence after which a stream is stale: its window, and no
@@ -31160,6 +31165,24 @@ mod tests {
         assert!(!stream.lagging());
         stream.mesh_lag_parts = Some(7);
         assert!(stream.lagging());
+        // Small parts: six parts are not enough, 30 ms is needed.
+        stream.part_target_us = Some(250);
+        stream.mesh_lag_parts = Some(120);
+        assert!(!stream.lagging());
+        stream.mesh_lag_parts = Some(121);
+        assert!(stream.lagging());
+        // Long parts: one frame, or one 200 ms part, behind is the routine
+        // difference between two snapshots. Six parts are not lagging,
+        // seven are, as before.
+        for part_us in [33_367, 41_708, 200_000] {
+            stream.part_target_us = Some(part_us);
+            for lag in 1..=6 {
+                stream.mesh_lag_parts = Some(lag);
+                assert!(!stream.lagging(), "{part_us} µs, {lag} parts");
+            }
+            stream.mesh_lag_parts = Some(7);
+            assert!(stream.lagging(), "{part_us} µs");
+        }
         // A node that predates the field counts parts.
         stream.part_target_us = None;
         assert!(stream.lagging());

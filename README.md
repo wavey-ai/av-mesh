@@ -281,7 +281,9 @@ headers.
 The windows that were counted in parts are lengths of time: the canonical gap
 hold, the edge hole repair grace (three parts, 3 to 15 ms), minimum interval
 (ten parts, 5 to 50 ms) and window (500 ms), the exact-part wait ahead limit
-(3 s), the stale threshold, the replica lag alarm (30 ms), the admission charge
+(3 s), the stale threshold, the replica lag alarm (more than 30 ms and more than six parts behind, so
+that one video frame of difference between two snapshots is not an alarm), the
+admission charge
 of a reader (one request a part plus two reloads a second), the hop journal
 (`--hop-journal-seconds`, default 30, unless `--hop-journal-capacity` is
 given) and the per-flow windows of the UDP FEC ingest (250 ms decoding, 1 s
