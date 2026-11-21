@@ -197,9 +197,19 @@ An edge holds a playlist only while it has readers for it.
 - `--cache-mesh-demand-idle-ms` (default 30,000) after the last request the
   edge releases the playlist. The distributors stop pushing it, and the edge
   frees the parts.
-- An edge holds at most 15 playlists at one time. It does not subscribe to one
-  more, so a request for an unknown stream cannot displace a playlist that
-  has readers.
+- A node has `--playlist-slots` slots (default 16). A relay and a distributor
+  hold every stream that passes through them, so this is the number of
+  streams of a region. A node whose slots all hold a live stream refuses the
+  parts of a new stream and names it in a warning; a stream that has had no
+  part for 10 s gives up its slot. An edge holds one playlist less than the
+  slots for its readers, and does not subscribe to one more.
+- A playlist that has readers is held by `--playlist-copies` edges (default
+  2). The edge that ranks first for the playlist, by a hash of the stream and
+  the edge names, takes the standby copy. A reader whose cache fails finds
+  the playlist warm at its first alternate.
+- A stream that is a rendition of a ladder (`--hls-rendition`) brings the
+  other renditions with it: an edge holds the whole ladder while it has a
+  reader of one rendition.
 - An edge chooses two parents for each playlist with a rendezvous hash of its
   node id, the stream id and the distributor address. Playlists and edges
   spread over the distributors of a region, and a distributor that has been
@@ -213,6 +223,23 @@ key frame, and when the contributor published it. An edge reads the entry from
 each part that arrives, so its playlist has the same parts, independent-part
 flags, segment boundaries and program date and time as the playlist of its
 distributor.
+
+A part also carries its place in the playlist, when the contributor stamps
+it: Media Sequence Number, part index, declared part target and declared
+target duration. A stamped stream has the same playlist on every cache of
+every region, with the same `EXT-X-MEDIA-SEQUENCE`, `PART-TARGET` and
+`EXT-X-TARGETDURATION`. A cache holds a playlist request until its copy is
+playable, lists at least seven target durations of segments, keeps a part or
+a segment for three target durations after it leaves the playlist, and never
+lets the Media Sequence Number go down. A blocking reload (`_HLS_msn`,
+`_HLS_part`) is answered 400 when it asks too far ahead and 503 after three
+target durations. A stream or a part that does not exist is answered 404 at
+once. Each rendition of a ladder reports the others with
+`EXT-X-RENDITION-REPORT`.
+
+A node measures the loss of each cache-network peer and reports it. A sender
+protects each object by the measured loss of the path. An edge asks one
+parent for a missing part, and for that part only.
 
 The window of a playlist is a length of time: `--window-parts` nominal parts
 of `--part-ms`. A stream whose parts are longer covers the same time with
@@ -233,6 +260,7 @@ Each node declares its limits, and enforces them:
 | --- | --- |
 | `--egress-capacity-bps`, `--egress-admission-percent` | Egress. New sessions are admitted up to the admission share (default 85%). |
 | `--edge-session-limit` | Playback sessions served at one time. Zero sets no limit. |
+| `--egress-request-capacity` | Playback requests a second that the node serves. Default 8,000 for each worker thread. |
 
 A session is admitted against the bit rate of the playlist that it asks for:
 the highest rate that the node has measured for that playlist. The rate is
@@ -240,6 +268,14 @@ measured over at least four seconds of parts. Until a new copy has that much,
 the node uses the highest rate that the caches of its region advertise for the
 playlist. The node rejects a new session when the sessions already admitted
 leave less than that.
+A session is charged the larger of that bit rate and its share of the request
+capacity: the egress capacity times its requests a second over the request
+capacity. A reader of 5 ms audio parts sends 200 requests a second, and a
+node on one vCPU serves about 60 such readers whatever their bit rate.
+The HTTP server runs on its own runtime at lower priority
+(`--http-worker-threads`), so that requests do not hold back the cache
+network of the node.
+
 This acts on the first request and does not wait for the measured egress to
 rise. Measured egress above the admission share for three seconds also stops
 admission, as before. A rejected request receives HTTP 429 with the other
@@ -259,7 +295,7 @@ its admission limit, and whether it drains.
 
 | Request | Answer |
 | --- | --- |
-| `GET /live/<stream>/master.m3u8?sid=<session>` | Multivariant Playlist. The assigned cache is the first variant. The next caches are the failover order. Each cache is one Content Steering pathway. |
+| `GET /live/<stream>/master.m3u8?sid=<session>` | Multivariant Playlist. The assigned cache is the first variant. The next caches are the failover order: caches that hold the playlist, then the edges in the order in which they take its standby copy. Each cache is one Content Steering pathway. With `--failover-entry NAME=URL` the last pathway is the entry point of a neighbouring region, which redirects the reader to the cache that it assigns (`assign=1`). With `--hls-rendition`, every rendition of the ladder is listed for every pathway. |
 | `GET /live/<stream>/steering.json?sid=<session>` | Content Steering manifest. The player sends `_HLS_pathway`, and the list starts with that cache while it is healthy. |
 | `GET /api/assignment?stream=<stream>&sid=<session>` | The assignment with the reason for each cache, and the state of every cache of the region. |
 
