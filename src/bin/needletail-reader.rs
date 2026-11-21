@@ -1181,6 +1181,12 @@ impl Reader {
             } else {
                 self.pipeline_depth(default_duration_ms)
             };
+            // A cache holds a request for a part that is up to three seconds
+            // ahead of its newest part, and answers 404 for one further
+            // ahead. A reader that catches up asked 20 parts of 200 ms ahead,
+            // took the 404 for a failure and left its cache. Two seconds of
+            // parts is the most that it asks ahead.
+            let depth = depth.min(parts_in_two_seconds(default_duration_ms));
             let mut start_error = None;
             while inflight.len() < depth {
                 let part_url = playlist_url.join(&format!("part{request_next}.{extension}"))?;
@@ -1712,6 +1718,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Parts of `part_ms` in two seconds, and no fewer than two.
+fn parts_in_two_seconds(part_ms: u64) -> usize {
+    usize::try_from(2_000 / part_ms.max(1))
+        .unwrap_or(usize::MAX)
+        .max(2)
+}
+
 /// The part that a reader goes on from when the part that it waits for will
 /// not come: the first listed part after `wanted`, when `wanted` is overdue
 /// and the playlist does not list it.
@@ -1796,6 +1809,14 @@ mod tests {
         .unwrap();
         assert_eq!(plain.caches[0].name, "10.0.0.1:19444");
         assert!(parse_master("#EXTM3U\n", &base).is_err());
+    }
+
+    #[test]
+    fn a_reader_asks_no_more_than_two_seconds_ahead() {
+        assert_eq!(parts_in_two_seconds(200), 10);
+        assert_eq!(parts_in_two_seconds(5), 400);
+        assert_eq!(parts_in_two_seconds(2_000), 2);
+        assert_eq!(parts_in_two_seconds(0), 2_000);
     }
 
     #[test]
