@@ -148,6 +148,14 @@ const REPLICA_REQUEST_MIN_INTERVAL_MS: u64 = 1_000;
 /// Time an edge waits for a requested part that both parents normally deliver
 /// within a millisecond of each other before it treats the part as a hole.
 const EDGE_HOLE_REPAIR_GRACE_MS: u64 = 15;
+/// How often a node of the cache network says hello to its peers. A parent
+/// with media to send is heard with every datagram.
+const CACHE_MESH_ANNOUNCE_MS: u64 = 100;
+/// An edge that has heard none of its parents for this long has lost them:
+/// its private network, or every distributor. It answers 503 for a part or a
+/// playlist reload that it would otherwise hold, so that a reader moves at
+/// once and does not wait out its own timeout.
+const EDGE_PARENTS_SILENT_MS: u64 = 400;
 /// Minimum time between two hole repair requests for one stream.
 const EDGE_HOLE_REPAIR_MIN_INTERVAL_MS: u64 = 50;
 /// A parent answers a repair request with every part from the hole to its
@@ -1620,7 +1628,8 @@ async fn main() -> Result<()> {
         .with_same_region_only(true)
         .with_role(args.cache_mesh_role.into())
         .with_max_parents(args.cache_mesh_max_parents)
-        .with_max_children(args.cache_mesh_max_children);
+        .with_max_children(args.cache_mesh_max_children)
+        .with_announce_interval(Duration::from_millis(CACHE_MESH_ANNOUNCE_MS));
     mesh_config.sync_interval = Duration::from_millis(args.mesh_sync_interval_ms);
     mesh_config.repair_symbols = args.mesh_repair_symbols;
     mesh_config.repair_ratio = args.mesh_repair_ratio;
@@ -1838,6 +1847,7 @@ async fn main() -> Result<()> {
     )
     .with_hls_renditions(args.hls_renditions.clone(), args.hls_rendition_stale_ms)
     .with_failover_entries(&args.failover_entries)
+    .with_parents_silent_after(Duration::from_millis(EDGE_PARENTS_SILENT_MS))
     .with_regional_view_ttl(REGIONAL_VIEW_TTL)
     .with_playlist_demand(playlist_demand)
     .with_assignment(
@@ -13453,6 +13463,9 @@ struct AppRouter {
     hls_failover_bandwidth_bps: u64,
     hls_renditions: Arc<HlsRenditionCatalog>,
     hls_rendition_stale_ms: u64,
+    /// Silence of every parent after which this edge sends its readers
+    /// away. `None` holds requests whatever the parents do.
+    parents_silent_after: Option<Duration>,
     /// Entry points of neighbouring regions: pathway name and base URL.
     failover_entries: Arc<Vec<(String, String)>>,
     edge_load: EdgeLoad,
@@ -13535,6 +13548,7 @@ impl AppRouter {
             hls_failover_bandwidth_bps: hls_failover_bandwidth_bps.max(1),
             hls_renditions: Arc::new(HlsRenditionCatalog::default()),
             hls_rendition_stale_ms: DEFAULT_HLS_RENDITION_STALE_MS,
+            parents_silent_after: None,
             failover_entries: Arc::new(Vec::new()),
             edge_load,
             edge_lifecycle_config: edge_lifecycle_config.normalized(),
@@ -13577,6 +13591,13 @@ impl AppRouter {
     /// Entry points of neighbouring regions, each as `NAME=URL`. An entry
     /// whose name is not a valid pathway name or whose URL is not HTTP is
     /// left out.
+    /// Answer 503 for a held part or reload when no parent has been heard
+    /// for this long. The parents must say hello several times in it.
+    fn with_parents_silent_after(mut self, limit: Duration) -> Self {
+        self.parents_silent_after = Some(limit);
+        self
+    }
+
     fn with_failover_entries(mut self, entries: &[String]) -> Self {
         let parsed = entries
             .iter()
@@ -15187,11 +15208,26 @@ impl AppRouter {
             ),
             Ok(None) => None,
             Ok(Some(position)) => {
-                match self
-                    .cache
-                    .wait_for_hls_reload_position(stream_id, position)
-                    .await
-                {
+                // The reload is held until the playlist reaches the part,
+                // unless this edge loses its parents while it waits.
+                let lost = async {
+                    loop {
+                        if self.parents_are_lost().await {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                };
+                let outcome = tokio::select! {
+                    outcome = self.cache.wait_for_hls_reload_position(stream_id, position) => outcome,
+                    _ = lost => {
+                        return refuse(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "this edge has lost its source\n",
+                        );
+                    }
+                };
+                match outcome {
                     HlsReloadOutcome::Ready => None,
                     HlsReloadOutcome::TooFarAhead => refuse(
                         StatusCode::BAD_REQUEST,
@@ -15206,19 +15242,46 @@ impl AppRouter {
         }
     }
 
-    async fn get_part_repairing_holes(&self, stream_id: u64, seq: u64) -> Option<(Bytes, u64)> {
+    /// Whether this edge has lost every parent: none of them has been heard
+    /// for `EDGE_PARENTS_SILENT_MS`. An edge that has never heard a parent
+    /// has not lost one.
+    async fn parents_are_lost(&self) -> bool {
+        let Some(limit) = self.parents_silent_after else {
+            return false;
+        };
+        self.cache_mesh_role == CacheMeshRole::Edge
+            && self
+                .mesh
+                .parents_silent_for()
+                .await
+                .is_some_and(|silent| silent >= limit)
+    }
+
+    /// `Err` when the part is not here and this edge has lost its parents.
+    async fn get_part_repairing_holes(
+        &self,
+        stream_id: u64,
+        seq: u64,
+    ) -> std::result::Result<Option<(Bytes, u64)>, ParentsLost> {
         if self.cache_mesh_role != CacheMeshRole::Edge {
-            return self
+            return Ok(self
                 .cache
                 .get_part_blocking_for_stream_id(stream_id, seq)
-                .await;
+                .await);
         }
         let deadline = Instant::now() + Duration::from_millis(PART_WAIT_MS);
         let mut requests = 0_u32;
         loop {
             let now = Instant::now();
             if now >= deadline {
-                return None;
+                return Ok(None);
+            }
+            if self.parents_are_lost().await {
+                // A part that is already here is still served.
+                return match self.cache.get_part_for_stream_id(stream_id, seq).await {
+                    Some(part) => Ok(Some(part)),
+                    None => Err(ParentsLost),
+                };
             }
             let wait_until = (now + Duration::from_millis(EDGE_HOLE_REPAIR_GRACE_MS)).min(deadline);
             if let Some(part) = self
@@ -15226,7 +15289,7 @@ impl AppRouter {
                 .get_part_until_for_stream_id(stream_id, seq, wait_until)
                 .await
             {
-                return Some(part);
+                return Ok(Some(part));
             }
             // The first request goes to one parent. A hole that is still
             // there after it is asked of both.
@@ -16046,7 +16109,22 @@ impl Router for AppRouter {
                     self.request_replica_for_stream(stream_id, "playlist-part-demand", None)
                         .await;
                     let part = if self.cache.part_request_may_wait(stream_id, seq).await {
-                        self.get_part_repairing_holes(stream_id, seq).await
+                        match self.get_part_repairing_holes(stream_id, seq).await {
+                            Ok(part) => part,
+                            Err(ParentsLost) => {
+                                let reader = ReaderRequest {
+                                    stream_id,
+                                    session: session_id.as_deref(),
+                                    pin: None,
+                                    current: None,
+                                };
+                                let alternatives =
+                                    self.alternate_cache_urls(reader, path, query).await;
+                                let response = parents_lost_response(&alternatives);
+                                return Ok(self
+                                    .record_edge_response(method, path, query, response, started));
+                            }
+                        }
                     } else {
                         // Not a part that the playlist names or will name
                         // soon: answer at once, and hold no request for it.
@@ -17026,6 +17104,21 @@ fn playback_request_url(base_url: &str, path: &str, query: Option<&str>) -> Opti
         url.push_str(query);
     }
     Some(url)
+}
+
+/// An edge has lost every parent and cannot say when the part will come.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParentsLost;
+
+/// The answer of an edge that has lost its parents: 503, with the other
+/// caches of the region as it last knew them.
+fn parents_lost_response(alternatives: &[String]) -> HandlerResponse {
+    let mut response = edge_overloaded_response(alternatives);
+    response.status = StatusCode::SERVICE_UNAVAILABLE;
+    response.body = Some(Bytes::from_static(
+        b"This edge has lost its source. Use another edge.\n",
+    ));
+    response
 }
 
 fn edge_overloaded_response(alternatives: &[String]) -> HandlerResponse {
@@ -19139,6 +19232,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_edge_that_has_lost_its_parents_does_not_hold_a_request() {
+        use playlists::mesh::{CacheMesh, CacheMeshConfig};
+
+        let stream_id = 77;
+        let parent_addr = unused_loopback_addr();
+        let edge_addr = unused_loopback_addr();
+        let parent_cache = canonical_gap_test_cache().await;
+        let edge_cache = canonical_gap_test_cache().await;
+        let parent_config = CacheMeshConfig::new("lost-parent", "uk", parent_addr)
+            .with_peer(edge_addr)
+            .with_announce_interval(Duration::from_millis(40));
+        let edge_config = CacheMeshConfig::new("lost-edge", "uk", edge_addr)
+            .with_peer(parent_addr)
+            .with_announce_interval(Duration::from_millis(40));
+        let parent_mesh = CacheMesh::new(Arc::clone(&parent_cache.chunk_cache), parent_config)
+            .start()
+            .await
+            .unwrap();
+        let edge_mesh = Arc::new(
+            CacheMesh::new(Arc::clone(&edge_cache.chunk_cache), edge_config)
+                .start()
+                .await
+                .unwrap(),
+        );
+        for sequence in 0..=2_u64 {
+            commit_canonical_gap_test_part(&edge_cache, stream_id, sequence).await;
+        }
+        let router = app_router_for_tests(Arc::clone(&edge_cache), Arc::clone(&edge_mesh))
+            .with_parents_silent_after(Duration::from_millis(200));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!router.parents_are_lost().await);
+        // The next part is not here yet. With a parent that says hello the
+        // request is held.
+        let held = tokio::time::timeout(
+            Duration::from_millis(150),
+            router.get_part_repairing_holes(stream_id, 3),
+        )
+        .await;
+        assert!(
+            held.is_err(),
+            "the request was answered while the parent is there"
+        );
+
+        // The parent is gone. The request is answered within the limit and a
+        // little, with the answer that sends the reader away.
+        parent_mesh.shutdown();
+        let started = Instant::now();
+        let answer = tokio::time::timeout(
+            Duration::from_secs(2),
+            router.get_part_repairing_holes(stream_id, 3),
+        )
+        .await
+        .expect("the request must not be held");
+        assert_eq!(answer, Err(ParentsLost));
+        assert!(
+            started.elapsed() < Duration::from_millis(600),
+            "{:?}",
+            started.elapsed()
+        );
+        // A part that the edge holds is still served.
+        assert!(router
+            .get_part_repairing_holes(stream_id, 1)
+            .await
+            .unwrap()
+            .is_some());
+        let response = parents_lost_response(&["https://edge-2.example/live/77/part3.mp4".into()]);
+        assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, _)| name == "x-needletail-alternate-edges"));
+        edge_mesh.shutdown();
+    }
+
+    #[tokio::test]
     async fn edge_repairs_a_recent_hole_without_waiting_for_the_replica_interval() {
         use playlists::mesh::{CacheMesh, CacheMeshConfig};
         use tokio::time::timeout;
@@ -19210,6 +19378,7 @@ mod tests {
         )
         .await
         .expect("the hole must be repaired well inside the replica interval")
+        .expect("the parent is there")
         .expect("the repaired part must be readable");
         assert_eq!(bytes, Bytes::from(canonical_gap_test_payload(hole)));
         assert!(started.elapsed() >= Duration::from_millis(EDGE_HOLE_REPAIR_GRACE_MS));

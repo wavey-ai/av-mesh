@@ -810,11 +810,27 @@ impl Reader {
 
     async fn load_playlist(&mut self, part: u64) -> Result<Option<MediaPlaylist>> {
         let url = self.master.caches[self.current].playlist.clone();
+        let within = self.timeout_for(&url);
+        self.load_playlist_within(part, within).await
+    }
+
+    async fn load_playlist_within(
+        &mut self,
+        part: u64,
+        within: Duration,
+    ) -> Result<Option<MediaPlaylist>> {
+        let url = self.master.caches[self.current].playlist.clone();
         let reused = self.http.connections.contains_key(&url.authority);
         let asked = Instant::now();
-        let response = self.http.get(&url, self.timeout_for(&url)).await?;
+        let response = self.http.get(&url, within).await?;
         self.playlist_response(url, reused.then_some(asked), response, part)
             .await
+    }
+
+    /// Time allowed for a question that a live cache answers at once: its
+    /// playlist, when a part is overdue.
+    fn quick_answer(&self) -> Duration {
+        self.path_round_trip() * 3 + Duration::from_millis(250)
     }
 
     /// Act on the answer to a playlist request: the parts of the playlist, a
@@ -1304,12 +1320,29 @@ impl Reader {
                         Ok(response) => format!("part {next} answered {}", response.status),
                         Err(error) => format!("part {next}: {error:#}"),
                     };
-                    // The cache says that it does not have the part. Its
-                    // playlist says whether the part was lost: a player
-                    // then plays the next part that is listed, from the
-                    // same cache.
-                    if not_found {
-                        if let Ok(Some(loaded)) = self.load_playlist(next).await {
+                    // The cache says that it does not have the part, or the
+                    // part is overdue. The playlist of the cache says what
+                    // happened. Later parts are listed and this one is not:
+                    // the part was lost, and a player plays the next one
+                    // that is listed, from the same cache. Nothing newer is
+                    // listed: the cache is there and the stream has
+                    // stopped, for every cache alike unless the entry point
+                    // says otherwise. A player then waits where it is. The
+                    // reader used to leave, and went round every cache of
+                    // two regions while the source was silent.
+                    let timed_out = detail.contains("timeout after");
+                    if not_found || timed_out {
+                        let within = self.quick_answer();
+                        if let Ok(Some(loaded)) = self.load_playlist_within(next, within).await {
+                            let newest = loaded.parts.iter().map(|(sequence, _)| *sequence).max();
+                            if part_after_a_hole(&loaded.parts, next, true).is_none()
+                                && newest.is_none_or(|newest| newest < next)
+                            {
+                                if self.master.steering.is_some() {
+                                    self.poll_steering(next).await;
+                                }
+                                continue;
+                            }
                             if let Some(skip_to) = part_after_a_hole(&loaded.parts, next, true) {
                                 for (sequence, duration) in &loaded.parts {
                                     durations.insert(*sequence, *duration);
