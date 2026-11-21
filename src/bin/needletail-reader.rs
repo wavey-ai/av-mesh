@@ -1290,10 +1290,39 @@ impl Reader {
                         pending.handle.abort();
                     }
                     request_next = next;
+                    let not_found = matches!(
+                        &other,
+                        Ok(response) if response.status == StatusCode::NOT_FOUND
+                    );
                     let detail = match other {
                         Ok(response) => format!("part {next} answered {}", response.status),
                         Err(error) => format!("part {next}: {error:#}"),
                     };
+                    // The cache says that it does not have the part. Its
+                    // playlist says whether the part was lost: a player
+                    // then plays the next part that is listed, from the
+                    // same cache.
+                    if not_found {
+                        if let Ok(Some(loaded)) = self.load_playlist(next).await {
+                            if let Some(skip_to) = part_after_a_hole(&loaded.parts, next, true) {
+                                for (sequence, duration) in &loaded.parts {
+                                    durations.insert(*sequence, *duration);
+                                }
+                                for sequence in next..skip_to {
+                                    scheduled_ms += durations
+                                        .get(&sequence)
+                                        .copied()
+                                        .unwrap_or(default_duration_ms);
+                                }
+                                self.report.parts_missing += skip_to - next;
+                                next = skip_to;
+                                request_next = next;
+                                part_started = Instant::now();
+                                failed = 0;
+                                continue;
+                            }
+                        }
+                    }
                     failed += 1;
                     if part_started.elapsed() >= Duration::from_millis(self.args.abandon_ms) {
                         // No cache has the part. Count it as missing and read on.
