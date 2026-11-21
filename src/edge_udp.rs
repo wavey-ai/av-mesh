@@ -754,7 +754,11 @@ struct CutState {
     routes: HashMap<(SocketAddr, u32), Route>,
     /// Datagrams of blocks whose first symbol (which names the part) has not
     /// arrived yet.
-    pending: HashMap<(SocketAddr, u32), Vec<Vec<u8>>>,
+    pending: HashMap<(SocketAddr, u32), (Instant, Vec<Vec<u8>>)>,
+    /// Parts that the edge decoded before any block of theirs was claimed:
+    /// a later block of the part must not claim it (the clients would wait
+    /// for a block that may never decode, and the cache sender has sent it).
+    decoded_unclaimed: HashMap<(u64, u64), Instant>,
     /// Each part claimed for cut-through.
     slots: HashMap<(u64, u64), SlotState>,
     pruned_at: Option<Instant>,
@@ -802,7 +806,10 @@ impl CutThrough {
     }
 }
 
-fn send_now(inner: &CutInner, datagram: &[u8], clients: &[(SocketAddr, RepairPolicy)]) {
+/// Send to every client now. `false` if a send found the socket full: the
+/// symbol is then sent again with the part's repair.
+fn send_now(inner: &CutInner, datagram: &[u8], clients: &[(SocketAddr, RepairPolicy)]) -> bool {
+    let mut all = true;
     for (peer, _) in clients {
         match inner.socket.try_send_to(datagram, *peer) {
             Ok(sent) => {
@@ -812,12 +819,14 @@ fn send_now(inner: &CutInner, datagram: &[u8], clients: &[(SocketAddr, RepairPol
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 inner.stats.would_block.fetch_add(1, Ordering::Relaxed);
+                all = false;
             }
             Err(_) => {
                 inner.stats.send_errors.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
+    all
 }
 
 impl CutState {
@@ -833,7 +842,12 @@ impl CutState {
             .retain(|_, route| now.duration_since(route.seen_at) < CUT_STATE_TTL);
         self.slots
             .retain(|_, slot| now.duration_since(slot.seen_at) < CUT_STATE_TTL);
-        self.pending.retain(|key, _| !self.routes.contains_key(key));
+        let routes = &self.routes;
+        self.pending.retain(|key, (since, _)| {
+            !routes.contains_key(key) && now.duration_since(*since) < Duration::from_secs(1)
+        });
+        self.decoded_unclaimed
+            .retain(|_, at| now.duration_since(*at) < CUT_STATE_TTL);
         if self.pending.len() > MAX_PENDING_BLOCKS {
             self.pending.clear();
         }
@@ -842,7 +856,7 @@ impl CutState {
 
 /// Forward one mesh source symbol of a chosen route, cut into client symbols.
 fn forward_symbol(inner: &CutInner, route: &mut Route, clients: &[(SocketAddr, RepairPolicy)], esi: u32, data: &[u8]) {
-    let per_mesh = u32::from(route.mesh_symbol / route.client_symbol);
+    let per_mesh = u32::from(route.mesh_symbol / route.client_symbol).max(1);
     let client_size = usize::from(route.client_symbol);
     for (index, piece) in data.chunks(client_size).enumerate() {
         let client_esi = esi * per_mesh + index as u32;
@@ -863,8 +877,7 @@ fn forward_symbol(inner: &CutInner, route: &mut Route, clients: &[(SocketAddr, R
             continue;
         };
         route.sequence = route.sequence.wrapping_add(1);
-        *done = true;
-        send_now(inner, &datagram, clients);
+        *done = send_now(inner, &datagram, clients);
     }
 }
 
@@ -893,7 +906,7 @@ impl CacheMeshReceiveObserver for CutThrough {
         if !state.routes.contains_key(&key) {
             if esi != 0 {
                 // The first symbol names the part; until it arrives, hold.
-                let held = state.pending.entry(key).or_default();
+                let (_, held) = state.pending.entry(key).or_insert_with(|| (now, Vec::new()));
                 if held.len() < MAX_PENDING_PER_BLOCK {
                     held.push(datagram.to_vec());
                 }
@@ -901,7 +914,7 @@ impl CacheMeshReceiveObserver for CutThrough {
             }
             let route = new_route(inner, &mut state, key, &header, &payload[4..], now);
             state.routes.insert(key, route);
-            let held = state.pending.remove(&key).unwrap_or_default();
+            let held = state.pending.remove(&key).map(|(_, held)| held).unwrap_or_default();
             let state = &mut *state;
             let route = state.routes.get_mut(&key).unwrap();
             if !route.chosen {
@@ -959,6 +972,7 @@ impl CacheMeshReceiveObserver for CutThrough {
         };
         let state = &mut *state;
         let Some(claim) = state.slots.get_mut(&(stream_id, slot)) else {
+            state.decoded_unclaimed.insert((stream_id, slot), Instant::now());
             return;
         };
         if claim.done {
@@ -1073,7 +1087,20 @@ fn complete(
                 continue;
             };
             for peer in &peers {
-                match socket.try_send_to(datagram, *peer) {
+                let mut attempt = 0;
+                let result = loop {
+                    match socket.try_send_to(datagram, *peer) {
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock && attempt < 200 =>
+                        {
+                            // A blocking thread: wait for the socket to drain.
+                            attempt += 1;
+                            std::thread::sleep(Duration::from_micros(50));
+                        }
+                        other => break other,
+                    }
+                };
+                match result {
                     Ok(sent) => {
                         stats.datagrams.fetch_add(1, Ordering::Relaxed);
                         stats.cut_through_datagrams.fetch_add(1, Ordering::Relaxed);
@@ -1103,7 +1130,16 @@ fn new_route(
     now: Instant,
 ) -> Route {
     let (stream_id, slot) = chunk_frame_slot(first_symbol).unwrap_or((u64::MAX, u64::MAX));
-    let client_symbol = cut_through_symbol_size(header.symbol_size, inner.config.symbol_size);
+    // A part in one mesh symbol is cut through in one client symbol of its
+    // own size (the mesh pads it to the mesh symbol size); a larger part in
+    // client symbols that divide the mesh symbol.
+    let client_symbol = if header.source_symbols == 1
+        && header.transfer_length <= u32::from(inner.config.symbol_size)
+    {
+        Some((header.transfer_length as u16).max(16))
+    } else {
+        cut_through_symbol_size(header.symbol_size, inner.config.symbol_size)
+    };
     let mut route = Route {
         stream_id,
         slot,
@@ -1118,6 +1154,7 @@ fn new_route(
     if stream_id == u64::MAX
         || client_symbol.is_none()
         || state.slots.contains_key(&(stream_id, slot))
+        || state.decoded_unclaimed.contains_key(&(stream_id, slot))
     {
         return route;
     }
