@@ -20,11 +20,25 @@ pub const DEFAULT_MAX_BUFFERED_FEC_OBJECT_BYTES: usize = 128 * 1024 * 1024;
 pub const DEFAULT_MAX_FEC_DATAGRAM_BYTES: usize = 65_535;
 pub const DEFAULT_MAX_FEC_FLOWS: usize = 4_096;
 pub const DEFAULT_MAX_ACTIVE_FEC_OBJECTS: usize = 4_096;
-pub const DEFAULT_MAX_ACTIVE_FEC_OBJECTS_PER_FLOW: usize = 32;
-pub const DEFAULT_MAX_COMPLETED_FEC_OBJECTS_PER_FLOW: usize = 64;
+/// The per-flow windows below are lengths of time, counted in objects of
+/// the shortest object interval that the receiver is sized for. These are
+/// their floors, sized for one object every 5 ms.
+pub const MIN_MAX_ACTIVE_FEC_OBJECTS_PER_FLOW: usize = 32;
+pub const MIN_MAX_COMPLETED_FEC_OBJECTS_PER_FLOW: usize = 64;
+pub const MIN_MAX_TRACKED_SEQUENCE_GAPS_PER_FLOW: usize = 1_024;
+/// Shortest interval between two objects of one flow that the default
+/// receiver keeps up with: a 0.25 ms part, 4,000 objects a second.
+pub const DEFAULT_MIN_FEC_OBJECT_INTERVAL: Duration = Duration::from_micros(250);
+/// Objects of one flow that may decode at the same time: this long of them.
+pub const FEC_ACTIVE_OBJECT_WINDOW: Duration = Duration::from_millis(250);
+/// Objects of one flow that are remembered as complete, so that a late
+/// symbol does not start them again: this long of them.
+pub const FEC_COMPLETED_OBJECT_WINDOW: Duration = Duration::from_millis(1_000);
+pub const DEFAULT_MAX_ACTIVE_FEC_OBJECTS_PER_FLOW: usize = 1_000;
+pub const DEFAULT_MAX_COMPLETED_FEC_OBJECTS_PER_FLOW: usize = 4_000;
 pub const DEFAULT_MAX_FEC_DATAGRAMS_PER_OBJECT: usize = 32_768;
 pub const DEFAULT_MAX_BUFFERED_FEC_DATAGRAMS: usize = 131_072;
-pub const DEFAULT_MAX_TRACKED_SEQUENCE_GAPS_PER_FLOW: usize = 1_024;
+pub const DEFAULT_MAX_TRACKED_SEQUENCE_GAPS_PER_FLOW: usize = 4_000;
 pub const DEFAULT_FEC_OBJECT_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_FEC_FLOW_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(120);
 pub const DEFAULT_FEC_EXPIRY_SCAN_INTERVAL: Duration = Duration::from_millis(250);
@@ -52,8 +66,36 @@ pub struct UdpFecReceiverConfig {
     pub expiry_scan_interval: Duration,
 }
 
-impl Default for UdpFecReceiverConfig {
-    fn default() -> Self {
+impl UdpFecReceiverConfig {
+    /// The default receiver with its per-flow windows sized for objects that
+    /// come as often as every `interval`: 250 ms of objects may decode at
+    /// once, and 1 s of them is remembered as complete, as are 1 s of
+    /// sequence gaps. Never smaller than the windows of 5 ms objects.
+    pub fn for_object_interval(interval: Duration) -> Self {
+        let interval_us = interval.as_micros().max(1);
+        let objects_in = |window: Duration, floor: usize| {
+            usize::try_from(window.as_micros().div_ceil(interval_us))
+                .unwrap_or(usize::MAX)
+                .max(floor)
+        };
+        Self {
+            max_active_objects_per_flow: objects_in(
+                FEC_ACTIVE_OBJECT_WINDOW,
+                MIN_MAX_ACTIVE_FEC_OBJECTS_PER_FLOW,
+            ),
+            max_completed_objects_per_flow: objects_in(
+                FEC_COMPLETED_OBJECT_WINDOW,
+                MIN_MAX_COMPLETED_FEC_OBJECTS_PER_FLOW,
+            ),
+            max_tracked_sequence_gaps_per_flow: objects_in(
+                FEC_COMPLETED_OBJECT_WINDOW,
+                MIN_MAX_TRACKED_SEQUENCE_GAPS_PER_FLOW,
+            ),
+            ..Self::fixed_defaults()
+        }
+    }
+
+    fn fixed_defaults() -> Self {
         Self {
             max_datagram_bytes: DEFAULT_MAX_FEC_DATAGRAM_BYTES,
             max_object_bytes: DEFAULT_MAX_FEC_OBJECT_BYTES,
@@ -69,6 +111,13 @@ impl Default for UdpFecReceiverConfig {
             flow_inactivity_timeout: DEFAULT_FEC_FLOW_INACTIVITY_TIMEOUT,
             expiry_scan_interval: DEFAULT_FEC_EXPIRY_SCAN_INTERVAL,
         }
+    }
+}
+
+impl Default for UdpFecReceiverConfig {
+    /// Sized for the smallest parts, one object every 0.25 ms.
+    fn default() -> Self {
+        Self::for_object_interval(DEFAULT_MIN_FEC_OBJECT_INTERVAL)
     }
 }
 
