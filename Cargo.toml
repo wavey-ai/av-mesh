@@ -17,6 +17,7 @@ linode-private-discovery = ["private-subnet-discovery", "linode-provisioner"]
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
+arc-swap = "1.9"
 bytes = "1.9"
 chrono = "0.4.44"
 clap = { version = "4.5", features = ["derive", "env"] }
@@ -37,7 +38,7 @@ linode = { git = "https://github.com/wavey-ai/linode.git", rev = "df7374666fa153
 message-packetizer = "0.1.0"
 media-object = "0.1.1"
 media-capability = "0.1.1"
-playlists = { git = "https://github.com/wavey-ai/playlists.git", rev = "853a33a2be4a3bef207007eeca20dceaa9446627", features = ["mesh"] }
+playlists = { git = "https://github.com/wavey-ai/playlists.git", rev = "6130443e59278c7a358f55bb8da99dea40969c46", features = ["mesh"] }
 raptorq-datagram-fec = "0.1.6"
 raptorq-fec-transport = "0.1.4"
 relay-session = { version = "0.1.1", default-features = false }

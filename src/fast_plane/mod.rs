@@ -14,6 +14,7 @@
 //! back, and a stall of the runtime never stops forwarding.
 
 pub mod dedup;
+pub mod lease;
 pub mod relay;
 pub mod sys;
 pub mod view;

@@ -181,6 +181,7 @@ name = "av-mesh"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "av-web-service",
  "base64 0.22.1",
@@ -2893,7 +2894,7 @@ dependencies = [
 [[package]]
 name = "playlists"
 version = "0.2.0"
-source = "git+https://github.com/wavey-ai/playlists.git?rev=853a33a2be4a3bef207007eeca20dceaa9446627#853a33a2be4a3bef207007eeca20dceaa9446627"
+source = "git+https://github.com/wavey-ai/playlists.git?rev=6130443e59278c7a358f55bb8da99dea40969c46#6130443e59278c7a358f55bb8da99dea40969c46"
 dependencies = [
  "access-unit 0.1.5",
  "bytes",

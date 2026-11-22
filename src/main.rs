@@ -1325,6 +1325,78 @@ struct Args {
     )]
     relay_class_tee_capacity: usize,
 
+    /// Feed every cache-mesh playlist lease that this node serves on the
+    /// fast plane as well: a forwarder with --relay-class-threads sends the
+    /// contributor's RLS1 symbols of a leased stream to the child (an edge)
+    /// as they arrive, after its compiled children, from
+    /// --relay-lease-bind. Audio in full to every child, video in full to
+    /// --relay-lease-primary-children and as repair to the others. Inert
+    /// without --relay-lease-bind. `false` leaves the edges to the cache
+    /// mesh alone.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_LEASE_CHILDREN",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_lease_children: bool,
+
+    /// Source address of the symbols to lease children (an audio socket
+    /// and its video twin on it): each edge binds it as its parent
+    /// (--relay-primary-peer or --relay-secondary-peer).
+    #[arg(long, env = "NEEDLETAIL_RELAY_LEASE_BIND")]
+    relay_lease_bind: Option<SocketAddr>,
+
+    /// A lease child's RLS1 ports as `PRIMARY,SECONDARY`: the first when
+    /// this node is the child's primary forwarder, the second when it is its
+    /// secondary. Video goes to each plus --relay-class-port-offset.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_LEASE_CHILD_PORTS",
+        default_value = "22001,22002",
+        value_parser = fast_plane::lease::parse_child_ports
+    )]
+    relay_lease_child_ports: [u16; 2],
+
+    /// The lease children (by address) that this node is the primary
+    /// forwarder for: they take video streams in full, the other children
+    /// take their repair until they promote this node (RLF1 to
+    /// --relay-lease-failover-bind).
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_LEASE_PRIMARY_CHILDREN",
+        value_delimiter = ','
+    )]
+    relay_lease_primary_children: Vec<std::net::IpAddr>,
+
+    /// Lease children fed at most; further children are refused, logged and
+    /// counted, and keep the cache mesh.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_MAX_LEASE_CHILDREN",
+        default_value_t = fast_plane::lease::DEFAULT_MAX_LEASE_CHILDREN
+    )]
+    relay_max_lease_children: usize,
+
+    /// Where the failover controllers of lease children promote this node
+    /// for their video (RLF1); the child is the controller's address.
+    #[arg(long, env = "NEEDLETAIL_RELAY_LEASE_FAILOVER_BIND")]
+    relay_lease_failover_bind: Option<SocketAddr>,
+
+    /// An edge (--cache-mesh-role edge) with --relay-controlled-local takes
+    /// its parents' RelaySession symbols on the fast plane: the class
+    /// threads on its relay ports, a tee that commits each object into the
+    /// edge's cache with the forwarders' own commit (byte for byte the part
+    /// the cache mesh carries), beside the cache mesh. `false` runs the edge
+    /// on the cache mesh alone: its relay flags are ignored.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_EDGE_FAST_INGEST",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    edge_fast_ingest: bool,
+
     /// Split the cache mesh by class: video playlists' parts travel on a
     /// second socket at the mesh port plus this offset, with receive and
     /// sync tasks of their own, so a 4K part never holds an audio part
@@ -2766,6 +2838,14 @@ async fn main() -> Result<()> {
         failover_heartbeat: Duration::from_millis(args.relay_failover_heartbeat_ms),
         link_telemetry: Some(link_telemetry),
     };
+    // The served cache-mesh leases make fast-plane children (B5).
+    let (lease_children, lease_tasks) = start_lease_children(
+        &args,
+        class_ingest,
+        &mesh_handle,
+        ingest_shutdown_rx.clone(),
+    )
+    .await?;
     // `..Default::default()` fills the fields that exist only in tests.
     #[allow(clippy::needless_update)]
     let relay_class_config = fast_plane::relay::RelayClassConfig {
@@ -2774,6 +2854,7 @@ async fn main() -> Result<()> {
         realtime: args.relay_class_realtime,
         tee_capacity: args.relay_class_tee_capacity,
         video_gso: args.relay_video_gso,
+        lease: lease_children,
         ..Default::default()
     };
     let fec_ingest_task = match (fec_socket, class_sockets) {
@@ -3101,7 +3182,7 @@ async fn main() -> Result<()> {
     if ingest_failure.is_none() {
         let _ = fec_ingest_task.await;
     }
-    for task in relay_failover_listener_tasks {
+    for task in relay_failover_listener_tasks.into_iter().chain(lease_tasks) {
         let _ = task.await;
     }
     let _ = media_fec_ingest_task.await;
@@ -3187,6 +3268,21 @@ impl Args {
             })
             .unwrap_or(1);
         workers.saturating_mul(DEFAULT_REQUESTS_PER_WORKER)
+    }
+
+    /// An edge with --edge-fast-ingest false: its relay flags are dropped,
+    /// so that it binds no relay parent and its cache mesh alone feeds it.
+    fn without_edge_fast_ingest(&mut self) {
+        info!("--edge-fast-ingest false: the edge ignores its relay parents and takes the cache mesh alone");
+        self.relay_controlled_local = false;
+        self.relay_primary_peer = None;
+        self.relay_primary_bind = None;
+        self.relay_secondary_peer = None;
+        self.relay_secondary_bind = None;
+        self.relay_primary_promoted = false;
+        self.relay_secondary_promoted = false;
+        self.relay_failover_controller = None;
+        self.relay_failover_listeners.clear();
     }
 
     fn normalized(mut self) -> Result<Self> {
@@ -3277,6 +3373,12 @@ impl Args {
         if !self.mesh_repair_ratio.is_finite() || self.mesh_repair_ratio < 0.0 {
             bail!("--mesh-repair-ratio must be a finite non-negative number");
         }
+        if self.cache_mesh_role == CacheMeshRoleArg::Edge
+            && self.relay_controlled_local
+            && !self.edge_fast_ingest
+        {
+            self.without_edge_fast_ingest();
+        }
         if (self.relay_primary_peer.is_some() || self.relay_secondary_peer.is_some())
             && !self.relay_controlled_local
         {
@@ -3324,6 +3426,21 @@ impl Args {
         }
         if self.relay_max_downstream_children == 0 {
             bail!("--relay-max-downstream-children must be positive");
+        }
+        if self.relay_max_lease_children == 0 {
+            bail!("--relay-max-lease-children must be positive");
+        }
+        if let Some(bind) = self.relay_lease_bind {
+            if bind == self.fec_bind || Some(bind) == self.relay_secondary_bind {
+                bail!("--relay-lease-bind {bind} conflicts with a RelaySession receive socket");
+            }
+            if self
+                .relay_forwards
+                .iter()
+                .any(|forward| forward.bind == bind)
+            {
+                bail!("--relay-lease-bind {bind} conflicts with a --relay-forward bind");
+            }
         }
         if self.relay_forwards.len() > self.relay_max_downstream_children {
             bail!(
@@ -3864,6 +3981,66 @@ async fn start_private_subnet_discovery(
         shutdown_tx: discovery_shutdown_tx,
         task,
     })
+}
+
+/// Bind the lease children of a forwarder (`--relay-lease-children`) and
+/// start the tasks that rebuild them from the served leases and take their
+/// failover commands. None when the node has no class threads or no
+/// --relay-lease-bind.
+async fn start_lease_children(
+    args: &Args,
+    class_ingest: bool,
+    mesh: &Arc<CacheMeshHandle>,
+    shutdown_rx: watch::Receiver<()>,
+) -> Result<(
+    Option<Arc<fast_plane::lease::LeaseChildren>>,
+    Vec<tokio::task::JoinHandle<()>>,
+)> {
+    let Some(bind) = args.relay_lease_bind.filter(|_| args.relay_lease_children) else {
+        return Ok((None, Vec::new()));
+    };
+    if !class_ingest {
+        warn!(
+            bind = %bind,
+            "--relay-lease-bind is inert: lease children are fed by the class threads (--relay-class-threads with --relay-controlled-local)"
+        );
+        return Ok((None, Vec::new()));
+    }
+    let lease = fast_plane::lease::LeaseChildren::bind(
+        fast_plane::lease::LeaseChildConfig {
+            bind,
+            child_ports: args.relay_lease_child_ports,
+            class_port_offset: args.relay_class_port_offset,
+            primary_children: args.relay_lease_primary_children.clone(),
+            max_children: args.relay_max_lease_children,
+        },
+        args.udp_socket_buffer_bytes,
+    )?;
+    info!(
+        bind = %lease.local_addr(),
+        "lease children of the served cache-mesh leases are fed on the fast plane"
+    );
+    let mut tasks = vec![tokio::spawn(fast_plane::lease::run_lease_children(
+        Arc::clone(&lease),
+        Arc::clone(mesh),
+        shutdown_rx.clone(),
+    ))];
+    if let Some(failover_bind) = args.relay_lease_failover_bind {
+        let socket = UdpSocket::bind(failover_bind).await.with_context(|| {
+            format!("failed to bind the lease children's failover listener on {failover_bind}")
+        })?;
+        info!(bind = %socket.local_addr()?, "lease children's failover listener ready");
+        tasks.push(tokio::spawn(
+            fast_plane::lease::run_lease_failover_listener(
+                socket,
+                Arc::clone(&lease),
+                TopologyGeneration::new(args.relay_topology_generation)?,
+                SubscriptionId::new(args.relay_subscription_id)?,
+                shutdown_rx,
+            ),
+        ));
+    }
+    Ok((Some(lease), tasks))
 }
 
 fn configured_relay_udp_dispatch(args: &Args, node_id: &str) -> Result<RelayUdpDispatch> {
@@ -7355,7 +7532,24 @@ impl LiveTsCache {
                     );
                 }
             }
-            if previous_epoch != Some(source_epoch) {
+            // An edge fed on the fast plane beside the cache mesh: the mesh
+            // can have written parts of this epoch (a lease's warm-up window)
+            // that nothing has recorded yet. They are the same parts, so the
+            // epoch is taken up without dropping them.
+            let adopt_mesh_copy = previous_epoch.is_none()
+                && self.mesh_copy_epoch(stream_id).await == Some(source_epoch);
+            if adopt_mesh_copy {
+                self.state
+                    .write()
+                    .await
+                    .stream_canonical_epoch
+                    .entry(stream_id)
+                    .or_insert(source_epoch);
+                info!(
+                    stream_id,
+                    source_epoch, "took up the canonical source epoch of the cache-mesh copy"
+                );
+            } else if previous_epoch != Some(source_epoch) {
                 self.chunk_cache.zero_stream_id(stream_id).await;
                 // A relay may restart and inherit an epoch that has already
                 // been active for minutes or hours. Its source age is not an
@@ -7647,6 +7841,15 @@ impl LiveTsCache {
         drop(state);
         self.part_updates.send_replace(seq);
         Ok(seq)
+    }
+
+    /// The source epoch of the newest part of a stream that the cache mesh
+    /// wrote into the cache, if it carries one.
+    async fn mesh_copy_epoch(&self, stream_id: u64) -> Option<u64> {
+        let stream_idx = self.chunk_cache.get_stream_idx(stream_id).await?;
+        let last = self.chunk_cache.last(stream_idx)?;
+        let (bytes, _) = self.chunk_cache.get_for_stream_id(stream_id, last).await?;
+        MeshPartRecord::from_slot(&bytes, stream_id)?.epoch
     }
 
     /// Record the playlist entry of a part that the cache mesh delivered.
@@ -35457,6 +35660,7 @@ mod tests {
                 realtime: false,
                 tee_capacity: 1_024,
                 video_gso: true,
+                lease: None,
                 test_tee_panic: Some(fast_plane::TrafficClass::Audio),
             },
         )
@@ -35893,4 +36097,7 @@ mod tests {
 
     /// The cost of an edge per part, counted (an ignored measurement).
     mod edge_cost;
+
+    /// Edges fed by the fast plane: lease children and edge ingest.
+    mod fast_lease;
 }

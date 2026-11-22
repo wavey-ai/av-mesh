@@ -6,6 +6,7 @@
 //! it forwards it.
 
 use super::dedup::FirstArrival;
+use super::lease::{LeaseChildren, LeaseSnapshot, LeaseSnapshotStats, LeaseTake};
 use super::sys::{self, RecvBatch, RECV_BATCH};
 use super::view::RlsView;
 use super::{class_addr, StreamClasses, TrafficClass};
@@ -32,7 +33,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -65,6 +66,9 @@ pub struct RelayClassConfig {
     /// of a drained batch as UDP GSO messages (one pass through the stack
     /// for up to 64 symbols) instead of one `sendmmsg` entry per symbol.
     pub video_gso: bool,
+    /// `--relay-lease-children`: the children that the served cache-mesh
+    /// leases make, fed after the compiled children (see `lease`).
+    pub lease: Option<Arc<LeaseChildren>>,
     /// Tests: the tee of this class panics on its first datagram.
     #[cfg(test)]
     pub test_tee_panic: Option<TrafficClass>,
@@ -78,6 +82,7 @@ impl Default for RelayClassConfig {
             realtime: true,
             tee_capacity: DEFAULT_TEE_CAPACITY,
             video_gso: true,
+            lease: None,
             #[cfg(test)]
             test_tee_panic: None,
         }
@@ -172,6 +177,8 @@ pub struct FastPlaneStats {
     pub gso_messages: AtomicU64,
     /// Threads that found UDP GSO unavailable and send without it.
     pub gso_fallbacks: AtomicU64,
+    /// The lease children, whose counters the snapshot reports.
+    pub lease: OnceLock<Arc<LeaseChildren>>,
 }
 
 /// What `/api/mesh` reports of the fast plane.
@@ -197,6 +204,7 @@ pub struct FastPlaneSnapshot {
     pub gso_datagrams: u64,
     pub gso_messages: u64,
     pub gso_fallbacks: u64,
+    pub lease_children: LeaseSnapshotStats,
 }
 
 impl FastPlaneStats {
@@ -222,6 +230,11 @@ impl FastPlaneStats {
             gso_datagrams: load(&self.gso_datagrams),
             gso_messages: load(&self.gso_messages),
             gso_fallbacks: load(&self.gso_fallbacks),
+            lease_children: self
+                .lease
+                .get()
+                .map(|lease| lease.stats.snapshot())
+                .unwrap_or_default(),
         }
     }
 }
@@ -307,11 +320,23 @@ struct PlannedWarm {
     expires_at_us: u64,
 }
 
+/// A send to a lease child: `child` indexes the snapshot's children.
+#[derive(Debug, Clone, Copy)]
+struct PlannedLease {
+    message: u16,
+    child: u16,
+}
+
 /// The sends of one drained batch, by source socket.
 pub(crate) struct ForwardPlan {
     groups: Vec<Vec<PlannedSend>>,
     retry: Vec<(usize, PlannedSend)>,
     warm: Vec<PlannedWarm>,
+    /// Sends to lease children, after every compiled child's.
+    lease: Vec<PlannedLease>,
+    /// Video sources held back from repair-only lease children: `path` is
+    /// the child's index in the snapshot.
+    lease_warm: Vec<PlannedWarm>,
     first: [Option<(SocketAddr, u64)>; RECV_BATCH],
 }
 
@@ -323,6 +348,8 @@ impl ForwardPlan {
                 .collect(),
             retry: Vec::with_capacity(RECV_BATCH),
             warm: Vec::with_capacity(RECV_BATCH * warm_paths),
+            lease: Vec::with_capacity(RECV_BATCH * 4),
+            lease_warm: Vec::new(),
             first: [None; RECV_BATCH],
         }
     }
@@ -333,7 +360,132 @@ impl ForwardPlan {
         }
         self.retry.clear();
         self.warm.clear();
+        self.lease.clear();
+        self.lease_warm.clear();
         self.first = [None; RECV_BATCH];
+    }
+}
+
+/// Plan the sends of one admitted symbol to the lease children of its
+/// stream, by the lane rule.
+fn plan_lease(
+    snapshot: &LeaseSnapshot,
+    class: TrafficClass,
+    message: usize,
+    view: &RlsView<'_>,
+    plan: &mut ForwardPlan,
+) {
+    let mut object = None;
+    for &child in snapshot.children_of(view.stream) {
+        match snapshot.children[usize::from(child)].takes(class, view.role) {
+            LeaseTake::Send => plan.lease.push(PlannedLease {
+                message: message as u16,
+                child,
+            }),
+            LeaseTake::Warm => plan.lease_warm.push(PlannedWarm {
+                message: message as u16,
+                path: child,
+                object: *object.get_or_insert_with(|| view_object_id(view)),
+                expires_at_us: view.deadline_us,
+            }),
+        }
+    }
+}
+
+/// Send the lease plan from the lease children's socket of the class: one
+/// non-blocking `sendmmsg` (video as UDP GSO messages, each child's symbols
+/// together), then one more try each for what the kernel did not take.
+/// Never waits. Then keep the held-back video sources warm.
+#[allow(clippy::too_many_arguments)]
+fn send_lease_plan(
+    lease: &LeaseChildren,
+    snapshot: &LeaseSnapshot,
+    class: TrafficClass,
+    batch: &RecvBatch,
+    plan: &mut ForwardPlan,
+    stats: &FastPlaneStats,
+    gso: &mut bool,
+    now_us: u64,
+) {
+    let ForwardPlan {
+        lease: sends,
+        lease_warm,
+        first,
+        ..
+    } = plan;
+    if !sends.is_empty() {
+        let fd = lease.fd(class);
+        let target =
+            |send: &PlannedLease| snapshot.children[usize::from(send.child)].targets[class.index()];
+        let use_gso = *gso && class == TrafficClass::Video;
+        if use_gso {
+            // A child's symbols in a row make one GSO message; the order of
+            // a child's own symbols is kept.
+            sends.sort_by_key(|send| send.child);
+        }
+        let message = |index: usize| {
+            let send = &sends[index];
+            (batch.data(usize::from(send.message)), target(send))
+        };
+        let mut sent = None;
+        if use_gso {
+            match sys::send_gso_batch(fd, sends.len(), message) {
+                Ok(gso_sent) => {
+                    stats
+                        .gso_datagrams
+                        .fetch_add(gso_sent.datagrams as u64, Ordering::Relaxed);
+                    stats
+                        .gso_messages
+                        .fetch_add(gso_sent.messages as u64, Ordering::Relaxed);
+                    sent = Some(gso_sent.datagrams);
+                }
+                Err(error) if sys::gso_unsupported(&error) => {
+                    *gso = false;
+                    stats.gso_fallbacks.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        error = %error,
+                        "UDP GSO is unavailable: the video thread sends each symbol on its own"
+                    );
+                }
+                Err(_) => sent = Some(0),
+            }
+        }
+        let sent = match sent {
+            Some(sent) => sent,
+            None => sys::send_batch(fd, sends.len(), message).unwrap_or(0),
+        };
+        let sent_us = now_unix_us();
+        for send in &sends[..sent] {
+            first[usize::from(send.message)].get_or_insert((target(send), sent_us));
+        }
+        let mut delivered = sent as u64;
+        for send in &sends[sent..] {
+            let data = batch.data(usize::from(send.message));
+            match sys::send_batch(fd, 1, |_| (data, target(send))) {
+                Ok(1) => {
+                    delivered += 1;
+                    first[usize::from(send.message)].get_or_insert((target(send), now_unix_us()));
+                }
+                Err(error) if error.kind() != std::io::ErrorKind::WouldBlock => {
+                    lease.stats.send_errors.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {
+                    // Counted, never waited for: the child's FEC or its
+                    // other parent covers the symbol.
+                    lease.stats.would_block.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        lease.stats.sent[class.index()].fetch_add(delivered, Ordering::Relaxed);
+    }
+    for warm in lease_warm.iter() {
+        lease.buffer_warm(
+            &snapshot.children[usize::from(warm.path)],
+            warm.object,
+            warm.expires_at_us,
+            batch.data(usize::from(warm.message)),
+            now_us,
+        );
     }
 }
 
@@ -536,6 +688,7 @@ struct ClassThread {
     cpu: Option<usize>,
     realtime: bool,
     video_gso: bool,
+    lease: Option<Arc<LeaseChildren>>,
 }
 
 struct Pending {
@@ -653,6 +806,12 @@ impl ClassThread {
         pending.clear();
         plan.clear();
         let class = self.class;
+        // The lease children as they are now, without a lock.
+        let lease = self
+            .lease
+            .as_deref()
+            .map(|lease| (lease, lease.load()))
+            .filter(|(_, snapshot)| !snapshot.is_empty());
         self.stats.received[class.index()].fetch_add(batch.len() as u64, Ordering::Relaxed);
         for message in 0..batch.len() {
             let received = batch.get(message);
@@ -728,6 +887,9 @@ impl ClassThread {
             if let Some(forwarder) = &self.forwarder {
                 forwarder.plan_fast(message, &view, plan);
             }
+            if let Some((_, snapshot)) = &lease {
+                plan_lease(snapshot, class, message, &view, plan);
+            }
             pending.push(Pending {
                 admitted: Some(view.is_video_kind()),
                 ..unchecked
@@ -738,6 +900,20 @@ impl ClassThread {
             // Held-back sources are kept only once every child has its
             // datagrams, in this class's own buffers.
             forwarder.buffer_fast_warm(class, batch, plan, now_us);
+        }
+        // The lease children (the edges) after the compiled children (the
+        // long-haul forwarders).
+        if let Some((lease, snapshot)) = &lease {
+            send_lease_plan(
+                lease,
+                snapshot,
+                class,
+                batch,
+                plan,
+                &self.stats,
+                gso,
+                now_us,
+            );
         }
         // The tee copies come after every child has its datagrams.
         for entry in pending.drain(..) {
@@ -1128,6 +1304,9 @@ pub async fn run_relay_class_ingest(
         link_telemetry,
     } = runtime;
     let stats = Arc::new(FastPlaneStats::default());
+    if let Some(lease) = &config.lease {
+        let _ = stats.lease.set(Arc::clone(lease));
+    }
     cache.set_fast_plane_stats(Arc::clone(&stats));
     let admissions = Arc::new(dispatch.peer_admissions());
     let limits = dispatch.receiver().config().relay_limits;
@@ -1174,6 +1353,7 @@ pub async fn run_relay_class_ingest(
             cpu: config.cpus[class.index()],
             realtime: config.realtime,
             video_gso: config.video_gso,
+            lease: config.lease.clone(),
         };
         match std::thread::Builder::new()
             .name(format!("needletail-fast-{}", class.as_str()))
@@ -1229,6 +1409,7 @@ pub async fn run_relay_class_ingest(
         children = forwarder
             .as_ref()
             .map_or(0, |forwarder| forwarder.paths.len()),
+        lease_children = config.lease.is_some(),
         "RelaySession ingest runs on the fast plane"
     );
 
