@@ -657,8 +657,10 @@ async fn an_edge_sends_each_part_once_to_fast_lane_clients_joining_anywhere() {
 }
 
 /// B9, 4K: one-frame fMP4 parts of a video stream (sources from the primary
-/// forwarder, repair from the secondary) reach a fast-lane client on a 1 %
-/// path whole, once each, in last-mile datagrams of at most 1,128 bytes.
+/// forwarder, repair from the secondary) reach three fast-lane clients, one
+/// on a 1 % path, whole, once each, in last-mile datagrams of at most 1,128
+/// bytes, sent as UDP GSO messages (each client's symbols of a batch
+/// together).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_4k_stream_rides_the_fast_lane_in_datagrams_that_fit_the_last_mile() {
     let edge = LaneEdge::start(loopback(6)).await;
@@ -678,22 +680,24 @@ async fn a_4k_stream_rides_the_fast_lane_in_datagrams_that_fit_the_last_mile() {
         )
     };
     let parts = 40_u64;
-    let mut client = None;
+    let mut clients = Vec::new();
     for sequence in 0..parts {
         if sequence == 5 {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            client = Some(tokio::spawn(lane_client(
-                edge.client_port,
-                stream_id,
-                None,
-                0.01,
-                Arc::clone(&last),
-                tx,
-            )));
-            timeout(Duration::from_secs(5), rx)
-                .await
-                .expect("the edge answers")
-                .unwrap();
+            for loss in [0.01, 0.0, 0.0] {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                clients.push(tokio::spawn(lane_client(
+                    edge.client_port,
+                    stream_id,
+                    None,
+                    loss,
+                    Arc::clone(&last),
+                    tx,
+                )));
+                timeout(Duration::from_secs(5), rx)
+                    .await
+                    .expect("the edge answers")
+                    .unwrap();
+            }
         }
         edge.send(true, &publish(sequence), false).await;
         served.insert(
@@ -703,13 +707,20 @@ async fn a_4k_stream_rides_the_fast_lane_in_datagrams_that_fit_the_last_mile() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     last.store(parts - 1, Ordering::Relaxed);
-    let run = client.unwrap().await.unwrap();
-    check_run("4K at 1 % loss", &run, &served, parts - 1, 5);
-    assert!(run.largest_media_datagram > 1_000);
+    for (index, client) in clients.into_iter().enumerate() {
+        let run = client.await.unwrap();
+        check_run(&format!("4K client {index}"), &run, &served, parts - 1, 5);
+        assert!(run.largest_media_datagram > 1_000);
+        assert!(
+            run.largest_media_datagram <= 1_128,
+            "a last-mile 4K datagram is {} bytes",
+            run.largest_media_datagram
+        );
+    }
+    let lane = edge.lane.snapshot_stats();
     assert!(
-        run.largest_media_datagram <= 1_128,
-        "a last-mile 4K datagram is {} bytes",
-        run.largest_media_datagram
+        lane.gso_messages > 0 && lane.gso_fallbacks == 0,
+        "video leaves the edge's fast lane as GSO messages: {lane:?}"
     );
     assert_eq!(
         edge.cache.stream_classes().class(stream_id),

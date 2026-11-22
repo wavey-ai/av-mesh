@@ -195,6 +195,10 @@ pub struct FastLaneStats {
     /// Symbols of streams with fast-lane clients that cannot ride the lane
     /// (init, codec configuration, a stream not yet seen committed).
     pub not_eligible: AtomicU64,
+    /// Video: UDP GSO messages (a client's symbols of a batch, together),
+    /// and the times the host refused GSO (sent without it from then on).
+    pub gso_messages: AtomicU64,
+    pub gso_fallbacks: AtomicU64,
 }
 
 /// What `/api/mesh` reports of the fast client lane.
@@ -214,6 +218,8 @@ pub struct FastLaneSnapshot {
     pub top_up_datagrams: u64,
     pub top_up_errors: u64,
     pub not_eligible: u64,
+    pub gso_messages: u64,
+    pub gso_fallbacks: u64,
 }
 
 struct Armed {
@@ -347,6 +353,8 @@ impl EdgeFastLane {
             top_up_datagrams: load(&self.stats.top_up_datagrams),
             top_up_errors: load(&self.stats.top_up_errors),
             not_eligible: load(&self.stats.not_eligible),
+            gso_messages: load(&self.stats.gso_messages),
+            gso_fallbacks: load(&self.stats.gso_fallbacks),
         }
     }
 
@@ -462,6 +470,8 @@ struct PlannedClient {
     source: bool,
     part: u64,
     peer: SocketAddr,
+    /// Its client, by index in `ClientPlan::clients`.
+    client: u32,
 }
 
 /// One class thread's working state of the fast client lane: the rewrap
@@ -476,6 +486,12 @@ pub struct ClientPlan {
     clients: Vec<Arc<FastClient>>,
     memo: Vec<(RepairPolicy, u32, u32)>,
     memo_next: usize,
+    /// Video with GSO: the place of each client in the batch (its first
+    /// send), so that a client's symbols go together and the clients keep
+    /// the turns of the plan.
+    turns: HashMap<SocketAddr, u32>,
+    /// Video is sent as UDP GSO messages until the host refuses it once.
+    gso: bool,
 }
 
 const REPAIR_MEMO: usize = 64;
@@ -495,7 +511,15 @@ impl ClientPlan {
             clients: Vec::with_capacity(sys::RECV_BATCH * 8),
             memo: Vec::with_capacity(REPAIR_MEMO),
             memo_next: 0,
+            turns: HashMap::new(),
+            gso: false,
         }
+    }
+
+    /// Send video as UDP GSO messages (--relay-video-gso).
+    pub fn with_gso(mut self, gso: bool) -> Self {
+        self.gso = gso;
+        self
     }
 
     pub fn clear(&mut self) {
@@ -589,16 +613,31 @@ impl ClientPlan {
                     source: repair_ordinal.is_none(),
                     part,
                     peer: *peer,
+                    client: self.clients.len() as u32,
                 });
                 self.clients.push(Arc::clone(client));
             }
         }
     }
 
+    /// Group each client's sends together, keeping the order of its own
+    /// sends and the clients' turns (the order of their first sends).
+    fn group_by_client(&mut self) {
+        self.turns.clear();
+        for send in &self.sends {
+            let turn = self.turns.len() as u32;
+            self.turns.entry(send.peer).or_insert(turn);
+        }
+        let turns = &self.turns;
+        self.sends.sort_by_key(|send| turns[&send.peer]);
+    }
+
     /// Send the plan from the client socket of `class`: one non-blocking
-    /// `sendmmsg`, then one more try each for what the kernel did not take.
-    /// A source symbol that is still refused gives its part back to the
-    /// cache-fed lane for that client.
+    /// `sendmmsg` (video with `gso`: each client's symbols of the batch
+    /// together, as UDP GSO messages), then one more try each for what the
+    /// kernel did not take, until the socket is full. A source symbol that
+    /// is refused gives its part back to the cache-fed lane for that
+    /// client. A host that refuses GSO is sent to without it from then on.
     pub fn send(&mut self, lane: &EdgeFastLane, class: TrafficClass) {
         if self.sends.is_empty() {
             return;
@@ -607,31 +646,76 @@ impl ClientPlan {
             self.clear();
             return;
         };
+        let use_gso = self.gso && class == TrafficClass::Video;
+        if use_gso {
+            self.group_by_client();
+        }
+        let (sends, buffers, lens) = (&self.sends, &self.buffers, &self.lens);
         let message = |index: usize| {
-            let send = &self.sends[index];
-            (self.buffer(usize::from(send.message)), send.peer)
+            let send = &sends[index];
+            let message = usize::from(send.message);
+            let start = message * REWRAP_BYTES;
+            (
+                &buffers[start..start + usize::from(lens[message])],
+                send.peer,
+            )
         };
-        let sent = sys::send_batch(fd, self.sends.len(), message).unwrap_or(0);
-        let mut delivered = sent as u64;
-        for index in sent..self.sends.len() {
-            let send = self.sends[index];
-            let data = self.buffer(usize::from(send.message));
-            match sys::send_batch(fd, 1, |_| (data, send.peer)) {
-                Ok(1) => delivered += 1,
-                result => {
-                    match result {
-                        Err(error) if error.kind() != std::io::ErrorKind::WouldBlock => {
-                            lane.stats.send_errors.fetch_add(1, Ordering::Relaxed);
-                        }
-                        _ => {
-                            lane.stats.would_block.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    if send.source {
-                        self.clients[index].give_back(send.part);
-                        lane.stats.given_back.fetch_add(1, Ordering::Relaxed);
-                    }
+        let mut sent = None;
+        if use_gso {
+            match sys::send_gso_batch(fd, self.sends.len(), message) {
+                Ok(gso_sent) => {
+                    lane.stats
+                        .gso_messages
+                        .fetch_add(gso_sent.messages as u64, Ordering::Relaxed);
+                    sent = Some(gso_sent.datagrams);
                 }
+                Err(error) if sys::gso_unsupported(&error) => {
+                    self.gso = false;
+                    lane.stats.gso_fallbacks.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        error = %error,
+                        "UDP GSO is unavailable: the edge's video clients are sent each symbol on its own"
+                    );
+                }
+                Err(_) => sent = Some(0),
+            }
+        }
+        let sent = match sent {
+            Some(sent) => sent,
+            None => sys::send_batch(fd, self.sends.len(), message).unwrap_or(0),
+        };
+        let mut delivered = sent as u64;
+        let (mut would_block, mut errors, mut given_back) = (0_u64, 0_u64, 0_u64);
+        let (sends, clients) = (&self.sends, &self.clients);
+        // One more try each for what the kernel did not take, until the
+        // socket is full: the rest are refused without a syscall each.
+        sys::send_rest(
+            sent,
+            sends.len(),
+            |index| sys::send_batch(fd, 1, |_| message(index)),
+            |index, outcome| {
+                match outcome {
+                    sys::RestOutcome::Sent => {
+                        delivered += 1;
+                        return;
+                    }
+                    sys::RestOutcome::WouldBlock => would_block += 1,
+                    sys::RestOutcome::Error => errors += 1,
+                }
+                let send = &sends[index];
+                if send.source {
+                    clients[send.client as usize].give_back(send.part);
+                    given_back += 1;
+                }
+            },
+        );
+        for (counter, count) in [
+            (&lane.stats.would_block, would_block),
+            (&lane.stats.send_errors, errors),
+            (&lane.stats.given_back, given_back),
+        ] {
+            if count > 0 {
+                counter.fetch_add(count, Ordering::Relaxed);
             }
         }
         lane.stats.datagrams.fetch_add(delivered, Ordering::Relaxed);
@@ -675,6 +759,55 @@ impl UpstreamRepair {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 4K on the edge's fast lane: the plan interleaves the clients symbol
+    /// by symbol; grouped for GSO, each client's symbols of a part are one
+    /// run (one message), in the clients' turns, its own symbols in order.
+    #[test]
+    fn a_video_batch_is_one_gso_message_per_client_per_part() {
+        let mut plan = ClientPlan::new().with_gso(true);
+        let peers: Vec<SocketAddr> = (0..25_u16)
+            .map(|port| SocketAddr::from(([127, 0, 0, 1], 40_000 + port)))
+            .collect();
+        let symbols = 48_usize;
+        for message in 0..symbols {
+            plan.lens[message] = 1_100;
+            // The turns of part 7: the clients rotate from 7 % 25.
+            for index in 0..peers.len() {
+                let turn = (7 + index) % peers.len();
+                let peer = peers[turn];
+                plan.sends.push(PlannedClient {
+                    message: message as u16,
+                    source: true,
+                    part: 7,
+                    peer,
+                    client: plan.clients.len() as u32,
+                });
+                plan.clients.push(FastClient::new(turn as u64));
+            }
+        }
+        let interleaved = sys::gso_runs(plan.sends.len(), |index| (1_100, plan.sends[index].peer));
+        assert_eq!(interleaved.len(), symbols * peers.len(), "one per datagram");
+        plan.group_by_client();
+        let runs = sys::gso_runs(plan.sends.len(), |index| (1_100, plan.sends[index].peer));
+        assert_eq!(runs.len(), peers.len(), "one message per client");
+        // The clients keep their turns, and each its symbols in order.
+        assert_eq!(plan.sends[0].peer, peers[7]);
+        for (run, (first, count)) in runs.iter().enumerate() {
+            assert_eq!(*count, symbols);
+            let turn = (7 + run) % peers.len();
+            let peer = peers[turn];
+            for (offset, send) in plan.sends[*first..first + count].iter().enumerate() {
+                assert_eq!(send.peer, peer);
+                assert_eq!(usize::from(send.message), offset);
+                // The send still names its own client.
+                assert_eq!(
+                    plan.clients[send.client as usize].fast_from, turn as u64,
+                    "the send names its own client"
+                );
+            }
+        }
+    }
 
     #[test]
     fn a_part_goes_to_a_client_on_one_lane_only() {

@@ -468,22 +468,37 @@ fn send_lease_plan(
             first[usize::from(send.message)].get_or_insert((target(send), sent_us));
         }
         let mut delivered = sent as u64;
-        for send in &sends[sent..] {
-            let data = batch.data(usize::from(send.message));
-            match sys::send_batch(fd, 1, |_| (data, target(send))) {
-                Ok(1) => {
+        let (mut would_block, mut errors) = (0_u64, 0_u64);
+        // One more try each for what the kernel did not take, until the
+        // socket is full. Refused symbols are counted, never waited for:
+        // the child's FEC or its other parent covers them.
+        sys::send_rest(
+            sent,
+            sends.len(),
+            |index| {
+                let send = &sends[index];
+                sys::send_batch(fd, 1, |_| {
+                    (batch.data(usize::from(send.message)), target(send))
+                })
+            },
+            |index, outcome| match outcome {
+                sys::RestOutcome::Sent => {
                     delivered += 1;
+                    let send = &sends[index];
                     first[usize::from(send.message)].get_or_insert((target(send), now_unix_us()));
                 }
-                Err(error) if error.kind() != std::io::ErrorKind::WouldBlock => {
-                    lease.stats.send_errors.fetch_add(1, Ordering::Relaxed);
-                }
-                _ => {
-                    // Counted, never waited for: the child's FEC or its
-                    // other parent covers the symbol.
-                    lease.stats.would_block.fetch_add(1, Ordering::Relaxed);
-                }
-            }
+                sys::RestOutcome::WouldBlock => would_block += 1,
+                sys::RestOutcome::Error => errors += 1,
+            },
+        );
+        if would_block > 0 {
+            lease
+                .stats
+                .would_block
+                .fetch_add(would_block, Ordering::Relaxed);
+        }
+        if errors > 0 {
+            lease.stats.send_errors.fetch_add(errors, Ordering::Relaxed);
         }
         lease.stats.sent[class.index()].fetch_add(delivered, Ordering::Relaxed);
     }
@@ -756,9 +771,10 @@ impl ClassThread {
             |forwarder| ForwardPlan::new(forwarder.socket_groups.len(), forwarder.warm_paths()),
         );
         let mut pending = Vec::with_capacity(RECV_BATCH);
-        let mut clients = ClientPlan::new();
-        // UDP GSO for video until the host refuses it once.
+        // UDP GSO for video until the host refuses it once (the edge's
+        // clients and the children apart).
         let mut gso = self.video_gso && self.class == TrafficClass::Video;
+        let mut clients = ClientPlan::new().with_gso(gso);
         let mut kernel_dropped = vec![0_u32; self.sockets.len()];
         while !self.stop.load(Ordering::Relaxed) {
             let ready = match sys::wait_readable(&fds, STOP_POLL_MS) {

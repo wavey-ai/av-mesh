@@ -304,6 +304,47 @@ fn sockaddr_to_std(storage: &libc::sockaddr_storage, len: libc::socklen_t) -> Op
     address.as_socket()
 }
 
+/// What became of one message of the rest of a batch (`send_rest`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestOutcome {
+    Sent,
+    /// The socket was full: refused, never waited for.
+    WouldBlock,
+    /// Another error, for this message.
+    Error,
+}
+
+/// The messages `from..count` of a batch that `send_batch` did not take,
+/// each tried once on its own with `try_one`, until the socket refuses one
+/// as full: the socket's send buffer is shared, so every later message
+/// would be refused too, and the rest are refused without a syscall each.
+/// An error of one message (its destination) does not stop the others.
+/// `outcome` is told of each message.
+pub fn send_rest(
+    from: usize,
+    count: usize,
+    mut try_one: impl FnMut(usize) -> io::Result<usize>,
+    mut outcome: impl FnMut(usize, RestOutcome),
+) {
+    let mut full = false;
+    for index in from..count {
+        if full {
+            outcome(index, RestOutcome::WouldBlock);
+            continue;
+        }
+        match try_one(index) {
+            Ok(1) => outcome(index, RestOutcome::Sent),
+            Err(error) if error.kind() != io::ErrorKind::WouldBlock => {
+                outcome(index, RestOutcome::Error);
+            }
+            _ => {
+                full = true;
+                outcome(index, RestOutcome::WouldBlock);
+            }
+        }
+    }
+}
+
 /// Hand messages to the kernel in `sendmmsg` calls of up to [`SEND_BATCH`],
 /// without waiting. Returns how many left, from the front.
 pub fn send_batch<'a>(
@@ -704,6 +745,39 @@ pub const fn supported() -> bool {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    /// Once the socket refuses a message as full, the rest of the batch
+    /// costs no syscall each; an error of one destination does not stop
+    /// the others.
+    #[test]
+    fn the_rest_of_a_batch_stops_at_the_first_full_socket() {
+        let mut tries = Vec::new();
+        let mut outcomes = Vec::new();
+        send_rest(
+            10,
+            1_600,
+            |index| {
+                tries.push(index);
+                match index {
+                    10 => Ok(1),
+                    11 => Err(io::Error::from(io::ErrorKind::ConnectionRefused)),
+                    _ => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                }
+            },
+            |index, outcome| outcomes.push((index, outcome)),
+        );
+        assert_eq!(
+            tries,
+            vec![10, 11, 12],
+            "one syscall after the socket is full"
+        );
+        assert_eq!(outcomes.len(), 1_590);
+        assert_eq!(outcomes[0], (10, RestOutcome::Sent));
+        assert_eq!(outcomes[1], (11, RestOutcome::Error));
+        assert!(outcomes[2..]
+            .iter()
+            .all(|(_, outcome)| *outcome == RestOutcome::WouldBlock));
+    }
 
     #[test]
     fn a_batch_receives_what_a_batch_sends_with_peer_and_kernel_time() {
