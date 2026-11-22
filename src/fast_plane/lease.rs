@@ -117,6 +117,28 @@ pub struct LeaseSnapshot {
 }
 
 impl LeaseSnapshot {
+    /// Whether the child at `ip` takes stream `stream_id` here, and if so
+    /// whether this forwarder is its primary. No allocation.
+    pub fn feeds(&self, ip: IpAddr, stream_id: u64) -> Option<bool> {
+        let mut digits = [0_u8; 20];
+        let mut at = digits.len();
+        let mut value = stream_id;
+        loop {
+            at -= 1;
+            digits[at] = b'0' + (value % 10) as u8;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        let stream = std::str::from_utf8(&digits[at..]).ok()?;
+        self.children_of(stream)
+            .iter()
+            .map(|&child| &self.children[usize::from(child)])
+            .find(|child| child.ip == ip)
+            .map(|child| child.primary)
+    }
+
     /// The children of a stream, in a stable order.
     pub fn children_of(&self, stream: &str) -> &[u16] {
         self.streams.get(stream).map_or(&[], |children| children)
@@ -130,6 +152,32 @@ impl LeaseSnapshot {
     pub fn pairs(&self) -> usize {
         self.streams.values().map(|children| children.len()).sum()
     }
+}
+
+/// The cache mesh's live push filter of a forwarder (wave 7 item 4,
+/// `--cache-mesh-fast-plane-push`): an audio stream's parts are not pushed
+/// over the cache mesh to a lease child that the fast plane feeds them to
+/// (with `primary_only`, only to the children this forwarder is the
+/// primary of: their secondary forwarder still pushes). Video keeps the
+/// push. The lease children are set in `slot` once they run; until then
+/// nothing is filtered.
+pub fn live_push_filter(
+    slot: Arc<std::sync::OnceLock<Arc<LeaseChildren>>>,
+    classes: super::StreamClasses,
+    primary_only: bool,
+) -> playlists::mesh::CacheMeshLivePushFilter {
+    Arc::new(move |peer: SocketAddr, stream_id: u64| {
+        if classes.class(stream_id) == TrafficClass::Video {
+            return false;
+        }
+        let Some(lease) = slot.get() else {
+            return false;
+        };
+        lease
+            .load()
+            .feeds(peer.ip(), stream_id)
+            .is_some_and(|primary| primary || !primary_only)
+    })
 }
 
 /// Counters of the lease children.
@@ -531,6 +579,44 @@ mod tests {
         lease.rebuild(&[]);
         assert!(lease.load().is_empty());
         assert_eq!(lease.stats.snapshot().children, 0);
+    }
+
+    #[test]
+    fn the_push_filter_names_the_audio_pairs_that_the_fast_plane_feeds() {
+        let lease = lease(16, &["10.0.0.5"]);
+        lease.rebuild(&[
+            served("10.0.0.5:9101", 4001),
+            served("10.0.0.6:9101", 4001),
+            served("10.0.0.6:9101", 1),
+            served("10.0.0.6:9101", 18_446_744_073_709_551_615),
+        ]);
+        let snapshot = lease.load();
+        let five: IpAddr = "10.0.0.5".parse().unwrap();
+        let six: IpAddr = "10.0.0.6".parse().unwrap();
+        assert_eq!(snapshot.feeds(five, 4001), Some(true));
+        assert_eq!(snapshot.feeds(six, 4001), Some(false));
+        assert_eq!(snapshot.feeds(five, 1), None);
+        assert_eq!(snapshot.feeds(six, u64::MAX), Some(false));
+        assert_eq!(snapshot.feeds("10.0.0.7".parse().unwrap(), 4001), None);
+
+        let classes = crate::fast_plane::StreamClasses::default();
+        classes.mark_video(1);
+        let slot = Arc::new(std::sync::OnceLock::new());
+        let none = live_push_filter(Arc::clone(&slot), classes.clone(), false);
+        let primary = live_push_filter(Arc::clone(&slot), classes, true);
+        let peer = |ip: &str| -> SocketAddr { format!("{ip}:9101").parse().unwrap() };
+        // Nothing is filtered before the lease children run.
+        assert!(!none(peer("10.0.0.5"), 4001));
+        slot.set(Arc::clone(&lease)).unwrap();
+        // `none`: no audio push to any child the fast plane feeds.
+        assert!(none(peer("10.0.0.5"), 4001));
+        assert!(none(peer("10.0.0.6"), 4001));
+        // `secondary`: the primary forwarder stops; the secondary pushes.
+        assert!(primary(peer("10.0.0.5"), 4001));
+        assert!(!primary(peer("10.0.0.6"), 4001));
+        // Video keeps the push; a child without a lease here is no pair.
+        assert!(!none(peer("10.0.0.6"), 1));
+        assert!(!none(peer("10.0.0.7"), 4001));
     }
 
     #[test]

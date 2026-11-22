@@ -1377,6 +1377,23 @@ struct Args {
     )]
     relay_lease_children: bool,
 
+    /// Wave 7 item 4: what a forwarder still pushes over the cache mesh of
+    /// an audio stream to a lease child that its fast plane feeds the
+    /// stream (an edge takes the contributor's RLS1 symbols from both of
+    /// its forwarders already). `none` (the default): no live push of
+    /// such a pair; the edge keeps its lease, its warm-up window and its
+    /// hole repair (replica requests). `secondary`: only the edge's
+    /// secondary forwarder pushes. `all`: every leased pair is pushed, as
+    /// before. Video streams are always pushed. Inert without lease
+    /// children.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CACHE_MESH_FAST_PLANE_PUSH",
+        value_enum,
+        default_value_t = CacheMeshFastPlanePush::Nothing
+    )]
+    cache_mesh_fast_plane_push: CacheMeshFastPlanePush,
+
     /// Source address of the symbols to lease children (an audio socket
     /// and its video twin on it): each edge binds it as its parent
     /// (--relay-primary-peer or --relay-secondary-peer).
@@ -2809,6 +2826,19 @@ async fn main() -> Result<()> {
     } else {
         mesh_config
     };
+    // The lease children are made from the running mesh; the mesh's live
+    // push filter reads them from this slot once they run.
+    let lease_push_slot: Arc<std::sync::OnceLock<Arc<fast_plane::lease::LeaseChildren>>> =
+        Arc::default();
+    let mesh_config = match args.cache_mesh_fast_plane_push {
+        _ if !(args.relay_lease_children && args.relay_lease_bind.is_some()) => mesh_config,
+        CacheMeshFastPlanePush::All => mesh_config,
+        mode => mesh_config.with_live_push_filter(fast_plane::lease::live_push_filter(
+            Arc::clone(&lease_push_slot),
+            cache.stream_classes().clone(),
+            mode == CacheMeshFastPlanePush::Secondary,
+        )),
+    };
     let mesh_chunk_cache = Arc::clone(&cache.chunk_cache);
     let mesh_handle = Arc::new(
         fast_path::on_media(media, async move {
@@ -3051,6 +3081,9 @@ async fn main() -> Result<()> {
         ingest_shutdown_rx.clone(),
     )
     .await?;
+    if let Some(lease) = &lease_children {
+        let _ = lease_push_slot.set(Arc::clone(lease));
+    }
     // `..Default::default()` fills the fields that exist only in tests.
     #[allow(clippy::needless_update)]
     let relay_class_config = fast_plane::relay::RelayClassConfig {
@@ -3907,6 +3940,15 @@ enum RelayForwardRole {
     All,
     Source,
     Repair,
+}
+
+/// `--cache-mesh-fast-plane-push`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CacheMeshFastPlanePush {
+    All,
+    Secondary,
+    #[value(name = "none")]
+    Nothing,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
