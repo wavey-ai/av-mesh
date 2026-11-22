@@ -989,6 +989,41 @@ impl CompactReceiver {
     pub fn expect_from(&mut self, part: u64, compact: bool) {
         self.reference = Some(part);
         self.active |= compact;
+        // Parts that came before this OK (an earlier OK was lost and the
+        // subscription asked again): the ones from the part it names up to
+        // the highest that came are holes, to ask for (wave 7 gate: under
+        // bursts a client whose OK was lost dropped the short parts that
+        // came first, and never asked for them again).
+        if let Some(highest) = self.highest {
+            self.note_holes(part, highest, Instant::now());
+        }
+    }
+
+    /// Parts `from..to` that have not come are holes (none if the run is
+    /// longer than [`MAX_HOLE_RUN`], or the lane is not compact).
+    fn note_holes(&mut self, from: u64, to: u64, now: Instant) {
+        if !self.active || to <= from || to - from > MAX_HOLE_RUN {
+            return;
+        }
+        let delay = self.nack_timing().delay;
+        for hole in from..to {
+            if self.delivered.contains(&hole) {
+                continue;
+            }
+            self.holes.entry(hole).or_insert(Hole {
+                since: now,
+                next_nack: now + delay,
+                nacks: 0,
+                last_nack: None,
+                gap: false,
+                silence_nacks: 0,
+            });
+            self.counts.entry(hole).or_insert(Count {
+                received: 0,
+                sent: 1 + self.last_copies,
+                at: now,
+            });
+        }
     }
 
     /// Forget everything of the last edge (or of the last source epoch,
@@ -1232,6 +1267,11 @@ impl CompactReceiver {
             None => {
                 self.highest = Some(part);
                 self.highest_at = Some(now);
+                // The first part after the OK: the parts from the one the OK
+                // named up to it were lost on the way.
+                if let Some(reference) = self.reference {
+                    self.note_holes(reference, part, now);
+                }
             }
         }
         true
@@ -1883,6 +1923,35 @@ mod tests {
         assert_eq!(parts[0].part, 70_000);
         assert_eq!(parts[0].payload, bytes);
         assert_eq!(parts[0].published_unix_us, 1_700_000_000_000_000);
+    }
+
+    /// Wave 7 gate: the first parts that a client misses are asked for
+    /// again: those between the part its OK names and the first that came
+    /// (lost on the way), and, when the OK came after parts (an earlier OK
+    /// was lost), those between it and the highest that came.
+    #[test]
+    fn the_first_parts_missed_are_asked_for_again() {
+        let bytes = payload(5, 56);
+        let start = Instant::now();
+        let delay = Duration::from_millis(5);
+        // The OK names 700; 700..=702 are lost and 703 comes first.
+        let mut receiver = CompactReceiver::new();
+        receiver.expect_from(700, true);
+        let first = encode_part(703, 1_700_000_000_000_000, &bytes).unwrap();
+        assert_eq!(receiver.push(&first, start, 1_700_000_000_001_000).len(), 1);
+        assert_eq!(receiver.nacks_due(start + delay, 64), vec![700, 701, 702]);
+        // A part (long, as every 256th is) came before the OK, which names
+        // an older part: the parts between are asked for.
+        let mut receiver = CompactReceiver::new();
+        let anchor = encode_part(768, 1_700_000_000_000_000, &bytes).unwrap();
+        assert!(shorten(&anchor).is_none());
+        receiver.active = true;
+        assert_eq!(receiver.push(&anchor, start, 1_700_000_000_001_000).len(), 1);
+        receiver.expect_from(760, true);
+        assert_eq!(
+            receiver.nacks_due(start + delay, 64),
+            (760..768).collect::<Vec<_>>()
+        );
     }
 
     /// A listener whose clock is a minute off the edge's still rebuilds the
