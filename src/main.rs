@@ -8933,15 +8933,27 @@ impl LiveTsCache {
             && available
                 .iter()
                 .any(|(_, _, _, segment_id, _, _)| segment_id.is_some());
-        let mut first_stamped_parts: BTreeMap<u64, u32> = BTreeMap::new();
-        let mut groups: BTreeMap<u64, Vec<(u64, u32, bool, u64)>> = BTreeMap::new();
+        // Parts that the watermark passed as holes and that are still
+        // missing (the repair horizon, wave 5 W2) are listed where they
+        // belong, as gaps, so that a player knows that they will not come.
+        let gaps = available
+            .first()
+            .map(|(first_listed, ..)| self.gap_parts_in(stream_id, *first_listed, last as u64))
+            .unwrap_or_default();
+        // The first listed part of each segment and its stamped index.
+        let mut first_stamped_parts: BTreeMap<u64, (u64, u32)> = BTreeMap::new();
+        // Each segment's parts: (sequence, duration, key frame, time, gap).
+        let mut groups: BTreeMap<u64, Vec<PlaylistEntry>> = BTreeMap::new();
+        // The listed parts in order: (sequence, segment, key frame, stamped
+        // index), for placing the gaps between them.
+        let mut listed: Vec<(u64, u64, bool, Option<u32>)> = Vec::new();
         for (seq, duration_us, keyframe, fmp4_segment_id, available_unix_us, stamped_part) in
             available
         {
             if let (Some(segment_id), Some(stamped_part)) = (fmp4_segment_id, stamped_part) {
                 first_stamped_parts
                     .entry(segment_id)
-                    .or_insert(stamped_part);
+                    .or_insert((seq, stamped_part));
             }
             let segment_id = if keyframe_aligned_segments {
                 let Some(segment_id) = fmp4_segment_id else {
@@ -8951,17 +8963,48 @@ impl LiveTsCache {
             } else {
                 seq / self.parts_per_segment as u64
             };
+            listed.push((seq, segment_id, keyframe, stamped_part));
             groups.entry(segment_id).or_default().push((
                 seq,
                 duration_us,
                 keyframe,
                 available_unix_us,
+                false,
             ));
+        }
+        if !gaps.is_empty() {
+            for gap in &gaps {
+                let segment_id = if keyframe_aligned_segments {
+                    gap_segment(&listed, *gap)
+                } else {
+                    Some(gap / self.parts_per_segment as u64)
+                };
+                if let Some(segment_id) = segment_id {
+                    groups
+                        .entry(segment_id)
+                        .or_default()
+                        .push((*gap, part_target_us, false, 0, true));
+                }
+            }
+            for group in groups.values_mut() {
+                group.sort_unstable_by_key(|entry| entry.0);
+            }
         }
         if stamped {
             // A retained window can begin halfway through a segment. The
-            // segment is listed only when its first part is here.
-            groups.retain(|segment_id, _group| first_stamped_parts.get(segment_id) == Some(&0));
+            // segment is listed only when its first part is here, or when
+            // the gaps in front of its first listed part stand for the
+            // parts before it (a segment in the middle of the window whose
+            // first part never came stays, so that the segments after it
+            // keep their numbers).
+            groups.retain(|segment_id, group| {
+                let Some((first_listed, index)) = first_stamped_parts.get(segment_id) else {
+                    return false;
+                };
+                let first = group.first().map_or(*first_listed, |entry| entry.0);
+                u64::from(*index) == first_listed.saturating_sub(first)
+                    && (*index == 0 || group.first().is_some_and(|entry| entry.4))
+            });
             // A playlist never grows at its front. The first segment that a
             // reader was shown stays the first until it leaves the window.
             if groups.len() >= 2 {
@@ -8976,10 +9019,12 @@ impl LiveTsCache {
             }
         } else if keyframe_aligned_segments {
             // A retained window can begin halfway through a GOP. Do not
-            // advertise that truncated parent as a playable HLS segment.
+            // advertise that truncated parent as a playable HLS segment. A
+            // segment that starts with a gap is one in the middle of the
+            // window whose key frame never came: it stays.
             groups.retain(|_segment_id, group| {
                 group.first().is_some_and(
-                    |(_sequence, _duration_us, keyframe, _available_unix_us)| *keyframe,
+                    |(_sequence, _duration_us, keyframe, _available_unix_us, gap)| *keyframe || *gap,
                 )
             });
         } else if groups.len() > 1 {
@@ -8992,7 +9037,7 @@ impl LiveTsCache {
                 if groups
                     .get(&first_segment)
                     .and_then(|group| group.first())
-                    .is_some_and(|(sequence, _duration_us, _keyframe, _available_unix_us)| {
+                    .is_some_and(|(sequence, _duration_us, _keyframe, _available_unix_us, _)| {
                         *sequence != expected_first_sequence
                     })
                 {
@@ -9016,8 +9061,8 @@ impl LiveTsCache {
             && groups
                 .last_key_value()
                 .and_then(|(_segment_id, group)| group.last())
-                .is_some_and(|(_sequence, duration_us, _keyframe, _available_unix_us)| {
-                    part_ends_segment_short(*duration_us, part_target_us)
+                .is_some_and(|(_sequence, duration_us, _keyframe, _available_unix_us, gap)| {
+                    !*gap && part_ends_segment_short(*duration_us, part_target_us)
                 });
         let segment_is_complete = |segment_id: u64, group_len: usize| {
             if keyframe_aligned_segments {
@@ -9032,7 +9077,7 @@ impl LiveTsCache {
             .map(|(_segment_id, group)| {
                 group
                     .iter()
-                    .map(|(_sequence, duration_us, _keyframe, _available_unix_us)| {
+                    .map(|(_sequence, duration_us, _keyframe, _available_unix_us, _)| {
                         u64::from(*duration_us)
                     })
                     .sum::<u64>()
@@ -9104,10 +9149,10 @@ impl LiveTsCache {
             .values()
             .next()
             .and_then(|group| group.first())
-            .filter(|(_sequence, _duration_us, _keyframe, available_unix_us)| {
+            .filter(|(_sequence, _duration_us, _keyframe, available_unix_us, _)| {
                 *available_unix_us > 0
             })
-            .and_then(|(_sequence, duration_us, _keyframe, available_unix_us)| {
+            .and_then(|(_sequence, duration_us, _keyframe, available_unix_us, _)| {
                 let start_unix_us = available_unix_us.saturating_sub(u64::from(*duration_us));
                 format_hls_program_date_time(start_unix_us)
             });
@@ -9129,32 +9174,20 @@ impl LiveTsCache {
         // Nearly every part of a stream has the same duration: its text is
         // written once and copied.
         let mut part_duration_text = (u32::MAX, String::new());
-        // Parts that the watermark passed as holes and that are still
-        // missing (the repair horizon, wave 5 W2) are listed where they
-        // belong, as gaps, so that a player knows that they will not come.
-        let gaps = groups
-            .first_key_value()
-            .and_then(|(_, group)| group.first())
-            .map(|(first_listed, ..)| self.gap_parts_in(stream_id, *first_listed, last as u64))
-            .unwrap_or_default();
-        let mut next_gap = 0_usize;
         let mut gap_duration_text = String::new();
         push_seconds(&mut gap_duration_text, u64::from(part_target_us));
         for (segment, group) in groups {
             let mut segment_duration_us = 0_u64;
-            for (seq, duration_us, keyframe, _available_unix_us) in &group {
+            for (seq, duration_us, keyframe, _available_unix_us, gap) in &group {
                 segment_duration_us = segment_duration_us.saturating_add(u64::from(*duration_us));
-                let first_gap = next_gap;
-                while gaps.get(next_gap).is_some_and(|gap| gap < seq) {
-                    next_gap += 1;
-                }
                 if segment < first_parted_segment {
                     continue;
                 }
-                for gap in &gaps[first_gap..next_gap] {
+                if *gap {
                     out.push_str("#EXT-X-PART:DURATION=");
                     out.push_str(&gap_duration_text);
-                    let _ = writeln!(out, ",URI=\"part{gap}.{extension}\",GAP=YES");
+                    let _ = writeln!(out, ",URI=\"part{seq}.{extension}\",GAP=YES");
+                    continue;
                 }
                 let independent =
                     if (*keyframe || audio_only_fmp4) && media_kind == LiveMediaKind::Fmp4 {
@@ -9172,6 +9205,10 @@ impl LiveTsCache {
                 let _ = writeln!(out, ",URI=\"part{seq}.{extension}\"{independent}");
             }
             if segment_is_complete(segment, group.len()) {
+                // A segment none of whose parts came is a gap as a whole.
+                if group.iter().all(|entry| entry.4) {
+                    out.push_str("#EXT-X-GAP\n");
+                }
                 out.push_str("#EXTINF:");
                 push_seconds(&mut out, segment_duration_us);
                 out.push_str(",\n");
@@ -21085,6 +21122,37 @@ fn playlist_request_rate(part_us: u64) -> u64 {
 /// 2.5 ms part is compared with a 2.5 ms target and not a rounded one.
 fn part_ends_segment_short(duration_us: u32, part_target_us: u32) -> bool {
     part_target_us > 0 && u64::from(duration_us) * 100 < u64::from(part_target_us) * 85
+}
+
+/// A part of a rendered playlist: sequence, duration, key frame, time, and
+/// whether it is a gap (a released hole, listed `GAP=YES`).
+type PlaylistEntry = (u64, u32, bool, u64, bool);
+
+/// The segment that a gap at `gap` belongs to in a stream whose segments
+/// follow its key frames, from the parts listed around it (`listed`, in
+/// order: sequence, segment, key frame, stamped index). Between two parts
+/// of one segment it is that segment's. Between the last part of a segment
+/// and the first of the next, it ends the earlier segment unless the later
+/// part says that it is not the first of its own: by its stamped index (a
+/// part with index `i` has `i` parts of its segment before it), or, without
+/// a stamp, by not being a key frame.
+fn gap_segment(listed: &[(u64, u64, bool, Option<u32>)], gap: u64) -> Option<u64> {
+    let after = listed.partition_point(|(seq, ..)| *seq < gap);
+    let before = after.checked_sub(1).map(|index| listed[index]);
+    let next = listed.get(after).copied();
+    match (before, next) {
+        (None, None) => None,
+        (Some((_, segment, ..)), None) => Some(segment),
+        (None, Some((_, segment, ..))) => Some(segment),
+        (Some((_, earlier, ..)), Some((_, later, ..))) if earlier == later => Some(earlier),
+        (Some((_, earlier, ..)), Some((seq, later, keyframe, stamped))) => {
+            let in_later = match stamped {
+                Some(index) => u64::from(index) >= seq - gap,
+                None => !keyframe,
+            };
+            Some(if in_later { later } else { earlier })
+        }
+    }
 }
 
 /// Give a rendition of a ladder a programme date and time that every other

@@ -284,6 +284,137 @@ async fn the_playlist_lists_a_released_hole_as_a_gap_until_it_is_filled() {
     assert!(filled.contains("URI=\"part3.mp4\""), "{filled}");
 }
 
+/// The lines of a playlist from the first that names `from`.
+fn lines_from<'a>(playlist: &'a str, from: &str) -> Vec<&'a str> {
+    let lines: Vec<&str> = playlist.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| line.contains(from))
+        .unwrap_or_else(|| panic!("{from} is not listed: {playlist}"));
+    lines[start..].to_vec()
+}
+
+/// A part of a stream with a key frame every fourth part (segments of
+/// four parts, derived from the key frames).
+async fn commit_gop(cache: &LiveTsCache, sequence: u64) {
+    cache
+        .commit_stream_payload(
+            STREAM,
+            encode_test_canonical_fmp4_object(
+                STREAM,
+                sequence,
+                ObjectKind::Media,
+                sequence % 4 == 0,
+                format!("moof-mdat-{sequence}").as_bytes(),
+            ),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_gap_at_the_end_of_a_segment_is_listed_in_that_segment() {
+    // Segments of four parts: part 7 ends the second, and it never comes.
+    let cache = horizon_cache(RepairHorizon::Fixed(10)).await;
+    commit_init(&cache).await;
+    for sequence in (0..7).chain(8..10) {
+        commit_gop(&cache, sequence).await;
+    }
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    commit_gop(&cache, 10).await;
+    cache.release_expired_repair_holes().await;
+    assert!(cache.is_gap_part(STREAM, 7));
+    let playlist = cache.playlist_for_stream_id(STREAM).await;
+    let lines = lines_from(&playlist, "part6.mp4");
+    assert!(
+        lines[1].contains("part7.mp4") && lines[1].ends_with("GAP=YES"),
+        "{playlist}"
+    );
+    // The segment's EXTINF counts the gap, and comes before part 8 (the
+    // key frame that starts the next segment).
+    assert_eq!(lines[2], "#EXTINF:0.020,", "{playlist}");
+    assert!(lines[3].starts_with("seg"), "{playlist}");
+    assert!(
+        lines[4].contains("part8.mp4") && lines[4].ends_with("INDEPENDENT=YES"),
+        "{playlist}"
+    );
+}
+
+/// A stamped part of a stream whose segments are of `per_segment` parts of
+/// 200 ms, starting at segment 1000.
+async fn commit_stamped(cache: &LiveTsCache, sequence: u64, per_segment: u64) {
+    let stamp = PartStamp {
+        msn: 1_000 + sequence / per_segment,
+        part: (sequence % per_segment) as u32,
+        part_target_us: 208_000,
+        target_duration_us: 2_000_000,
+    };
+    cache
+        .commit_stream_payload(
+            STREAM,
+            encode_test_stamped_fmp4_part(
+                STREAM,
+                5,
+                sequence,
+                sequence % per_segment == 0,
+                200,
+                Some(stamp),
+            ),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_stamped_segment_whose_first_part_is_a_gap_stays_in_the_playlist() {
+    let cache = LiveTsCache::new(1, Duration::from_millis(5), 200, 2_400, 64).await;
+    cache.set_canonical_gap_hold(Duration::from_millis(DEFAULT_CANONICAL_GAP_HOLD_MS));
+    cache.set_repair_horizon(RepairHorizon::Fixed(10));
+    // Segments of four parts: part 8 (the key frame of segment 1002) and
+    // part 7 (the last part of segment 1001) never come.
+    for sequence in (0..7).chain(9..14) {
+        commit_stamped(&cache, sequence, 4).await;
+    }
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    commit_stamped(&cache, 14, 4).await;
+    cache.release_expired_repair_holes().await;
+    assert!(cache.is_gap_part(STREAM, 7) && cache.is_gap_part(STREAM, 8));
+    let playlist = cache.playlist_for_stream_id(STREAM).await;
+    assert!(playlist.contains("#EXT-X-MEDIA-SEQUENCE:1000\n"), "{playlist}");
+    // Each gap in its own segment: 7 ends 1001, 8 starts 1002.
+    let lines = lines_from(&playlist, "part6.mp4");
+    assert!(lines[1].contains("part7.mp4") && lines[1].ends_with("GAP=YES"), "{playlist}");
+    assert!(lines[2].starts_with("#EXTINF:"), "{playlist}");
+    assert_eq!(lines[3], "seg1001.mp4", "{playlist}");
+    assert!(lines[4].contains("part8.mp4") && lines[4].ends_with("GAP=YES"), "{playlist}");
+    assert!(lines[5].contains("part9.mp4"), "{playlist}");
+    // Segment 1002 is listed, and the segments after it keep their numbers.
+    assert!(playlist.contains("seg1002.mp4"), "{playlist}");
+    let segments: Vec<&str> = playlist
+        .lines()
+        .filter(|line| line.starts_with("seg"))
+        .collect();
+    assert_eq!(
+        segments,
+        ["seg1000.mp4", "seg1001.mp4", "seg1002.mp4"],
+        "{playlist}"
+    );
+}
+
+#[test]
+fn a_gap_between_two_segments_goes_by_the_stamp_or_the_key_frame() {
+    // (sequence, segment, key frame, stamped index)
+    let stamped = [(6, 1, false, Some(2)), (9, 2, false, Some(1))];
+    assert_eq!(gap_segment(&stamped, 7), Some(1));
+    assert_eq!(gap_segment(&stamped, 8), Some(2));
+    let unstamped = [(6, 1, false, None), (8, 2, true, None)];
+    assert_eq!(gap_segment(&unstamped, 7), Some(1));
+    let unstamped = [(6, 1, false, None), (8, 2, false, None)];
+    assert_eq!(gap_segment(&unstamped, 7), Some(2));
+    assert_eq!(gap_segment(&unstamped, 9), Some(2));
+    assert_eq!(gap_segment(&[], 9), None);
+}
+
 #[tokio::test]
 async fn a_new_epoch_forgets_the_gaps_of_the_old() {
     let cache = horizon_cache(RepairHorizon::Fixed(10)).await;
