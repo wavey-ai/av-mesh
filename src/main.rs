@@ -1763,6 +1763,17 @@ struct Args {
         action = clap::ArgAction::Set
     )]
     client_udp_compact_top_up: bool,
+    /// The edge's fast lane marks its compact datagrams (a flag bit outside
+    /// the canonical form), so that a client counts the parts of each lane
+    /// (wave 6: the compact lane's reports said every part came cache-fed).
+    /// `false` sends them unmarked, as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_COMPACT_MARK_FAST_LANE",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    client_udp_compact_mark_fast_lane: bool,
 
     /// An edge that has heard none of its cache-mesh parents for this long
     /// has lost them: it answers 503 for a part or a playlist reload that it
@@ -2725,6 +2736,7 @@ async fn main() -> Result<()> {
     if let Some(lane) = &fast_lane {
         lane.set_compact_fast_parse(args.client_udp_compact_fast_parse);
         lane.set_compact_top_up(args.client_udp_compact_top_up);
+        lane.set_compact_mark(args.client_udp_compact_mark_fast_lane);
         lane.set_video_pacing(Some(fast_plane::edge_clients::VideoPacing {
             percent: args.client_udp_video_pace_percent,
             max_delay_us: args.client_udp_video_pace_max_ms.saturating_mul(1_000),

@@ -765,6 +765,10 @@ pub struct ObjectReceiver {
     /// The envelope bytes of the part that the last `push` returned, if it
     /// came on the fast lane.
     pub last_fast_envelope_bytes: Option<usize>,
+    /// The parts that the last `push` delivered from compact datagrams of
+    /// the edge's fast lane (marked by the edge, see
+    /// [`compact::set_fast_lane`]).
+    pub last_compact_fast_lane: Vec<u64>,
     /// The source epoch of the last fast-lane part, and how often it changed
     /// (a contributor restart: its part numbers start again).
     pub fast_epoch: Option<u64>,
@@ -855,6 +859,9 @@ impl ObjectReceiver {
             if part.recovered {
                 self.recovered_objects += 1;
             }
+            if part.fast_lane && part.kind == compact::Kind::Part {
+                self.last_compact_fast_lane.push(part.part);
+            }
             // The other lanes' blocks of the part will not complete, and are
             // not loss.
             for other in [
@@ -887,6 +894,7 @@ impl ObjectReceiver {
         self.datagrams += 1;
         self.wire_bytes += (datagram.len() + compact::IP_UDP_HEADER_BYTES) as u64;
         self.last_fast_envelope_bytes = None;
+        self.last_compact_fast_lane.clear();
         if compact::is_compact(datagram) {
             return self.push_compact(datagram);
         }

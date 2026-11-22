@@ -350,6 +350,9 @@ pub(super) struct ListenerRun {
     pub(super) wire_bytes: u64,
     /// Publication to first arrival of each part, in µs.
     pub(super) latencies_us: Vec<u64>,
+    /// Parts first delivered by a compact datagram that the edge marked as
+    /// its fast lane's.
+    pub(super) fast_lane_parts: u64,
 }
 
 impl ListenerRun {
@@ -533,9 +536,14 @@ pub(super) async fn listen(
             run.lost_on_path += 1;
             continue;
         }
-        for object in receiver.push_all(datagram) {
+        let objects = receiver.push_all(datagram);
+        let fast = std::mem::take(&mut receiver.last_compact_fast_lane);
+        for object in objects {
             match object.kind {
                 UdpObjectKind::Part => {
+                    if !run.parts.contains_key(&object.part) && fast.contains(&object.part) {
+                        run.fast_lane_parts += 1;
+                    }
                     if object.published_unix_us > 0 && !run.parts.contains_key(&object.part) {
                         run.latencies_us
                             .push(now_unix_us().saturating_sub(object.published_unix_us));
@@ -946,6 +954,21 @@ async fn compact_listeners_lose_nothing(feed: Feed, payload: Payload, ip: u8) {
             "{name}: the edge serves the compact lane to those that ask"
         );
         check(&name, &run, &served, parts - 1);
+        // The lane of the parts, from the edge's mark: a fast-lane edge
+        // sends an F1 listener its parts from the class thread (all but
+        // the few that the cache-fed lane sent first, and those that loss
+        // took), and the cache-fed lane sends the rest unmarked.
+        if run.compact_confirmed {
+            if feed == Feed::Fast && name.contains("F1=true") {
+                assert!(
+                    run.fast_lane_parts as f64 >= 0.8 * received,
+                    "{name}: {} of {received} parts came marked as the fast lane's",
+                    run.fast_lane_parts
+                );
+            } else {
+                assert_eq!(run.fast_lane_parts, 0, "{name}: no part is marked fast");
+            }
+        }
         if !name.contains("clean") {
             assert!(run.lost_on_path > 0, "{name}: the path lost datagrams");
         }
@@ -1352,6 +1375,19 @@ fn the_compact_flag_defaults_on_and_can_be_turned_off() {
     assert!(args.client_udp_compact);
     let args = Args::try_parse_from(["av-mesh", "--client-udp-compact", "false"]).unwrap();
     assert!(!args.client_udp_compact);
+}
+
+#[test]
+fn the_fast_lane_mark_defaults_on_and_can_be_turned_off() {
+    let args = Args::try_parse_from(["av-mesh"]).unwrap();
+    assert!(args.client_udp_compact_mark_fast_lane);
+    let args = Args::try_parse_from([
+        "av-mesh",
+        "--client-udp-compact-mark-fast-lane",
+        "false",
+    ])
+    .unwrap();
+    assert!(!args.client_udp_compact_mark_fast_lane);
 }
 
 // ------------------------------------------------------------------ the measurement

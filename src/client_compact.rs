@@ -75,6 +75,10 @@ const FIELD_AT: usize = 7;
 const REPAIR_PREFIX: usize = 6;
 const FLAG_COPIES: u8 = 0x07;
 const FLAG_RETRANSMIT: u8 = 0x08;
+/// The edge's fast lane sent the datagram (its class thread, from the
+/// symbol as it arrived), not the cache-fed lane: a client tells the lanes
+/// apart for its report. Not part of the canonical form, like every flag.
+const FLAG_FAST_LANE: u8 = 0x10;
 /// Rows of the Cauchy code: the repair of one window has at most this many.
 const MAX_ROWS: usize = 16;
 
@@ -306,6 +310,14 @@ pub fn set_flags(datagram: &mut [u8], copies: u8, retransmit: bool) {
     }
 }
 
+/// Mark a datagram as sent by the edge's fast lane (after [`set_flags`],
+/// which clears the mark). Clients before the mark ignore the bit.
+pub fn set_fast_lane(datagram: &mut [u8]) {
+    if datagram.len() > FLAGS_AT {
+        datagram[FLAGS_AT] |= FLAG_FAST_LANE;
+    }
+}
+
 /// A datagram with its flags cleared: the bytes that the window repair
 /// covers.
 pub fn canonical(datagram: &[u8]) -> Vec<u8> {
@@ -330,6 +342,8 @@ pub struct View<'a> {
     pub kind: Kind,
     pub copies: u8,
     pub retransmit: bool,
+    /// The edge's fast lane sent it ([`set_fast_lane`]).
+    pub fast_lane: bool,
     /// The source generation of the part (0: unknown).
     pub generation: u8,
     pub part_low: u32,
@@ -351,6 +365,7 @@ pub fn parse(datagram: &[u8]) -> Option<View<'_>> {
         kind,
         copies: flags & FLAG_COPIES,
         retransmit: flags & FLAG_RETRANSMIT != 0,
+        fast_lane: flags & FLAG_FAST_LANE != 0,
         generation: datagram[GENERATION_AT],
         part_low: u32::from_be_bytes(datagram[PART_AT..PART_AT + 4].try_into().ok()?),
         field: datagram[FIELD_AT..FIELD_AT + 4].try_into().ok()?,
@@ -615,6 +630,8 @@ pub struct CompactPart {
     pub retransmit: bool,
     /// It was recovered from a window's repair.
     pub recovered: bool,
+    /// The datagram that brought it came from the edge's fast lane.
+    pub fast_lane: bool,
 }
 
 /// How long a hole waits before its first NACK: the time a part's
@@ -1025,6 +1042,7 @@ impl CompactReceiver {
             payload: view.payload.to_vec(),
             retransmit: view.retransmit,
             recovered,
+            fast_lane: view.fast_lane && !recovered,
         }
     }
 
@@ -1219,6 +1237,36 @@ mod tests {
 
     fn payload(part: u64, len: usize) -> Vec<u8> {
         (0..len).map(|i| (i as u64 * 7 + part * 13) as u8).collect()
+    }
+
+    #[test]
+    fn the_fast_lane_mark_is_a_flag_outside_the_canonical_form() {
+        let bytes = payload(5, 40);
+        let mut datagram = encode_part(5, 1_700_000_000_000_500, &bytes).unwrap();
+        set_generation(&mut datagram, 3);
+        let plain = datagram.clone();
+        set_flags(&mut datagram, 1, false);
+        set_fast_lane(&mut datagram);
+        let view = parse(&datagram).unwrap();
+        assert!(view.fast_lane);
+        assert_eq!((view.copies, view.retransmit), (1, false));
+        assert_eq!(canonical(&datagram), plain);
+        assert!(!parse(&plain).unwrap().fast_lane);
+        // A new set_flags (a retransmission from the cache) clears it.
+        set_flags(&mut datagram, 0, true);
+        assert!(!parse(&datagram).unwrap().fast_lane);
+        // The receiver says which parts came marked; a part recovered from
+        // window repair is not marked.
+        let now = Instant::now();
+        let mut receiver = CompactReceiver::new();
+        receiver.expect_from(5, true);
+        let mut marked = encode_part(5, 1_700_000_000_000_500, &bytes).unwrap();
+        set_fast_lane(&mut marked);
+        let parts = receiver.push(&marked, now, 1_700_000_000_001_000);
+        assert_eq!(parts.len(), 1);
+        assert!(parts[0].fast_lane);
+        let unmarked = encode_part(6, 1_700_000_000_001_500, &payload(6, 40)).unwrap();
+        assert!(!receiver.push(&unmarked, now, 1_700_000_000_002_000)[0].fast_lane);
     }
 
     #[test]

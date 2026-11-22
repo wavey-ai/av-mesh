@@ -407,6 +407,10 @@ pub struct EdgeFastLane {
     /// (`--client-udp-compact-top-up`; `false`: the cache-fed lane sends
     /// it, as before).
     compact_top_up: AtomicBool,
+    /// Compact datagrams of this lane carry the fast-lane mark
+    /// (`--client-udp-compact-mark-fast-lane`), so that a client can count
+    /// the parts of each lane.
+    compact_mark: AtomicBool,
     /// Video pacing: the percent of the stream's rate (0: off), the bound
     /// on the delay, and whether the video socket takes SO_TXTIME
     /// (`TXTIME_*`).
@@ -442,6 +446,7 @@ impl EdgeFastLane {
             next_sequence: AtomicU32::new(0),
             compact_fast_parse: AtomicBool::new(true),
             compact_top_up: AtomicBool::new(true),
+            compact_mark: AtomicBool::new(true),
             pace_percent: AtomicU32::new(0),
             pace_max_delay_us: AtomicU64::new(0),
             txtime: AtomicU8::new(TXTIME_UNSET),
@@ -510,6 +515,18 @@ impl EdgeFastLane {
     /// to the cache-fed lane, as before (`false`).
     pub fn set_compact_top_up(&self, top_up: bool) {
         self.compact_top_up.store(top_up, Ordering::Relaxed);
+    }
+
+    /// Mark this lane's compact datagrams as the fast lane's (`true`, the
+    /// default), or send them unmarked, as before (`false`).
+    pub fn set_compact_mark(&self, mark: bool) {
+        self.compact_mark.store(mark, Ordering::Relaxed);
+    }
+
+    fn mark_compact(&self, datagram: &mut [u8]) {
+        if self.compact_mark.load(Ordering::Relaxed) {
+            compact::set_fast_lane(datagram);
+        }
     }
 
     /// Give the lane its client sockets and subscriber table.
@@ -710,6 +727,7 @@ impl EdgeFastLane {
             marked.entry(copies).or_insert_with(|| {
                 let mut datagram = canonical.to_vec();
                 compact::set_flags(&mut datagram, copies, false);
+                self.mark_compact(&mut datagram);
                 datagram
             });
             claimed.push((peer, copies));
@@ -1164,6 +1182,7 @@ impl ClientPlan {
             let buffer = &mut self.compact_buffers[start..start + len];
             buffer.copy_from_slice(&canonical);
             compact::set_flags(buffer, copies, false);
+            lane.mark_compact(buffer);
         }
         self.compact_lens[message] = len as u16;
         true

@@ -416,6 +416,9 @@ struct Report {
     fast_lane_asked: bool,
     /// Parts that came on the fast lane, and on the cache-fed lane.
     fast_lane_parts: u64,
+    /// The fast-lane parts that came as compact datagrams (marked by the
+    /// edge; an edge before the mark sends them unmarked, counted cache-fed).
+    compact_fast_lane_parts: u64,
     cache_lane_parts: u64,
     /// Bytes of the canonical envelope of each fast-lane part, and the bytes
     /// of it that are not the part's media (the envelope's own header,
@@ -571,6 +574,7 @@ async fn main() -> Result<()> {
     let mut init_objects = 0_u64;
     let mut payload_bytes = 0_u64;
     let mut fast_lane_parts = 0_u64;
+    let mut compact_fast_lane_parts = 0_u64;
     let mut cache_lane_parts = 0_u64;
     let mut fast_envelope_bytes = Vec::new();
     let mut fast_envelope_overhead = Vec::new();
@@ -968,6 +972,7 @@ async fn main() -> Result<()> {
             }
             let objects = receiver.push_all(&buf[..len]);
             let fast_envelope = receiver.last_fast_envelope_bytes;
+            let compact_fast = std::mem::take(&mut receiver.last_compact_fast_lane);
             let arrival_us = now_unix_us();
             for object in objects {
                 let PartObject {
@@ -998,6 +1003,11 @@ async fn main() -> Result<()> {
                                 fast_envelope_bytes.push(envelope as f64);
                                 fast_envelope_overhead
                                     .push(envelope.saturating_sub(payload.len()) as f64);
+                            }
+                            // A compact datagram of the edge's fast lane.
+                            None if compact_fast.contains(&part) => {
+                                fast_lane_parts += 1;
+                                compact_fast_lane_parts += 1;
                             }
                             None => cache_lane_parts += 1,
                         }
@@ -1150,6 +1160,7 @@ async fn main() -> Result<()> {
         },
         fast_lane_asked: args.fast_lane,
         fast_lane_parts,
+        compact_fast_lane_parts,
         cache_lane_parts,
         fast_envelope_bytes: percentiles(fast_envelope_bytes),
         fast_envelope_overhead_bytes: percentiles(fast_envelope_overhead),
