@@ -81,6 +81,14 @@ async fn collect(socket: &UdpSocket) -> Vec<(u64, bool)> {
 }
 
 async fn run_lanes(single_symbol: bool, payload: usize) -> (Vec<(u64, bool)>, Vec<(u64, bool)>, usize) {
+    run_lanes_with(single_symbol, true, payload).await
+}
+
+async fn run_lanes_with(
+    single_symbol: bool,
+    repair_lane_copy: bool,
+    payload: usize,
+) -> (Vec<(u64, bool)>, Vec<(u64, bool)>, usize) {
     let (source_child, _) = bind_class_pair(1_000).await;
     let (repair_child, _) = bind_class_pair(1_000).await;
     let relay = start_fast_relay_with(
@@ -104,6 +112,11 @@ async fn run_lanes(single_symbol: bool, payload: usize) -> (Vec<(u64, bool)>, Ve
         .as_ref()
         .unwrap()
         .set_repair_lane_single_symbol(single_symbol);
+    relay
+        .forwarder
+        .as_ref()
+        .unwrap()
+        .set_repair_lane_burst_copy(repair_lane_copy);
     // No repair: the contributor's clean-path part.
     let parts = encoded_parts(4001, 20, payload, 1_200, 0);
     let sources = parts.iter().map(|(sources, _)| sources.len()).max().unwrap();
@@ -128,11 +141,22 @@ async fn a_repair_lane_carries_the_one_symbol_of_a_one_symbol_audio_part() {
     assert_eq!(symbols, 1, "a 1 ms part is one symbol");
     // The source lane: every source and its burst copy.
     assert_eq!(at_source.len(), 40, "{at_source:?}");
-    // The repair lane: every part's one symbol, once (no burst copy).
+    // The repair lane: every part's one symbol and its burst copy (wave 7
+    // review: four copies across the two forwarders, as before item 2).
+    let mut objects: Vec<u64> = at_repair.iter().map(|(object, _)| *object).collect();
+    objects.sort_unstable();
+    let twice: Vec<u64> = (0..20).flat_map(|object| [object, object]).collect();
+    assert_eq!(objects, twice, "{at_repair:?}");
+    assert!(at_repair.iter().all(|(_, source)| *source));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_its_burst_copy_a_repair_lane_carries_the_one_symbol_once() {
+    let (at_source, at_repair, _) = run_lanes_with(true, false, 300).await;
+    assert_eq!(at_source.len(), 40, "{at_source:?}");
     let mut objects: Vec<u64> = at_repair.iter().map(|(object, _)| *object).collect();
     objects.sort_unstable();
     assert_eq!(objects, (0..20).collect::<Vec<_>>(), "{at_repair:?}");
-    assert!(at_repair.iter().all(|(_, source)| *source));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -411,4 +435,19 @@ async fn a_node_reports_its_demand_to_its_parents() {
     }
     assert!(relay.stats().demand_reports >= 4);
     relay.stop().await;
+}
+
+#[test]
+fn the_repair_lane_flags_default_on_and_turn_off() {
+    let args = Args::try_parse_from(["av-mesh"]).unwrap();
+    assert!(args.relay_repair_lane_single_symbol);
+    assert!(args.relay_repair_lane_burst_copy);
+    assert!(args.relay_loss_report);
+    let args = Args::try_parse_from([
+        "av-mesh",
+        "--relay-repair-lane-burst-copy",
+        "false",
+    ])
+    .unwrap();
+    assert!(!args.relay_repair_lane_burst_copy);
 }

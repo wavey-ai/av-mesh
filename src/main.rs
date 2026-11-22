@@ -1328,8 +1328,7 @@ struct Args {
     /// object as well. The contributor sends a 1 ms part as one symbol with
     /// no repair on a clean path; without this the repair lane carries
     /// nothing of it, and the long-haul child has one parent's copy only.
-    /// The source to a repair lane takes no burst copy. `false`: repair only,
-    /// as before.
+    /// `false`: repair only, as before.
     #[arg(
         long,
         env = "NEEDLETAIL_RELAY_REPAIR_LANE_SINGLE_SYMBOL",
@@ -1337,6 +1336,24 @@ struct Args {
         action = clap::ArgAction::Set
     )]
     relay_repair_lane_single_symbol: bool,
+
+    /// Wave 7 review: the one symbol that a repair-lane child takes of a
+    /// one-symbol audio object (--relay-repair-lane-single-symbol) gets the
+    /// burst copy too (--relay-burst-copy-ms later), as the source lane's
+    /// does. Before wave 7 a long-haul child got four copies of a 1 ms part
+    /// (the source and its burst copy from one first forwarder, two
+    /// contributor repair copies from the other); with copies sized to the
+    /// contributor lanes' loss (none on a clean VLAN) it got three, and
+    /// nothing sizes them to the long haul's loss. This keeps four, with
+    /// time diversity on both paths. `false`: no burst copy on the repair
+    /// lane.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_REPAIR_LANE_BURST_COPY",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_repair_lane_burst_copy: bool,
 
     /// Wave 7 item 2: the audio fast-plane thread measures the loss of each
     /// parent lane whose parent sends ledgers (RLL1, the contributor: the
@@ -3175,6 +3192,7 @@ async fn main() -> Result<()> {
         forwarder.set_nonblocking(args.relay_forward_nonblocking);
         forwarder.set_batch(args.relay_forward_batch);
         forwarder.set_repair_lane_single_symbol(args.relay_repair_lane_single_symbol);
+        forwarder.set_repair_lane_burst_copy(args.relay_repair_lane_burst_copy);
         forwarder.set_demand_groups(args.relay_demand_renditions.clone());
         fast_path_report.record_relay_forward_sockets(
             forwarder.socket_groups.len(),
@@ -4923,6 +4941,8 @@ struct RelayDownstreamForwarder {
     /// `--relay-repair-lane-single-symbol`: a repair-lane child takes the
     /// source of a one-symbol audio object (fast plane).
     repair_lane_single_symbol: AtomicBool,
+    /// `--relay-repair-lane-burst-copy`: that symbol gets a burst copy.
+    repair_lane_burst_copy: AtomicBool,
     /// `--relay-demand-renditions`: renditions held off a compiled lane
     /// whose child does not read them. Unset or empty: none.
     demand_groups: OnceLock<fast_plane::demand::RenditionGroups>,
@@ -5073,6 +5093,7 @@ impl RelayDownstreamForwarder {
             nonblocking: AtomicBool::new(true),
             batch: AtomicBool::new(true),
             repair_lane_single_symbol: AtomicBool::new(true),
+            repair_lane_burst_copy: AtomicBool::new(true),
             demand_groups: OnceLock::new(),
             hop_journal: OnceLock::new(),
             #[cfg(test)]
@@ -5359,6 +5380,14 @@ impl RelayDownstreamForwarder {
 
     fn repair_lane_single_symbol(&self) -> bool {
         self.repair_lane_single_symbol.load(Ordering::Relaxed)
+    }
+
+    fn set_repair_lane_burst_copy(&self, enabled: bool) {
+        self.repair_lane_burst_copy.store(enabled, Ordering::Relaxed);
+    }
+
+    fn repair_lane_burst_copy(&self) -> bool {
+        self.repair_lane_burst_copy.load(Ordering::Relaxed)
     }
 
     fn set_demand_groups(&self, groups: fast_plane::demand::RenditionGroups) {

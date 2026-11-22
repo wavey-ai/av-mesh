@@ -597,11 +597,13 @@ impl RelayDownstreamForwarder {
         // A one-symbol audio object has nothing a repair lane could carry
         // but its symbol when its parent sent no repair (wave 7 item 2):
         // the repair-lane child takes the source, so it still has a copy
-        // from this forwarder beside its primary's.
+        // from this forwarder beside its primary's, and its burst copy
+        // unless --relay-repair-lane-burst-copy is off.
         let single_symbol = matches!(role, MediaDatagramRole::Source)
             && view.source_symbols == 1
             && view.kind == MediaObjectKind::Audio
             && self.repair_lane_single_symbol();
+        let single_symbol_copy = self.repair_lane_burst_copy();
         for (index, path) in self.paths.iter().enumerate() {
             if let Some((groups, stream)) = gate {
                 let report = path.demand.fresh(now);
@@ -620,7 +622,7 @@ impl RelayDownstreamForwarder {
                     message: message as u16,
                     path: index as u16,
                     role,
-                    copy: !single_symbol_source,
+                    copy: !single_symbol_source || single_symbol_copy,
                 });
                 continue;
             }
