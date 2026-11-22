@@ -264,6 +264,15 @@ impl LaneEdge {
 
     /// With holes found by part distance (`hole_distance` not zero).
     async fn start_with(ip: Ipv4Addr, hole_distance: Duration) -> Self {
+        Self::start_with_capacity(ip, hole_distance, 64).await
+    }
+
+    /// An edge that takes up to `max_subscribers` UDP clients.
+    pub(super) async fn start_with_capacity(
+        ip: Ipv4Addr,
+        hole_distance: Duration,
+        max_subscribers: usize,
+    ) -> Self {
         let (ports, sockets) = bind_edge_class_ports(ip);
         let forwarders = [
             UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap(),
@@ -332,7 +341,7 @@ impl LaneEdge {
             .local_addr()
             .unwrap();
         let stats: Arc<edge_udp::EdgeUdpStats> = Arc::default();
-        let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, 64);
+        let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, max_subscribers);
         // A host stall must not make the cache-fed lane skip a part it owes.
         config.playout = Duration::from_secs(5);
         let udp = tokio::spawn(edge_udp::run_edge_udp(

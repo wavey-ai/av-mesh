@@ -196,7 +196,7 @@ impl Payload {
     /// The contributor's RelaySession symbols of an envelope: audio parts
     /// one symbol and one repair symbol, a 4K frame in 1,088-byte symbols
     /// with a tenth of repair.
-    fn symbols(self, envelope: &[u8]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    pub(super) fn symbols(self, envelope: &[u8]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
         let deadline = now_unix_us() + 30_000_000;
         if self.video() {
             let sources = envelope.len().div_ceil(1_088) as u32;
@@ -809,7 +809,7 @@ impl AnyEdge {
         }
     }
 
-    fn stats(&self) -> &Arc<edge_udp::EdgeUdpStats> {
+    pub(super) fn stats(&self) -> &Arc<edge_udp::EdgeUdpStats> {
         match self {
             Self::Fast(edge) => &edge.stats,
             Self::Mesh(edge) => &edge.stats,

@@ -37129,4 +37129,8 @@ mod tests {
     /// 4K past 164 Mbit/s: a forwarder's video thread and an edge's video
     /// clients, at 200 Mbit/s, and their processor time per Mbit/s.
     mod video_throughput;
+
+    /// The load mode: thousands of simulated UDP listeners against an edge
+    /// in this process, and their cost per listener.
+    mod load_mode;
 }
