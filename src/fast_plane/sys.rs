@@ -848,20 +848,21 @@ pub fn set_fifo(priority: i32) -> Result<(), String> {
     }
 }
 
-/// Run the calling thread as an ordinary one: SCHED_OTHER at nice 0, on
-/// the CPUs of the process's main thread. A thread inherits the policy, the
-/// priority and the CPUs of the thread that started it: a helper started by
-/// a SCHED_FIFO class thread pinned to one CPU would otherwise share that
-/// CPU with it at its priority, and hold it.
+/// Run the calling thread as an ordinary one: SCHED_OTHER on the CPUs of
+/// the process's main thread, at the process's nice value. A thread
+/// inherits the policy, the priority and the CPUs of the thread that
+/// started it: a helper started by a SCHED_FIFO class thread pinned to one
+/// CPU would otherwise share that CPU with it at its priority, and hold it.
+///
+/// The CPUs come first and the nice value last, and a nice value the
+/// kernel refuses is not an error: a niced process without CAP_SYS_NICE
+/// may not lower a thread's nice value, and a refusal there must not leave
+/// the thread pinned to the class thread's CPU (wave 7 review). The nice
+/// value asked for is the process's own, which raising never needs a
+/// privilege for.
 pub fn set_ordinary() -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
-        let param = libc::sched_param { sched_priority: 0 };
-        // SAFETY: pid 0 is the calling thread; the parameter is valid.
-        if unsafe { libc::sched_setscheduler(0, libc::SCHED_OTHER, &param) } != 0 {
-            return Err(format!("SCHED_OTHER: {}", io::Error::last_os_error()));
-        }
-        set_nice(0)?;
         // SAFETY: a zeroed cpu_set_t is valid; sched_getaffinity writes at
         // most its size; getpid is the main thread's id.
         unsafe {
@@ -873,11 +874,35 @@ pub fn set_ordinary() -> Result<(), String> {
                 return Err(format!("CPUs of the process: {}", io::Error::last_os_error()));
             }
         }
+        let param = libc::sched_param { sched_priority: 0 };
+        // SAFETY: pid 0 is the calling thread; the parameter is valid.
+        if unsafe { libc::sched_setscheduler(0, libc::SCHED_OTHER, &param) } != 0 {
+            return Err(format!("SCHED_OTHER: {}", io::Error::last_os_error()));
+        }
+        if let Err(error) = set_nice(process_nice()) {
+            tracing::debug!(error, "an ordinary thread keeps its nice value");
+        }
         Ok(())
     }
     #[cfg(not(target_os = "linux"))]
     {
         Ok(())
+    }
+}
+
+/// The nice value of the process's main thread (0 if it cannot be read).
+#[cfg(target_os = "linux")]
+fn process_nice() -> i32 {
+    // SAFETY: errno is reset before the call, as getpriority's -1 is also
+    // a valid nice value; getpid has no preconditions.
+    unsafe {
+        *libc::__errno_location() = 0;
+        let nice = libc::getpriority(libc::PRIO_PROCESS, libc::getpid() as libc::id_t);
+        if nice == -1 && *libc::__errno_location() != 0 {
+            0
+        } else {
+            nice
+        }
     }
 }
 
@@ -955,6 +980,11 @@ mod tests {
             assert_eq!(count(&affinity(0)), process);
             let policy = unsafe { libc::sched_getscheduler(0) };
             assert_eq!(policy, libc::SCHED_OTHER);
+            // At the process's nice value, which needs no privilege (the
+            // test passes under `nice -n 10` too).
+            assert_eq!(super::process_nice(), unsafe {
+                libc::getpriority(libc::PRIO_PROCESS, 0)
+            });
         })
         .join()
         .unwrap();
