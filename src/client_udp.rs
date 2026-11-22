@@ -175,7 +175,10 @@ impl RepairPolicy {
         let (default_permille, default_min) = if compact {
             (DEFAULT_REPAIR_PERMILLE, DEFAULT_MIN_REPAIR_SYMBOLS)
         } else {
-            (RAPTORQ_LANE_REPAIR_PERMILLE, RAPTORQ_LANE_MIN_REPAIR_SYMBOLS)
+            (
+                RAPTORQ_LANE_REPAIR_PERMILLE,
+                RAPTORQ_LANE_MIN_REPAIR_SYMBOLS,
+            )
         };
         Self {
             permille: permille.unwrap_or(default_permille),
@@ -895,7 +898,7 @@ impl ObjectReceiver {
         self.wire_bytes += (datagram.len() + compact::IP_UDP_HEADER_BYTES) as u64;
         self.last_fast_envelope_bytes = None;
         self.last_compact_fast_lane.clear();
-        if compact::is_compact(datagram) {
+        if compact::is_compact(datagram) || compact::is_short(datagram) {
             return self.push_compact(datagram);
         }
         let header = match DatagramFecHeader::decode(datagram) {
@@ -1242,6 +1245,7 @@ mod tests {
                     copies: 1,
                     window: 16,
                     window_repair: 2,
+                    short_header: true,
                 }),
             },
             Control::Nack {

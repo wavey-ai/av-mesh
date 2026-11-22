@@ -304,8 +304,11 @@ pub(super) enum Mode {
     /// source symbols and at least three), as needletail-udp-client asked
     /// for it: `--compact false --repair-permille 250 --min-repair 3`.
     Before,
-    /// needletail-udp-client's defaults now: the compact lane.
+    /// The compact lane, parts in the long form (11-byte header).
     Compact,
+    /// needletail-udp-client's defaults now: the compact lane, parts in the
+    /// short form (7-byte header, wave 7 item 9).
+    CompactShort,
 }
 
 /// Shared with a running listener.
@@ -391,10 +394,11 @@ pub(super) async fn listen(
     let _ = SockRef::from(&socket).set_recv_buffer_size(16 << 20);
     // As needletail-udp-client: the compact lane's repair while it asks
     // for it, the RaptorQ lane's (as before wave 5) on that lane alone.
-    let mut base = RepairPolicy::base_for_lane(mode == Mode::Compact, None, None);
+    let compact = mode != Mode::Before;
+    let short = mode == Mode::CompactShort;
+    let mut base = RepairPolicy::base_for_lane(compact, None, None);
     let mut repair = RepairPolicy::for_loss(UNMEASURED_LOSS, base);
-    let mut plan = CompactPlan::CLEAN;
-    let compact = mode == Mode::Compact;
+    let mut plan = CompactPlan::CLEAN.with_short_header(short);
     let subscribe = |token, repair, plan| {
         Control::Subscribe {
             stream_id,
@@ -460,7 +464,8 @@ pub(super) async fn listen(
                     burst = Some(burst.map_or(sample, |previous| previous * 0.7 + sample * 0.3));
                 }
                 let wanted = RepairPolicy::for_loss(value, base);
-                let wanted_plan = CompactPlan::for_measured(smoothed, burst.unwrap_or(1.0));
+                let wanted_plan = CompactPlan::for_measured(smoothed, burst.unwrap_or(1.0))
+                    .with_short_header(short);
                 if wanted != repair || (compact && wanted_plan != plan) {
                     repair = wanted;
                     plan = wanted_plan;
@@ -942,7 +947,12 @@ async fn compact_listeners_lose_nothing(feed: Feed, payload: Payload, ip: u8) {
                 tokio::spawn(listen(
                     edge.client_port(),
                     stream_id,
-                    Mode::Compact,
+                    // The compact feed's listeners take the short form.
+                    if feed == Feed::FastCompact {
+                        Mode::CompactShort
+                    } else {
+                        Mode::Compact
+                    },
                     *fast_lane,
                     loss,
                     0x5eed + index as u64,
@@ -1015,8 +1025,12 @@ async fn compact_listeners_lose_nothing(feed: Feed, payload: Payload, ip: u8) {
         // The wire of a clean path: one datagram a part and a window's
         // repair (1/32), nothing more.
         if name.contains("clean") {
-            let ceiling =
-                (payload.media_len() + av_mesh::client_compact::HEADER_LEN + 28) as f64 * 1.06;
+            let header = if feed == Feed::FastCompact {
+                av_mesh::client_compact::SHORT_HEADER_LEN
+            } else {
+                av_mesh::client_compact::HEADER_LEN
+            };
+            let ceiling = (payload.media_len() + header + 28) as f64 * 1.06;
             assert!(
                 datagrams_per_part <= 1.06 && bytes_per_part <= ceiling,
                 "{name}: {datagrams_per_part:.3} datagrams and {bytes_per_part:.0} B a part \

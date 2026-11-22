@@ -1813,6 +1813,20 @@ struct Args {
     )]
     client_udp_compact: bool,
 
+    /// Parts on the compact lane in the short form (wave 7 item 9) to the
+    /// clients that ask for it (`C...7`): a 7-byte header (the flags in the
+    /// first byte, the part number's low 16 bits and the publication time's
+    /// low 24 bits) instead of 11. A 1 ms Opus part of 56 bytes is 91 bytes
+    /// with IPv4 and UDP instead of 95. Gaps and window repair keep the long
+    /// form; a client reads both. `false` sends every client the long form.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_COMPACT_SHORT_HEADER",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    client_udp_compact_short_header: bool,
+
     /// The fast lane makes a part's compact datagram on the class thread
     /// from the contributor's envelope read in place (the part bytes and its
     /// publication time, payload hash checked), before it sends: no decode,
@@ -3469,6 +3483,7 @@ async fn main() -> Result<()> {
                 inline_complete_bytes: args.client_udp_inline_complete_bytes,
                 gso: args.client_udp_gso,
                 compact: args.client_udp_compact,
+                compact_short_header: args.client_udp_compact_short_header,
                 admit_on_first_part: args.client_udp_admit_on_first_part,
                 first_part_at_once: args.client_udp_first_part_at_once,
             },

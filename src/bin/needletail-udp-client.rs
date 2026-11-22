@@ -126,6 +126,12 @@ struct Args {
     /// for the burst. `false`: one copy and at most two more rows, as before.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     compact_burst_rows: bool,
+    /// Ask for parts in the short form (wave 7 item 9): a 7-byte header
+    /// instead of 11 (`C...7`). The client reads both forms, so an edge
+    /// that does not send it is read as before. `false` asks for the long
+    /// form.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    compact_short_header: bool,
     /// Wait before the first NACK of a hole that a later part showed, in
     /// µs (wave 6: 250; before, 1,000, when the cache-fed lane could trail
     /// its fast-lane neighbours).
@@ -598,9 +604,8 @@ async fn recv_timestamped(
             message.msg_iovlen = 1;
             message.msg_control = control.as_mut_ptr().cast();
             message.msg_controllen = std::mem::size_of_val(&control) as _;
-            let len = unsafe {
-                libc::recvmsg(socket.as_raw_fd(), &mut message, libc::MSG_DONTWAIT)
-            };
+            let len =
+                unsafe { libc::recvmsg(socket.as_raw_fd(), &mut message, libc::MSG_DONTWAIT) };
             if len < 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -613,8 +618,9 @@ async fn recv_timestamped(
                     if (*cmsg).cmsg_level == libc::SOL_SOCKET
                         && (*cmsg).cmsg_type == libc::SCM_TIMESTAMPNS
                     {
-                        let time =
-                            std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::timespec>());
+                        let time = std::ptr::read_unaligned(
+                            libc::CMSG_DATA(cmsg).cast::<libc::timespec>(),
+                        );
                         kernel_us = Some(
                             (time.tv_sec as u64)
                                 .saturating_mul(1_000_000)
@@ -748,9 +754,8 @@ async fn main() -> Result<()> {
     let mut buf = vec![0_u8; 65_536];
     // The compact lane's repair while it is asked for and served; the
     // RaptorQ lane's (as before wave 5) otherwise.
-    let base_for = |compact: bool| {
-        RepairPolicy::base_for_lane(compact, args.repair_permille, args.min_repair)
-    };
+    let base_for =
+        |compact: bool| RepairPolicy::base_for_lane(compact, args.repair_permille, args.min_repair);
     let mut base_repair = base_for(args.compact);
     // The edge left last, with the token that it gave, for an UNSUB.
     let mut leaving: Option<(SocketAddr, u64)> = None;
@@ -765,7 +770,7 @@ async fn main() -> Result<()> {
     let mut repair_changes = 0_u64;
     // The compact lane's plan: window repair alone until the path shows
     // loss.
-    let mut plan = CompactPlan::CLEAN;
+    let mut plan = CompactPlan::CLEAN.with_short_header(args.compact_short_header);
     let mut plan_changes = 0_u64;
     let mut burst_estimate: Option<f64> = None;
     // The compact plan follows a smoother estimate: NACK covers what a
@@ -954,9 +959,8 @@ async fn main() -> Result<()> {
                         .collect();
                 }
             }
-            let draining = drain_last.is_some()
-                && !drain_missing.is_empty()
-                && now < deadline + drain;
+            let draining =
+                drain_last.is_some() && !drain_missing.is_empty() && now < deadline + drain;
             if now >= deadline && !draining {
                 if let Some(token) = token {
                     let _ = socket
@@ -1041,7 +1045,8 @@ async fn main() -> Result<()> {
                             smooth,
                             burst_estimate.unwrap_or(1.0),
                             args.compact_burst_rows,
-                        );
+                        )
+                        .with_short_header(args.compact_short_header);
                         if wanted != plan {
                             plan = wanted;
                             plan_changes += 1;
@@ -1128,11 +1133,12 @@ async fn main() -> Result<()> {
                 }
             }
             let wait = wake.saturating_duration_since(now);
-            let (len, peer, kernel_us) = match tokio::time::timeout(wait, recv_timestamped(&socket, &mut buf)).await {
-                Ok(Ok(received)) => received,
-                Ok(Err(_)) => continue,
-                Err(_) => continue,
-            };
+            let (len, peer, kernel_us) =
+                match tokio::time::timeout(wait, recv_timestamped(&socket, &mut buf)).await {
+                    Ok(Ok(received)) => received,
+                    Ok(Err(_)) => continue,
+                    Err(_) => continue,
+                };
             if peer.ip() != target.ip() {
                 continue;
             }
@@ -1145,9 +1151,9 @@ async fn main() -> Result<()> {
                             if token.is_none() {
                                 // A request and its answer: the round trip
                                 // that the NACKs wait for.
-                                receiver
-                                    .compact
-                                    .set_rtt(last_datagram.saturating_duration_since(last_request_at));
+                                receiver.compact.set_rtt(
+                                    last_datagram.saturating_duration_since(last_request_at),
+                                );
                             }
                             token = Some(given);
                             subscribe(
@@ -1185,8 +1191,7 @@ async fn main() -> Result<()> {
                                 base_repair
                             } else {
                                 RepairPolicy::for_loss(
-                                    loss_estimate
-                                        .unwrap_or(av_mesh::client_udp::UNMEASURED_LOSS),
+                                    loss_estimate.unwrap_or(av_mesh::client_udp::UNMEASURED_LOSS),
                                     base_repair,
                                 )
                             };

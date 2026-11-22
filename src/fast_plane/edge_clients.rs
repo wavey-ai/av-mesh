@@ -775,7 +775,7 @@ impl EdgeFastLane {
         let Some(armed) = self.armed.get() else {
             return;
         };
-        let waiting: Vec<(SocketAddr, u8, &Arc<FastClient>)> = groups
+        let waiting: Vec<(SocketAddr, (u8, bool), &Arc<FastClient>)> = groups
             .iter()
             .filter_map(|group| group.compact.map(|plan| (group, plan)))
             .flat_map(|(group, plan)| {
@@ -783,7 +783,7 @@ impl EdgeFastLane {
                     .clients
                     .iter()
                     .filter(move |(_, client)| part >= client.fast_from && !client.has_fast(part))
-                    .map(move |(peer, client)| (*peer, plan.copies, client))
+                    .map(move |(peer, client)| (*peer, (plan.copies, plan.short_header), client))
             })
             .collect();
         if waiting.is_empty() {
@@ -801,28 +801,33 @@ impl EdgeFastLane {
                 ring.put(part, bytes::Bytes::from(datagram))
             }
         };
-        let mut marked: HashMap<u8, Vec<u8>> = HashMap::new();
-        let mut claimed: Vec<(SocketAddr, u8)> = Vec::new();
-        for (peer, copies, client) in waiting {
+        let mut marked: HashMap<(u8, bool), Vec<u8>> = HashMap::new();
+        let mut claimed: Vec<(SocketAddr, (u8, bool))> = Vec::new();
+        for (peer, (copies, short), client) in waiting {
             // The cache-fed lane may have taken it meanwhile.
             if !client.claim_fast(part) {
                 continue;
             }
-            marked.entry(copies).or_insert_with(|| {
+            marked.entry((copies, short)).or_insert_with(|| {
                 let mut datagram = canonical.to_vec();
                 compact::set_flags(&mut datagram, copies, false);
                 self.mark_compact(&mut datagram);
+                if short {
+                    if let Some(short) = compact::shorten(&datagram) {
+                        return short;
+                    }
+                }
                 datagram
             });
-            claimed.push((peer, copies));
+            claimed.push((peer, (copies, short)));
         }
         if claimed.is_empty() {
             return;
         }
         let list: Vec<(&[u8], SocketAddr)> = claimed
             .iter()
-            .flat_map(|(peer, copies)| {
-                std::iter::repeat_n((marked[copies].as_slice(), *peer), 1 + usize::from(*copies))
+            .flat_map(|(peer, form)| {
+                std::iter::repeat_n((marked[form].as_slice(), *peer), 1 + usize::from(form.0))
             })
             .collect();
         let (delivered, _) =
@@ -1049,8 +1054,27 @@ pub struct ClientPlan {
 const REPAIR_MEMO: usize = 64;
 /// Marked copies of a compact datagram: one for each count of copies.
 const COMPACT_VARIANTS: usize = compact::MAX_COPIES as usize + 1;
-fn compact_at(message: usize, copies: u8) -> usize {
-    (message * COMPACT_VARIANTS + usize::from(copies)) * compact::MAX_DATAGRAM
+/// The variants in the long form, then the same in the short form (wave 7
+/// item 9): variant `copies + COMPACT_VARIANTS` is `copies` in short.
+const COMPACT_SLOTS: usize = 2 * COMPACT_VARIANTS;
+
+fn compact_at(message: usize, variant: u8) -> usize {
+    (message * COMPACT_SLOTS + usize::from(variant)) * compact::MAX_DATAGRAM
+}
+
+/// The variant of a plan's copies in its form.
+fn compact_variant(copies: u8, short: bool) -> u8 {
+    copies + if short { COMPACT_VARIANTS as u8 } else { 0 }
+}
+
+/// The length of a variant of a message's compact datagram (`len`: its long
+/// form's).
+fn compact_variant_len(len: u16, variant: u8) -> usize {
+    if usize::from(variant) >= COMPACT_VARIANTS {
+        usize::from(len).saturating_sub(compact::SHORT_SAVES)
+    } else {
+        usize::from(len)
+    }
 }
 
 impl Default for ClientPlan {
@@ -1064,7 +1088,7 @@ impl ClientPlan {
         Self {
             buffers: vec![0_u8; sys::RECV_BATCH * REWRAP_BYTES],
             lens: vec![0; sys::RECV_BATCH],
-            compact_buffers: vec![0_u8; sys::RECV_BATCH * COMPACT_VARIANTS * compact::MAX_DATAGRAM],
+            compact_buffers: vec![0_u8; sys::RECV_BATCH * COMPACT_SLOTS * compact::MAX_DATAGRAM],
             compact_lens: vec![0; sys::RECV_BATCH],
             sends: Vec::with_capacity(sys::RECV_BATCH * 8),
             clients: Vec::with_capacity(sys::RECV_BATCH * 8),
@@ -1195,6 +1219,7 @@ impl ClientPlan {
         let mut compact_made: Option<bool> = None;
         for group in groups {
             let mut copies = None;
+            let mut short = false;
             if let Some(plan) = group.compact.filter(|_| k == 1) {
                 if repair_ordinal.is_some() {
                     // Its compact datagram goes instead of the symbols.
@@ -1207,6 +1232,7 @@ impl ClientPlan {
                     .get_or_insert_with(|| self.make_compact(lane, stream_id, message, view));
                 if made {
                     copies = Some(plan.copies);
+                    short = plan.short_header;
                     if plan.window_repair > 0
                         && !self.compact_sent.contains(&(stream_id, part, plan.window))
                     {
@@ -1252,7 +1278,7 @@ impl ClientPlan {
                 for _ in 0..sends {
                     self.sends.push(PlannedClient {
                         message: message as u16,
-                        compact: copies,
+                        compact: copies.map(|copies| compact_variant(copies, short)),
                         source: repair_ordinal.is_none(),
                         part,
                         peer: *peer,
@@ -1288,6 +1314,12 @@ impl ClientPlan {
             buffer.copy_from_slice(&canonical);
             compact::set_flags(buffer, copies, false);
             lane.mark_compact(buffer);
+            // The same in the short form, for the clients that ask for it.
+            let short_at = compact_at(message, compact_variant(copies, true));
+            self.compact_buffers
+                .copy_within(start..start + len, short_at);
+            let _ =
+                compact::shorten_in_place(&mut self.compact_buffers[short_at..short_at + len], len);
         }
         self.compact_lens[message] = len as u16;
         true
@@ -1326,11 +1358,10 @@ impl ClientPlan {
         let len_of = |index: usize| {
             let send = &sends[index];
             let message = usize::from(send.message);
-            usize::from(if send.compact.is_some() {
-                compact_lens[message]
-            } else {
-                lens[message]
-            })
+            match send.compact {
+                Some(variant) => compact_variant_len(compact_lens[message], variant),
+                None => usize::from(lens[message]),
+            }
         };
         sys::gso_runs_into(
             runs,
@@ -1407,10 +1438,11 @@ impl ClientPlan {
         let message = |index: usize| {
             let send = &sends[index];
             let message = usize::from(send.message);
-            if let Some(copies) = send.compact {
-                let start = compact_at(message, copies);
+            if let Some(variant) = send.compact {
+                let start = compact_at(message, variant);
                 return (
-                    &compact_buffers[start..start + usize::from(compact_lens[message])],
+                    &compact_buffers
+                        [start..start + compact_variant_len(compact_lens[message], variant)],
                     send.peer,
                 );
             }
@@ -1532,8 +1564,8 @@ impl ClientPlan {
                 let compact_len = usize::from(self.compact_lens[message]);
                 into.compact_lens[message] = self.compact_lens[message];
                 if compact_len > 0 {
-                    for copies in 0..COMPACT_VARIANTS as u8 {
-                        let at = compact_at(message, copies);
+                    for variant in 0..COMPACT_SLOTS as u8 {
+                        let at = compact_at(message, variant);
                         into.compact_buffers[at..at + compact_len]
                             .copy_from_slice(&self.compact_buffers[at..at + compact_len]);
                     }

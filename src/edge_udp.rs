@@ -117,6 +117,10 @@ pub(crate) struct EdgeUdpConfig {
     /// (`--client-udp-compact`; `false`: they get the RaptorQ lane, as
     /// before).
     pub compact: bool,
+    /// Send parts in the short form (a 7-byte header) to the compact clients
+    /// that ask for it (`--client-udp-compact-short-header`, wave 7 item 9;
+    /// `false`: the 11-byte header to every client, as before).
+    pub compact_short_header: bool,
     /// Admit a subscriber as soon as the edge holds a part of its stream,
     /// woken by the part's arrival (`--client-udp-admit-on-first-part`,
     /// wave 7 item 8; `false`: once the edge's playlist copy is playable,
@@ -142,6 +146,7 @@ impl EdgeUdpConfig {
             inline_complete_bytes: DEFAULT_INLINE_COMPLETE_BYTES,
             gso: true,
             compact: true,
+            compact_short_header: true,
             admit_on_first_part: true,
             first_part_at_once: true,
         }
@@ -367,10 +372,20 @@ impl CompactStore {
 }
 
 /// A compact datagram as one subscriber gets it: marked with its copies (or
-/// as a retransmission).
-pub(crate) fn compact_marked(canonical: &[u8], copies: u8, retransmit: bool) -> Vec<u8> {
+/// as a retransmission), a part in the short form if its plan asks for it.
+pub(crate) fn compact_marked(
+    canonical: &[u8],
+    copies: u8,
+    retransmit: bool,
+    short: bool,
+) -> Vec<u8> {
     let mut datagram = canonical.to_vec();
     compact::set_flags(&mut datagram, copies, retransmit);
+    if short {
+        if let Some(short) = compact::shorten(&datagram) {
+            return short;
+        }
+    }
     datagram
 }
 
@@ -1298,7 +1313,9 @@ pub(crate) async fn run_edge_udp(
                 fast_lane,
                 compact,
             } => {
-                let compact = compact.filter(|_| config.compact);
+                let compact = compact.filter(|_| config.compact).map(|plan| {
+                    plan.with_short_header(plan.short_header && config.compact_short_header)
+                });
                 let valid = token.is_some_and(|token| tokens.valid(peer, token));
                 if !valid {
                     if token.is_some() {
@@ -1522,7 +1539,8 @@ pub(crate) fn answer_nack(
                 break;
             }
             answered += 1;
-            let datagram = compact_marked(&kept, 0, true);
+            let short = subscriber.compact.is_some_and(|plan| plan.short_header);
+            let datagram = compact_marked(&kept, 0, true, short);
             if matches!(
                 out.send(stats, &datagram, peer),
                 SendOutcome::Sent | SendOutcome::Queued
@@ -1576,7 +1594,9 @@ pub(crate) async fn answer_nack_from_cache(
                 refused += 1;
                 continue;
             }
-            let datagram = compact_marked(&kept, 0, true);
+            // Rare (the ring had lost it): the long form, which every
+            // client reads.
+            let datagram = compact_marked(&kept, 0, true, false);
             if matches!(
                 out.send(stats, &datagram, peer),
                 SendOutcome::Sent | SendOutcome::Queued
@@ -2152,16 +2172,16 @@ async fn send_compact(
     canonical: &[u8],
     targets: &[(SocketAddr, RepairPolicy, CompactPlan)],
 ) {
-    let mut marked: HashMap<u8, Vec<u8>> = HashMap::new();
+    let mut marked: HashMap<(u8, bool), Vec<u8>> = HashMap::new();
     for (_, _, plan) in targets {
         marked
-            .entry(plan.copies)
-            .or_insert_with(|| compact_marked(canonical, plan.copies, false));
+            .entry((plan.copies, plan.short_header))
+            .or_insert_with(|| compact_marked(canonical, plan.copies, false, plan.short_header));
     }
     let list: Vec<(&[u8], SocketAddr)> = targets
         .iter()
         .flat_map(|(peer, _, plan)| {
-            let datagram = marked[&plan.copies].as_slice();
+            let datagram = marked[&(plan.copies, plan.short_header)].as_slice();
             std::iter::repeat_n((datagram, *peer), 1 + usize::from(plan.copies))
         })
         .collect();
@@ -2264,7 +2284,10 @@ pub(crate) fn window_repair_now(
             let sent = (first..first + window).all(|p| {
                 p < subscriber.next_part
                     || subscriber.cut_slots.contains(&p)
-                    || subscriber.fast.as_ref().is_some_and(|fast| fast.has_fast(p))
+                    || subscriber
+                        .fast
+                        .as_ref()
+                        .is_some_and(|fast| fast.has_fast(p))
             });
             if !sent {
                 continue;
@@ -2282,7 +2305,10 @@ pub(crate) fn window_repair_now(
     }
     let mut windows: HashMap<(u64, u8), Vec<(SocketAddr, u8)>> = HashMap::new();
     for (peer, first, window, rows) in wanted {
-        windows.entry((first, window)).or_default().push((peer, rows));
+        windows
+            .entry((first, window))
+            .or_default()
+            .push((peer, rows));
     }
     let out = sockets.out_for_stream(stream_id);
     for ((first, window), peers) in windows {
@@ -2887,13 +2913,25 @@ fn send_compact_now(
     if clients.is_empty() {
         return;
     }
-    let marked: Vec<Vec<u8>> = (0..=compact::MAX_COPIES)
-        .map(|copies| compact_marked(canonical, copies, false))
+    let forms: &[bool] = if clients.iter().any(|(_, _, plan)| plan.short_header) {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    let marked: Vec<Vec<u8>> = forms
+        .iter()
+        .copied()
+        .flat_map(|short| {
+            (0..=compact::MAX_COPIES)
+                .map(move |copies| compact_marked(canonical, copies, false, short))
+        })
         .collect();
+    let variants = usize::from(compact::MAX_COPIES) + 1;
     let list: Vec<(&[u8], SocketAddr)> = clients
         .iter()
         .flat_map(|(peer, _, plan)| {
-            let datagram = marked[usize::from(plan.copies)].as_slice();
+            let variant = usize::from(plan.copies) + usize::from(plan.short_header) * variants;
+            let datagram = marked[variant].as_slice();
             std::iter::repeat_n((datagram, *peer), 1 + usize::from(plan.copies))
         })
         .collect();
@@ -3495,7 +3533,10 @@ fn new_route(
     if let Some(canonical) = &compact {
         send_compact_now(inner, stream_id, slot, canonical, &compact_clients);
         if !compact_clients.is_empty() {
-            let windows: Vec<u8> = compact_clients.iter().map(|(_, _, plan)| plan.window).collect();
+            let windows: Vec<u8> = compact_clients
+                .iter()
+                .map(|(_, _, plan)| plan.window)
+                .collect();
             window_repair_now(
                 &inner.sockets,
                 &inner.table,

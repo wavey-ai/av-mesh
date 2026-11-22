@@ -119,6 +119,10 @@ pub struct CompactPlan {
     pub window: u8,
     /// Repair datagrams for each window; 0 for none.
     pub window_repair: u8,
+    /// Parts in the short form ([`shorten`], wave 7 item 9): a 7-byte
+    /// header instead of 11. The client asks for it (`C1.16.2.7`); an edge
+    /// without it sends the long form, which a client reads as before.
+    pub short_header: bool,
 }
 
 /// The measured loss below which a path counts as clean.
@@ -140,6 +144,7 @@ impl CompactPlan {
         copies: 0,
         window: 32,
         window_repair: 1,
+        short_header: false,
     };
 
     pub fn bounded(self) -> Self {
@@ -147,22 +152,44 @@ impl CompactPlan {
             copies: self.copies.min(MAX_COPIES),
             window: self.window.clamp(MIN_WINDOW, MAX_WINDOW),
             window_repair: self.window_repair.min(MAX_WINDOW_REPAIR),
+            short_header: self.short_header,
         }
     }
 
+    /// The plan with parts in the short form, or not.
+    #[must_use]
+    pub const fn with_short_header(mut self, short_header: bool) -> Self {
+        self.short_header = short_header;
+        self
+    }
+
     /// The word of a `SUB` that asks for the compact lane: `C1.32.1`
-    /// (copies, window, window repair).
+    /// (copies, window, window repair), and `.7` for the short form.
     pub fn word(self) -> String {
-        format!("C{}.{}.{}", self.copies, self.window, self.window_repair)
+        format!(
+            "C{}.{}.{}{}",
+            self.copies,
+            self.window,
+            self.window_repair,
+            if self.short_header { ".7" } else { "" }
+        )
     }
 
     pub fn parse_word(word: &str) -> Option<Self> {
         let mut numbers = word.strip_prefix('C')?.split('.');
-        let plan = Self {
+        let mut plan = Self {
             copies: numbers.next()?.parse().ok()?,
             window: numbers.next()?.parse().ok()?,
             window_repair: numbers.next()?.parse().ok()?,
+            short_header: false,
         };
+        match numbers.next() {
+            None => {}
+            Some(header) if header.parse::<usize>().ok()? == SHORT_HEADER_LEN => {
+                plan.short_header = true;
+            }
+            Some(_) => return None,
+        }
         if numbers.next().is_some() {
             return None;
         }
@@ -197,6 +224,7 @@ impl CompactPlan {
                 copies: 0,
                 window,
                 window_repair: rows.min(MAX_WINDOW_REPAIR),
+                short_header: false,
             }
             .bounded();
         }
@@ -219,6 +247,7 @@ impl CompactPlan {
             copies,
             window,
             window_repair: window_repair.min(4),
+            short_header: false,
         }
         .bounded()
     }
@@ -253,9 +282,10 @@ pub fn extend_u32(reference: u64, low: u32) -> u64 {
 /// The generation byte of a source epoch: a digest of all its bytes,
 /// never 0 (which a datagram of an unknown epoch carries).
 pub fn generation_of_epoch(epoch: u64) -> u8 {
-    let folded = epoch.to_le_bytes().iter().fold(0_u8, |acc, byte| {
-        acc.rotate_left(3) ^ byte
-    });
+    let folded = epoch
+        .to_le_bytes()
+        .iter()
+        .fold(0_u8, |acc, byte| acc.rotate_left(3) ^ byte);
     if folded == 0 {
         1
     } else {
@@ -334,6 +364,109 @@ pub fn is_compact(datagram: &[u8]) -> bool {
 /// it sent it, which the part itself replaces if the edge gets it later.
 pub fn is_gap(datagram: &[u8]) -> bool {
     is_compact(datagram) && datagram[0] & !MAGIC_MASK == Kind::Gap.code()
+}
+
+// ------------------------------------------------------- the short form
+
+/// The first byte of a part in the short form (wave 7 item 9), less its
+/// flags (the low five bits): 0xE0 to 0xFF, which is neither a long compact
+/// datagram (0xC0 to 0xC3), a control (text) nor RQD2 (`R`).
+pub const SHORT_MAGIC: u8 = 0xE0;
+const SHORT_MAGIC_MASK: u8 = 0xE0;
+/// The short form's header: the magic and the flags, the generation, the
+/// part number's low 16 bits and the publication time's low 24 bits (in
+/// microseconds: 16.7 s).
+pub const SHORT_HEADER_LEN: usize = 7;
+/// What the short form saves on each part.
+pub const SHORT_SAVES: usize = HEADER_LEN - SHORT_HEADER_LEN;
+
+/// Whether a datagram is a part in the short form.
+pub fn is_short(datagram: &[u8]) -> bool {
+    datagram.len() >= SHORT_HEADER_LEN && datagram[0] & SHORT_MAGIC_MASK == SHORT_MAGIC
+}
+
+/// The short form of a part's datagram (marked or not: its flags go with
+/// it); `None` for a gap or a repair datagram, which keep the long form.
+pub fn shorten(datagram: &[u8]) -> Option<Vec<u8>> {
+    let mut short = Vec::with_capacity(datagram.len() - SHORT_SAVES);
+    shorten_into(datagram, &mut short)?;
+    Some(short)
+}
+
+/// [`shorten`], into `out` (cleared first).
+pub fn shorten_into(datagram: &[u8], out: &mut Vec<u8>) -> Option<()> {
+    let view = parse(datagram)?;
+    if view.kind != Kind::Part {
+        return None;
+    }
+    out.clear();
+    out.push(SHORT_MAGIC | (datagram[FLAGS_AT] & !SHORT_MAGIC_MASK));
+    out.push(view.generation);
+    out.extend_from_slice(&(view.part_low as u16).to_be_bytes());
+    out.extend_from_slice(&view.field[1..4]);
+    out.extend_from_slice(view.payload);
+    Some(())
+}
+
+/// The short form, in place in `buffer` (a part's datagram of `len` bytes
+/// at its start): the new length, or `None` if it is not a part.
+pub fn shorten_in_place(buffer: &mut [u8], len: usize) -> Option<usize> {
+    let datagram = buffer.get(..len)?;
+    let view = parse(datagram)?;
+    if view.kind != Kind::Part {
+        return None;
+    }
+    let flags = datagram[FLAGS_AT] & !SHORT_MAGIC_MASK;
+    let generation = view.generation;
+    let part = (view.part_low as u16).to_be_bytes();
+    let field = view.field;
+    buffer.copy_within(HEADER_LEN..len, SHORT_HEADER_LEN);
+    buffer[0] = SHORT_MAGIC | flags;
+    buffer[1] = generation;
+    buffer[2..4].copy_from_slice(&part);
+    buffer[4..7].copy_from_slice(&field[1..4]);
+    Some(len - SHORT_SAVES)
+}
+
+/// `low`, the low `bits` bits of a number, extended to the number nearest
+/// to `reference`.
+pub fn extend_bits(reference: u64, low: u64, bits: u32) -> u64 {
+    let span = 1_u64 << bits;
+    let candidate = (reference & !(span - 1)) | (low & (span - 1));
+    [
+        candidate.checked_sub(span),
+        Some(candidate),
+        candidate.checked_add(span),
+    ]
+    .into_iter()
+    .flatten()
+    .min_by_key(|value| value.abs_diff(reference))
+    .unwrap_or(candidate)
+}
+
+/// The long form of a part in the short form: its part number extended to
+/// the one nearest `reference_part`, its publication time to the one
+/// nearest `now_unix_us` (so the two clocks must agree within 8 s), its
+/// flags as they came. The long form is what window repair covers, so a
+/// client keeps it.
+pub fn lengthen(short: &[u8], reference_part: u64, now_unix_us: u64) -> Option<Vec<u8>> {
+    if !is_short(short) {
+        return None;
+    }
+    let part = extend_bits(
+        reference_part,
+        u64::from(u16::from_be_bytes([short[2], short[3]])),
+        16,
+    );
+    let published = extend_bits(
+        now_unix_us,
+        u64::from(u32::from_be_bytes([0, short[4], short[5], short[6]])),
+        24,
+    );
+    let mut datagram = encode_part(part, published, &short[SHORT_HEADER_LEN..])?;
+    set_generation(&mut datagram, short[1]);
+    datagram[FLAGS_AT] = short[0] & !SHORT_MAGIC_MASK;
+    Some(datagram)
 }
 
 /// A compact datagram, checked.
@@ -1086,6 +1219,31 @@ impl CompactReceiver {
     /// Push one compact datagram; returns the parts it delivered (itself,
     /// and any that a window's repair recovered with it).
     pub fn push(&mut self, datagram: &[u8], now: Instant, now_unix_us: u64) -> Vec<CompactPart> {
+        // A part in the short form is read in its long form, which is what
+        // the window repair covers.
+        let long;
+        let datagram = if is_short(datagram) {
+            // Its 16 bits of part number need a reference: the edge's OK
+            // or a part. Before either, it is dropped (and asked again).
+            let Some(reference) = self.highest.or(self.reference) else {
+                self.stats.datagrams += 1;
+                self.stats.errors += 1;
+                return Vec::new();
+            };
+            match lengthen(datagram, reference, now_unix_us) {
+                Some(datagram) => {
+                    long = datagram;
+                    &long
+                }
+                None => {
+                    self.stats.datagrams += 1;
+                    self.stats.errors += 1;
+                    return Vec::new();
+                }
+            }
+        } else {
+            datagram
+        };
         self.stats.datagrams += 1;
         let Some(view) = parse(datagram) else {
             self.stats.errors += 1;
@@ -1348,9 +1506,7 @@ impl CompactReceiver {
                     hole.next_nack = now + every * (1 << (hole.silence_nacks / 2).min(3));
                 } else {
                     hole.nacks += 1;
-                    let backoff = retry
-                        .saturating_mul(1 << (hole.nacks - 1).min(8))
-                        .min(most);
+                    let backoff = retry.saturating_mul(1 << (hole.nacks - 1).min(8)).min(most);
                     hole.next_nack = now + backoff;
                 }
                 hole.last_nack = Some(now);
@@ -1373,11 +1529,10 @@ impl CompactReceiver {
     /// have been silent long enough to NACK the parts due.
     pub fn next_nack_at(&self) -> Option<Instant> {
         let holes = self.holes.values().map(|hole| hole.next_nack).min();
-        let silence = (self.active
-            && self.nack_timing().silence
-            && self.silence_noted != self.highest_at)
-            .then(|| Some(self.highest_at? + self.silence_after()?))
-            .flatten();
+        let silence =
+            (self.active && self.nack_timing().silence && self.silence_noted != self.highest_at)
+                .then(|| Some(self.highest_at? + self.silence_after()?))
+                .flatten();
         match (holes, silence) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -1505,7 +1660,9 @@ mod tests {
         // Part 120 is due at last + 1 ms; it is asked for 2 ms after the
         // last part (one interval and the margin), not sooner.
         assert_eq!(receiver.next_nack_at(), Some(last + ms * 2));
-        assert!(receiver.nacks_due(last + Duration::from_micros(1_900), 64).is_empty());
+        assert!(receiver
+            .nacks_due(last + Duration::from_micros(1_900), 64)
+            .is_empty());
         assert_eq!(receiver.nacks_due(last + ms * 2, 64), vec![120]);
         // A millisecond on: 120 again (its answer went into the burst) and
         // 121, now due; then 120 waits two intervals.
@@ -1632,6 +1789,63 @@ mod tests {
         assert!(!receiver.push(&unmarked, now, 1_700_000_000_002_000)[0].fast_lane);
     }
 
+    /// The short form (wave 7 item 9): 7 bytes of header, the flags kept,
+    /// and read back to the long form byte for byte, around the wraps of
+    /// its 16-bit part number and 24-bit time.
+    #[test]
+    fn a_part_in_the_short_form_reads_back_to_its_long_form() {
+        let bytes = payload(3, 56);
+        for (part, published) in [
+            (9_u64, 1_700_000_000_123_456_u64),
+            (65_535, 1_700_000_016_777_215),
+            (65_536, 1_700_000_016_777_216),
+            (1_234_567, 1_763_812_345_678_901),
+        ] {
+            let mut long = encode_part(part, published, &bytes).unwrap();
+            set_generation(&mut long, 9);
+            set_flags(&mut long, 2, true);
+            set_fast_lane(&mut long);
+            let short = shorten(&long).unwrap();
+            assert_eq!(short.len(), SHORT_HEADER_LEN + 56);
+            assert_eq!(short.len() + SHORT_SAVES, long.len());
+            assert!(is_short(&short) && !is_compact(&short));
+            let mut in_place = long.clone();
+            assert_eq!(
+                shorten_in_place(&mut in_place, long.len()),
+                Some(short.len())
+            );
+            assert_eq!(&in_place[..short.len()], short.as_slice());
+            // The client's reference is a part or two away, its clock a few
+            // milliseconds (or seconds) off.
+            for (reference, now) in [
+                (part.saturating_sub(2), published + 3_000),
+                (part + 1, published - 2_000_000),
+                (part + 30_000, published + 7_000_000),
+            ] {
+                assert_eq!(
+                    lengthen(&short, reference, now).unwrap(),
+                    long,
+                    "part {part}"
+                );
+            }
+        }
+        // Gaps and repair keep the long form.
+        assert_eq!(shorten(&encode_gap(5)), None);
+        // A short part before any reference is dropped; after the OK it is
+        // a part.
+        let mut receiver = CompactReceiver::new();
+        let long = encode_part(70_000, 1_700_000_000_000_000, &bytes).unwrap();
+        let short = shorten(&long).unwrap();
+        let now = Instant::now();
+        assert!(receiver.push(&short, now, 1_700_000_000_001_000).is_empty());
+        receiver.expect_from(69_999, true);
+        let parts = receiver.push(&short, now, 1_700_000_000_001_000);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].part, 70_000);
+        assert_eq!(parts[0].payload, bytes);
+        assert_eq!(parts[0].published_unix_us, 1_700_000_000_000_000);
+    }
+
     #[test]
     fn a_part_is_one_datagram_with_an_eleven_byte_header() {
         assert_eq!(HEADER_LEN, 11);
@@ -1656,7 +1870,10 @@ mod tests {
         let stamped = marked.clone();
         set_flags(&mut marked, 2, true);
         let view = parse(&marked).unwrap();
-        assert_eq!((view.copies, view.retransmit, view.generation), (2, true, 7));
+        assert_eq!(
+            (view.copies, view.retransmit, view.generation),
+            (2, true, 7)
+        );
         assert_eq!(canonical(&marked), stamped);
         // Not a compact datagram: text controls, an RQD2 header.
         assert!(!is_compact(b"SUB 4001 0 C0.32.1 ok"));
@@ -1689,18 +1906,27 @@ mod tests {
                 copies: 2,
                 window: 16,
                 window_repair: 3,
+                short_header: false,
             },
+            CompactPlan::CLEAN.with_short_header(true),
         ] {
             assert_eq!(CompactPlan::parse_word(&plan.word()), Some(plan));
         }
+        assert_eq!(
+            CompactPlan::CLEAN.with_short_header(true).word(),
+            "C0.32.1.7"
+        );
         assert_eq!(
             CompactPlan::parse_word("C9.200.40"),
             Some(CompactPlan {
                 copies: MAX_COPIES,
                 window: MAX_WINDOW,
-                window_repair: MAX_WINDOW_REPAIR
+                window_repair: MAX_WINDOW_REPAIR,
+                short_header: false,
             })
         );
+        assert_eq!(CompactPlan::parse_word("C1.2.3.11"), None);
+        assert_eq!(CompactPlan::parse_word("C1.2.3.7.7"), None);
         assert_eq!(CompactPlan::parse_word("C1.2"), None);
         assert_eq!(CompactPlan::parse_word("F1"), None);
         assert_eq!(CompactPlan::parse_word("C1.2.3.4"), None);
@@ -1814,7 +2040,10 @@ mod tests {
             .collect();
         // Each part is coded behind its length and CRC.
         let t = views[0].payload.len();
-        assert_eq!(t, symbols.iter().map(Vec::len).max().unwrap() + REPAIR_PREFIX);
+        assert_eq!(
+            t,
+            symbols.iter().map(Vec::len).max().unwrap() + REPAIR_PREFIX
+        );
         for lost_mask in 1_u32..(1 << k) {
             let lost = lost_mask.count_ones() as usize;
             if lost > 4 {
