@@ -29,13 +29,21 @@
 //! - Init and codec configuration never ride the lane, and neither does a
 //!   stream until the tee has seen it commit as a canonical slot (a Soundkit
 //!   bundle is reboxed at the commit, so its part is not the envelope's).
+//! - A client of the compact lane (`av_mesh::client_compact`) gets an object
+//!   of one symbol (an audio part) as its compact datagram, made here once
+//!   per part from the envelope that the symbol carries, with the edge's own
+//!   slot functions (the bytes that the client would build from the
+//!   envelope), and kept in the edge's compact ring for the window repair
+//!   and NACK answers. It takes no upstream repair of such an object, and no
+//!   top-up: its plan's copies, window repair and NACK protect it.
 
 use super::sys;
 use super::view::RlsView;
 use super::TrafficClass;
 use crate::edge_udp::{EdgeSockets, EdgeUdpStats, Table};
 use arc_swap::ArcSwap;
-use av_mesh::client_udp::{fast_block_id, rewrap_fast, RepairPolicy};
+use av_mesh::client_compact as compact;
+use av_mesh::client_udp::{fast_block_id, rewrap_fast, CompactPlan, RepairPolicy};
 use dashmap::DashMap;
 use raptorq_datagram_fec::{
     DatagramFecHeader, MediaObjectKind, RaptorQBlockProfile, RaptorQRepairEncoder,
@@ -151,10 +159,11 @@ impl FastClient {
     }
 }
 
-/// The fast-lane clients of one repair policy.
+/// The fast-lane clients of one repair policy and compact plan.
 #[derive(Debug, Clone)]
 pub struct FastGroup {
     pub repair: RepairPolicy,
+    pub compact: Option<CompactPlan>,
     pub clients: Vec<(SocketAddr, Arc<FastClient>)>,
 }
 
@@ -199,6 +208,11 @@ pub struct FastLaneStats {
     /// and the times the host refused GSO (sent without it from then on).
     pub gso_messages: AtomicU64,
     pub gso_fallbacks: AtomicU64,
+    /// Compact lane: parts sent as compact datagrams (one per client), and
+    /// one-symbol objects whose compact datagram could not be made (they
+    /// went as symbols).
+    pub compact_parts: AtomicU64,
+    pub compact_failed: AtomicU64,
 }
 
 /// What `/api/mesh` reports of the fast client lane.
@@ -220,6 +234,8 @@ pub struct FastLaneSnapshot {
     pub not_eligible: u64,
     pub gso_messages: u64,
     pub gso_fallbacks: u64,
+    pub compact_parts: u64,
+    pub compact_failed: u64,
 }
 
 struct Armed {
@@ -355,7 +371,39 @@ impl EdgeFastLane {
             not_eligible: load(&self.stats.not_eligible),
             gso_messages: load(&self.stats.gso_messages),
             gso_fallbacks: load(&self.stats.gso_fallbacks),
+            compact_parts: load(&self.stats.compact_parts),
+            compact_failed: load(&self.stats.compact_failed),
         }
+    }
+
+    /// The compact datagram of a one-symbol object whose source symbol is
+    /// `view` (in canonical form), kept in the edge's compact ring (or the
+    /// one kept there already); `None` when the object is not a canonical
+    /// part that fits one datagram.
+    fn compact_of(&self, stream_id: u64, view: &RlsView<'_>) -> Option<bytes::Bytes> {
+        let armed = self.armed.get()?;
+        let ring = armed.sockets.compact().ring(stream_id);
+        if let Some(kept) = ring.get(view.object) {
+            return Some(kept);
+        }
+        let header = DatagramFecHeader::decode(view.fec).ok()?;
+        if header.source_symbols != 1 || view.esi != 0 {
+            return None;
+        }
+        let symbol = header.payload(view.fec).ok()?;
+        let envelope = symbol.get(4..4 + header.transfer_length as usize)?;
+        let part = av_mesh::canonical_slot::canonical_part_from_envelope(
+            bytes::Bytes::copy_from_slice(envelope),
+        )
+        .ok()?;
+        if part.stream_id != stream_id || part.object.key().object() != view.object {
+            return None;
+        }
+        let (media, _init) = av_mesh::canonical_slot::slot_media(&part.slot, part.stream_id)?;
+        let published =
+            av_mesh::canonical_slot::object_published_unix_us(&part.object).unwrap_or(0);
+        let datagram = compact::encode_part(view.object, published, &media)?;
+        Some(ring.put(view.object, bytes::Bytes::from(datagram)))
     }
 
     /// The edge's own repair of a decoded object for the clients that took
@@ -384,6 +432,10 @@ impl EdgeFastLane {
         let k = u32::from(header.source_symbols);
         let mut wanted: Vec<(u32, Vec<SocketAddr>)> = Vec::new();
         for group in groups {
+            if group.compact.is_some() && k == 1 {
+                // Its compact datagram went instead of the symbol.
+                continue;
+            }
             let extra = group
                 .repair
                 .repair_symbols(k)
@@ -467,6 +519,9 @@ impl EdgeFastLane {
 #[derive(Debug, Clone, Copy)]
 struct PlannedClient {
     message: u16,
+    /// The compact datagram of the message, marked with this many copies,
+    /// instead of its rewrapped symbol.
+    compact: Option<u8>,
     source: bool,
     part: u64,
     peer: SocketAddr,
@@ -480,6 +535,11 @@ struct PlannedClient {
 pub struct ClientPlan {
     buffers: Vec<u8>,
     lens: Vec<u16>,
+    /// The compact datagrams of the batch's messages: one marked copy for
+    /// each count of copies (0 to MAX_COPIES), and their lengths (0: none
+    /// made).
+    compact_buffers: Vec<u8>,
+    compact_lens: Vec<u16>,
     sends: Vec<PlannedClient>,
     /// The clients of the sends, by index in `sends` (kept apart so that a
     /// send is `Copy`).
@@ -495,6 +555,12 @@ pub struct ClientPlan {
 }
 
 const REPAIR_MEMO: usize = 64;
+/// Marked copies of a compact datagram: one for each count of copies.
+const COMPACT_VARIANTS: usize = compact::MAX_COPIES as usize + 1;
+
+fn compact_at(message: usize, copies: u8) -> usize {
+    (message * COMPACT_VARIANTS + usize::from(copies)) * compact::MAX_DATAGRAM
+}
 
 impl Default for ClientPlan {
     fn default() -> Self {
@@ -507,6 +573,8 @@ impl ClientPlan {
         Self {
             buffers: vec![0_u8; sys::RECV_BATCH * REWRAP_BYTES],
             lens: vec![0; sys::RECV_BATCH],
+            compact_buffers: vec![0_u8; sys::RECV_BATCH * COMPACT_VARIANTS * compact::MAX_DATAGRAM],
+            compact_lens: vec![0; sys::RECV_BATCH],
             sends: Vec::with_capacity(sys::RECV_BATCH * 8),
             clients: Vec::with_capacity(sys::RECV_BATCH * 8),
             memo: Vec::with_capacity(REPAIR_MEMO),
@@ -577,10 +645,28 @@ impl ClientPlan {
             return;
         };
         self.lens[message] = len as u16;
+        self.compact_lens[message] = 0;
         let k = u32::from(view.source_symbols);
         let repair_ordinal = view.esi.checked_sub(k);
+        // The compact datagram of a one-symbol object, made at most once.
+        let mut compact_made: Option<bool> = None;
         for group in groups {
-            if let Some(ordinal) = repair_ordinal {
+            let mut copies = None;
+            if let Some(plan) = group.compact.filter(|_| k == 1) {
+                if repair_ordinal.is_some() {
+                    // Its compact datagram goes instead of the symbols.
+                    lane.stats
+                        .repair_capped
+                        .fetch_add(group.clients.len() as u64, Ordering::Relaxed);
+                    continue;
+                }
+                let made = *compact_made
+                    .get_or_insert_with(|| self.make_compact(lane, stream_id, message, view));
+                if made {
+                    copies = Some(plan.copies);
+                }
+            }
+            if let (None, Some(ordinal)) = (copies, repair_ordinal) {
                 if ordinal >= self.repair_symbols(group.repair, k) {
                     lane.stats
                         .repair_capped
@@ -603,16 +689,48 @@ impl ClientPlan {
                 if fresh {
                     lane.stats.parts.fetch_add(1, Ordering::Relaxed);
                 }
-                self.sends.push(PlannedClient {
-                    message: message as u16,
-                    source: repair_ordinal.is_none(),
-                    part,
-                    peer: *peer,
-                    client: self.clients.len() as u32,
-                });
+                let sends = 1 + copies.map_or(0, usize::from);
+                for _ in 0..sends {
+                    self.sends.push(PlannedClient {
+                        message: message as u16,
+                        compact: copies,
+                        source: repair_ordinal.is_none(),
+                        part,
+                        peer: *peer,
+                        client: self.clients.len() as u32,
+                    });
+                }
+                if copies.is_some() {
+                    lane.stats.compact_parts.fetch_add(1, Ordering::Relaxed);
+                }
                 self.clients.push(Arc::clone(client));
             }
         }
+    }
+
+    /// Make the compact datagram of the message's one-symbol object, in each
+    /// marked copy; `false` if it cannot be made (the clients then get the
+    /// symbol).
+    fn make_compact(
+        &mut self,
+        lane: &EdgeFastLane,
+        stream_id: u64,
+        message: usize,
+        view: &RlsView<'_>,
+    ) -> bool {
+        let Some(canonical) = lane.compact_of(stream_id, view) else {
+            lane.stats.compact_failed.fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        let len = canonical.len();
+        for copies in 0..COMPACT_VARIANTS as u8 {
+            let start = compact_at(message, copies);
+            let buffer = &mut self.compact_buffers[start..start + len];
+            buffer.copy_from_slice(&canonical);
+            compact::set_flags(buffer, copies, false);
+        }
+        self.compact_lens[message] = len as u16;
+        true
     }
 
     /// Group each client's sends together, keeping the order of its own
@@ -646,9 +764,17 @@ impl ClientPlan {
             self.group_by_client();
         }
         let (sends, buffers, lens) = (&self.sends, &self.buffers, &self.lens);
+        let (compact_buffers, compact_lens) = (&self.compact_buffers, &self.compact_lens);
         let message = |index: usize| {
             let send = &sends[index];
             let message = usize::from(send.message);
+            if let Some(copies) = send.compact {
+                let start = compact_at(message, copies);
+                return (
+                    &compact_buffers[start..start + usize::from(compact_lens[message])],
+                    send.peer,
+                );
+            }
             let start = message * REWRAP_BYTES;
             (
                 &buffers[start..start + usize::from(lens[message])],
@@ -773,6 +899,7 @@ mod tests {
                 let peer = peers[turn];
                 plan.sends.push(PlannedClient {
                     message: message as u16,
+                    compact: None,
                     source: true,
                     part: 7,
                     peer,

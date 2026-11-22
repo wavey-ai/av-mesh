@@ -1548,6 +1548,21 @@ struct Args {
     #[arg(long, env = "NEEDLETAIL_CLIENT_UDP_EDGE_RANK", default_value_t = 0)]
     client_udp_edge_rank: u32,
 
+    /// The compact client lane (`av_mesh::client_compact`): a client that
+    /// asks for it (`SUB ... C<copies>.<window>.<repair>`) gets each part
+    /// that fits one datagram as one compact datagram (20 bytes of header,
+    /// no RaptorQ), with the copies and the repair across parts that it
+    /// asks for, and the parts it asks for again (`NACK`) from the edge's
+    /// ring. About 1.2x the source rate on a clean path instead of about
+    /// 4x to 40x. `false` gives such a client the RaptorQ lane, as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_COMPACT",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    client_udp_compact: bool,
+
     /// An edge that has heard none of its cache-mesh parents for this long
     /// has lost them: it answers 503 for a part or a playlist reload that it
     /// would otherwise hold, and moves its UDP clients. Keep it above the
@@ -2975,6 +2990,7 @@ async fn main() -> Result<()> {
                 batch_send: args.client_udp_batch_send,
                 inline_complete_bytes: args.client_udp_inline_complete_bytes,
                 gso: args.client_udp_gso,
+                compact: args.client_udp_compact,
             },
             Arc::clone(&router.edge_udp_stats),
             edge_cut_through.clone(),
@@ -17749,6 +17765,12 @@ impl AppRouter {
                     "region_silence_held": stats.region_silence_held.load(Ordering::Relaxed),
                     "tokens_sent": stats.tokens_sent.load(Ordering::Relaxed),
                     "bad_tokens": stats.bad_tokens.load(Ordering::Relaxed),
+                    "compact_parts": stats.compact_parts.load(Ordering::Relaxed),
+                    "compact_copies": stats.compact_copies.load(Ordering::Relaxed),
+                    "compact_window_repair": stats.compact_window_repair.load(Ordering::Relaxed),
+                    "nack_parts": stats.nack_parts.load(Ordering::Relaxed),
+                    "nack_resent": stats.nack_resent.load(Ordering::Relaxed),
+                    "nack_refused": stats.nack_refused.load(Ordering::Relaxed),
                     "fast_lane": stats.fast_lane.get().map(|lane| lane.snapshot_stats()),
                 })
             }),
@@ -31798,6 +31820,7 @@ mod tests {
                         repair: RepairPolicy::default(),
                         token,
                         fast_lane: false,
+                        compact: None,
                     }
                     .encode()
                 };
@@ -32078,6 +32101,7 @@ mod tests {
                         repair: RepairPolicy::default(),
                         token,
                         fast_lane: false,
+                        compact: None,
                     }
                     .encode()
                 };
@@ -32257,6 +32281,7 @@ mod tests {
             },
             token,
             fast_lane: false,
+            compact: None,
         };
         let mut buf = vec![0_u8; 65_536];
         // A first request gets a token and nothing else: an address that
@@ -32329,7 +32354,8 @@ mod tests {
             subscribed,
             Some(Control::Subscribed {
                 stream_id: 77,
-                next_part: 0
+                next_part: 0,
+                compact: false,
             })
         );
         assert!(receiver.recovered_objects > 0);
@@ -32433,6 +32459,7 @@ mod tests {
                     },
                     token,
                     fast_lane: false,
+                    compact: None,
                 }
                 .encode()
             };
@@ -36269,4 +36296,8 @@ mod tests {
 
     /// The fast client lane: the client's decode and the edge's lane.
     mod fast_lane;
+
+    /// The compact client lane: bytes per listener, zero loss through loss
+    /// and bursts, the edge's cost per listener.
+    mod compact_lane;
 }

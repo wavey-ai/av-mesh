@@ -12,13 +12,21 @@
 //! An edge sends media only to an address that echoed a token that the edge
 //! sent to it, so a forged source address gets at most an answer smaller than
 //! the request.
+//!
+//! A subscriber that asks for the compact lane (`av_mesh::client_compact`,
+//! `--client-udp-compact`) gets each part that fits one datagram as that
+//! datagram, from whichever lane sends it first (the fast lane, cut-through
+//! or the cache-fed sender); the edge keeps each stream's compact datagrams
+//! in a ring ([`CompactStore`]), so that every lane sends the same bytes, the
+//! sender's window repair covers them, and a `NACK` is answered from it.
 
 use crate::fast_plane::edge_clients::{EdgeFastLane, FastClient, FastGroup};
 use crate::fast_plane::{StreamClasses, TrafficClass};
 use crate::{AppRouter, ParentsLost};
+use av_mesh::client_compact as compact;
 use av_mesh::client_udp::{
     block_id, cut_through_block_id, cut_through_symbol_size, encode_block, encode_object, geometry,
-    source_datagram, Control, ObjectKind, PartObject, RepairPolicy, KEEPALIVE,
+    source_datagram, CompactPlan, Control, ObjectKind, PartObject, RepairPolicy, KEEPALIVE,
     MIN_FIRST_REQUEST_BYTES, SUBSCRIPTION_TTL,
 };
 use bytes::Bytes;
@@ -66,6 +74,13 @@ const SEND_QUEUE_MAX_DATAGRAMS: usize = 32_768;
 /// Datagrams that one drain round takes under the lock and sends, without
 /// it, in one `sendmmsg`.
 const DRAIN_SLICE: usize = 256;
+/// Parts of each stream whose compact datagrams the edge keeps: 4 s of 1 ms
+/// parts, more than any playout deadline.
+const COMPACT_RING: usize = 4_096;
+/// The most parts a subscriber may ask for again in one NACK interval
+/// (a burst of a second of 1 ms PCM, spread over ten intervals).
+const NACK_BUDGET: u32 = 200;
+const NACK_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct EdgeUdpConfig {
@@ -92,6 +107,10 @@ pub(crate) struct EdgeUdpConfig {
     /// A client's datagrams of a completed part leave as one UDP GSO
     /// message (`UDP_SEGMENT`) in the batch, not one message each.
     pub gso: bool,
+    /// Serve the compact lane to the clients that ask for it
+    /// (`--client-udp-compact`; `false`: they get the RaptorQ lane, as
+    /// before).
+    pub compact: bool,
 }
 
 impl EdgeUdpConfig {
@@ -107,6 +126,7 @@ impl EdgeUdpConfig {
             batch_send: true,
             inline_complete_bytes: DEFAULT_INLINE_COMPLETE_BYTES,
             gso: true,
+            compact: true,
         }
     }
 }
@@ -151,6 +171,108 @@ pub(crate) struct EdgeUdpStats {
     pub region_silence_held: AtomicU64,
     /// The fast client lane, once armed, whose counters the API reports.
     pub fast_lane: OnceLock<Arc<EdgeFastLane>>,
+    /// The compact lane: parts sent as compact datagrams (one per part and
+    /// client, copies apart), their copies, window repair datagrams, parts
+    /// asked for again (NACK) and sent again, and those refused (over the
+    /// budget, or not yet due).
+    pub compact_parts: AtomicU64,
+    pub compact_copies: AtomicU64,
+    pub compact_window_repair: AtomicU64,
+    pub nack_parts: AtomicU64,
+    pub nack_resent: AtomicU64,
+    pub nack_refused: AtomicU64,
+}
+
+/// The compact datagrams of each stream's recent parts, in their canonical
+/// form: the first lane to make a part's datagram keeps it here, and every
+/// other lane, the window repair and the NACK answers use those bytes.
+#[derive(Default)]
+pub(crate) struct CompactStore {
+    streams: dashmap::DashMap<u64, Arc<CompactRing>>,
+}
+
+pub(crate) struct CompactRing {
+    slots: Box<[Mutex<Option<(u64, Bytes)>>]>,
+}
+
+impl CompactRing {
+    fn new() -> Self {
+        Self {
+            slots: (0..COMPACT_RING).map(|_| Mutex::new(None)).collect(),
+        }
+    }
+
+    fn slot(&self, part: u64) -> &Mutex<Option<(u64, Bytes)>> {
+        &self.slots[(part % COMPACT_RING as u64) as usize]
+    }
+
+    pub(crate) fn get(&self, part: u64) -> Option<Bytes> {
+        match &*self.slot(part).lock().unwrap() {
+            Some((held, datagram)) if *held == part => Some(datagram.clone()),
+            _ => None,
+        }
+    }
+
+    /// Keep `datagram` as the part's, unless the part has one already:
+    /// returns the one kept.
+    pub(crate) fn put(&self, part: u64, datagram: Bytes) -> Bytes {
+        let mut slot = self.slot(part).lock().unwrap();
+        match &*slot {
+            Some((held, kept)) if *held == part => kept.clone(),
+            _ => {
+                *slot = Some((part, datagram.clone()));
+                datagram
+            }
+        }
+    }
+}
+
+impl CompactStore {
+    pub(crate) fn ring(&self, stream_id: u64) -> Arc<CompactRing> {
+        if let Some(ring) = self.streams.get(&stream_id) {
+            return Arc::clone(&ring);
+        }
+        Arc::clone(
+            &self
+                .streams
+                .entry(stream_id)
+                .or_insert_with(|| Arc::new(CompactRing::new())),
+        )
+    }
+
+    pub(crate) fn get(&self, stream_id: u64, part: u64) -> Option<Bytes> {
+        self.streams.get(&stream_id)?.get(part)
+    }
+
+    /// The compact datagram of an object (a part or a gap), kept or made
+    /// and kept; `None` for one that does not fit a datagram (or an init).
+    pub(crate) fn of_object(&self, object: &PartObject) -> Option<Bytes> {
+        let ring = self.ring(object.stream_id);
+        if let Some(kept) = ring.get(object.part) {
+            return Some(kept);
+        }
+        let datagram = match object.kind {
+            ObjectKind::Part => {
+                compact::encode_part(object.part, object.published_unix_us, &object.payload)?
+            }
+            ObjectKind::Gap => compact::encode_gap(object.part),
+            ObjectKind::Init => return None,
+        };
+        Some(ring.put(object.part, Bytes::from(datagram)))
+    }
+
+    /// Forget a stream that no subscriber follows any more.
+    fn forget(&self, stream_id: u64) {
+        self.streams.remove(&stream_id);
+    }
+}
+
+/// A compact datagram as one subscriber gets it: marked with its copies (or
+/// as a retransmission).
+pub(crate) fn compact_marked(canonical: &[u8], copies: u8, retransmit: bool) -> Vec<u8> {
+    let mut datagram = canonical.to_vec();
+    compact::set_flags(&mut datagram, copies, retransmit);
+    datagram
 }
 
 /// The client socket of an edge, or a pair of them on one address: audio
@@ -170,6 +292,8 @@ pub(crate) struct EdgeSockets {
     /// The fast client lane, when the edge's class threads feed one
     /// (`--client-udp-fast-lane`).
     fast_lane: Option<Arc<EdgeFastLane>>,
+    /// The compact lane's datagrams, shared by every lane.
+    compact: Arc<CompactStore>,
 }
 
 /// Where a stream's datagrams leave from: its socket, and the socket's send
@@ -354,6 +478,7 @@ impl EdgeSockets {
             audio_queue: None,
             video_queue: None,
             fast_lane: None,
+            compact: Arc::default(),
         }
     }
 
@@ -365,7 +490,13 @@ impl EdgeSockets {
             audio_queue: None,
             video_queue: None,
             fast_lane: None,
+            compact: Arc::default(),
         }
+    }
+
+    /// The compact lane's datagrams.
+    pub(crate) fn compact(&self) -> &Arc<CompactStore> {
+        &self.compact
     }
 
     /// Serve `lane`'s clients from these sockets (armed by `run_edge_udp`).
@@ -716,6 +847,15 @@ pub(crate) struct Subscriber {
     /// Its place on the fast lane, if it asked for it (`F1`) and the edge
     /// has one.
     fast: Option<Arc<FastClient>>,
+    /// Its plan of the compact lane, if it asked for it and the edge serves
+    /// it.
+    compact: Option<CompactPlan>,
+    /// The first part that this edge sent it: window repair goes to it only
+    /// for windows from there on.
+    first_part: u64,
+    /// Its NACKs: the start of the current interval and the parts asked for
+    /// in it.
+    nack_interval: (Instant, u32),
 }
 
 #[derive(Debug, Default)]
@@ -737,11 +877,12 @@ pub(crate) fn fast_groups(entry: &StreamEntry) -> Vec<FastGroup> {
         };
         match groups
             .iter_mut()
-            .find(|group| group.repair == subscriber.repair)
+            .find(|group| group.repair == subscriber.repair && group.compact == subscriber.compact)
         {
             Some(group) => group.clients.push((*peer, Arc::clone(fast))),
             None => groups.push(FastGroup {
                 repair: subscriber.repair,
+                compact: subscriber.compact,
                 clients: vec![(*peer, Arc::clone(fast))],
             }),
         }
@@ -878,7 +1019,9 @@ pub(crate) async fn run_edge_udp(
                 repair,
                 token,
                 fast_lane,
+                compact,
             } => {
+                let compact = compact.filter(|_| config.compact);
                 let valid = token.is_some_and(|token| tokens.valid(peer, token));
                 if !valid {
                     if token.is_some() {
@@ -912,8 +1055,10 @@ pub(crate) async fn run_edge_udp(
                             subscriber.expires_at = Instant::now() + SUBSCRIPTION_TTL;
                             // A fast-lane client whose repair changed moves
                             // to the group of its new policy.
-                            let regroup = subscriber.fast.is_some() && subscriber.repair != repair;
+                            let regroup = subscriber.fast.is_some()
+                                && (subscriber.repair != repair || subscriber.compact != compact);
                             subscriber.repair = repair;
+                            subscriber.compact = compact;
                             // A client that names a part has not yet heard
                             // the edge's answer: it resumes there.
                             if let (Some(part), Some(head)) = (from_part, head) {
@@ -938,6 +1083,7 @@ pub(crate) async fn run_edge_udp(
                         &Control::Subscribed {
                             stream_id,
                             next_part,
+                            compact: compact.is_some(),
                         },
                     )
                     .await;
@@ -974,6 +1120,7 @@ pub(crate) async fn run_edge_udp(
                     from_part,
                     repair,
                     fast_lane,
+                    compact,
                 );
                 let admitting = Arc::clone(&admitting);
                 tokio::spawn(async move {
@@ -994,8 +1141,117 @@ pub(crate) async fn run_edge_udp(
                     fast_lane_changed(&sockets, &table);
                 }
             }
+            Control::Nack {
+                stream_id,
+                token,
+                parts,
+            } => {
+                if !tokens.valid(peer, token) {
+                    stats.bad_tokens.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                answer_nack(
+                    &sockets, &router, &table, config, &stats, peer, stream_id, &parts,
+                )
+                .await;
+            }
             _ => {}
         }
+    }
+}
+
+/// Send a compact-lane subscriber the parts that it asks for again: each
+/// part that was sent to it already (the cache-fed sender has passed it, or
+/// the fast lane or cut-through carried it; the others are still due),
+/// within its NACK budget, from the compact ring, else from the cache (a
+/// part too large for one datagram as a RaptorQ object with its repair).
+#[allow(clippy::too_many_arguments)]
+async fn answer_nack(
+    sockets: &EdgeSockets,
+    router: &AppRouter,
+    table: &Table,
+    config: EdgeUdpConfig,
+    stats: &EdgeUdpStats,
+    peer: SocketAddr,
+    stream_id: u64,
+    parts: &[u64],
+) {
+    stats
+        .nack_parts
+        .fetch_add(parts.len() as u64, Ordering::Relaxed);
+    let (granted, repair) = {
+        let mut table = table.lock().unwrap();
+        let Some(subscriber) = table
+            .get_mut(&stream_id)
+            .and_then(|entry| entry.subscribers.get_mut(&peer))
+        else {
+            stats
+                .nack_refused
+                .fetch_add(parts.len() as u64, Ordering::Relaxed);
+            return;
+        };
+        if subscriber.compact.is_none() {
+            stats
+                .nack_refused
+                .fetch_add(parts.len() as u64, Ordering::Relaxed);
+            return;
+        }
+        let now = Instant::now();
+        if now.duration_since(subscriber.nack_interval.0) >= NACK_INTERVAL {
+            subscriber.nack_interval = (now, 0);
+        }
+        let mut granted = Vec::new();
+        for part in parts {
+            let sent = *part < subscriber.next_part
+                || subscriber.cut_slots.contains(part)
+                || subscriber
+                    .fast
+                    .as_ref()
+                    .is_some_and(|fast| fast.has_fast(*part));
+            if !sent || *part < subscriber.first_part {
+                continue;
+            }
+            if subscriber.nack_interval.1 >= NACK_BUDGET {
+                break;
+            }
+            subscriber.nack_interval.1 += 1;
+            granted.push(*part);
+        }
+        (granted, subscriber.repair)
+    };
+    stats
+        .nack_refused
+        .fetch_add((parts.len() - granted.len()) as u64, Ordering::Relaxed);
+    let out = sockets.out_for_stream(stream_id);
+    for part in granted {
+        if let Some(kept) = sockets.compact().get(stream_id, part) {
+            let datagram = compact_marked(&kept, 0, true);
+            if matches!(
+                out.send(stats, &datagram, peer),
+                SendOutcome::Sent | SendOutcome::Queued
+            ) {
+                stats.nack_resent.fetch_add(1, Ordering::Relaxed);
+            }
+            continue;
+        }
+        let Some((bytes, _)) = router.cache.get_part_for_stream_id(stream_id, part).await else {
+            continue;
+        };
+        let object = part_object(router, stream_id, part, bytes).await;
+        if let Some(kept) = sockets.compact().of_object(&object) {
+            let datagram = compact_marked(&kept, 0, true);
+            if matches!(
+                out.send(stats, &datagram, peer),
+                SendOutcome::Sent | SendOutcome::Queued
+            ) {
+                stats.nack_resent.fetch_add(1, Ordering::Relaxed);
+            }
+            continue;
+        }
+        // Too large for one datagram: the whole part, as the cache-fed lane
+        // sends it.
+        send_object(out, config, stats, &object, &[(peer, repair)]).await;
+        stats.nack_resent.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1124,6 +1380,7 @@ async fn admit(
     from_part: Option<u64>,
     repair: RepairPolicy,
     fast_lane: bool,
+    compact: Option<CompactPlan>,
 ) {
     let reason = match move_reason(&router).await {
         // A client sent away for lost parents that comes back at once has
@@ -1230,6 +1487,9 @@ async fn admit(
                 moved_in: from_part.is_some(),
                 held_down_counted: false,
                 fast: fast.clone(),
+                compact,
+                first_part,
+                nack_interval: (Instant::now(), 0),
             },
         );
         let start = !std::mem::replace(&mut entry.running, true);
@@ -1246,6 +1506,7 @@ async fn admit(
         &Control::Subscribed {
             stream_id,
             next_part: first_part,
+            compact: compact.is_some(),
         },
     )
     .await;
@@ -1255,6 +1516,7 @@ async fn admit(
         first_part,
         head,
         fast_lane = fast.is_some(),
+        compact = compact.map(|plan| plan.word()),
         "edge client UDP subscription"
     );
     if start_sender {
@@ -1399,18 +1661,28 @@ async fn send_init_if_new(
 /// Subscribers to send an object to, with their repair.
 type Targets = Vec<(SocketAddr, RepairPolicy)>;
 
-/// The subscribers due for `part`, after the part has been taken for them,
-/// and those due that the fast lane carries it to (they need only its init
-/// segment). A subscriber that cut-through carries the part to is passed
-/// over, unless `gap`: a gap goes to every subscriber due that the fast lane
-/// did not carry the part to.
-fn take_due(table: &Table, stream_id: u64, part: u64, gap: bool) -> (Targets, Targets) {
+/// The subscribers due for a part.
+#[derive(Default)]
+struct Due {
+    /// On the RaptorQ lane.
+    blocks: Targets,
+    /// On the compact lane, with their plans.
+    compact: Vec<(SocketAddr, RepairPolicy, CompactPlan)>,
+    /// Those that the fast lane carried the part to: they need only its
+    /// init segment.
+    on_fast_lane: Targets,
+}
+
+/// The subscribers due for `part`, after the part has been taken for them.
+/// A subscriber that cut-through carries the part to is passed over, unless
+/// `gap`: a gap goes to every subscriber due that the fast lane did not
+/// carry the part to.
+fn take_due(table: &Table, stream_id: u64, part: u64, gap: bool) -> Due {
     let mut table = table.lock().unwrap();
     let Some(entry) = table.get_mut(&stream_id) else {
-        return (Vec::new(), Vec::new());
+        return Due::default();
     };
-    let mut due = Vec::new();
-    let mut on_fast_lane = Vec::new();
+    let mut due = Due::default();
     for (peer, subscriber) in entry
         .subscribers
         .iter_mut()
@@ -1430,19 +1702,161 @@ fn take_due(table: &Table, stream_id: u64, part: u64, gap: bool) -> (Targets, Ta
             .as_ref()
             .is_some_and(|fast| !fast.claim_cache(part))
         {
-            on_fast_lane.push((*peer, subscriber.repair));
+            due.on_fast_lane.push((*peer, subscriber.repair));
             continue;
         }
         if !cut || gap {
-            due.push((*peer, subscriber.repair));
+            match subscriber.compact {
+                Some(plan) => due.compact.push((*peer, subscriber.repair, plan)),
+                None => due.blocks.push((*peer, subscriber.repair)),
+            }
         }
     }
-    (due, on_fast_lane)
+    due
+}
+
+/// Send a compact datagram to each target, with the copies of its plan.
+async fn send_compact(
+    out: ClientOut<'_>,
+    config: EdgeUdpConfig,
+    stats: &EdgeUdpStats,
+    canonical: &[u8],
+    targets: &[(SocketAddr, RepairPolicy, CompactPlan)],
+) {
+    let mut marked: HashMap<u8, Vec<u8>> = HashMap::new();
+    for (_, _, plan) in targets {
+        marked
+            .entry(plan.copies)
+            .or_insert_with(|| compact_marked(canonical, plan.copies, false));
+    }
+    let list: Vec<(&[u8], SocketAddr)> = targets
+        .iter()
+        .flat_map(|(peer, _, plan)| {
+            let datagram = marked[&plan.copies].as_slice();
+            std::iter::repeat_n((datagram, *peer), 1 + usize::from(plan.copies))
+        })
+        .collect();
+    stats
+        .compact_parts
+        .fetch_add(targets.len() as u64, Ordering::Relaxed);
+    stats
+        .compact_copies
+        .fetch_add((list.len() - targets.len()) as u64, Ordering::Relaxed);
+    send_list(out, config, stats, &list).await;
+}
+
+/// Send each datagram to its client: batched when the socket has a send
+/// queue (never waits), else one send each, waiting for the socket.
+async fn send_list(
+    out: ClientOut<'_>,
+    config: EdgeUdpConfig,
+    stats: &EdgeUdpStats,
+    list: &[(&[u8], SocketAddr)],
+) {
+    if out.queue.is_some() {
+        out.send_many(stats, config.batch_send, false, list);
+        return;
+    }
+    for (datagram, peer) in list {
+        match out.socket.send_to(datagram, *peer).await {
+            Ok(sent) => {
+                stats.datagrams.fetch_add(1, Ordering::Relaxed);
+                stats.bytes.fetch_add(sent as u64, Ordering::Relaxed);
+            }
+            Err(error) => {
+                stats.send_errors.fetch_add(1, Ordering::Relaxed);
+                debug!(%peer, error = %error, "edge client UDP send failed");
+            }
+        }
+    }
+}
+
+/// After `part`: the window repair of each window that it ends, to the
+/// compact subscribers whose plan asks for it and that were sent the whole
+/// window. A window with a part that the edge holds no compact datagram of
+/// (a part too large for one) has none.
+async fn send_window_repair(
+    store: &CompactStore,
+    out: ClientOut<'_>,
+    table: &Table,
+    config: EdgeUdpConfig,
+    stats: &EdgeUdpStats,
+    stream_id: u64,
+    part: u64,
+) {
+    let wanted: Vec<(SocketAddr, u8, u8)> = {
+        let table = table.lock().unwrap();
+        let Some(entry) = table.get(&stream_id) else {
+            return;
+        };
+        entry
+            .subscribers
+            .iter()
+            .filter_map(|(peer, subscriber)| {
+                let plan = subscriber.compact?;
+                let window = u64::from(plan.window);
+                if plan.window_repair == 0 || (part + 1) % window != 0 {
+                    return None;
+                }
+                let first = part + 1 - window;
+                (subscriber.first_part <= first && subscriber.next_part > part).then_some((
+                    *peer,
+                    plan.window,
+                    plan.window_repair,
+                ))
+            })
+            .collect()
+    };
+    if wanted.is_empty() {
+        return;
+    }
+    let ring = store.ring(stream_id);
+    let mut windows: HashMap<u8, Vec<(SocketAddr, u8)>> = HashMap::new();
+    for (peer, window, rows) in wanted {
+        windows.entry(window).or_default().push((peer, rows));
+    }
+    for (window, peers) in windows {
+        let first = part + 1 - u64::from(window);
+        let Some(symbols) = (first..=part)
+            .map(|part| ring.get(part))
+            .collect::<Option<Vec<Bytes>>>()
+        else {
+            continue;
+        };
+        let symbols: Vec<&[u8]> = symbols.iter().map(|symbol| symbol.as_ref()).collect();
+        let rows = peers.iter().map(|(_, rows)| *rows).max().unwrap_or(0);
+        let repair = compact::encode_window_repair(first, &symbols, rows);
+        // Each client is told the rows that it gets (its loss count reads
+        // them): the rows once for each count of rows asked for.
+        let mut by_rows: HashMap<u8, Vec<Vec<u8>>> = HashMap::new();
+        for (_, rows) in &peers {
+            by_rows.entry(*rows).or_insert_with(|| {
+                repair
+                    .iter()
+                    .take(usize::from(*rows))
+                    .map(|datagram| compact::with_rows_sent(datagram, *rows))
+                    .collect()
+            });
+        }
+        let list: Vec<(&[u8], SocketAddr)> = peers
+            .iter()
+            .flat_map(|(peer, rows)| {
+                by_rows[rows]
+                    .iter()
+                    .map(move |datagram| (datagram.as_slice(), *peer))
+            })
+            .collect();
+        stats
+            .compact_window_repair
+            .fetch_add(list.len() as u64, Ordering::Relaxed);
+        send_list(out, config, stats, &list).await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn deliver(
     out: ClientOut<'_>,
+    store: &CompactStore,
     router: &AppRouter,
     table: &Table,
     config: EdgeUdpConfig,
@@ -1451,7 +1865,11 @@ async fn deliver(
     part: u64,
     bytes: Option<Bytes>,
 ) {
-    let (targets, on_fast_lane) = take_due(table, stream_id, part, bytes.is_none());
+    let Due {
+        blocks: mut targets,
+        compact: compact_targets,
+        on_fast_lane,
+    } = take_due(table, stream_id, part, bytes.is_none());
     if bytes.is_some() && !on_fast_lane.is_empty() {
         // The fast lane carries parts, never the init segment: it goes on
         // this lane, in space 2.
@@ -1467,12 +1885,24 @@ async fn deliver(
         )
         .await;
     }
-    if targets.is_empty() {
+    if targets.is_empty() && compact_targets.is_empty() {
         return;
     }
     let object = match bytes {
         Some(bytes) => {
-            send_init_if_new(out, router, table, config, stats, stream_id, part, &targets).await;
+            let everyone: Targets = targets
+                .iter()
+                .copied()
+                .chain(
+                    compact_targets
+                        .iter()
+                        .map(|(peer, repair, _)| (*peer, *repair)),
+                )
+                .collect();
+            send_init_if_new(
+                out, router, table, config, stats, stream_id, part, &everyone,
+            )
+            .await;
             stats.parts.fetch_add(1, Ordering::Relaxed);
             part_object(router, stream_id, part, bytes).await
         }
@@ -1481,7 +1911,22 @@ async fn deliver(
             gap_object(stream_id, part)
         }
     };
-    send_object(out, config, stats, &object, &targets).await;
+    if !compact_targets.is_empty() {
+        match store.of_object(&object) {
+            Some(canonical) => {
+                send_compact(out, config, stats, &canonical, &compact_targets).await;
+            }
+            // Too large for one datagram: a RaptorQ object, as for the rest.
+            None => targets.extend(
+                compact_targets
+                    .iter()
+                    .map(|(peer, repair, _)| (*peer, *repair)),
+            ),
+        }
+    }
+    if !targets.is_empty() {
+        send_object(out, config, stats, &object, &targets).await;
+    }
 }
 
 async fn run_stream_sender(
@@ -1545,6 +1990,7 @@ async fn run_stream_sender(
                 fast_lane_changed(&sockets, &guard);
             }
             if empty {
+                sockets.compact().forget(stream_id);
                 debug!(stream_id, "edge client UDP sender stops: no subscriber");
                 return;
             }
@@ -1686,7 +2132,28 @@ async fn run_stream_sender(
                     }
                 }
             };
-            deliver(out, &router, &table, config, &stats, stream_id, part, bytes).await;
+            deliver(
+                out,
+                sockets.compact(),
+                &router,
+                &table,
+                config,
+                &stats,
+                stream_id,
+                part,
+                bytes,
+            )
+            .await;
+            send_window_repair(
+                sockets.compact(),
+                out,
+                &table,
+                config,
+                &stats,
+                stream_id,
+                part,
+            )
+            .await;
             last_sent = Instant::now();
             continue;
         }
@@ -1705,6 +2172,7 @@ async fn run_stream_sender(
             Ok(Ok(Some((bytes, _)))) => {
                 deliver(
                     out,
+                    sockets.compact(),
                     &router,
                     &table,
                     config,
@@ -1712,6 +2180,16 @@ async fn run_stream_sender(
                     stream_id,
                     part,
                     Some(bytes),
+                )
+                .await;
+                send_window_repair(
+                    sockets.compact(),
+                    out,
+                    &table,
+                    config,
+                    &stats,
+                    stream_id,
+                    part,
                 )
                 .await;
                 last_sent = Instant::now();
@@ -1891,6 +2369,46 @@ fn send_now(
         }
     }
     all
+}
+
+/// Send a compact datagram to each client now, with its copies.
+fn send_compact_now(
+    inner: &CutInner,
+    stream_id: u64,
+    canonical: &[u8],
+    clients: &[(SocketAddr, RepairPolicy, CompactPlan)],
+) {
+    if clients.is_empty() {
+        return;
+    }
+    let marked: Vec<Vec<u8>> = (0..=compact::MAX_COPIES)
+        .map(|copies| compact_marked(canonical, copies, false))
+        .collect();
+    let list: Vec<(&[u8], SocketAddr)> = clients
+        .iter()
+        .flat_map(|(peer, _, plan)| {
+            let datagram = marked[usize::from(plan.copies)].as_slice();
+            std::iter::repeat_n((datagram, *peer), 1 + usize::from(plan.copies))
+        })
+        .collect();
+    inner
+        .stats
+        .compact_parts
+        .fetch_add(clients.len() as u64, Ordering::Relaxed);
+    inner
+        .stats
+        .compact_copies
+        .fetch_add((list.len() - clients.len()) as u64, Ordering::Relaxed);
+    let out = inner.sockets.out_for_stream(stream_id);
+    let (delivered, _) = if out.queue.is_some() {
+        out.send_many(&inner.stats, inner.config.batch_send, false, &list)
+    } else {
+        out.send_each(&inner.stats, &list)
+    };
+    inner
+        .stats
+        .cut_through_datagrams
+        .fetch_add(delivered as u64, Ordering::Relaxed);
 }
 
 impl CutState {
@@ -2414,6 +2932,27 @@ fn new_route(
     {
         return route;
     }
+    // A part in one mesh symbol is whole in this first symbol: the compact
+    // lane's clients take it as its compact datagram, now.
+    let wants_compact = |subscriber: &Subscriber| {
+        subscriber.compact.is_some()
+            && subscriber.fast.is_none()
+            && subscriber.next_part <= slot
+            && !subscriber.cut_slots.contains(&slot)
+    };
+    let compact = (header.source_symbols == 1
+        && inner
+            .table
+            .lock()
+            .unwrap()
+            .get(&stream_id)
+            .is_some_and(|entry| entry.subscribers.values().any(wants_compact)))
+    .then(|| first_symbol.get(..header.transfer_length as usize))
+    .flatten()
+    .and_then(av_mesh::client_udp::cut_through_part)
+    .filter(|object| object.stream_id == stream_id && object.part == slot)
+    .and_then(|object| inner.sockets.compact().of_object(&object));
+    let mut compact_clients: Vec<(SocketAddr, RepairPolicy, CompactPlan)> = Vec::new();
     let clients: Vec<(SocketAddr, RepairPolicy)> = {
         let mut table = inner.table.lock().unwrap();
         let Some(entry) = table.get_mut(&stream_id) else {
@@ -2423,13 +2962,26 @@ fn new_route(
         entry
             .subscribers
             .iter_mut()
-            .filter(|(_, subscriber)| subscriber.next_part <= slot && subscriber.fast.is_none())
-            .map(|(peer, subscriber)| {
+            .filter(|(_, subscriber)| {
+                subscriber.next_part <= slot
+                    && subscriber.fast.is_none()
+                    && !subscriber.cut_slots.contains(&slot)
+            })
+            .filter_map(|(peer, subscriber)| {
                 subscriber.cut_slots.insert(slot);
-                (*peer, subscriber.repair)
+                match (subscriber.compact, &compact) {
+                    (Some(plan), Some(_)) => {
+                        compact_clients.push((*peer, subscriber.repair, plan));
+                        None
+                    }
+                    _ => Some((*peer, subscriber.repair)),
+                }
             })
             .collect()
     };
+    if let Some(canonical) = &compact {
+        send_compact_now(inner, stream_id, canonical, &compact_clients);
+    }
     if clients.is_empty() {
         return route;
     }
@@ -2520,6 +3072,9 @@ mod tests {
             moved_in,
             held_down_counted: false,
             fast: None,
+            compact: None,
+            first_part: 0,
+            nack_interval: (admitted_at, 0),
         }
     }
 

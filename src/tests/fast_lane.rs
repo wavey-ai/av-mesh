@@ -244,13 +244,13 @@ async fn a_soundkit_bundle_is_refused_on_the_fast_lane() {
 
 /// An edge fed by two forwarders on the fast plane, with its client UDP
 /// port and the fast lane.
-struct LaneEdge {
-    cache: Arc<LiveTsCache>,
-    lane: Arc<EdgeFastLane>,
-    client_port: SocketAddr,
+pub(super) struct LaneEdge {
+    pub(super) cache: Arc<LiveTsCache>,
+    pub(super) lane: Arc<EdgeFastLane>,
+    pub(super) client_port: SocketAddr,
     relay_ports: [SocketAddr; 2],
     forwarders: [UdpSocket; 2],
-    stats: Arc<edge_udp::EdgeUdpStats>,
+    pub(super) stats: Arc<edge_udp::EdgeUdpStats>,
     holes: Option<Arc<edge_holes::HoleTrigger>>,
     shutdown_tx: watch::Sender<()>,
     ingest: tokio::task::JoinHandle<Result<()>>,
@@ -258,7 +258,7 @@ struct LaneEdge {
 }
 
 impl LaneEdge {
-    async fn start(ip: Ipv4Addr) -> Self {
+    pub(super) async fn start(ip: Ipv4Addr) -> Self {
         Self::start_with(ip, Duration::ZERO).await
     }
 
@@ -360,7 +360,7 @@ impl LaneEdge {
     /// The forwarders send an object's symbols: F1 its sources (except
     /// when `lost_at_1`) and its repair, F2 its sources, as both forward an
     /// audio stream in full (and F2, a video stream's repair).
-    async fn send(
+    pub(super) async fn send(
         &self,
         video: bool,
         (sources, repairs): &(Vec<Vec<u8>>, Vec<Vec<u8>>),
@@ -386,14 +386,14 @@ impl LaneEdge {
         }
     }
 
-    async fn head(&self, stream_id: u64) -> Option<u64> {
+    pub(super) async fn head(&self, stream_id: u64) -> Option<u64> {
         self.cache
             .stream_position_for_id(stream_id)
             .await
             .map(|(_, last)| last as u64)
     }
 
-    async fn stop(self) {
+    pub(super) async fn stop(self) {
         let _ = self.shutdown_tx.send(());
         self.ingest.await.unwrap().unwrap();
         self.udp.await.unwrap().unwrap();
@@ -460,6 +460,7 @@ async fn lane_client(
             repair,
             token,
             fast_lane: true,
+            compact: None,
         }
         .encode()
     };

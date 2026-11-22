@@ -16,10 +16,11 @@
 //!
 //!   | from   | text                                                          |
 //!   | ------ | ------------------------------------------------------------- |
-//!   | client | `SUB <stream> <from part or -> <repair ‰> <min repair> <loss ppm> <token or -> [F1]` |
+//!   | client | `SUB <stream> <from part or -> <repair ‰> <min repair> <loss ppm> <token or -> [F1] [C<copies>.<window>.<repair>]` |
 //!   | client | `UNSUB <stream> <token>`                                      |
+//!   | client | `NACK <stream> <token> <part> [<part> ...]`                   |
 //!   | edge   | `TOKEN <stream> <token>`                                      |
-//!   | edge   | `OK <stream> <next part>`                                     |
+//!   | edge   | `OK <stream> <next part> [C]`                                 |
 //!   | edge   | `WAIT <stream> <next part>`                                   |
 //!   | edge   | `REFUSED <stream> <reason>`                                   |
 //!   | edge   | `MOVE <stream> <reason>`                                      |
@@ -54,10 +55,20 @@
 //! init segment, parts older than the fast lane's first and gaps come on the
 //! cache-fed lane as before.
 //!
+//! The compact lane (`crate::client_compact`): a `SUB` with a `C` word asks
+//! for it, and an edge that has it answers `OK ... C`. A part that fits one
+//! datagram then comes as one compact datagram, not as a RaptorQ block,
+//! with the copies and the repair across parts that the word asks for, and
+//! the client asks for a part it misses with `NACK`. Parts that do not fit
+//! (4K video), and the init segment, keep their RaptorQ blocks, with the
+//! repair of the `SUB`'s policy.
+//!
 //! One client socket carries one stream: block ids are per stream. A client
 //! that moves to another edge starts a new decoder ([`ObjectReceiver::new_flow`]):
 //! two edges encode one part into different symbols.
 
+pub use crate::client_compact::CompactPlan;
+use crate::client_compact::{self as compact, CompactReceiver};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use raptorq_datagram_fec::{DatagramFecDecoder, DatagramFecEncoder, DatagramFecHeader};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -75,10 +86,16 @@ pub const KEEPALIVE: Duration = Duration::from_millis(300);
 /// with its headers, the smallest IPv6 path MTU. A small part is sent in
 /// symbols of its own size.
 pub const DEFAULT_SYMBOL_SIZE: u16 = 1_200;
-/// Repair asked for before any loss is measured: a quarter of the source
-/// symbols, and at least three.
-pub const DEFAULT_REPAIR_PERMILLE: u32 = 250;
-pub const DEFAULT_MIN_REPAIR_SYMBOLS: u32 = 3;
+/// Repair of a RaptorQ block on a path with no measured loss: one symbol
+/// (the loss that a client measures adds to it, see
+/// [`RepairPolicy::for_loss`]). Until wave 5 it was a quarter of the source
+/// symbols and at least three: four datagrams for every one-symbol part,
+/// about 13 Mbit/s for a client of 2.5 ms Opus. A client asks for the old
+/// repair with `--repair-permille 250 --min-repair 3`.
+pub const DEFAULT_REPAIR_PERMILLE: u32 = 0;
+pub const DEFAULT_MIN_REPAIR_SYMBOLS: u32 = 1;
+/// The most parts of one `NACK`.
+pub const MAX_NACK_PARTS: usize = 64;
 /// The most repair an edge sends for one subscriber.
 pub const MAX_REPAIR_PERMILLE: u32 = 1_000;
 pub const MAX_MIN_REPAIR_SYMBOLS: u32 = 16;
@@ -193,10 +210,18 @@ pub enum Control {
         token: Option<u64>,
         /// The client takes the fast lane (`F1`).
         fast_lane: bool,
+        /// The client takes the compact lane, with this plan (`C...`).
+        compact: Option<CompactPlan>,
     },
     Unsubscribe {
         stream_id: u64,
         token: u64,
+    },
+    /// The client asks for parts again (compact lane).
+    Nack {
+        stream_id: u64,
+        token: u64,
+        parts: Vec<u64>,
     },
     Token {
         stream_id: u64,
@@ -205,6 +230,8 @@ pub enum Control {
     Subscribed {
         stream_id: u64,
         next_part: u64,
+        /// The edge sends the compact lane (`C`).
+        compact: bool,
     },
     Waiting {
         stream_id: u64,
@@ -225,6 +252,7 @@ impl Control {
         match self {
             Self::Subscribe { stream_id, .. }
             | Self::Unsubscribe { stream_id, .. }
+            | Self::Nack { stream_id, .. }
             | Self::Token { stream_id, .. }
             | Self::Subscribed { stream_id, .. }
             | Self::Waiting { stream_id, .. }
@@ -241,8 +269,9 @@ impl Control {
                 repair,
                 token,
                 fast_lane,
+                compact,
             } => format!(
-                "{CONTROL_PREFIX}SUB {stream_id} {} {} {} {} {}{}",
+                "{CONTROL_PREFIX}SUB {stream_id} {} {} {} {} {}{}{}",
                 from_part.map_or_else(|| "-".to_owned(), |part| part.to_string()),
                 repair.permille,
                 repair.min_symbols,
@@ -254,9 +283,22 @@ impl Control {
                     |token| format!("{token:016x}")
                 ),
                 if *fast_lane { " F1" } else { "" },
+                compact.map_or_else(String::new, |plan| format!(" {}", plan.word())),
             ),
             Self::Unsubscribe { stream_id, token } => {
                 format!("{CONTROL_PREFIX}UNSUB {stream_id} {token:016x}")
+            }
+            Self::Nack {
+                stream_id,
+                token,
+                parts,
+            } => {
+                let mut text = format!("{CONTROL_PREFIX}NACK {stream_id} {token:016x}");
+                for part in parts.iter().take(MAX_NACK_PARTS) {
+                    text.push(' ');
+                    text.push_str(&part.to_string());
+                }
+                text
             }
             Self::Token { stream_id, token } => {
                 format!("{CONTROL_PREFIX}TOKEN {stream_id} {token:016x}")
@@ -264,7 +306,11 @@ impl Control {
             Self::Subscribed {
                 stream_id,
                 next_part,
-            } => format!("{CONTROL_PREFIX}OK {stream_id} {next_part}"),
+                compact,
+            } => format!(
+                "{CONTROL_PREFIX}OK {stream_id} {next_part}{}",
+                if *compact { " C" } else { "" }
+            ),
             Self::Waiting {
                 stream_id,
                 next_part,
@@ -310,10 +356,15 @@ impl Control {
                     }
                     word => Some(token(word)?),
                 };
-                // The optional last word of a client that takes the fast
-                // lane; a request without it parses as before.
+                // The optional last words of a client that takes the fast
+                // lane (`F1`) and the compact lane (`C...`), in this order;
+                // a request without them parses as before.
                 let fast_lane = words.clone().next() == Some("F1");
                 if fast_lane {
+                    words.next();
+                }
+                let compact = words.clone().next().and_then(CompactPlan::parse_word);
+                if compact.is_some() {
                     words.next();
                 }
                 Self::Subscribe {
@@ -326,20 +377,47 @@ impl Control {
                     },
                     token,
                     fast_lane,
+                    compact,
                 }
             }
             "UNSUB" => Self::Unsubscribe {
                 stream_id,
                 token: token(words.next()?)?,
             },
+            "NACK" => {
+                let token = token(words.next()?)?;
+                let mut parts = Vec::new();
+                for word in words.by_ref() {
+                    if parts.len() == MAX_NACK_PARTS {
+                        return None;
+                    }
+                    parts.push(word.parse().ok()?);
+                }
+                if parts.is_empty() {
+                    return None;
+                }
+                Self::Nack {
+                    stream_id,
+                    token,
+                    parts,
+                }
+            }
             "TOKEN" => Self::Token {
                 stream_id,
                 token: token(words.next()?)?,
             },
-            "OK" => Self::Subscribed {
-                stream_id,
-                next_part: words.next()?.parse().ok()?,
-            },
+            "OK" => {
+                let next_part = words.next()?.parse().ok()?;
+                let compact = words.clone().next() == Some("C");
+                if compact {
+                    words.next();
+                }
+                Self::Subscribed {
+                    stream_id,
+                    next_part,
+                    compact,
+                }
+            }
             "WAIT" => Self::Waiting {
                 stream_id,
                 next_part: words.next()?.parse().ok()?,
@@ -570,6 +648,12 @@ pub fn slot_published_unix_us(payload: &Bytes) -> Option<u64> {
         .filter(|us| *us > 0)
 }
 
+/// The part of a cache-mesh chunk frame, as the client of a cut-through
+/// block decodes it.
+pub fn cut_through_part(frame: &[u8]) -> Option<PartObject> {
+    cut_through_object(frame)
+}
+
 /// The object of a cut-through block: the cache-mesh chunk frame of a part.
 fn cut_through_object(frame: &[u8]) -> Option<PartObject> {
     let (stream_id, slot, payload) = playlists::mesh::chunk_frame_payload(frame)?;
@@ -664,6 +748,21 @@ pub struct ObjectReceiver {
     /// (a contributor restart: its part numbers start again).
     pub fast_epoch: Option<u64>,
     pub fast_epoch_changes: u64,
+    /// The compact lane's receiver.
+    pub compact: CompactReceiver,
+    /// The stream of this receiver, for the objects of the compact lane
+    /// (whose datagrams do not carry it): see [`Self::expect`].
+    pub stream_id: u64,
+    /// Bytes of the media datagrams received, with their IPv4 and UDP
+    /// headers ([`compact::IP_UDP_HEADER_BYTES`] each): what they cost on
+    /// the wire.
+    pub wire_bytes: u64,
+    /// Decoded parts that another lane (or a copy) had delivered already,
+    /// and that `push` did not return again.
+    pub duplicate_parts: u64,
+    /// Objects that one datagram delivered beyond the one `push` returned
+    /// (a window's repair recovers several): see [`Self::next_ready`].
+    ready: VecDeque<PartObject>,
 }
 
 /// A block is counted for loss once its datagrams have had this long to
@@ -689,12 +788,87 @@ impl ObjectReceiver {
         self.blocks.clear();
         self.settled.clear();
         self.settled_order.clear();
+        self.compact.new_flow();
         self.flows += 1;
+    }
+
+    /// The edge's `OK`: the stream, the part that it sends first (the
+    /// reference for the compact lane's 32-bit part numbers) and whether it
+    /// sends the compact lane (holes are then asked for with NACK).
+    pub fn expect(&mut self, stream_id: u64, next_part: u64, compact: bool) {
+        self.stream_id = stream_id;
+        self.compact.expect_from(next_part, compact);
+    }
+
+    /// The next object that the last `push` delivered besides the one it
+    /// returned.
+    pub fn next_ready(&mut self) -> Option<PartObject> {
+        self.ready.pop_front()
+    }
+
+    /// Push one datagram and take every object that it delivered.
+    pub fn push_all(&mut self, datagram: &[u8]) -> Vec<PartObject> {
+        let mut objects: Vec<PartObject> = self.push(datagram).into_iter().collect();
+        objects.extend(self.ready.drain(..));
+        objects
+    }
+
+    /// Parts to ask the edge for again now (compact lane), at most
+    /// [`MAX_NACK_PARTS`].
+    pub fn nacks_due(&mut self, now: Instant) -> Vec<u64> {
+        self.compact.nacks_due(now, MAX_NACK_PARTS)
+    }
+
+    /// The compact lane: push one compact datagram.
+    fn push_compact(&mut self, datagram: &[u8]) -> Option<PartObject> {
+        let now_unix_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_micros() as u64);
+        let before = self.compact.stats;
+        let parts = self.compact.push(datagram, Instant::now(), now_unix_us);
+        let after = self.compact.stats;
+        self.errors += after.errors - before.errors;
+        self.duplicate_parts += after.duplicates - before.duplicates;
+        for part in parts {
+            self.objects += 1;
+            if part.recovered {
+                self.recovered_objects += 1;
+            }
+            // The other lanes' blocks of the part will not complete, and are
+            // not loss.
+            for other in [
+                cut_through_block_id(part.part),
+                block_id(ObjectKind::Part, part.part),
+                fast_block_id(part.part),
+            ] {
+                if self.blocks.remove(&other).is_some() {
+                    self.settle(other);
+                }
+            }
+            self.ready.push_back(PartObject {
+                kind: match part.kind {
+                    compact::Kind::Gap => ObjectKind::Gap,
+                    _ => ObjectKind::Part,
+                },
+                datagrams: 0,
+                stream_id: self.stream_id,
+                part: part.part,
+                available_unix_us: 0,
+                published_unix_us: part.published_unix_us,
+                payload: Bytes::from(part.payload),
+            });
+        }
+        self.ready.pop_front()
     }
 
     /// Push one media datagram. Returns the object that it completed.
     pub fn push(&mut self, datagram: &[u8]) -> Option<PartObject> {
         self.datagrams += 1;
+        self.wire_bytes += (datagram.len() + compact::IP_UDP_HEADER_BYTES) as u64;
+        self.last_fast_envelope_bytes = None;
+        if compact::is_compact(datagram) {
+            return self.push_compact(datagram);
+        }
         let header = match DatagramFecHeader::decode(datagram) {
             Ok(header) => header,
             Err(_) => {
@@ -723,7 +897,6 @@ impl ObjectReceiver {
             .get(&header.block_id)
             .map_or(0, |count| count.received);
         let space = block_space(header.block_id);
-        self.last_fast_envelope_bytes = None;
         match self.decoders[space].push_datagram(datagram) {
             Ok(Some(bytes)) => match decode_any_object(bytes) {
                 Ok((object, fast)) => {
@@ -757,6 +930,16 @@ impl ObjectReceiver {
                                 self.settle(other);
                             }
                         }
+                    }
+                    if matches!(object.kind, ObjectKind::Part | ObjectKind::Gap)
+                        && !self
+                            .compact
+                            .delivered_elsewhere(object.part, Instant::now())
+                    {
+                        // A part that the compact lane (or another block)
+                        // delivered already.
+                        self.duplicate_parts += 1;
+                        return None;
                     }
                     Some(object)
                 }
@@ -835,6 +1018,12 @@ impl ObjectReceiver {
             self.sent_datagrams += u64::from(sent);
             self.lost_datagrams += u64::from(sent - received);
         }
+        // The compact lane's parts and window repair.
+        let (received, sent) = self.compact.take_counts(now);
+        self.window_received += received;
+        self.window_sent += sent;
+        self.sent_datagrams += sent;
+        self.lost_datagrams += sent - received;
         if self.window_sent == 0 {
             return None;
         }
@@ -992,6 +1181,7 @@ mod tests {
                 repair: RepairPolicy::default(),
                 token: Some(0xdead_beef_0123_4567),
                 fast_lane: false,
+                compact: None,
             },
             Control::Subscribe {
                 stream_id: 1,
@@ -1003,6 +1193,32 @@ mod tests {
                 },
                 token: None,
                 fast_lane: false,
+                compact: None,
+            },
+            Control::Subscribe {
+                stream_id: 4001,
+                from_part: Some(7),
+                repair: RepairPolicy::default(),
+                token: Some(3),
+                fast_lane: true,
+                compact: Some(CompactPlan::CLEAN),
+            },
+            Control::Subscribe {
+                stream_id: 4001,
+                from_part: None,
+                repair: RepairPolicy::default(),
+                token: None,
+                fast_lane: false,
+                compact: Some(CompactPlan {
+                    copies: 1,
+                    window: 16,
+                    window_repair: 2,
+                }),
+            },
+            Control::Nack {
+                stream_id: 4001,
+                token: 0xfeed,
+                parts: vec![12, 13, 900_000_000_001],
             },
             Control::Unsubscribe {
                 stream_id: 9,
@@ -1015,6 +1231,12 @@ mod tests {
             Control::Subscribed {
                 stream_id: 9,
                 next_part: 77,
+                compact: false,
+            },
+            Control::Subscribed {
+                stream_id: 9,
+                next_part: 78,
+                compact: true,
             },
             Control::Waiting {
                 stream_id: 9,
@@ -1034,6 +1256,33 @@ mod tests {
         assert_eq!(Control::decode(b"WAVEY-DAW-SUBSCRIBE/2 5"), None);
         assert_eq!(Control::decode(b"NTU/1 SUB 5 - 1"), None);
         assert_eq!(Control::decode(b"NTU/1 SUB 5 - 1 2 3 - x"), None);
+        // A NACK names at least one part and at most MAX_NACK_PARTS.
+        assert_eq!(Control::decode(b"NTU/1 NACK 5 00ff"), None);
+        let many: String = (0..=MAX_NACK_PARTS)
+            .map(|part| format!(" {part}"))
+            .collect();
+        assert_eq!(
+            Control::decode(format!("NTU/1 NACK 5 00ff{many}").as_bytes()),
+            None
+        );
+        // An OK from an edge without the compact lane parses as before.
+        assert_eq!(
+            Control::decode(b"NTU/1 OK 5 9"),
+            Some(Control::Subscribed {
+                stream_id: 5,
+                next_part: 9,
+                compact: false
+            })
+        );
+        // The compact word comes after F1, once.
+        assert_eq!(
+            Control::decode(b"NTU/1 SUB 5 - 0 1 0 00ff C0.32.1 F1"),
+            None
+        );
+        assert_eq!(
+            Control::decode(b"NTU/1 SUB 5 - 0 1 0 00ff C0.32.1 C0.32.1"),
+            None
+        );
     }
 
     #[test]
@@ -1046,6 +1295,7 @@ mod tests {
                     repair: RepairPolicy::default(),
                     token,
                     fast_lane,
+                    compact: None,
                 };
                 let encoded = control.encode();
                 assert_eq!(encoded.ends_with(b" F1"), fast_lane);
@@ -1059,9 +1309,14 @@ mod tests {
             Some(Control::Subscribe {
                 stream_id: 4001,
                 from_part: Some(12),
-                repair: RepairPolicy::default(),
+                repair: RepairPolicy {
+                    permille: 250,
+                    min_symbols: 3,
+                    loss_ppm: 0
+                },
                 token: Some(0xdead_beef),
                 fast_lane: false,
+                compact: None,
             })
         );
         let first = format!("NTU/1 SUB 4001 - 250 3 0 - {}", ".".repeat(48));
@@ -1242,7 +1497,8 @@ mod tests {
             from_part: None,
             repair: RepairPolicy::default(),
             token: None,
-            fast_lane: false,
+            fast_lane: true,
+            compact: Some(CompactPlan::CLEAN),
         };
         let answer = Control::Token {
             stream_id: 1,

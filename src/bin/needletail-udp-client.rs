@@ -24,9 +24,18 @@
 //! client builds the part from the canonical envelope with the edge's own
 //! slot functions. The report counts the parts of each lane and the envelope
 //! bytes of the fast-lane parts.
+//!
+//! With `--compact` (the default) it asks for the compact lane
+//! (`av_mesh::client_compact`): each part that fits one datagram comes as
+//! one, with the copies and the repair across parts that the client sizes
+//! from the loss and the bursts it measures, and it asks for a part it
+//! misses again (`NACK`). The report gives the bytes received on the wire
+//! (with IP and UDP headers) and their rate, beside the parts' own bytes.
 
 use anyhow::{anyhow, bail, Context, Result};
-use av_mesh::client_udp::{Control, ObjectKind, ObjectReceiver, PartObject, RepairPolicy, REFRESH};
+use av_mesh::client_udp::{
+    CompactPlan, Control, ObjectKind, ObjectReceiver, PartObject, RepairPolicy, REFRESH,
+};
 use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use http::{Request, StatusCode};
@@ -99,6 +108,12 @@ struct Args {
     /// alone, as before.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     fast_lane: bool,
+    /// Ask the edge for the compact lane: a part that fits one datagram as
+    /// one datagram, with repair across parts and NACK. `false` takes the
+    /// RaptorQ lane alone, as before (with `--repair-permille 250
+    /// --min-repair 3` the repair of before wave 5 as well).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    compact: bool,
 }
 
 fn now_unix_us() -> u64 {
@@ -362,6 +377,18 @@ struct Report {
     final_loss_ppm: u32,
     flows: u64,
     payload_bytes: u64,
+    /// Bytes of the media datagrams received, with 28 bytes of IPv4 and UDP
+    /// header each, and their rate over the parts' time.
+    wire_bytes: u64,
+    wire_bits_per_second: Option<f64>,
+    /// Wire bytes over the parts' own bytes.
+    wire_per_payload: Option<f64>,
+    compact_asked: bool,
+    compact_confirmed: bool,
+    final_compact_plan: Option<String>,
+    compact_plan_changes: u64,
+    burst_estimate_max: Option<f64>,
+    compact: CompactReport,
     fast_lane_asked: bool,
     /// Parts that came on the fast lane, and on the cache-fed lane.
     fast_lane_parts: u64,
@@ -376,6 +403,21 @@ struct Report {
     publish_to_arrival_ms: Percentiles,
     available_to_arrival_ms: Percentiles,
     time_to_first_part_ms: Option<f64>,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct CompactReport {
+    datagrams: u64,
+    parts: u64,
+    gaps: u64,
+    duplicates: u64,
+    retransmits: u64,
+    repair_datagrams: u64,
+    recovered_by_window: u64,
+    nack_parts_sent: u64,
+    nack_datagrams_sent: u64,
+    holes_abandoned: u64,
+    errors: u64,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -401,6 +443,7 @@ async fn subscribe(
     args: &Args,
     from_part: Option<u64>,
     repair: RepairPolicy,
+    compact: CompactPlan,
     token: Option<u64>,
 ) {
     let control = Control::Subscribe {
@@ -409,6 +452,7 @@ async fn subscribe(
         repair,
         token,
         fast_lane: args.fast_lane,
+        compact: args.compact.then_some(compact),
     };
     // A failed send is a lost request: the next refresh repeats it.
     let _ = socket.send_to(&control.encode(), target).await;
@@ -538,6 +582,19 @@ async fn main() -> Result<()> {
     let mut loss_estimate: Option<f64> = None;
     let mut loss_samples: Vec<f64> = Vec::new();
     let mut repair_changes = 0_u64;
+    // The compact lane's plan: window repair alone until the path shows
+    // loss.
+    let mut plan = CompactPlan::CLEAN;
+    let mut plan_changes = 0_u64;
+    let mut burst_estimate: Option<f64> = None;
+    // The compact plan follows a smoother estimate: NACK covers what a
+    // short rise of the loss leaves, so it need not rise at once.
+    let mut compact_estimate: Option<f64> = None;
+    let mut burst_samples: Vec<f64> = Vec::new();
+    let mut compact_confirmed = false;
+    let mut nack_datagrams = 0_u64;
+    let mut first_published_us: Option<u64> = None;
+    let mut last_published_us: Option<u64> = None;
 
     'caches: while Instant::now() < deadline {
         let (caches, port) = match assignment(&http, &args, current.as_deref()).await {
@@ -627,7 +684,7 @@ async fn main() -> Result<()> {
         current = Some(cache.node_id.clone());
         caches_used.push(cache.node_id.clone());
         let mut token: Option<u64> = None;
-        subscribe(&socket, target, &args, next_part, repair, token).await;
+        subscribe(&socket, target, &args, next_part, repair, plan, token).await;
         let asked_at = Instant::now();
         let mut last_datagram = Instant::now();
         // Until the cache answers, the request is repeated often.
@@ -675,6 +732,15 @@ async fn main() -> Result<()> {
                         _ => loss,
                     };
                     loss_estimate = Some(estimate);
+                    let smooth = av_mesh::client_compact::smoothed_loss(compact_estimate, loss);
+                    compact_estimate = Some(smooth);
+                    if let Some(burst) = receiver.compact.take_burst() {
+                        burst_samples.push(burst);
+                        burst_estimate = Some(match burst_estimate {
+                            Some(previous) => previous * 0.7 + burst * 0.3,
+                            None => burst,
+                        });
+                    }
                     if !args.fixed_repair {
                         let wanted = RepairPolicy::for_loss(estimate, base_repair);
                         if wanted != repair {
@@ -682,6 +748,32 @@ async fn main() -> Result<()> {
                             repair_changes += 1;
                             next_refresh = now;
                         }
+                        let wanted =
+                            CompactPlan::for_measured(smooth, burst_estimate.unwrap_or(1.0));
+                        if wanted != plan {
+                            plan = wanted;
+                            plan_changes += 1;
+                            next_refresh = now;
+                        }
+                    }
+                }
+            }
+            if compact_confirmed {
+                if let Some(token) = token {
+                    let parts = receiver.nacks_due(now);
+                    if !parts.is_empty() {
+                        nack_datagrams += 1;
+                        let _ = socket
+                            .send_to(
+                                &Control::Nack {
+                                    stream_id: args.stream,
+                                    token,
+                                    parts,
+                                }
+                                .encode(),
+                                target,
+                            )
+                            .await;
                     }
                 }
             }
@@ -693,6 +785,7 @@ async fn main() -> Result<()> {
                     &args,
                     if subscribed { None } else { next_part },
                     repair,
+                    plan,
                     token,
                 )
                 .await;
@@ -708,11 +801,16 @@ async fn main() -> Result<()> {
             } else {
                 asked_at + Duration::from_millis(args.answer_ms)
             };
-            let wait = deadline
+            let mut wake = deadline
                 .min(next_refresh)
                 .min(next_loss_check)
-                .min(silence_at + Duration::from_millis(1))
-                .saturating_duration_since(now);
+                .min(silence_at + Duration::from_millis(1));
+            if compact_confirmed {
+                if let Some(at) = receiver.compact.next_nack_at() {
+                    wake = wake.min(at);
+                }
+            }
+            let wait = wake.saturating_duration_since(now);
             let (len, peer) = match tokio::time::timeout(wait, socket.recv_from(&mut buf)).await {
                 Ok(Ok(received)) => received,
                 Ok(Err(_)) => continue,
@@ -727,15 +825,19 @@ async fn main() -> Result<()> {
                     Control::Token { token: given, .. } => {
                         if token != Some(given) {
                             token = Some(given);
-                            subscribe(&socket, target, &args, next_part, repair, token).await;
+                            subscribe(&socket, target, &args, next_part, repair, plan, token).await;
                         }
                     }
                     Control::Subscribed {
-                        next_part: first, ..
+                        next_part: first,
+                        compact,
+                        ..
                     } => {
                         if !subscribed {
                             first_subscribed_part.get_or_insert(first);
+                            receiver.expect(args.stream, first, compact);
                         }
+                        compact_confirmed = compact;
                         subscribed = true;
                         next_refresh = Instant::now() + REFRESH;
                     }
@@ -748,62 +850,72 @@ async fn main() -> Result<()> {
                 }
                 continue;
             }
-            let Some(object) = receiver.push(&buf[..len]) else {
-                continue;
-            };
+            let objects = receiver.push_all(&buf[..len]);
             let fast_envelope = receiver.last_fast_envelope_bytes;
             let arrival_us = now_unix_us();
-            let PartObject {
-                kind,
-                part,
-                payload,
-                published_unix_us,
-                available_unix_us,
-                ..
-            } = object;
-            match kind {
-                ObjectKind::Init => init_objects += 1,
-                ObjectKind::Gap => {
-                    gaps.insert(part);
-                }
-                ObjectKind::Part => {
-                    if received.contains_key(&part) {
-                        duplicates += 1;
-                        continue;
+            for object in objects {
+                let PartObject {
+                    kind,
+                    part,
+                    payload,
+                    published_unix_us,
+                    available_unix_us,
+                    ..
+                } = object;
+                match kind {
+                    ObjectKind::Init => init_objects += 1,
+                    ObjectKind::Gap => {
+                        gaps.insert(part);
                     }
-                    first_part_ms.get_or_insert(started.elapsed().as_secs_f64() * 1_000.0);
-                    match fast_envelope {
-                        Some(envelope) => {
-                            fast_lane_parts += 1;
-                            fast_envelope_bytes.push(envelope as f64);
-                            fast_envelope_overhead
-                                .push(envelope.saturating_sub(payload.len()) as f64);
+                    ObjectKind::Part => {
+                        if received.contains_key(&part) {
+                            duplicates += 1;
+                            continue;
                         }
-                        None => cache_lane_parts += 1,
-                    }
-                    received.insert(part, payload.len());
-                    payload_bytes += payload.len() as u64;
-                    if published_unix_us > 0 {
-                        publish_ms
-                            .push(arrival_us.saturating_sub(published_unix_us) as f64 / 1_000.0);
-                    }
-                    if available_unix_us > 0 {
-                        available_ms
-                            .push(arrival_us.saturating_sub(available_unix_us) as f64 / 1_000.0);
-                    }
-                    if parts_out.is_some() {
-                        written_parts.insert(part, payload.clone());
-                    }
-                    if args.verify_http {
-                        let _ = verify_tx.send(VerifyJob {
-                            authority: cache.base.authority.clone(),
-                            path: format!(
-                                "{}/{}/part{part}.{extension}",
-                                cache.base.path, args.stream
-                            ),
-                            part,
-                            payload,
-                        });
+                        first_part_ms.get_or_insert(started.elapsed().as_secs_f64() * 1_000.0);
+                        match fast_envelope {
+                            Some(envelope) => {
+                                fast_lane_parts += 1;
+                                fast_envelope_bytes.push(envelope as f64);
+                                fast_envelope_overhead
+                                    .push(envelope.saturating_sub(payload.len()) as f64);
+                            }
+                            None => cache_lane_parts += 1,
+                        }
+                        received.insert(part, payload.len());
+                        payload_bytes += payload.len() as u64;
+                        if published_unix_us > 0 {
+                            first_published_us =
+                                Some(first_published_us.map_or(published_unix_us, |first| {
+                                    first.min(published_unix_us)
+                                }));
+                            last_published_us = Some(
+                                last_published_us
+                                    .map_or(published_unix_us, |last| last.max(published_unix_us)),
+                            );
+                            publish_ms.push(
+                                arrival_us.saturating_sub(published_unix_us) as f64 / 1_000.0,
+                            );
+                        }
+                        if available_unix_us > 0 {
+                            available_ms.push(
+                                arrival_us.saturating_sub(available_unix_us) as f64 / 1_000.0,
+                            );
+                        }
+                        if parts_out.is_some() {
+                            written_parts.insert(part, payload.clone());
+                        }
+                        if args.verify_http {
+                            let _ = verify_tx.send(VerifyJob {
+                                authority: cache.base.authority.clone(),
+                                path: format!(
+                                    "{}/{}/part{part}.{extension}",
+                                    cache.base.path, args.stream
+                                ),
+                                part,
+                                payload,
+                            });
+                        }
                     }
                 }
             }
@@ -840,6 +952,11 @@ async fn main() -> Result<()> {
             .collect(),
         _ => Vec::new(),
     };
+    let span_s = match (first_published_us, last_published_us) {
+        (Some(first), Some(last)) if last > first => Some((last - first) as f64 / 1e6),
+        _ => None,
+    };
+    let stats = receiver.compact.stats;
     let report = Report {
         schema: "needletail.udp-client.v1",
         stream_id: args.stream,
@@ -872,6 +989,28 @@ async fn main() -> Result<()> {
         final_loss_ppm: repair.loss_ppm,
         flows: receiver.flows,
         payload_bytes,
+        wire_bytes: receiver.wire_bytes,
+        wire_bits_per_second: span_s.map(|span| receiver.wire_bytes as f64 * 8.0 / span),
+        wire_per_payload: (payload_bytes > 0)
+            .then(|| receiver.wire_bytes as f64 / payload_bytes as f64),
+        compact_asked: args.compact,
+        compact_confirmed,
+        final_compact_plan: args.compact.then(|| plan.word()),
+        compact_plan_changes: plan_changes,
+        burst_estimate_max: burst_samples.iter().copied().reduce(f64::max),
+        compact: CompactReport {
+            datagrams: stats.datagrams,
+            parts: stats.parts,
+            gaps: stats.gaps,
+            duplicates: stats.duplicates,
+            retransmits: stats.retransmits,
+            repair_datagrams: stats.repair_datagrams,
+            recovered_by_window: stats.recovered,
+            nack_parts_sent: stats.nacked,
+            nack_datagrams_sent: nack_datagrams,
+            holes_abandoned: stats.abandoned,
+            errors: stats.errors,
+        },
         fast_lane_asked: args.fast_lane,
         fast_lane_parts,
         cache_lane_parts,

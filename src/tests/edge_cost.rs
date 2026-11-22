@@ -390,6 +390,7 @@ fn run_bench(bench: &Bench) -> Measured {
                         repair: RepairPolicy::default(),
                         token,
                         fast_lane: false,
+                        compact: None,
                     }
                     .encode()
                 };
