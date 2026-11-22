@@ -52,6 +52,32 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Semaphore};
 use tokio_rustls::TlsConnector;
 
+/// An edge that has not answered the compact lane's requests for this long
+/// (and three of them) is asked without it.
+const COMPACT_FALLBACK_AFTER: Duration = Duration::from_millis(1_500);
+
+/// Whether a client that asked for the compact lane and has had no answer
+/// (no token, no OK) to `unanswered` requests over `waited` asks without it
+/// from now on: three requests and 1.5 s (wave 7 review: a lost ARP request
+/// held the first datagrams of a lossy path for a second, and the client
+/// left the compact lane, and so the fast lane, for the whole run).
+fn falls_back_from_compact(
+    compact_asked: bool,
+    answered: bool,
+    unanswered: u32,
+    waited: Duration,
+) -> bool {
+    compact_asked && !answered && unanswered >= 3 && waited >= COMPACT_FALLBACK_AFTER
+}
+
+/// Whether an OK (compact or not) to a request with `plan` means the edge
+/// refused the short form: it asked for the compact lane in the short form
+/// and was refused the lane. An edge older than the short form refuses a
+/// plan word with it (`C...7`); the client asks again with the long form.
+fn drops_short_header(compact: bool, compact_asked: bool, plan: CompactPlan) -> bool {
+    !compact && compact_asked && plan.short_header
+}
+
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "needletail-udp-client",
@@ -459,6 +485,9 @@ struct Report {
     /// Edges that did not answer a request for the compact lane and were
     /// asked without it.
     compact_fallbacks: u64,
+    /// Edges that refused the compact lane asked with the short form, and
+    /// were asked again with the long form.
+    compact_short_header_dropped: u64,
     /// The round trip to the edge that the NACKs wait for.
     nack_rtt_ms: Option<f64>,
     /// The NACK timing asked for, and the interval between parts measured.
@@ -770,7 +799,10 @@ async fn main() -> Result<()> {
     let mut repair_changes = 0_u64;
     // The compact lane's plan: window repair alone until the path shows
     // loss.
-    let mut plan = CompactPlan::CLEAN.with_short_header(args.compact_short_header);
+    // The short form, until an edge refuses it (see the OK without C).
+    let mut short_header = args.compact_short_header;
+    let mut short_header_dropped = 0_u64;
+    let mut plan = CompactPlan::CLEAN.with_short_header(short_header);
     let mut plan_changes = 0_u64;
     let mut burst_estimate: Option<f64> = None;
     // The compact plan follows a smoother estimate: NACK covers what a
@@ -1046,7 +1078,7 @@ async fn main() -> Result<()> {
                             burst_estimate.unwrap_or(1.0),
                             args.compact_burst_rows,
                         )
-                        .with_short_header(args.compact_short_header);
+                        .with_short_header(short_header);
                         if wanted != plan {
                             plan = wanted;
                             plan_changes += 1;
@@ -1077,8 +1109,16 @@ async fn main() -> Result<()> {
             if now >= next_refresh {
                 // An edge that has not answered two requests for the compact
                 // lane (an edge older than the lane drops them) is asked
-                // without it, on the RaptorQ lane with its repair.
-                if compact_asked && token.is_none() && !subscribed && unanswered >= 3 {
+                // without it, on the RaptorQ lane with its repair: for the
+                // rest of the run, so only after 1.5 s of silence (a lost ARP
+                // request alone holds a path's first datagrams for a second;
+                // wave 7 review).
+                if falls_back_from_compact(
+                    compact_asked,
+                    token.is_some() || subscribed,
+                    unanswered,
+                    asked_at.elapsed(),
+                ) {
                     compact_asked = false;
                     compact_fallbacks += 1;
                     eprintln!(
@@ -1174,6 +1214,22 @@ async fn main() -> Result<()> {
                         compact,
                         ..
                     } => {
+                        // An edge older than the short form refuses a plan
+                        // word with it (C...7) and serves the RaptorQ lane:
+                        // asked again at once with the long form (wave 7
+                        // review). An edge that refuses the lane for
+                        // another reason refuses that too.
+                        if drops_short_header(compact, compact_asked, plan) {
+                            short_header = false;
+                            short_header_dropped += 1;
+                            plan = plan.with_short_header(false);
+                            eprintln!(
+                                "{}: the compact lane was refused with the short form: asking with the long form",
+                                cache.node_id
+                            );
+                            next_refresh = Instant::now();
+                            continue;
+                        }
                         if !subscribed {
                             startup.subscribed_ms.get_or_insert(since_start(started));
                             first_subscribed_part.get_or_insert(first);
@@ -1398,6 +1454,7 @@ async fn main() -> Result<()> {
             .then(|| receiver.wire_bytes as f64 / payload_bytes as f64),
         compact_asked,
         compact_fallbacks,
+        compact_short_header_dropped: short_header_dropped,
         nack_timing: format!(
             "delay {} us, retry floor {} us, silence {}",
             args.nack_delay_us, args.nack_retry_floor_us, args.silence_nack
@@ -1467,6 +1524,24 @@ mod tests {
         let args =
             Args::try_parse_from(base.into_iter().chain(["--playlist-first", "true"])).unwrap();
         assert!(args.playlist_first);
+    }
+
+    /// Wave 7 review: the compact lane is given up only after three
+    /// unanswered requests and 1.5 s, and an edge that refuses the short
+    /// form is asked again with the long form (once: the plan then has none).
+    #[test]
+    fn the_compact_lane_is_given_up_late_and_the_short_form_first() {
+        let second = Duration::from_millis(600);
+        assert!(!falls_back_from_compact(true, false, 3, second));
+        assert!(!falls_back_from_compact(true, false, 2, Duration::from_secs(2)));
+        assert!(falls_back_from_compact(true, false, 3, COMPACT_FALLBACK_AFTER));
+        assert!(!falls_back_from_compact(true, true, 9, Duration::from_secs(9)));
+        assert!(!falls_back_from_compact(false, false, 9, Duration::from_secs(9)));
+        let short = CompactPlan::CLEAN.with_short_header(true);
+        assert!(drops_short_header(false, true, short));
+        assert!(!drops_short_header(true, true, short));
+        assert!(!drops_short_header(false, false, short));
+        assert!(!drops_short_header(false, true, short.with_short_header(false)));
     }
 
     #[test]
