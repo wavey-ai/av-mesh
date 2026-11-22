@@ -1173,8 +1173,8 @@ async fn children_of_a_shared_socket_take_4k_as_gso_messages() {
 #[test]
 fn the_video_pacing_flags_default_on_and_can_be_turned_off() {
     let args = Args::try_parse_from(["av-mesh"]).unwrap();
-    assert_eq!(args.client_udp_video_pace_percent, 125);
-    assert_eq!(args.client_udp_video_pace_max_ms, 8);
+    assert_eq!(args.client_udp_video_pace_percent, 600);
+    assert_eq!(args.client_udp_video_pace_max_ms, 2);
     let args = Args::try_parse_from([
         "av-mesh",
         "--client-udp-video-pace-percent",

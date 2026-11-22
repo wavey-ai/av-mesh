@@ -110,11 +110,17 @@ pub struct VideoPacing {
     pub max_delay_us: u64,
 }
 
+/// The default spreads a frame over about a sixth of its interval (a 4K
+/// frame at 60 fps over some 2.8 ms, not 13 ms at 125 %) and delays no
+/// message more than 2 ms: pacing takes the line-rate burst off a client's
+/// path without moving a frame's completion by most of a frame interval,
+/// which the frame-lateness budget of a 60 fps listener (16.7 ms) cannot
+/// spare at every edge.
 impl Default for VideoPacing {
     fn default() -> Self {
         Self {
-            percent: 125,
-            max_delay_us: 8_000,
+            percent: 600,
+            max_delay_us: 2_000,
         }
     }
 }
@@ -1329,6 +1335,38 @@ mod tests {
         // A pause of seconds keeps the rate of before it.
         rate.observe(start + 5_000 * ms, 25_000);
         assert_eq!(rate.bps(start + 5_000 * ms), Some(steady));
+    }
+
+    #[test]
+    fn the_default_pacing_delays_a_4k_frame_at_most_two_milliseconds() {
+        let pacing = VideoPacing::default();
+        let mut pacer = Pacer::default();
+        let now = 10_000_000_000_u64;
+        let peer = SocketAddr::from(([127, 0, 0, 1], 1));
+        for (mbps, frame_bytes) in [(25_u64, 52_000_usize), (200, 420_000)] {
+            pacer.rates.insert(
+                mbps,
+                StreamRate {
+                    window_start_ns: now,
+                    bytes: 0,
+                    bps: mbps * 1_000_000,
+                },
+            );
+            let bps = pacer.client_bps(mbps, pacing, now).unwrap();
+            let slice = (bps * PACING_SLICE_US / 8_000_000) as usize;
+            let mut last = now;
+            let mut left = frame_bytes;
+            while left > 0 {
+                let bytes = left.min(slice);
+                last = pacer.departure(peer, bytes, bps, pacing, now).0;
+                left -= bytes;
+            }
+            // A frame's last message: within the bound, and spread over
+            // more than one slice (it is paced, not sent at once).
+            assert!(last - now <= pacing.max_delay_us * 1_000, "{mbps}: {}", last - now);
+            assert!(last - now >= 1_000_000, "{mbps}: {}", last - now);
+            pacer.next.clear();
+        }
     }
 
     #[test]

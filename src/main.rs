@@ -1697,7 +1697,9 @@ struct Args {
     /// rate, each with an earliest departure (SO_TXTIME), which the host's
     /// fq qdisc keeps, so a client gets a frame at its rate and not at the
     /// NIC's line rate. No timer runs on the thread. Other qdiscs send at
-    /// once; audio is never paced. 0 sends video at once, as before.
+    /// once; audio is never paced. 0 sends video at once, as before. The
+    /// default 600 % spreads a 60 fps frame over about 2.8 ms (125 %, the
+    /// first default, over 13 ms: up to the delay bound later at every edge).
     #[arg(
         long,
         env = "NEEDLETAIL_CLIENT_UDP_VIDEO_PACE_PERCENT",
@@ -1707,7 +1709,8 @@ struct Args {
 
     /// A paced 4K message never departs later than this after the video
     /// thread hands it to the kernel: a burst above the pacing rate (a
-    /// keyframe, a burst from upstream) is delayed at most this much.
+    /// keyframe, a burst from upstream) is delayed at most this much
+    /// (default 2 ms; it was 8).
     #[arg(
         long,
         env = "NEEDLETAIL_CLIENT_UDP_VIDEO_PACE_MAX_MS",
