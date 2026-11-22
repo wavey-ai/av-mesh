@@ -86,7 +86,7 @@ use relay_session::{
 use serde::{de, Deserialize, Serialize};
 use socket2::SockRef;
 use soundkit_fmp4::{rebox_soundkit_v2, ReboxOptions, SoundKitFmp4Codec};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -212,6 +212,112 @@ const DEFAULT_CANONICAL_GAP_HOLD_MS: u64 = 1_000;
 /// watermark, so a long loss burst cannot make every commit rescan it.
 const CANONICAL_GAP_SCAN_LIMIT: usize = 1_024;
 const CANONICAL_GAP_LOG_INTERVAL_MS: u64 = 1_000;
+/// The repair horizon before this node has measured a repair (wave 5, W2):
+/// a hole is published as a gap once it is this old.
+const REPAIR_HORIZON_INITIAL_MS: u64 = 60;
+/// The measured horizon (twice the 90th percentile of the repairs that this
+/// node saw) is kept within these bounds, and never above the gap hold.
+const REPAIR_HORIZON_MIN_MS: u64 = 10;
+const REPAIR_HORIZON_MAX_MS: u64 = 250;
+/// Repairs that the measured horizon is computed from: the newest of them.
+const REPAIR_DELAY_SAMPLES: usize = 128;
+/// Gaps remembered for each stream's playlist: the oldest are forgotten.
+const MAX_GAP_PARTS_PER_STREAM: usize = 4_096;
+
+/// `--canonical-repair-horizon`: how long a hole may hold back the
+/// contiguous watermark of a stream (the playlist and the cache-mesh push)
+/// before the parts behind it are published and the hole is marked as a
+/// gap. `Off` keeps the gap hold (`--canonical-gap-hold-ms`) as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepairHorizon {
+    Off,
+    /// Twice the repair delay that this node measures, within
+    /// [`REPAIR_HORIZON_MIN_MS`, `REPAIR_HORIZON_MAX_MS`].
+    Auto,
+    Fixed(u64),
+}
+
+impl RepairHorizon {
+    const OFF_CODE: u64 = u64::MAX;
+
+    fn code(self) -> u64 {
+        match self {
+            Self::Off => Self::OFF_CODE,
+            Self::Auto => 0,
+            Self::Fixed(ms) => ms.clamp(1, Self::OFF_CODE - 1),
+        }
+    }
+
+    fn from_code(code: u64) -> Self {
+        match code {
+            Self::OFF_CODE => Self::Off,
+            0 => Self::Auto,
+            ms => Self::Fixed(ms),
+        }
+    }
+
+    fn as_str(self) -> String {
+        match self {
+            Self::Off => "off".into(),
+            Self::Auto => "auto".into(),
+            Self::Fixed(ms) => ms.to_string(),
+        }
+    }
+}
+
+impl std::str::FromStr for RepairHorizon {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim() {
+            "off" | "false" | "0" => Ok(Self::Off),
+            "auto" | "true" => Ok(Self::Auto),
+            ms => ms
+                .parse::<u64>()
+                .map(Self::Fixed)
+                .map_err(|_| format!("expected auto, off or milliseconds, got {ms:?}")),
+        }
+    }
+}
+
+/// The repair delays that a node has seen: for each part that arrived after
+/// a later part of its stream, how long after that later part.
+#[derive(Debug, Default)]
+struct RepairDelays {
+    samples_us: VecDeque<u64>,
+    total: u64,
+}
+
+impl RepairDelays {
+    fn record(&mut self, delay_us: u64) {
+        if self.samples_us.len() == REPAIR_DELAY_SAMPLES {
+            self.samples_us.pop_front();
+        }
+        self.samples_us.push_back(delay_us);
+        self.total = self.total.saturating_add(1);
+    }
+
+    /// The 90th percentile of the newest samples.
+    fn p90_us(&self) -> Option<u64> {
+        if self.samples_us.is_empty() {
+            return None;
+        }
+        let mut sorted: Vec<u64> = self.samples_us.iter().copied().collect();
+        sorted.sort_unstable();
+        let index = (sorted.len() * 9).div_ceil(10).saturating_sub(1);
+        sorted.get(index).copied()
+    }
+
+    /// Twice the 90th percentile within the bounds, or the initial horizon.
+    fn horizon_us(&self) -> u64 {
+        match self.p90_us() {
+            Some(p90_us) => p90_us
+                .saturating_mul(2)
+                .clamp(REPAIR_HORIZON_MIN_MS * 1_000, REPAIR_HORIZON_MAX_MS * 1_000),
+            None => REPAIR_HORIZON_INITIAL_MS * 1_000,
+        }
+    }
+}
 const REPLICA_REQUEST_MIN_INTERVAL_MS: u64 = 1_000;
 /// With --edge-hole-distance-ms, how long a waiting request waits before it
 /// first asks the parents for a hole itself, the backstop of the trigger's
@@ -1783,13 +1889,32 @@ struct Args {
     /// How long one unrecovered canonical object may hold back the contiguous
     /// watermark that gates cache-mesh replication before the watermark skips
     /// past it. Converted to parts with --part-ms. Keep it at or above the
-    /// contributor relay media deadline. 0 disables gap skipping.
+    /// contributor relay media deadline. 0 disables gap skipping. With
+    /// --canonical-repair-horizon (on by default) a hole is skipped after
+    /// the horizon, which this only bounds.
     #[arg(
         long,
         env = "NEEDLETAIL_CANONICAL_GAP_HOLD_MS",
         default_value_t = DEFAULT_CANONICAL_GAP_HOLD_MS
     )]
     canonical_gap_hold_ms: u64,
+
+    /// The repair horizon of the live path (wave 5, W2): a hole holds back
+    /// the contiguous watermark (the LL-HLS playlist, the cache-mesh push,
+    /// the cache-fed UDP lane) only this long, measured in time from the
+    /// first part after it; then the parts behind it are published and the
+    /// hole is listed as a gap (EXT-X-PART ... GAP=YES, the UDP gap object).
+    /// A repair that comes later still fills the hole in the cache. `auto`:
+    /// twice the 90th percentile of the repair delays this node measures
+    /// (10-250 ms, 60 ms before the first). A number: that many
+    /// milliseconds. `off`: the gap hold alone, as before. Never longer
+    /// than --canonical-gap-hold-ms, and nothing is skipped when that is 0.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CANONICAL_REPAIR_HORIZON",
+        default_value = "auto"
+    )]
+    canonical_repair_horizon: RepairHorizon,
 
     #[arg(long, default_value_t = 2048)]
     slot_kb: usize,
@@ -2399,6 +2524,7 @@ async fn main() -> Result<()> {
     )
     .await;
     cache.set_canonical_gap_hold(Duration::from_millis(args.canonical_gap_hold_ms));
+    cache.set_repair_horizon(args.canonical_repair_horizon);
     cache.set_playlist_scan_memo(args.playlist_scan_memo);
     cache.set_part_hold_back_floor(Duration::from_millis(args.part_hold_back_ms));
     let link_telemetry = Arc::new(LinkTelemetry::new(
@@ -5673,6 +5799,8 @@ async fn run_udp_fec_ingest(
             }
             _ = rotate.tick() => {
                 cache.rotate_if_due(false).await?;
+                // Holes past the repair horizon that no commit released.
+                cache.release_expired_repair_holes().await;
             }
             _ = expire_fec.tick() => {
                 native_audio_relay.expire(Instant::now());
@@ -6655,6 +6783,21 @@ struct LiveTsCache {
     canonical_gap_idle_flushes: AtomicU64,
     canonical_gap_skipped_parts: AtomicU64,
     canonical_gap_last_log_unix_ms: AtomicU64,
+    /// `--canonical-repair-horizon`, as [`RepairHorizon::code`].
+    repair_horizon: AtomicU64,
+    repair_delays: StdMutex<RepairDelays>,
+    /// The measured horizon, kept current as repairs are measured: the
+    /// commit path reads it without a lock.
+    repair_horizon_auto_us: AtomicU64,
+    /// Releases of a hole by the repair horizon, and the parts they listed
+    /// as gaps.
+    repair_horizon_releases: AtomicU64,
+    /// Parts that came after they were listed as gaps: the cache has them
+    /// for later readers.
+    late_gap_fills: AtomicU64,
+    /// The parts of each stream that the watermark passed as holes: the
+    /// playlist lists them as gaps while they are missing.
+    gap_parts: StdMutex<HashMap<u64, BTreeSet<u64>>>,
     part_updates: watch::Sender<u64>,
     playlist_cache: Vec<StdRwLock<Option<CachedPlaylist>>>,
     /// The scan memo of the playlist in each playlist slot.
@@ -6782,6 +6925,14 @@ impl LiveTsCache {
             canonical_gap_idle_flushes: AtomicU64::new(0),
             canonical_gap_skipped_parts: AtomicU64::new(0),
             canonical_gap_last_log_unix_ms: AtomicU64::new(0),
+            // A node is configured from its flags; a cache made otherwise
+            // (tests) keeps the gap hold alone.
+            repair_horizon: AtomicU64::new(RepairHorizon::Off.code()),
+            repair_delays: StdMutex::new(RepairDelays::default()),
+            repair_horizon_auto_us: AtomicU64::new(REPAIR_HORIZON_INITIAL_MS * 1_000),
+            repair_horizon_releases: AtomicU64::new(0),
+            late_gap_fills: AtomicU64::new(0),
+            gap_parts: StdMutex::new(HashMap::new()),
             part_updates,
             playlist_cache,
             playlist_scan_memos,
@@ -7061,6 +7212,146 @@ impl LiveTsCache {
         );
     }
 
+    /// Configure the repair horizon of the live path (`--canonical-repair-horizon`).
+    fn set_repair_horizon(&self, horizon: RepairHorizon) {
+        self.repair_horizon.store(horizon.code(), Ordering::Relaxed);
+    }
+
+    fn repair_horizon_mode(&self) -> RepairHorizon {
+        RepairHorizon::from_code(self.repair_horizon.load(Ordering::Relaxed))
+    }
+
+    /// The repair horizon in microseconds now, never above the gap hold;
+    /// `None` when it is off or the gap hold is 0 (nothing is skipped).
+    fn repair_horizon_us(&self) -> Option<u64> {
+        let hold_us = self
+            .canonical_gap_hold_ms
+            .load(Ordering::Relaxed)
+            .saturating_mul(1_000);
+        if hold_us == 0 {
+            return None;
+        }
+        let horizon_us = match self.repair_horizon_mode() {
+            RepairHorizon::Off => return None,
+            RepairHorizon::Fixed(ms) => ms.saturating_mul(1_000),
+            RepairHorizon::Auto => self.repair_horizon_auto_us.load(Ordering::Relaxed),
+        };
+        Some(horizon_us.min(hold_us))
+    }
+
+    /// How long the cache-fed UDP lane may still wait for the hole at
+    /// `part`, `age` behind the head: zero for a part listed as a gap, the
+    /// rest of the repair horizon otherwise; `None` with the horizon off.
+    fn live_hole_wait(&self, stream_id: u64, part: u64, age: Duration) -> Option<Duration> {
+        let horizon_us = self.repair_horizon_us()?;
+        if self.is_gap_part(stream_id, part) {
+            return Some(Duration::ZERO);
+        }
+        Some(Duration::from_micros(horizon_us).saturating_sub(age))
+    }
+
+    fn is_gap_part(&self, stream_id: u64, part: u64) -> bool {
+        self.gap_parts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&stream_id)
+            .is_some_and(|gaps| gaps.contains(&part))
+    }
+
+    /// The gaps of a stream in `first..=last`.
+    fn gap_parts_in(&self, stream_id: u64, first: u64, last: u64) -> Vec<u64> {
+        if first > last {
+            return Vec::new();
+        }
+        self.gap_parts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&stream_id)
+            .map(|gaps| gaps.range(first..=last).copied().collect())
+            .unwrap_or_default()
+    }
+
+    fn record_gap_parts(&self, stream_id: u64, parts: &[u64]) {
+        if parts.is_empty() {
+            return;
+        }
+        let mut gaps = self
+            .gap_parts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stream = gaps.entry(stream_id).or_default();
+        stream.extend(parts.iter().copied());
+        while stream.len() > MAX_GAP_PARTS_PER_STREAM {
+            stream.pop_first();
+        }
+    }
+
+    /// A part has come: it is no longer a gap. Returns whether it was one.
+    fn fill_gap_part(&self, stream_id: u64, part: u64) -> bool {
+        let mut gaps = self
+            .gap_parts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(stream) = gaps.get_mut(&stream_id) else {
+            return false;
+        };
+        let filled = stream.remove(&part);
+        if stream.is_empty() {
+            gaps.remove(&stream_id);
+        }
+        filled
+    }
+
+    fn forget_gap_parts(&self, stream_id: u64) {
+        self.gap_parts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&stream_id);
+    }
+
+    /// A part `part` of a stream was stored after a later part: a repair
+    /// (or a reordering), `delay_us` after the first part beyond it came.
+    fn record_repair_delay(&self, delay_us: u64) {
+        let mut delays = self
+            .repair_delays
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        delays.record(delay_us);
+        self.repair_horizon_auto_us
+            .store(delays.horizon_us(), Ordering::Relaxed);
+    }
+
+    /// How long after the first stored part beyond it `part` came, if one
+    /// is stored within the next 16: the time that its hole was open. Lock
+    /// free: two atomic loads a slot.
+    fn hole_open_us(&self, stream_idx: usize, part: usize, committed_us: u64) -> Option<u64> {
+        (1..=16).find_map(|step| {
+            let later = part.checked_add(step)?;
+            self.chunk_cache
+                .written_unix_us(stream_idx, later)
+                .map(|written_us| committed_us.saturating_sub(written_us))
+        })
+    }
+
+    /// A canonical part was just stored: when a later part of its stream
+    /// was stored before it, it filled a hole. How long the hole was open is
+    /// a repair delay, which the measured repair horizon is made of; a part
+    /// already listed as a gap is a late fill, kept for later readers.
+    fn observe_late_part(&self, stream_id: u64, seq: u64, committed_us: u64) {
+        if self.fill_gap_part(stream_id, seq) {
+            self.late_gap_fills.fetch_add(1, Ordering::Relaxed);
+        }
+        let (Some(stream_idx), Ok(part)) =
+            (self.chunk_cache.stream_idx(stream_id), usize::try_from(seq))
+        else {
+            return;
+        };
+        // In order (no later part stored): nothing to measure.
+        if let Some(delay_us) = self.hole_open_us(stream_idx, part, committed_us) {
+            self.record_repair_delay(delay_us);
+        }
+    }
+
     /// Configure a floor for PART-HOLD-BACK. Zero keeps three part targets.
     fn set_part_hold_back_floor(&self, floor: Duration) {
         self.part_hold_back_floor_us
@@ -7077,12 +7368,25 @@ impl LiveTsCache {
     }
 
     fn canonical_gap_skip_snapshot(&self) -> CanonicalGapSkipSnapshot {
+        let (repair_delay_p90_us, repair_delays) = {
+            let delays = self
+                .repair_delays
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (delays.p90_us(), delays.total)
+        };
         CanonicalGapSkipSnapshot {
             hold_ms: self.canonical_gap_hold_ms.load(Ordering::Relaxed),
             hold_parts: self.canonical_gap_hold_parts.load(Ordering::Relaxed),
             skips: self.canonical_gap_skips.load(Ordering::Relaxed),
             idle_flushes: self.canonical_gap_idle_flushes.load(Ordering::Relaxed),
             skipped_parts: self.canonical_gap_skipped_parts.load(Ordering::Relaxed),
+            repair_horizon: self.repair_horizon_mode().as_str(),
+            repair_horizon_us: self.repair_horizon_us(),
+            repair_delay_p90_us,
+            repair_delays,
+            repair_horizon_releases: self.repair_horizon_releases.load(Ordering::Relaxed),
+            late_gap_fills: self.late_gap_fills.load(Ordering::Relaxed),
         }
     }
 
@@ -7104,6 +7408,11 @@ impl LiveTsCache {
         // not in the nominal parts of the node.
         let hold_ms = self.canonical_gap_hold_ms.load(Ordering::Relaxed);
         if hold_ms == 0 {
+            return;
+        }
+        if let Some(horizon_us) = self.repair_horizon_us() {
+            self.release_holes_past_horizon(stream_id, Some(committing_slot), horizon_us)
+                .await;
             return;
         }
         let hold_parts = hold_ms
@@ -7131,6 +7440,120 @@ impl LiveTsCache {
         }
         self.advance_canonical_watermark(stream_id, stream_idx, last, ceiling, false)
             .await;
+    }
+
+    /// The repair horizon (wave 5, W2): move the contiguous watermark of a
+    /// stream past every hole that has been open for `horizon_us`, counted
+    /// from when the first stored part after the hole was written. The
+    /// parts passed are recorded as gaps. `committing` is a part about to be
+    /// written: the walk stops there, since its write continues the
+    /// contiguous publication. Returns the new watermark.
+    ///
+    /// The caller must hold the stream's canonical commit lock.
+    async fn release_holes_past_horizon(
+        &self,
+        stream_id: u64,
+        committing: Option<usize>,
+        horizon_us: u64,
+    ) -> Option<usize> {
+        let stream_idx = self.chunk_cache.get_stream_idx(stream_id).await?;
+        // Nothing is published before the first canonical media object.
+        let last = self.chunk_cache.last(stream_idx)?;
+        let first = last.checked_add(1)?;
+        // The part right after the watermark: no hole (the common case
+        // costs no lock).
+        if committing == Some(first) {
+            return None;
+        }
+        let head = {
+            let state = self.state.read().await;
+            state
+                .stream_latest_canonical_object
+                .get(&stream_id)
+                .and_then(|head| usize::try_from(*head).ok())
+        };
+        let head = match (head, committing) {
+            (Some(head), Some(committing)) => head.max(committing),
+            (head, committing) => head.or(committing)?,
+        };
+        if head < first {
+            return None;
+        }
+        let now_us = now_unix_us();
+        let end = head.min(last.saturating_add(CANONICAL_GAP_SCAN_LIMIT));
+        let mut ceiling = None;
+        let mut in_hole = false;
+        for slot in first..=end {
+            if committing == Some(slot) {
+                break;
+            }
+            match self.chunk_cache.written_unix_us(stream_idx, slot) {
+                None => in_hole = true,
+                Some(written_us) => {
+                    // A hole is as old as the first part stored after it.
+                    if in_hole && now_us.saturating_sub(written_us) < horizon_us {
+                        break;
+                    }
+                    in_hole = false;
+                    ceiling = Some(slot);
+                }
+            }
+        }
+        let ceiling = ceiling.filter(|ceiling| *ceiling > last)?;
+        let watermark = self
+            .advance_canonical_watermark(stream_id, stream_idx, last, ceiling, false)
+            .await?;
+        self.repair_horizon_releases.fetch_add(1, Ordering::Relaxed);
+        Some(watermark)
+    }
+
+    /// Release every hole of every stream that the repair horizon has
+    /// passed, for streams that no commit has come to since (a stalled or
+    /// ended stream, or parts longer than the horizon). Returns the streams
+    /// whose watermark moved.
+    async fn release_expired_repair_holes(&self) -> usize {
+        let Some(horizon_us) = self.repair_horizon_us() else {
+            return 0;
+        };
+        let candidates: Vec<(u64, u64)> = {
+            let state = self.state.read().await;
+            state
+                .stream_latest_canonical_object
+                .iter()
+                .map(|(stream_id, head)| (*stream_id, *head))
+                .collect()
+        };
+        let mut released = 0;
+        for (stream_id, head) in candidates {
+            // Most streams have no hole: one lookup and one comparison.
+            let Some(stream_idx) = self.chunk_cache.stream_idx(stream_id) else {
+                continue;
+            };
+            let Some(last) = self.chunk_cache.last(stream_idx) else {
+                continue;
+            };
+            if last as u64 >= head {
+                continue;
+            }
+            let Some(commit_lock) = self
+                .canonical_commit_locks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&stream_id)
+                .cloned()
+            else {
+                continue;
+            };
+            let _commit_guard = commit_lock.lock().await;
+            if let Some(watermark) = self
+                .release_holes_past_horizon(stream_id, None, horizon_us)
+                .await
+            {
+                released += 1;
+                self.part_updates.send_replace(watermark as u64);
+            }
+        }
+        released
     }
 
     /// Advance the watermark of idle canonical streams whose tail is stranded
@@ -7244,6 +7667,7 @@ impl LiveTsCache {
                 .retained_start(candidate)
                 .max(first_unpublished);
             let mut skipped_parts = (retained_start - first_unpublished) as u64;
+            let mut gaps = Vec::new();
             for slot in retained_start..candidate {
                 if self
                     .chunk_cache
@@ -7252,6 +7676,7 @@ impl LiveTsCache {
                     .is_none()
                 {
                     skipped_parts = skipped_parts.saturating_add(1);
+                    gaps.push(slot as u64);
                 }
             }
 
@@ -7297,6 +7722,8 @@ impl LiveTsCache {
                 }
             }
 
+            // The playlist lists them as gaps while they are missing.
+            self.record_gap_parts(stream_id, &gaps);
             if skipped_parts > 0 {
                 self.canonical_gap_skips.fetch_add(1, Ordering::Relaxed);
                 self.canonical_gap_skipped_parts
@@ -7495,6 +7922,7 @@ impl LiveTsCache {
                 );
             } else if previous_epoch != Some(source_epoch) {
                 self.chunk_cache.zero_stream_id(stream_id).await;
+                self.forget_gap_parts(stream_id);
                 // A relay may restart and inherit an epoch that has already
                 // been active for minutes or hours. Its source age is not an
                 // epoch-activation delay. Measure only epochs observed after
@@ -7661,6 +8089,7 @@ impl LiveTsCache {
                 );
             }
             if write_result == PutIfAbsentResult::Inserted {
+                self.observe_late_part(stream_id, seq, committed_us);
                 if let Some(journal) = self.hops() {
                     journal.record_part(HopStage::Committed, stream_id, seq, committed_us);
                     if let Some(before) = watermark_before {
@@ -8047,6 +8476,7 @@ impl LiveTsCache {
 
             self.chunk_cache.zero_stream_id(stream_id).await;
             self.state.write().await.forget_stream(stream_id);
+            self.forget_gap_parts(stream_id);
             for cached_playlist in &self.playlist_cache {
                 let mut cached_playlist = cached_playlist
                     .write()
@@ -8520,12 +8950,32 @@ impl LiveTsCache {
         // Nearly every part of a stream has the same duration: its text is
         // written once and copied.
         let mut part_duration_text = (u32::MAX, String::new());
+        // Parts that the watermark passed as holes and that are still
+        // missing (the repair horizon, wave 5 W2) are listed where they
+        // belong, as gaps, so that a player knows that they will not come.
+        let gaps = groups
+            .first_key_value()
+            .and_then(|(_, group)| group.first())
+            .map(|(first_listed, ..)| self.gap_parts_in(stream_id, *first_listed, last as u64))
+            .unwrap_or_default();
+        let mut next_gap = 0_usize;
+        let mut gap_duration_text = String::new();
+        push_seconds(&mut gap_duration_text, u64::from(part_target_us));
         for (segment, group) in groups {
             let mut segment_duration_us = 0_u64;
             for (seq, duration_us, keyframe, _available_unix_us) in &group {
                 segment_duration_us = segment_duration_us.saturating_add(u64::from(*duration_us));
+                let first_gap = next_gap;
+                while gaps.get(next_gap).is_some_and(|gap| gap < seq) {
+                    next_gap += 1;
+                }
                 if segment < first_parted_segment {
                     continue;
+                }
+                for gap in &gaps[first_gap..next_gap] {
+                    out.push_str("#EXT-X-PART:DURATION=");
+                    out.push_str(&gap_duration_text);
+                    let _ = writeln!(out, ",URI=\"part{gap}.{extension}\",GAP=YES");
                 }
                 let independent =
                     if (*keyframe || audio_only_fmp4) && media_kind == LiveMediaKind::Fmp4 {
@@ -10779,13 +11229,25 @@ struct LlhlsRuntimeSnapshot {
 
 /// Contiguous-watermark advances past canonical objects the relay never
 /// recovered, as seen by this node's cache-mesh replication.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 struct CanonicalGapSkipSnapshot {
     hold_ms: u64,
     hold_parts: u64,
     skips: u64,
     idle_flushes: u64,
     skipped_parts: u64,
+    /// `--canonical-repair-horizon` (wave 5, W2): auto, off or milliseconds.
+    repair_horizon: String,
+    /// The horizon in force; null when holes wait for the gap hold.
+    repair_horizon_us: Option<u64>,
+    /// The 90th percentile of the newest measured repair delays.
+    repair_delay_p90_us: Option<u64>,
+    /// Repair delays measured since start.
+    repair_delays: u64,
+    /// Holes that the horizon released (the parts are in skipped_parts).
+    repair_horizon_releases: u64,
+    /// Parts that came after they were published as gaps.
+    late_gap_fills: u64,
 }
 
 impl From<playlists::chunk_cache::ExactPartWaiterStats> for LlhlsRuntimeSnapshot {
@@ -13420,6 +13882,16 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
             "av_mesh_canonical_gap_idle_flushes_total",
             "Times an idle canonical stream had its stranded tail published past a gap.",
             snapshot.canonical_gap_skip.idle_flushes,
+        ),
+        (
+            "av_mesh_canonical_repair_horizon_releases_total",
+            "Times the repair horizon published the parts behind a hole and listed it as a gap.",
+            snapshot.canonical_gap_skip.repair_horizon_releases,
+        ),
+        (
+            "av_mesh_canonical_late_gap_fills_total",
+            "Parts that came after they were listed as gaps, kept for later readers.",
+            snapshot.canonical_gap_skip.late_gap_fills,
         ),
         (
             "av_mesh_edge_hole_repair_requests_total",
@@ -23540,6 +24012,12 @@ mod tests {
                 "skips": 1,
                 "idle_flushes": 0,
                 "skipped_parts": 1,
+                "repair_horizon": "off",
+                "repair_horizon_us": null,
+                "repair_delay_p90_us": null,
+                "repair_delays": 0,
+                "repair_horizon_releases": 0,
+                "late_gap_fills": 0,
             })
         );
         mesh.shutdown();
@@ -36300,4 +36778,8 @@ mod tests {
     /// The compact client lane: bytes per listener, zero loss through loss
     /// and bursts, the edge's cost per listener.
     mod compact_lane;
+
+    /// The repair horizon of the live path: holes hold the watermark only
+    /// briefly, and are listed as gaps.
+    mod live_gaps;
 }

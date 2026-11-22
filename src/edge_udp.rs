@@ -2111,7 +2111,14 @@ async fn run_stream_sender(
                 None if held_while_lost => None,
                 None => {
                     let age = hole_age(&router, stream_id, head, part).await;
-                    let wait = hole_budget(age, config.playout).unwrap_or(HOLE_WAIT);
+                    let mut wait = hole_budget(age, config.playout).unwrap_or(HOLE_WAIT);
+                    // The repair horizon (wave 5, W2): a hole holds the
+                    // stream's later parts back no longer than the cache
+                    // does, and a part that the cache listed as a gap is
+                    // sent as one at once.
+                    if let Some(horizon) = router.cache.live_hole_wait(stream_id, part, age) {
+                        wait = wait.min(horizon);
+                    }
                     if wait.is_zero() {
                         stats.holes_past_playout.fetch_add(1, Ordering::Relaxed);
                         None

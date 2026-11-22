@@ -5,8 +5,9 @@
 //! happens here, and reaches the fast plane through atomics, snapshots and
 //! notifications:
 //!
-//! - the tees' housekeeping: the cache rotation every 10 ms, and once a
-//!   second the expiry of receive state, which the tee runs when told;
+//! - the tees' housekeeping: the cache rotation every 10 ms, the release of
+//!   holes past the repair horizon every 5 ms, and once a second the expiry
+//!   of receive state, which the tee runs when told;
 //! - the relay failover controller, which reads the threads' atomics;
 //! - the lease children: their snapshot's backstop rebuild, their failover
 //!   listener (whose promotions lapse), and the replay of a promoted
@@ -42,6 +43,9 @@ const REPLAY_WAIT: Duration = Duration::from_millis(50);
 const ROTATE_EVERY: Duration = Duration::from_millis(10);
 /// How often the tees expire their receive state.
 const EXPIRE_EVERY: Duration = Duration::from_secs(1);
+/// How often holes past the repair horizon that no commit released are
+/// released (`--canonical-repair-horizon`, at least 10 ms).
+const HORIZON_EVERY: Duration = Duration::from_millis(5);
 
 /// The tees' housekeeping, on its own task: the cache's rotation (when
 /// `rotate`), and a nudge to each tee to expire its receive state. A tee
@@ -56,6 +60,8 @@ pub(crate) async fn run_tee_housekeeping(
     rotation.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut expiry = interval(EXPIRE_EVERY);
     expiry.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut horizon = interval(HORIZON_EVERY);
+    horizon.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => return,
@@ -63,6 +69,9 @@ pub(crate) async fn run_tee_housekeeping(
                 if let Err(error) = cache.rotate_if_due(false).await {
                     warn!(error = %format!("{error:#}"), "fast-plane cache rotation failed");
                 }
+            }
+            _ = horizon.tick() => {
+                cache.release_expired_repair_holes().await;
             }
             _ = expiry.tick() => {
                 for tee in &expire {
