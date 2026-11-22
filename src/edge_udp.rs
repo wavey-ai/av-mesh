@@ -49,6 +49,9 @@ use tracing::{debug, info, warn};
 /// How long a new subscription waits for the edge to hold parts of its
 /// stream before it is refused.
 const ADMIT_WAIT: Duration = Duration::from_secs(4);
+
+/// `--client-udp-fresh-head-ms`.
+pub(crate) const DEFAULT_FRESH_HEAD_MS: u64 = 1_000;
 /// How often a sender renews the demand for its playlist and checks that
 /// the edge still serves.
 const HOUSEKEEPING: Duration = Duration::from_secs(1);
@@ -130,6 +133,14 @@ pub(crate) struct EdgeUdpConfig {
     /// (`--client-udp-first-part-at-once`; `false`: the stream's sender
     /// sends it when it next looks, up to a part later, as before).
     pub first_part_at_once: bool,
+    /// With `admit_on_first_part`: the part a subscriber is admitted at must
+    /// have arrived at this edge within this long (or four of the stream's
+    /// parts, if longer). A stale head, such as the last part before a
+    /// rendition was held back or before an earlier demand lapsed, is not
+    /// a start: the subscription waits for a newer part, and takes the
+    /// stale one only at the end of its wait (`--client-udp-fresh-head-ms`,
+    /// wave 7 review; zero: any part, as before).
+    pub fresh_head: Duration,
 }
 
 impl EdgeUdpConfig {
@@ -149,6 +160,7 @@ impl EdgeUdpConfig {
             compact_short_header: true,
             admit_on_first_part: true,
             first_part_at_once: true,
+            fresh_head: Duration::from_millis(DEFAULT_FRESH_HEAD_MS),
         }
     }
 }
@@ -1643,17 +1655,35 @@ async fn move_reason(router: &AppRouter) -> Option<&'static str> {
     None
 }
 
-/// The stream's newest part once the edge holds one, woken by the parts'
-/// arrival; `None` at `deadline`.
-async fn wait_for_head(router: &AppRouter, stream_id: u64, deadline: Instant) -> Option<u64> {
+/// The stream's newest part once the edge holds one that arrived within
+/// `fresh` (zero: any), woken by the parts' arrival; at `deadline`, a stale
+/// head if there is one, else `None`.
+async fn wait_for_head(
+    router: &AppRouter,
+    stream_id: u64,
+    deadline: Instant,
+    fresh: Duration,
+) -> Option<u64> {
     let mut updates = router.cache.part_updates.subscribe();
+    let fresh_us = u64::try_from(fresh.as_micros()).unwrap_or(u64::MAX);
+    let mut stale = None;
     loop {
         if let Some(head) = head_part(router, stream_id).await {
-            return Some(head);
+            if fresh.is_zero()
+                || router
+                    .cache
+                    .state
+                    .read()
+                    .await
+                    .part_arrived_within(stream_id, head, crate::now_unix_us(), fresh_us)
+            {
+                return Some(head);
+            }
+            stale = Some(head);
         }
         let now = Instant::now();
         if now >= deadline {
-            return None;
+            return stale;
         }
         // A bound on the wait, in case an update is missed between the
         // look and the subscription's mark.
@@ -1828,7 +1858,7 @@ async fn admit(
     }
     let deadline = Instant::now() + ADMIT_WAIT;
     let head = if config.admit_on_first_part {
-        wait_for_head(&router, stream_id, deadline).await
+        wait_for_head(&router, stream_id, deadline, config.fresh_head).await
     } else {
         loop {
             if let Some(head) = head_part(&router, stream_id).await {

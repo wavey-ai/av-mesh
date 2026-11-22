@@ -18,6 +18,21 @@ async fn edge(
     admit_on_first_part: bool,
     first_part_at_once: bool,
 ) -> (SocketAddr, watch::Sender<()>) {
+    let (port, shutdown, _) = edge_with(
+        admit_on_first_part,
+        first_part_at_once,
+        Duration::from_millis(edge_udp::DEFAULT_FRESH_HEAD_MS),
+    )
+    .await;
+    (port, shutdown)
+}
+
+/// [`edge`] with `--client-udp-fresh-head-ms`, and its cache.
+async fn edge_with(
+    admit_on_first_part: bool,
+    first_part_at_once: bool,
+    fresh_head: Duration,
+) -> (SocketAddr, watch::Sender<()>, Arc<LiveTsCache>) {
     let cache =
         LiveTsCache::with_ring(1, Duration::from_micros(1_000), 400, 12_000, 64, 8, 0).await;
     let mesh = Arc::new(
@@ -35,6 +50,7 @@ async fn edge(
         cache.commit_stream_payload(STREAM, envelope).await.unwrap();
     }
     assert!(!cache.state.read().await.playlist_is_playable(STREAM));
+    let edge_cache = Arc::clone(&cache);
     let router = app_router_for_tests(Arc::clone(&cache), mesh).with_playlist_demand(
         PlaylistDemand::new(PlaylistDemandConfig {
             enabled: true,
@@ -50,6 +66,7 @@ async fn edge(
     let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, 64);
     config.admit_on_first_part = admit_on_first_part;
     config.first_part_at_once = first_part_at_once;
+    config.fresh_head = fresh_head;
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     tokio::spawn(edge_udp::run_edge_udp(
         sockets,
@@ -59,7 +76,7 @@ async fn edge(
         Vec::new(),
         shutdown_rx,
     ));
-    (port, shutdown_tx)
+    (port, shutdown_tx, edge_cache)
 }
 
 /// Subscribe to the compact lane; when it is answered and when its first
@@ -147,11 +164,31 @@ async fn without_the_flag_a_subscriber_waits_for_a_playable_copy() {
     assert_eq!(first, None);
 }
 
+/// Wave 7 review: a head that arrived long ago (the last part before a
+/// hold, or before an earlier demand lapsed) is not a start. The
+/// subscription waits for a newer part and starts there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_head_is_not_a_start() {
+    let (port, _shutdown, cache) = edge_with(true, true, Duration::from_millis(50)).await;
+    // Parts 5..=9 are now older than 50 ms (and four 1 ms parts).
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let subscriber = tokio::spawn(subscribe(port, Duration::from_secs(2)));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!subscriber.is_finished());
+    let (envelope, _) = Payload::Opus1.envelope(STREAM, 10);
+    cache.commit_stream_payload(STREAM, envelope).await.unwrap();
+    let (subscribed, first) = subscriber.await.unwrap();
+    let subscribed = subscribed.expect("admitted once a fresh part came");
+    assert!(subscribed >= Duration::from_millis(300), "{subscribed:?}");
+    assert_eq!(first.expect("its first part").1, 10, "the fresh part");
+}
+
 #[test]
 fn the_first_audio_flags_default_on_and_can_be_turned_off() {
     let args = Args::try_parse_from(["av-mesh"]).unwrap();
     assert!(args.client_udp_admit_on_first_part);
     assert!(args.client_udp_first_part_at_once);
+    assert_eq!(args.client_udp_fresh_head_ms, 1_000);
     let args = Args::try_parse_from([
         "av-mesh",
         "--client-udp-admit-on-first-part",

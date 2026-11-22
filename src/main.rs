@@ -1949,6 +1949,21 @@ struct Args {
     )]
     client_udp_first_part_at_once: bool,
 
+    /// With --client-udp-admit-on-first-part: a UDP subscriber is admitted
+    /// at the newest part only if it arrived at this edge within this many
+    /// ms (or four of the stream's parts, if longer). A stale head (the last
+    /// part before a rendition was held back, or before an earlier demand
+    /// lapsed) is not a start: the subscription waits for a newer part, up
+    /// to its 4 s, and only then takes the stale one (wave 7 review: a New
+    /// York client joined at a head kept from before a hold and counted
+    /// 34,662 parts missing). 0: any part, as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_FRESH_HEAD_MS",
+        default_value_t = edge_udp::DEFAULT_FRESH_HEAD_MS
+    )]
+    client_udp_fresh_head_ms: u64,
+
     /// An edge that has heard none of its cache-mesh parents for this long
     /// has lost them: it answers 503 for a part or a playlist reload that it
     /// would otherwise hold, and moves its UDP clients. Keep it above the
@@ -3517,6 +3532,7 @@ async fn main() -> Result<()> {
                 compact_short_header: args.client_udp_compact_short_header,
                 admit_on_first_part: args.client_udp_admit_on_first_part,
                 first_part_at_once: args.client_udp_first_part_at_once,
+                fresh_head: Duration::from_millis(args.client_udp_fresh_head_ms),
             },
             Arc::clone(&router.edge_udp_stats),
             edge_cut_through.clone(),
@@ -11612,6 +11628,21 @@ impl LiveState {
             .get(&stream_id)
             .map_or(self.nominal_part_us, |part_us| u64::from(*part_us))
             .max(1)
+    }
+
+    /// Whether `part` of a stream arrived at this node within `within_us`
+    /// of `now_us`, or of four of the stream's parts if that is longer. A
+    /// part without a record counts as fresh.
+    fn part_arrived_within(&self, stream_id: u64, part: u64, now_us: u64, within_us: u64) -> bool {
+        let Some(record) = self
+            .stream_parts
+            .get(&stream_id)
+            .and_then(|parts| parts.get(&part))
+        else {
+            return true;
+        };
+        let limit = within_us.max(self.stream_part_target_us(stream_id).saturating_mul(4));
+        now_us.saturating_sub(record.available_unix_us) <= limit
     }
 
     /// How far a part of a stream lies behind `head`, in microseconds of
