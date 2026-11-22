@@ -61,6 +61,7 @@
 //!   cache-fed lane) and the class thread reads on.
 
 use super::sys;
+use std::time::{Duration, Instant};
 use super::view::RlsView;
 use super::TrafficClass;
 use crate::edge_udp::{EdgeSockets, EdgeUdpStats, Table};
@@ -370,6 +371,8 @@ pub struct FastLaneStats {
     pub fanout_batches: AtomicU64,
     pub fanout_sends: AtomicU64,
     pub fanout_shed: AtomicU64,
+    /// Batches whose fan-out thread waited for room in a full socket.
+    pub fanout_waited: AtomicU64,
 }
 
 /// What `/api/mesh` reports of the fast client lane.
@@ -401,6 +404,8 @@ pub struct FastLaneSnapshot {
     pub fanout_batches: u64,
     pub fanout_sends: u64,
     pub fanout_shed: u64,
+    #[serde(default)]
+    pub fanout_waited: u64,
 }
 
 struct Armed {
@@ -690,6 +695,7 @@ impl EdgeFastLane {
             fanout_batches: load(&self.stats.fanout_batches),
             fanout_sends: load(&self.stats.fanout_sends),
             fanout_shed: load(&self.stats.fanout_shed),
+            fanout_waited: load(&self.stats.fanout_waited),
         }
     }
 
@@ -1411,6 +1417,21 @@ impl ClientPlan {
     /// is refused gives its part back to the cache-fed lane for that
     /// client. A host that refuses GSO is sent to without it from then on.
     pub fn send(&mut self, lane: &EdgeFastLane, class: TrafficClass) {
+        self.send_with_patience(lane, class, None);
+    }
+
+    /// [`Self::send`], waiting up to `patience` for room in a full socket
+    /// before a part goes back to the cache-fed lane. A fan-out thread may
+    /// wait (it is not the ingest), and must: it can send a batch several
+    /// milliseconds after the class thread claimed its parts, when the
+    /// cache-fed lane has passed over them already, so a part it gave back
+    /// would go to the client only after a NACK (wave 7 review).
+    pub fn send_with_patience(
+        &mut self,
+        lane: &EdgeFastLane,
+        class: TrafficClass,
+        patience: Option<Duration>,
+    ) {
         if self.sends.is_empty() {
             return;
         }
@@ -1492,10 +1513,30 @@ impl ClientPlan {
                 Err(_) => sent = Some(0),
             }
         }
-        let sent = match sent {
+        let mut sent = match sent {
             Some(sent) => sent,
             None => sys::send_batch(fd, self.sends.len(), message).unwrap_or(0),
         };
+        if let Some(patience) = patience.filter(|_| !use_gso && pacing.is_none()) {
+            let give_up = Instant::now() + patience;
+            let mut waited = false;
+            while sent < sends.len() {
+                let left = give_up.saturating_duration_since(Instant::now());
+                if left.is_zero() || !sys::wait_writable(fd, left.as_millis().max(1) as i32) {
+                    break;
+                }
+                waited = true;
+                let more = sys::send_batch(fd, sends.len() - sent, |index| message(sent + index))
+                    .unwrap_or(0);
+                if more == 0 {
+                    break;
+                }
+                sent += more;
+            }
+            if waited {
+                lane.stats.fanout_waited.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let mut delivered = sent as u64;
         let (mut would_block, mut errors, mut given_back) = (0_u64, 0_u64, 0_u64);
         let (sends, clients, first_sent) = (&self.sends, &self.clients, &mut self.first_sent);
@@ -1827,6 +1868,10 @@ impl Drop for Fanout {
     }
 }
 
+/// How long a fan-out thread waits for room in a full client socket before
+/// it gives a part back to the cache-fed lane.
+const FANOUT_SEND_PATIENCE: Duration = Duration::from_millis(2);
+
 fn run_fanout(
     work: &std::sync::mpsc::Receiver<Box<ClientPlan>>,
     free: &std::sync::mpsc::SyncSender<Box<ClientPlan>>,
@@ -1835,7 +1880,7 @@ fn run_fanout(
     in_hand: &AtomicU32,
 ) {
     while let Ok(mut plan) = work.recv() {
-        plan.send(lane, class);
+        plan.send_with_patience(lane, class, Some(FANOUT_SEND_PATIENCE));
         plan.journal_sent(lane);
         in_hand.fetch_sub(1, Ordering::AcqRel);
         if free.try_send(plan).is_err() {

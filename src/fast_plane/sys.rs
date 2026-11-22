@@ -783,6 +783,27 @@ pub fn monotonic_ns() -> u64 {
 
 /// Wait until one of the descriptors is readable, or the timeout. Returns
 /// a bit set of the readable ones.
+/// Wait up to `timeout_ms` for room in `fd`'s send buffer; `true` when
+/// there is.
+pub fn wait_writable(fd: RawFd, timeout_ms: i32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let mut poll = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: one initialised pollfd.
+        let result = unsafe { libc::poll(&mut poll, 1, timeout_ms) };
+        result > 0 && poll.revents & libc::POLLOUT != 0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (fd, timeout_ms);
+        false
+    }
+}
+
 pub fn wait_readable(fds: &[RawFd], timeout_ms: i32) -> io::Result<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -988,6 +1009,14 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn a_socket_with_room_is_writable_at_once() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let started = std::time::Instant::now();
+        assert!(wait_writable(socket.as_raw_fd(), 1_000));
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
     }
 
     #[test]
