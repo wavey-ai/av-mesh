@@ -219,6 +219,15 @@ const REPAIR_HORIZON_INITIAL_MS: u64 = 60;
 /// node saw) is kept within these bounds, and never above the gap hold.
 const REPAIR_HORIZON_MIN_MS: u64 = 10;
 const REPAIR_HORIZON_MAX_MS: u64 = 250;
+/// A part stored this soon after a later part is a reordering or the other
+/// parent's copy, not a repair: it is not a repair delay. Two parents and
+/// 1 % loss make many such fills of well under a millisecond, which would
+/// otherwise hold the 90th percentile, and so the horizon, at the floor.
+const REPAIR_REORDER_GRACE_US: u64 = 2_000;
+/// The measured horizon is never shorter than the burst copy delay of the
+/// long-haul lanes (`--relay-burst-copy-ms`) plus this: a part that a burst
+/// took comes as its copy that much later, and must not be a gap by then.
+const REPAIR_HORIZON_BURST_COPY_MARGIN_MS: u64 = 10;
 /// Repairs that the measured horizon is computed from: the newest of them.
 const REPAIR_DELAY_SAMPLES: usize = 128;
 /// Gaps remembered for each stream's playlist: the oldest are forgotten.
@@ -1973,7 +1982,10 @@ struct Args {
     /// hole is listed as a gap (EXT-X-PART ... GAP=YES, the UDP gap object).
     /// A repair that comes later still fills the hole in the cache. `auto`:
     /// twice the 90th percentile of the repair delays this node measures
-    /// (10-250 ms, 60 ms before the first). A number: that many
+    /// (parts stored at least 2 ms after a later part; 60 ms before the
+    /// first), at most 250 ms and at least --relay-burst-copy-ms plus 10 ms
+    /// (10 ms without burst copies), so that a burst copy is never late for
+    /// it. A number: that many
     /// milliseconds. `off`: the gap hold alone, as before. Never longer
     /// than --canonical-gap-hold-ms, and nothing is skipped when that is 0.
     #[arg(
@@ -2592,6 +2604,7 @@ async fn main() -> Result<()> {
     .await;
     cache.set_canonical_gap_hold(Duration::from_millis(args.canonical_gap_hold_ms));
     cache.set_repair_horizon(args.canonical_repair_horizon);
+    cache.set_repair_horizon_floor_for_burst_copy(Duration::from_millis(args.relay_burst_copy_ms));
     cache.set_playlist_scan_memo(args.playlist_scan_memo);
     cache.set_part_hold_back_floor(Duration::from_millis(args.part_hold_back_ms));
     let link_telemetry = Arc::new(LinkTelemetry::new(
@@ -6920,6 +6933,9 @@ struct LiveTsCache {
     /// The measured horizon, kept current as repairs are measured: the
     /// commit path reads it without a lock.
     repair_horizon_auto_us: AtomicU64,
+    /// The least that the measured (auto) horizon may be: the burst copy
+    /// delay plus a margin, or [`REPAIR_HORIZON_MIN_MS`].
+    repair_horizon_floor_us: AtomicU64,
     /// Releases of a hole by the repair horizon, and the parts they listed
     /// as gaps.
     repair_horizon_releases: AtomicU64,
@@ -7061,6 +7077,7 @@ impl LiveTsCache {
             repair_horizon: AtomicU64::new(RepairHorizon::Off.code()),
             repair_delays: StdMutex::new(RepairDelays::default()),
             repair_horizon_auto_us: AtomicU64::new(REPAIR_HORIZON_INITIAL_MS * 1_000),
+            repair_horizon_floor_us: AtomicU64::new(REPAIR_HORIZON_MIN_MS * 1_000),
             repair_horizon_releases: AtomicU64::new(0),
             late_gap_fills: AtomicU64::new(0),
             gap_parts: StdMutex::new(HashMap::new()),
@@ -7348,6 +7365,22 @@ impl LiveTsCache {
         self.repair_horizon.store(horizon.code(), Ordering::Relaxed);
     }
 
+    /// The floor of the measured horizon for long-haul lanes that send
+    /// burst copies `burst_copy` after the source (`--relay-burst-copy-ms`):
+    /// the copy delay plus a margin, never below [`REPAIR_HORIZON_MIN_MS`].
+    /// A fixed horizon is not raised.
+    fn set_repair_horizon_floor_for_burst_copy(&self, burst_copy: Duration) {
+        let floor_us = if burst_copy.is_zero() {
+            REPAIR_HORIZON_MIN_MS * 1_000
+        } else {
+            duration_us(burst_copy)
+                .saturating_add(REPAIR_HORIZON_BURST_COPY_MARGIN_MS * 1_000)
+                .max(REPAIR_HORIZON_MIN_MS * 1_000)
+        };
+        self.repair_horizon_floor_us
+            .store(floor_us, Ordering::Relaxed);
+    }
+
     fn repair_horizon_mode(&self) -> RepairHorizon {
         RepairHorizon::from_code(self.repair_horizon.load(Ordering::Relaxed))
     }
@@ -7365,7 +7398,10 @@ impl LiveTsCache {
         let horizon_us = match self.repair_horizon_mode() {
             RepairHorizon::Off => return None,
             RepairHorizon::Fixed(ms) => ms.saturating_mul(1_000),
-            RepairHorizon::Auto => self.repair_horizon_auto_us.load(Ordering::Relaxed),
+            RepairHorizon::Auto => self
+                .repair_horizon_auto_us
+                .load(Ordering::Relaxed)
+                .max(self.repair_horizon_floor_us.load(Ordering::Relaxed)),
         };
         Some(horizon_us.min(hold_us))
     }
@@ -7477,8 +7513,13 @@ impl LiveTsCache {
         else {
             return;
         };
-        // In order (no later part stored): nothing to measure.
-        if let Some(delay_us) = self.hole_open_us(stream_idx, part, committed_us) {
+        // In order (no later part stored): nothing to measure. A part a
+        // moment behind a later one was reordered, or came from the other
+        // parent: not a repair.
+        if let Some(delay_us) = self
+            .hole_open_us(stream_idx, part, committed_us)
+            .filter(|delay_us| *delay_us >= REPAIR_REORDER_GRACE_US)
+        {
             self.record_repair_delay(delay_us);
         }
     }
@@ -7853,8 +7894,12 @@ impl LiveTsCache {
                 }
             }
 
-            // The playlist lists them as gaps while they are missing.
-            self.record_gap_parts(stream_id, &gaps);
+            // With the repair horizon, the playlist lists them as gaps while
+            // they are missing. With it off (the gap hold alone, as before
+            // the horizon) they are left out of the playlist, as they were.
+            if self.repair_horizon_us().is_some() {
+                self.record_gap_parts(stream_id, &gaps);
+            }
             if skipped_parts > 0 {
                 self.canonical_gap_skips.fetch_add(1, Ordering::Relaxed);
                 self.canonical_gap_skipped_parts

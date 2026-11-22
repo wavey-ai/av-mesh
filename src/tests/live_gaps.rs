@@ -311,6 +311,126 @@ async fn a_new_epoch_forgets_the_gaps_of_the_old() {
     assert!(!cache.is_gap_part(STREAM, 1));
 }
 
+#[tokio::test]
+async fn with_the_horizon_off_a_gap_hold_skip_lists_no_gap() {
+    // The A/B setting: --canonical-repair-horizon off must leave the
+    // playlist as before the horizon, where a skipped hole was left out.
+    let cache = horizon_cache(RepairHorizon::Off).await;
+    cache.set_canonical_gap_hold(Duration::from_millis(20));
+    commit_init(&cache).await;
+    for sequence in [0, 1, 2, 4] {
+        commit(&cache, sequence).await;
+    }
+    // Past the hold (four 5 ms parts), counted in parts committed.
+    for sequence in 5..12 {
+        commit(&cache, sequence).await;
+    }
+    assert!(watermark(&cache).await.unwrap() >= 4, "the hold released");
+    assert!(cache.canonical_gap_skip_snapshot().skipped_parts >= 1);
+    assert!(!cache.is_gap_part(STREAM, 3));
+    let playlist = cache.playlist_for_stream_id(STREAM).await;
+    assert!(!playlist.contains("GAP=YES"), "{playlist}");
+    assert!(!playlist.contains("part3.mp4"), "{playlist}");
+    assert!(playlist.contains("URI=\"part4.mp4\""), "{playlist}");
+}
+
+#[tokio::test]
+async fn reorderings_are_not_repairs_and_the_auto_horizon_waits_for_a_burst_copy() {
+    let cache = horizon_cache(RepairHorizon::Auto).await;
+    cache.set_repair_horizon_floor_for_burst_copy(Duration::from_millis(20));
+    assert_eq!(cache.repair_horizon_us(), Some(REPAIR_HORIZON_INITIAL_MS * 1_000));
+    commit_init(&cache).await;
+    // Two parents: each odd part comes a moment before the even one.
+    for pair in 0..40 {
+        commit(&cache, pair * 2 + 1).await;
+        commit(&cache, pair * 2).await;
+    }
+    let snapshot = cache.canonical_gap_skip_snapshot();
+    assert_eq!(snapshot.repair_delays, 0, "reorderings counted as repairs");
+    // Fast repairs alone would put the measured horizon at its minimum; the
+    // floor keeps it past the burst copy.
+    for _ in 0..50 {
+        cache.record_repair_delay(500);
+    }
+    assert_eq!(cache.repair_horizon_us(), Some(30_000));
+
+    // A part that a burst took comes as its copy 20 ms later: no gap.
+    for sequence in 81..86 {
+        commit(&cache, sequence).await;
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(cache.release_expired_repair_holes().await, 0);
+    assert_eq!(watermark(&cache).await, Some(79));
+    commit(&cache, 80).await;
+    assert_eq!(watermark(&cache).await, Some(85));
+    assert!(!cache.is_gap_part(STREAM, 80));
+    assert_eq!(cache.canonical_gap_skip_snapshot().skipped_parts, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn burst_copies_and_two_parent_reordering_leave_no_gap_with_the_auto_horizon() {
+    // A long-haul lane under gemodel 1% 20% with burst copies on: a part
+    // that a burst took comes as its copy --relay-burst-copy-ms later, and
+    // half the parts come from the other parent a moment before the part
+    // ahead of them. With the auto horizon, none of them is a gap.
+    let part = Duration::from_millis(2);
+    let copy_delay = Duration::from_millis(fast_plane::burst_copy::DEFAULT_BURST_COPY_MS);
+    let cache = LiveTsCache::new(1, part, 200, 2_000, 64).await;
+    cache.set_canonical_gap_hold(Duration::from_millis(DEFAULT_CANONICAL_GAP_HOLD_MS));
+    cache.set_repair_horizon(RepairHorizon::Auto);
+    cache.set_repair_horizon_floor_for_burst_copy(copy_delay);
+    commit_init(&cache).await;
+    let mut path = LongHaul::new(0.01, 0.2, 5);
+    let mut copies: VecDeque<(Instant, u64)> = VecDeque::new();
+    let started = Instant::now();
+    let mut lost = 0;
+    let mut swapped = None::<u64>;
+    let parts = 600_u64;
+    for sequence in 0..parts {
+        tokio::time::sleep_until((started + part * sequence as u32).into()).await;
+        while copies.front().is_some_and(|(due, _)| *due <= Instant::now()) {
+            let (_, copy) = copies.pop_front().unwrap();
+            commit(&cache, copy).await;
+        }
+        if sequence > 0 && path.part_lost(1) {
+            lost += 1;
+            copies.push_back((Instant::now() + copy_delay, sequence));
+            continue;
+        }
+        // The other parent's copy of an even part comes first: hold it
+        // until the odd part after it is stored.
+        if sequence % 2 == 0 && sequence + 1 < parts {
+            swapped = Some(sequence);
+            continue;
+        }
+        commit(&cache, sequence).await;
+        if let Some(held) = swapped.take() {
+            commit(&cache, held).await;
+        }
+        cache.release_expired_repair_holes().await;
+    }
+    if let Some(held) = swapped.take() {
+        commit(&cache, held).await;
+    }
+    for (due, copy) in copies {
+        tokio::time::sleep_until(due.into()).await;
+        commit(&cache, copy).await;
+    }
+    assert!(lost > 5, "the path lost {lost} parts");
+    let snapshot = cache.canonical_gap_skip_snapshot();
+    assert_eq!(
+        snapshot.skipped_parts, 0,
+        "parts listed as gaps: {snapshot:?}"
+    );
+    assert_eq!(snapshot.late_gap_fills, 0);
+    // The copies were measured as repairs, the reorderings were not.
+    assert!(snapshot.repair_delays <= lost, "{snapshot:?}");
+    assert!(
+        snapshot.repair_horizon_us.unwrap() >= duration_us(copy_delay),
+        "{snapshot:?}"
+    );
+}
+
 /// A long-haul path with Gilbert-Elliott loss, as netem's `gemodel p r`
 /// makes it (every datagram lost in the bad state), deciding which parts
 /// a distributor never recovers.
