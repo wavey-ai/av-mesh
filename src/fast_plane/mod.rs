@@ -13,6 +13,7 @@
 //! decodes or hashes the payload, so a 4K object never holds an audio symbol
 //! back, and a stall of the runtime never stops forwarding.
 
+pub mod burst_copy;
 pub mod dedup;
 pub mod edge_clients;
 pub mod lease;

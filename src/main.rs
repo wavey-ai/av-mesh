@@ -1278,6 +1278,22 @@ struct Args {
     )]
     relay_video_gso: bool,
 
+    /// Burst copies on the long-haul lanes (wave 5, W2): the audio
+    /// fast-plane thread sends every audio source symbol that it forwards
+    /// to a compiled child (--relay-forward: the long-haul forwarders, a
+    /// relay's distributors) once more, this many milliseconds later, so
+    /// that a burst of loss shorter than that cannot take a part (its
+    /// source and the repair right behind it) at the next forwarder. The
+    /// child drops the copy of a symbol that came. Costs the audio sources
+    /// again on those lanes; lease children (edges) get no copy. 0: no
+    /// copies. Needs --relay-class-threads.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_BURST_COPY_MS",
+        default_value_t = fast_plane::burst_copy::DEFAULT_BURST_COPY_MS
+    )]
+    relay_burst_copy_ms: u64,
+
     /// Datagrams each class's tee holds before the fast plane drops its tee
     /// copy (counted as tee_dropped; forwarding is never held back).
     #[arg(
@@ -2918,6 +2934,7 @@ async fn main() -> Result<()> {
         realtime: args.relay_class_realtime,
         tee_capacity: args.relay_class_tee_capacity,
         video_gso: args.relay_video_gso,
+        burst_copy_ms: args.relay_burst_copy_ms,
         lease: lease_children,
         edge_clients: fast_lane.clone(),
         holes: hole_trigger.clone(),
@@ -36332,6 +36349,7 @@ mod tests {
                 lease: None,
                 edge_clients: None,
                 holes: None,
+                burst_copy_ms: 0,
                 test_tee_panic: Some(fast_plane::TrafficClass::Audio),
             },
         )
@@ -36782,4 +36800,8 @@ mod tests {
     /// The repair horizon of the live path: holes hold the watermark only
     /// briefly, and are listed as gaps.
     mod live_gaps;
+
+    /// Burst copies on the long-haul lanes: a burst of loss cannot take a
+    /// part at the next forwarder.
+    mod burst_copy;
 }

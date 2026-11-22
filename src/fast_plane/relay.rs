@@ -5,6 +5,7 @@
 //! `false` keeps that loop, which validates and decodes every symbol before
 //! it forwards it.
 
+use super::burst_copy::BurstCopies;
 use super::dedup::FirstArrival;
 use super::edge_clients::{ClientPlan, EdgeFastLane, UpstreamRepair};
 use super::lease::{LeaseChildren, LeaseSnapshot, LeaseSnapshotStats, LeaseTake};
@@ -76,6 +77,10 @@ pub struct RelayClassConfig {
     /// `--edge-hole-distance-ms`: the tee finds an edge's holes by part
     /// distance as it takes each symbol (see `edge_holes`).
     pub holes: Option<Arc<crate::edge_holes::HoleTrigger>>,
+    /// `--relay-burst-copy-ms` (wave 5, W2): the audio thread sends each
+    /// audio source symbol to the compiled children again this long after
+    /// it forwarded it (see `burst_copy`); 0 sends no copy.
+    pub burst_copy_ms: u64,
     /// Tests: the tee of this class panics on its first datagram.
     #[cfg(test)]
     pub test_tee_panic: Option<TrafficClass>,
@@ -92,6 +97,7 @@ impl Default for RelayClassConfig {
             lease: None,
             edge_clients: None,
             holes: None,
+            burst_copy_ms: 0,
             #[cfg(test)]
             test_tee_panic: None,
         }
@@ -186,6 +192,10 @@ pub struct FastPlaneStats {
     pub gso_messages: AtomicU64,
     /// Threads that found UDP GSO unavailable and send without it.
     pub gso_fallbacks: AtomicU64,
+    /// Burst copies sent to compiled children, and dropped (a full ring, a
+    /// full socket).
+    pub burst_copies: AtomicU64,
+    pub burst_copies_dropped: AtomicU64,
     /// The lease children, whose counters the snapshot reports.
     pub lease: OnceLock<Arc<LeaseChildren>>,
 }
@@ -213,6 +223,8 @@ pub struct FastPlaneSnapshot {
     pub gso_datagrams: u64,
     pub gso_messages: u64,
     pub gso_fallbacks: u64,
+    pub burst_copies: u64,
+    pub burst_copies_dropped: u64,
     pub lease_children: LeaseSnapshotStats,
 }
 
@@ -239,6 +251,8 @@ impl FastPlaneStats {
             gso_datagrams: load(&self.gso_datagrams),
             gso_messages: load(&self.gso_messages),
             gso_fallbacks: load(&self.gso_fallbacks),
+            burst_copies: load(&self.burst_copies),
+            burst_copies_dropped: load(&self.burst_copies_dropped),
             lease_children: self
                 .lease
                 .get()
@@ -714,6 +728,7 @@ struct ClassThread {
     video_gso: bool,
     lease: Option<Arc<LeaseChildren>>,
     edge_clients: Option<Arc<EdgeFastLane>>,
+    burst_copy_ms: u64,
 }
 
 struct Pending {
@@ -776,8 +791,17 @@ impl ClassThread {
         let mut gso = self.video_gso && self.class == TrafficClass::Video;
         let mut clients = ClientPlan::new().with_gso(gso);
         let mut kernel_dropped = vec![0_u32; self.sockets.len()];
+        // Burst copies of the audio sources for the compiled children.
+        let mut copies = (self.class == TrafficClass::Audio && self.forwarder.is_some())
+            .then(|| BurstCopies::new(self.burst_copy_ms.saturating_mul(1_000)))
+            .flatten();
         while !self.stop.load(Ordering::Relaxed) {
-            let ready = match sys::wait_readable(&fds, STOP_POLL_MS) {
+            // No longer than the next copy's due time.
+            let timeout = copies
+                .as_ref()
+                .and_then(|copies| copies.wait_ms(now_unix_us()))
+                .map_or(STOP_POLL_MS, |wait| wait.min(STOP_POLL_MS));
+            let ready = match sys::wait_readable(&fds, timeout) {
                 Ok(ready) => ready,
                 Err(error) => {
                     warn!(class = self.class.as_str(), error = %error, "fast-plane wait failed");
@@ -809,12 +833,41 @@ impl ClassThread {
                         &mut pending,
                         &mut clients,
                         &mut gso,
+                        copies.as_mut(),
                     );
                     if received < RECV_BATCH {
                         break;
                     }
                 }
             }
+            if let Some(copies) = copies.as_mut() {
+                self.send_copies(copies);
+            }
+        }
+    }
+
+    /// Send the burst copies that are due, after the batch's own sends.
+    fn send_copies(&self, copies: &mut BurstCopies) {
+        let Some(forwarder) = &self.forwarder else {
+            return;
+        };
+        if copies.is_empty() {
+            return;
+        }
+        let dropped = copies.dropped;
+        let sent = copies.send_due(now_unix_us(), |group, run| {
+            sys::send_batch(forwarder.class_fd(self.class, group), run.len(), |index| {
+                run[index]
+            })
+            .unwrap_or(0)
+        });
+        if sent > 0 {
+            self.stats.burst_copies.fetch_add(sent, Ordering::Relaxed);
+        }
+        if copies.dropped > dropped {
+            self.stats
+                .burst_copies_dropped
+                .fetch_add(copies.dropped - dropped, Ordering::Relaxed);
         }
     }
 
@@ -829,6 +882,7 @@ impl ClassThread {
         pending: &mut Vec<Pending>,
         clients: &mut ClientPlan,
         gso: &mut bool,
+        copies: Option<&mut BurstCopies>,
     ) {
         let now_us = now_unix_us();
         let now = Instant::now();
@@ -939,6 +993,28 @@ impl ClassThread {
             // Held-back sources are kept only once every child has its
             // datagrams, in this class's own buffers.
             forwarder.buffer_fast_warm(class, batch, plan, now_us);
+            // The sources' burst copies, due their delay from now.
+            if let Some(copies) = copies {
+                let dropped = copies.dropped;
+                for (group, sends) in plan.groups.iter().enumerate() {
+                    for send in sends
+                        .iter()
+                        .filter(|send| matches!(send.role, MediaDatagramRole::Source))
+                    {
+                        copies.push(
+                            batch.data(usize::from(send.message)),
+                            group,
+                            forwarder.class_target(class, usize::from(send.path)),
+                            now_us,
+                        );
+                    }
+                }
+                if copies.dropped > dropped {
+                    self.stats
+                        .burst_copies_dropped
+                        .fetch_add(copies.dropped - dropped, Ordering::Relaxed);
+                }
+            }
         }
         // The lease children (the edges) after the compiled children (the
         // long-haul forwarders).
@@ -1418,6 +1494,7 @@ pub async fn run_relay_class_ingest(
             video_gso: config.video_gso,
             lease: config.lease.clone(),
             edge_clients: config.edge_clients.clone(),
+            burst_copy_ms: config.burst_copy_ms,
         };
         match std::thread::Builder::new()
             .name(format!("needletail-fast-{}", class.as_str()))
