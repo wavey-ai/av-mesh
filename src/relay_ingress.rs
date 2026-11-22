@@ -537,9 +537,14 @@ impl RelayObjectReceiver {
             config,
             sessions: HashMap::new(),
             objects: HashMap::new(),
-            logical_keys: HashMap::new(),
-            completed: HashMap::new(),
-            completed_order: VecDeque::new(),
+            // A completed object keeps its logical key until it is evicted:
+            // both tables hold up to `max_completed_objects` and are sized
+            // for that once, so they never grow under the tee (growing them
+            // rehashed thousands of string keys, which held a 1 ms stream's
+            // commits for 2-5 ms at its 1,792nd and 3,584th part).
+            logical_keys: HashMap::with_capacity(config.max_completed_objects),
+            completed: HashMap::with_capacity(config.max_completed_objects),
+            completed_order: VecDeque::with_capacity(config.max_completed_objects),
             buffered_object_bytes: 0,
             buffered_datagrams: 0,
             counters: RelayIngressCounters::default(),
@@ -1703,6 +1708,58 @@ mod tests {
         assert_eq!(receiver.state().active_objects, 0);
         assert_eq!(receiver.state().buffered_object_bytes, 0);
         assert_eq!(receiver.state().buffered_datagrams, 0);
+    }
+
+    #[test]
+    fn the_completed_tables_are_sized_once_and_never_grow() {
+        let config = RelayObjectReceiverConfig {
+            max_completed_objects: 64,
+            ..RelayObjectReceiverConfig::default()
+        };
+        let mut receiver = RelayObjectReceiver::new(config).expect("receiver");
+        let capacity = |receiver: &RelayObjectReceiver| {
+            (
+                receiver.completed.capacity(),
+                receiver.logical_keys.capacity(),
+                receiver.completed_order.capacity(),
+            )
+        };
+        let sized = capacity(&receiver);
+        assert!(sized.0 >= 64 && sized.1 >= 64 && sized.2 >= 64);
+        receiver
+            .register_parent_session(parent(1, "primary-amsterdam", ParentPath::Primary))
+            .expect("primary");
+        let mut encoder = encoder();
+        for sequence in 0..200 {
+            let object = fmp4_object(sequence, 600);
+            let encoded = encoder
+                .encode_object(
+                    &object,
+                    generation(),
+                    subscription(),
+                    MediaDeadline::from_micros(2_000_000),
+                    MediaPriority::VideoKey,
+                )
+                .expect("relay symbols");
+            receiver
+                .announce_object(1, encoded.announcement, 1_000)
+                .expect("announcement");
+            for symbol in &encoded.source_symbols {
+                let wire = encode_datagram(symbol, RelayLimits::default()).expect("source wire");
+                receiver
+                    .push_wire_datagram(1, &wire, 1_100)
+                    .expect("source");
+            }
+        }
+        assert_eq!(receiver.state().completed_objects, 64);
+        assert_eq!(receiver.logical_keys.len(), 64);
+        // A table that grew would at least double its capacity (removals
+        // can only leave it lower, until a rehash in place).
+        let after = capacity(&receiver);
+        assert!(
+            after.0 <= sized.0 && after.1 <= sized.1 && after.2 == sized.2,
+            "no table grew: {sized:?} -> {after:?}"
+        );
     }
 
     #[test]
