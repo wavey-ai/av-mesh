@@ -640,10 +640,19 @@ impl RelayDownstreamForwarder {
             first,
             ..
         } = plan;
-        for (group, sends) in groups.iter().enumerate() {
+        let use_gso = *gso && class == TrafficClass::Video;
+        for (group, sends) in groups.iter_mut().enumerate() {
             if sends.is_empty() {
                 continue;
             }
+            if use_gso && self.socket_groups[group].len() > 1 {
+                // Children that share a source socket: the plan takes them
+                // in turn symbol by symbol, which leaves GSO nothing to join.
+                // Each child's symbols together (its own order kept, the
+                // children in compiled order) make one message per child.
+                sends.sort_unstable_by_key(|send| (send.path, send.message));
+            }
+            let sends = &*sends;
             let fd = self.class_fd(class, group);
             let started = Instant::now();
             let message = |index: usize| {
@@ -654,7 +663,7 @@ impl RelayDownstreamForwarder {
                 )
             };
             let mut sent = None;
-            if *gso && class == TrafficClass::Video {
+            if use_gso && *gso {
                 match sys::send_gso_batch(fd, sends.len(), message) {
                     Ok(gso_sent) => {
                         stats
@@ -682,12 +691,17 @@ impl RelayDownstreamForwarder {
             };
             let sent_us = now_unix_us();
             let elapsed = started.elapsed();
+            let (mut sources, mut repairs, mut bytes) = (0_u64, 0_u64, 0_u64);
             for send in &sends[..sent] {
-                let len = batch.data(usize::from(send.message)).len();
-                self.record_forward_success(send.role, len, elapsed);
+                bytes += batch.data(usize::from(send.message)).len() as u64;
+                match send.role {
+                    MediaDatagramRole::Source => sources += 1,
+                    MediaDatagramRole::Repair => repairs += 1,
+                }
                 first[usize::from(send.message)]
                     .get_or_insert((self.class_target(class, usize::from(send.path)), sent_us));
             }
+            self.record_forward_batch(sources, repairs, bytes, elapsed);
             stats.forwarded[class.index()].fetch_add(sent as u64, Ordering::Relaxed);
             retry.extend(sends[sent..].iter().map(|send| (group, *send)));
         }
@@ -794,7 +808,9 @@ impl ClassThread {
         // UDP GSO for video until the host refuses it once (the edge's
         // clients and the children apart).
         let mut gso = self.video_gso && self.class == TrafficClass::Video;
-        let mut clients = ClientPlan::new().with_gso(gso);
+        let mut clients = ClientPlan::new()
+            .with_gso(gso)
+            .with_video(self.class == TrafficClass::Video);
         let mut kernel_dropped = vec![0_u32; self.sockets.len()];
         // Burst copies of the audio sources for the compiled children.
         let mut copies = (self.class == TrafficClass::Audio && self.forwarder.is_some())

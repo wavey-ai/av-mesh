@@ -481,15 +481,31 @@ pub fn gso_runs(
     datagram: impl Fn(usize) -> (usize, SocketAddr),
 ) -> Vec<(usize, usize)> {
     let mut runs = Vec::new();
+    gso_runs_into(&mut runs, count, datagram, |_| GSO_MAX_SEGMENTS);
+    runs
+}
+
+/// [`gso_runs`] into `runs` (cleared first), with a run that starts at
+/// datagram `first` at most `max_segments(first)` datagrams (and never more
+/// than [`GSO_MAX_SEGMENTS`]): a paced sender cuts a client's datagrams
+/// into runs that each leave at their own time.
+pub fn gso_runs_into(
+    runs: &mut Vec<(usize, usize)>,
+    count: usize,
+    datagram: impl Fn(usize) -> (usize, SocketAddr),
+    max_segments: impl Fn(usize) -> usize,
+) {
+    runs.clear();
     let mut index = 0;
     while index < count {
         let (size, target) = datagram(index);
         let mut length = 1;
         let mut bytes = size;
+        let limit = max_segments(index).clamp(1, GSO_MAX_SEGMENTS);
         // A run continues while the next datagram goes to the same target
         // and has the run's size; a shorter one may end it.
         if size > 0 {
-            while index + length < count && length < GSO_MAX_SEGMENTS {
+            while index + length < count && length < limit {
                 let (next_size, next_target) = datagram(index + length);
                 if next_target != target
                     || next_size == 0
@@ -508,7 +524,6 @@ pub fn gso_runs(
         runs.push((index, length));
         index += length;
     }
-    runs
 }
 
 /// Whether a GSO send failed because the host cannot do UDP GSO on this
@@ -544,6 +559,21 @@ pub fn send_gso_batch<'a>(
         let (data, target) = message(index);
         (data.len(), target)
     });
+    send_gso_runs(socket, &runs, message, None)
+}
+
+/// Send `runs` (from [`gso_runs_into`]) of the messages, each run one UDP
+/// GSO message, as [`send_gso_batch`] does. With `departures`, run `i`
+/// carries an earliest departure time (`SCM_TXTIME`, CLOCK_MONOTONIC ns,
+/// [`monotonic_ns`]) of `departures[i]`: on a socket with [`enable_txtime`],
+/// an `fq` qdisc holds the run until then (other qdiscs send it at once).
+pub fn send_gso_runs<'a>(
+    socket: RawFd,
+    runs: &[(usize, usize)],
+    message: impl Fn(usize) -> (&'a [u8], SocketAddr),
+    departures: Option<&[u64]>,
+) -> io::Result<GsoSent> {
+    debug_assert!(departures.is_none_or(|departures| departures.len() == runs.len()));
     let mut sent = GsoSent::default();
     let mut next_run = 0;
     while next_run < runs.len() {
@@ -559,7 +589,8 @@ pub fn send_gso_batch<'a>(
             end += 1;
         }
         let call = &runs[next_run..end];
-        match send_gso_chunk(socket, call, &message) {
+        let call_departures = departures.map(|departures| &departures[next_run..end]);
+        match send_gso_chunk(socket, call, &message, call_departures) {
             Ok(taken) => {
                 sent.calls += 1;
                 sent.messages += taken;
@@ -581,10 +612,12 @@ fn send_gso_chunk<'a>(
     socket: RawFd,
     runs: &[(usize, usize)],
     message: &impl Fn(usize) -> (&'a [u8], SocketAddr),
+    departures: Option<&[u64]>,
 ) -> io::Result<usize> {
     debug_assert!(runs.len() <= SEND_BATCH);
-    // One cmsghdr with a u16 payload, aligned as the kernel reads it.
-    const CONTROL: usize = 32;
+    // A cmsghdr with a u16 payload (UDP_SEGMENT) and one with a u64
+    // (SCM_TXTIME), aligned as the kernel reads them.
+    const CONTROL: usize = 64;
     #[repr(C, align(8))]
     #[derive(Clone, Copy)]
     struct Control([u8; CONTROL]);
@@ -595,8 +628,10 @@ fn send_gso_chunk<'a>(
     let mut headers: [libc::mmsghdr; SEND_BATCH] = unsafe { std::mem::zeroed() };
     let mut controls = [Control([0; CONTROL]); SEND_BATCH];
     // SAFETY: CMSG_SPACE is a pure size computation.
-    let control_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) } as usize;
-    debug_assert!(control_space <= CONTROL);
+    let segment_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) } as usize;
+    // SAFETY: as above.
+    let txtime_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u64>() as u32) } as usize;
+    debug_assert!(segment_space + txtime_space <= CONTROL);
     let mut iov = 0;
     for (slot, &(first, length)) in runs.iter().enumerate() {
         let (head, target) = message(first);
@@ -623,20 +658,34 @@ fn send_gso_chunk<'a>(
         header.msg_namelen = address.len();
         header.msg_iov = std::ptr::from_mut(&mut iovecs[iov_first]);
         header.msg_iovlen = length as _;
-        if length > 1 {
-            let segment = u16::try_from(head.len()).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "GSO segment over 64 KiB")
-            })?;
-            header.msg_control = controls[slot].0.as_mut_ptr().cast();
-            header.msg_controllen = control_space as _;
-            // SAFETY: the control buffer is aligned and CMSG_SPACE(2) long,
-            // so the first header and its two data bytes lie inside it.
-            unsafe {
-                let cmsg = libc::CMSG_FIRSTHDR(header);
+        let departure = departures.map(|departures| departures[slot]);
+        let control = usize::from(length > 1) * segment_space
+            + usize::from(departure.is_some()) * txtime_space;
+        if control == 0 {
+            continue;
+        }
+        header.msg_control = controls[slot].0.as_mut_ptr().cast();
+        header.msg_controllen = control as _;
+        // SAFETY: the control buffer is aligned and as long as the headers
+        // written, each with its data, so CMSG_FIRSTHDR/CMSG_NXTHDR stay
+        // inside it.
+        unsafe {
+            let mut cmsg = libc::CMSG_FIRSTHDR(header);
+            if length > 1 {
+                let segment = u16::try_from(head.len()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "GSO segment over 64 KiB")
+                })?;
                 (*cmsg).cmsg_level = libc::SOL_UDP;
                 (*cmsg).cmsg_type = libc::UDP_SEGMENT;
                 (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as _;
                 std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<u16>(), segment);
+                cmsg = libc::CMSG_NXTHDR(header, cmsg);
+            }
+            if let Some(departure) = departure {
+                (*cmsg).cmsg_level = libc::SOL_SOCKET;
+                (*cmsg).cmsg_type = libc::SCM_TXTIME;
+                (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u64>() as u32) as _;
+                std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<u64>(), departure);
             }
         }
     }
@@ -662,12 +711,74 @@ fn send_gso_chunk<'a>(
     socket: RawFd,
     runs: &[(usize, usize)],
     message: &impl Fn(usize) -> (&'a [u8], SocketAddr),
+    departures: Option<&[u64]>,
 ) -> io::Result<usize> {
-    let _ = (socket, runs, message);
+    let _ = (socket, runs, message, departures);
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "UDP GSO is Linux only",
     ))
+}
+
+/// Let the socket's messages carry an earliest departure time
+/// (`SO_TXTIME`, CLOCK_MONOTONIC, no deadline mode, no error reports). An
+/// `fq` qdisc honours it; CLOCK_MONOTONIC needs no privilege.
+pub fn enable_txtime(socket: RawFd) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        #[repr(C)]
+        struct SockTxtime {
+            clockid: libc::clockid_t,
+            flags: u32,
+        }
+        let value = SockTxtime {
+            clockid: libc::CLOCK_MONOTONIC,
+            flags: 0,
+        };
+        // SAFETY: a setsockopt of a sock_txtime on a live descriptor.
+        let result = unsafe {
+            libc::setsockopt(
+                socket,
+                libc::SOL_SOCKET,
+                libc::SO_TXTIME,
+                std::ptr::from_ref(&value).cast(),
+                std::mem::size_of::<SockTxtime>() as libc::socklen_t,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = socket;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "SO_TXTIME is Linux only",
+        ))
+    }
+}
+
+/// CLOCK_MONOTONIC now, in nanoseconds: the clock of `SCM_TXTIME`.
+pub fn monotonic_ns() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: clock_gettime writes one timespec.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
+        (time.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(time.tv_nsec as u64)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
 }
 
 /// Wait until one of the descriptors is readable, or the timeout. Returns
@@ -889,6 +1000,94 @@ mod tests {
         let runs = gso_runs(big.len(), |index| big[index]);
         assert!(runs.iter().all(|run| run.1 * 9_000 <= GSO_MAX_BYTES));
         assert_eq!(gso_runs(0, |index| many[index]), Vec::new());
+    }
+
+    #[test]
+    fn gso_runs_are_cut_to_the_segments_each_run_may_carry() {
+        let a: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        // 40 symbols to a, then 10 to b: a's runs carry at most 16, b's 3.
+        let mut datagrams: Vec<(usize, SocketAddr)> = vec![(1_100, a); 40];
+        datagrams.extend([(1_100, b); 10]);
+        let mut runs = Vec::new();
+        gso_runs_into(
+            &mut runs,
+            datagrams.len(),
+            |index| datagrams[index],
+            |first| if datagrams[first].1 == a { 16 } else { 3 },
+        );
+        assert_eq!(
+            runs,
+            vec![
+                (0, 16),
+                (16, 16),
+                (32, 8),
+                (40, 3),
+                (43, 3),
+                (46, 3),
+                (49, 1)
+            ]
+        );
+        // A limit of 0 or above the kernel's is held to 1..=64.
+        gso_runs_into(&mut runs, 3, |index| datagrams[index], |_| 0);
+        assert_eq!(runs, vec![(0, 1), (1, 1), (2, 1)]);
+        gso_runs_into(&mut runs, 40, |index| datagrams[index], |_| 1_000);
+        assert_eq!(runs, vec![(0, 40)]);
+    }
+
+    /// Runs with an earliest departure each (SO_TXTIME): the receiver sees
+    /// the same datagrams in order (on loopback without fq they leave at
+    /// once; `tests::video_throughput` measures the spacing under fq).
+    #[test]
+    fn runs_with_departures_arrive_as_the_same_datagrams_in_order() {
+        let receiver = bind_plain("127.0.0.1:0".parse().unwrap()).unwrap();
+        socket2::SockRef::from(&receiver)
+            .set_recv_buffer_size(4 << 20)
+            .unwrap();
+        let target = receiver.local_addr().unwrap();
+        let sender = bind_plain("127.0.0.1:0".parse().unwrap()).unwrap();
+        enable_txtime(sender.as_raw_fd()).unwrap();
+        let payloads: Vec<Vec<u8>> = (0..50_u32)
+            .map(|index| vec![index as u8; if index == 49 { 200 } else { 1_100 }])
+            .collect();
+        let mut runs = Vec::new();
+        gso_runs_into(
+            &mut runs,
+            payloads.len(),
+            |index| (payloads[index].len(), target),
+            |_| 8,
+        );
+        let now = monotonic_ns();
+        let departures: Vec<u64> = (0..runs.len() as u64)
+            .map(|run| now + run * 1_000)
+            .collect();
+        let sent = match send_gso_runs(
+            sender.as_raw_fd(),
+            &runs,
+            |index| (&payloads[index][..], target),
+            Some(&departures),
+        ) {
+            Ok(sent) => sent,
+            Err(error) if gso_unsupported(&error) => {
+                eprintln!("UDP GSO is not available here: {error}");
+                return;
+            }
+            Err(error) => panic!("paced GSO send failed: {error}"),
+        };
+        assert_eq!(sent.datagrams, payloads.len());
+        assert_eq!(sent.messages, runs.len());
+        let mut got = Vec::new();
+        let mut batch = RecvBatch::new();
+        for _ in 0..100 {
+            let _ = wait_readable(&[receiver.as_raw_fd()], 100);
+            let n = batch.recv(&receiver).unwrap_or(0);
+            got.extend((0..n).map(|index| batch.data(index).to_vec()));
+            if got.len() == payloads.len() {
+                break;
+            }
+        }
+        assert_eq!(got, payloads);
+        assert!(monotonic_ns() >= now);
     }
 
     #[test]

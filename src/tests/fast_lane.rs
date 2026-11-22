@@ -390,6 +390,25 @@ impl LaneEdge {
         }
     }
 
+    /// Forwarder `index`'s socket, for a sender thread of its own.
+    pub(super) fn forwarder_fd(&self, index: usize) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.forwarders[index].as_raw_fd()
+    }
+
+    pub(super) fn forwarder_socket(&self, index: usize) -> &UdpSocket {
+        &self.forwarders[index]
+    }
+
+    /// The edge's RLS1 port that forwarder `index` sends a class to.
+    pub(super) fn relay_port(&self, index: usize, video: bool) -> SocketAddr {
+        let mut port = self.relay_ports[index];
+        if video {
+            port.set_port(port.port() + OFFSET);
+        }
+        port
+    }
+
     pub(super) async fn head(&self, stream_id: u64) -> Option<u64> {
         self.cache
             .stream_position_for_id(stream_id)

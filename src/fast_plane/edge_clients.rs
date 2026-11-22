@@ -36,6 +36,16 @@
 //!   envelope), and kept in the edge's compact ring for the window repair
 //!   and NACK answers. It takes no upstream repair of such an object, and no
 //!   top-up: its plan's copies, window repair and NACK protect it.
+//! - Video is paced per client (`--client-udp-video-pace-percent`, wave 5
+//!   W3): the video thread measures each stream's rate from the symbols it
+//!   takes, cuts each client's symbols of a batch into GSO messages of about
+//!   a millisecond of the client's rate (that percent of the stream's), and
+//!   gives each message an earliest departure (`SO_TXTIME`): the client's
+//!   last departure plus its bytes at that rate, never earlier than now and
+//!   never later than `--client-udp-video-pace-max-ms` from now. The host's
+//!   `fq` qdisc holds each message until then, so a client gets a 4K frame
+//!   at its rate instead of at the NIC's line rate, with no timer on the
+//!   thread. Other qdiscs send at once. Audio is never paced.
 
 use super::sys;
 use super::view::RlsView;
@@ -52,7 +62,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 use tracing::debug;
 
@@ -76,6 +86,118 @@ const INLINE_TOP_UP_BYTES: usize = 16 * 1024;
 
 const LANE_FAST: u64 = 1;
 const LANE_CACHE: u64 = 2;
+
+/// Each paced GSO message carries about this much of its client's rate.
+pub const PACING_SLICE_US: u64 = 1_000;
+/// A stream's rate is measured over windows of this long.
+const RATE_WINDOW_NS: u64 = 500_000_000;
+/// The rate is known once a stream has been seen this long.
+const RATE_FIRST_NS: u64 = 100_000_000;
+/// A client is never paced below this rate.
+const MIN_CLIENT_BPS: u64 = 1_000_000;
+/// Departures the video thread remembers before it forgets past ones.
+const PACED_CLIENTS: usize = 8_192;
+
+/// The edge's pacing of its video clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoPacing {
+    /// Each client's rate, in percent of the stream's measured rate
+    /// (`--client-udp-video-pace-percent`).
+    pub percent: u32,
+    /// A message never departs later than this after the thread sends it
+    /// (`--client-udp-video-pace-max-ms`): a burst above the rate (a
+    /// keyframe) is delayed at most this much.
+    pub max_delay_us: u64,
+}
+
+impl Default for VideoPacing {
+    fn default() -> Self {
+        Self {
+            percent: 125,
+            max_delay_us: 8_000,
+        }
+    }
+}
+
+/// A stream's rate, from the bytes of its symbols.
+#[derive(Debug, Default, Clone, Copy)]
+struct StreamRate {
+    window_start_ns: u64,
+    bytes: u64,
+    bps: u64,
+}
+
+impl StreamRate {
+    fn observe(&mut self, now_ns: u64, bytes: u64) {
+        let elapsed = now_ns.saturating_sub(self.window_start_ns);
+        if self.window_start_ns == 0 || elapsed > 2 * RATE_WINDOW_NS {
+            // First seen, or back after a pause: a new window, and the
+            // rate before the pause stands.
+            self.window_start_ns = now_ns;
+            self.bytes = 0;
+        } else if elapsed >= RATE_WINDOW_NS {
+            let measured = self.bytes.saturating_mul(8_000_000_000) / elapsed.max(1);
+            self.bps = if self.bps == 0 {
+                measured
+            } else {
+                (self.bps + measured) / 2
+            };
+            self.window_start_ns = now_ns;
+            self.bytes = 0;
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    fn bps(&self, now_ns: u64) -> Option<u64> {
+        if self.bps > 0 {
+            return Some(self.bps);
+        }
+        let elapsed = now_ns.saturating_sub(self.window_start_ns);
+        (self.window_start_ns > 0 && elapsed >= RATE_FIRST_NS)
+            .then(|| self.bytes.saturating_mul(8_000_000_000) / elapsed)
+            .filter(|bps| *bps > 0)
+    }
+}
+
+/// The video thread's pacing state: each stream's rate, each client's
+/// next departure.
+#[derive(Debug, Default)]
+struct Pacer {
+    rates: HashMap<u64, StreamRate>,
+    next: HashMap<SocketAddr, u64>,
+}
+
+impl Pacer {
+    /// The client's rate on `stream_id`, bits a second, once it is known.
+    fn client_bps(&self, stream_id: u64, pacing: VideoPacing, now_ns: u64) -> Option<u64> {
+        let bps = self.rates.get(&stream_id)?.bps(now_ns)?;
+        Some((bps.saturating_mul(u64::from(pacing.percent)) / 100).max(MIN_CLIENT_BPS))
+    }
+
+    /// When a message of `bytes` to `peer` at `bps` departs, and whether
+    /// the bound on the delay held it earlier than the rate would.
+    fn departure(
+        &mut self,
+        peer: SocketAddr,
+        bytes: usize,
+        bps: u64,
+        pacing: VideoPacing,
+        now_ns: u64,
+    ) -> (u64, bool) {
+        let latest = now_ns.saturating_add(pacing.max_delay_us.saturating_mul(1_000));
+        let next = self.next.entry(peer).or_insert(0);
+        let wanted = (*next).max(now_ns);
+        let departure = wanted.min(latest);
+        *next = departure.saturating_add((bytes as u64).saturating_mul(8_000_000_000) / bps.max(1));
+        (departure, wanted > latest)
+    }
+
+    fn forget_past(&mut self, now_ns: u64) {
+        if self.next.len() > PACED_CLIENTS {
+            self.next.retain(|_, next| *next > now_ns);
+        }
+    }
+}
 
 const fn claim_tag(part: u64, lane: u64) -> u64 {
     (part.wrapping_add(1) << 2) | lane
@@ -213,6 +335,12 @@ pub struct FastLaneStats {
     /// went as symbols).
     pub compact_parts: AtomicU64,
     pub compact_failed: AtomicU64,
+    /// Video pacing: messages sent with an earliest departure, those whose
+    /// departure the bound on the delay brought forward, and refusals of
+    /// SO_TXTIME by the host (video then goes unpaced).
+    pub paced_messages: AtomicU64,
+    pub paced_clamped: AtomicU64,
+    pub txtime_refused: AtomicU64,
 }
 
 /// What `/api/mesh` reports of the fast client lane.
@@ -236,6 +364,9 @@ pub struct FastLaneSnapshot {
     pub gso_fallbacks: u64,
     pub compact_parts: u64,
     pub compact_failed: u64,
+    pub paced_messages: u64,
+    pub paced_clamped: u64,
+    pub txtime_refused: u64,
 }
 
 struct Armed {
@@ -261,8 +392,18 @@ pub struct EdgeFastLane {
     /// place (`--client-udp-compact-fast-parse`), not from a full decode and
     /// slot.
     compact_fast_parse: AtomicBool,
+    /// Video pacing: the percent of the stream's rate (0: off), the bound
+    /// on the delay, and whether the video socket takes SO_TXTIME
+    /// (`TXTIME_*`).
+    pace_percent: AtomicU32,
+    pace_max_delay_us: AtomicU64,
+    txtime: AtomicU8,
     pub stats: FastLaneStats,
 }
+
+const TXTIME_UNSET: u8 = 0;
+const TXTIME_ON: u8 = 1;
+const TXTIME_REFUSED: u8 = 2;
 
 impl std::fmt::Debug for EdgeFastLane {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -285,8 +426,61 @@ impl EdgeFastLane {
             rank,
             next_sequence: AtomicU32::new(0),
             compact_fast_parse: AtomicBool::new(true),
+            pace_percent: AtomicU32::new(0),
+            pace_max_delay_us: AtomicU64::new(0),
+            txtime: AtomicU8::new(TXTIME_UNSET),
             stats: FastLaneStats::default(),
         })
+    }
+
+    /// Pace each video client (`Some`), or send video at once (`None`, as
+    /// before). Takes effect on the video socket once the lane is armed.
+    pub fn set_video_pacing(&self, pacing: Option<VideoPacing>) {
+        let pacing = pacing.filter(|pacing| pacing.percent > 0);
+        self.pace_max_delay_us.store(
+            pacing.map_or(0, |pacing| pacing.max_delay_us),
+            Ordering::Relaxed,
+        );
+        self.pace_percent
+            .store(pacing.map_or(0, |pacing| pacing.percent), Ordering::Release);
+        if pacing.is_some() {
+            self.enable_txtime();
+        }
+    }
+
+    /// The pacing in force: set, and the video socket takes SO_TXTIME.
+    fn video_pacing(&self) -> Option<VideoPacing> {
+        let percent = self.pace_percent.load(Ordering::Acquire);
+        (percent > 0 && self.txtime.load(Ordering::Acquire) == TXTIME_ON).then(|| VideoPacing {
+            percent,
+            max_delay_us: self.pace_max_delay_us.load(Ordering::Relaxed),
+        })
+    }
+
+    /// SO_TXTIME on the video client socket, once, when the lane is armed
+    /// and paces.
+    fn enable_txtime(&self) {
+        if self.pace_percent.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let Some(fd) = self.fd(TrafficClass::Video) else {
+            return;
+        };
+        if self.txtime.load(Ordering::Acquire) != TXTIME_UNSET {
+            return;
+        }
+        let state = match sys::enable_txtime(fd) {
+            Ok(()) => TXTIME_ON,
+            Err(error) => {
+                self.stats.txtime_refused.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    error = %error,
+                    "SO_TXTIME is unavailable: the edge's video clients are not paced"
+                );
+                TXTIME_REFUSED
+            }
+        };
+        self.txtime.store(state, Ordering::Release);
     }
 
     /// Make compact datagrams from the envelope read in place (`true`, the
@@ -310,6 +504,7 @@ impl EdgeFastLane {
         {
             self.fds[0].store(audio as u64, Ordering::Release);
             self.fds[1].store(video as u64, Ordering::Release);
+            self.enable_txtime();
         }
     }
 
@@ -384,6 +579,9 @@ impl EdgeFastLane {
             gso_fallbacks: load(&self.stats.gso_fallbacks),
             compact_parts: load(&self.stats.compact_parts),
             compact_failed: load(&self.stats.compact_failed),
+            paced_messages: load(&self.stats.paced_messages),
+            paced_clamped: load(&self.stats.paced_clamped),
+            txtime_refused: load(&self.stats.txtime_refused),
         }
     }
 
@@ -575,6 +773,16 @@ pub struct ClientPlan {
     turns: HashMap<SocketAddr, u32>,
     /// Video is sent as UDP GSO messages until the host refuses it once.
     gso: bool,
+    /// This plan is a video thread's: it measures its streams' rates and
+    /// paces its clients when the lane paces.
+    video: bool,
+    /// CLOCK_MONOTONIC at the start of the batch (video only).
+    now_ns: u64,
+    /// The stream of each message of the batch.
+    streams: [u64; sys::RECV_BATCH],
+    pacer: Pacer,
+    runs: Vec<(usize, usize)>,
+    departures: Vec<u64>,
     /// The first client that each message of the batch was handed to the
     /// kernel for, and when the batch's sends returned (the hop journal's
     /// `udp_sent`, recorded by the tee).
@@ -609,6 +817,12 @@ impl ClientPlan {
             memo_next: 0,
             turns: HashMap::new(),
             gso: false,
+            video: false,
+            now_ns: 0,
+            streams: [0; sys::RECV_BATCH],
+            pacer: Pacer::default(),
+            runs: Vec::with_capacity(sys::RECV_BATCH),
+            departures: Vec::with_capacity(sys::RECV_BATCH),
             first_sent: [None; sys::RECV_BATCH],
             sent_us: 0,
         }
@@ -620,11 +834,21 @@ impl ClientPlan {
         self
     }
 
+    /// The plan of a video thread: it measures its streams' rates, and
+    /// paces its clients when the lane paces.
+    pub fn with_video(mut self, video: bool) -> Self {
+        self.video = video;
+        self
+    }
+
     /// Start a batch.
     pub fn clear(&mut self) {
         self.sends.clear();
         self.clients.clear();
         self.first_sent = [None; sys::RECV_BATCH];
+        if self.video {
+            self.now_ns = sys::monotonic_ns();
+        }
     }
 
     /// The first client that the batch's `message` was handed to the kernel
@@ -688,6 +912,14 @@ impl ClientPlan {
         };
         self.lens[message] = len as u16;
         self.compact_lens[message] = 0;
+        self.streams[message] = stream_id;
+        if self.video {
+            self.pacer
+                .rates
+                .entry(stream_id)
+                .or_default()
+                .observe(self.now_ns, len as u64);
+        }
         let k = u32::from(view.source_symbols);
         let repair_ordinal = view.esi.checked_sub(k);
         // The compact datagram of a one-symbol object, made at most once.
@@ -787,6 +1019,71 @@ impl ClientPlan {
         self.sends.sort_by_key(|send| turns[&send.peer]);
     }
 
+    /// Cut each client's sends into runs of about [`PACING_SLICE_US`] of
+    /// its rate (one datagram each without `gso`), and give each run its
+    /// earliest departure (`runs`, `departures`). The sends are grouped by
+    /// client.
+    /// Returns how many departures the bound on the delay brought forward.
+    fn plan_departures(&mut self, pacing: VideoPacing, gso: bool) -> u64 {
+        let Self {
+            sends,
+            lens,
+            compact_lens,
+            streams,
+            pacer,
+            runs,
+            departures,
+            now_ns,
+            ..
+        } = self;
+        let now_ns = *now_ns;
+        let len_of = |index: usize| {
+            let send = &sends[index];
+            let message = usize::from(send.message);
+            usize::from(if send.compact.is_some() {
+                compact_lens[message]
+            } else {
+                lens[message]
+            })
+        };
+        sys::gso_runs_into(
+            runs,
+            sends.len(),
+            |index| (len_of(index), sends[index].peer),
+            |first| {
+                if !gso {
+                    return 1;
+                }
+                let stream_id = streams[usize::from(sends[first].message)];
+                pacer
+                    .client_bps(stream_id, pacing, now_ns)
+                    .map_or(sys::GSO_MAX_SEGMENTS, |bps| {
+                        let slice_bytes = bps.saturating_mul(PACING_SLICE_US) / 8_000_000;
+                        (slice_bytes / len_of(first).max(1) as u64).max(1) as usize
+                    })
+            },
+        );
+        departures.clear();
+        let mut clamped = 0_u64;
+        for &(first, count) in runs.iter() {
+            let send = &sends[first];
+            let stream_id = streams[usize::from(send.message)];
+            let departure = match pacer.client_bps(stream_id, pacing, now_ns) {
+                Some(bps) => {
+                    let bytes = (first..first + count).map(len_of).sum();
+                    let (departure, held) = pacer.departure(send.peer, bytes, bps, pacing, now_ns);
+                    clamped += u64::from(held);
+                    departure
+                }
+                // The stream's rate is not known yet: at once.
+                None => now_ns,
+            };
+            departures.push(departure);
+        }
+        pacer.forget_past(now_ns);
+        clamped
+    }
+
     /// Send the plan from the client socket of `class`: one non-blocking
     /// `sendmmsg` (video with `gso`: each client's symbols of the batch
     /// together, as UDP GSO messages), then one more try each for what the
@@ -803,8 +1100,21 @@ impl ClientPlan {
             return;
         };
         let use_gso = self.gso && class == TrafficClass::Video;
-        if use_gso {
+        // Video is paced per client when the lane paces (and the host takes
+        // SO_TXTIME).
+        let pacing = (self.video && class == TrafficClass::Video)
+            .then(|| lane.video_pacing())
+            .flatten();
+        if use_gso || pacing.is_some() {
             self.group_by_client();
+        }
+        if let Some(pacing) = pacing {
+            let clamped = self.plan_departures(pacing, use_gso);
+            if clamped > 0 {
+                lane.stats
+                    .paced_clamped
+                    .fetch_add(clamped, Ordering::Relaxed);
+            }
         }
         let (sends, buffers, lens) = (&self.sends, &self.buffers, &self.lens);
         let (compact_buffers, compact_lens) = (&self.compact_buffers, &self.compact_lens);
@@ -825,15 +1135,32 @@ impl ClientPlan {
             )
         };
         let mut sent = None;
-        if use_gso {
-            match sys::send_gso_batch(fd, self.sends.len(), message) {
+        if pacing.is_some() || use_gso {
+            let result = if pacing.is_some() {
+                sys::send_gso_runs(fd, &self.runs, message, Some(&self.departures))
+            } else {
+                sys::send_gso_batch(fd, self.sends.len(), message)
+            };
+            match result {
                 Ok(gso_sent) => {
-                    lane.stats
-                        .gso_messages
-                        .fetch_add(gso_sent.messages as u64, Ordering::Relaxed);
+                    if use_gso {
+                        lane.stats
+                            .gso_messages
+                            .fetch_add(gso_sent.messages as u64, Ordering::Relaxed);
+                    }
+                    if pacing.is_some() {
+                        let now_ns = self.now_ns;
+                        let paced = self.departures[..gso_sent.messages]
+                            .iter()
+                            .filter(|departure| **departure > now_ns)
+                            .count();
+                        lane.stats
+                            .paced_messages
+                            .fetch_add(paced as u64, Ordering::Relaxed);
+                    }
                     sent = Some(gso_sent.datagrams);
                 }
-                Err(error) if sys::gso_unsupported(&error) => {
+                Err(error) if use_gso && sys::gso_unsupported(&error) => {
                     self.gso = false;
                     lane.stats.gso_fallbacks.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
@@ -976,6 +1303,151 @@ mod tests {
                 assert_eq!(
                     plan.clients[send.client as usize].fast_from, turn as u64,
                     "the send names its own client"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_stream_rate_is_measured_from_its_symbols() {
+        let mut rate = StreamRate::default();
+        let ms = 1_000_000_u64;
+        let start = 1_000 * ms;
+        assert_eq!(rate.bps(start), None);
+        // 25 kB a millisecond: 200 Mbit/s.
+        for step in 0..=99 {
+            rate.observe(start + step * ms, 25_000);
+        }
+        assert_eq!(rate.bps(start + 50 * ms), None, "too soon to tell");
+        let early = rate.bps(start + 100 * ms).unwrap();
+        assert!((190_000_000..=210_000_000).contains(&early), "{early}");
+        for step in 100..=1_000 {
+            rate.observe(start + step * ms, 25_000);
+        }
+        let steady = rate.bps(start + 1_000 * ms).unwrap();
+        assert!((195_000_000..=205_000_000).contains(&steady), "{steady}");
+        // A pause of seconds keeps the rate of before it.
+        rate.observe(start + 5_000 * ms, 25_000);
+        assert_eq!(rate.bps(start + 5_000 * ms), Some(steady));
+    }
+
+    #[test]
+    fn a_client_departs_at_its_rate_and_never_later_than_the_bound() {
+        let pacing = VideoPacing {
+            percent: 125,
+            max_delay_us: 8_000,
+        };
+        let mut pacer = Pacer::default();
+        let stream = 1;
+        let now = 10_000_000_000_u64;
+        pacer.rates.insert(
+            stream,
+            StreamRate {
+                window_start_ns: now,
+                bytes: 0,
+                bps: 80_000_000,
+            },
+        );
+        // 1.25 times 80 Mbit/s: 100 Mbit/s, 12.5 kB a millisecond.
+        let bps = pacer.client_bps(stream, pacing, now).unwrap();
+        assert_eq!(bps, 100_000_000);
+        let (a, b) = (
+            SocketAddr::from(([127, 0, 0, 1], 1)),
+            SocketAddr::from(([127, 0, 0, 1], 2)),
+        );
+        let departures: Vec<(u64, bool)> = (0..12)
+            .map(|_| pacer.departure(a, 12_500, bps, pacing, now))
+            .collect();
+        for (index, (departure, clamped)) in departures.iter().enumerate() {
+            let wanted = now + index as u64 * 1_000_000;
+            // Up to 8 ms ahead at the rate, then held at the bound.
+            assert_eq!(*departure, wanted.min(now + 8_000_000), "{index}");
+            assert_eq!(*clamped, wanted > now + 8_000_000, "{index}");
+        }
+        // Each client has its own departures.
+        assert_eq!(pacer.departure(b, 12_500, bps, pacing, now), (now, false));
+        // Later, a client that has caught up departs at once.
+        let later = now + 50_000_000;
+        assert_eq!(
+            pacer.departure(a, 12_500, bps, pacing, later),
+            (later, false)
+        );
+        // Unknown streams are not paced; a slow stream is paced at 1 Mbit/s
+        // at least.
+        assert_eq!(pacer.client_bps(2, pacing, now), None);
+        pacer.rates.insert(
+            3,
+            StreamRate {
+                window_start_ns: now,
+                bytes: 0,
+                bps: 10_000,
+            },
+        );
+        assert_eq!(pacer.client_bps(3, pacing, now), Some(MIN_CLIENT_BPS));
+    }
+
+    /// A paced video batch: each client's symbols are cut into GSO messages
+    /// of about a millisecond at its rate, each departing a millisecond
+    /// after the one before; without GSO, one datagram a message.
+    #[test]
+    fn a_paced_batch_is_cut_into_a_millisecond_of_each_clients_rate() {
+        let pacing = VideoPacing {
+            percent: 100,
+            max_delay_us: 50_000,
+        };
+        for gso in [true, false] {
+            let mut plan = ClientPlan::new().with_gso(gso).with_video(true);
+            plan.clear();
+            let now = plan.now_ns;
+            // 8.8 Mbit/s: a millisecond is 1,100 bytes, one symbol; at 88
+            // Mbit/s, ten.
+            plan.pacer.rates.insert(
+                1,
+                StreamRate {
+                    window_start_ns: now,
+                    bytes: 0,
+                    bps: 88_000_000,
+                },
+            );
+            let peers = [
+                SocketAddr::from(([127, 0, 0, 1], 1)),
+                SocketAddr::from(([127, 0, 0, 1], 2)),
+            ];
+            for message in 0..40_usize {
+                plan.lens[message] = 1_100;
+                plan.streams[message] = 1;
+                for peer in peers {
+                    plan.sends.push(PlannedClient {
+                        message: message as u16,
+                        compact: None,
+                        source: true,
+                        part: 3,
+                        peer,
+                        client: plan.clients.len() as u32,
+                    });
+                    plan.clients.push(FastClient::new(0));
+                }
+            }
+            plan.group_by_client();
+            let clamped = plan.plan_departures(pacing, gso);
+            assert_eq!(clamped, 0);
+            let per_run = if gso { 10 } else { 1 };
+            assert_eq!(plan.runs.len(), 80 / per_run, "gso {gso}");
+            assert_eq!(plan.departures.len(), plan.runs.len());
+            for (run, (&(first, count), departure)) in
+                plan.runs.iter().zip(&plan.departures).enumerate()
+            {
+                assert_eq!(count, per_run);
+                let within = (run % (40 / per_run)) as u64;
+                let peer = plan.sends[first].peer;
+                assert!(plan.sends[first..first + count]
+                    .iter()
+                    .all(|send| send.peer == peer));
+                // 1,100 bytes at 88 Mbit/s: 100 µs a symbol.
+                assert_eq!(
+                    *departure,
+                    now + within * per_run as u64 * 100_000,
+                    "run {run}"
                 );
             }
         }

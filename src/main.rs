@@ -1682,6 +1682,30 @@ struct Args {
     #[arg(long, env = "NEEDLETAIL_CLIENT_UDP_EDGE_RANK", default_value_t = 0)]
     client_udp_edge_rank: u32,
 
+    /// Pace each 4K client of the fast lane at this percent of its stream's
+    /// rate (measured by the video thread from the symbols it takes): each
+    /// client's symbols leave in GSO messages of about a millisecond of that
+    /// rate, each with an earliest departure (SO_TXTIME), which the host's
+    /// fq qdisc keeps, so a client gets a frame at its rate and not at the
+    /// NIC's line rate. No timer runs on the thread. Other qdiscs send at
+    /// once; audio is never paced. 0 sends video at once, as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_VIDEO_PACE_PERCENT",
+        default_value_t = fast_plane::edge_clients::VideoPacing::default().percent
+    )]
+    client_udp_video_pace_percent: u32,
+
+    /// A paced 4K message never departs later than this after the video
+    /// thread hands it to the kernel: a burst above the pacing rate (a
+    /// keyframe, a burst from upstream) is delayed at most this much.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_VIDEO_PACE_MAX_MS",
+        default_value_t = fast_plane::edge_clients::VideoPacing::default().max_delay_us / 1_000
+    )]
+    client_udp_video_pace_max_ms: u64,
+
     /// The compact client lane (`av_mesh::client_compact`): a client that
     /// asks for it (`SUB ... C<copies>.<window>.<repair>`) gets each part
     /// that fits one datagram as one compact datagram (20 bytes of header,
@@ -2668,6 +2692,10 @@ async fn main() -> Result<()> {
     .then(|| fast_plane::edge_clients::EdgeFastLane::new(args.client_udp_edge_rank));
     if let Some(lane) = &fast_lane {
         lane.set_compact_fast_parse(args.client_udp_compact_fast_parse);
+        lane.set_video_pacing(Some(fast_plane::edge_clients::VideoPacing {
+            percent: args.client_udp_video_pace_percent,
+            max_delay_us: args.client_udp_video_pace_max_ms.saturating_mul(1_000),
+        }));
     }
     if fast_lane.is_some() && args.client_udp_cut_through {
         info!("edge client UDP: the fast lane runs, so cut-through is off (--client-udp-fast-lane false turns it back on)");
@@ -5208,6 +5236,24 @@ impl RelayDownstreamForwarder {
         }
     }
 
+    /// The sends of one `sendmmsg` call (the fast plane's): the counters as
+    /// that many `record_forward_success` calls leave them, in a handful of
+    /// atomic adds instead of about twenty a datagram, which the audio and
+    /// video threads would otherwise contend for at 4K rates.
+    fn record_forward_batch(&self, sources: u64, repairs: u64, bytes: u64, duration: Duration) {
+        if sources > 0 {
+            self.source_datagrams.fetch_add(sources, Ordering::Relaxed);
+        }
+        if repairs > 0 {
+            self.repair_datagrams.fetch_add(repairs, Ordering::Relaxed);
+        }
+        let count = sources + repairs;
+        if count > 0 {
+            self.bytes.fetch_add(bytes, Ordering::Relaxed);
+            self.observe_durations(duration, count);
+        }
+    }
+
     fn record_forward_success(&self, role: MediaDatagramRole, sent: usize, duration: Duration) {
         match role {
             MediaDatagramRole::Source => {
@@ -5275,15 +5321,20 @@ impl RelayDownstreamForwarder {
     }
 
     fn observe_duration(&self, duration: Duration) {
+        self.observe_durations(duration, 1);
+    }
+
+    /// `count` sends that each took `duration` (the sends of one call).
+    fn observe_durations(&self, duration: Duration, count: u64) {
         let duration_us = duration.as_micros().min(u128::from(u64::MAX)) as u64;
-        self.duration_count.fetch_add(1, Ordering::Relaxed);
+        self.duration_count.fetch_add(count, Ordering::Relaxed);
         self.duration_sum_us
-            .fetch_add(duration_us, Ordering::Relaxed);
+            .fetch_add(duration_us.saturating_mul(count), Ordering::Relaxed);
         self.duration_max_us
             .fetch_max(duration_us, Ordering::Relaxed);
         for (index, upper_bound_us) in EDGE_RESPONSE_DURATION_BUCKETS_US.iter().enumerate() {
             if duration_us <= *upper_bound_us {
-                self.duration_buckets[index].fetch_add(1, Ordering::Relaxed);
+                self.duration_buckets[index].fetch_add(count, Ordering::Relaxed);
             }
         }
     }
@@ -35343,14 +35394,6 @@ mod tests {
         children: &[(SocketAddr, RelayForwardRole)],
         config: fast_plane::relay::RelayClassConfig,
     ) -> FastRelay {
-        let offset = config.port_offset;
-        let primary_sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let secondary_sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let dispatch = fast_test_dispatch(
-            primary_sender.local_addr().unwrap(),
-            secondary_sender.local_addr().unwrap(),
-            secondary_path,
-        );
         let endpoints: Vec<RelayForwardEndpoint> = children
             .iter()
             .map(|(target, role)| RelayForwardEndpoint {
@@ -35359,8 +35402,26 @@ mod tests {
                 role: *role,
             })
             .collect();
+        start_fast_relay_endpoints(secondary_path, &endpoints, config).await
+    }
+
+    /// A fast-plane relay whose children are `endpoints` (a fixed bind
+    /// given twice is one source socket that both children share).
+    async fn start_fast_relay_endpoints(
+        secondary_path: ParentPath,
+        endpoints: &[RelayForwardEndpoint],
+        config: fast_plane::relay::RelayClassConfig,
+    ) -> FastRelay {
+        let offset = config.port_offset;
+        let primary_sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let secondary_sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let dispatch = fast_test_dispatch(
+            primary_sender.local_addr().unwrap(),
+            secondary_sender.local_addr().unwrap(),
+            secondary_path,
+        );
         let forwarder =
-            RelayDownstreamForwarder::bind_split(&endpoints, (offset > 0).then_some(offset))
+            RelayDownstreamForwarder::bind_split(endpoints, (offset > 0).then_some(offset))
                 .await
                 .unwrap();
         let sockets = fast_plane::relay::bind_class_sockets(
@@ -35874,14 +35935,23 @@ mod tests {
             sources.len()
         );
         // As the contributor sends the primary lane: the part's source
-        // symbols in one burst.
+        // symbols in one burst (sendmmsg, so that the thread's drains hold
+        // many of them even on a loaded host).
         let symbols = sources.clone();
-        for symbol in &symbols {
-            relay
-                .primary_sender
-                .send_to(symbol, relay.primary_video.unwrap())
-                .await
-                .unwrap();
+        {
+            use std::os::fd::AsRawFd;
+            let target = relay.primary_video.unwrap();
+            let mut sent = 0;
+            while sent < symbols.len() {
+                match fast_plane::sys::send_batch(
+                    relay.primary_sender.as_raw_fd(),
+                    symbols.len() - sent,
+                    |index| (&symbols[sent + index][..], target),
+                ) {
+                    Ok(0) | Err(_) => tokio::time::sleep(Duration::from_millis(1)).await,
+                    Ok(taken) => sent += taken,
+                }
+            }
         }
         let first = receive_all(&first_video, symbols.len()).await;
         let second = receive_all(&second_video, sources.len()).await;
@@ -36871,4 +36941,8 @@ mod tests {
     /// An edge's fixed costs per part from its hop journal: receipt, wake,
     /// work and the send to its UDP clients.
     mod edge_fixed_cost;
+
+    /// 4K past 164 Mbit/s: a forwarder's video thread and an edge's video
+    /// clients, at 200 Mbit/s, and their processor time per Mbit/s.
+    mod video_throughput;
 }
