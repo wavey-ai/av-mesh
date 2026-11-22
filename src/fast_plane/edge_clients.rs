@@ -1278,7 +1278,10 @@ impl ClientPlan {
                 for _ in 0..sends {
                     self.sends.push(PlannedClient {
                         message: message as u16,
-                        compact: copies.map(|copies| compact_variant(copies, short)),
+                        // Every 256th part goes long (its time's high bits).
+                        compact: copies.map(|copies| {
+                            compact_variant(copies, short && !compact::keeps_long_form(part))
+                        }),
                         source: repair_ordinal.is_none(),
                         part,
                         peer: *peer,

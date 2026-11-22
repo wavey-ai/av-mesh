@@ -380,13 +380,28 @@ pub const SHORT_HEADER_LEN: usize = 7;
 /// What the short form saves on each part.
 pub const SHORT_SAVES: usize = HEADER_LEN - SHORT_HEADER_LEN;
 
+/// Every part whose number is a multiple of this keeps the long form, with
+/// its 32 bits of publication time: a client learns the high 8 bits of the
+/// short form's 24 from it, so its own clock need not agree with the
+/// edge's (wave 7 review). At 1 ms parts, one long part every 256 ms
+/// (4 bytes more per 256 parts).
+pub const LONG_FORM_EVERY: u64 = 256;
+
+/// Whether a part keeps the long form ([`LONG_FORM_EVERY`]). The low 32
+/// bits of its number say it.
+#[must_use]
+pub const fn keeps_long_form(part_low: u64) -> bool {
+    part_low % LONG_FORM_EVERY == 0
+}
+
 /// Whether a datagram is a part in the short form.
 pub fn is_short(datagram: &[u8]) -> bool {
     datagram.len() >= SHORT_HEADER_LEN && datagram[0] & SHORT_MAGIC_MASK == SHORT_MAGIC
 }
 
 /// The short form of a part's datagram (marked or not: its flags go with
-/// it); `None` for a gap or a repair datagram, which keep the long form.
+/// it); `None` for a gap or a repair datagram, which keep the long form,
+/// and for a part that keeps it ([`keeps_long_form`]).
 pub fn shorten(datagram: &[u8]) -> Option<Vec<u8>> {
     let mut short = Vec::with_capacity(datagram.len() - SHORT_SAVES);
     shorten_into(datagram, &mut short)?;
@@ -396,7 +411,7 @@ pub fn shorten(datagram: &[u8]) -> Option<Vec<u8>> {
 /// [`shorten`], into `out` (cleared first).
 pub fn shorten_into(datagram: &[u8], out: &mut Vec<u8>) -> Option<()> {
     let view = parse(datagram)?;
-    if view.kind != Kind::Part {
+    if view.kind != Kind::Part || keeps_long_form(u64::from(view.part_low)) {
         return None;
     }
     out.clear();
@@ -413,7 +428,7 @@ pub fn shorten_into(datagram: &[u8], out: &mut Vec<u8>) -> Option<()> {
 pub fn shorten_in_place(buffer: &mut [u8], len: usize) -> Option<usize> {
     let datagram = buffer.get(..len)?;
     let view = parse(datagram)?;
-    if view.kind != Kind::Part {
+    if view.kind != Kind::Part || keeps_long_form(u64::from(view.part_low)) {
         return None;
     }
     let flags = datagram[FLAGS_AT] & !SHORT_MAGIC_MASK;
@@ -446,9 +461,10 @@ pub fn extend_bits(reference: u64, low: u64, bits: u32) -> u64 {
 
 /// The long form of a part in the short form: its part number extended to
 /// the one nearest `reference_part`, its publication time to the one
-/// nearest `now_unix_us` (so the two clocks must agree within 8 s), its
-/// flags as they came. The long form is what window repair covers, so a
-/// client keeps it.
+/// nearest `now_unix_us` (which must be within 8 s of the edge's time: a
+/// client takes it from the last long-form part, see
+/// [`CompactReceiver::push`]), its flags as they came. The long form is
+/// what window repair covers, so a client keeps it.
 pub fn lengthen(short: &[u8], reference_part: u64, now_unix_us: u64) -> Option<Vec<u8>> {
     if !is_short(short) {
         return None;
@@ -956,6 +972,10 @@ pub struct CompactReceiver {
     /// the generations before it (their late datagrams are dropped).
     generation: Option<u8>,
     old_generations: VecDeque<u8>,
+    /// The publication time of the last long-form part (its 32 bits,
+    /// extended by the local clock) and when it arrived: the reference of
+    /// the short form's 24 bits, advanced by the time since.
+    time_anchor: Option<(u64, Instant)>,
     pub stats: CompactStats,
 }
 
@@ -987,6 +1007,7 @@ impl CompactReceiver {
         self.window_counts.clear();
         self.gapped.clear();
         self.run = 0;
+        self.time_anchor = None;
     }
 
     /// A round trip of the client's path to its edge (a request and its
@@ -1230,7 +1251,12 @@ impl CompactReceiver {
                 self.stats.errors += 1;
                 return Vec::new();
             };
-            match lengthen(datagram, reference, now_unix_us) {
+            // Its 24 bits of time are extended around the edge's clock as
+            // the last long-form part gave it, not the client's own.
+            let reference_us = self.time_anchor.map_or(now_unix_us, |(published, at)| {
+                published + now.saturating_duration_since(at).as_micros() as u64
+            });
+            match lengthen(datagram, reference, reference_us) {
                 Some(datagram) => {
                     long = datagram;
                     &long
@@ -1242,6 +1268,12 @@ impl CompactReceiver {
                 }
             }
         } else {
+            if let Some(view) = parse(datagram) {
+                let low = u32::from_be_bytes(view.field);
+                if view.kind == Kind::Part && !view.retransmit && low != 0 {
+                    self.time_anchor = Some((extend_u32(now_unix_us, low), now));
+                }
+            }
             datagram
         };
         self.stats.datagrams += 1;
@@ -1798,7 +1830,7 @@ mod tests {
         for (part, published) in [
             (9_u64, 1_700_000_000_123_456_u64),
             (65_535, 1_700_000_016_777_215),
-            (65_536, 1_700_000_016_777_216),
+            (65_537, 1_700_000_016_777_216),
             (1_234_567, 1_763_812_345_678_901),
         ] {
             let mut long = encode_part(part, published, &bytes).unwrap();
@@ -1829,8 +1861,15 @@ mod tests {
                 );
             }
         }
-        // Gaps and repair keep the long form.
+        // Gaps and repair keep the long form, and so does every 256th part.
         assert_eq!(shorten(&encode_gap(5)), None);
+        for part in [0_u64, 256, 65_536, 1 << 32] {
+            let long = encode_part(part, 1_700_000_000_000_000, &bytes).unwrap();
+            assert!(keeps_long_form(part));
+            assert_eq!(shorten(&long), None, "part {part}");
+            let mut in_place = long.clone();
+            assert_eq!(shorten_in_place(&mut in_place, long.len()), None);
+        }
         // A short part before any reference is dropped; after the OK it is
         // a part.
         let mut receiver = CompactReceiver::new();
@@ -1844,6 +1883,44 @@ mod tests {
         assert_eq!(parts[0].part, 70_000);
         assert_eq!(parts[0].payload, bytes);
         assert_eq!(parts[0].published_unix_us, 1_700_000_000_000_000);
+    }
+
+    /// A listener whose clock is a minute off the edge's still rebuilds the
+    /// edge's long form byte for byte: the high bits of the short form's
+    /// time come from the last long-form part, not the local clock.
+    #[test]
+    fn a_short_part_takes_its_time_from_the_last_long_part() {
+        let bytes = payload(4, 56);
+        let edge_us = 1_763_812_345_678_901_u64;
+        let client_off_us = 60_000_000;
+        let mut receiver = CompactReceiver::new();
+        receiver.expect_from(511, true);
+        let start = Instant::now();
+        let anchor = encode_part(512, edge_us, &bytes).unwrap();
+        assert!(shorten(&anchor).is_none(), "part 512 keeps the long form");
+        let parts = receiver.push(&anchor, start, edge_us + client_off_us);
+        assert_eq!(parts.len(), 1);
+        for index in 1..300_u64 {
+            let part = 512 + index;
+            let published = edge_us + index * 1_000;
+            let long = encode_part(part, published, &bytes).unwrap();
+            let datagram = shorten(&long).unwrap_or(long.clone());
+            let at = start + Duration::from_millis(index);
+            let parts = receiver.push(&datagram, at, published + client_off_us + 500);
+            assert_eq!(parts.len(), 1, "part {part}");
+            // The long form it keeps (for window repair) is the edge's.
+            assert_eq!(
+                lengthen(&datagram, part, published).unwrap_or(long.clone()),
+                long
+            );
+            assert_eq!(
+                u32::from_be_bytes(receiver.known[&part][7..11].try_into().unwrap())
+                    as u64,
+                published & 0xffff_ffff,
+                "part {part}"
+            );
+        }
+        assert_eq!(receiver.stats.errors, 0);
     }
 
     #[test]
