@@ -1315,7 +1315,13 @@ impl Tee {
                     | raptorq_datagram_fec::MediaObjectKind::CodecConfig
             );
             if let Some(stream_id) = view.stream_id().filter(|_| media) {
-                holes.arrived(stream_id, view.object).await;
+                holes
+                    .arrived(
+                        stream_id,
+                        view.object,
+                        crate::edge_holes::Arrival::FastPlane,
+                    )
+                    .await;
             }
         }
     }

@@ -550,6 +550,11 @@ pub(crate) struct Subscriber {
     cut_slots: BTreeSet<u64>,
     /// When this edge took it.
     admitted_at: Instant,
+    /// It came by a move from another edge (it named the part that it needs
+    /// next): only such a client is held within the move hold-down.
+    moved_in: bool,
+    /// It has been counted in `moves_held_down` once already.
+    held_down_counted: bool,
     /// Its place on the fast lane, if it asked for it (`F1`) and the edge
     /// has one.
     fast: Option<Arc<FastClient>>,
@@ -861,47 +866,72 @@ async fn head_part(router: &AppRouter, stream_id: u64) -> Option<u64> {
         .map(|(_, last)| last as u64)
 }
 
-/// Parts of a stream within the playout deadline of a subscriber, or
-/// `None` when there is no deadline (--client-udp-playout-ms 0).
-async fn playout_parts(router: &AppRouter, config: EdgeUdpConfig, stream_id: u64) -> Option<u64> {
+/// The oldest part of a stream that a subscriber may still be sent, by its
+/// playout deadline, when `oldest` is the oldest part that a subscriber
+/// wants; `None` when there is no deadline (--client-udp-playout-ms 0).
+/// The deadline is a length of time, measured on the parts' times (see
+/// `LiveState::playout_floor`).
+async fn playout_floor(
+    router: &AppRouter,
+    config: EdgeUdpConfig,
+    stream_id: u64,
+    head: u64,
+    oldest: u64,
+) -> Option<u64> {
     if config.playout.is_zero() {
         return None;
     }
-    let part_us = router.cache.state.read().await.stream_part_us(stream_id);
-    Some(playout_parts_of(config.playout, part_us))
-}
-
-fn playout_parts_of(playout: Duration, part_us: u64) -> u64 {
-    (u64::try_from(playout.as_micros()).unwrap_or(u64::MAX) / part_us.max(1)).max(1)
+    let playout_us = u64::try_from(config.playout.as_micros()).unwrap_or(u64::MAX);
+    Some(
+        router
+            .cache
+            .state
+            .read()
+            .await
+            .playout_floor(stream_id, head, playout_us, oldest),
+    )
 }
 
 /// The part that a new subscriber starts at. A client that moves from
 /// another edge names the part that it needs next: it resumes there if the
 /// part is still in the window, and otherwise at the newest part. A part
 /// past the playout deadline is not worth sending: it resumes at the oldest
-/// part within it.
+/// part within it (`playout_floor`).
 fn first_part_for(
     from_part: Option<u64>,
     head: u64,
     window: u64,
-    playout_parts: Option<u64>,
+    playout_floor: Option<u64>,
 ) -> u64 {
     match from_part {
         Some(part) if part <= head.saturating_add(1) && head.saturating_sub(part) < window => {
-            playout_parts.map_or(part, |parts| part.max(head.saturating_sub(parts)))
+            playout_floor.map_or(part, |floor| part.max(floor))
         }
         _ => head,
     }
 }
 
-/// How long a hole at `part` may be repaired before its playout deadline
-/// passes; `None` without a deadline (HOLE_WAIT then). Zero: send the gap.
-fn hole_budget(head: Option<u64>, part: u64, part_us: u64, playout: Duration) -> Option<Duration> {
+/// How far a hole at `part` lies behind the head, in time: from the parts'
+/// times, else (no record of them) as a count of the stream's longest part.
+async fn hole_age(router: &AppRouter, stream_id: u64, head: Option<u64>, part: u64) -> Duration {
+    let Some(head) = head else {
+        return Duration::ZERO;
+    };
+    let state = router.cache.state.read().await;
+    let age_us = state.part_age_us(stream_id, part, head).unwrap_or_else(|| {
+        head.saturating_sub(part)
+            .saturating_mul(state.stream_part_us(stream_id))
+    });
+    Duration::from_micros(age_us)
+}
+
+/// How long a hole `age` behind the head may be repaired before its
+/// playout deadline passes; `None` without a deadline (HOLE_WAIT then).
+/// Zero: send the gap.
+fn hole_budget(age: Duration, playout: Duration) -> Option<Duration> {
     if playout.is_zero() {
         return None;
     }
-    let behind = head.map_or(0, |head| head.saturating_sub(part));
-    let age = Duration::from_micros(behind.saturating_mul(part_us));
     Some(playout.saturating_sub(age).min(HOLE_WAIT))
 }
 
@@ -1005,8 +1035,15 @@ async fn admit(
         return;
     };
     let window = router.cache.window_parts_for(stream_id).await as u64;
-    let playout = playout_parts(&router, config, stream_id).await;
-    let first_part = first_part_for(from_part, head, window, playout);
+    let floor = playout_floor(
+        &router,
+        config,
+        stream_id,
+        head,
+        from_part.unwrap_or(head).min(head),
+    )
+    .await;
+    let first_part = first_part_for(from_part, head, window, floor);
     if let Some(part) = from_part.filter(|part| head.saturating_sub(*part) < window) {
         if first_part > part {
             stats
@@ -1032,6 +1069,8 @@ async fn admit(
                 init: None,
                 cut_slots: BTreeSet::new(),
                 admitted_at: Instant::now(),
+                moved_in: from_part.is_some(),
+                held_down_counted: false,
                 fast: fast.clone(),
             },
         );
@@ -1308,7 +1347,22 @@ async fn run_stream_sender(
         let out = sockets.out_for_stream(stream_id);
         let head = head_part(&router, stream_id).await;
         let window = router.cache.window_parts_for(stream_id).await as u64;
-        let playout = playout_parts(&router, config, stream_id).await;
+        let oldest_wanted = {
+            let guard = table.lock().unwrap();
+            guard.get(&stream_id).and_then(|entry| {
+                entry
+                    .subscribers
+                    .values()
+                    .map(|subscriber| subscriber.next_part)
+                    .min()
+            })
+        };
+        let playout = match (head, oldest_wanted) {
+            (Some(head), Some(oldest)) => {
+                playout_floor(&router, config, stream_id, head, oldest.min(head)).await
+            }
+            _ => None,
+        };
         // Subscribers that stopped refreshing end; with none left, so does
         // the sender. A subscriber whose next part has left the window
         // continues at the newest part, and one whose next part is past its
@@ -1343,8 +1397,7 @@ async fn run_stream_sender(
                 for subscriber in entry.subscribers.values_mut() {
                     if head.saturating_sub(subscriber.next_part) >= window {
                         subscriber.next_part = head;
-                    } else if let Some(parts) = playout {
-                        let floor = head.saturating_sub(parts);
+                    } else if let Some(floor) = playout {
                         if subscriber.next_part < floor {
                             stats
                                 .playout_skipped_parts
@@ -1369,35 +1422,37 @@ async fn run_stream_sender(
             housekeeping_at = now + HOUSEKEEPING;
             held_while_lost = false;
             if let Some(reason) = move_reason(&router).await {
-                // Lost parents do not move a subscriber taken within the
-                // hold-down: it may have just come from an edge that lost
-                // its parents too. Draining moves every subscriber.
+                // Lost parents do not move a subscriber that came by a
+                // move within the hold-down: it may have just come from an
+                // edge that lost its parents too. A subscriber that did not
+                // move here goes at once, and draining moves every one.
                 let hold_down = if reason == "parents-lost" {
                     config.move_hold_down
                 } else {
                     Duration::ZERO
                 };
-                let (leaving, kept) = {
+                let (leaving, kept, newly_held) = {
                     let mut guard = table.lock().unwrap();
                     match guard.get_mut(&stream_id) {
                         Some(entry) => {
                             let leaving = take_movable(entry, hold_down, now);
                             let kept = entry.subscribers.len();
+                            let newly_held = count_held_down(entry);
                             if kept == 0 {
                                 guard.remove(&stream_id);
                             }
                             if !leaving.is_empty() {
                                 fast_lane_changed(&sockets, &guard);
                             }
-                            (leaving, kept)
+                            (leaving, kept, newly_held)
                         }
-                        None => (Vec::new(), 0),
+                        None => (Vec::new(), 0, 0),
                     }
                 };
-                if kept > 0 {
+                if newly_held > 0 {
                     stats
                         .moves_held_down
-                        .fetch_add(kept as u64, Ordering::Relaxed);
+                        .fetch_add(newly_held, Ordering::Relaxed);
                 }
                 if !leaving.is_empty() {
                     stats
@@ -1451,9 +1506,8 @@ async fn run_stream_sender(
                 Some((bytes, _)) => Some(bytes),
                 None if held_while_lost => None,
                 None => {
-                    let part_us = router.cache.state.read().await.stream_part_us(stream_id);
-                    let wait =
-                        hole_budget(head, part, part_us, config.playout).unwrap_or(HOLE_WAIT);
+                    let age = hole_age(&router, stream_id, head, part).await;
+                    let wait = hole_budget(age, config.playout).unwrap_or(HOLE_WAIT);
                     if wait.is_zero() {
                         stats.holes_past_playout.fetch_add(1, Ordering::Relaxed);
                         None
@@ -1530,18 +1584,32 @@ async fn run_stream_sender(
 }
 
 /// Take the subscribers that may be moved: all of them, or with a
-/// hold-down those that the edge took at least that long ago.
+/// hold-down all but those that came by a move less than that long ago.
 fn take_movable(entry: &mut StreamEntry, hold_down: Duration, now: Instant) -> Vec<SocketAddr> {
     let leaving: Vec<SocketAddr> = entry
         .subscribers
         .iter()
-        .filter(|(_, subscriber)| now.duration_since(subscriber.admitted_at) >= hold_down)
+        .filter(|(_, subscriber)| {
+            !subscriber.moved_in || now.duration_since(subscriber.admitted_at) >= hold_down
+        })
         .map(|(peer, _)| *peer)
         .collect();
     for peer in &leaving {
         entry.subscribers.remove(peer);
     }
     leaving
+}
+
+/// The subscribers left after `take_movable` are held within the
+/// hold-down: count each of them once, the first time it is held.
+fn count_held_down(entry: &mut StreamEntry) -> u64 {
+    let mut newly = 0;
+    for subscriber in entry.subscribers.values_mut() {
+        if !std::mem::replace(&mut subscriber.held_down_counted, true) {
+            newly += 1;
+        }
+    }
+    newly
 }
 
 // ------------------------------------------------------------------ cut-through
@@ -1882,7 +1950,11 @@ impl CacheMeshReceiveObserver for CutThrough {
             send: inner.config.batch_send,
             gso: inner.config.gso,
         };
-        if frame.len() <= inner.config.inline_complete_bytes {
+        if completes_inline(
+            frame.len(),
+            inner.config.inline_complete_bytes,
+            inner.sockets.out_for_stream(stream_id).queue.is_some(),
+        ) {
             // A small part encodes in microseconds: complete it here rather
             // than wake a thread of the blocking pool for it, and without
             // the cut-through state locked.
@@ -2011,6 +2083,15 @@ struct Batch {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Whether a cut-through part is completed where it decoded. Only a small
+/// part, and only on a socket with a send queue: without one (send queue
+/// 0), `complete` waits on a full socket, datagram by datagram, which may
+/// not hold up the cut-through thread or the receive task. It then goes to
+/// the blocking pool, as every part did before.
+fn completes_inline(frame_len: usize, inline_complete_bytes: usize, send_queue: bool) -> bool {
+    send_queue && frame_len <= inline_complete_bytes
+}
+
 fn complete(
     out: ClientOut<'_>,
     stats: &EdgeUdpStats,
@@ -2219,52 +2300,54 @@ mod tests {
 
     #[test]
     fn a_subscriber_resumes_within_its_playout_deadline() {
-        // 500 ms of 5 ms parts: 100 parts.
-        let playout = Some(playout_parts_of(Duration::from_millis(500), 5_000));
-        assert_eq!(playout, Some(100));
+        // The oldest part within 500 ms of 5 ms parts: 100 parts back.
+        let floor = Some(1_400);
         // A client that moved names part 1000; the head is 1500 and the
         // window 2400 parts: it resumes at 1400, not 500 parts back.
-        assert_eq!(first_part_for(Some(1_000), 1_500, 2_400, playout), 1_400);
+        assert_eq!(first_part_for(Some(1_000), 1_500, 2_400, floor), 1_400);
         // The behaviour from before: anywhere in the window.
         assert_eq!(first_part_for(Some(1_000), 1_500, 2_400, None), 1_000);
         // A part within the deadline, the next part, and none named.
-        assert_eq!(first_part_for(Some(1_450), 1_500, 2_400, playout), 1_450);
-        assert_eq!(first_part_for(Some(1_501), 1_500, 2_400, playout), 1_501);
-        assert_eq!(first_part_for(None, 1_500, 2_400, playout), 1_500);
+        assert_eq!(first_part_for(Some(1_450), 1_500, 2_400, floor), 1_450);
+        assert_eq!(first_part_for(Some(1_501), 1_500, 2_400, floor), 1_501);
+        assert_eq!(first_part_for(None, 1_500, 2_400, floor), 1_500);
         // Out of the window: the newest part, as before.
-        assert_eq!(first_part_for(Some(10), 5_000, 2_400, playout), 5_000);
-        // Parts longer than the deadline: one part.
-        assert_eq!(playout_parts_of(Duration::from_millis(500), 2_000_000), 1);
+        assert_eq!(first_part_for(Some(10), 5_000, 2_400, floor), 5_000);
+    }
+
+    /// With no send queue a part is never completed inline, whatever its
+    /// size: there `complete` waits on a full socket, which the cut-through
+    /// thread may not do (--client-udp-send-queue-ms 0 is the behaviour
+    /// from before).
+    #[test]
+    fn a_part_is_completed_inline_only_on_a_socket_with_a_send_queue() {
+        assert!(completes_inline(1_000, 16_384, true));
+        assert!(!completes_inline(20_000, 16_384, true));
+        assert!(!completes_inline(1_000, 16_384, false));
+        assert!(!completes_inline(1_000, 0, true));
     }
 
     #[test]
     fn a_hole_is_repaired_only_while_it_is_within_the_playout_deadline() {
         let playout = Duration::from_millis(500);
+        let ms = Duration::from_millis;
         // No deadline: HOLE_WAIT, as before.
-        assert_eq!(hole_budget(Some(10), 5, 5_000, Duration::ZERO), None);
-        // 20 parts of 5 ms behind: 400 ms left, capped at HOLE_WAIT.
-        assert_eq!(
-            hole_budget(Some(120), 100, 5_000, playout),
-            Some(Duration::from_millis(400))
-        );
-        // 80 parts behind: 100 ms left.
-        assert_eq!(
-            hole_budget(Some(180), 100, 5_000, playout),
-            Some(Duration::from_millis(100))
-        );
+        assert_eq!(hole_budget(ms(25), Duration::ZERO), None);
+        // 100 ms behind: 400 ms left, capped at HOLE_WAIT.
+        assert_eq!(hole_budget(ms(100), playout), Some(ms(400).min(HOLE_WAIT)));
+        // 400 ms behind: 100 ms left.
+        assert_eq!(hole_budget(ms(400), playout), Some(ms(100)));
         // Past the deadline: the gap goes at once.
-        assert_eq!(
-            hole_budget(Some(300), 100, 5_000, playout),
-            Some(Duration::ZERO)
-        );
+        assert_eq!(hole_budget(ms(1_000), playout), Some(Duration::ZERO));
         // A part at or ahead of the head has its whole budget.
-        assert_eq!(
-            hole_budget(Some(100), 101, 5_000, Duration::from_millis(50)),
-            Some(Duration::from_millis(50))
-        );
+        assert_eq!(hole_budget(Duration::ZERO, ms(50)), Some(ms(50)));
     }
 
     fn subscriber(admitted_at: Instant) -> Subscriber {
+        moved_subscriber(admitted_at, true)
+    }
+
+    fn moved_subscriber(admitted_at: Instant, moved_in: bool) -> Subscriber {
         Subscriber {
             repair: RepairPolicy {
                 permille: 0,
@@ -2276,6 +2359,8 @@ mod tests {
             init: None,
             cut_slots: BTreeSet::new(),
             admitted_at,
+            moved_in,
+            held_down_counted: false,
             fast: None,
         }
     }
@@ -2300,6 +2385,42 @@ mod tests {
         // Without a hold-down (or draining) every subscriber goes.
         assert_eq!(take_movable(&mut entry, Duration::ZERO, now), vec![new]);
         assert!(entry.subscribers.is_empty());
+    }
+
+    /// The hold-down is for clients that came by a move: a client that
+    /// subscribed afresh just before the edge lost its parents is moved at
+    /// once, not served from the cache for the hold-down. A held client is
+    /// counted once, however many housekeeping rounds hold it.
+    #[test]
+    fn only_a_moved_client_is_held_down_and_counted_once() {
+        let now = Instant::now();
+        let fresh: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let moved: SocketAddr = "127.0.0.1:1001".parse().unwrap();
+        let mut entry = StreamEntry::default();
+        entry.subscribers.insert(
+            fresh,
+            moved_subscriber(now - Duration::from_millis(200), false),
+        );
+        entry.subscribers.insert(
+            moved,
+            moved_subscriber(now - Duration::from_millis(200), true),
+        );
+        assert_eq!(
+            take_movable(&mut entry, Duration::from_secs(3), now),
+            vec![fresh]
+        );
+        assert_eq!(count_held_down(&mut entry), 1);
+        // A later round holds it again but does not count it again.
+        assert!(take_movable(&mut entry, Duration::from_secs(3), now).is_empty());
+        assert_eq!(count_held_down(&mut entry), 0);
+        assert_eq!(
+            take_movable(
+                &mut entry,
+                Duration::from_secs(3),
+                now + Duration::from_secs(3)
+            ),
+            vec![moved]
+        );
     }
 
     #[test]

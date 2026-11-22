@@ -740,14 +740,16 @@ fn the_fast_lane_flags_default_on_and_can_be_turned_off() {
 /// B10: an edge fed by the fast plane finds a hole by part distance. Part
 /// 10 of a 1 ms stream never arrives; when part 25 (15 ms later) arrives
 /// the tee asks the parents for part 10, once, with no timer: before part
-/// 25 nothing is asked, and parts that arrived are never asked for.
+/// 25 nothing is asked, and parts that arrived are never asked for. The
+/// request is lost (the edge has no parent): when part 40 (twice the
+/// distance) arrives, part 10 is asked again, of both parents.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_edge_asks_for_a_hole_when_the_part_the_distance_later_arrives() {
     let edge = LaneEdge::start_with(loopback(7), Duration::from_millis(15)).await;
     let holes = edge.holes.clone().expect("the trigger is on");
     let stream_id = 4001;
     let deadline = now_unix_us() + 30_000_000;
-    for sequence in 0..40_u64 {
+    for sequence in 0..48_u64 {
         if sequence != 10 {
             let (envelope, _) = packaged_envelope(Packaging::Pcm, stream_id, 0, sequence, 288);
             let symbols = fast_test_symbols(
@@ -762,7 +764,8 @@ async fn an_edge_asks_for_a_hole_when_the_part_the_distance_later_arrives() {
             wait_for_part(&edge.cache, stream_id, sequence).await;
             // The tee looks for holes after it commits.
             let looked = timeout(Duration::from_secs(1), async {
-                while holes.requests.load(Ordering::Relaxed) < u64::from(sequence >= 25) {
+                let expected = u64::from(sequence >= 25) + u64::from(sequence >= 40);
+                while holes.requests.load(Ordering::Relaxed) < expected {
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
             })
@@ -779,11 +782,17 @@ async fn an_edge_asks_for_a_hole_when_the_part_the_distance_later_arrives() {
                 (0, 0),
                 "nothing asked at part {sequence}"
             );
-        } else {
+        } else if sequence < 40 {
             assert_eq!(
                 (requests, asked),
                 (1, 1),
                 "part 10 asked once, at part {sequence}"
+            );
+        } else {
+            assert_eq!(
+                (requests, asked, holes.rechecks.load(Ordering::Relaxed)),
+                (2, 2, 1),
+                "part 10 asked again, of both parents, at part {sequence}"
             );
         }
     }

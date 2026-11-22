@@ -214,8 +214,15 @@ const CANONICAL_GAP_SCAN_LIMIT: usize = 1_024;
 const CANONICAL_GAP_LOG_INTERVAL_MS: u64 = 1_000;
 const REPLICA_REQUEST_MIN_INTERVAL_MS: u64 = 1_000;
 /// With --edge-hole-distance-ms, how long a waiting request waits before it
-/// asks the parents for a hole itself: the backstop of a lost request.
-const EDGE_HOLE_BACKSTOP_MS: u64 = 100;
+/// first asks the parents for a hole itself, the backstop of the trigger's
+/// two looks: twice the distance (by then the trigger has asked one parent,
+/// and is asking both), and at least the grace of the stream's parts. After
+/// that first request it asks again every grace, as without the trigger.
+fn edge_hole_backstop(distance: Duration, part_us: u64) -> Duration {
+    distance
+        .saturating_mul(2)
+        .max(edge_hole_repair_grace(part_us))
+}
 /// Time an edge waits for a requested part that both parents normally deliver
 /// within a millisecond of each other before it treats the part as a hole.
 const EDGE_HOLE_REPAIR_GRACE_MS: u64 = 15;
@@ -1495,7 +1502,9 @@ struct Args {
     /// A cut-through part of at most this many bytes has its client repair
     /// encoded and sent where it decoded (the cache-mesh receive task or the
     /// cut-through thread), not on a thread of the blocking pool woken for
-    /// each part. 0 is the behaviour from before.
+    /// each part. 0 is the behaviour from before. Only with a send queue
+    /// (--client-udp-send-queue-ms above 0): without one every part goes to
+    /// the blocking pool, where a full socket may be waited on.
     #[arg(
         long,
         env = "NEEDLETAIL_CLIENT_UDP_INLINE_COMPLETE_BYTES",
@@ -1595,8 +1604,10 @@ struct Args {
     /// not. It asks its cache-mesh parents for the missing run at once, from
     /// the fast-plane tee (or, without the fast plane, as the cache mesh
     /// applies parts), and a reader that waits for a part no longer asks on
-    /// a grace timer (3-15 ms): only after EDGE_HOLE_BACKSTOP_MS, as a
-    /// backstop. 0 is the behaviour from before (the grace timer).
+    /// a grace timer (3-15 ms) at first: only after twice the distance, as a
+    /// backstop, and then on the grace timer, of both parents. A part that
+    /// is still missing at twice the distance is asked of both parents. 0
+    /// is the behaviour from before (the grace timer).
     #[arg(
         long,
         env = "NEEDLETAIL_EDGE_HOLE_DISTANCE_MS",
@@ -2576,7 +2587,9 @@ async fn main() -> Result<()> {
         Arc::clone(&cache),
         edge_load.clone(),
         mesh_applied_rx,
-        hole_trigger.clone().filter(|_| !fast_ingest_planned),
+        // Also beside the fast plane: the trigger takes the cache mesh's
+        // arrivals of a stream that the fast plane has stopped feeding.
+        hole_trigger.clone(),
         ingest_shutdown_rx.clone(),
     ));
     let playlist_demand_task = tokio::spawn(run_playlist_demand(
@@ -2866,7 +2879,11 @@ async fn main() -> Result<()> {
     )
     .with_liveness_cache(args.edge_liveness_cache_us)
     .with_part_wait_due(args.edge_part_wait_due)
-    .with_hole_distance(hole_trigger.is_some())
+    .with_hole_distance(
+        hole_trigger
+            .is_some()
+            .then(|| Duration::from_millis(args.edge_hole_distance_ms)),
+    )
     .with_regional_view_ttl(REGIONAL_VIEW_TTL)
     .with_playlist_demand(playlist_demand)
     .with_client_udp_port(args.client_udp_bind.map(|bind| bind.port()))
@@ -10372,6 +10389,103 @@ impl LiveState {
             .max(1)
     }
 
+    /// How far a part of a stream lies behind `head`, in microseconds of
+    /// media: the durations of the parts after it up to the head. A part
+    /// that this node has no record of (a hole) is taken to be as long as
+    /// the recorded part after it. `None` without a record of the head.
+    fn part_age_us(&self, stream_id: u64, part: u64, head: u64) -> Option<u64> {
+        let mut age = None;
+        self.walk_part_ages(stream_id, head, |seq, age_us| {
+            if seq <= part {
+                age = Some(age_us);
+                return false;
+            }
+            true
+        })?;
+        age.or(Some(0).filter(|_| part >= head))
+    }
+
+    /// The oldest part of a stream within `playout_us` of `head`: parts
+    /// before it are past their playout deadline. `oldest` is the oldest
+    /// part that anyone wants: when it is within the deadline, `oldest` is
+    /// returned.
+    ///
+    /// The deadline is a length of media, the durations of the parts, not
+    /// a count of parts of the stream's longest part, which one long part
+    /// would shrink for the rest of the stream. Without a record of the
+    /// head it falls back to that count. A hole in the records counts as
+    /// within the deadline when the part after it is.
+    fn playout_floor(&self, stream_id: u64, head: u64, playout_us: u64, oldest: u64) -> u64 {
+        // Every part is at most the longest part long: at least this many
+        // parts behind the head are within the deadline.
+        let surely_within =
+            head.saturating_sub((playout_us / self.stream_part_us(stream_id)).max(1));
+        if oldest >= surely_within {
+            return oldest.min(surely_within);
+        }
+        let mut floor = None;
+        let walked = self.walk_part_ages(stream_id, head, |seq, age_us| {
+            if age_us > playout_us {
+                floor = Some(seq.saturating_add(1));
+                return false;
+            }
+            if seq <= oldest {
+                floor = Some(oldest);
+                return false;
+            }
+            true
+        });
+        match (walked, floor) {
+            (None, _) => surely_within,
+            (Some(_), Some(floor)) => floor.min(surely_within),
+            // The records end within the deadline: the oldest retained part.
+            (Some(oldest_recorded), None) => oldest_recorded.min(surely_within),
+        }
+    }
+
+    /// Walk the parts of a stream from `head` back, with the media time
+    /// from the end of each to the end of the head, until `visit` returns
+    /// false. A part not recorded between two that are is visited too, as
+    /// long as the recorded part after it. Returns the last part visited,
+    /// or `None` without a record of the head.
+    fn walk_part_ages(
+        &self,
+        stream_id: u64,
+        head: u64,
+        mut visit: impl FnMut(u64, u64) -> bool,
+    ) -> Option<u64> {
+        let parts = self.stream_parts.get(&stream_id)?;
+        let head_record = parts.get(&head)?;
+        let fallback_us = self.stream_part_target_us(stream_id);
+        let duration_of = |record: &RetainedPartObservation| {
+            record
+                .duration_us
+                .map(u64::from)
+                .filter(|duration_us| *duration_us > 0)
+                .unwrap_or(fallback_us)
+        };
+        let (mut newer, mut newer_us, mut age_us) = (head, duration_of(head_record), 0_u64);
+        if !visit(head, 0) {
+            return Some(head);
+        }
+        for (seq, record) in parts.range(..head).rev() {
+            // The holes between this part and the newer one, then this one.
+            for hole in (seq + 1..newer).rev() {
+                age_us = age_us.saturating_add(newer_us);
+                if !visit(hole, age_us) {
+                    return Some(hole);
+                }
+            }
+            age_us = age_us.saturating_add(newer_us);
+            if !visit(*seq, age_us) {
+                return Some(*seq);
+            }
+            newer = *seq;
+            newer_us = duration_of(record);
+        }
+        Some(newer)
+    }
+
     /// The part target of a stream in microseconds: what its contributor
     /// declares, else its longest part, else the nominal part of the node.
     fn stream_part_target_us(&self, stream_id: u64) -> u64 {
@@ -12514,7 +12628,11 @@ async fn run_mesh_applied_parts(
         journal_mesh_applied(&cache, &applied, committed_us);
         if let Some(holes) = &holes {
             holes
-                .arrived(applied.stream_id, applied.slot_id as u64)
+                .arrived(
+                    applied.stream_id,
+                    applied.slot_id as u64,
+                    edge_holes::Arrival::CacheMesh,
+                )
                 .await;
         }
         if cache
@@ -16184,9 +16302,10 @@ struct AppRouter {
     /// A part request ahead of the stream waits until the part is due
     /// (--edge-part-wait-due).
     part_wait_due: bool,
-    /// Holes are found by part distance (--edge-hole-distance-ms): a waiting
-    /// request asks the parents only as a backstop.
-    hole_distance: bool,
+    /// Holes are found by part distance (--edge-hole-distance-ms), this
+    /// distance: a waiting request asks the parents only as a backstop
+    /// (`edge_hole_backstop`).
+    hole_distance: Option<Duration>,
     /// Entry points of neighbouring regions: pathway name and base URL.
     failover_entries: Arc<Vec<(String, String)>>,
     edge_load: EdgeLoad,
@@ -16326,7 +16445,7 @@ impl AppRouter {
             region_silence_fresh_ms: None,
             liveness: Arc::new(LivenessCache::new(DEFAULT_EDGE_LIVENESS_CACHE_US)),
             part_wait_due: true,
-            hole_distance: false,
+            hole_distance: None,
             failover_entries: Arc::new(Vec::new()),
             edge_load,
             edge_lifecycle_config: edge_lifecycle_config.normalized(),
@@ -16409,8 +16528,8 @@ impl AppRouter {
         self
     }
 
-    fn with_hole_distance(mut self, on: bool) -> Self {
-        self.hole_distance = on;
+    fn with_hole_distance(mut self, distance: Option<Duration>) -> Self {
+        self.hole_distance = distance.filter(|distance| !distance.is_zero());
         self
     }
 
@@ -18170,10 +18289,11 @@ impl AppRouter {
             return true;
         };
         let snapshots = self.regional_snapshots().await;
+        let now_ms = now_unix_ms();
         if region_wide_silence(
             &snapshots,
             &self.node,
-            now_unix_ms(),
+            |snapshot| self.telemetry.advertisement_age_ms(snapshot, now_ms),
             u64::try_from(limit.as_millis()).unwrap_or(u64::MAX),
             fresh_ms,
         ) {
@@ -18221,10 +18341,9 @@ impl AppRouter {
             };
             // With holes found by part distance, a waiting request asks
             // the parents only as a backstop.
-            let grace = if self.hole_distance {
-                Duration::from_millis(EDGE_HOLE_BACKSTOP_MS)
-            } else {
-                edge_hole_repair_grace(part_us)
+            let grace = match self.hole_distance {
+                Some(distance) if requests == 0 => edge_hole_backstop(distance, part_us),
+                _ => edge_hole_repair_grace(part_us),
             };
             let wait = if self.part_wait_due {
                 part_wait_until_due(
@@ -18246,11 +18365,14 @@ impl AppRouter {
                 return Ok(Some(part));
             }
             // The first request goes to one parent. A hole that is still
-            // there after it is asked of both.
-            if self
-                .repair_stream_hole(stream_id, seq, if requests == 0 { 1 } else { 2 })
-                .await
-            {
+            // there after it is asked of both. With the hole trigger on, a
+            // parent has been asked already: the reader asks both.
+            let parents = if requests == 0 && self.hole_distance.is_none() {
+                1
+            } else {
+                2
+            };
+            if self.repair_stream_hole(stream_id, seq, parents).await {
                 requests += 1;
             }
         }
@@ -20104,36 +20226,44 @@ const REGION_SILENCE_MIN_FRESH_MS: u64 = 1_500;
 
 /// Whether the silence of this edge's parents is region-wide: at least one
 /// other edge of `me`'s region advertised in the last `fresh_ms`, and every
-/// such edge said that its parents were silent then for long enough that,
-/// had the silence gone on, it would be `limit_ms` long by now. An edge
-/// that hears no other edge of its region cannot tell, and its silence is
-/// its own.
+/// such edge said that its parents were silent then for at least half of
+/// `limit_ms`, and for long enough that, had the silence gone on, it would
+/// be `limit_ms` long by now. An edge that hears no other edge of its
+/// region cannot tell, and its silence is its own.
+///
+/// `age_ms` is the age of an advertisement as this node measures it (the
+/// time since it was received, on this clock; see
+/// `TelemetryAggregator::advertisement_age_ms`), not the time it carries:
+/// a sender whose clock is behind would otherwise look silent on every
+/// advertisement. A small silence is not extrapolated: an edge that said
+/// it heard its parents 20 ms before, in an advertisement that came late,
+/// is not silent because the advertisement is old.
 fn region_wide_silence(
     snapshots: &[MeshSnapshot],
     me: &MeshNode,
-    now_ms: u64,
+    age_ms: impl Fn(&MeshSnapshot) -> u64,
     limit_ms: u64,
     fresh_ms: u64,
 ) -> bool {
+    let shown_loss_ms = limit_ms / 2;
     let mut others = snapshots
         .iter()
-        .filter(|snapshot| {
-            snapshot.node.region == me.region
-                && snapshot.node.node_id != me.node_id
-                && now_ms.saturating_sub(snapshot.updated_unix_ms) <= fresh_ms
-        })
+        .filter(|snapshot| snapshot.node.region == me.region && snapshot.node.node_id != me.node_id)
         .filter_map(|snapshot| {
+            let age = age_ms(snapshot);
+            (age <= fresh_ms).then_some((age, snapshot))
+        })
+        .filter_map(|(age, snapshot)| {
             let edge = snapshot.edge_service.as_ref()?;
-            (edge.cache_mesh_role == "edge").then_some((snapshot.updated_unix_ms, edge))
+            (edge.cache_mesh_role == "edge").then_some((age, edge))
         })
         .peekable();
     if others.peek().is_none() {
         return false;
     }
-    others.all(|(updated_ms, edge)| {
-        edge.parents_silent_ms.is_some_and(|silent| {
-            silent.saturating_add(now_ms.saturating_sub(updated_ms)) >= limit_ms
-        })
+    others.all(|(age, edge)| {
+        edge.parents_silent_ms
+            .is_some_and(|silent| silent >= shown_loss_ms && silent.saturating_add(age) >= limit_ms)
     })
 }
 
@@ -22527,8 +22657,15 @@ mod tests {
     fn a_silence_is_region_wide_only_when_every_fresh_edge_of_the_region_shares_it() {
         let me = mesh_node_for_tests("edge-a", "uk", "eu", 51.5, -0.1);
         let now = 1_000_000;
-        let wide =
-            |snapshots: &[MeshSnapshot]| region_wide_silence(snapshots, &me, now, 1_500, 3_000);
+        let wide = |snapshots: &[MeshSnapshot]| {
+            region_wide_silence(
+                snapshots,
+                &me,
+                |snapshot| now - snapshot.updated_unix_ms,
+                1_500,
+                3_000,
+            )
+        };
         // No other edge heard: the silence is this edge's own.
         assert!(!wide(&[]));
         // Itself does not count.
@@ -22545,6 +22682,12 @@ mod tests {
         // An edge that hears its parents breaks it.
         let alive_c = edge_snapshot_for_region_silence("edge-c", "uk", "edge", 100, Some(20));
         assert!(!wide(&[silent_b.clone(), alive_c]));
+        // So does one that heard its parents 20 ms before an advertisement
+        // that is 1.6 s old (one advertisement late or lost): a small
+        // silence is not extrapolated.
+        let late_alive = edge_snapshot_for_region_silence("edge-c", "uk", "edge", 1_600, Some(20));
+        assert!(!wide(&[silent_b.clone(), late_alive.clone()]));
+        assert!(!wide(&[late_alive]));
         // So does one that never heard them, and one silent too briefly.
         assert!(!wide(&[edge_snapshot_for_region_silence(
             "edge-c", "uk", "edge", 100, None
@@ -22569,6 +22712,38 @@ mod tests {
             stale.clone()
         ]));
         assert!(!wide(&[other_region, stale]));
+    }
+
+    /// The age of another edge's advertisement is measured on this clock:
+    /// an edge whose clock is 2 s behind, and that said, in an
+    /// advertisement just received, that its parents had been silent for
+    /// 0.8 s, is not silent for 1.5 s.
+    #[tokio::test]
+    async fn region_silence_ages_advertisements_on_the_receiver_clock() {
+        let me = mesh_node_for_tests("edge-a", "uk", "eu", 51.5, -0.1);
+        let telemetry = TelemetryAggregator::new(60_000);
+        let now = now_unix_ms();
+        let mut behind = edge_snapshot_for_region_silence("edge-b", "uk", "edge", 0, Some(800));
+        behind.updated_unix_ms = now - 2_000;
+        telemetry.ingest_snapshot(behind.clone()).await;
+        let snapshots = vec![behind];
+        let receiver_age =
+            |snapshot: &MeshSnapshot| telemetry.advertisement_age_ms(snapshot, now_unix_ms());
+        assert!(!region_wide_silence(
+            &snapshots,
+            &me,
+            receiver_age,
+            1_500,
+            3_000
+        ));
+        // Aged by the time it carries, it would have counted as 2.8 s silent.
+        assert!(region_wide_silence(
+            &snapshots,
+            &me,
+            |snapshot| now - snapshot.updated_unix_ms,
+            1_500,
+            3_000,
+        ));
     }
 
     /// Both parents of every edge of the region went silent together (the
@@ -30576,6 +30751,59 @@ mod tests {
         );
     }
 
+    /// The playout deadline is a length of time: one long part (20 ms in a
+    /// stream of 1 ms parts) does not shrink 500 ms to 25 parts for the
+    /// rest of the stream, and a hole is aged by the parts' durations.
+    #[test]
+    fn the_playout_floor_is_measured_in_time_not_in_longest_parts() {
+        let mut state = LiveState::new();
+        state.nominal_part_us = 1_000;
+        let base_us = 1_000_000_000_u64;
+        let mut at_us = base_us;
+        for sequence in 0..2_000_u64 {
+            // Part 100 is 20 ms long; the others 1 ms. Part 1_990 is a hole.
+            let duration_us = if sequence == 100 { 20_000 } else { 1_000 };
+            at_us += duration_us;
+            if sequence == 1_990 {
+                continue;
+            }
+            state.record_part_available(
+                7,
+                sequence,
+                100,
+                at_us,
+                Some(duration_us as u32),
+                false,
+                false,
+                None,
+                1_000_000,
+            );
+            state.record_part_published(7, sequence, Some(at_us));
+        }
+        assert_eq!(state.stream_part_us(7), 20_000);
+        let head = 1_999;
+        // Everyone at the head: nothing to look for.
+        assert_eq!(state.playout_floor(7, head, 500_000, head), head - 25);
+        // A subscriber 300 parts (300 ms) behind is within the deadline:
+        // the count of longest parts would have moved it to head - 25.
+        assert_eq!(
+            state.playout_floor(7, head, 500_000, head - 300),
+            head - 300
+        );
+        // One 800 ms behind is moved to the part 500 ms behind the head.
+        assert_eq!(
+            state.playout_floor(7, head, 500_000, head - 800),
+            head - 500
+        );
+        // A hole is aged by the part after it.
+        assert_eq!(state.part_age_us(7, 1_990, head), Some(9_000));
+        assert_eq!(state.part_age_us(7, head, head), Some(0));
+        assert_eq!(state.part_age_us(7, 1_500, head), Some(499_000));
+        assert_eq!(state.part_age_us(7, 1_500, 5_000), None);
+        // Without records: the count of longest parts, as before.
+        assert_eq!(state.playout_floor(8, 1_000, 500_000, 0), 500);
+    }
+
     #[tokio::test]
     async fn edge_copy_restarts_when_the_source_starts_a_new_publication() {
         let distributor = LiveTsCache::new(1, Duration::from_millis(250), 4, 16, 64).await;
@@ -34099,6 +34327,15 @@ mod tests {
         assert_eq!(edge_hole_repair_grace(2_500), Duration::from_micros(7_500));
         assert_eq!(edge_hole_repair_grace(250), Duration::from_millis(3));
         assert_eq!(edge_hole_repair_grace(200_000), Duration::from_millis(15));
+        // With the hole trigger: twice the distance, not 100 ms.
+        assert_eq!(
+            edge_hole_backstop(Duration::from_millis(15), 1_000),
+            Duration::from_millis(30)
+        );
+        assert_eq!(
+            edge_hole_backstop(Duration::from_millis(1), 5_000),
+            Duration::from_millis(15)
+        );
         assert_eq!(
             edge_hole_repair_min_interval(5_000),
             Duration::from_millis(50)
