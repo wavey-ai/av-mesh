@@ -36,7 +36,7 @@
 //! (the `flags` byte) are not part of a datagram's canonical form
 //! ([`canonical`]) nor of its CRC.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 /// The first bytes of a compact datagram.
@@ -269,6 +269,12 @@ pub fn canonical(datagram: &[u8]) -> Vec<u8> {
 
 pub fn is_compact(datagram: &[u8]) -> bool {
     datagram.len() >= HEADER_LEN && datagram[..4] == MAGIC
+}
+
+/// Whether a compact datagram is a gap: a part the edge did not have when
+/// it sent it, which the part itself replaces if the edge gets it later.
+pub fn is_gap(datagram: &[u8]) -> bool {
+    is_compact(datagram) && datagram[4] == Kind::Gap.code()
 }
 
 /// A compact datagram, checked.
@@ -513,8 +519,11 @@ pub struct CompactPart {
 /// How long a hole waits before its first NACK: the time a part's
 /// cache-fed send may trail its fast-lane neighbours.
 pub const NACK_DELAY: Duration = Duration::from_millis(1);
-/// The time between the first two NACKs of one part; it doubles with each
-/// NACK after, up to [`MAX_NACK_RETRY`].
+/// The time between the first two NACKs of one part, at least: a NACK is
+/// not repeated before its answer can have come (one and a half round
+/// trips of the client's path, see [`CompactReceiver::set_rtt`]). It
+/// doubles with each NACK after, up to [`MAX_NACK_RETRY`] (or the round
+/// trip's wait, if that is longer).
 pub const NACK_RETRY: Duration = Duration::from_millis(5);
 pub const MAX_NACK_RETRY: Duration = Duration::from_millis(100);
 /// A hole is given up after this long, or after this many NACKs.
@@ -522,6 +531,11 @@ pub const HOLE_GIVE_UP: Duration = Duration::from_millis(1_000);
 pub const MAX_NACKS_PER_HOLE: u8 = 12;
 /// A jump of more parts than this is a resume elsewhere, not holes.
 pub const MAX_HOLE_RUN: u64 = 256;
+/// The most gaps that are asked for again at once: a gap is a part that
+/// the edge did not have when it was due (its hole outlived the repair
+/// horizon); its cache may fill it a moment later, and a NACK then brings
+/// the part. Gaps past this many (an outage) are final.
+pub const MAX_GAP_HOLES: usize = 64;
 /// Parts that the receiver remembers (for windows and duplicates).
 const MEMORY: usize = 4_096;
 /// A part, or a window, is counted for loss once its datagrams have had
@@ -533,6 +547,12 @@ struct Hole {
     since: Instant,
     next_nack: Instant,
     nacks: u8,
+    /// When the last NACK of it went (a retransmission after the first
+    /// one measures the round trip).
+    last_nack: Option<Instant>,
+    /// It was delivered as a gap: the NACK asks for the part in case the
+    /// edge has it now.
+    gap: bool,
 }
 
 #[derive(Debug)]
@@ -591,6 +611,11 @@ pub struct CompactReceiver {
     burst_runs: u64,
     window_received: u64,
     window_sent: u64,
+    /// Parts delivered as gaps: the part itself, if it comes, is delivered
+    /// after its gap.
+    gapped: BTreeSet<u64>,
+    /// The round trip of the client's path to its edge, if measured.
+    rtt: Option<Duration>,
     pub stats: CompactStats,
 }
 
@@ -618,7 +643,50 @@ impl CompactReceiver {
         self.holes.clear();
         self.counts.clear();
         self.window_counts.clear();
+        self.gapped.clear();
         self.run = 0;
+    }
+
+    /// A round trip of the client's path to its edge (a request and its
+    /// answer): NACKs are not repeated sooner than an answer can come.
+    pub fn set_rtt(&mut self, sample: Duration) {
+        self.rtt = Some(match self.rtt {
+            Some(rtt) => (rtt * 7 + sample) / 8,
+            None => sample,
+        });
+    }
+
+    pub fn rtt(&self) -> Option<Duration> {
+        self.rtt
+    }
+
+    /// The wait between the first two NACKs of a hole: [`NACK_RETRY`], or
+    /// one and a half round trips if that is longer.
+    pub fn nack_retry(&self) -> Duration {
+        self.rtt
+            .map_or(NACK_RETRY, |rtt| NACK_RETRY.max(rtt * 3 / 2))
+    }
+
+    /// A part came as a gap: remember it, and ask for the part again a
+    /// round trip later (the edge's cache may fill it).
+    fn note_gap(&mut self, part: u64, now: Instant) {
+        self.gapped.insert(part);
+        while self.gapped.len() > MEMORY {
+            self.gapped.pop_first();
+        }
+        let waiting = self.holes.values().filter(|hole| hole.gap).count();
+        if self.active && waiting < MAX_GAP_HOLES {
+            self.holes.insert(
+                part,
+                Hole {
+                    since: now,
+                    next_nack: now + self.nack_retry(),
+                    nacks: 0,
+                    last_nack: None,
+                    gap: true,
+                },
+            );
+        }
     }
 
     /// A part came on a RaptorQ lane: it is delivered, and it is no compact
@@ -673,6 +741,8 @@ impl CompactReceiver {
                                 since: now,
                                 next_nack: now + NACK_DELAY,
                                 nacks: 0,
+                                last_nack: None,
+                                gap: false,
                             });
                             self.counts.entry(hole).or_insert(Count {
                                 received: 0,
@@ -732,6 +802,16 @@ impl CompactReceiver {
             Kind::Part | Kind::Gap => {
                 if view.retransmit {
                     self.stats.retransmits += 1;
+                    // The answer to the only NACK of a hole: a round trip.
+                    if let Some(Hole {
+                        nacks: 1,
+                        last_nack: Some(at),
+                        ..
+                    }) = self.holes.get(&part)
+                    {
+                        let sample = now.saturating_duration_since(*at);
+                        self.set_rtt(sample);
+                    }
                 } else {
                     self.last_copies = view.copies;
                     let count = self.counts.entry(part).or_insert(Count {
@@ -743,10 +823,26 @@ impl CompactReceiver {
                     count.sent = 1 + view.copies;
                 }
                 let canonical = canonical(&datagram[..HEADER_LEN + view.payload.len()]);
+                // The part after its gap: the edge got it late. It is
+                // delivered (once), and replaces the gap's bytes.
+                if view.kind == Kind::Part && self.gapped.remove(&part) {
+                    self.holes.remove(&part);
+                    self.known.insert(part, canonical);
+                    out.push(self.part_of(part, &view, now_unix_us, false));
+                    self.try_windows_with(part, now, now_unix_us, &mut out);
+                    return out;
+                }
+                if view.kind == Kind::Gap && self.delivered.contains(&part) {
+                    self.stats.duplicates += 1;
+                    return out;
+                }
                 self.remember(part, canonical);
                 if !self.mark_delivered(part, now) {
                     self.stats.duplicates += 1;
                     return out;
+                }
+                if view.kind == Kind::Gap {
+                    self.note_gap(part, now);
                 }
                 out.push(self.part_of(part, &view, now_unix_us, false));
                 self.try_windows_with(part, now, now_unix_us, &mut out);
@@ -856,6 +952,9 @@ impl CompactReceiver {
                 let datagram = padded[..HEADER_LEN + view.payload.len()].to_vec();
                 self.remember(part, datagram);
                 if self.mark_delivered(part, now) {
+                    if view.kind == Kind::Gap {
+                        self.note_gap(part, now);
+                    }
                     out.push(self.part_of(part, &view, now_unix_us, true));
                     // Other windows that held it may now be complete enough.
                     queue.extend(
@@ -876,23 +975,29 @@ impl CompactReceiver {
     pub fn nacks_due(&mut self, now: Instant, limit: usize) -> Vec<u64> {
         let mut due = Vec::new();
         let mut abandoned = Vec::new();
+        let retry = self.nack_retry();
+        let most = MAX_NACK_RETRY.max(retry);
         for (part, hole) in self.holes.iter_mut() {
             if now.duration_since(hole.since) >= HOLE_GIVE_UP || hole.nacks >= MAX_NACKS_PER_HOLE {
-                abandoned.push(*part);
+                abandoned.push((*part, hole.gap));
                 continue;
             }
             if hole.next_nack <= now && due.len() < limit {
                 hole.nacks += 1;
-                let backoff = NACK_RETRY
+                let backoff = retry
                     .saturating_mul(1 << (hole.nacks - 1).min(8))
-                    .min(MAX_NACK_RETRY);
+                    .min(most);
                 hole.next_nack = now + backoff;
+                hole.last_nack = Some(now);
                 due.push(*part);
             }
         }
-        for part in abandoned {
+        for (part, gap) in abandoned {
             self.holes.remove(&part);
-            self.stats.abandoned += 1;
+            // A gap that never filled was delivered as a gap: not lost.
+            if !gap {
+                self.stats.abandoned += 1;
+            }
         }
         self.stats.nacked += due.len() as u64;
         due
@@ -1200,6 +1305,77 @@ mod tests {
         // A jump far ahead is a resume, not holes.
         receiver.push(&encode_part(10_000, 0, &[]).unwrap(), start, 0);
         assert_eq!(receiver.holes(), 0);
+    }
+
+    #[test]
+    fn a_part_that_comes_after_its_gap_is_delivered_and_the_gap_is_asked_for() {
+        let mut receiver = CompactReceiver::new();
+        receiver.expect_from(20, true);
+        let start = Instant::now();
+        receiver.push(&encode_part(20, 0, &payload(20, 10)).unwrap(), start, 0);
+        // The edge gave part 21 up (its hole outlived the repair horizon).
+        let parts = receiver.push(&encode_gap(21), start, 0);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].kind, Kind::Gap);
+        // The gap is asked for again a round trip later, in case the edge's
+        // cache has filled it since.
+        assert!(receiver.nacks_due(start, 64).is_empty());
+        assert_eq!(receiver.nacks_due(start + NACK_RETRY, 64), vec![21]);
+        // It had: the part comes, and is delivered after its gap, once.
+        let mut late = encode_part(21, 0, &payload(21, 10)).unwrap();
+        set_flags(&mut late, 0, true);
+        let parts = receiver.push(&late, start + NACK_RETRY * 2, 0);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].kind, Kind::Part);
+        assert_eq!(parts[0].payload, payload(21, 10));
+        assert!(receiver.push(&late, start + NACK_RETRY * 2, 0).is_empty());
+        assert_eq!(receiver.holes(), 0);
+        // A gap again for a part delivered is a duplicate.
+        assert!(receiver.push(&encode_gap(20), start, 0).is_empty());
+        // A gap whose part never comes is not counted as abandoned (it was
+        // delivered, as a gap).
+        receiver.push(&encode_gap(22), start, 0);
+        receiver.nacks_due(start + HOLE_GIVE_UP, 64);
+        assert_eq!(receiver.holes(), 0);
+        assert_eq!(receiver.stats.abandoned, 0);
+    }
+
+    #[test]
+    fn nacks_are_not_repeated_before_a_round_trip() {
+        let mut receiver = CompactReceiver::new();
+        receiver.expect_from(10, true);
+        receiver.set_rtt(Duration::from_millis(30));
+        assert_eq!(receiver.nack_retry(), Duration::from_millis(45));
+        let start = Instant::now();
+        for part in [10_u64, 12] {
+            receiver.push(&encode_part(part, 0, &payload(part, 10)).unwrap(), start, 0);
+        }
+        assert_eq!(receiver.nacks_due(start + NACK_DELAY, 64), vec![11]);
+        // Not at 5 ms or 15 ms after it: a retransmission takes 30 ms.
+        for after in [5, 15, 40] {
+            assert!(receiver
+                .nacks_due(start + NACK_DELAY + Duration::from_millis(after), 64)
+                .is_empty());
+        }
+        assert_eq!(
+            receiver.nacks_due(start + NACK_DELAY + Duration::from_millis(45), 64),
+            vec![11]
+        );
+        // A short path keeps the 5 ms floor.
+        let mut near = CompactReceiver::new();
+        near.set_rtt(Duration::from_micros(200));
+        assert_eq!(near.nack_retry(), NACK_RETRY);
+        // The answer to a hole's only NACK measures the round trip.
+        let mut measured = CompactReceiver::new();
+        measured.expect_from(0, true);
+        for part in [0_u64, 2] {
+            measured.push(&encode_part(part, 0, &payload(part, 10)).unwrap(), start, 0);
+        }
+        assert_eq!(measured.nacks_due(start + NACK_DELAY, 64), vec![1]);
+        let mut again = encode_part(1, 0, &payload(1, 10)).unwrap();
+        set_flags(&mut again, 0, true);
+        measured.push(&again, start + NACK_DELAY + Duration::from_millis(20), 0);
+        assert_eq!(measured.rtt(), Some(Duration::from_millis(20)));
     }
 
     #[test]

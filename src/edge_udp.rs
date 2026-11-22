@@ -34,7 +34,7 @@ use bytes::Bytes;
 use playlists::mesh::{chunk_frame_slot, CacheMeshReceiveObserver};
 use raptorq_datagram_fec::DatagramFecHeader;
 use std::collections::hash_map::RandomState;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
 use std::net::SocketAddr;
@@ -220,16 +220,27 @@ impl CompactRing {
     }
 
     /// Keep `datagram` as the part's, unless the part has one already:
-    /// returns the one kept.
+    /// returns the one kept. A gap kept is provisional: the part itself,
+    /// when the edge gets it after the gap went, replaces it (so that a
+    /// NACK, a later subscriber and the fast lane get the part).
     pub(crate) fn put(&self, part: u64, datagram: Bytes) -> Bytes {
         let mut slot = self.slot(part).lock().unwrap();
         match &*slot {
-            Some((held, kept)) if *held == part => kept.clone(),
+            Some((held, kept))
+                if *held == part && !(compact::is_gap(kept) && !compact::is_gap(&datagram)) =>
+            {
+                kept.clone()
+            }
             _ => {
                 *slot = Some((part, datagram.clone()));
                 datagram
             }
         }
+    }
+
+    /// The part's kept datagram, unless it is a gap.
+    pub(crate) fn get_part(&self, part: u64) -> Option<Bytes> {
+        self.get(part).filter(|kept| !compact::is_gap(kept))
     }
 }
 
@@ -250,12 +261,20 @@ impl CompactStore {
         self.streams.get(&stream_id)?.get(part)
     }
 
+    /// A stream's ring, if it has one.
+    pub(crate) fn existing_ring(&self, stream_id: u64) -> Option<Arc<CompactRing>> {
+        self.streams.get(&stream_id).map(|ring| Arc::clone(&ring))
+    }
+
     /// The compact datagram of an object (a part or a gap), kept or made
     /// and kept; `None` for one that does not fit a datagram (or an init).
     pub(crate) fn of_object(&self, object: &PartObject) -> Option<Bytes> {
         let ring = self.ring(object.stream_id);
         if let Some(kept) = ring.get(object.part) {
-            return Some(kept);
+            // A gap kept gives way to the part.
+            if !(object.kind == ObjectKind::Part && compact::is_gap(&kept)) {
+                return Some(kept);
+            }
         }
         let datagram = match object.kind {
             ObjectKind::Part => {
@@ -884,6 +903,9 @@ pub(crate) struct Subscriber {
     /// Its NACKs: the start of the current interval, and the parts granted
     /// and the bytes sent again in it.
     nack_interval: NackInterval,
+    /// The windows (their first parts) whose repair went to it, newest
+    /// last: whichever lane completes a window sends its repair once.
+    windows_repaired: VecDeque<u64>,
 }
 
 /// A subscriber's NACK budget in the current interval: parts, and bytes.
@@ -1311,7 +1333,13 @@ pub(crate) fn answer_nack(
             if !subscriber.nack_interval.grant_part(now) {
                 break;
             }
-            let Some(kept) = sockets.compact().get(stream_id, *part) else {
+            // A gap kept is looked for in the cache: the part may have come
+            // since (a late repair); if it has not, nothing is sent again.
+            let Some(kept) = sockets
+                .compact()
+                .get(stream_id, *part)
+                .filter(|kept| !compact::is_gap(kept))
+            else {
                 misses.push(*part);
                 answered += 1;
                 continue;
@@ -1636,6 +1664,7 @@ async fn admit(
                 compact,
                 first_part,
                 nack_interval: NackInterval::new(Instant::now()),
+                windows_repaired: VecDeque::new(),
             },
         );
         let start = !std::mem::replace(&mut entry.running, true);
@@ -1928,53 +1957,93 @@ async fn send_list(
     }
 }
 
-/// After `part`: the window repair of each window that it ends, to the
-/// compact subscribers whose plan asks for it and that were sent the whole
-/// window. A window with a part that the edge holds no compact datagram of
-/// (a part too large for one) has none.
-async fn send_window_repair(
-    store: &CompactStore,
-    out: ClientOut<'_>,
+/// Windows whose repair each subscriber remembers having been sent.
+const WINDOWS_REPAIRED: usize = 16;
+
+/// After `part` went to its clients, on any lane (the fast lane's class
+/// thread, cut-through or the cache-fed lane): the window repair of the
+/// window of each compact plan that `part` completes in the compact ring
+/// (its last part, or a late part of a window whose last part is there),
+/// to each subscriber whose plan asks for it, that was sent the whole
+/// window (by any lane) and that has not had it. A window with a part that
+/// the edge holds no compact datagram of (a part too large for one) has
+/// none. `windows`: the plans' windows, if the caller knows them (a part
+/// that completes none of them costs no lock of the table).
+pub(crate) fn window_repair_now(
+    sockets: &EdgeSockets,
     table: &Table,
-    config: EdgeUdpConfig,
+    batch: bool,
     stats: &EdgeUdpStats,
     stream_id: u64,
     part: u64,
+    windows: Option<&[u8]>,
 ) {
-    let wanted: Vec<(SocketAddr, u8, u8)> = {
-        let table = table.lock().unwrap();
-        let Some(entry) = table.get(&stream_id) else {
+    let Some(ring) = sockets.compact().existing_ring(stream_id) else {
+        return;
+    };
+    let completes = |window: u8| {
+        let window = u64::from(window.max(1));
+        let first = part - part % window;
+        let end = first + window - 1;
+        (part == end || ring.get(end).is_some()) && (first..=end).all(|p| ring.get(p).is_some())
+    };
+    if let Some(windows) = windows {
+        if !windows.iter().any(|window| completes(*window)) {
+            return;
+        }
+    }
+    // (peer, first part, window, rows)
+    let wanted: Vec<(SocketAddr, u64, u8, u8)> = {
+        let mut table = table.lock().unwrap();
+        let Some(entry) = table.get_mut(&stream_id) else {
             return;
         };
-        entry
-            .subscribers
-            .iter()
-            .filter_map(|(peer, subscriber)| {
-                let plan = subscriber.compact?;
-                let window = u64::from(plan.window);
-                if plan.window_repair == 0 || (part + 1) % window != 0 {
-                    return None;
-                }
-                let first = part + 1 - window;
-                (subscriber.first_part <= first && subscriber.next_part > part).then_some((
-                    *peer,
-                    plan.window,
-                    plan.window_repair,
-                ))
-            })
-            .collect()
+        let mut complete: HashMap<u8, bool> = HashMap::new();
+        let mut wanted = Vec::new();
+        for (peer, subscriber) in entry.subscribers.iter_mut() {
+            let Some(plan) = subscriber.compact else {
+                continue;
+            };
+            if plan.window_repair == 0 {
+                continue;
+            }
+            let window = u64::from(plan.window);
+            let first = part - part % window;
+            if subscriber.first_part > first || subscriber.windows_repaired.contains(&first) {
+                continue;
+            }
+            if !*complete
+                .entry(plan.window)
+                .or_insert_with(|| completes(plan.window))
+            {
+                continue;
+            }
+            let sent = (first..first + window).all(|p| {
+                p < subscriber.next_part
+                    || subscriber.cut_slots.contains(&p)
+                    || subscriber.fast.as_ref().is_some_and(|fast| fast.has_fast(p))
+            });
+            if !sent {
+                continue;
+            }
+            subscriber.windows_repaired.push_back(first);
+            if subscriber.windows_repaired.len() > WINDOWS_REPAIRED {
+                subscriber.windows_repaired.pop_front();
+            }
+            wanted.push((*peer, first, plan.window, plan.window_repair));
+        }
+        wanted
     };
     if wanted.is_empty() {
         return;
     }
-    let ring = store.ring(stream_id);
-    let mut windows: HashMap<u8, Vec<(SocketAddr, u8)>> = HashMap::new();
-    for (peer, window, rows) in wanted {
-        windows.entry(window).or_default().push((peer, rows));
+    let mut windows: HashMap<(u64, u8), Vec<(SocketAddr, u8)>> = HashMap::new();
+    for (peer, first, window, rows) in wanted {
+        windows.entry((first, window)).or_default().push((peer, rows));
     }
-    for (window, peers) in windows {
-        let first = part + 1 - u64::from(window);
-        let Some(symbols) = (first..=part)
+    let out = sockets.out_for_stream(stream_id);
+    for ((first, window), peers) in windows {
+        let Some(symbols) = (first..first + u64::from(window))
             .map(|part| ring.get(part))
             .collect::<Option<Vec<Bytes>>>()
         else {
@@ -2006,7 +2075,11 @@ async fn send_window_repair(
         stats
             .compact_window_repair
             .fetch_add(list.len() as u64, Ordering::Relaxed);
-        send_list(out, config, stats, &list).await;
+        if out.queue.is_some() {
+            out.send_many(stats, batch, false, &list);
+        } else {
+            out.send_each(stats, &list);
+        }
     }
 }
 
@@ -2315,16 +2388,15 @@ async fn run_stream_sender(
                 bytes,
             )
             .await;
-            send_window_repair(
-                sockets.compact(),
-                out,
+            window_repair_now(
+                &sockets,
                 &table,
-                config,
+                config.batch_send,
                 &stats,
                 stream_id,
                 part,
-            )
-            .await;
+                None,
+            );
             last_sent = Instant::now();
             continue;
         }
@@ -2337,7 +2409,17 @@ async fn run_stream_sender(
                 .get_part_until_for_stream_id(stream_id, part, Instant::now() + LIVE_WAIT)
                 .await))
         } else {
-            tokio::time::timeout(LIVE_WAIT, router.get_part_repairing_holes(stream_id, part)).await
+            // With a repair horizon, the newest part may be a hole that the
+            // cache releases as a gap within the horizon: the wait is that
+            // long at a time, so that the parts behind the hole are not held
+            // for LIVE_WAIT (the wait does not wake for a release).
+            let slice = router
+                .cache
+                .repair_horizon_us()
+                .map_or(LIVE_WAIT, |horizon_us| {
+                    LIVE_WAIT.min(Duration::from_micros(horizon_us).max(Duration::from_millis(1)))
+                });
+            tokio::time::timeout(slice, router.get_part_repairing_holes(stream_id, part)).await
         };
         match waited {
             Ok(Ok(Some((bytes, _)))) => {
@@ -2353,16 +2435,15 @@ async fn run_stream_sender(
                     Some(bytes),
                 )
                 .await;
-                send_window_repair(
-                    sockets.compact(),
-                    out,
+                window_repair_now(
+                    &sockets,
                     &table,
-                    config,
+                    config.batch_send,
                     &stats,
                     stream_id,
                     part,
-                )
-                .await;
+                    None,
+                );
                 last_sent = Instant::now();
             }
             Ok(Err(ParentsLost)) => {
@@ -3160,6 +3241,18 @@ fn new_route(
     };
     if let Some(canonical) = &compact {
         send_compact_now(inner, stream_id, slot, canonical, &compact_clients);
+        if !compact_clients.is_empty() {
+            let windows: Vec<u8> = compact_clients.iter().map(|(_, _, plan)| plan.window).collect();
+            window_repair_now(
+                &inner.sockets,
+                &inner.table,
+                inner.config.batch_send,
+                &inner.stats,
+                stream_id,
+                slot,
+                Some(&windows),
+            );
+        }
     }
     if clients.is_empty() {
         return route;
@@ -3186,6 +3279,35 @@ fn new_route(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_gap_in_the_compact_ring_gives_way_to_the_part() {
+        let store = CompactStore::default();
+        let gap = gap_object(9, 40);
+        let kept = store.of_object(&gap).unwrap();
+        assert!(compact::is_gap(&kept));
+        assert_eq!(store.ring(9).get_part(40), None);
+        // The part comes late (a repair after the horizon): it replaces the
+        // gap, for NACKs, later subscribers and the fast lane.
+        let part = PartObject {
+            kind: ObjectKind::Part,
+            datagrams: 0,
+            stream_id: 9,
+            part: 40,
+            available_unix_us: 0,
+            published_unix_us: 7,
+            payload: Bytes::from_static(b"late part"),
+        };
+        let kept = store.of_object(&part).unwrap();
+        assert!(!compact::is_gap(&kept));
+        assert_eq!(compact::parse(&kept).unwrap().payload, b"late part");
+        assert_eq!(store.get(9, 40), Some(kept.clone()));
+        assert_eq!(store.ring(9).get_part(40), Some(kept.clone()));
+        // A gap never replaces a part, and a part never another.
+        assert_eq!(store.of_object(&gap), Some(kept.clone()));
+        let other = Bytes::from(compact::encode_part(40, 7, b"other").unwrap());
+        assert_eq!(store.ring(9).put(40, other), kept);
+    }
 
     #[test]
     fn a_nack_interval_bounds_the_parts_and_the_bytes_sent_again() {
@@ -3288,6 +3410,7 @@ mod tests {
             compact: None,
             first_part: 0,
             nack_interval: NackInterval::new(admitted_at),
+            windows_repaired: VecDeque::new(),
         }
     }
 

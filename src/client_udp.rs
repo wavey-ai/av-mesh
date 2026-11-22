@@ -86,14 +86,18 @@ pub const KEEPALIVE: Duration = Duration::from_millis(300);
 /// with its headers, the smallest IPv6 path MTU. A small part is sent in
 /// symbols of its own size.
 pub const DEFAULT_SYMBOL_SIZE: u16 = 1_200;
-/// Repair of a RaptorQ block on a path with no measured loss: one symbol
-/// (the loss that a client measures adds to it, see
-/// [`RepairPolicy::for_loss`]). Until wave 5 it was a quarter of the source
-/// symbols and at least three: four datagrams for every one-symbol part,
-/// about 13 Mbit/s for a client of 2.5 ms Opus. A client asks for the old
-/// repair with `--repair-permille 250 --min-repair 3`.
+/// Repair of a RaptorQ block on a path with no measured loss, for a client
+/// that the edge serves the compact lane: one symbol (the loss that a
+/// client measures adds to it, see [`RepairPolicy::for_loss`]). Its parts
+/// that fit one datagram go compact, and NACK backs up the rest.
 pub const DEFAULT_REPAIR_PERMILLE: u32 = 0;
 pub const DEFAULT_MIN_REPAIR_SYMBOLS: u32 = 1;
+/// The repair of a client on the RaptorQ lane alone (it did not ask for the
+/// compact lane, or its edge does not serve it): a quarter of the source
+/// symbols and at least three, as before wave 5. That lane has no NACK, so
+/// it keeps the margin against bursts that it had.
+pub const RAPTORQ_LANE_REPAIR_PERMILLE: u32 = 250;
+pub const RAPTORQ_LANE_MIN_REPAIR_SYMBOLS: u32 = 3;
 /// The most parts of one `NACK`.
 pub const MAX_NACK_PARTS: usize = 64;
 /// The most repair an edge sends for one subscriber.
@@ -164,6 +168,23 @@ pub fn repair_for_loss(k: u32, p: f64) -> u32 {
 }
 
 impl RepairPolicy {
+    /// The base repair of a client: the compact lane's when the edge serves
+    /// it the compact lane, else the RaptorQ lane's. `permille` and
+    /// `min_symbols` given by the user stand either way.
+    pub fn base_for_lane(compact: bool, permille: Option<u32>, min_symbols: Option<u32>) -> Self {
+        let (default_permille, default_min) = if compact {
+            (DEFAULT_REPAIR_PERMILLE, DEFAULT_MIN_REPAIR_SYMBOLS)
+        } else {
+            (RAPTORQ_LANE_REPAIR_PERMILLE, RAPTORQ_LANE_MIN_REPAIR_SYMBOLS)
+        };
+        Self {
+            permille: permille.unwrap_or(default_permille),
+            min_symbols: min_symbols.unwrap_or(default_min),
+            loss_ppm: 0,
+        }
+        .bounded()
+    }
+
     pub fn bounded(self) -> Self {
         Self {
             permille: self.permille.min(MAX_REPAIR_PERMILLE),
@@ -1283,6 +1304,23 @@ mod tests {
             Control::decode(b"NTU/1 SUB 5 - 0 1 0 00ff C0.32.1 C0.32.1"),
             None
         );
+    }
+
+    #[test]
+    fn the_raptorq_lane_keeps_the_repair_of_before_the_compact_lane() {
+        let compact = RepairPolicy::base_for_lane(true, None, None);
+        assert_eq!((compact.permille, compact.min_symbols), (0, 1));
+        let raptorq = RepairPolicy::base_for_lane(false, None, None);
+        assert_eq!((raptorq.permille, raptorq.min_symbols), (250, 3));
+        // A one-symbol part on the RaptorQ lane: three repair symbols, as
+        // in wave 4, whatever the measured loss adds.
+        assert_eq!(raptorq.repair_symbols(1), 3);
+        assert_eq!(compact.repair_symbols(1), 1);
+        // What the user sets stands on either lane.
+        let set = RepairPolicy::base_for_lane(false, Some(100), Some(2));
+        assert_eq!((set.permille, set.min_symbols), (100, 2));
+        let set = RepairPolicy::base_for_lane(true, Some(250), None);
+        assert_eq!((set.permille, set.min_symbols), (250, 1));
     }
 
     #[test]

@@ -341,6 +341,9 @@ pub struct FastLaneStats {
     /// went as symbols).
     pub compact_parts: AtomicU64,
     pub compact_failed: AtomicU64,
+    /// Compact parts sent from a decoded envelope (the part's source symbol
+    /// was lost upstream).
+    pub compact_top_ups: AtomicU64,
     /// Video pacing: messages sent with an earliest departure, those whose
     /// departure the bound on the delay brought forward, and refusals of
     /// SO_TXTIME by the host (video then goes unpaced).
@@ -370,6 +373,7 @@ pub struct FastLaneSnapshot {
     pub gso_fallbacks: u64,
     pub compact_parts: u64,
     pub compact_failed: u64,
+    pub compact_top_ups: u64,
     pub paced_messages: u64,
     pub paced_clamped: u64,
     pub txtime_refused: u64,
@@ -398,6 +402,11 @@ pub struct EdgeFastLane {
     /// place (`--client-udp-compact-fast-parse`), not from a full decode and
     /// slot.
     compact_fast_parse: AtomicBool,
+    /// A one-symbol part decoded from repair alone goes to the compact
+    /// clients at once from the decoded envelope
+    /// (`--client-udp-compact-top-up`; `false`: the cache-fed lane sends
+    /// it, as before).
+    compact_top_up: AtomicBool,
     /// Video pacing: the percent of the stream's rate (0: off), the bound
     /// on the delay, and whether the video socket takes SO_TXTIME
     /// (`TXTIME_*`).
@@ -432,6 +441,7 @@ impl EdgeFastLane {
             rank,
             next_sequence: AtomicU32::new(0),
             compact_fast_parse: AtomicBool::new(true),
+            compact_top_up: AtomicBool::new(true),
             pace_percent: AtomicU32::new(0),
             pace_max_delay_us: AtomicU64::new(0),
             txtime: AtomicU8::new(TXTIME_UNSET),
@@ -493,6 +503,13 @@ impl EdgeFastLane {
     /// default) or from the full decode and slot, as before (`false`).
     pub fn set_compact_fast_parse(&self, fast: bool) {
         self.compact_fast_parse.store(fast, Ordering::Relaxed);
+    }
+
+    /// Send a one-symbol part decoded from repair alone to the compact
+    /// clients from the decoded envelope (`true`, the default), or leave it
+    /// to the cache-fed lane, as before (`false`).
+    pub fn set_compact_top_up(&self, top_up: bool) {
+        self.compact_top_up.store(top_up, Ordering::Relaxed);
     }
 
     /// Give the lane its client sockets and subscriber table.
@@ -585,6 +602,7 @@ impl EdgeFastLane {
             gso_fallbacks: load(&self.stats.gso_fallbacks),
             compact_parts: load(&self.stats.compact_parts),
             compact_failed: load(&self.stats.compact_failed),
+            compact_top_ups: load(&self.stats.compact_top_ups),
             paced_messages: load(&self.stats.paced_messages),
             paced_clamped: load(&self.stats.paced_clamped),
             txtime_refused: load(&self.stats.txtime_refused),
@@ -598,7 +616,9 @@ impl EdgeFastLane {
     fn compact_of(&self, stream_id: u64, view: &RlsView<'_>) -> Option<bytes::Bytes> {
         let armed = self.armed.get()?;
         let ring = armed.sockets.compact().ring(stream_id);
-        if let Some(kept) = ring.get(view.object) {
+        // A gap kept (the cache-fed lane gave the part up) gives way to the
+        // part.
+        if let Some(kept) = ring.get_part(view.object) {
             return Some(kept);
         }
         let header = DatagramFecHeader::decode(view.fec).ok()?;
@@ -633,6 +653,99 @@ impl EdgeFastLane {
         Some(ring.put(view.object, bytes::Bytes::from(datagram)))
     }
 
+    /// A one-symbol part that this edge decoded from repair alone (its source
+    /// symbol was lost upstream): the class threads made no compact datagram
+    /// of it (a repair symbol is not the part), so its compact clients would
+    /// wait for the cache-fed lane, which goes part by part behind any hole.
+    /// Make the datagram from the decoded envelope and send it now, with
+    /// each plan's copies, to the compact clients that the fast lane has not
+    /// carried it to (`--client-udp-compact-top-up`).
+    fn compact_top_up(&self, stream_id: u64, part: u64, groups: &[FastGroup], envelope: &[u8]) {
+        if !self.compact_top_up.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(armed) = self.armed.get() else {
+            return;
+        };
+        let waiting: Vec<(SocketAddr, u8, &Arc<FastClient>)> = groups
+            .iter()
+            .filter_map(|group| group.compact.map(|plan| (group, plan)))
+            .flat_map(|(group, plan)| {
+                group
+                    .clients
+                    .iter()
+                    .filter(move |(_, client)| part >= client.fast_from && !client.has_fast(part))
+                    .map(move |(peer, client)| (*peer, plan.copies, client))
+            })
+            .collect();
+        if waiting.is_empty() {
+            return;
+        }
+        let ring = armed.sockets.compact().ring(stream_id);
+        let canonical = match ring.get_part(part) {
+            Some(kept) => kept,
+            None => {
+                let Some(datagram) = compact_of_envelope(stream_id, part, envelope) else {
+                    self.stats.compact_failed.fetch_add(1, Ordering::Relaxed);
+                    return;
+                };
+                ring.put(part, bytes::Bytes::from(datagram))
+            }
+        };
+        let mut marked: HashMap<u8, Vec<u8>> = HashMap::new();
+        let mut claimed: Vec<(SocketAddr, u8)> = Vec::new();
+        for (peer, copies, client) in waiting {
+            // The cache-fed lane may have taken it meanwhile.
+            if !client.claim_fast(part) {
+                continue;
+            }
+            marked.entry(copies).or_insert_with(|| {
+                let mut datagram = canonical.to_vec();
+                compact::set_flags(&mut datagram, copies, false);
+                datagram
+            });
+            claimed.push((peer, copies));
+        }
+        if claimed.is_empty() {
+            return;
+        }
+        let list: Vec<(&[u8], SocketAddr)> = claimed
+            .iter()
+            .flat_map(|(peer, copies)| {
+                std::iter::repeat_n(
+                    (marked[copies].as_slice(), *peer),
+                    1 + usize::from(*copies),
+                )
+            })
+            .collect();
+        let (delivered, _) = armed
+            .sockets
+            .out_for_stream(stream_id)
+            .send_many(&armed.stats, true, false, &list);
+        self.stats
+            .compact_parts
+            .fetch_add(claimed.len() as u64, Ordering::Relaxed);
+        self.stats
+            .compact_top_ups
+            .fetch_add(claimed.len() as u64, Ordering::Relaxed);
+        let windows: Vec<u8> = groups
+            .iter()
+            .filter_map(|group| group.compact.map(|plan| plan.window))
+            .collect();
+        crate::edge_udp::window_repair_now(
+            &armed.sockets,
+            &armed.table,
+            true,
+            &armed.stats,
+            stream_id,
+            part,
+            Some(&windows),
+        );
+        self.stats
+            .datagrams
+            .fetch_add(delivered as u64, Ordering::Relaxed);
+    }
+
     /// The edge's own repair of a decoded object for the clients that took
     /// it on the fast lane: up to each client's policy, less the upstream
     /// repair that the stream's objects carry (`upstream_repair`, which the
@@ -657,6 +770,9 @@ impl EdgeFastLane {
             return;
         };
         let k = u32::from(header.source_symbols);
+        if k == 1 {
+            self.compact_top_up(stream_id, part, groups, envelope);
+        }
         let mut wanted: Vec<(u32, Vec<SocketAddr>)> = Vec::new();
         for group in groups {
             if group.compact.is_some() && k == 1 {
@@ -742,6 +858,27 @@ impl EdgeFastLane {
     }
 }
 
+/// The canonical compact datagram of part `part` of `stream_id` from its
+/// decoded envelope; `None` when it is not a canonical part that fits one.
+fn compact_of_envelope(stream_id: u64, part: u64, envelope: &[u8]) -> Option<Vec<u8>> {
+    if let Some(parsed) = av_mesh::canonical_slot::envelope_part(envelope) {
+        if parsed.stream_id != stream_id || parsed.object != part {
+            return None;
+        }
+        return compact::encode_part(part, parsed.published_unix_us, parsed.media);
+    }
+    let decoded = av_mesh::canonical_slot::canonical_part_from_envelope(
+        bytes::Bytes::copy_from_slice(envelope),
+    )
+    .ok()?;
+    if decoded.stream_id != stream_id || decoded.object.key().object() != part {
+        return None;
+    }
+    let (media, _init) = av_mesh::canonical_slot::slot_media(&decoded.slot, decoded.stream_id)?;
+    let published = av_mesh::canonical_slot::object_published_unix_us(&decoded.object).unwrap_or(0);
+    compact::encode_part(part, published, &media)
+}
+
 /// A send planned by a class thread.
 #[derive(Debug, Clone, Copy)]
 struct PlannedClient {
@@ -794,6 +931,10 @@ pub struct ClientPlan {
     /// `udp_sent`, recorded by the tee).
     first_sent: [Option<SocketAddr>; sys::RECV_BATCH],
     sent_us: u64,
+    /// The compact parts of the batch and their plans' windows (stream,
+    /// part, window): after the sends, the window repair of each window
+    /// that one of them completes goes from here.
+    compact_sent: Vec<(u64, u64, u8)>,
 }
 
 const REPAIR_MEMO: usize = 64;
@@ -831,6 +972,7 @@ impl ClientPlan {
             departures: Vec::with_capacity(sys::RECV_BATCH),
             first_sent: [None; sys::RECV_BATCH],
             sent_us: 0,
+            compact_sent: Vec::with_capacity(sys::RECV_BATCH),
         }
     }
 
@@ -851,6 +993,7 @@ impl ClientPlan {
     pub fn clear(&mut self) {
         self.sends.clear();
         self.clients.clear();
+        self.compact_sent.clear();
         self.first_sent = [None; sys::RECV_BATCH];
         if self.video {
             self.now_ns = sys::monotonic_ns();
@@ -944,6 +1087,11 @@ impl ClientPlan {
                     .get_or_insert_with(|| self.make_compact(lane, stream_id, message, view));
                 if made {
                     copies = Some(plan.copies);
+                    if plan.window_repair > 0
+                        && !self.compact_sent.contains(&(stream_id, part, plan.window))
+                    {
+                        self.compact_sent.push((stream_id, part, plan.window));
+                    }
                 }
             }
             if let (None, Some(ordinal)) = (copies, repair_ordinal) {
@@ -1224,6 +1372,45 @@ impl ClientPlan {
         self.sent_us = crate::now_unix_us();
         self.sends.clear();
         self.clients.clear();
+        self.window_repair(lane);
+    }
+
+    /// The window repair of the windows that the batch's compact parts
+    /// complete, from this thread: a window's repair does not wait for the
+    /// cache-fed lane to work its way to the window's end.
+    fn window_repair(&mut self, lane: &EdgeFastLane) {
+        if self.compact_sent.is_empty() {
+            return;
+        }
+        if let Some(armed) = lane.armed.get() {
+            let mut windows: Vec<u8> = Vec::new();
+            for (index, (stream_id, part, _)) in self.compact_sent.iter().enumerate() {
+                // Once for each part, with all its plans' windows.
+                if self.compact_sent[..index]
+                    .iter()
+                    .any(|(other, at, _)| other == stream_id && at == part)
+                {
+                    continue;
+                }
+                windows.clear();
+                windows.extend(
+                    self.compact_sent
+                        .iter()
+                        .filter(|(other, at, _)| other == stream_id && at == part)
+                        .map(|(_, _, window)| *window),
+                );
+                crate::edge_udp::window_repair_now(
+                    &armed.sockets,
+                    &armed.table,
+                    true,
+                    &armed.stats,
+                    *stream_id,
+                    *part,
+                    Some(&windows),
+                );
+            }
+        }
+        self.compact_sent.clear();
     }
 }
 

@@ -1748,6 +1748,19 @@ struct Args {
     )]
     client_udp_compact_fast_parse: bool,
 
+    /// A one-symbol part that the edge's fast plane decoded from repair
+    /// alone (its source symbol was lost upstream) goes to the compact
+    /// clients at once, made from the decoded envelope (low-latency wave 5
+    /// review). `false` leaves it to the cache-fed lane, which goes part by
+    /// part behind any hole, as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_COMPACT_TOP_UP",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    client_udp_compact_top_up: bool,
+
     /// An edge that has heard none of its cache-mesh parents for this long
     /// has lost them: it answers 503 for a part or a playlist reload that it
     /// would otherwise hold, and moves its UDP clients. Keep it above the
@@ -2708,6 +2721,7 @@ async fn main() -> Result<()> {
     .then(|| fast_plane::edge_clients::EdgeFastLane::new(args.client_udp_edge_rank));
     if let Some(lane) = &fast_lane {
         lane.set_compact_fast_parse(args.client_udp_compact_fast_parse);
+        lane.set_compact_top_up(args.client_udp_compact_top_up);
         lane.set_video_pacing(Some(fast_plane::edge_clients::VideoPacing {
             percent: args.client_udp_video_pace_percent,
             max_delay_us: args.client_udp_video_pace_max_ms.saturating_mul(1_000),

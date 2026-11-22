@@ -344,6 +344,25 @@ pub(super) struct ListenerRun {
     pub(super) copies_asked: u8,
     pub(super) lost_on_path: u64,
     pub(super) errors: u64,
+    /// Media datagrams that reached the listener's socket, and their bytes
+    /// with IP and UDP headers (before the path's loss).
+    pub(super) datagrams: u64,
+    pub(super) wire_bytes: u64,
+    /// Publication to first arrival of each part, in µs.
+    pub(super) latencies_us: Vec<u64>,
+}
+
+impl ListenerRun {
+    /// The `q` quantile of publication to arrival, in ms.
+    pub(super) fn latency_ms(&self, q: f64) -> f64 {
+        let mut values = self.latencies_us.clone();
+        if values.is_empty() {
+            return 0.0;
+        }
+        values.sort_unstable();
+        let index = ((values.len() as f64 * q).ceil() as usize).clamp(1, values.len()) - 1;
+        values[index] as f64 / 1_000.0
+    }
 }
 
 /// A listener of `stream_id` at `edge` on a path with `loss`, until it has
@@ -361,14 +380,9 @@ pub(super) async fn listen(
 ) -> ListenerRun {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let _ = SockRef::from(&socket).set_recv_buffer_size(16 << 20);
-    let base = match mode {
-        Mode::Before => RepairPolicy {
-            permille: 250,
-            min_symbols: 3,
-            loss_ppm: 0,
-        },
-        Mode::Compact => RepairPolicy::default(),
-    };
+    // As needletail-udp-client: the compact lane's repair while it asks
+    // for it, the RaptorQ lane's (as before wave 5) on that lane alone.
+    let mut base = RepairPolicy::base_for_lane(mode == Mode::Compact, None, None);
     let mut repair = RepairPolicy::for_loss(UNMEASURED_LOSS, base);
     let mut plan = CompactPlan::CLEAN;
     let compact = mode == Mode::Compact;
@@ -388,12 +402,14 @@ pub(super) async fn listen(
         .send_to(&subscribe(None, repair, plan), edge)
         .await
         .unwrap();
+    let asked_at = Instant::now();
     let token = loop {
         let (len, _) = socket.recv_from(&mut buf).await.unwrap();
         if let Some(Control::Token { token, .. }) = Control::decode(&buf[..len]) {
             break token;
         }
     };
+    let request_rtt = asked_at.elapsed();
     socket
         .send_to(&subscribe(Some(token), repair, plan), edge)
         .await
@@ -401,6 +417,7 @@ pub(super) async fn listen(
     let mut run = ListenerRun::default();
     let mut subscribed = Some(subscribed);
     let mut receiver = ObjectReceiver::new();
+    receiver.compact.set_rtt(request_rtt);
     let mut path = Path::new(loss, seed);
     let mut estimate: Option<f64> = None;
     let mut smooth: Option<f64> = None;
@@ -490,6 +507,14 @@ pub(super) async fn listen(
                     receiver.expect(stream_id, next_part, compact);
                 }
                 run.compact_confirmed = compact;
+                // An edge that does not serve the compact lane: the RaptorQ
+                // lane's repair.
+                let wanted = RepairPolicy::base_for_lane(compact, None, None);
+                if wanted != base {
+                    base = wanted;
+                    repair = RepairPolicy::for_loss(estimate.unwrap_or(UNMEASURED_LOSS), base);
+                    next_refresh = Instant::now();
+                }
                 if let Some(subscribed) = subscribed.take() {
                     let _ = subscribed.send(next_part);
                 }
@@ -502,6 +527,8 @@ pub(super) async fn listen(
                 .fetch_add((len + 28) as u64, Ordering::Relaxed);
             shared.datagrams.fetch_add(1, Ordering::Relaxed);
         }
+        run.datagrams += 1;
+        run.wire_bytes += (len + 28) as u64;
         if path.lost() {
             run.lost_on_path += 1;
             continue;
@@ -509,6 +536,10 @@ pub(super) async fn listen(
         for object in receiver.push_all(datagram) {
             match object.kind {
                 UdpObjectKind::Part => {
+                    if object.published_unix_us > 0 && !run.parts.contains_key(&object.part) {
+                        run.latencies_us
+                            .push(now_unix_us().saturating_sub(object.published_unix_us));
+                    }
                     if object.published_unix_us > 0
                         && !run.parts.contains_key(&object.part)
                         && shared.measuring.load(Ordering::Relaxed)
@@ -893,9 +924,16 @@ async fn compact_listeners_lose_nothing(feed: Feed, payload: Payload, ip: u8) {
         served.insert(part, wait_for_part(edge.cache(), stream_id, part).await);
     }
     let mut report = Vec::new();
+    let part_ms = payload.part_us() as f64 / 1_000.0;
     for (name, run) in runs {
+        let received = (parts - run.first.unwrap_or(first)) as f64;
+        let datagrams_per_part = run.datagrams as f64 / received;
+        let bytes_per_part = run.wire_bytes as f64 / received;
+        let (p50, p99) = (run.latency_ms(0.5), run.latency_ms(0.99));
         report.push(format!(
-            "{name}: lost on path {}, NACKed {}, retransmitted {}, recovered by window {}, plan {:?}",
+            "{name}: lost on path {}, NACKed {}, retransmitted {}, recovered by window {}, plan {:?}, \
+             {datagrams_per_part:.3} datagrams and {bytes_per_part:.0} B a part, \
+             publish->arrival p50 {p50:.2} p99 {p99:.2} ms",
             run.lost_on_path,
             run.nack_parts,
             run.retransmits,
@@ -911,6 +949,31 @@ async fn compact_listeners_lose_nothing(feed: Feed, payload: Payload, ip: u8) {
         if !name.contains("clean") {
             assert!(run.lost_on_path > 0, "{name}: the path lost datagrams");
         }
+        if !run.compact_confirmed {
+            continue;
+        }
+        // The wire of a clean path: one datagram a part and a window's
+        // repair (1/32), nothing more.
+        if name.contains("clean") {
+            let ceiling = (payload.media_len() + av_mesh::client_compact::HEADER_LEN + 28) as f64 * 1.06;
+            assert!(
+                datagrams_per_part <= 1.06 && bytes_per_part <= ceiling,
+                "{name}: {datagrams_per_part:.3} datagrams and {bytes_per_part:.0} B a part \
+                 (at most 1.06 and {ceiling:.0})"
+            );
+        }
+        // On time: a part that its path lost comes with its copy, its
+        // window's repair or a NACK's answer, not hundreds of ms late. A
+        // burst can wait for the end of its window (16 parts).
+        let bound_ms = if name.contains("gemodel") {
+            16.0 * part_ms + 30.0
+        } else {
+            30.0
+        };
+        assert!(
+            p99 <= bound_ms,
+            "{name}: publish->arrival p99 {p99:.2} ms (at most {bound_ms:.1})"
+        );
     }
     println!("{}", report.join("\n"));
     let stats = edge.stats();
@@ -932,7 +995,8 @@ async fn compact_listeners_of_a_mesh_fed_edge_lose_nothing_through_loss_and_burs
 
 /// 4K parts do not fit one datagram: a compact listener gets them as RaptorQ
 /// blocks with one repair symbol on a clean path, and a part that its loss
-/// beats is asked for again and sent whole.
+/// beats is asked for again and sent whole. Five seconds of 25 Mbit/s, on
+/// clean, 1 % and bursty paths: every frame, and on time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_compact_listener_of_4k_loses_nothing_at_one_percent() {
     let stream_id = 1;
@@ -940,9 +1004,16 @@ async fn a_compact_listener_of_4k_loses_nothing_at_one_percent() {
     let (edge, first) = AnyEdge::start(Feed::Fast, payload, stream_id, 23).await;
     let shared = Shared::new();
     let mut listeners = Vec::new();
-    for (index, loss) in [PathLoss::Clean, PathLoss::Random(0.01)]
-        .into_iter()
-        .enumerate()
+    for (index, loss) in [
+        PathLoss::Clean,
+        PathLoss::Random(0.01),
+        PathLoss::Bursts {
+            enter: 0.01,
+            leave: 0.2,
+        },
+    ]
+    .into_iter()
+    .enumerate()
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
         listeners.push((
@@ -960,7 +1031,7 @@ async fn a_compact_listener_of_4k_loses_nothing_at_one_percent() {
         ));
         timeout(Duration::from_secs(5), rx).await.unwrap().unwrap();
     }
-    let parts = 60_u64;
+    let parts = 300_u64;
     publish_paced(&edge, payload, stream_id, first, parts).await;
     shared.last.store(parts - 1, Ordering::Relaxed);
     let mut runs = Vec::new();
@@ -973,19 +1044,182 @@ async fn a_compact_listener_of_4k_loses_nothing_at_one_percent() {
     }
     for (name, run) in runs {
         check(&name, &run, &served, parts - 1);
+        // On time: within two frames of its publication, but for the 1 %
+        // that a NACK's round trip may take.
+        let (p50, p99) = (run.latency_ms(0.5), run.latency_ms(0.99));
+        let on_time = run
+            .latencies_us
+            .iter()
+            .filter(|latency| **latency <= 2 * payload.part_us())
+            .count() as f64
+            / run.latencies_us.len().max(1) as f64;
+        println!(
+            "{name}: lost on path {}, NACKed {}, frames on time {:.1} %, p50 {p50:.2} p99 {p99:.2} ms",
+            run.lost_on_path,
+            run.nack_parts,
+            on_time * 100.0
+        );
+        assert!(on_time >= 0.98, "{name}: {:.1} % of frames on time", on_time * 100.0);
+        assert!(p99 <= 100.0, "{name}: p99 {p99:.2} ms");
     }
     edge.stop().await;
 }
 
 /// With --client-udp-compact false, a listener that asks for the compact
 /// lane is told no (`OK` without `C`) and gets every part on the RaptorQ
-/// lane, as before.
+/// lane, with the repair of before the compact lane (a quarter and at least
+/// three symbols a part): on clean and 1 % paths nothing is lost, and on a
+/// bursty one no more than wave 4's lane lost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_edge_without_the_compact_lane_serves_the_raptorq_lane() {
     let stream_id = 4001;
     let payload = Payload::Opus;
     let (edge, first) = MeshEdge::start(payload, stream_id, false).await;
     let edge = AnyEdge::Mesh(edge);
+    let shared = Shared::new();
+    let mut listeners = Vec::new();
+    for (index, loss) in [
+        PathLoss::Clean,
+        PathLoss::Random(0.01),
+        PathLoss::Bursts {
+            enter: 0.01,
+            leave: 0.2,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        listeners.push((
+            format!("compact off, {}", loss.name()),
+            tokio::spawn(listen(
+                edge.client_port(),
+                stream_id,
+                Mode::Compact,
+                true,
+                loss,
+                7 + index as u64,
+                Arc::clone(&shared),
+                tx,
+            )),
+        ));
+        timeout(Duration::from_secs(5), rx).await.unwrap().unwrap();
+    }
+    let parts = first + 2_000;
+    publish_paced(&edge, payload, stream_id, first, parts).await;
+    shared.last.store(parts - 1, Ordering::Relaxed);
+    let mut runs = Vec::new();
+    for (name, listener) in listeners {
+        runs.push((name, listener.await.unwrap()));
+    }
+    let from = runs.iter().filter_map(|(_, run)| run.first).min().unwrap();
+    let mut served = BTreeMap::new();
+    for part in from..parts {
+        served.insert(part, wait_for_part(edge.cache(), stream_id, part).await);
+    }
+    for (name, run) in runs {
+        assert!(!run.compact_confirmed, "{name}");
+        let received = (parts - run.first.unwrap()) as f64;
+        // The RaptorQ lane's repair: four datagrams or more a part.
+        let datagrams_per_part = run.datagrams as f64 / received;
+        assert!(
+            datagrams_per_part >= 3.9,
+            "{name}: {datagrams_per_part:.2} datagrams a part"
+        );
+        if name.contains("gemodel") {
+            let missing = (run.first.unwrap()..parts)
+                .filter(|part| !run.parts.contains_key(part))
+                .count();
+            println!(
+                "{name}: lost on path {}, parts missing {missing} of {received}",
+                run.lost_on_path
+            );
+            assert!(
+                missing as f64 <= received * 0.01,
+                "{name}: {missing} parts missing"
+            );
+        } else {
+            check(&name, &run, &served, parts - 1);
+        }
+    }
+    assert_eq!(edge.stats().compact_parts.load(Ordering::Relaxed), 0);
+    edge.stop().await;
+}
+
+/// A part that the edge gave up as a gap (its hole outlived the repair
+/// horizon) and that its cache gets a moment later reaches a compact
+/// listener: the listener asks for the gap again, and the edge answers with
+/// the part, not the gap it had kept.
+async fn a_part_filled_after_its_gap_reaches_the_listener(fast_lane: bool, ip: u8) {
+    let stream_id = 4002;
+    let payload = Payload::Opus;
+    let (edge, first) = AnyEdge::start(Feed::Fast, payload, stream_id, ip).await;
+    edge.cache()
+        .set_canonical_gap_hold(Duration::from_millis(DEFAULT_CANONICAL_GAP_HOLD_MS));
+    edge.cache().set_repair_horizon(RepairHorizon::Fixed(10));
+    let shared = Shared::new();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let listener = tokio::spawn(listen(
+        edge.client_port(),
+        stream_id,
+        Mode::Compact,
+        fast_lane,
+        PathLoss::Clean,
+        11,
+        Arc::clone(&shared),
+        tx,
+    ));
+    timeout(Duration::from_secs(5), rx).await.unwrap().unwrap();
+    let parts = first + 200;
+    let late = first + 100;
+    let start = Instant::now();
+    for sequence in first..parts {
+        let due = start + Duration::from_micros(payload.part_us() * (sequence - first));
+        tokio::time::sleep_until(due.into()).await;
+        if sequence != late {
+            edge.publish(payload, stream_id, sequence).await;
+        }
+        // The lost part comes 60 ms late: long after the 10 ms horizon.
+        if sequence == late + 24 {
+            edge.publish(payload, stream_id, late).await;
+        }
+    }
+    shared.last.store(parts - 1, Ordering::Relaxed);
+    let run = listener.await.unwrap();
+    let name = format!("late part, F1={fast_lane}");
+    assert!(run.compact_confirmed, "{name}");
+    assert_eq!(
+        run.gaps,
+        1,
+        "{name}: the part went as a gap first: late {late} came {:?}, edge gaps {} past playout {} nack resent {}, cache {:?}",
+        run.parts.get(&late).map(|entry| entry.0),
+        edge.stats().gaps.load(Ordering::Relaxed),
+        edge.stats().holes_past_playout.load(Ordering::Relaxed),
+        edge.stats().nack_resent.load(Ordering::Relaxed),
+        edge.cache().canonical_gap_skip_snapshot()
+    );
+    let (count, bytes) = run
+        .parts
+        .get(&late)
+        .unwrap_or_else(|| panic!("{name}: the late part never came: {run:?}"));
+    assert_eq!(*count, 1, "{name}");
+    assert_eq!(*bytes, wait_for_part(edge.cache(), stream_id, late).await);
+    for part in run.first.unwrap()..parts {
+        assert!(run.parts.contains_key(&part), "{name}: part {part}");
+    }
+    assert!(edge.stats().gaps.load(Ordering::Relaxed) >= 1);
+    edge.stop().await;
+}
+
+/// A one-symbol part whose source symbol the edge never got (only the
+/// contributor's repair symbol came) goes to a compact fast-lane listener
+/// from the edge's decode, on the fast plane, not after the cache-fed lane
+/// has worked its way to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_part_decoded_from_repair_alone_goes_to_compact_listeners_at_once() {
+    let stream_id = 4003;
+    let payload = Payload::Opus;
+    let (edge, first) = AnyEdge::start(Feed::Fast, payload, stream_id, 26).await;
     let shared = Shared::new();
     let (tx, rx) = tokio::sync::oneshot::channel();
     let listener = tokio::spawn(listen(
@@ -994,23 +1228,122 @@ async fn an_edge_without_the_compact_lane_serves_the_raptorq_lane() {
         Mode::Compact,
         true,
         PathLoss::Clean,
-        7,
+        13,
         Arc::clone(&shared),
         tx,
     ));
     timeout(Duration::from_secs(5), rx).await.unwrap().unwrap();
+    let AnyEdge::Fast(lane_edge) = &edge else {
+        unreachable!()
+    };
     let parts = first + 400;
-    publish_paced(&edge, payload, stream_id, first, parts).await;
+    let start = Instant::now();
+    let mut repair_only = 0;
+    for sequence in first..parts {
+        let due = start + Duration::from_micros(payload.part_us() * (sequence - first));
+        tokio::time::sleep_until(due.into()).await;
+        let (envelope, _) = payload.envelope(stream_id, sequence);
+        let (sources, repairs) = payload.symbols(&envelope);
+        // Every tenth part loses its source symbol upstream.
+        if sequence % 10 == 5 {
+            repair_only += 1;
+            lane_edge.send(false, &(Vec::new(), repairs), false).await;
+        } else {
+            lane_edge.send(false, &(sources, repairs), false).await;
+        }
+    }
     shared.last.store(parts - 1, Ordering::Relaxed);
     let run = listener.await.unwrap();
     let mut served = BTreeMap::new();
     for part in run.first.unwrap()..parts {
         served.insert(part, wait_for_part(edge.cache(), stream_id, part).await);
     }
-    assert!(!run.compact_confirmed);
-    check("compact off", &run, &served, parts - 1);
-    assert_eq!(edge.stats().compact_parts.load(Ordering::Relaxed), 0);
+    check("repair alone", &run, &served, parts - 1);
+    let snapshot = edge
+        .stats()
+        .fast_lane
+        .get()
+        .expect("the fast lane")
+        .snapshot_stats();
+    assert!(
+        snapshot.compact_top_ups >= repair_only - 2,
+        "{} of {repair_only} parts decoded from repair went from the decode",
+        snapshot.compact_top_ups
+    );
+    let p99 = run.latency_ms(0.99);
+    assert!(p99 <= 30.0, "publish->arrival p99 {p99:.2} ms");
     edge.stop().await;
+}
+
+/// A window's repair goes from the lane that completes the window (here
+/// the fast lane's class thread), not when the cache-fed lane reaches the
+/// window's end: that lane waits at a hole upstream for the playout budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn window_repair_does_not_wait_for_the_cache_fed_lane() {
+    let stream_id = 4004;
+    let payload = Payload::Opus;
+    let (edge, first) = AnyEdge::start(Feed::Fast, payload, stream_id, 27).await;
+    let shared = Shared::new();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let listener = tokio::spawn(listen(
+        edge.client_port(),
+        stream_id,
+        Mode::Compact,
+        true,
+        PathLoss::Clean,
+        17,
+        Arc::clone(&shared),
+        tx,
+    ));
+    let from = timeout(Duration::from_secs(5), rx).await.unwrap().unwrap();
+    // A part that never comes, early: the cache-fed lane holds there for
+    // the playout budget (500 ms).
+    let hole = from + 3;
+    // Two whole windows of 32 after it, then a look before the hole's wait
+    // is over (about 200 ms of parts).
+    let window = u64::from(CompactPlan::CLEAN.window);
+    let parts = (hole / window + 3) * window;
+    let start = Instant::now();
+    for sequence in first..parts {
+        let due = start + Duration::from_micros(payload.part_us() * (sequence - first));
+        tokio::time::sleep_until(due.into()).await;
+        if sequence != hole {
+            edge.publish(payload, stream_id, sequence).await;
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let held_for = start.elapsed();
+    let repair = edge.stats().compact_window_repair.load(Ordering::Relaxed);
+    assert!(
+        held_for < Duration::from_millis(450),
+        "the run took {held_for:?}: the hole's wait is over"
+    );
+    assert!(
+        repair >= 2,
+        "{repair} window repair datagrams sent within {held_for:?} (two windows complete)"
+    );
+    // Each window's repair goes once, though the cache-fed lane passes it
+    // later.
+    shared.last.store(parts - 1, Ordering::Relaxed);
+    let run = listener.await.unwrap();
+    assert!(run.compact_confirmed);
+    let windows = (parts - from).div_ceil(window) + 1;
+    let repair = edge.stats().compact_window_repair.load(Ordering::Relaxed);
+    assert!(
+        repair <= windows,
+        "{repair} window repair datagrams for at most {windows} windows"
+    );
+    edge.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_part_filled_after_its_gap_reaches_a_cache_fed_listener() {
+    a_part_filled_after_its_gap_reaches_the_listener(false, 24).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_part_filled_after_its_gap_reaches_a_fast_lane_listener() {
+    a_part_filled_after_its_gap_reaches_the_listener(true, 25).await;
 }
 
 #[test]
