@@ -2894,7 +2894,7 @@ dependencies = [
 [[package]]
 name = "playlists"
 version = "0.2.0"
-source = "git+https://github.com/wavey-ai/playlists.git?rev=6130443e59278c7a358f55bb8da99dea40969c46#6130443e59278c7a358f55bb8da99dea40969c46"
+source = "git+https://github.com/wavey-ai/playlists.git?rev=c14d92143825626a0d89e75357db76a7dc083b4c#c14d92143825626a0d89e75357db76a7dc083b4c"
 dependencies = [
  "access-unit 0.1.5",
  "bytes",
