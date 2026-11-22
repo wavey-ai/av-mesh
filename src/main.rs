@@ -217,11 +217,15 @@ const EDGE_HOLE_REPAIR_GRACE_MS: u64 = 15;
 /// How often a node of the cache network says hello to its peers. A parent
 /// with media to send is heard with every datagram.
 const CACHE_MESH_ANNOUNCE_MS: u64 = 100;
-/// An edge that has heard none of its parents for this long has lost them:
-/// its private network, or every distributor. It answers 503 for a part or a
-/// playlist reload that it would otherwise hold, so that a reader moves at
-/// once and does not wait out its own timeout.
-const EDGE_PARENTS_SILENT_MS: u64 = 400;
+/// Default for --edge-parents-silent-ms. An edge that has heard none of its
+/// parents for this long has lost them: its private network, or every
+/// distributor. It answers 503 for a part or a playlist reload that it would
+/// otherwise hold, so that a reader moves at once and does not wait out its
+/// own timeout. It is above the canonical gap hold of a long-haul
+/// distributor (400 ms in deploy, at most the 1 s default) plus a long-haul
+/// round trip: 400 ms tripped while parents were alive but slow to decode,
+/// and moved UDP clients between edges every few milliseconds.
+const EDGE_PARENTS_SILENT_MS: u64 = 1_500;
 /// Minimum time between two hole repair requests for one stream: ten parts
 /// of the stream, from 5 ms up to this, and no less than one part of up to
 /// 100 ms.
@@ -1438,6 +1442,80 @@ struct Args {
     #[arg(long, default_value_t = 4_096)]
     client_udp_max_subscribers: usize,
 
+    /// A client datagram that finds the client socket full waits in a queue
+    /// of its client for this long, and leaves when the socket can take it,
+    /// instead of being dropped (or, for the cache-fed sender, holding up
+    /// every client of the stream). Older ones are dropped and counted. 0
+    /// is the behaviour from before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_SEND_QUEUE_MS",
+        default_value_t = edge_udp::DEFAULT_SEND_QUEUE_MS
+    )]
+    client_udp_send_queue_ms: u64,
+
+    /// Playout deadline of a client UDP subscriber: a part further than
+    /// this behind the edge's newest part is too old to play. A subscriber
+    /// that is further behind (after a move, or a backlog) jumps to the
+    /// oldest part within it, and a hole is repaired only while it is
+    /// within it, not for HOLE_WAIT each. 0 is the behaviour from before
+    /// (resume anywhere in the window, wait HOLE_WAIT for each hole).
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_PLAYOUT_MS",
+        default_value_t = edge_udp::DEFAULT_PLAYOUT_MS
+    )]
+    client_udp_playout_ms: u64,
+
+    /// A client UDP subscriber that this edge took less than this long ago
+    /// is not sent away because the edge lost its parents, and a client
+    /// that this edge sent away for that reason and that comes back within
+    /// it is taken: a client is not moved back and forth between edges
+    /// that lost their parents together. 0 is the behaviour from before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_MOVE_HOLD_DOWN_MS",
+        default_value_t = edge_udp::DEFAULT_MOVE_HOLD_DOWN_MS
+    )]
+    client_udp_move_hold_down_ms: u64,
+
+    /// An edge that has heard none of its cache-mesh parents for this long
+    /// has lost them: it answers 503 for a part or a playlist reload that it
+    /// would otherwise hold, and moves its UDP clients. Keep it above the
+    /// canonical gap hold of the distributors plus a long-haul round trip,
+    /// so that a parent that holds a hole is not taken for a lost one. 0
+    /// never treats the parents as lost.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_EDGE_PARENTS_SILENT_MS",
+        default_value_t = EDGE_PARENTS_SILENT_MS
+    )]
+    edge_parents_silent_ms: u64,
+
+    /// An edge whose parents went silent does not send its readers away
+    /// when every other edge of its region that it hears says the same: the
+    /// silence is region-wide (the source, or the long-haul path) and no
+    /// other edge of the region would do better. `false` is the behaviour
+    /// from before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_EDGE_REGION_SILENCE_HOLDS",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    edge_region_silence_holds: bool,
+
+    /// A cache-mesh parent is heard when any datagram of it is read off a
+    /// mesh socket (either class), before FEC decode; `false` hears it only
+    /// when one of its frames decodes (the behaviour from before).
+    #[arg(
+        long,
+        env = "NEEDLETAIL_MESH_LIVENESS_ON_RECEIPT",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    mesh_liveness_on_receipt: bool,
+
     #[arg(long, default_value_t = 9444)]
     http_port: u16,
 
@@ -2266,7 +2344,8 @@ async fn main() -> Result<()> {
         })
         .with_applied_tx(mesh_applied_tx);
     let mesh_config =
-        with_low_latency_mesh_options(mesh_config, args.mesh_sync_on_publish, &hop_journal);
+        with_low_latency_mesh_options(mesh_config, args.mesh_sync_on_publish, &hop_journal)
+            .with_liveness_on_receipt(args.mesh_liveness_on_receipt);
     // An edge with a client UDP port forwards the parts that reach it over
     // the cache mesh to its UDP clients as their datagrams arrive.
     // With a class-split mesh each class's receive task feeds a cut-through
@@ -2628,7 +2707,16 @@ async fn main() -> Result<()> {
     )
     .with_hls_renditions(args.hls_renditions.clone(), args.hls_rendition_stale_ms)
     .with_failover_entries(&args.failover_entries)
-    .with_parents_silent_after(Duration::from_millis(EDGE_PARENTS_SILENT_MS))
+    .with_parents_silent_after(
+        (args.edge_parents_silent_ms > 0)
+            .then(|| Duration::from_millis(args.edge_parents_silent_ms)),
+    )
+    .with_region_silence_holds(
+        args.edge_region_silence_holds,
+        args.telemetry_interval_ms
+            .saturating_mul(3)
+            .max(REGION_SILENCE_MIN_FRESH_MS),
+    )
     .with_regional_view_ttl(REGIONAL_VIEW_TTL)
     .with_playlist_demand(playlist_demand)
     .with_client_udp_port(args.client_udp_bind.map(|bind| bind.port()))
@@ -2714,6 +2802,9 @@ async fn main() -> Result<()> {
             edge_udp::EdgeUdpConfig {
                 symbol_size: args.client_udp_symbol_size,
                 max_subscribers: args.client_udp_max_subscribers,
+                send_queue: Duration::from_millis(args.client_udp_send_queue_ms),
+                playout: Duration::from_millis(args.client_udp_playout_ms),
+                move_hold_down: Duration::from_millis(args.client_udp_move_hold_down_ms),
             },
             Arc::clone(&router.edge_udp_stats),
             edge_cut_through.clone(),
@@ -10901,6 +10992,12 @@ struct EdgeServiceSnapshot {
     #[serde(default)]
     playlists: Vec<PlaylistHolding>,
     draining: bool,
+    /// How long this edge had heard none of its cache-mesh parents when it
+    /// advertised; `None` before it first heard one, or on a node that is
+    /// not an edge. Edges of a region read it to tell a silence of their
+    /// own from one of the whole region.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parents_silent_ms: Option<u64>,
 }
 
 /// One playlist that a cache holds. This is what a cache advertises to the
@@ -10962,6 +11059,7 @@ impl EdgeServiceSnapshot {
             egress_request_capacity: 0,
             playlists: Vec::new(),
             draining: node.draining,
+            parents_silent_ms: None,
         }
     }
 
@@ -15600,6 +15698,11 @@ struct AppRouter {
     /// Silence of every parent after which this edge sends its readers
     /// away. `None` holds requests whatever the parents do.
     parents_silent_after: Option<Duration>,
+    /// When set, an edge whose parents went silent does not send its
+    /// readers away while every other edge of its region that advertised in
+    /// the last this many milliseconds says the same (see
+    /// `region_wide_silence`).
+    region_silence_fresh_ms: Option<u64>,
     /// Entry points of neighbouring regions: pathway name and base URL.
     failover_entries: Arc<Vec<(String, String)>>,
     edge_load: EdgeLoad,
@@ -15736,6 +15839,7 @@ impl AppRouter {
             hls_renditions: Arc::new(HlsRenditionCatalog::default()),
             hls_rendition_stale_ms: DEFAULT_HLS_RENDITION_STALE_MS,
             parents_silent_after: None,
+            region_silence_fresh_ms: None,
             failover_entries: Arc::new(Vec::new()),
             edge_load,
             edge_lifecycle_config: edge_lifecycle_config.normalized(),
@@ -15787,8 +15891,17 @@ impl AppRouter {
     /// left out.
     /// Answer 503 for a held part or reload when no parent has been heard
     /// for this long. The parents must say hello several times in it.
-    fn with_parents_silent_after(mut self, limit: Duration) -> Self {
-        self.parents_silent_after = Some(limit);
+    /// `None` never treats the parents as lost.
+    fn with_parents_silent_after(mut self, limit: Option<Duration>) -> Self {
+        self.parents_silent_after = limit;
+        self
+    }
+
+    /// Hold readers while a silence of the parents is region-wide (`holds`),
+    /// judged from the advertisements of the region's edges that are at
+    /// most `fresh_ms` old.
+    fn with_region_silence_holds(mut self, holds: bool, fresh_ms: u64) -> Self {
+        self.region_silence_fresh_ms = holds.then_some(fresh_ms);
         self
     }
 
@@ -15845,6 +15958,13 @@ impl AppRouter {
             cache_mesh_role_label(self.cache_mesh_role),
         );
         edge_service.egress_request_capacity = self.edge_load.egress.request_capacity_per_sec();
+        if self.cache_mesh_role == CacheMeshRole::Edge {
+            edge_service.parents_silent_ms = self
+                .mesh
+                .parents_silent_for()
+                .await
+                .map(|silent| u64::try_from(silent.as_millis()).unwrap_or(u64::MAX));
+        }
         edge_service.playlists = snapshot
             .streams
             .iter()
@@ -16993,6 +17113,12 @@ impl AppRouter {
                     "cut_through_fallbacks": stats.cut_through_fallbacks.load(Ordering::Relaxed),
                     "would_block": stats.would_block.load(Ordering::Relaxed),
                     "cut_through_queue_drops": stats.cut_through_queue_drops.load(Ordering::Relaxed),
+                    "send_queued": stats.send_queued.load(Ordering::Relaxed),
+                    "send_queue_drops": stats.send_queue_drops.load(Ordering::Relaxed),
+                    "playout_skipped_parts": stats.playout_skipped_parts.load(Ordering::Relaxed),
+                    "holes_past_playout": stats.holes_past_playout.load(Ordering::Relaxed),
+                    "moves_held_down": stats.moves_held_down.load(Ordering::Relaxed),
+                    "region_silence_held": stats.region_silence_held.load(Ordering::Relaxed),
                     "tokens_sent": stats.tokens_sent.load(Ordering::Relaxed),
                     "bad_tokens": stats.bad_tokens.load(Ordering::Relaxed),
                 })
@@ -17498,18 +17624,41 @@ impl AppRouter {
     }
 
     /// Whether this edge has lost every parent: none of them has been heard
-    /// for `EDGE_PARENTS_SILENT_MS`. An edge that has never heard a parent
-    /// has not lost one.
+    /// for --edge-parents-silent-ms. An edge that has never heard a parent
+    /// has not lost one. A silence that every other edge of the region
+    /// shares is not a loss of this edge's (with
+    /// --edge-region-silence-holds): no other edge of the region would do
+    /// better, and readers sent away would come back.
     async fn parents_are_lost(&self) -> bool {
         let Some(limit) = self.parents_silent_after else {
             return false;
         };
-        self.cache_mesh_role == CacheMeshRole::Edge
-            && self
+        if self.cache_mesh_role != CacheMeshRole::Edge
+            || !self
                 .mesh
                 .parents_silent_for()
                 .await
                 .is_some_and(|silent| silent >= limit)
+        {
+            return false;
+        }
+        let Some(fresh_ms) = self.region_silence_fresh_ms else {
+            return true;
+        };
+        let snapshots = self.regional_snapshots().await;
+        if region_wide_silence(
+            &snapshots,
+            &self.node,
+            now_unix_ms(),
+            u64::try_from(limit.as_millis()).unwrap_or(u64::MAX),
+            fresh_ms,
+        ) {
+            self.edge_udp_stats
+                .region_silence_held
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        true
     }
 
     /// `Err` when the part is not here and this edge has lost its parents.
@@ -19399,6 +19548,45 @@ fn playback_request_url(base_url: &str, path: &str, query: Option<&str>) -> Opti
 /// An edge has lost every parent and cannot say when the part will come.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ParentsLost;
+
+/// Shortest age below which the advertisement of another edge counts for
+/// `region_wide_silence`, whatever the telemetry interval.
+const REGION_SILENCE_MIN_FRESH_MS: u64 = 1_500;
+
+/// Whether the silence of this edge's parents is region-wide: at least one
+/// other edge of `me`'s region advertised in the last `fresh_ms`, and every
+/// such edge said that its parents were silent then for long enough that,
+/// had the silence gone on, it would be `limit_ms` long by now. An edge
+/// that hears no other edge of its region cannot tell, and its silence is
+/// its own.
+fn region_wide_silence(
+    snapshots: &[MeshSnapshot],
+    me: &MeshNode,
+    now_ms: u64,
+    limit_ms: u64,
+    fresh_ms: u64,
+) -> bool {
+    let mut others = snapshots
+        .iter()
+        .filter(|snapshot| {
+            snapshot.node.region == me.region
+                && snapshot.node.node_id != me.node_id
+                && now_ms.saturating_sub(snapshot.updated_unix_ms) <= fresh_ms
+        })
+        .filter_map(|snapshot| {
+            let edge = snapshot.edge_service.as_ref()?;
+            (edge.cache_mesh_role == "edge").then_some((snapshot.updated_unix_ms, edge))
+        })
+        .peekable();
+    if others.peek().is_none() {
+        return false;
+    }
+    others.all(|(updated_ms, edge)| {
+        edge.parents_silent_ms.is_some_and(|silent| {
+            silent.saturating_add(now_ms.saturating_sub(updated_ms)) >= limit_ms
+        })
+    })
+}
 
 /// The answer of an edge that has lost its parents: 503, with the other
 /// caches of the region as it last knew them.
@@ -21723,7 +21911,7 @@ mod tests {
             commit_canonical_gap_test_part(&edge_cache, stream_id, sequence).await;
         }
         let router = app_router_for_tests(Arc::clone(&edge_cache), Arc::clone(&edge_mesh))
-            .with_parents_silent_after(Duration::from_millis(200));
+            .with_parents_silent_after(Some(Duration::from_millis(200)));
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(!router.parents_are_lost().await);
         // The next part is not here yet. With a parent that says hello the
@@ -21766,6 +21954,165 @@ mod tests {
             .headers
             .iter()
             .any(|(name, _)| name == "x-needletail-alternate-edges"));
+        edge_mesh.shutdown();
+    }
+
+    fn edge_snapshot_for_region_silence(
+        node_id: &str,
+        region: &str,
+        role: &str,
+        age_ms: u64,
+        parents_silent_ms: Option<u64>,
+    ) -> MeshSnapshot {
+        let mut snapshot =
+            telemetry_snapshot_for_tests(node_id, region, "eu", 51.5, -0.1, Vec::new(), 77);
+        snapshot.updated_unix_ms = 1_000_000 - age_ms;
+        let mut edge =
+            EdgeServiceSnapshot::from_node(&snapshot.node, None, role, EdgeLoadSnapshot::default());
+        edge.parents_silent_ms = parents_silent_ms;
+        snapshot.edge_service = Some(edge);
+        snapshot
+    }
+
+    #[test]
+    fn a_silence_is_region_wide_only_when_every_fresh_edge_of_the_region_shares_it() {
+        let me = mesh_node_for_tests("edge-a", "uk", "eu", 51.5, -0.1);
+        let now = 1_000_000;
+        let wide =
+            |snapshots: &[MeshSnapshot]| region_wide_silence(snapshots, &me, now, 1_500, 3_000);
+        // No other edge heard: the silence is this edge's own.
+        assert!(!wide(&[]));
+        // Itself does not count.
+        assert!(!wide(&[edge_snapshot_for_region_silence(
+            "edge-a",
+            "uk",
+            "edge",
+            0,
+            Some(9_000)
+        )]));
+        // Another edge said 1.3 s of silence 0.3 s ago: 1.6 s by now.
+        let silent_b = edge_snapshot_for_region_silence("edge-b", "uk", "edge", 300, Some(1_300));
+        assert!(wide(&[silent_b.clone()]));
+        // An edge that hears its parents breaks it.
+        let alive_c = edge_snapshot_for_region_silence("edge-c", "uk", "edge", 100, Some(20));
+        assert!(!wide(&[silent_b.clone(), alive_c]));
+        // So does one that never heard them, and one silent too briefly.
+        assert!(!wide(&[edge_snapshot_for_region_silence(
+            "edge-c", "uk", "edge", 100, None
+        )]));
+        assert!(!wide(&[edge_snapshot_for_region_silence(
+            "edge-c",
+            "uk",
+            "edge",
+            100,
+            Some(500)
+        )]));
+        // Edges of other regions, distributors and stale advertisements do
+        // not count either way.
+        let other_region = edge_snapshot_for_region_silence("edge-x", "us", "edge", 0, Some(20));
+        let distributor =
+            edge_snapshot_for_region_silence("dist-1", "uk", "distributor", 0, Some(20));
+        let stale = edge_snapshot_for_region_silence("edge-d", "uk", "edge", 5_000, Some(20));
+        assert!(wide(&[
+            silent_b.clone(),
+            other_region.clone(),
+            distributor,
+            stale.clone()
+        ]));
+        assert!(!wide(&[other_region, stale]));
+    }
+
+    /// Both parents of every edge of the region went silent together (the
+    /// source or the long-haul path): the edge holds its readers rather than
+    /// sending them away, as no other edge of the region would do better.
+    #[tokio::test]
+    async fn an_edge_holds_its_readers_when_the_whole_region_lost_its_parents() {
+        use playlists::mesh::{CacheMesh, CacheMeshConfig};
+
+        let parent_addr = unused_loopback_addr();
+        let edge_addr = unused_loopback_addr();
+        let edge_cache = canonical_gap_test_cache().await;
+        let parent_mesh = CacheMesh::new(
+            Arc::clone(&canonical_gap_test_cache().await.chunk_cache),
+            CacheMeshConfig::new("region-parent", "uk", parent_addr)
+                .with_peer(edge_addr)
+                .with_announce_interval(Duration::from_millis(40)),
+        )
+        .start()
+        .await
+        .unwrap();
+        let edge_mesh = Arc::new(
+            CacheMesh::new(
+                Arc::clone(&edge_cache.chunk_cache),
+                CacheMeshConfig::new("region-edge", "uk", edge_addr)
+                    .with_peer(parent_addr)
+                    .with_announce_interval(Duration::from_millis(40)),
+            )
+            .start()
+            .await
+            .unwrap(),
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        parent_mesh.shutdown();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let telemetry = TelemetryAggregator::default();
+        let mut other = telemetry_snapshot_for_tests(
+            "edge-b",
+            "test-region",
+            "test-continent",
+            51.6,
+            -0.2,
+            Vec::new(),
+            77,
+        );
+        let mut edge =
+            EdgeServiceSnapshot::from_node(&other.node, None, "edge", EdgeLoadSnapshot::default());
+        edge.parents_silent_ms = Some(5_000);
+        other.edge_service = Some(edge);
+        telemetry.ingest_snapshot(other.clone()).await;
+        let router = app_router_for_tests_with_telemetry(
+            Arc::clone(&edge_cache),
+            Arc::clone(&edge_mesh),
+            telemetry,
+        )
+        .with_parents_silent_after(Some(Duration::from_millis(200)));
+
+        // Without the rule the edge has lost its parents.
+        assert!(router.parents_are_lost().await);
+        // With it, the region shares the silence: the edge holds.
+        let holding = router.clone().with_region_silence_holds(true, 3_000);
+        assert!(!holding.parents_are_lost().await);
+        assert!(
+            holding
+                .edge_udp_stats
+                .region_silence_held
+                .load(Ordering::Relaxed)
+                >= 1
+        );
+
+        // The other edge hears its parents again: this edge's silence is
+        // its own, and it sends its readers away.
+        let telemetry = TelemetryAggregator::default();
+        if let Some(edge) = other.edge_service.as_mut() {
+            edge.parents_silent_ms = Some(10);
+        }
+        other.updated_unix_ms = now_unix_ms();
+        telemetry.ingest_snapshot(other).await;
+        let router = app_router_for_tests_with_telemetry(
+            Arc::clone(&edge_cache),
+            Arc::clone(&edge_mesh),
+            telemetry,
+        )
+        .with_parents_silent_after(Some(Duration::from_millis(200)))
+        .with_region_silence_holds(true, 3_000);
+        assert!(router.parents_are_lost().await);
+        // And its own advertisement says how long its parents are silent.
+        let local = router.local_mesh_snapshot().await;
+        assert!(local
+            .edge_service
+            .and_then(|edge| edge.parents_silent_ms)
+            .is_some_and(|silent| silent >= 200));
         edge_mesh.shutdown();
     }
 
@@ -23483,6 +23830,7 @@ mod tests {
             egress_request_capacity: 0,
             playlists: Vec::new(),
             draining: false,
+            parents_silent_ms: None,
         });
         let mut snapshot = TelemetryAggregator::default().snapshot(local).await;
         assert!(!snapshot
@@ -30650,13 +30998,16 @@ mod tests {
                 let edge = sockets.for_stream(0).local_addr().unwrap();
                 let stats: Arc<edge_udp::EdgeUdpStats> = Arc::default();
                 let (shutdown_tx, shutdown_rx) = watch::channel(());
+                // Every part must arrive: a host stall of more than the
+                // default 500 ms playout deadline (seen with the test
+                // runner's other tests and builds on the host) would let
+                // the cache-fed sender skip parts that it owes.
+                let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, 16);
+                config.playout = Duration::from_secs(5);
                 let task = tokio::spawn(edge_udp::run_edge_udp(
                     sockets,
                     router.clone(),
-                    edge_udp::EdgeUdpConfig {
-                        symbol_size: 1_200,
-                        max_subscribers: 16,
-                    },
+                    config,
                     Arc::clone(&stats),
                     cuts.clone(),
                     shutdown_rx,
@@ -30931,10 +31282,7 @@ mod tests {
             let task = tokio::spawn(edge_udp::run_edge_udp(
                 sockets,
                 router.clone(),
-                edge_udp::EdgeUdpConfig {
-                    symbol_size: 1_200,
-                    max_subscribers: 16,
-                },
+                edge_udp::EdgeUdpConfig::with_defaults(1_200, 16),
                 Arc::clone(&stats),
                 cuts.clone(),
                 shutdown_rx,
@@ -31104,13 +31452,15 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let edge = socket.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = watch::channel(());
+        // Parts of 250 ms: no playout deadline, so that the client takes
+        // every cached part from the one it names
+        // (a_moved_udp_client_resumes_within_its_playout_deadline).
+        let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, 16);
+        config.playout = Duration::ZERO;
         let task = tokio::spawn(edge_udp::run_edge_udp(
             edge_udp::EdgeSockets::single(socket),
             router.clone(),
-            edge_udp::EdgeUdpConfig {
-                symbol_size: 1_200,
-                max_subscribers: 16,
-            },
+            config,
             Arc::default(),
             Vec::new(),
             shutdown_rx,
@@ -31245,6 +31595,123 @@ mod tests {
         let _ = shutdown_tx.send(());
         task.await.unwrap().unwrap();
         mesh.shutdown();
+    }
+
+    /// A client that moves to an edge names a part that is past its playout
+    /// deadline: the edge starts it at the oldest part within the deadline,
+    /// not at the named part (which would make it wait behind a backlog).
+    /// Without a deadline it resumes at the named part, as before.
+    #[tokio::test]
+    async fn a_moved_udp_client_resumes_within_its_playout_deadline() {
+        use av_mesh::client_udp::{Control, RepairPolicy};
+        use tokio::time::timeout;
+
+        async fn first_part(playout_ms: u64) -> (u64, u64) {
+            let cache = LiveTsCache::new(1, Duration::from_millis(250), 4, 32, 64).await;
+            for sequence in 0..10_u64 {
+                cache
+                    .commit_stream_payload(
+                        77,
+                        encode_test_canonical_fmp4_bundle_with_duration(
+                            77,
+                            sequence,
+                            (sequence == 0).then_some(b"ftyp-fLaC-moov".as_slice()),
+                            &[sequence as u8; 2_000],
+                            Some(250),
+                            true,
+                        ),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+            let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let edge = socket.local_addr().unwrap();
+            let (shutdown_tx, shutdown_rx) = watch::channel(());
+            let stats = Arc::new(edge_udp::EdgeUdpStats::default());
+            let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, 16);
+            config.playout = Duration::from_millis(playout_ms);
+            let task = tokio::spawn(edge_udp::run_edge_udp(
+                edge_udp::EdgeSockets::single(socket),
+                router.clone(),
+                config,
+                Arc::clone(&stats),
+                Vec::new(),
+                shutdown_rx,
+            ));
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let subscribe = |token| {
+                Control::Subscribe {
+                    stream_id: 77,
+                    from_part: Some(1),
+                    repair: RepairPolicy {
+                        permille: 0,
+                        min_symbols: 0,
+                        loss_ppm: 0,
+                    },
+                    token,
+                }
+                .encode()
+            };
+            let mut buf = vec![0_u8; 65_536];
+            client.send_to(&subscribe(None), edge).await.unwrap();
+            let next = timeout(Duration::from_secs(5), async {
+                loop {
+                    let (len, _) = client.recv_from(&mut buf).await.unwrap();
+                    match Control::decode(&buf[..len]) {
+                        Some(Control::Token { token, .. }) => {
+                            client.send_to(&subscribe(Some(token)), edge).await.unwrap();
+                        }
+                        Some(Control::Subscribed { next_part, .. }) => break next_part,
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("the edge takes the client");
+            let _ = shutdown_tx.send(());
+            task.await.unwrap().unwrap();
+            mesh.shutdown();
+            (next, stats.playout_skipped_parts.load(Ordering::Relaxed))
+        }
+        // Parts of 250 ms, the head at 9: 500 ms is the two parts behind it.
+        assert_eq!(first_part(500).await, (7, 6));
+        assert_eq!(first_part(0).await, (1, 0));
+    }
+
+    #[test]
+    fn the_edge_churn_flags_default_to_the_new_behaviour_and_can_be_turned_off() {
+        let args = Args::try_parse_from(["av-mesh"]).unwrap();
+        assert_eq!(args.edge_parents_silent_ms, 1_500);
+        assert!(args.edge_region_silence_holds);
+        assert!(args.mesh_liveness_on_receipt);
+        assert_eq!(args.client_udp_send_queue_ms, 250);
+        assert_eq!(args.client_udp_playout_ms, 500);
+        assert_eq!(args.client_udp_move_hold_down_ms, 3_000);
+        let args = Args::try_parse_from([
+            "av-mesh",
+            "--edge-parents-silent-ms",
+            "400",
+            "--edge-region-silence-holds",
+            "false",
+            "--mesh-liveness-on-receipt=false",
+            "--client-udp-send-queue-ms",
+            "0",
+            "--client-udp-playout-ms",
+            "0",
+            "--client-udp-move-hold-down-ms",
+            "0",
+        ])
+        .unwrap();
+        assert_eq!(args.edge_parents_silent_ms, 400);
+        assert!(!args.edge_region_silence_holds);
+        assert!(!args.mesh_liveness_on_receipt);
+        assert_eq!(args.client_udp_send_queue_ms, 0);
+        assert_eq!(args.client_udp_playout_ms, 0);
+        assert_eq!(args.client_udp_move_hold_down_ms, 0);
+        // A bare boolean flag is not accepted, so that `false` cannot be lost.
+        assert!(Args::try_parse_from(["av-mesh", "--edge-region-silence-holds"]).is_err());
     }
 
     // ---- Low-latency round: hop journal, sync on publish, relay forward ----

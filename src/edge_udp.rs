@@ -48,11 +48,47 @@ const LIVE_WAIT: Duration = Duration::from_millis(250);
 /// The longest a sender tries to repair a part that the stream has passed
 /// before it sends a gap.
 const HOLE_WAIT: Duration = Duration::from_millis(400);
+/// Default of --client-udp-send-queue-ms: how long a datagram that found
+/// the client socket full waits for it.
+pub(crate) const DEFAULT_SEND_QUEUE_MS: u64 = 250;
+/// Default of --client-udp-playout-ms: how far behind the newest part a part
+/// is still worth sending to a client.
+pub(crate) const DEFAULT_PLAYOUT_MS: u64 = 500;
+/// Default of --client-udp-move-hold-down-ms.
+pub(crate) const DEFAULT_MOVE_HOLD_DOWN_MS: u64 = 3_000;
+/// Most datagrams that the send queues of one socket hold, whatever their
+/// age: about 40 MB of full datagrams.
+const SEND_QUEUE_MAX_DATAGRAMS: usize = 32_768;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct EdgeUdpConfig {
     pub symbol_size: u16,
     pub max_subscribers: usize,
+    /// How long a datagram that found the socket full waits in its
+    /// client's queue (zero: it is dropped, or the cache-fed sender waits
+    /// for the socket, as before).
+    pub send_queue: Duration,
+    /// Playout deadline of a subscriber, behind the newest part (zero: the
+    /// whole window, and HOLE_WAIT for each hole, as before).
+    pub playout: Duration,
+    /// A subscriber is not moved for lost parents within this of its
+    /// admission, and a client moved away for that is taken back within
+    /// this of its move (zero: no hold-down).
+    pub move_hold_down: Duration,
+}
+
+impl EdgeUdpConfig {
+    /// The configuration with the defaults of the flags.
+    #[cfg(test)]
+    pub(crate) fn with_defaults(symbol_size: u16, max_subscribers: usize) -> Self {
+        Self {
+            symbol_size,
+            max_subscribers,
+            send_queue: Duration::from_millis(DEFAULT_SEND_QUEUE_MS),
+            playout: Duration::from_millis(DEFAULT_PLAYOUT_MS),
+            move_hold_down: Duration::from_millis(DEFAULT_MOVE_HOLD_DOWN_MS),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -78,6 +114,21 @@ pub(crate) struct EdgeUdpStats {
     /// time (its queue was full): their client symbols go with the part's
     /// completion instead.
     pub cut_through_queue_drops: AtomicU64,
+    /// Datagrams that found the socket full and waited in their client's
+    /// send queue, and those dropped from it (too old, or the queues full).
+    pub send_queued: AtomicU64,
+    pub send_queue_drops: AtomicU64,
+    /// Parts that subscribers skipped because they were past their playout
+    /// deadline (after a move or a backlog), and holes sent as gaps at once
+    /// because they were.
+    pub playout_skipped_parts: AtomicU64,
+    pub holes_past_playout: AtomicU64,
+    /// Clients kept (or taken back) within the move hold-down although the
+    /// edge had lost its parents.
+    pub moves_held_down: AtomicU64,
+    /// Times that the edge held its readers because the silence of its
+    /// parents was region-wide.
+    pub region_silence_held: AtomicU64,
 }
 
 /// The client socket of an edge, or a pair of them on one address: audio
@@ -90,6 +141,68 @@ pub(crate) struct EdgeSockets {
     audio: Arc<UdpSocket>,
     video: Option<Arc<UdpSocket>>,
     classes: StreamClasses,
+    /// The send queues of the sockets, when --client-udp-send-queue-ms is
+    /// not zero.
+    audio_queue: Option<Arc<SendQueue>>,
+    video_queue: Option<Arc<SendQueue>>,
+}
+
+/// Where a stream's datagrams leave from: its socket, and the socket's send
+/// queue if there is one.
+#[derive(Clone, Copy)]
+pub(crate) struct ClientOut<'a> {
+    socket: &'a Arc<UdpSocket>,
+    queue: Option<&'a Arc<SendQueue>>,
+}
+
+/// What became of one datagram for one client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SendOutcome {
+    Sent,
+    /// The socket was full: it waits in the client's queue.
+    Queued,
+    /// The socket was full and there is no queue (or the queue is full).
+    Blocked,
+    Failed,
+}
+
+impl ClientOut<'_> {
+    /// Send now, or queue if the socket is full; never waits.
+    pub(crate) fn send(
+        &self,
+        stats: &EdgeUdpStats,
+        datagram: &[u8],
+        peer: SocketAddr,
+    ) -> SendOutcome {
+        match self.queue {
+            Some(queue) => queue.send(datagram, peer),
+            None => try_send_counted(self.socket, stats, datagram, peer),
+        }
+    }
+}
+
+fn try_send_counted(
+    socket: &UdpSocket,
+    stats: &EdgeUdpStats,
+    datagram: &[u8],
+    peer: SocketAddr,
+) -> SendOutcome {
+    match socket.try_send_to(datagram, peer) {
+        Ok(sent) => {
+            stats.datagrams.fetch_add(1, Ordering::Relaxed);
+            stats.bytes.fetch_add(sent as u64, Ordering::Relaxed);
+            SendOutcome::Sent
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            stats.would_block.fetch_add(1, Ordering::Relaxed);
+            SendOutcome::Blocked
+        }
+        Err(error) => {
+            stats.send_errors.fetch_add(1, Ordering::Relaxed);
+            debug!(%peer, error = %error, "edge client UDP send failed");
+            SendOutcome::Failed
+        }
+    }
 }
 
 impl EdgeSockets {
@@ -98,6 +211,8 @@ impl EdgeSockets {
             audio: Arc::new(socket),
             video: None,
             classes: StreamClasses::default(),
+            audio_queue: None,
+            video_queue: None,
         }
     }
 
@@ -106,14 +221,188 @@ impl EdgeSockets {
             audio: Arc::new(audio),
             video: Some(Arc::new(video)),
             classes,
+            audio_queue: None,
+            video_queue: None,
         }
+    }
+
+    /// Give each socket a send queue that holds a datagram for `limit`
+    /// (none when zero), with its drain task on the current runtime.
+    pub(crate) fn with_send_queues(mut self, limit: Duration, stats: &Arc<EdgeUdpStats>) -> Self {
+        if limit.is_zero() {
+            return self;
+        }
+        self.audio_queue = Some(SendQueue::start(
+            Arc::clone(&self.audio),
+            limit,
+            Arc::clone(stats),
+        ));
+        self.video_queue = self
+            .video
+            .as_ref()
+            .map(|video| SendQueue::start(Arc::clone(video), limit, Arc::clone(stats)));
+        self
     }
 
     /// The socket that a stream's datagrams leave from.
     pub(crate) fn for_stream(&self, stream_id: u64) -> &Arc<UdpSocket> {
+        self.out_for_stream(stream_id).socket
+    }
+
+    /// The socket and send queue that a stream's datagrams leave from.
+    pub(crate) fn out_for_stream(&self, stream_id: u64) -> ClientOut<'_> {
         match (&self.video, self.classes.class(stream_id)) {
-            (Some(video), TrafficClass::Video) => video,
-            _ => &self.audio,
+            (Some(video), TrafficClass::Video) => ClientOut {
+                socket: video,
+                queue: self.video_queue.as_ref(),
+            },
+            _ => ClientOut {
+                socket: &self.audio,
+                queue: self.audio_queue.as_ref(),
+            },
+        }
+    }
+}
+
+// ------------------------------------------------------------------ send queue
+
+/// The datagrams of each client that found its socket full, in order.
+///
+/// A datagram that the socket cannot take now is never dropped at once and
+/// never holds up the sender: it waits in its client's queue, and a drain
+/// task sends it when the socket can take it. A client with datagrams
+/// waiting has its next ones queued behind them, so its order holds. A
+/// datagram older than the limit (a part past any client's playout) is
+/// dropped and counted, as is one that finds the queues full.
+pub(crate) struct SendQueue {
+    socket: Arc<UdpSocket>,
+    limit: Duration,
+    /// Datagrams waiting, all clients: zero lets a send skip the lock.
+    waiting: std::sync::atomic::AtomicUsize,
+    clients: Mutex<HashMap<SocketAddr, std::collections::VecDeque<(Instant, Bytes)>>>,
+    wake: tokio::sync::Notify,
+    stats: Arc<EdgeUdpStats>,
+}
+
+impl SendQueue {
+    fn start(socket: Arc<UdpSocket>, limit: Duration, stats: Arc<EdgeUdpStats>) -> Arc<Self> {
+        let queue = Arc::new(Self {
+            socket,
+            limit,
+            waiting: std::sync::atomic::AtomicUsize::new(0),
+            clients: Mutex::new(HashMap::new()),
+            wake: tokio::sync::Notify::new(),
+            stats,
+        });
+        tokio::spawn(drain_send_queue(Arc::downgrade(&queue)));
+        queue
+    }
+
+    pub(crate) fn send(&self, datagram: &[u8], peer: SocketAddr) -> SendOutcome {
+        if self.waiting.load(Ordering::Acquire) == 0 {
+            match try_send_counted(&self.socket, &self.stats, datagram, peer) {
+                SendOutcome::Blocked => {}
+                outcome => return outcome,
+            }
+            return self.enqueue(datagram, peer, true);
+        }
+        self.enqueue(datagram, peer, false)
+    }
+
+    /// Queue behind the client's waiting datagrams; a client with none
+    /// tries the socket first (unless it just did).
+    fn enqueue(&self, datagram: &[u8], peer: SocketAddr, tried: bool) -> SendOutcome {
+        let now = Instant::now();
+        let mut clients = self.clients.lock().unwrap();
+        let waiting_here = clients.get(&peer).is_some_and(|queue| !queue.is_empty());
+        if !waiting_here && !tried {
+            match try_send_counted(&self.socket, &self.stats, datagram, peer) {
+                SendOutcome::Blocked => {}
+                outcome => return outcome,
+            }
+        }
+        if self.waiting.load(Ordering::Acquire) >= SEND_QUEUE_MAX_DATAGRAMS {
+            self.stats.send_queue_drops.fetch_add(1, Ordering::Relaxed);
+            return SendOutcome::Blocked;
+        }
+        let queue = clients.entry(peer).or_default();
+        // What the limit already condemns goes now, not at the next drain.
+        while queue
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) > self.limit)
+        {
+            queue.pop_front();
+            self.waiting.fetch_sub(1, Ordering::AcqRel);
+            self.stats.send_queue_drops.fetch_add(1, Ordering::Relaxed);
+        }
+        queue.push_back((now, Bytes::copy_from_slice(datagram)));
+        self.waiting.fetch_add(1, Ordering::AcqRel);
+        self.stats.send_queued.fetch_add(1, Ordering::Relaxed);
+        drop(clients);
+        self.wake.notify_one();
+        SendOutcome::Queued
+    }
+
+    /// Send what the socket takes, a datagram of each client in turn, and
+    /// drop what is too old. `true` when the socket filled up before the
+    /// queues were empty.
+    fn drain(&self) -> bool {
+        let mut clients = self.clients.lock().unwrap();
+        let now = Instant::now();
+        let mut blocked = false;
+        while !blocked && self.waiting.load(Ordering::Acquire) > 0 {
+            let mut progressed = false;
+            for (peer, queue) in clients.iter_mut() {
+                let Some((at, datagram)) = queue.pop_front() else {
+                    continue;
+                };
+                if now.duration_since(at) > self.limit {
+                    self.waiting.fetch_sub(1, Ordering::AcqRel);
+                    self.stats.send_queue_drops.fetch_add(1, Ordering::Relaxed);
+                    progressed = true;
+                    continue;
+                }
+                match try_send_counted(&self.socket, &self.stats, &datagram, *peer) {
+                    SendOutcome::Blocked => {
+                        // Not a would-block of a new datagram: undo the count.
+                        self.stats.would_block.fetch_sub(1, Ordering::Relaxed);
+                        queue.push_front((at, datagram));
+                        blocked = true;
+                        break;
+                    }
+                    _ => {
+                        self.waiting.fetch_sub(1, Ordering::AcqRel);
+                        progressed = true;
+                    }
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        clients.retain(|_, queue| !queue.is_empty());
+        blocked
+    }
+}
+
+/// Drain a send queue whenever it holds datagrams and its socket can take
+/// one. Ends when the queue is dropped.
+async fn drain_send_queue(queue: std::sync::Weak<SendQueue>) {
+    loop {
+        let Some(strong) = queue.upgrade() else {
+            return;
+        };
+        if strong.waiting.load(Ordering::Acquire) == 0 {
+            // Wake on a queued datagram; look again now and then so that a
+            // dropped queue ends this task.
+            let _ = tokio::time::timeout(Duration::from_secs(1), strong.wake.notified()).await;
+            continue;
+        }
+        if strong.drain() {
+            // The socket is full: wait until it can take a datagram.
+            let socket = Arc::clone(&strong.socket);
+            drop(strong);
+            let _ = tokio::time::timeout(Duration::from_millis(50), socket.writable()).await;
         }
     }
 }
@@ -138,6 +427,8 @@ pub(crate) struct Subscriber {
     init: Option<Bytes>,
     /// Parts that cut-through carries to it: the cache sender skips them.
     cut_slots: BTreeSet<u64>,
+    /// When this edge took it.
+    admitted_at: Instant,
 }
 
 #[derive(Debug, Default)]
@@ -148,6 +439,9 @@ pub(crate) struct StreamEntry {
 }
 
 pub(crate) type Table = Arc<Mutex<HashMap<u64, StreamEntry>>>;
+/// Clients that this edge sent away because it had lost its parents, and
+/// when: one that comes back within the move hold-down is taken.
+type MovedAway = Arc<Mutex<HashMap<(SocketAddr, u64), Instant>>>;
 /// Subscriptions that are being admitted: a client repeats its request
 /// until it is answered, and the repeats must not admit it twice.
 type Admitting = Arc<Mutex<HashSet<(SocketAddr, u64)>>>;
@@ -194,7 +488,9 @@ pub(crate) async fn run_edge_udp(
     cut_through: Vec<Arc<CutThrough>>,
     mut shutdown_rx: watch::Receiver<()>,
 ) -> anyhow::Result<()> {
+    let sockets = sockets.with_send_queues(config.send_queue, &stats);
     let table: Table = Arc::default();
+    let moved: MovedAway = Arc::default();
     for cut in &cut_through {
         cut.arm(
             sockets.clone(),
@@ -333,6 +629,7 @@ pub(crate) async fn run_edge_udp(
                     sockets.clone(),
                     router.clone(),
                     Arc::clone(&table),
+                    Arc::clone(&moved),
                     config,
                     Arc::clone(&stats),
                     peer,
@@ -385,12 +682,74 @@ async fn head_part(router: &AppRouter, stream_id: u64) -> Option<u64> {
         .map(|(_, last)| last as u64)
 }
 
+/// Parts of a stream within the playout deadline of a subscriber, or
+/// `None` when there is no deadline (--client-udp-playout-ms 0).
+async fn playout_parts(router: &AppRouter, config: EdgeUdpConfig, stream_id: u64) -> Option<u64> {
+    if config.playout.is_zero() {
+        return None;
+    }
+    let part_us = router.cache.state.read().await.stream_part_us(stream_id);
+    Some(playout_parts_of(config.playout, part_us))
+}
+
+fn playout_parts_of(playout: Duration, part_us: u64) -> u64 {
+    (u64::try_from(playout.as_micros()).unwrap_or(u64::MAX) / part_us.max(1)).max(1)
+}
+
+/// The part that a new subscriber starts at. A client that moves from
+/// another edge names the part that it needs next: it resumes there if the
+/// part is still in the window, and otherwise at the newest part. A part
+/// past the playout deadline is not worth sending: it resumes at the oldest
+/// part within it.
+fn first_part_for(
+    from_part: Option<u64>,
+    head: u64,
+    window: u64,
+    playout_parts: Option<u64>,
+) -> u64 {
+    match from_part {
+        Some(part) if part <= head.saturating_add(1) && head.saturating_sub(part) < window => {
+            playout_parts.map_or(part, |parts| part.max(head.saturating_sub(parts)))
+        }
+        _ => head,
+    }
+}
+
+/// How long a hole at `part` may be repaired before its playout deadline
+/// passes; `None` without a deadline (HOLE_WAIT then). Zero: send the gap.
+fn hole_budget(head: Option<u64>, part: u64, part_us: u64, playout: Duration) -> Option<Duration> {
+    if playout.is_zero() {
+        return None;
+    }
+    let behind = head.map_or(0, |head| head.saturating_sub(part));
+    let age = Duration::from_micros(behind.saturating_mul(part_us));
+    Some(playout.saturating_sub(age).min(HOLE_WAIT))
+}
+
+/// Whether the edge takes a client back that it sent away for lost parents
+/// within the hold-down (and forgets the moves that are older).
+fn moved_back_within_hold_down(
+    moved: &MovedAway,
+    peer: SocketAddr,
+    stream_id: u64,
+    hold_down: Duration,
+    now: Instant,
+) -> bool {
+    if hold_down.is_zero() {
+        return false;
+    }
+    let mut moved = moved.lock().unwrap();
+    moved.retain(|_, at| now.duration_since(*at) < hold_down);
+    moved.contains_key(&(peer, stream_id))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn admit(
     socket: Arc<UdpSocket>,
     sockets: EdgeSockets,
     router: AppRouter,
     table: Table,
+    moved: MovedAway,
     config: EdgeUdpConfig,
     stats: Arc<EdgeUdpStats>,
     peer: SocketAddr,
@@ -398,7 +757,24 @@ async fn admit(
     from_part: Option<u64>,
     repair: RepairPolicy,
 ) {
-    if let Some(reason) = move_reason(&router).await {
+    let reason = match move_reason(&router).await {
+        // A client sent away for lost parents that comes back at once has
+        // found no better edge: it is taken, not sent away again.
+        Some("parents-lost")
+            if moved_back_within_hold_down(
+                &moved,
+                peer,
+                stream_id,
+                config.move_hold_down,
+                Instant::now(),
+            ) =>
+        {
+            stats.moves_held_down.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+        reason => reason,
+    };
+    if let Some(reason) = reason {
         stats.moves.fetch_add(1, Ordering::Relaxed);
         send_control(
             &socket,
@@ -449,13 +825,15 @@ async fn admit(
         return;
     };
     let window = router.cache.window_parts_for(stream_id).await as u64;
-    // A client that moves from another edge names the part that it needs
-    // next. It resumes there if the part is still in the window, and
-    // otherwise at the newest part.
-    let first_part = match from_part {
-        Some(part) if part <= head.saturating_add(1) && head.saturating_sub(part) < window => part,
-        _ => head,
-    };
+    let playout = playout_parts(&router, config, stream_id).await;
+    let first_part = first_part_for(from_part, head, window, playout);
+    if let Some(part) = from_part.filter(|part| head.saturating_sub(*part) < window) {
+        if first_part > part {
+            stats
+                .playout_skipped_parts
+                .fetch_add(first_part - part, Ordering::Relaxed);
+        }
+    }
     let start_sender = {
         let mut table = table.lock().unwrap();
         let entry = table.entry(stream_id).or_default();
@@ -467,6 +845,7 @@ async fn admit(
                 next_part: first_part,
                 init: None,
                 cut_slots: BTreeSet::new(),
+                admitted_at: Instant::now(),
             },
         );
         !std::mem::replace(&mut entry.running, true)
@@ -484,7 +863,7 @@ async fn admit(
     info!(%peer, stream_id, first_part, head, "edge client UDP subscription");
     if start_sender {
         tokio::spawn(run_stream_sender(
-            sockets, router, table, config, stats, stream_id,
+            sockets, router, table, moved, config, stats, stream_id,
         ));
     }
 }
@@ -493,7 +872,7 @@ async fn admit(
 /// the targets asked for: one subscriber on a lossy path does not raise the
 /// repair that the others receive.
 async fn send_object(
-    socket: &UdpSocket,
+    out: ClientOut<'_>,
     config: EdgeUdpConfig,
     stats: &EdgeUdpStats,
     object: &PartObject,
@@ -516,7 +895,13 @@ async fn send_object(
         // the whole of a large part to be sent to the others.
         for datagram in &datagrams {
             for peer in &peers {
-                match socket.send_to(datagram, *peer).await {
+                if out.queue.is_some() {
+                    // A full socket queues the datagram for this client and
+                    // does not hold up the others.
+                    out.send(stats, datagram, *peer);
+                    continue;
+                }
+                match out.socket.send_to(datagram, *peer).await {
                     Ok(sent) => {
                         stats.datagrams.fetch_add(1, Ordering::Relaxed);
                         stats.bytes.fetch_add(sent as u64, Ordering::Relaxed);
@@ -560,7 +945,7 @@ fn gap_object(stream_id: u64, part: u64) -> PartObject {
 /// have this one yet.
 #[allow(clippy::too_many_arguments)]
 async fn send_init_if_new(
-    socket: &UdpSocket,
+    out: ClientOut<'_>,
     router: &AppRouter,
     table: &Table,
     config: EdgeUdpConfig,
@@ -604,7 +989,7 @@ async fn send_init_if_new(
         published_unix_us: 0,
         payload: init,
     };
-    send_object(socket, config, stats, &object, &needing).await;
+    send_object(out, config, stats, &object, &needing).await;
 }
 
 /// The subscribers due for `part`, after the part has been taken for them.
@@ -641,7 +1026,7 @@ fn take_due(
 
 #[allow(clippy::too_many_arguments)]
 async fn deliver(
-    socket: &UdpSocket,
+    out: ClientOut<'_>,
     router: &AppRouter,
     table: &Table,
     config: EdgeUdpConfig,
@@ -656,10 +1041,7 @@ async fn deliver(
     }
     let object = match bytes {
         Some(bytes) => {
-            send_init_if_new(
-                socket, router, table, config, stats, stream_id, part, &targets,
-            )
-            .await;
+            send_init_if_new(out, router, table, config, stats, stream_id, part, &targets).await;
             stats.parts.fetch_add(1, Ordering::Relaxed);
             part_object(router, stream_id, part, bytes).await
         }
@@ -668,28 +1050,36 @@ async fn deliver(
             gap_object(stream_id, part)
         }
     };
-    send_object(socket, config, stats, &object, &targets).await;
+    send_object(out, config, stats, &object, &targets).await;
 }
 
 async fn run_stream_sender(
     sockets: EdgeSockets,
     router: AppRouter,
     table: Table,
+    moved: MovedAway,
     config: EdgeUdpConfig,
     stats: Arc<EdgeUdpStats>,
     stream_id: u64,
 ) {
     let mut housekeeping_at = Instant::now();
     let mut last_sent = Instant::now();
+    // The edge has lost its parents but keeps subscribers within the move
+    // hold-down: it serves them from its cache alone, without repair.
+    let mut held_while_lost = false;
     loop {
         let now = Instant::now();
         // The stream's class can become known after it started.
         let socket = Arc::clone(sockets.for_stream(stream_id));
+        let out = sockets.out_for_stream(stream_id);
         let head = head_part(&router, stream_id).await;
         let window = router.cache.window_parts_for(stream_id).await as u64;
+        let playout = playout_parts(&router, config, stream_id).await;
         // Subscribers that stopped refreshing end; with none left, so does
         // the sender. A subscriber whose next part has left the window
-        // continues at the newest part.
+        // continues at the newest part, and one whose next part is past its
+        // playout deadline (after a move, or a backlog) at the oldest part
+        // within it.
         let (oldest_next, newest_next, peers) = {
             let mut guard = table.lock().unwrap();
             let Some(entry) = guard.get_mut(&stream_id) else {
@@ -707,6 +1097,14 @@ async fn run_stream_sender(
                 for subscriber in entry.subscribers.values_mut() {
                     if head.saturating_sub(subscriber.next_part) >= window {
                         subscriber.next_part = head;
+                    } else if let Some(parts) = playout {
+                        let floor = head.saturating_sub(parts);
+                        if subscriber.next_part < floor {
+                            stats
+                                .playout_skipped_parts
+                                .fetch_add(floor - subscriber.next_part, Ordering::Relaxed);
+                            subscriber.next_part = floor;
+                        }
                     }
                 }
             }
@@ -723,22 +1121,54 @@ async fn run_stream_sender(
 
         if now >= housekeeping_at {
             housekeeping_at = now + HOUSEKEEPING;
+            held_while_lost = false;
             if let Some(reason) = move_reason(&router).await {
-                let peers: Vec<SocketAddr> = {
-                    let mut guard = table.lock().unwrap();
-                    guard
-                        .remove(&stream_id)
-                        .map(|entry| entry.subscribers.into_keys().collect())
-                        .unwrap_or_default()
+                // Lost parents do not move a subscriber taken within the
+                // hold-down: it may have just come from an edge that lost
+                // its parents too. Draining moves every subscriber.
+                let hold_down = if reason == "parents-lost" {
+                    config.move_hold_down
+                } else {
+                    Duration::ZERO
                 };
-                stats.moves.fetch_add(peers.len() as u64, Ordering::Relaxed);
-                info!(
-                    stream_id,
-                    reason,
-                    clients = peers.len(),
-                    "edge client UDP moves its clients"
-                );
-                for peer in peers {
+                let (leaving, kept) = {
+                    let mut guard = table.lock().unwrap();
+                    match guard.get_mut(&stream_id) {
+                        Some(entry) => {
+                            let leaving = take_movable(entry, hold_down, now);
+                            let kept = entry.subscribers.len();
+                            if kept == 0 {
+                                guard.remove(&stream_id);
+                            }
+                            (leaving, kept)
+                        }
+                        None => (Vec::new(), 0),
+                    }
+                };
+                if kept > 0 {
+                    stats
+                        .moves_held_down
+                        .fetch_add(kept as u64, Ordering::Relaxed);
+                }
+                if !leaving.is_empty() {
+                    stats
+                        .moves
+                        .fetch_add(leaving.len() as u64, Ordering::Relaxed);
+                    info!(
+                        stream_id,
+                        reason,
+                        clients = leaving.len(),
+                        kept,
+                        "edge client UDP moves its clients"
+                    );
+                    if !hold_down.is_zero() {
+                        let mut moved = moved.lock().unwrap();
+                        for peer in &leaving {
+                            moved.insert((*peer, stream_id), now);
+                        }
+                    }
+                }
+                for peer in leaving {
                     send_control(
                         &socket,
                         peer,
@@ -749,7 +1179,11 @@ async fn run_stream_sender(
                     )
                     .await;
                 }
-                return;
+                if kept == 0 {
+                    return;
+                }
+                held_while_lost = true;
+                continue;
             }
             // Keep the playlist held, as a reader's playlist reloads do.
             router.ensure_playlist_copy(stream_id).await;
@@ -762,39 +1196,54 @@ async fn run_stream_sender(
         let behind_head = head.is_some_and(|head| part <= head);
         if behind_head || part < newest_next {
             // A part that the stream has passed: send it from the cache, or
-            // repair it from the parents for a short while, or send a gap.
+            // repair it from the parents while it is within the playout
+            // deadline (HOLE_WAIT without one), or send a gap.
             let bytes = match router.cache.get_part_for_stream_id(stream_id, part).await {
                 Some((bytes, _)) => Some(bytes),
-                None => match tokio::time::timeout(
-                    HOLE_WAIT,
-                    router.get_part_repairing_holes(stream_id, part),
-                )
-                .await
-                {
-                    Ok(Ok(Some((bytes, _)))) => Some(bytes),
-                    Ok(Err(ParentsLost)) => {
-                        housekeeping_at = Instant::now();
-                        continue;
+                None if held_while_lost => None,
+                None => {
+                    let part_us = router.cache.state.read().await.stream_part_us(stream_id);
+                    let wait =
+                        hole_budget(head, part, part_us, config.playout).unwrap_or(HOLE_WAIT);
+                    if wait.is_zero() {
+                        stats.holes_past_playout.fetch_add(1, Ordering::Relaxed);
+                        None
+                    } else {
+                        match tokio::time::timeout(
+                            wait,
+                            router.get_part_repairing_holes(stream_id, part),
+                        )
+                        .await
+                        {
+                            Ok(Ok(Some((bytes, _)))) => Some(bytes),
+                            Ok(Err(ParentsLost)) => {
+                                housekeeping_at = Instant::now();
+                                continue;
+                            }
+                            _ => None,
+                        }
                     }
-                    _ => None,
-                },
+                }
             };
-            deliver(
-                &socket, &router, &table, config, &stats, stream_id, part, bytes,
-            )
-            .await;
+            deliver(out, &router, &table, config, &stats, stream_id, part, bytes).await;
             last_sent = Instant::now();
             continue;
         }
 
         // The newest part: wait for it as an LL-HLS part request does, for a
         // short while at a time.
-        match tokio::time::timeout(LIVE_WAIT, router.get_part_repairing_holes(stream_id, part))
-            .await
-        {
+        let waited = if held_while_lost {
+            Ok(Ok(router
+                .cache
+                .get_part_until_for_stream_id(stream_id, part, Instant::now() + LIVE_WAIT)
+                .await))
+        } else {
+            tokio::time::timeout(LIVE_WAIT, router.get_part_repairing_holes(stream_id, part)).await
+        };
+        match waited {
             Ok(Ok(Some((bytes, _)))) => {
                 deliver(
-                    &socket,
+                    out,
                     &router,
                     &table,
                     config,
@@ -829,6 +1278,21 @@ async fn run_stream_sender(
             }
         }
     }
+}
+
+/// Take the subscribers that may be moved: all of them, or with a
+/// hold-down those that the edge took at least that long ago.
+fn take_movable(entry: &mut StreamEntry, hold_down: Duration, now: Instant) -> Vec<SocketAddr> {
+    let leaving: Vec<SocketAddr> = entry
+        .subscribers
+        .iter()
+        .filter(|(_, subscriber)| now.duration_since(subscriber.admitted_at) >= hold_down)
+        .map(|(peer, _)| *peer)
+        .collect();
+    for peer in &leaving {
+        entry.subscribers.remove(peer);
+    }
+    leaving
 }
 
 // ------------------------------------------------------------------ cut-through
@@ -928,24 +1392,17 @@ fn send_now(
     clients: &[(SocketAddr, RepairPolicy)],
 ) -> bool {
     let mut all = true;
-    let socket = inner.sockets.for_stream(stream_id);
+    let out = inner.sockets.out_for_stream(stream_id);
     for (peer, _) in clients {
-        match socket.try_send_to(datagram, *peer) {
-            Ok(sent) => {
-                inner.stats.datagrams.fetch_add(1, Ordering::Relaxed);
+        match out.send(&inner.stats, datagram, *peer) {
+            SendOutcome::Sent | SendOutcome::Queued => {
                 inner
                     .stats
                     .cut_through_datagrams
                     .fetch_add(1, Ordering::Relaxed);
-                inner.stats.bytes.fetch_add(sent as u64, Ordering::Relaxed);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                inner.stats.would_block.fetch_add(1, Ordering::Relaxed);
-                all = false;
-            }
-            Err(_) => {
-                inner.stats.send_errors.fetch_add(1, Ordering::Relaxed);
-            }
+            SendOutcome::Blocked => all = false,
+            SendOutcome::Failed => {}
         }
     }
     all
@@ -1162,12 +1619,20 @@ impl CacheMeshReceiveObserver for CutThrough {
                 .collect()
         };
         let frame = frame.to_vec();
-        let socket = Arc::clone(inner.sockets.for_stream(stream_id));
+        let sockets = inner.sockets.clone();
         let stats = Arc::clone(&inner.stats);
         let max_symbol = inner.config.symbol_size;
         // Encoding a 4K part takes milliseconds: not on the receive task.
         tokio::task::spawn_blocking(move || {
-            complete(&socket, &stats, max_symbol, slot, &frame, job, &clients)
+            complete(
+                sockets.out_for_stream(stream_id),
+                &stats,
+                max_symbol,
+                slot,
+                &frame,
+                job,
+                &clients,
+            )
         });
     }
 }
@@ -1256,7 +1721,7 @@ enum CompleteJob {
 }
 
 fn complete(
-    socket: &UdpSocket,
+    out: ClientOut<'_>,
     stats: &EdgeUdpStats,
     max_symbol: u16,
     slot: u64,
@@ -1311,6 +1776,17 @@ fn complete(
                 continue;
             };
             for peer in &peers {
+                if out.queue.is_some() {
+                    // Sent, or queued until the socket takes it: no wait.
+                    if matches!(
+                        out.send(stats, datagram, *peer),
+                        SendOutcome::Sent | SendOutcome::Queued
+                    ) {
+                        stats.cut_through_datagrams.fetch_add(1, Ordering::Relaxed);
+                    }
+                    continue;
+                }
+                let socket = out.socket;
                 let mut attempt = 0;
                 let result = loop {
                     match socket.try_send_to(datagram, *peer) {
@@ -1417,4 +1893,221 @@ fn new_route(
         },
     );
     route
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_subscriber_resumes_within_its_playout_deadline() {
+        // 500 ms of 5 ms parts: 100 parts.
+        let playout = Some(playout_parts_of(Duration::from_millis(500), 5_000));
+        assert_eq!(playout, Some(100));
+        // A client that moved names part 1000; the head is 1500 and the
+        // window 2400 parts: it resumes at 1400, not 500 parts back.
+        assert_eq!(first_part_for(Some(1_000), 1_500, 2_400, playout), 1_400);
+        // The behaviour from before: anywhere in the window.
+        assert_eq!(first_part_for(Some(1_000), 1_500, 2_400, None), 1_000);
+        // A part within the deadline, the next part, and none named.
+        assert_eq!(first_part_for(Some(1_450), 1_500, 2_400, playout), 1_450);
+        assert_eq!(first_part_for(Some(1_501), 1_500, 2_400, playout), 1_501);
+        assert_eq!(first_part_for(None, 1_500, 2_400, playout), 1_500);
+        // Out of the window: the newest part, as before.
+        assert_eq!(first_part_for(Some(10), 5_000, 2_400, playout), 5_000);
+        // Parts longer than the deadline: one part.
+        assert_eq!(playout_parts_of(Duration::from_millis(500), 2_000_000), 1);
+    }
+
+    #[test]
+    fn a_hole_is_repaired_only_while_it_is_within_the_playout_deadline() {
+        let playout = Duration::from_millis(500);
+        // No deadline: HOLE_WAIT, as before.
+        assert_eq!(hole_budget(Some(10), 5, 5_000, Duration::ZERO), None);
+        // 20 parts of 5 ms behind: 400 ms left, capped at HOLE_WAIT.
+        assert_eq!(
+            hole_budget(Some(120), 100, 5_000, playout),
+            Some(Duration::from_millis(400))
+        );
+        // 80 parts behind: 100 ms left.
+        assert_eq!(
+            hole_budget(Some(180), 100, 5_000, playout),
+            Some(Duration::from_millis(100))
+        );
+        // Past the deadline: the gap goes at once.
+        assert_eq!(
+            hole_budget(Some(300), 100, 5_000, playout),
+            Some(Duration::ZERO)
+        );
+        // A part at or ahead of the head has its whole budget.
+        assert_eq!(
+            hole_budget(Some(100), 101, 5_000, Duration::from_millis(50)),
+            Some(Duration::from_millis(50))
+        );
+    }
+
+    fn subscriber(admitted_at: Instant) -> Subscriber {
+        Subscriber {
+            repair: RepairPolicy {
+                permille: 0,
+                min_symbols: 0,
+                loss_ppm: 0,
+            },
+            expires_at: admitted_at + Duration::from_secs(10),
+            next_part: 0,
+            init: None,
+            cut_slots: BTreeSet::new(),
+            admitted_at,
+        }
+    }
+
+    #[test]
+    fn lost_parents_do_not_move_a_subscriber_within_the_hold_down() {
+        let now = Instant::now();
+        let old: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let new: SocketAddr = "127.0.0.1:1001".parse().unwrap();
+        let mut entry = StreamEntry::default();
+        entry
+            .subscribers
+            .insert(old, subscriber(now - Duration::from_secs(5)));
+        entry
+            .subscribers
+            .insert(new, subscriber(now - Duration::from_millis(500)));
+        assert_eq!(
+            take_movable(&mut entry, Duration::from_secs(3), now),
+            vec![old]
+        );
+        assert_eq!(entry.subscribers.len(), 1);
+        // Without a hold-down (or draining) every subscriber goes.
+        assert_eq!(take_movable(&mut entry, Duration::ZERO, now), vec![new]);
+        assert!(entry.subscribers.is_empty());
+    }
+
+    #[test]
+    fn a_client_moved_away_for_lost_parents_is_taken_back_within_the_hold_down() {
+        let moved: MovedAway = Arc::default();
+        let peer: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let other: SocketAddr = "127.0.0.1:1001".parse().unwrap();
+        let now = Instant::now();
+        let hold = Duration::from_secs(3);
+        moved.lock().unwrap().insert((peer, 7), now);
+        assert!(moved_back_within_hold_down(
+            &moved,
+            peer,
+            7,
+            hold,
+            now + Duration::from_secs(1)
+        ));
+        assert!(!moved_back_within_hold_down(&moved, peer, 8, hold, now));
+        assert!(!moved_back_within_hold_down(&moved, other, 7, hold, now));
+        assert!(!moved_back_within_hold_down(
+            &moved,
+            peer,
+            7,
+            Duration::ZERO,
+            now
+        ));
+        // After the hold-down the move is forgotten.
+        assert!(!moved_back_within_hold_down(
+            &moved,
+            peer,
+            7,
+            hold,
+            now + Duration::from_secs(4)
+        ));
+        assert!(moved.lock().unwrap().is_empty());
+    }
+
+    async fn receive(socket: &UdpSocket, count: usize) -> Vec<Vec<u8>> {
+        let mut buf = vec![0_u8; 2_048];
+        let mut got = Vec::new();
+        while got.len() < count {
+            let (len, _) = tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buf))
+                .await
+                .expect("the queued datagrams arrive")
+                .unwrap();
+            got.push(buf[..len].to_vec());
+        }
+        got
+    }
+
+    /// A datagram that found the socket full waits in its client's queue and
+    /// leaves in order when the socket can take it; the client's next
+    /// datagrams queue behind it, and another client is not held up.
+    #[tokio::test]
+    async fn a_datagram_that_finds_the_socket_full_is_sent_later_in_order() {
+        let sender = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        // Until the reactor has seen the socket writable, a try_send says
+        // WouldBlock without trying.
+        sender.writable().await.unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let other = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stats = Arc::new(EdgeUdpStats::default());
+        let queue = SendQueue::start(
+            Arc::clone(&sender),
+            Duration::from_millis(250),
+            Arc::clone(&stats),
+        );
+        let to = client.local_addr().unwrap();
+        // As if the socket had refused the first two.
+        assert_eq!(queue.enqueue(b"one", to, true), SendOutcome::Queued);
+        assert_eq!(queue.enqueue(b"two", to, true), SendOutcome::Queued);
+        // The client's next datagram goes behind them (or, if the drain has
+        // already emptied the queue, straight out): never ahead.
+        let third = queue.send(b"three", to);
+        assert!(
+            matches!(third, SendOutcome::Queued | SendOutcome::Sent),
+            "{third:?}"
+        );
+        // Another client goes straight out.
+        assert_eq!(
+            queue.send(b"other", other.local_addr().unwrap()),
+            SendOutcome::Sent
+        );
+        assert_eq!(receive(&other, 1).await, vec![b"other".to_vec()]);
+        assert_eq!(
+            receive(&client, 3).await,
+            vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]
+        );
+        assert!(stats.send_queued.load(Ordering::Relaxed) >= 2);
+        assert_eq!(stats.send_queue_drops.load(Ordering::Relaxed), 0);
+        assert_eq!(queue.waiting.load(Ordering::Relaxed), 0);
+    }
+
+    /// A datagram older than the limit is dropped, not sent, and counted.
+    #[tokio::test]
+    async fn a_queued_datagram_older_than_the_limit_is_dropped_and_counted() {
+        let sender = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stats = Arc::new(EdgeUdpStats::default());
+        // No drain task: the test drains by hand.
+        let queue = SendQueue {
+            socket: sender,
+            limit: Duration::from_millis(20),
+            waiting: std::sync::atomic::AtomicUsize::new(0),
+            clients: Mutex::new(HashMap::new()),
+            wake: tokio::sync::Notify::new(),
+            stats: Arc::clone(&stats),
+        };
+        let to = client.local_addr().unwrap();
+        queue.enqueue(b"stale", to, true);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        queue.enqueue(b"fresh", to, true);
+        // The stale one went when the fresh one was queued behind it.
+        assert_eq!(stats.send_queue_drops.load(Ordering::Relaxed), 1);
+        assert!(!queue.drain());
+        assert_eq!(receive(&client, 1).await, vec![b"fresh".to_vec()]);
+        queue.enqueue(b"late", to, true);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(!queue.drain());
+        assert_eq!(stats.send_queue_drops.load(Ordering::Relaxed), 2);
+        assert_eq!(queue.waiting.load(Ordering::Relaxed), 0);
+        let mut buf = [0_u8; 64];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), client.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "a dropped datagram is not sent"
+        );
+    }
 }
