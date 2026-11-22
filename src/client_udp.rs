@@ -16,7 +16,7 @@
 //!
 //!   | from   | text                                                          |
 //!   | ------ | ------------------------------------------------------------- |
-//!   | client | `SUB <stream> <from part or -> <repair ‰> <min repair> <loss ppm> <token or ->` |
+//!   | client | `SUB <stream> <from part or -> <repair ‰> <min repair> <loss ppm> <token or -> [F1]` |
 //!   | client | `UNSUB <stream> <token>`                                      |
 //!   | edge   | `TOKEN <stream> <token>`                                      |
 //!   | edge   | `OK <stream> <next part>`                                     |
@@ -34,13 +34,25 @@
 //!   `WAIT` at least every [`KEEPALIVE`], so that a client can tell a quiet
 //!   stream from a dead edge. `MOVE` tells the client to go to the next cache
 //!   of its assignment (the edge drains, or has lost its parents); `REFUSED`
-//!   that this edge cannot take it.
+//!   that this edge cannot take it. A `SUB` that ends in the word `F1` asks
+//!   for the fast lane (see below); an edge without it, or a client that
+//!   does not ask, uses the cache-fed lane alone.
 //! - Media datagrams are RaptorQ datagrams of `raptorq-datagram-fec` (they
 //!   start with its magic). Each decodes to one [`PartObject`]: a part, the
 //!   initialisation segment of an fMP4 stream, or the notice that the edge
 //!   skipped a part that it never received (a gap, as LL-HLS has
 //!   `EXT-X-GAP`). The block id is the part number, so a client knows which
 //!   part a lost block was. The object carries a CRC-32 of its payload.
+//!
+//! The fast lane: an edge fed by its forwarders' RelaySession symbols sends
+//! each one on to its `F1` clients as it arrives, the contributor's own
+//! RaptorQ datagram with only its block id rewritten ([`fast_block_id`], the
+//! fourth quarter of the block id space) and its CRC recomputed. Such a
+//! block decodes to the canonical media-object envelope; the client builds
+//! the part from it with the edge's own slot functions
+//! (`crate::canonical_slot`), so its bytes are the edge's LL-HLS part. The
+//! init segment, parts older than the fast lane's first and gaps come on the
+//! cache-fed lane as before.
 //!
 //! One client socket carries one stream: block ids are per stream. A client
 //! that moves to another edge starts a new decoder ([`ObjectReceiver::new_flow`]):
@@ -119,7 +131,7 @@ pub fn repair_for_loss(k: u32, p: f64) -> u32 {
     while r < limit {
         let n = k + r;
         let allowed = r - margin; // datagrams that may be lost
-        // P(lost <= allowed), with the binomial terms in log space.
+                                  // P(lost <= allowed), with the binomial terms in log space.
         let mut ln_term = f64::from(n) * ln_q;
         let mut delivered = ln_term.exp();
         for j in 0..allowed {
@@ -153,7 +165,11 @@ impl RepairPolicy {
         // encoding of each part at the edge.
         const STEPS: [f64; 10] = [0.005, 0.01, 0.02, 0.03, 0.05, 0.08, 0.12, 0.18, 0.25, 0.3];
         let wanted = (loss * 1.5 + 0.002).min(0.3);
-        let planned = STEPS.iter().copied().find(|step| *step >= wanted).unwrap_or(0.3);
+        let planned = STEPS
+            .iter()
+            .copied()
+            .find(|step| *step >= wanted)
+            .unwrap_or(0.3);
         Self {
             loss_ppm: ((planned * 1e6).ceil() as u32).max(base.loss_ppm),
             ..base
@@ -175,6 +191,8 @@ pub enum Control {
         from_part: Option<u64>,
         repair: RepairPolicy,
         token: Option<u64>,
+        /// The client takes the fast lane (`F1`).
+        fast_lane: bool,
     },
     Unsubscribe {
         stream_id: u64,
@@ -222,15 +240,20 @@ impl Control {
                 from_part,
                 repair,
                 token,
+                fast_lane,
             } => format!(
-                "{CONTROL_PREFIX}SUB {stream_id} {} {} {} {} {}",
+                "{CONTROL_PREFIX}SUB {stream_id} {} {} {} {} {}{}",
                 from_part.map_or_else(|| "-".to_owned(), |part| part.to_string()),
                 repair.permille,
                 repair.min_symbols,
                 repair.loss_ppm,
                 // A first request carries padding, so that the edge's answer
                 // (a TOKEN) is never larger than the request.
-                token.map_or_else(|| format!("- {}", ".".repeat(48)), |token| format!("{token:016x}")),
+                token.map_or_else(
+                    || format!("- {}", ".".repeat(48)),
+                    |token| format!("{token:016x}")
+                ),
+                if *fast_lane { " F1" } else { "" },
             ),
             Self::Unsubscribe { stream_id, token } => {
                 format!("{CONTROL_PREFIX}UNSUB {stream_id} {token:016x}")
@@ -276,13 +299,23 @@ impl Control {
                 let token = match words.next()? {
                     "-" => {
                         // The padding of a first request.
-                        if words.clone().next().is_some_and(|pad| pad.bytes().all(|b| b == b'.')) {
+                        if words
+                            .clone()
+                            .next()
+                            .is_some_and(|pad| pad.bytes().all(|b| b == b'.'))
+                        {
                             words.next();
                         }
                         None
                     }
                     word => Some(token(word)?),
                 };
+                // The optional last word of a client that takes the fast
+                // lane; a request without it parses as before.
+                let fast_lane = words.clone().next() == Some("F1");
+                if fast_lane {
+                    words.next();
+                }
                 Self::Subscribe {
                     stream_id,
                     from_part,
@@ -292,6 +325,7 @@ impl Control {
                         loss_ppm,
                     },
                     token,
+                    fast_lane,
                 }
             }
             "UNSUB" => Self::Unsubscribe {
@@ -461,84 +495,58 @@ pub fn cut_through_block_id(part: u64) -> u32 {
 }
 
 /// The bytes of the LL-HLS part, and the init segment if the slot carries
-/// one, of a cache slot as the edge stores it. The same rules as the edge's
-/// own slot decoding (`LiveSlotPayload` in the av-mesh binary).
-pub fn slot_media(payload: &Bytes, stream_id: u64) -> Option<(Bytes, Option<Bytes>)> {
-    const CANONICAL: &[u8; 8] = b"AVMOBJS1";
-    const CANONICAL_HEADER: usize = 40;
-    let be32 = |range: std::ops::Range<usize>| -> Option<usize> {
-        Some(u32::from_be_bytes(payload.get(range)?.try_into().ok()?) as usize)
-    };
-    if payload.starts_with(CANONICAL) {
-        if payload.len() < CANONICAL_HEADER || payload[17..20] != [0, 0, 0] {
-            return None;
-        }
-        if u64::from_be_bytes(payload[8..16].try_into().ok()?) != stream_id || payload[16] > 2 {
-            return None;
-        }
-        if be32(20..24)? != payload.len() - CANONICAL_HEADER
-            || !payload[CANONICAL_HEADER..].starts_with(&media_object::WIRE_MAGIC)
-        {
-            return None;
-        }
-        let range = |offset: usize, len: usize| {
-            let end = offset.checked_add(len)?;
-            (offset >= CANONICAL_HEADER && end <= payload.len()).then(|| payload.slice(offset..end))
-        };
-        let (init_offset, init_len) = (be32(24..28)?, be32(28..32)?);
-        let init = if init_len == 0 {
-            if init_offset != 0 {
-                return None;
-            }
-            None
-        } else {
-            Some(range(init_offset, init_len)?)
-        };
-        if init.is_some() && payload[16] != 0 {
-            return None;
-        }
-        return Some((range(be32(32..36)?, be32(36..40)?)?, init));
-    }
-    if payload.starts_with(&media_object::WIRE_MAGIC) {
-        let object = media_object::decode(payload).ok()?;
-        if object.key().stream() != stream_id.to_string() {
-            return None;
-        }
-        let body = Bytes::copy_from_slice(object.payload());
-        let meta = |key: &str, value: &[u8]| {
-            object
-                .metadata()
-                .get(key)
-                .is_some_and(|found| found.as_slice() == value)
-        };
-        return match object.kind() {
-            media_object::ObjectKind::Media
-                if meta("container", b"fmp4") && meta("payload-format", b"fmp4-slot-v1") =>
-            {
-                fmp4_slot(&body)
-            }
-            media_object::ObjectKind::Media => Some((body, None)),
-            _ => None,
-        };
-    }
-    fmp4_slot(payload).or_else(|| Some((payload.clone(), None)))
+/// one, of a cache slot as the edge stores it: one function with the edge's
+/// own slot decoding (see `crate::canonical_slot`).
+pub use crate::canonical_slot::slot_media;
+
+/// Block id of a fast-lane block: the contributor's own RaptorQ block of a
+/// part, forwarded by the edge as its symbols arrive from the forwarders
+/// (RLS1 stripped, block id rewritten, nothing else changed). The fourth
+/// quarter of the block id space: init and codec configuration never ride
+/// it (they keep the second, on the cache-fed lane), so a completed init
+/// block can never make the decoder forget an in-flight media block.
+pub fn fast_block_id(part: u64) -> u32 {
+    0xC000_0000 | (part & 0x3fff_ffff) as u32
 }
 
-fn fmp4_slot(payload: &Bytes) -> Option<(Bytes, Option<Bytes>)> {
-    const MAGIC: &[u8; 8] = b"AVFMP4S1";
-    const HEADER: usize = 16;
-    if payload.len() < HEADER || !payload.starts_with(MAGIC) {
+/// The quarter of the block id space that a block id is in.
+pub const fn block_space(block_id: u32) -> usize {
+    (block_id >> 30) as usize
+}
+
+/// The quarter of the fast lane.
+pub const FAST_SPACE: usize = 3;
+
+/// Rewrap an RQD2 datagram (the one an RLS1 symbol carries) for the fast
+/// lane: copied into `out`, its block id replaced by [`fast_block_id`] of
+/// `part` and its CRC (if it has one) recomputed. K, T, the transfer length,
+/// the packet sequence and the payload id are unchanged, so a client decodes
+/// the contributor's own symbols into the canonical envelope. Returns the
+/// datagram's length, or `None` when `fec` is not an RQD2 datagram or does
+/// not fit `out`.
+pub fn rewrap_fast(fec: &[u8], part: u64, out: &mut [u8]) -> Option<usize> {
+    const HEADER: usize = raptorq_datagram_fec::HEADER_LEN;
+    if fec.len() < HEADER
+        || out.len() < fec.len()
+        || fec[..4] != raptorq_datagram_fec::DATAGRAM_MAGIC
+    {
         return None;
     }
-    let init_len = u32::from_be_bytes(payload[8..12].try_into().ok()?) as usize;
-    let media_len = u32::from_be_bytes(payload[12..16].try_into().ok()?) as usize;
-    let init_end = HEADER.checked_add(init_len)?;
-    let media_end = init_end.checked_add(media_len)?;
-    if media_end != payload.len() {
-        return None;
+    let out = &mut out[..fec.len()];
+    out.copy_from_slice(fec);
+    out[8..12].copy_from_slice(&fast_block_id(part).to_le_bytes());
+    if out[7] & raptorq_datagram_fec::DATAGRAM_FLAG_PACKET_CRC32 != 0 {
+        let crc = raptorq_datagram_fec::packet_crc32(&out[..HEADER - 4], &out[HEADER..]);
+        out[HEADER - 4..HEADER].copy_from_slice(&crc.to_le_bytes());
     }
-    let init = (init_len > 0).then(|| payload.slice(HEADER..init_end));
-    Some((payload.slice(init_end..media_end), init))
+    Some(fec.len())
+}
+
+/// [`rewrap_fast`] into a new buffer.
+pub fn rewrap_fast_vec(fec: &[u8], part: u64) -> Option<Vec<u8>> {
+    let mut out = vec![0_u8; fec.len()];
+    rewrap_fast(fec, part, &mut out)?;
+    Some(out)
 }
 
 /// When the contributor published the part of a cache slot, in µs since
@@ -623,8 +631,9 @@ struct BlockCount {
 #[derive(Debug, Default)]
 pub struct ObjectReceiver {
     /// One decoder for each quarter of the block id space (cut-through,
-    /// edge-encoded parts, -, init): a decoder forgets blocks far below the
-    /// last one it decoded, and the spaces must not prune each other.
+    /// edge-encoded parts, init, fast lane): a decoder forgets blocks far
+    /// below the last one it decoded, and the spaces must not prune each
+    /// other.
     decoders: [DatagramFecDecoder; 4],
     blocks: HashMap<u32, BlockCount>,
     /// Blocks counted already, so that a late datagram does not count one
@@ -644,6 +653,17 @@ pub struct ObjectReceiver {
     pub lost_datagrams: u64,
     pub sent_datagrams: u64,
     pub flows: u64,
+    /// Parts that came on the fast lane, and the bytes of their canonical
+    /// envelopes.
+    pub fast_parts: u64,
+    pub fast_envelope_bytes: u64,
+    /// The envelope bytes of the part that the last `push` returned, if it
+    /// came on the fast lane.
+    pub last_fast_envelope_bytes: Option<usize>,
+    /// The source epoch of the last fast-lane part, and how often it changed
+    /// (a contributor restart: its part numbers start again).
+    pub fast_epoch: Option<u64>,
+    pub fast_epoch_changes: u64,
 }
 
 /// A block is counted for loss once its datagrams have had this long to
@@ -698,15 +718,22 @@ impl ObjectReceiver {
             });
             count.received += 1;
         }
-        let seen = self.blocks.get(&header.block_id).map_or(0, |count| count.received);
-        let space = (header.block_id >> 30) as usize;
+        let seen = self
+            .blocks
+            .get(&header.block_id)
+            .map_or(0, |count| count.received);
+        let space = block_space(header.block_id);
+        self.last_fast_envelope_bytes = None;
         match self.decoders[space].push_datagram(datagram) {
             Ok(Some(bytes)) => match decode_any_object(bytes) {
-                Ok(object) => {
+                Ok((object, fast)) => {
+                    if let Some(fast) = fast {
+                        self.fast_decoded(header.block_id, fast);
+                    }
                     self.objects += 1;
                     if let Some(count) = self.blocks.get_mut(&header.block_id) {
-                        // A cut-through object does not say how many
-                        // datagrams were sent (0): its source symbols and
+                        // A cut-through or fast-lane object does not say how
+                        // many datagrams were sent (0): its source symbols and
                         // the repair of the client's own policy.
                         count.sent = Some(object.datagrams);
                         count.decoded = true;
@@ -716,15 +743,19 @@ impl ObjectReceiver {
                         // completed by a repair symbol.
                         self.recovered_objects += 1;
                     }
-                    if space == 1 && object.kind == ObjectKind::Part {
-                        // The edge sent the whole part again (another
-                        // parent's block decoded first): the cut-through
-                        // block of the part will not complete, and is not
-                        // loss.
-                        let cut = cut_through_block_id(object.part);
-                        if self.blocks.remove(&cut).is_some() {
-                            self.settled.insert(cut);
-                            self.settled_order.push_back(cut);
+                    if object.kind == ObjectKind::Part {
+                        // The part came on one lane: its blocks on the other
+                        // lanes (another parent's block decoded first, or the
+                        // edge sent the whole part again) will not complete,
+                        // and are not loss.
+                        for other in [
+                            cut_through_block_id(object.part),
+                            block_id(ObjectKind::Part, object.part),
+                            fast_block_id(object.part),
+                        ] {
+                            if other != header.block_id && self.blocks.remove(&other).is_some() {
+                                self.settle(other);
+                            }
                         }
                     }
                     Some(object)
@@ -742,6 +773,37 @@ impl ObjectReceiver {
         }
     }
 
+    /// Remember a block as counted, so that a late datagram of it does not
+    /// count again.
+    fn settle(&mut self, block: u32) {
+        if self.settled.insert(block) {
+            self.settled_order.push_back(block);
+        }
+        if self.settled_order.len() > SETTLED_MEMORY {
+            if let Some(old) = self.settled_order.pop_front() {
+                self.settled.remove(&old);
+            }
+        }
+    }
+
+    /// A fast-lane block decoded. A new source epoch (the contributor
+    /// restarted, and counts its parts from 0 again) starts a new flow: the
+    /// old epoch's blocks of the same numbers must not meet the new ones in
+    /// a decoder, nor its completed blocks hide them. The block that showed
+    /// the new epoch stays completed in the new flow.
+    fn fast_decoded(&mut self, block: u32, fast: FastObject) {
+        if self.fast_epoch.is_some_and(|epoch| epoch != fast.epoch) {
+            self.new_flow();
+            self.decoders[FAST_SPACE].expire_block(block);
+            self.settle(block);
+            self.fast_epoch_changes += 1;
+        }
+        self.fast_epoch = Some(fast.epoch);
+        self.fast_parts += 1;
+        self.fast_envelope_bytes += fast.envelope_bytes as u64;
+        self.last_fast_envelope_bytes = Some(fast.envelope_bytes);
+    }
+
     /// Count the blocks that have settled, and return the datagram loss
     /// measured since the last call, if any datagram was due. A block that
     /// was never decoded is counted as sent with the repair of `policy`.
@@ -755,6 +817,7 @@ impl ObjectReceiver {
             .collect();
         for block in settled {
             let count = self.blocks.remove(&block).unwrap();
+            self.settle(block);
             let expected = count.source_symbols + policy.repair_symbols(count.source_symbols);
             let sent = match count.sent {
                 Some(sent) if sent > 0 => sent,
@@ -771,13 +834,6 @@ impl ObjectReceiver {
             self.window_sent += u64::from(sent);
             self.sent_datagrams += u64::from(sent);
             self.lost_datagrams += u64::from(sent - received);
-            self.settled.insert(block);
-            self.settled_order.push_back(block);
-            if self.settled_order.len() > SETTLED_MEMORY {
-                if let Some(old) = self.settled_order.pop_front() {
-                    self.settled.remove(&old);
-                }
-            }
         }
         if self.window_sent == 0 {
             return None;
@@ -789,11 +845,57 @@ impl ObjectReceiver {
     }
 }
 
-fn decode_any_object(bytes: Vec<u8>) -> Result<PartObject, ObjectError> {
+/// What a fast-lane block carried besides its part.
+#[derive(Debug, Clone, Copy)]
+struct FastObject {
+    epoch: u64,
+    envelope_bytes: usize,
+}
+
+/// The object of a decoded block: a part object the edge encoded, a
+/// cache-mesh chunk frame (cut-through), or a canonical media-object
+/// envelope (the fast lane).
+fn decode_any_object(bytes: Vec<u8>) -> Result<(PartObject, Option<FastObject>), ObjectError> {
     if bytes.starts_with(OBJECT_MAGIC) {
-        return PartObject::decode(Bytes::from(bytes));
+        return PartObject::decode(Bytes::from(bytes)).map(|object| (object, None));
     }
-    cut_through_object(&bytes).ok_or(ObjectError("not a part object or a chunk frame"))
+    if bytes.starts_with(&media_object::WIRE_MAGIC) {
+        let (object, fast) = fast_object(Bytes::from(bytes))?;
+        return Ok((object, Some(fast)));
+    }
+    cut_through_object(&bytes)
+        .map(|object| (object, None))
+        .ok_or(ObjectError(
+            "not a part object, a chunk frame or an envelope",
+        ))
+}
+
+/// The part of a canonical envelope: the slot that every node's commit
+/// stores for it (the same function), then the LL-HLS part bytes of that
+/// slot (the same function as the edge's part responses).
+fn fast_object(envelope: Bytes) -> Result<(PartObject, FastObject), ObjectError> {
+    let envelope_bytes = envelope.len();
+    let part = crate::canonical_slot::canonical_part_from_envelope(envelope)
+        .map_err(|error| ObjectError(error.reason()))?;
+    let (media, _init) =
+        slot_media(&part.slot, part.stream_id).ok_or(ObjectError("unreadable canonical slot"))?;
+    let key = part.object.key();
+    Ok((
+        PartObject {
+            kind: ObjectKind::Part,
+            datagrams: 0,
+            stream_id: part.stream_id,
+            part: key.object(),
+            available_unix_us: 0,
+            published_unix_us: crate::canonical_slot::object_published_unix_us(&part.object)
+                .unwrap_or(0),
+            payload: media,
+        },
+        FastObject {
+            epoch: key.epoch(),
+            envelope_bytes,
+        },
+    ))
 }
 
 /// Client symbol size of a cut-through block: the largest divisor of the
@@ -889,6 +991,7 @@ mod tests {
                 from_part: Some(42),
                 repair: RepairPolicy::default(),
                 token: Some(0xdead_beef_0123_4567),
+                fast_lane: false,
             },
             Control::Subscribe {
                 stream_id: 1,
@@ -899,6 +1002,7 @@ mod tests {
                     loss_ppm: 52_000,
                 },
                 token: None,
+                fast_lane: false,
             },
             Control::Unsubscribe {
                 stream_id: 9,
@@ -933,12 +1037,212 @@ mod tests {
     }
 
     #[test]
+    fn a_sub_may_ask_for_the_fast_lane_and_an_old_one_still_parses() {
+        for token in [None, Some(0xdead_beef_u64)] {
+            for fast_lane in [false, true] {
+                let control = Control::Subscribe {
+                    stream_id: 4001,
+                    from_part: Some(9),
+                    repair: RepairPolicy::default(),
+                    token,
+                    fast_lane,
+                };
+                let encoded = control.encode();
+                assert_eq!(encoded.ends_with(b" F1"), fast_lane);
+                assert_eq!(Control::decode(&encoded), Some(control));
+            }
+        }
+        // A request of a client from before the fast lane.
+        let old = b"NTU/1 SUB 4001 12 250 3 0 00000000deadbeef";
+        assert_eq!(
+            Control::decode(old),
+            Some(Control::Subscribe {
+                stream_id: 4001,
+                from_part: Some(12),
+                repair: RepairPolicy::default(),
+                token: Some(0xdead_beef),
+                fast_lane: false,
+            })
+        );
+        let first = format!("NTU/1 SUB 4001 - 250 3 0 - {}", ".".repeat(48));
+        assert!(matches!(
+            Control::decode(first.as_bytes()),
+            Some(Control::Subscribe {
+                token: None,
+                fast_lane: false,
+                ..
+            })
+        ));
+        // Only F1, and only once, after the token.
+        assert_eq!(Control::decode(b"NTU/1 SUB 4001 - 250 3 0 00ff F2"), None);
+        assert_eq!(
+            Control::decode(b"NTU/1 SUB 4001 - 250 3 0 00ff F1 F1"),
+            None
+        );
+        // A first request that is padded still takes F1 after its padding.
+        let first = format!("NTU/1 SUB 4001 - 250 3 0 - {} F1", ".".repeat(48));
+        assert!(matches!(
+            Control::decode(first.as_bytes()),
+            Some(Control::Subscribe {
+                fast_lane: true,
+                ..
+            })
+        ));
+    }
+
+    /// A canonical opaque envelope of `part` in `epoch`, of `len` bytes.
+    fn envelope(epoch: u64, part: u64, len: usize) -> Vec<u8> {
+        let payload: Vec<u8> = (0..len).map(|i| (i as u64 * 13 + part) as u8).collect();
+        let key = media_object::ObjectKey::for_payload(
+            "default", "4001", "audio", epoch, 0, part, 1, &payload,
+        )
+        .unwrap();
+        let object =
+            media_object::MediaObject::builder(key, media_object::ObjectKind::Media, payload)
+                .with_metadata("container", b"opaque".to_vec())
+                .with_metadata("payload-format", b"opaque-part-v1".to_vec())
+                .build()
+                .unwrap();
+        media_object::encode(&object).unwrap()
+    }
+
+    /// The fast-lane datagrams of an envelope, as a contributor encodes it
+    /// (`symbol_size`, with `repair` repair symbols) and an edge rewraps it.
+    fn fast_datagrams(envelope: &[u8], part: u64, symbol_size: u16, repair: u32) -> Vec<Vec<u8>> {
+        let sources = envelope.len().div_ceil(usize::from(symbol_size)).max(1);
+        DatagramFecEncoder::new()
+            .with_symbol_size(symbol_size)
+            .with_source_symbols(sources as u16)
+            .with_initial_block_id(17)
+            .encode_object_with_repair_symbols(envelope, repair)
+            .unwrap()
+            .iter()
+            .map(|datagram| rewrap_fast_vec(datagram, part).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_rewrapped_datagram_keeps_everything_but_its_block_id() {
+        let datagrams = DatagramFecEncoder::new()
+            .with_symbol_size(100)
+            .with_source_symbols(3)
+            .with_initial_block_id(17)
+            .encode_object_with_repair_symbols(&envelope(0, 5, 250), 2)
+            .unwrap();
+        for original in &datagrams {
+            let fast = rewrap_fast_vec(original, 0x4000_0005).unwrap();
+            let (a, b) = (
+                DatagramFecHeader::decode(original).unwrap(),
+                DatagramFecHeader::decode(&fast).unwrap(),
+            );
+            assert_eq!(b.block_id, fast_block_id(0x4000_0005));
+            assert_eq!(b.block_id, 0xC000_0005);
+            assert_eq!(block_space(b.block_id), FAST_SPACE);
+            assert_eq!(
+                (
+                    a.transfer_length,
+                    a.packet_sequence,
+                    a.source_symbols,
+                    a.symbol_size
+                ),
+                (
+                    b.transfer_length,
+                    b.packet_sequence,
+                    b.source_symbols,
+                    b.symbol_size
+                )
+            );
+            // The CRC is right for the new block id.
+            assert_eq!(b.payload(&fast).unwrap(), a.payload(original).unwrap());
+            assert_eq!(fast[32..], original[32..]);
+        }
+        assert!(rewrap_fast_vec(b"too short", 1).is_none());
+        let mut small = [0_u8; 8];
+        assert!(rewrap_fast(&datagrams[0], 1, &mut small).is_none());
+    }
+
+    #[test]
+    fn an_init_block_never_prunes_an_in_flight_fast_lane_block() {
+        // Part 500 rides the fast lane in 21 symbols; half of them are in
+        // when the inits of a hundred later parts and the cache-fed parts
+        // around it complete. Part 500 still decodes.
+        let envelope = envelope(0, 500, 20_000);
+        let fast = fast_datagrams(&envelope, 500, 1_000, 2);
+        let mut receiver = ObjectReceiver::new();
+        for datagram in &fast[..10] {
+            assert!(receiver.push(datagram).is_none());
+        }
+        for part in 501..600 {
+            let init = PartObject {
+                kind: ObjectKind::Init,
+                ..object(part, 300)
+            };
+            assert!(
+                encode_object(&init, DEFAULT_SYMBOL_SIZE, RepairPolicy::default())
+                    .unwrap()
+                    .iter()
+                    .any(|datagram| receiver.push(datagram).is_some())
+            );
+        }
+        assert!(encode_object(
+            &object(499, 900),
+            DEFAULT_SYMBOL_SIZE,
+            RepairPolicy::default()
+        )
+        .unwrap()
+        .iter()
+        .any(|datagram| receiver.push(datagram).is_some()));
+        let decoded = fast[10..]
+            .iter()
+            .find_map(|datagram| receiver.push(datagram))
+            .expect("the fast-lane block completes");
+        assert_eq!(decoded.part, 500);
+        assert_eq!(receiver.fast_parts, 1);
+        assert_eq!(receiver.last_fast_envelope_bytes, Some(envelope.len()));
+    }
+
+    #[test]
+    fn an_epoch_reset_with_lower_part_numbers_decodes_after_a_new_flow() {
+        let mut receiver = ObjectReceiver::new();
+        let decode = |receiver: &mut ObjectReceiver, epoch: u64, part: u64| {
+            fast_datagrams(&envelope(epoch, part, 300), part, 400, 1)
+                .iter()
+                .find_map(|datagram| receiver.push(datagram))
+        };
+        for part in 1_000..1_010 {
+            assert_eq!(decode(&mut receiver, 1, part).unwrap().part, part);
+        }
+        assert_eq!(receiver.fast_epoch, Some(1));
+        let flows = receiver.flows;
+        // The contributor restarts: epoch 2 counts its parts from 0.
+        for part in 0..10 {
+            let decoded = decode(&mut receiver, 2, part).expect("the new epoch's part decodes");
+            assert_eq!(decoded.part, part);
+        }
+        assert_eq!(receiver.fast_epoch, Some(2));
+        assert_eq!(receiver.fast_epoch_changes, 1);
+        assert_eq!(
+            receiver.flows,
+            flows + 1,
+            "the epoch change started a new flow"
+        );
+        // A late symbol of the part that showed the change does not decode
+        // it again.
+        let late = fast_datagrams(&envelope(2, 0, 300), 0, 400, 1);
+        assert!(late
+            .iter()
+            .all(|datagram| receiver.push(datagram).is_none()));
+        assert_eq!(receiver.fast_parts, 20);
+    }
+
+    #[test]
     fn a_token_answer_is_shorter_than_the_request() {
         let request = Control::Subscribe {
             stream_id: 1,
             from_part: None,
             repair: RepairPolicy::default(),
             token: None,
+            fast_lane: false,
         };
         let answer = Control::Token {
             stream_id: 1,
@@ -970,9 +1274,15 @@ mod tests {
         for p in [0.001, 0.01, 0.05, 0.1] {
             for k in [1_u32, 2, 3, 10, 30, 60, 340] {
                 let r = repair_for_loss(k, p);
-                assert!(part_loss(k, r, p) <= TARGET_PART_LOSS * 1.01, "k {k} p {p} r {r}");
+                assert!(
+                    part_loss(k, r, p) <= TARGET_PART_LOSS * 1.01,
+                    "k {k} p {p} r {r}"
+                );
                 if r > u32::from(k > 1) {
-                    assert!(part_loss(k, r - 1, p) > TARGET_PART_LOSS, "k {k} p {p}: {r} is not least");
+                    assert!(
+                        part_loss(k, r - 1, p) > TARGET_PART_LOSS,
+                        "k {k} p {p}: {r} is not least"
+                    );
                 }
             }
         }
@@ -980,7 +1290,10 @@ mod tests {
         // the earlier proportional rule did not.
         let policy = RepairPolicy::for_loss(0.05, RepairPolicy::default());
         assert!(part_loss(30, policy.repair_symbols(30), 0.05) <= TARGET_PART_LOSS);
-        assert_eq!(RepairPolicy::for_loss(0.0, RepairPolicy::default()), RepairPolicy::default());
+        assert_eq!(
+            RepairPolicy::for_loss(0.0, RepairPolicy::default()),
+            RepairPolicy::default()
+        );
     }
 
     #[test]
@@ -1017,7 +1330,10 @@ mod tests {
                 encode_object(&original, DEFAULT_SYMBOL_SIZE, RepairPolicy::default()).unwrap();
             let (sources, _) = geometry(OBJECT_HEADER_LEN + len, DEFAULT_SYMBOL_SIZE);
             let repair = datagrams.len() - sources as usize;
-            assert_eq!(repair as u32, RepairPolicy::default().repair_symbols(sources));
+            assert_eq!(
+                repair as u32,
+                RepairPolicy::default().repair_symbols(sources)
+            );
             // Lose one datagram fewer than there are repair symbols (a block
             // of more than one symbol is decoded with one to spare), spread
             // over the source symbols.
@@ -1035,7 +1351,13 @@ mod tests {
             }
             let decoded = decoded.expect("object decoded");
             assert_eq!(decoded.datagrams as usize, datagrams.len());
-            assert_eq!(PartObject { datagrams: 0, ..decoded }, original);
+            assert_eq!(
+                PartObject {
+                    datagrams: 0,
+                    ..decoded
+                },
+                original
+            );
         }
     }
 
@@ -1053,7 +1375,12 @@ mod tests {
         let from_b = encode_object(&b, DEFAULT_SYMBOL_SIZE, policy).unwrap();
         let mut receiver = ObjectReceiver::new();
         let mut decoded = None;
-        for (index, datagram) in from_a.iter().take(3).chain(from_b.iter().skip(3)).enumerate() {
+        for (index, datagram) in from_a
+            .iter()
+            .take(3)
+            .chain(from_b.iter().skip(3))
+            .enumerate()
+        {
             let _ = index;
             if let Some(object) = receiver.push(datagram) {
                 decoded = Some(object);
@@ -1069,7 +1396,10 @@ mod tests {
             receiver.push(datagram);
         }
         receiver.new_flow();
-        let decoded = from_b.iter().find_map(|datagram| receiver.push(datagram)).unwrap();
+        let decoded = from_b
+            .iter()
+            .find_map(|datagram| receiver.push(datagram))
+            .unwrap();
         assert_eq!(decoded.payload, b.payload);
         assert_eq!(decoded.available_unix_us, 2);
     }
@@ -1078,9 +1408,12 @@ mod tests {
     fn a_receiver_measures_the_loss_of_its_path() {
         let mut receiver = ObjectReceiver::new();
         for part in 0..200_u64 {
-            let datagrams =
-                encode_object(&object(part, 3_000), DEFAULT_SYMBOL_SIZE, RepairPolicy::default())
-                    .unwrap();
+            let datagrams = encode_object(
+                &object(part, 3_000),
+                DEFAULT_SYMBOL_SIZE,
+                RepairPolicy::default(),
+            )
+            .unwrap();
             for (index, datagram) in datagrams.iter().enumerate() {
                 // Every tenth datagram of the path is lost.
                 if (part as usize * datagrams.len() + index) % 10 == 0 {
@@ -1094,8 +1427,12 @@ mod tests {
         assert!((0.08..0.12).contains(&loss), "{loss}");
         assert_eq!(receiver.objects, 200);
         // A late datagram of a counted block is not counted again.
-        let late = encode_object(&object(0, 3_000), DEFAULT_SYMBOL_SIZE, RepairPolicy::default())
-            .unwrap();
+        let late = encode_object(
+            &object(0, 3_000),
+            DEFAULT_SYMBOL_SIZE,
+            RepairPolicy::default(),
+        )
+        .unwrap();
         receiver.push(&late[0]);
         std::thread::sleep(LOSS_SETTLE);
         assert_eq!(receiver.take_loss(RepairPolicy::default()), None);
@@ -1136,9 +1473,20 @@ mod tests {
             for esi in 0..sources {
                 let start = esi * usize::from(size);
                 let end = (start + usize::from(size)).min(frame.len());
-                let cut = source_datagram(33, frame.len() as u32, 0, size, esi as u32, &frame[start..end])
-                    .unwrap();
-                assert_eq!(cut[HEADER_LEN_FOR_TESTS..], encoded[esi][HEADER_LEN_FOR_TESTS..], "esi {esi}");
+                let cut = source_datagram(
+                    33,
+                    frame.len() as u32,
+                    0,
+                    size,
+                    esi as u32,
+                    &frame[start..end],
+                )
+                .unwrap();
+                assert_eq!(
+                    cut[HEADER_LEN_FOR_TESTS..],
+                    encoded[esi][HEADER_LEN_FOR_TESTS..],
+                    "esi {esi}"
+                );
             }
         }
         assert_eq!(cut_through_symbol_size(16_000, 1_200), Some(1_000));
@@ -1173,7 +1521,10 @@ mod tests {
                 decoded = decoded.or(receiver.push(&datagram));
             }
         }
-        assert!(decoded.is_none(), "a fifth of the source symbols is missing");
+        assert!(
+            decoded.is_none(),
+            "a fifth of the source symbols is missing"
+        );
         let sources = frame.len().div_ceil(usize::from(client)) as u32;
         let repair = RepairPolicy::for_loss(0.2, RepairPolicy::default()).repair_symbols(sources);
         let encoded = encode_block(&frame, block, client, repair).unwrap();
@@ -1191,7 +1542,10 @@ mod tests {
         let fmp4 = Bytes::from(fmp4_slot_payload(b"init", b"media"));
         assert_eq!(
             slot_media(&fmp4, 1),
-            Some((Bytes::from_static(b"media"), Some(Bytes::from_static(b"init"))))
+            Some((
+                Bytes::from_static(b"media"),
+                Some(Bytes::from_static(b"init"))
+            ))
         );
         let ts = Bytes::from_static(b"\x47raw-ts");
         assert_eq!(slot_media(&ts, 1), Some((ts.clone(), None)));
@@ -1212,15 +1566,23 @@ mod tests {
             kind: ObjectKind::Init,
             ..object(501, 900)
         };
-        assert!(encode_object(&init, DEFAULT_SYMBOL_SIZE, RepairPolicy::default())
-            .unwrap()
+        assert!(
+            encode_object(&init, DEFAULT_SYMBOL_SIZE, RepairPolicy::default())
+                .unwrap()
+                .iter()
+                .any(|datagram| receiver.push(datagram).is_some())
+        );
+        assert!(encode_object(
+            &object(499, 900),
+            DEFAULT_SYMBOL_SIZE,
+            RepairPolicy::default()
+        )
+        .unwrap()
+        .iter()
+        .any(|datagram| receiver.push(datagram).is_some()));
+        let decoded = cut[10..]
             .iter()
-            .any(|datagram| receiver.push(datagram).is_some()));
-        assert!(encode_object(&object(499, 900), DEFAULT_SYMBOL_SIZE, RepairPolicy::default())
-            .unwrap()
-            .iter()
-            .any(|datagram| receiver.push(datagram).is_some()));
-        let decoded = cut[10..].iter().find_map(|datagram| receiver.push(datagram));
+            .find_map(|datagram| receiver.push(datagram));
         assert_eq!(decoded.expect("the cut-through block completes").part, 500);
     }
 

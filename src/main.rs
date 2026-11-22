@@ -1,8 +1,10 @@
 mod assignment;
 mod control;
 mod edge_admission;
+mod edge_holes;
 mod edge_lifecycle;
 mod edge_udp;
+mod fast_control;
 mod fast_path;
 mod fast_plane;
 mod hop_journal;
@@ -211,6 +213,9 @@ const DEFAULT_CANONICAL_GAP_HOLD_MS: u64 = 1_000;
 const CANONICAL_GAP_SCAN_LIMIT: usize = 1_024;
 const CANONICAL_GAP_LOG_INTERVAL_MS: u64 = 1_000;
 const REPLICA_REQUEST_MIN_INTERVAL_MS: u64 = 1_000;
+/// With --edge-hole-distance-ms, how long a waiting request waits before it
+/// asks the parents for a hole itself: the backstop of a lost request.
+const EDGE_HOLE_BACKSTOP_MS: u64 = 100;
 /// Time an edge waits for a requested part that both parents normally deliver
 /// within a millisecond of each other before it treats the part as a hole.
 const EDGE_HOLE_REPAIR_GRACE_MS: u64 = 15;
@@ -434,8 +439,6 @@ const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8"
 const MEDIA_ACCESS_UNIT_CONTENT_TYPE: &str = "application/vnd.wavey.media-access-unit";
 const LIVE_FMP4_CONTENT_TYPE: &str = "video/mp4";
 const LIVE_AUDIO_FMP4_CONTENT_TYPE: &str = "audio/mp4";
-const LIVE_TS_CONTENT_TYPE: &str = "video/mp2t";
-const LIVE_OPAQUE_CONTENT_TYPE: &str = "application/octet-stream";
 const AUDIO_EPOCH_SUBSCRIPTION: &[u8] = b"WAVEY-AUDIO-EPOCH/1";
 const AUDIO_EPOCH_SUBSCRIPTION_V2_PREFIX: &[u8] = b"WAVEY-AUDIO-EPOCH/2 ";
 const AUDIO_EPOCH_BROADCAST_CAPACITY: usize = 2048;
@@ -586,15 +589,16 @@ impl NativeAudioRelay {
         }
     }
 }
-const MESH_FMP4_SLOT_MAGIC: &[u8; 8] = b"AVFMP4S1";
-const MESH_FMP4_SLOT_HEADER_LEN: usize = 16;
 // Canonical envelopes are fully authenticated and validated before entering
-// the live cache. Retain the exact envelope after this fixed index so retries
+// the live cache. Retain the exact envelope after a fixed index so retries
 // still compare every canonical byte, while hot LL-HLS reads can return a
 // checked Bytes slice instead of decoding, allocating, and hashing the object
-// again for every customer.
-const CANONICAL_LIVE_SLOT_MAGIC: &[u8; 8] = b"AVMOBJS1";
-const CANONICAL_LIVE_SLOT_HEADER_LEN: usize = 40;
+// again for every customer. The slot is built and read by
+// `av_mesh::canonical_slot`, which the fast-lane UDP client runs too.
+use av_mesh::canonical_slot::{
+    encode_canonical_live_slot, LiveMediaKind, CANONICAL_LIVE_SLOT_HEADER_LEN,
+    CANONICAL_LIVE_SLOT_MAGIC, MESH_FMP4_SLOT_HEADER_LEN, MESH_FMP4_SLOT_MAGIC,
+};
 const TELEMETRY_TAG: [u8; 4] = *b"AVMT";
 const CONTROL_TAG: [u8; 4] = *b"AVMC";
 const DEFAULT_TELEMETRY_STALE_MS: u64 = 30_000;
@@ -619,48 +623,6 @@ const PUBLICATION_AVAILABILITY_BUCKETS_US: [u64; 16] = [
     1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 75_000, 100_000, 125_000, 150_000, 175_000,
     200_000, 250_000, 500_000, 1_000_000, 2_000_000,
 ];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LiveMediaKind {
-    Fmp4,
-    Opaque,
-    Ts,
-}
-
-impl LiveMediaKind {
-    fn extension(self) -> &'static str {
-        match self {
-            Self::Fmp4 => "mp4",
-            Self::Opaque => "bin",
-            Self::Ts => "ts",
-        }
-    }
-
-    fn content_type(self) -> &'static str {
-        match self {
-            Self::Fmp4 => LIVE_FMP4_CONTENT_TYPE,
-            Self::Opaque => LIVE_OPAQUE_CONTENT_TYPE,
-            Self::Ts => LIVE_TS_CONTENT_TYPE,
-        }
-    }
-
-    const fn canonical_slot_tag(self) -> u8 {
-        match self {
-            Self::Fmp4 => 0,
-            Self::Opaque => 1,
-            Self::Ts => 2,
-        }
-    }
-
-    const fn from_canonical_slot_tag(tag: u8) -> Option<Self> {
-        match tag {
-            0 => Some(Self::Fmp4),
-            1 => Some(Self::Opaque),
-            2 => Some(Self::Ts),
-            _ => None,
-        }
-    }
-}
 
 fn is_multichannel_audio_transport_datagram(datagram: &[u8]) -> bool {
     datagram.starts_with(MULTICHANNEL_AUDIO_TRANSPORT_MAGIC)
@@ -746,65 +708,22 @@ impl LiveSlotPayload {
     }
 
     fn decode_canonical_live_slot(payload: Bytes, expected_stream_id: Option<u64>) -> Option<Self> {
-        if payload.len() < CANONICAL_LIVE_SLOT_HEADER_LEN
-            || !payload.starts_with(CANONICAL_LIVE_SLOT_MAGIC)
-            || payload[17..20] != [0, 0, 0]
-        {
-            return None;
-        }
-        let stream_id = u64::from_be_bytes(payload[8..16].try_into().ok()?);
-        if expected_stream_id.is_some_and(|expected| expected != stream_id) {
-            return None;
-        }
-        let kind = LiveMediaKind::from_canonical_slot_tag(payload[16])?;
-        let envelope_len = u32::from_be_bytes(payload[20..24].try_into().ok()?) as usize;
-        if envelope_len != payload.len().checked_sub(CANONICAL_LIVE_SLOT_HEADER_LEN)?
-            || !payload[CANONICAL_LIVE_SLOT_HEADER_LEN..].starts_with(&WIRE_MAGIC)
-        {
-            return None;
-        }
-        let init_offset = u32::from_be_bytes(payload[24..28].try_into().ok()?) as usize;
-        let init_len = u32::from_be_bytes(payload[28..32].try_into().ok()?) as usize;
-        let media_offset = u32::from_be_bytes(payload[32..36].try_into().ok()?) as usize;
-        let media_len = u32::from_be_bytes(payload[36..40].try_into().ok()?) as usize;
-        let checked_range = |offset: usize, len: usize| {
-            let end = offset.checked_add(len)?;
-            (offset >= CANONICAL_LIVE_SLOT_HEADER_LEN && end <= payload.len())
-                .then(|| payload.slice(offset..end))
-        };
-        let init = if init_len == 0 {
-            if init_offset != 0 {
-                return None;
-            }
-            None
-        } else {
-            Some(checked_range(init_offset, init_len)?)
-        };
-        let media = checked_range(media_offset, media_len)?;
-        match kind {
-            LiveMediaKind::Fmp4 => Some(Self::Fmp4 { init, media }),
-            LiveMediaKind::Opaque | LiveMediaKind::Ts if init.is_none() => {
-                Some(Self::Opaque { media, kind })
-            }
-            LiveMediaKind::Opaque | LiveMediaKind::Ts => None,
+        let view =
+            av_mesh::canonical_slot::decode_canonical_live_slot(&payload, expected_stream_id)?;
+        match view.kind {
+            LiveMediaKind::Fmp4 => Some(Self::Fmp4 {
+                init: view.init,
+                media: view.media,
+            }),
+            kind => Some(Self::Opaque {
+                media: view.media,
+                kind,
+            }),
         }
     }
 
     fn decode_fmp4_slot(payload: Bytes) -> Option<Self> {
-        if payload.len() < MESH_FMP4_SLOT_HEADER_LEN || !payload.starts_with(MESH_FMP4_SLOT_MAGIC) {
-            return None;
-        }
-
-        let init_len = u32::from_be_bytes(payload[8..12].try_into().unwrap()) as usize;
-        let media_len = u32::from_be_bytes(payload[12..16].try_into().unwrap()) as usize;
-        let init_end = MESH_FMP4_SLOT_HEADER_LEN.checked_add(init_len)?;
-        let media_end = init_end.checked_add(media_len)?;
-        if media_end != payload.len() {
-            return None;
-        }
-
-        let init = (init_len > 0).then(|| payload.slice(MESH_FMP4_SLOT_HEADER_LEN..init_end));
-        let media = payload.slice(init_end..media_end);
+        let (media, init) = av_mesh::canonical_slot::decode_fmp4_slot(&payload)?;
         Some(Self::Fmp4 { init, media })
     }
 
@@ -1081,76 +1000,6 @@ fn encode_fmp4_slot(init: &[u8], media: &[u8]) -> Result<Bytes> {
     slot.put_slice(init);
     slot.put_slice(media);
     Ok(slot.freeze())
-}
-
-fn encode_canonical_live_slot(
-    stream_id: u64,
-    object: &MediaObject,
-    envelope: Bytes,
-    media_kind: LiveMediaKind,
-) -> Result<Bytes> {
-    if object.kind() != ObjectKind::Media || object.payload().is_empty() {
-        bail!("only non-empty canonical media objects can enter the live media cache");
-    }
-    let envelope_len = u32::try_from(envelope.len()).context("canonical envelope is too large")?;
-    let object_payload_offset = CANONICAL_LIVE_SLOT_HEADER_LEN
-        .checked_add(
-            envelope
-                .len()
-                .checked_sub(object.payload().len())
-                .context("canonical payload is not contained in its envelope")?,
-        )
-        .context("canonical live-slot payload offset overflow")?;
-    let is_fmp4_slot = media_kind == LiveMediaKind::Fmp4
-        && object
-            .metadata()
-            .get("payload-format")
-            .is_some_and(|format| format.as_slice() == b"fmp4-slot-v1");
-    let (init_offset, init_len, media_offset, media_len) = if is_fmp4_slot {
-        let slot = object.payload();
-        if slot.len() < MESH_FMP4_SLOT_HEADER_LEN || !slot.starts_with(MESH_FMP4_SLOT_MAGIC) {
-            bail!("canonical fMP4 slot has an invalid header");
-        }
-        let init_len = u32::from_be_bytes(slot[8..12].try_into().unwrap()) as usize;
-        let media_len = u32::from_be_bytes(slot[12..16].try_into().unwrap()) as usize;
-        let init_start = object_payload_offset
-            .checked_add(MESH_FMP4_SLOT_HEADER_LEN)
-            .context("canonical fMP4 init offset overflow")?;
-        let media_start = init_start
-            .checked_add(init_len)
-            .context("canonical fMP4 media offset overflow")?;
-        let media_end = media_start
-            .checked_add(media_len)
-            .context("canonical fMP4 media length overflow")?;
-        if media_end != CANONICAL_LIVE_SLOT_HEADER_LEN + envelope.len() {
-            bail!("canonical fMP4 slot lengths do not match its envelope");
-        }
-        (
-            if init_len > 0 { init_start } else { 0 },
-            init_len,
-            media_start,
-            media_len,
-        )
-    } else {
-        (0, 0, object_payload_offset, object.payload().len())
-    };
-
-    let mut cached = BytesMut::with_capacity(CANONICAL_LIVE_SLOT_HEADER_LEN + envelope.len());
-    cached.put_slice(CANONICAL_LIVE_SLOT_MAGIC);
-    cached.put_u64(stream_id);
-    cached.put_u8(media_kind.canonical_slot_tag());
-    cached.put_bytes(0, 3);
-    cached.put_u32(envelope_len);
-    cached.put_u32(u32::try_from(init_offset).context("canonical init offset is too large")?);
-    cached.put_u32(u32::try_from(init_len).context("canonical init is too large")?);
-    cached.put_u32(u32::try_from(media_offset).context("canonical media offset is too large")?);
-    cached.put_u32(u32::try_from(media_len).context("canonical media is too large")?);
-    cached.put_slice(&envelope);
-    debug_assert_eq!(
-        cached.len(),
-        CANONICAL_LIVE_SLOT_HEADER_LEN + envelope.len()
-    );
-    Ok(cached.freeze())
 }
 
 fn decode_canonical_stream_object(payload: &[u8]) -> Result<Option<MediaObject>> {
@@ -1667,6 +1516,29 @@ struct Args {
     )]
     client_udp_gso: bool,
 
+    /// The fast client lane: a node whose class threads take RelaySession
+    /// symbols (an edge fed by the fast plane) sends each symbol on to the
+    /// UDP clients that ask for it (`SUB ... F1`) as it arrives, the
+    /// contributor's own RaptorQ datagram with its block id rewritten, from
+    /// the same thread, in one sendmmsg per class per batch, and tops their
+    /// repair up from the decoded object. The cache-fed lane keeps the init
+    /// segment, older parts and gaps, and skips the parts the fast lane
+    /// carried. While the lane runs, cut-through is off. `false` keeps the
+    /// cache-fed lane (and cut-through) alone, as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_FAST_LANE",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    client_udp_fast_lane: bool,
+
+    /// This edge's rank among the edges a client may move between: its own
+    /// fast-lane repair takes repair ordinals 256 + 64 * rank onwards, apart
+    /// from the contributor's and other edges'.
+    #[arg(long, env = "NEEDLETAIL_CLIENT_UDP_EDGE_RANK", default_value_t = 0)]
+    client_udp_edge_rank: u32,
+
     /// An edge that has heard none of its cache-mesh parents for this long
     /// has lost them: it answers 503 for a part or a playlist reload that it
     /// would otherwise hold, and moves its UDP clients. Keep it above the
@@ -1717,6 +1589,20 @@ struct Args {
         action = clap::ArgAction::Set
     )]
     edge_part_wait_due: bool,
+
+    /// An edge finds a hole by part distance: part N is a hole when a part
+    /// this far later (in time, at least two parts) has arrived and N has
+    /// not. It asks its cache-mesh parents for the missing run at once, from
+    /// the fast-plane tee (or, without the fast plane, as the cache mesh
+    /// applies parts), and a reader that waits for a part no longer asks on
+    /// a grace timer (3-15 ms): only after EDGE_HOLE_BACKSTOP_MS, as a
+    /// backstop. 0 is the behaviour from before (the grace timer).
+    #[arg(
+        long,
+        env = "NEEDLETAIL_EDGE_HOLE_DISTANCE_MS",
+        default_value_t = edge_holes::DEFAULT_EDGE_HOLE_DISTANCE_MS
+    )]
+    edge_hole_distance_ms: u64,
 
     /// An edge answers whether it has lost its parents from an answer at
     /// most this old (microseconds), instead of asking the cache mesh for
@@ -2577,9 +2463,20 @@ async fn main() -> Result<()> {
     // of its own, and with --client-udp-cut-through-thread each runs on a
     // thread of its own rather than inline on the receive task.
     let mesh_split = args.cache_mesh_class_port_offset > 0;
+    // A node whose class threads take RelaySession symbols feeds its UDP
+    // clients the fast lane; cut-through is then off.
+    let fast_lane = (args.client_udp_bind.is_some()
+        && args.client_udp_fast_lane
+        && args.relay_class_threads
+        && args.relay_controlled_local
+        && fast_plane::sys::supported())
+    .then(|| fast_plane::edge_clients::EdgeFastLane::new(args.client_udp_edge_rank));
+    if fast_lane.is_some() && args.client_udp_cut_through {
+        info!("edge client UDP: the fast lane runs, so cut-through is off (--client-udp-fast-lane false turns it back on)");
+    }
     let edge_cut_through: Vec<Arc<edge_udp::CutThrough>> = args
         .client_udp_bind
-        .filter(|_| args.client_udp_cut_through)
+        .filter(|_| args.client_udp_cut_through && fast_lane.is_none())
         .map(|_| {
             (0..if mesh_split { 2 } else { 1 })
                 .map(|_| Arc::new(edge_udp::CutThrough::default()))
@@ -2662,10 +2559,24 @@ async fn main() -> Result<()> {
 
     let (ingest_shutdown_tx, ingest_shutdown_rx) = watch::channel(());
     link_telemetry.start(ingest_shutdown_rx.clone());
+    // An edge finds its holes by part distance: in its fast-plane tee when
+    // the class threads feed it, and otherwise as the cache mesh applies.
+    let hole_trigger = (cache_mesh_role == CacheMeshRole::Edge)
+        .then(|| {
+            edge_holes::HoleTrigger::new(
+                Arc::clone(&cache),
+                Arc::clone(&mesh_handle),
+                Duration::from_millis(args.edge_hole_distance_ms),
+            )
+        })
+        .flatten();
+    let fast_ingest_planned =
+        args.relay_class_threads && args.relay_controlled_local && fast_plane::sys::supported();
     let mesh_applied_task = tokio::spawn(run_mesh_applied_parts(
         Arc::clone(&cache),
         edge_load.clone(),
         mesh_applied_rx,
+        hole_trigger.clone().filter(|_| !fast_ingest_planned),
         ingest_shutdown_rx.clone(),
     ));
     let playlist_demand_task = tokio::spawn(run_playlist_demand(
@@ -2707,8 +2618,7 @@ async fn main() -> Result<()> {
 
     // A relay or distributor runs its RelaySession ingest on the fast plane:
     // class threads that forward before anything decodes.
-    let class_ingest =
-        args.relay_class_threads && args.relay_controlled_local && fast_plane::sys::supported();
+    let class_ingest = fast_ingest_planned;
     let class_sockets = if class_ingest {
         let sockets = fast_plane::relay::bind_class_sockets(
             args.fec_bind,
@@ -2855,6 +2765,8 @@ async fn main() -> Result<()> {
         tee_capacity: args.relay_class_tee_capacity,
         video_gso: args.relay_video_gso,
         lease: lease_children,
+        edge_clients: fast_lane.clone(),
+        holes: hole_trigger.clone(),
         ..Default::default()
     };
     let fec_ingest_task = match (fec_socket, class_sockets) {
@@ -2954,6 +2866,7 @@ async fn main() -> Result<()> {
     )
     .with_liveness_cache(args.edge_liveness_cache_us)
     .with_part_wait_due(args.edge_part_wait_due)
+    .with_hole_distance(hole_trigger.is_some())
     .with_regional_view_ttl(REGIONAL_VIEW_TTL)
     .with_playlist_demand(playlist_demand)
     .with_client_udp_port(args.client_udp_bind.map(|bind| bind.port()))
@@ -3034,7 +2947,7 @@ async fn main() -> Result<()> {
             )
         };
         Some(tokio::spawn(edge_udp::run_edge_udp(
-            sockets,
+            sockets.with_fast_lane(fast_lane.clone()),
             router.clone(),
             edge_udp::EdgeUdpConfig {
                 symbol_size: args.client_udp_symbol_size,
@@ -4020,7 +3933,7 @@ async fn start_lease_children(
         bind = %lease.local_addr(),
         "lease children of the served cache-mesh leases are fed on the fast plane"
     );
-    let mut tasks = vec![tokio::spawn(fast_plane::lease::run_lease_children(
+    let mut tasks = vec![tokio::spawn(fast_control::run_lease_children(
         Arc::clone(&lease),
         Arc::clone(mesh),
         shutdown_rx.clone(),
@@ -4030,15 +3943,13 @@ async fn start_lease_children(
             format!("failed to bind the lease children's failover listener on {failover_bind}")
         })?;
         info!(bind = %socket.local_addr()?, "lease children's failover listener ready");
-        tasks.push(tokio::spawn(
-            fast_plane::lease::run_lease_failover_listener(
-                socket,
-                Arc::clone(&lease),
-                TopologyGeneration::new(args.relay_topology_generation)?,
-                SubscriptionId::new(args.relay_subscription_id)?,
-                shutdown_rx,
-            ),
-        ));
+        tasks.push(tokio::spawn(fast_control::run_lease_failover_listener(
+            socket,
+            Arc::clone(&lease),
+            TopologyGeneration::new(args.relay_topology_generation)?,
+            SubscriptionId::new(args.relay_subscription_id)?,
+            shutdown_rx,
+        )));
     }
     Ok((Some(lease), tasks))
 }
@@ -7614,24 +7525,12 @@ impl LiveTsCache {
                 .as_ref()
                 .map(|reboxed| reboxed.duration_us)
                 .or_else(|| object_duration_us(&object));
-            let is_fmp4 = object
-                .metadata()
-                .get("container")
-                .is_some_and(|container| container.as_slice() == b"fmp4");
-            let is_opaque = object
-                .metadata()
-                .get("container")
-                .is_some_and(|container| container.as_slice() == b"opaque")
-                && object
-                    .metadata()
-                    .get("payload-format")
-                    .is_some_and(|format| format.as_slice() == b"opaque-part-v1");
-            let media_kind = if reboxed_audio.is_some() || is_fmp4 {
+            // The kind that the fast-lane client derives from the envelope
+            // with the same function (a reboxed bundle is fMP4).
+            let media_kind = if reboxed_audio.is_some() {
                 LiveMediaKind::Fmp4
-            } else if is_opaque {
-                LiveMediaKind::Opaque
             } else {
-                LiveMediaKind::Ts
+                av_mesh::canonical_slot::live_media_kind(&object)
             };
             let now_ms = now_unix_ms();
 
@@ -12599,6 +12498,7 @@ async fn run_mesh_applied_parts(
     cache: Arc<LiveTsCache>,
     edge_load: EdgeLoad,
     mut applied_rx: mpsc::UnboundedReceiver<AppliedSlot>,
+    holes: Option<Arc<edge_holes::HoleTrigger>>,
     mut shutdown_rx: watch::Receiver<()>,
 ) {
     let mut bitrate_refreshed_unix_ms: HashMap<u64, u64> = HashMap::new();
@@ -12612,6 +12512,11 @@ async fn run_mesh_applied_parts(
         };
         let committed_us = mesh_applied_committed_us(&cache, &applied);
         journal_mesh_applied(&cache, &applied, committed_us);
+        if let Some(holes) = &holes {
+            holes
+                .arrived(applied.stream_id, applied.slot_id as u64)
+                .await;
+        }
         if cache
             .observe_mesh_part(applied.stream_id, applied.slot_id, Some(committed_us))
             .await
@@ -16279,6 +16184,9 @@ struct AppRouter {
     /// A part request ahead of the stream waits until the part is due
     /// (--edge-part-wait-due).
     part_wait_due: bool,
+    /// Holes are found by part distance (--edge-hole-distance-ms): a waiting
+    /// request asks the parents only as a backstop.
+    hole_distance: bool,
     /// Entry points of neighbouring regions: pathway name and base URL.
     failover_entries: Arc<Vec<(String, String)>>,
     edge_load: EdgeLoad,
@@ -16418,6 +16326,7 @@ impl AppRouter {
             region_silence_fresh_ms: None,
             liveness: Arc::new(LivenessCache::new(DEFAULT_EDGE_LIVENESS_CACHE_US)),
             part_wait_due: true,
+            hole_distance: false,
             failover_entries: Arc::new(Vec::new()),
             edge_load,
             edge_lifecycle_config: edge_lifecycle_config.normalized(),
@@ -16497,6 +16406,11 @@ impl AppRouter {
     /// (`true`), or looks again every hole repair grace (`false`).
     fn with_part_wait_due(mut self, due: bool) -> Self {
         self.part_wait_due = due;
+        self
+    }
+
+    fn with_hole_distance(mut self, on: bool) -> Self {
+        self.hole_distance = on;
         self
     }
 
@@ -17716,6 +17630,7 @@ impl AppRouter {
                     "region_silence_held": stats.region_silence_held.load(Ordering::Relaxed),
                     "tokens_sent": stats.tokens_sent.load(Ordering::Relaxed),
                     "bad_tokens": stats.bad_tokens.load(Ordering::Relaxed),
+                    "fast_lane": stats.fast_lane.get().map(|lane| lane.snapshot_stats()),
                 })
             }),
         });
@@ -18304,7 +18219,13 @@ impl AppRouter {
                     *part_us.insert(read)
                 }
             };
-            let grace = edge_hole_repair_grace(part_us);
+            // With holes found by part distance, a waiting request asks
+            // the parents only as a backstop.
+            let grace = if self.hole_distance {
+                Duration::from_millis(EDGE_HOLE_BACKSTOP_MS)
+            } else {
+                edge_hole_repair_grace(part_us)
+            };
             let wait = if self.part_wait_due {
                 part_wait_until_due(
                     self.cache.stream_head(stream_id),
@@ -30844,6 +30765,7 @@ mod tests {
             Arc::clone(&edge_cache),
             router.edge_load.clone(),
             applied_rx,
+            None,
             shutdown_rx.clone(),
         ));
         tokio::spawn(run_playlist_demand(
@@ -31647,6 +31569,7 @@ mod tests {
                         from_part: None,
                         repair: RepairPolicy::default(),
                         token,
+                        fast_lane: false,
                     }
                     .encode()
                 };
@@ -31926,6 +31849,7 @@ mod tests {
                         from_part: None,
                         repair: RepairPolicy::default(),
                         token,
+                        fast_lane: false,
                     }
                     .encode()
                 };
@@ -32104,6 +32028,7 @@ mod tests {
                 loss_ppm: 0,
             },
             token,
+            fast_lane: false,
         };
         let mut buf = vec![0_u8; 65_536];
         // A first request gets a token and nothing else: an address that
@@ -32279,6 +32204,7 @@ mod tests {
                         loss_ppm: 0,
                     },
                     token,
+                    fast_lane: false,
                 }
                 .encode()
             };
@@ -33305,6 +33231,7 @@ mod tests {
                 Arc::clone(&edge),
                 router.edge_load.clone(),
                 applied_rx,
+                None,
                 shutdown_rx,
             ));
             // Let the first tick run.
@@ -35661,6 +35588,8 @@ mod tests {
                 tee_capacity: 1_024,
                 video_gso: true,
                 lease: None,
+                edge_clients: None,
+                holes: None,
                 test_tee_panic: Some(fast_plane::TrafficClass::Audio),
             },
         )
@@ -36100,4 +36029,7 @@ mod tests {
 
     /// Edges fed by the fast plane: lease children and edge ingest.
     mod fast_lease;
+
+    /// The fast client lane: the client's decode and the edge's lane.
+    mod fast_lane;
 }

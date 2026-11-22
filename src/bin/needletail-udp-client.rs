@@ -17,11 +17,16 @@
 //! bytes. The report says how many parts arrived, how many the FEC
 //! recovered, how many the cache skipped (gaps) and how many never arrived,
 //! every move, and the time from publication to arrival.
+//!
+//! With `--fast-lane` (the default) it asks the edge for the fast lane
+//! (`SUB ... F1`): an edge fed by the fast plane sends it each part's
+//! symbols as they arrive from the forwarders, the contributor's own, and the
+//! client builds the part from the canonical envelope with the edge's own
+//! slot functions. The report counts the parts of each lane and the envelope
+//! bytes of the fast-lane parts.
 
 use anyhow::{anyhow, bail, Context, Result};
-use av_mesh::client_udp::{
-    Control, ObjectKind, ObjectReceiver, PartObject, RepairPolicy, REFRESH,
-};
+use av_mesh::client_udp::{Control, ObjectKind, ObjectReceiver, PartObject, RepairPolicy, REFRESH};
 use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use http::{Request, StatusCode};
@@ -89,6 +94,11 @@ struct Args {
     /// Write the parts' bytes, concatenated in part order, to this file.
     #[arg(long)]
     write_parts: Option<PathBuf>,
+    /// Ask the edge for the fast lane (`F1`): parts as their symbols arrive
+    /// at the edge, before it decodes them. `false` takes the cache-fed lane
+    /// alone, as before.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    fast_lane: bool,
 }
 
 fn now_unix_us() -> u64 {
@@ -120,7 +130,10 @@ impl Url {
 
     fn host_port(&self) -> (String, u16) {
         match self.authority.rsplit_once(':') {
-            Some((host, port)) => (host.trim_matches(['[', ']']).to_owned(), port.parse().unwrap_or(443)),
+            Some((host, port)) => (
+                host.trim_matches(['[', ']']).to_owned(),
+                port.parse().unwrap_or(443),
+            ),
             None => (self.authority.clone(), 443),
         }
     }
@@ -227,9 +240,16 @@ struct Cache {
     base: Url,
 }
 
-async fn assignment(http: &Http, args: &Args, current: Option<&str>) -> Result<(Vec<Cache>, Option<u16>)> {
+async fn assignment(
+    http: &Http,
+    args: &Args,
+    current: Option<&str>,
+) -> Result<(Vec<Cache>, Option<u16>)> {
     let entry = Url::parse(&args.entry)?;
-    let mut path = format!("/api/assignment?stream={}&sid={}", args.stream, args.session);
+    let mut path = format!(
+        "/api/assignment?stream={}&sid={}",
+        args.stream, args.session
+    );
     if let Some(current) = current {
         path.push_str(&format!("&current={current}"));
     }
@@ -264,7 +284,10 @@ fn playlist_parts(body: &str) -> (Option<u64>, String) {
         };
         let uri = &line[start + 5..];
         let uri = &uri[..uri.find('"').unwrap_or(uri.len())];
-        if let Some((number, ext)) = uri.strip_prefix("part").and_then(|rest| rest.split_once('.')) {
+        if let Some((number, ext)) = uri
+            .strip_prefix("part")
+            .and_then(|rest| rest.split_once('.'))
+        {
             if let Ok(number) = number.parse::<u64>() {
                 last = Some(last.map_or(number, |last: u64| last.max(number)));
                 extension = ext.to_owned();
@@ -339,6 +362,16 @@ struct Report {
     final_loss_ppm: u32,
     flows: u64,
     payload_bytes: u64,
+    fast_lane_asked: bool,
+    /// Parts that came on the fast lane, and on the cache-fed lane.
+    fast_lane_parts: u64,
+    cache_lane_parts: u64,
+    /// Bytes of the canonical envelope of each fast-lane part, and the bytes
+    /// of it that are not the part's media (the envelope's own header,
+    /// metadata and timestamps).
+    fast_envelope_bytes: Percentiles,
+    fast_envelope_overhead_bytes: Percentiles,
+    fast_epoch_changes: u64,
     verify: Option<VerifyReport>,
     publish_to_arrival_ms: Percentiles,
     available_to_arrival_ms: Percentiles,
@@ -375,6 +408,7 @@ async fn subscribe(
         from_part,
         repair,
         token,
+        fast_lane: args.fast_lane,
     };
     // A failed send is a lost request: the next refresh repeats it.
     let _ = socket.send_to(&control.encode(), target).await;
@@ -446,7 +480,9 @@ async fn main() -> Result<()> {
                 Ok((status, _)) => {
                     report.http_errors += 1;
                     if report.error_examples.len() < 10 {
-                        report.error_examples.push(format!("part {part}: HTTP {status}"));
+                        report
+                            .error_examples
+                            .push(format!("part {part}: HTTP {status}"));
                     }
                 }
                 Err(error) => {
@@ -466,6 +502,10 @@ async fn main() -> Result<()> {
     let mut duplicates = 0_u64;
     let mut init_objects = 0_u64;
     let mut payload_bytes = 0_u64;
+    let mut fast_lane_parts = 0_u64;
+    let mut cache_lane_parts = 0_u64;
+    let mut fast_envelope_bytes = Vec::new();
+    let mut fast_envelope_overhead = Vec::new();
     let mut publish_ms = Vec::new();
     let mut available_ms = Vec::new();
     let mut first_part_ms = None;
@@ -508,10 +548,9 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
-        let port = args
-            .udp_port
-            .or(port)
-            .ok_or_else(|| anyhow!("no client UDP port: the entry point names none; pass --udp-port"))?;
+        let port = args.udp_port.or(port).ok_or_else(|| {
+            anyhow!("no client UDP port: the entry point names none; pass --udp-port")
+        })?;
         // The first cache of the assignment that this client has not just
         // left, or the first one when it has left them all.
         let cache = caches
@@ -561,7 +600,14 @@ async fn main() -> Result<()> {
         // the new edge's symbols apart from the old edge's.
         if let Some((old, token)) = leaving.take() {
             let _ = socket
-                .send_to(&Control::Unsubscribe { stream_id: args.stream, token }.encode(), old)
+                .send_to(
+                    &Control::Unsubscribe {
+                        stream_id: args.stream,
+                        token,
+                    }
+                    .encode(),
+                    old,
+                )
                 .await;
         }
         if current.is_some() {
@@ -594,7 +640,14 @@ async fn main() -> Result<()> {
             if now >= deadline {
                 if let Some(token) = token {
                     let _ = socket
-                        .send_to(&Control::Unsubscribe { stream_id: args.stream, token }.encode(), target)
+                        .send_to(
+                            &Control::Unsubscribe {
+                                stream_id: args.stream,
+                                token,
+                            }
+                            .encode(),
+                            target,
+                        )
                         .await;
                 }
                 break 'caches;
@@ -605,7 +658,9 @@ async fn main() -> Result<()> {
                 skip.insert(cache.node_id.clone());
                 continue 'caches;
             }
-            if subscribed && now.duration_since(last_datagram) > Duration::from_millis(args.silence_ms) {
+            if subscribed
+                && now.duration_since(last_datagram) > Duration::from_millis(args.silence_ms)
+            {
                 move_reason = format!("silence-{}ms", args.silence_ms);
                 skip.insert(cache.node_id.clone());
                 continue 'caches;
@@ -632,8 +687,15 @@ async fn main() -> Result<()> {
             }
             if now >= next_refresh {
                 // Before the edge answers, keep asking from the same part.
-                subscribe(&socket, target, &args, if subscribed { None } else { next_part }, repair, token)
-                    .await;
+                subscribe(
+                    &socket,
+                    target,
+                    &args,
+                    if subscribed { None } else { next_part },
+                    repair,
+                    token,
+                )
+                .await;
                 next_refresh = now
                     + if subscribed {
                         REFRESH
@@ -668,7 +730,9 @@ async fn main() -> Result<()> {
                             subscribe(&socket, target, &args, next_part, repair, token).await;
                         }
                     }
-                    Control::Subscribed { next_part: first, .. } => {
+                    Control::Subscribed {
+                        next_part: first, ..
+                    } => {
                         if !subscribed {
                             first_subscribed_part.get_or_insert(first);
                         }
@@ -687,6 +751,7 @@ async fn main() -> Result<()> {
             let Some(object) = receiver.push(&buf[..len]) else {
                 continue;
             };
+            let fast_envelope = receiver.last_fast_envelope_bytes;
             let arrival_us = now_unix_us();
             let PartObject {
                 kind,
@@ -707,13 +772,24 @@ async fn main() -> Result<()> {
                         continue;
                     }
                     first_part_ms.get_or_insert(started.elapsed().as_secs_f64() * 1_000.0);
+                    match fast_envelope {
+                        Some(envelope) => {
+                            fast_lane_parts += 1;
+                            fast_envelope_bytes.push(envelope as f64);
+                            fast_envelope_overhead
+                                .push(envelope.saturating_sub(payload.len()) as f64);
+                        }
+                        None => cache_lane_parts += 1,
+                    }
                     received.insert(part, payload.len());
                     payload_bytes += payload.len() as u64;
                     if published_unix_us > 0 {
-                        publish_ms.push(arrival_us.saturating_sub(published_unix_us) as f64 / 1_000.0);
+                        publish_ms
+                            .push(arrival_us.saturating_sub(published_unix_us) as f64 / 1_000.0);
                     }
                     if available_unix_us > 0 {
-                        available_ms.push(arrival_us.saturating_sub(available_unix_us) as f64 / 1_000.0);
+                        available_ms
+                            .push(arrival_us.saturating_sub(available_unix_us) as f64 / 1_000.0);
                     }
                     if parts_out.is_some() {
                         written_parts.insert(part, payload.clone());
@@ -721,7 +797,10 @@ async fn main() -> Result<()> {
                     if args.verify_http {
                         let _ = verify_tx.send(VerifyJob {
                             authority: cache.base.authority.clone(),
-                            path: format!("{}/{}/part{part}.{extension}", cache.base.path, args.stream),
+                            path: format!(
+                                "{}/{}/part{part}.{extension}",
+                                cache.base.path, args.stream
+                            ),
                             part,
                             payload,
                         });
@@ -793,6 +872,12 @@ async fn main() -> Result<()> {
         final_loss_ppm: repair.loss_ppm,
         flows: receiver.flows,
         payload_bytes,
+        fast_lane_asked: args.fast_lane,
+        fast_lane_parts,
+        cache_lane_parts,
+        fast_envelope_bytes: percentiles(fast_envelope_bytes),
+        fast_envelope_overhead_bytes: percentiles(fast_envelope_overhead),
+        fast_epoch_changes: receiver.fast_epoch_changes,
         verify: if args.verify_http { verify } else { None },
         publish_to_arrival_ms: percentiles(publish_ms),
         available_to_arrival_ms: percentiles(available_ms),

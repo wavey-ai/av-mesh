@@ -1,3 +1,4 @@
+pub mod canonical_slot;
 pub mod client_udp;
 pub mod relay_ingress;
 pub mod replication;

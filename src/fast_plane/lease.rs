@@ -26,34 +26,27 @@
 //! The threads read the children from an `ArcSwap` snapshot that a tokio
 //! task rebuilds from the served leases whenever they change
 //! (`CacheMeshHandle::served_changed`), so a child joins within one cache
-//! mesh sync interval and the hot path takes no lock.
+//! mesh sync interval and the hot path takes no lock. That task, the
+//! failover listener and the warm replay are in `crate::fast_control`,
+//! with every other timer of the fast plane.
 
 use super::sys;
 use super::{class_addr, TrafficClass};
 use crate::{now_unix_us, WarmSourceReplayBuffer};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
-use playlists::mesh::{CacheMeshHandle, ServedSubscription};
+use playlists::mesh::ServedSubscription;
 use raptorq_datagram_fec::MediaDatagramRole;
-use relay_session::{
-    FailoverForwardMode, FailoverLeaseCommand, SubscriptionId, TopologyGeneration,
-};
+use relay_session::FailoverForwardMode;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
-use tokio::net::UdpSocket;
-use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 /// Lease children a forwarder feeds at most (one per edge).
 pub const DEFAULT_MAX_LEASE_CHILDREN: usize = 16;
-/// How often the children are rebuilt when no lease changes, as a backstop.
-const REBUILD_BACKSTOP: Duration = Duration::from_secs(1);
-/// How long a warm-source replay waits for a full socket in all.
-const REPLAY_WAIT: Duration = Duration::from_millis(50);
 
 /// How a forwarder feeds its lease children.
 #[derive(Debug, Clone)]
@@ -394,9 +387,9 @@ impl LeaseChildren {
         Some(!previous && promoted)
     }
 
-    /// Replay a promoted child's warm video sources from the video socket.
-    /// Returns the datagrams sent.
-    pub async fn replay_warm(&self, child: &LeaseChild) -> usize {
+    /// Take a promoted child's warm video sources that are still live, for
+    /// a replay (`fast_control::replay_warm`), and count the expired ones.
+    pub fn take_warm(&self, child: &LeaseChild) -> Vec<Vec<u8>> {
         let batch = child
             .warm
             .lock()
@@ -405,128 +398,7 @@ impl LeaseChildren {
         self.stats
             .warm_dropped
             .fetch_add(batch.expired_datagrams as u64, Ordering::Relaxed);
-        let target = child.targets[TrafficClass::Video.index()];
-        let fd = self.fd(TrafficClass::Video);
-        let mut sent = 0;
-        let started = Instant::now();
-        while sent < batch.datagrams.len() {
-            let left = batch.datagrams.len() - sent;
-            let taken = sys::send_batch(fd, left, |index| {
-                (&batch.datagrams[sent + index][..], target)
-            })
-            .unwrap_or(0);
-            sent += taken;
-            if taken == 0 {
-                if started.elapsed() >= REPLAY_WAIT {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        }
-        self.stats
-            .warm_replayed
-            .fetch_add(sent as u64, Ordering::Relaxed);
-        self.stats
-            .warm_dropped
-            .fetch_add((batch.datagrams.len() - sent) as u64, Ordering::Relaxed);
-        sent
-    }
-}
-
-/// Rebuild the lease children whenever the served leases change, and once a
-/// second in any case.
-pub async fn run_lease_children(
-    lease: Arc<LeaseChildren>,
-    mesh: Arc<CacheMeshHandle>,
-    mut shutdown_rx: watch::Receiver<()>,
-) {
-    let mut changed = mesh.served_changed();
-    let mut backstop = tokio::time::interval(REBUILD_BACKSTOP);
-    backstop.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            _ = shutdown_rx.changed() => return,
-            result = changed.changed() => {
-                if result.is_err() {
-                    return;
-                }
-            }
-            _ = backstop.tick() => {}
-        }
-        lease.rebuild(&mesh.served_subscriptions());
-    }
-}
-
-/// The failover listener of the lease children: an edge's failover
-/// controller promotes this forwarder (RLF1) for the edge's video once its
-/// primary went silent. The child is the controller's address; a command
-/// from an address without a lease is rejected. A promotion replays the
-/// child's warm ring; the lease of a promotion ends it unless renewed.
-pub async fn run_lease_failover_listener(
-    socket: UdpSocket,
-    lease: Arc<LeaseChildren>,
-    generation: TopologyGeneration,
-    subscription_id: SubscriptionId,
-    mut shutdown_rx: watch::Receiver<()>,
-) {
-    let mut buffer = [0_u8; relay_session::FAILOVER_CONTROL_WIRE_LEN + 1];
-    // By child: the last transition taken, and when a promotion lapses.
-    let mut transitions: HashMap<IpAddr, (u64, FailoverForwardMode, Option<Instant>)> =
-        HashMap::new();
-    let mut tick = tokio::time::interval(Duration::from_millis(25));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            _ = shutdown_rx.changed() => return,
-            _ = tick.tick() => {
-                let now = Instant::now();
-                for (ip, (_, mode, deadline)) in &mut transitions {
-                    if deadline.is_some_and(|deadline| now >= deadline) {
-                        let _ = lease.apply_failover(*ip, FailoverForwardMode::RepairOnly);
-                        *deadline = None;
-                        *mode = FailoverForwardMode::RepairOnly;
-                    }
-                }
-                transitions.retain(|ip, _| lease.child(*ip).is_some());
-            }
-            received = socket.recv_from(&mut buffer) => {
-                let Ok((len, peer)) = received else {
-                    lease.stats.commands_rejected.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                };
-                let Ok(command) = FailoverLeaseCommand::decode(&buffer[..len]) else {
-                    lease.stats.commands_rejected.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                };
-                let ip = peer.ip();
-                let (last_id, last_mode, _) = transitions
-                    .get(&ip)
-                    .copied()
-                    .unwrap_or((0, FailoverForwardMode::RepairOnly, None));
-                let stale = command.generation != generation
-                    || command.subscription_id != subscription_id
-                    || command.transition_id < last_id
-                    || (command.transition_id == last_id && command.mode != last_mode);
-                if stale {
-                    lease.stats.commands_rejected.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                let Some(promoted_now) = lease.apply_failover(ip, command.mode) else {
-                    lease.stats.commands_rejected.fetch_add(1, Ordering::Relaxed);
-                    debug!(%peer, "failover command from an address without a lease");
-                    continue;
-                };
-                let deadline = (command.mode == FailoverForwardMode::SourceAndRepair)
-                    .then(|| Instant::now() + Duration::from_micros(command.lease_duration_us));
-                transitions.insert(ip, (command.transition_id, command.mode, deadline));
-                if promoted_now {
-                    if let Some(child) = lease.child(ip) {
-                        let replayed = lease.replay_warm(&child).await;
-                        debug!(child = %ip, replayed, "replayed a promoted lease child's warm sources");
-                    }
-                }
-            }
-        }
+        batch.datagrams
     }
 }
 

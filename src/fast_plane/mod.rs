@@ -14,6 +14,7 @@
 //! back, and a stall of the runtime never stops forwarding.
 
 pub mod dedup;
+pub mod edge_clients;
 pub mod lease;
 pub mod relay;
 pub mod sys;
@@ -166,6 +167,38 @@ mod tests {
         assert_eq!(classes.mesh_class(1), StreamClass::Video);
         assert_eq!(classes.mesh_class(4001), StreamClass::Audio);
         assert_eq!(classes.video_streams(), 1);
+    }
+
+    /// Timers off the live path (wave 4, B10): no code of the fast plane
+    /// waits on tokio's clock. Its threads wait on their sockets and its tees
+    /// on their datagrams; what runs on a timer is in `crate::fast_control`.
+    /// Test code is not counted.
+    #[test]
+    fn the_fast_plane_has_no_tokio_timer() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/fast_plane");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).unwrap();
+            let code = source.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+            for timer in [
+                "tokio::time",
+                "time::sleep",
+                "time::interval",
+                "time::timeout",
+            ] {
+                assert!(
+                    !code.contains(timer),
+                    "{} uses {timer} on the fast plane",
+                    path.display()
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked >= 7, "the fast plane's files were read");
     }
 
     #[test]

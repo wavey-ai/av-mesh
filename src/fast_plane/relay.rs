@@ -6,6 +6,7 @@
 //! it forwards it.
 
 use super::dedup::FirstArrival;
+use super::edge_clients::{ClientPlan, EdgeFastLane, UpstreamRepair};
 use super::lease::{LeaseChildren, LeaseSnapshot, LeaseSnapshotStats, LeaseTake};
 use super::sys::{self, RecvBatch, RECV_BATCH};
 use super::view::RlsView;
@@ -15,8 +16,8 @@ use crate::{
     commit_relay_object, configure_udp_socket_buffers, journal_relay_symbol, now_unix_ms,
     now_unix_us, process_relay_audio_epoch_datagram, process_udp_fec_ingest_datagram_inner,
     relay_publication_clock, take_relay_deadline_drop_delta, AudioEpochDatagram, LiveTsCache,
-    NativeAudioRelay, RelayDatagramObservation, RelayDownstreamForwarder, RelayFailoverController,
-    RelayForwardRole, RelayIngestRuntime, RelayIngressParentPath, CANONICAL_STREAM_IDLE_RETENTION,
+    NativeAudioRelay, RelayDownstreamForwarder, RelayForwardRole, RelayIngestRuntime,
+    RelayIngressParentPath, CANONICAL_STREAM_IDLE_RETENTION,
 };
 use anyhow::{Context, Result};
 use av_mesh::relay_ingress::{
@@ -36,8 +37,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::{broadcast, mpsc, watch};
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tracing::{debug, info, warn};
 
 /// Datagrams a class's tee holds before the thread drops its tee copy.
@@ -69,6 +69,13 @@ pub struct RelayClassConfig {
     /// `--relay-lease-children`: the children that the served cache-mesh
     /// leases make, fed after the compiled children (see `lease`).
     pub lease: Option<Arc<LeaseChildren>>,
+    /// `--client-udp-fast-lane`: the edge's UDP clients that take the fast
+    /// lane, fed after the children and before the tee (see
+    /// `edge_clients`).
+    pub edge_clients: Option<Arc<EdgeFastLane>>,
+    /// `--edge-hole-distance-ms`: the tee finds an edge's holes by part
+    /// distance as it takes each symbol (see `edge_holes`).
+    pub holes: Option<Arc<crate::edge_holes::HoleTrigger>>,
     /// Tests: the tee of this class panics on its first datagram.
     #[cfg(test)]
     pub test_tee_panic: Option<TrafficClass>,
@@ -83,6 +90,8 @@ impl Default for RelayClassConfig {
             tee_capacity: DEFAULT_TEE_CAPACITY,
             video_gso: true,
             lease: None,
+            edge_clients: None,
+            holes: None,
             #[cfg(test)]
             test_tee_panic: None,
         }
@@ -241,12 +250,12 @@ impl FastPlaneStats {
 
 /// What the class threads saw last, for the failover controller: times in
 /// µs since `base`, plus one (zero is never).
-struct FailoverInputs {
-    base: Instant,
-    primary_source: AtomicU64,
-    secondary_repair: AtomicU64,
-    secondary_source: AtomicU64,
-    decoded: AtomicU64,
+pub(crate) struct FailoverInputs {
+    pub(crate) base: Instant,
+    pub(crate) primary_source: AtomicU64,
+    pub(crate) secondary_repair: AtomicU64,
+    pub(crate) secondary_source: AtomicU64,
+    pub(crate) decoded: AtomicU64,
 }
 
 impl FailoverInputs {
@@ -689,6 +698,7 @@ struct ClassThread {
     realtime: bool,
     video_gso: bool,
     lease: Option<Arc<LeaseChildren>>,
+    edge_clients: Option<Arc<EdgeFastLane>>,
 }
 
 struct Pending {
@@ -746,6 +756,7 @@ impl ClassThread {
             |forwarder| ForwardPlan::new(forwarder.socket_groups.len(), forwarder.warm_paths()),
         );
         let mut pending = Vec::with_capacity(RECV_BATCH);
+        let mut clients = ClientPlan::new();
         // UDP GSO for video until the host refuses it once.
         let mut gso = self.video_gso && self.class == TrafficClass::Video;
         let mut kernel_dropped = vec![0_u32; self.sockets.len()];
@@ -780,6 +791,7 @@ impl ClassThread {
                         &mut dedup,
                         &mut plan,
                         &mut pending,
+                        &mut clients,
                         &mut gso,
                     );
                     if received < RECV_BATCH {
@@ -799,6 +811,7 @@ impl ClassThread {
         dedup: &mut FirstArrival,
         plan: &mut ForwardPlan,
         pending: &mut Vec<Pending>,
+        clients: &mut ClientPlan,
         gso: &mut bool,
     ) {
         let now_us = now_unix_us();
@@ -812,6 +825,13 @@ impl ClassThread {
             .as_deref()
             .map(|lease| (lease, lease.load()))
             .filter(|(_, snapshot)| !snapshot.is_empty());
+        // The edge's fast-lane clients as they are now, without a lock.
+        let edge_clients = self
+            .edge_clients
+            .as_deref()
+            .map(|lane| (lane, lane.load()))
+            .filter(|(_, snapshot)| !snapshot.streams.is_empty());
+        clients.clear();
         self.stats.received[class.index()].fetch_add(batch.len() as u64, Ordering::Relaxed);
         for message in 0..batch.len() {
             let received = batch.get(message);
@@ -890,6 +910,9 @@ impl ClassThread {
             if let Some((_, snapshot)) = &lease {
                 plan_lease(snapshot, class, message, &view, plan);
             }
+            if let Some((lane, snapshot)) = &edge_clients {
+                clients.plan(lane, snapshot, message, &view);
+            }
             pending.push(Pending {
                 admitted: Some(view.is_video_kind()),
                 ..unchecked
@@ -914,6 +937,11 @@ impl ClassThread {
                 gso,
                 now_us,
             );
+        }
+        // The edge's clients after its children, in one sendmmsg from the
+        // client socket of the class.
+        if let Some((lane, _)) = &edge_clients {
+            clients.send(lane, class);
         }
         // The tee copies come after every child has its datagrams.
         for entry in pending.drain(..) {
@@ -978,9 +1006,15 @@ struct Tee {
     classes: StreamClasses,
     snapshots: Arc<StdMutex<[RelayIngressSnapshot; 2]>>,
     stats: Arc<FastPlaneStats>,
-    /// The audio tee also rotates the cache and retires idle streams, as
-    /// the single ingest loop did.
+    /// The audio tee also retires idle streams, as the single ingest loop
+    /// did (the cache's rotation is `fast_control`'s, on its own task).
     housekeeping: bool,
+    /// The edge's fast client lane: the tee tells it which streams commit
+    /// as canonical slots, and tops its clients' repair up after a decode.
+    edge_clients: Option<Arc<EdgeFastLane>>,
+    upstream_repair: UpstreamRepair,
+    limits: RelayLimits,
+    holes: Option<Arc<crate::edge_holes::HoleTrigger>>,
     reported_deadline_drops: u64,
     /// Tests: the tee panics on its first datagram.
     #[cfg(test)]
@@ -988,11 +1022,11 @@ struct Tee {
 }
 
 impl Tee {
-    async fn run(mut self, mut items: mpsc::Receiver<TeeItem>) -> Result<()> {
-        let mut rotate = interval(Duration::from_millis(10));
-        rotate.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut expire = interval(Duration::from_secs(1));
-        expire.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    /// Runs until the thread's channel closes. It waits on nothing but its
+    /// datagrams and the housekeeping task's nudge to expire its state
+    /// (`fast_control::run_tee_housekeeping`, which also rotates the cache):
+    /// no timer of its own sits beside the datagrams.
+    async fn run(mut self, mut items: mpsc::Receiver<TeeItem>, expire: Arc<Notify>) -> Result<()> {
         loop {
             tokio::select! {
                 item = items.recv() => {
@@ -1009,10 +1043,7 @@ impl Tee {
                     }
                     self.publish();
                 }
-                _ = rotate.tick(), if self.housekeeping => {
-                    self.cache.rotate_if_due(false).await?;
-                }
-                _ = expire.tick() => {
+                () = expire.notified() => {
                     self.expire().await;
                 }
             }
@@ -1163,6 +1194,20 @@ impl Tee {
         video_kind: bool,
     ) {
         let peer = item.peer;
+        // The upstream repair of the stream's objects, for the fast lane's
+        // top-up.
+        // The symbol's header, read again in place, for the fast lane's
+        // top-up (the upstream repair of the stream's objects) and the hole
+        // trigger.
+        let fast_view = (self.edge_clients.is_some() || self.holes.is_some())
+            .then(|| RlsView::parse(&item.bytes, self.limits).ok())
+            .flatten();
+        if let (Some(view), Some(_)) = (&fast_view, &self.edge_clients) {
+            if let Some(stream_id) = view.stream_id() {
+                self.upstream_repair
+                    .observe(stream_id, view.object, view.esi, view.source_symbols);
+            }
+        }
         let journal_forward = |key: &ObjectKey| {
             if let (Some(forwarder), Some((child, sent_us))) = (&self.forwarder, forwarded) {
                 forwarder.journal_forward(key, child, sent_us);
@@ -1195,8 +1240,33 @@ impl Tee {
                 let stream = object.key().stream().to_owned();
                 let sequence = object.key().object();
                 let publication_clock = relay_publication_clock(&object);
+                let fast_lane = self.edge_clients.clone().zip(stream.parse::<u64>().ok());
+                let canonical = !av_mesh::canonical_slot::is_soundkit_v2_bundle(&object)
+                    && object.kind() == media_object::ObjectKind::Media;
+                let media = object.kind() == media_object::ObjectKind::Media;
+                // A copy of the envelope only for a stream with clients.
+                let top_up_envelope = fast_lane
+                    .as_ref()
+                    .filter(|(lane, stream_id)| lane.load().streams.contains_key(stream_id))
+                    .map(|_| envelope.clone());
                 match commit_relay_object(&self.cache, *object, envelope).await {
                     Ok(_) => {
+                        if let Some((lane, stream_id)) = fast_lane {
+                            if media {
+                                lane.mark_committed(stream_id, canonical);
+                            }
+                            if let (Some(view), Some(envelope), true) =
+                                (&fast_view, top_up_envelope, canonical)
+                            {
+                                lane.top_up(
+                                    stream_id,
+                                    sequence,
+                                    view.fec,
+                                    envelope.as_ref(),
+                                    self.upstream_repair.expected(stream_id, sequence),
+                                );
+                            }
+                        }
                         if let Some(clock) = publication_clock {
                             self.cache
                                 .record_relay_availability(clock.observe(now_unix_us()));
@@ -1236,48 +1306,16 @@ impl Tee {
                 );
             }
         }
-    }
-}
-
-async fn run_failover_controller(
-    mut controller: RelayFailoverController,
-    inputs: Arc<FailoverInputs>,
-    heartbeat: Duration,
-    cache: Arc<LiveTsCache>,
-    mut shutdown_rx: watch::Receiver<()>,
-) {
-    let mut tick = interval(heartbeat);
-    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut seen = [0_u64; 4];
-    loop {
-        tokio::select! {
-            _ = shutdown_rx.changed() => return,
-            _ = tick.tick() => {
-                let mut events = Vec::with_capacity(4);
-                for (index, (slot, path, role, decoded)) in [
-                    (&inputs.primary_source, RelayIngressParentPath::Primary, MediaDatagramRole::Source, false),
-                    (&inputs.secondary_repair, RelayIngressParentPath::Secondary, MediaDatagramRole::Repair, false),
-                    (&inputs.secondary_source, RelayIngressParentPath::Secondary, MediaDatagramRole::Source, false),
-                    // A decode alone: a (path, role) pair that observe()
-                    // reads as nothing but the decode.
-                    (&inputs.decoded, RelayIngressParentPath::Primary, MediaDatagramRole::Repair, true),
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    let value = slot.load(Ordering::Relaxed);
-                    if value != seen[index] {
-                        seen[index] = value;
-                        events.push((value, path, RelayDatagramObservation { role, decoded }));
-                    }
-                }
-                events.sort_by_key(|(value, _, _)| *value);
-                for (value, path, observation) in events {
-                    let at = inputs.base + Duration::from_micros(value - 1);
-                    controller.observe(path, observation, at);
-                }
-                controller.tick(Instant::now()).await;
-                cache.update_relay_failover_controller(controller.snapshot());
+        // The part this symbol is of shows the holes the distance behind it,
+        // once whatever it completed is committed.
+        if let (Some(holes), Some(view)) = (&self.holes, &fast_view) {
+            let media = !matches!(
+                view.kind,
+                raptorq_datagram_fec::MediaObjectKind::Initialization
+                    | raptorq_datagram_fec::MediaObjectKind::CodecConfig
+            );
+            if let Some(stream_id) = view.stream_id().filter(|_| media) {
+                holes.arrived(stream_id, view.object).await;
             }
         }
     }
@@ -1333,6 +1371,9 @@ pub async fn run_relay_class_ingest(
     let mut dispatches = [Some(dispatch), Some(video_dispatch)];
     let mut threads = Vec::new();
     let mut tees = tokio::task::JoinSet::new();
+    let mut expire = Vec::new();
+    // The audio tee's node rotates the cache, as the single loop did.
+    let mut audio_tee = false;
     for class in TrafficClass::ALL {
         let class_sockets = std::mem::take(&mut by_class[class.index()]);
         if class_sockets.is_empty() {
@@ -1354,6 +1395,7 @@ pub async fn run_relay_class_ingest(
             realtime: config.realtime,
             video_gso: config.video_gso,
             lease: config.lease.clone(),
+            edge_clients: config.edge_clients.clone(),
         };
         match std::thread::Builder::new()
             .name(format!("needletail-fast-{}", class.as_str()))
@@ -1387,14 +1429,27 @@ pub async fn run_relay_class_ingest(
             snapshots: Arc::clone(&snapshots),
             stats: Arc::clone(&stats),
             housekeeping: class == TrafficClass::Audio,
+            edge_clients: config.edge_clients.clone(),
+            upstream_repair: UpstreamRepair::default(),
+            limits,
+            holes: config.holes.clone(),
             reported_deadline_drops: 0,
             #[cfg(test)]
             panic_on_item: config.test_tee_panic == Some(class),
         };
-        tees.spawn(async move { (class, tee.run(rx).await) });
+        audio_tee |= class == TrafficClass::Audio;
+        let nudge = Arc::new(Notify::new());
+        expire.push(Arc::clone(&nudge));
+        tees.spawn(async move { (class, tee.run(rx, nudge).await) });
     }
+    let housekeeping = tokio::spawn(crate::fast_control::run_tee_housekeeping(
+        Arc::clone(&cache),
+        audio_tee,
+        expire,
+        shutdown_rx.clone(),
+    ));
     let controller = failover_controller.map(|controller| {
-        tokio::spawn(run_failover_controller(
+        tokio::spawn(crate::fast_control::run_failover_controller(
             controller,
             Arc::clone(&failover),
             failover_heartbeat,
@@ -1429,6 +1484,7 @@ pub async fn run_relay_class_ingest(
             controller.abort();
         }
     }
+    housekeeping.abort();
     stop.store(true, Ordering::Relaxed);
     join_threads(threads).await;
     // With the threads gone the tees' channels close and they end.
@@ -1440,6 +1496,7 @@ pub async fn run_relay_class_ingest(
     if let Some(controller) = controller {
         let _ = controller.await;
     }
+    let _ = housekeeping.await;
     if result.is_ok() {
         cache.rotate_if_due(true).await?;
     }

@@ -13,6 +13,7 @@
 //! sent to it, so a forged source address gets at most an answer smaller than
 //! the request.
 
+use crate::fast_plane::edge_clients::{EdgeFastLane, FastClient, FastGroup};
 use crate::fast_plane::{StreamClasses, TrafficClass};
 use crate::{AppRouter, ParentsLost};
 use av_mesh::client_udp::{
@@ -145,6 +146,8 @@ pub(crate) struct EdgeUdpStats {
     /// Times that the edge held its readers because the silence of its
     /// parents was region-wide.
     pub region_silence_held: AtomicU64,
+    /// The fast client lane, once armed, whose counters the API reports.
+    pub fast_lane: OnceLock<Arc<EdgeFastLane>>,
 }
 
 /// The client socket of an edge, or a pair of them on one address: audio
@@ -161,6 +164,9 @@ pub(crate) struct EdgeSockets {
     /// not zero.
     audio_queue: Option<Arc<SendQueue>>,
     video_queue: Option<Arc<SendQueue>>,
+    /// The fast client lane, when the edge's class threads feed one
+    /// (`--client-udp-fast-lane`).
+    fast_lane: Option<Arc<EdgeFastLane>>,
 }
 
 /// Where a stream's datagrams leave from: its socket, and the socket's send
@@ -308,6 +314,7 @@ impl EdgeSockets {
             classes: StreamClasses::default(),
             audio_queue: None,
             video_queue: None,
+            fast_lane: None,
         }
     }
 
@@ -318,6 +325,25 @@ impl EdgeSockets {
             classes,
             audio_queue: None,
             video_queue: None,
+            fast_lane: None,
+        }
+    }
+
+    /// Serve `lane`'s clients from these sockets (armed by `run_edge_udp`).
+    pub(crate) fn with_fast_lane(mut self, lane: Option<Arc<EdgeFastLane>>) -> Self {
+        self.fast_lane = lane;
+        self
+    }
+
+    pub(crate) fn fast_lane(&self) -> Option<&Arc<EdgeFastLane>> {
+        self.fast_lane.as_ref()
+    }
+
+    /// The socket of a class: the video socket of a pair, or the one socket.
+    pub(crate) fn class_socket(&self, class: TrafficClass) -> &Arc<UdpSocket> {
+        match (class, &self.video) {
+            (TrafficClass::Video, Some(video)) => video,
+            _ => &self.audio,
         }
     }
 
@@ -524,6 +550,9 @@ pub(crate) struct Subscriber {
     cut_slots: BTreeSet<u64>,
     /// When this edge took it.
     admitted_at: Instant,
+    /// Its place on the fast lane, if it asked for it (`F1`) and the edge
+    /// has one.
+    fast: Option<Arc<FastClient>>,
 }
 
 #[derive(Debug, Default)]
@@ -534,6 +563,39 @@ pub(crate) struct StreamEntry {
 }
 
 pub(crate) type Table = Arc<Mutex<HashMap<u64, StreamEntry>>>;
+
+/// The fast-lane clients of a stream, by repair policy (for the snapshot
+/// that the class threads read).
+pub(crate) fn fast_groups(entry: &StreamEntry) -> Vec<FastGroup> {
+    let mut groups: Vec<FastGroup> = Vec::new();
+    for (peer, subscriber) in &entry.subscribers {
+        let Some(fast) = &subscriber.fast else {
+            continue;
+        };
+        match groups
+            .iter_mut()
+            .find(|group| group.repair == subscriber.repair)
+        {
+            Some(group) => group.clients.push((*peer, Arc::clone(fast))),
+            None => groups.push(FastGroup {
+                repair: subscriber.repair,
+                clients: vec![(*peer, Arc::clone(fast))],
+            }),
+        }
+    }
+    // A stable order, so that the rotation by part means something.
+    for group in &mut groups {
+        group.clients.sort_by_key(|(peer, _)| *peer);
+    }
+    groups
+}
+
+/// Rebuild the fast lane's snapshot after the table changed, under its lock.
+fn fast_lane_changed(sockets: &EdgeSockets, table: &HashMap<u64, StreamEntry>) {
+    if let Some(lane) = sockets.fast_lane() {
+        lane.rebuild_locked(table);
+    }
+}
 /// Clients that this edge sent away because it had lost its parents, and
 /// when: one that comes back within the move hold-down is taken.
 type MovedAway = Arc<Mutex<HashMap<(SocketAddr, u64), Instant>>>;
@@ -586,6 +648,15 @@ pub(crate) async fn run_edge_udp(
     let sockets = sockets.with_send_queues(config.send_queue, &stats);
     let table: Table = Arc::default();
     let moved: MovedAway = Arc::default();
+    if let Some(lane) = sockets.fast_lane() {
+        let _ = stats.fast_lane.set(Arc::clone(lane));
+        // The lane's own copy of the sockets does not hold the lane.
+        lane.arm(
+            sockets.clone().with_fast_lane(None),
+            Arc::clone(&table),
+            Arc::clone(&stats),
+        );
+    }
     for cut in &cut_through {
         cut.arm(
             sockets.clone(),
@@ -643,6 +714,7 @@ pub(crate) async fn run_edge_udp(
                 from_part,
                 repair,
                 token,
+                fast_lane,
             } => {
                 let valid = token.is_some_and(|token| tokens.valid(peer, token));
                 if !valid {
@@ -669,12 +741,15 @@ pub(crate) async fn run_edge_udp(
                 let head = head_part(&router, stream_id).await;
                 let refreshed = {
                     let mut table = table.lock().unwrap();
-                    match table
+                    let refreshed = match table
                         .get_mut(&stream_id)
                         .and_then(|entry| entry.subscribers.get_mut(&peer))
                     {
                         Some(subscriber) => {
                             subscriber.expires_at = Instant::now() + SUBSCRIPTION_TTL;
+                            // A fast-lane client whose repair changed moves
+                            // to the group of its new policy.
+                            let regroup = subscriber.fast.is_some() && subscriber.repair != repair;
                             subscriber.repair = repair;
                             // A client that names a part has not yet heard
                             // the edge's answer: it resumes there.
@@ -684,10 +759,14 @@ pub(crate) async fn run_edge_udp(
                                     subscriber.next_part = part;
                                 }
                             }
-                            Some(subscriber.next_part)
+                            Some((subscriber.next_part, regroup))
                         }
                         None => None,
+                    };
+                    if refreshed.is_some_and(|(_, regroup)| regroup) {
+                        fast_lane_changed(&sockets, &table);
                     }
+                    refreshed.map(|(next_part, _)| next_part)
                 };
                 if let Some(next_part) = refreshed {
                     send_control(
@@ -731,6 +810,7 @@ pub(crate) async fn run_edge_udp(
                     stream_id,
                     from_part,
                     repair,
+                    fast_lane,
                 );
                 let admitting = Arc::clone(&admitting);
                 tokio::spawn(async move {
@@ -743,8 +823,12 @@ pub(crate) async fn run_edge_udp(
                     stats.bad_tokens.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
-                if let Some(entry) = table.lock().unwrap().get_mut(&stream_id) {
-                    entry.subscribers.remove(&peer);
+                let mut table = table.lock().unwrap();
+                let removed = table
+                    .get_mut(&stream_id)
+                    .and_then(|entry| entry.subscribers.remove(&peer));
+                if removed.is_some_and(|subscriber| subscriber.fast.is_some()) {
+                    fast_lane_changed(&sockets, &table);
                 }
             }
             _ => {}
@@ -851,6 +935,7 @@ async fn admit(
     stream_id: u64,
     from_part: Option<u64>,
     repair: RepairPolicy,
+    fast_lane: bool,
 ) {
     let reason = match move_reason(&router).await {
         // A client sent away for lost parents that comes back at once has
@@ -929,6 +1014,12 @@ async fn admit(
                 .fetch_add(first_part - part, Ordering::Relaxed);
         }
     }
+    // A client that asked for the fast lane takes it from its first part:
+    // the threads send it each part from there on that they forward after
+    // the snapshot below, and the cache-fed lane every part that they do not
+    // (older parts, a part already on its way).
+    let fast = (fast_lane && sockets.fast_lane().is_some_and(|lane| lane.is_armed()))
+        .then(|| FastClient::new(first_part));
     let start_sender = {
         let mut table = table.lock().unwrap();
         let entry = table.entry(stream_id).or_default();
@@ -941,9 +1032,15 @@ async fn admit(
                 init: None,
                 cut_slots: BTreeSet::new(),
                 admitted_at: Instant::now(),
+                fast: fast.clone(),
             },
         );
-        !std::mem::replace(&mut entry.running, true)
+        let start = !std::mem::replace(&mut entry.running, true);
+        // In the threads' snapshot before the client hears OK.
+        if fast.is_some() {
+            fast_lane_changed(&sockets, &table);
+        }
+        start
     };
     stats.subscriptions.fetch_add(1, Ordering::Relaxed);
     send_control(
@@ -955,7 +1052,14 @@ async fn admit(
         },
     )
     .await;
-    info!(%peer, stream_id, first_part, head, "edge client UDP subscription");
+    info!(
+        %peer,
+        stream_id,
+        first_part,
+        head,
+        fast_lane = fast.is_some(),
+        "edge client UDP subscription"
+    );
     if start_sender {
         tokio::spawn(run_stream_sender(
             sockets, router, table, moved, config, stats, stream_id,
@@ -1095,36 +1199,48 @@ async fn send_init_if_new(
     send_object(out, config, stats, &object, &needing).await;
 }
 
-/// The subscribers due for `part`, after the part has been taken for them.
-/// A subscriber that cut-through carries the part to is passed over, unless
-/// `gap`: a gap goes to every subscriber due.
-fn take_due(
-    table: &Table,
-    stream_id: u64,
-    part: u64,
-    gap: bool,
-) -> Vec<(SocketAddr, RepairPolicy)> {
+/// Subscribers to send an object to, with their repair.
+type Targets = Vec<(SocketAddr, RepairPolicy)>;
+
+/// The subscribers due for `part`, after the part has been taken for them,
+/// and those due that the fast lane carries it to (they need only its init
+/// segment). A subscriber that cut-through carries the part to is passed
+/// over, unless `gap`: a gap goes to every subscriber due that the fast lane
+/// did not carry the part to.
+fn take_due(table: &Table, stream_id: u64, part: u64, gap: bool) -> (Targets, Targets) {
     let mut table = table.lock().unwrap();
     let Some(entry) = table.get_mut(&stream_id) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
-    entry
+    let mut due = Vec::new();
+    let mut on_fast_lane = Vec::new();
+    for (peer, subscriber) in entry
         .subscribers
         .iter_mut()
         .filter(|(_, subscriber)| subscriber.next_part == part)
-        .filter_map(|(peer, subscriber)| {
-            subscriber.next_part = part + 1;
-            let cut = subscriber.cut_slots.remove(&part);
-            while subscriber
-                .cut_slots
-                .first()
-                .is_some_and(|slot| *slot < subscriber.next_part)
-            {
-                subscriber.cut_slots.pop_first();
-            }
-            (!cut || gap).then_some((*peer, subscriber.repair))
-        })
-        .collect()
+    {
+        subscriber.next_part = part + 1;
+        let cut = subscriber.cut_slots.remove(&part);
+        while subscriber
+            .cut_slots
+            .first()
+            .is_some_and(|slot| *slot < subscriber.next_part)
+        {
+            subscriber.cut_slots.pop_first();
+        }
+        if subscriber
+            .fast
+            .as_ref()
+            .is_some_and(|fast| !fast.claim_cache(part))
+        {
+            on_fast_lane.push((*peer, subscriber.repair));
+            continue;
+        }
+        if !cut || gap {
+            due.push((*peer, subscriber.repair));
+        }
+    }
+    (due, on_fast_lane)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1138,7 +1254,22 @@ async fn deliver(
     part: u64,
     bytes: Option<Bytes>,
 ) {
-    let targets = take_due(table, stream_id, part, bytes.is_none());
+    let (targets, on_fast_lane) = take_due(table, stream_id, part, bytes.is_none());
+    if bytes.is_some() && !on_fast_lane.is_empty() {
+        // The fast lane carries parts, never the init segment: it goes on
+        // this lane, in space 2.
+        send_init_if_new(
+            out,
+            router,
+            table,
+            config,
+            stats,
+            stream_id,
+            part,
+            &on_fast_lane,
+        )
+        .await;
+    }
     if targets.is_empty() {
         return;
     }
@@ -1188,14 +1319,26 @@ async fn run_stream_sender(
             let Some(entry) = guard.get_mut(&stream_id) else {
                 return;
             };
-            entry
-                .subscribers
-                .retain(|_, subscriber| subscriber.expires_at > now);
-            if entry.subscribers.is_empty() {
+            let mut fast_expired = false;
+            entry.subscribers.retain(|_, subscriber| {
+                let live = subscriber.expires_at > now;
+                fast_expired |= !live && subscriber.fast.is_some();
+                live
+            });
+            let empty = entry.subscribers.is_empty();
+            if empty {
                 guard.remove(&stream_id);
+            }
+            if fast_expired {
+                fast_lane_changed(&sockets, &guard);
+            }
+            if empty {
                 debug!(stream_id, "edge client UDP sender stops: no subscriber");
                 return;
             }
+            let Some(entry) = guard.get_mut(&stream_id) else {
+                return;
+            };
             if let Some(head) = head {
                 for subscriber in entry.subscribers.values_mut() {
                     if head.saturating_sub(subscriber.next_part) >= window {
@@ -1242,6 +1385,9 @@ async fn run_stream_sender(
                             let kept = entry.subscribers.len();
                             if kept == 0 {
                                 guard.remove(&stream_id);
+                            }
+                            if !leaving.is_empty() {
+                                fast_lane_changed(&sockets, &guard);
                             }
                             (leaving, kept)
                         }
@@ -2034,10 +2180,11 @@ fn new_route(
         let Some(entry) = table.get_mut(&stream_id) else {
             return route;
         };
+        // A fast-lane client takes the part from the fast lane.
         entry
             .subscribers
             .iter_mut()
-            .filter(|(_, subscriber)| subscriber.next_part <= slot)
+            .filter(|(_, subscriber)| subscriber.next_part <= slot && subscriber.fast.is_none())
             .map(|(peer, subscriber)| {
                 subscriber.cut_slots.insert(slot);
                 (*peer, subscriber.repair)
@@ -2129,6 +2276,7 @@ mod tests {
             init: None,
             cut_slots: BTreeSet::new(),
             admitted_at,
+            fast: None,
         }
     }
 

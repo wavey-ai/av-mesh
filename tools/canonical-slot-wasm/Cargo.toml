@@ -1,0 +1,17 @@
+# Builds av-mesh's `canonical_slot` module alone for wasm32: the module that
+# a browser client of the fast lane runs to turn a decoded envelope into the
+# part the edge serves. `make wasm-check` runs it.
+[package]
+name = "canonical-slot-wasm-check"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "../../src/canonical_slot.rs"
+
+[dependencies]
+bytes = "1.9"
+media-object = "0.1.1"
+
+[workspace]

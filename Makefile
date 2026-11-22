@@ -27,7 +27,7 @@ STACK_ARGS ?=
 .PHONY: help service service-release uk us mission-control-build mission-control-serve \
 	mission-control-check mission-control-clean local-stack local-stack-debug local-stack-fast \
 	realtime-benchmark realtime-qualification realtime-soak observability-check \
-	k3d-up k3d-check k3d-down build build-release fmt test check
+	k3d-up k3d-check k3d-down build build-release fmt test check wasm-check
 
 help:
 	@printf '%s\n' 'av-mesh tasks'
@@ -48,6 +48,7 @@ help:
 	@printf '%s\n' '  make k3d-check        Probe the k3d mesh port-forwards'
 	@printf '%s\n' '  make k3d-down         Delete the local k3d mesh cluster'
 	@printf '%s\n' '  make test              Run cargo test --locked'
+	@printf '%s\n' '  make wasm-check        Build the canonical slot module for wasm32'
 	@printf '%s\n' ''
 	@printf '%s\n' 'Common overrides: STREAM_ID=1 PART_US=2500 PART_MS=<whole ms, stack targets only> RUST_LOG=info HOST=local.infidelity.io'
 
@@ -131,3 +132,9 @@ test:
 
 check:
 	$(CARGO) check --locked
+
+# The canonical slot module (src/canonical_slot.rs), which the fast-lane
+# client shares with the edge's commit, builds for wasm32 on its own.
+wasm-check:
+	cd tools/canonical-slot-wasm && $(CARGO) check --locked --target wasm32-unknown-unknown \
+		--target-dir ../../target/canonical-slot-wasm

@@ -243,6 +243,7 @@ fn run_bench(bench: &Bench) -> Measured {
                     Arc::clone(&cache),
                     router.edge_load.clone(),
                     applied_rx,
+                    None,
                     shutdown_rx.clone(),
                 ));
                 let sockets =
@@ -388,6 +389,7 @@ fn run_bench(bench: &Bench) -> Measured {
                         from_part: None,
                         repair: RepairPolicy::default(),
                         token,
+                        fast_lane: false,
                     }
                     .encode()
                 };

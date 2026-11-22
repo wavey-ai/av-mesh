@@ -12,7 +12,7 @@ use tokio::time::timeout;
 
 const OFFSET: u16 = 1_000;
 
-fn loopback(last: u8) -> Ipv4Addr {
+pub(super) fn loopback(last: u8) -> Ipv4Addr {
     Ipv4Addr::new(127, 0, 0, last)
 }
 
@@ -98,7 +98,7 @@ async fn receive_from(socket: &UdpSocket, count: usize, from: SocketAddr) -> Vec
     sorted(received.into_iter().map(|(bytes, _)| bytes).collect())
 }
 
-async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+pub(super) async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     timeout(Duration::from_secs(3), async {
         while !done() {
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -150,7 +150,7 @@ async fn a_served_lease_makes_its_child_a_fast_plane_child_of_its_stream() {
         .await
         .unwrap();
     let (shutdown_tx, shutdown_rx) = watch::channel(());
-    tokio::spawn(fast_plane::lease::run_lease_children(
+    tokio::spawn(fast_control::run_lease_children(
         Arc::clone(&lease),
         Arc::clone(&distributor_mesh),
         shutdown_rx,
@@ -356,7 +356,7 @@ async fn lease_video_goes_whole_to_primary_children_and_as_repair_to_the_others(
     let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let listener_addr = listener.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = watch::channel(());
-    tokio::spawn(fast_plane::lease::run_lease_failover_listener(
+    tokio::spawn(fast_control::run_lease_failover_listener(
         listener,
         Arc::clone(&lease),
         TopologyGeneration::new(FAST_GENERATION).unwrap(),
@@ -460,7 +460,9 @@ async fn lease_children_above_the_cap_are_refused() {
 
 /// An edge's RLS1 ports, at the given address: the primary and secondary
 /// relay binds, each with its video twin.
-fn bind_edge_class_ports(ip: Ipv4Addr) -> ([u16; 2], Vec<fast_plane::relay::ClassSocket>) {
+pub(super) fn bind_edge_class_ports(
+    ip: Ipv4Addr,
+) -> ([u16; 2], Vec<fast_plane::relay::ClassSocket>) {
     for _ in 0..128 {
         let probe = || {
             std::net::UdpSocket::bind((ip, 0))
@@ -487,7 +489,7 @@ fn bind_edge_class_ports(ip: Ipv4Addr) -> ([u16; 2], Vec<fast_plane::relay::Clas
 
 /// An edge's dispatch: its two forwarders (their lease sockets) bound as
 /// parents that may send both sources and repair, as deploy binds them.
-fn edge_dispatch(primary: SocketAddr, secondary: SocketAddr) -> RelayUdpDispatch {
+pub(super) fn edge_dispatch(primary: SocketAddr, secondary: SocketAddr) -> RelayUdpDispatch {
     let mut dispatch = empty_relay_udp_dispatch();
     for (session_id, peer, peer_id) in [(1, primary, "forwarder-1"), (2, secondary, "forwarder-2")]
     {
@@ -717,7 +719,7 @@ async fn an_edge_promotes_its_secondary_forwarder_for_video_when_the_primary_sto
     let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let listener_addr = listener.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = watch::channel(());
-    tokio::spawn(fast_plane::lease::run_lease_failover_listener(
+    tokio::spawn(fast_control::run_lease_failover_listener(
         listener,
         Arc::clone(&lease_2),
         TopologyGeneration::new(FAST_GENERATION).unwrap(),
