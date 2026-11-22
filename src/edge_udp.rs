@@ -81,6 +81,11 @@ const COMPACT_RING: usize = 4_096;
 /// The most parts a subscriber may ask for again in one NACK interval
 /// (a burst of a second of 1 ms PCM, spread over ten intervals).
 const NACK_BUDGET: u32 = 200;
+/// The most bytes that a subscriber's NACKs may have sent again in one NACK
+/// interval (about 10 Mbit/s): 200 parts of 1 ms PCM fit, but not 200 whole
+/// 4K parts from a few small NACK datagrams. A part larger than this is
+/// still sent when it is the first of its interval.
+const NACK_BUDGET_BYTES: u64 = 128 * 1_024;
 const NACK_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy)]
@@ -876,9 +881,65 @@ pub(crate) struct Subscriber {
     /// The first part that this edge sent it: window repair goes to it only
     /// for windows from there on.
     first_part: u64,
-    /// Its NACKs: the start of the current interval and the parts asked for
-    /// in it.
-    nack_interval: (Instant, u32),
+    /// Its NACKs: the start of the current interval, and the parts granted
+    /// and the bytes sent again in it.
+    nack_interval: NackInterval,
+}
+
+/// A subscriber's NACK budget in the current interval: parts, and bytes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NackInterval {
+    started: Instant,
+    parts: u32,
+    bytes: u64,
+}
+
+impl NackInterval {
+    pub(crate) fn new(started: Instant) -> Self {
+        Self {
+            started,
+            parts: 0,
+            bytes: 0,
+        }
+    }
+
+    fn roll(&mut self, now: Instant) {
+        if now.duration_since(self.started) >= NACK_INTERVAL {
+            *self = Self::new(now);
+        }
+    }
+
+    /// Take one part of the budget.
+    fn grant_part(&mut self, now: Instant) -> bool {
+        self.roll(now);
+        if self.parts >= NACK_BUDGET {
+            return false;
+        }
+        self.parts += 1;
+        true
+    }
+
+    /// Take `bytes` of the byte budget: refused when the interval has sent
+    /// some bytes already and these would pass it.
+    fn charge_bytes(&mut self, now: Instant, bytes: u64) -> bool {
+        self.roll(now);
+        if self.bytes > 0 && self.bytes.saturating_add(bytes) > NACK_BUDGET_BYTES {
+            return false;
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+        true
+    }
+}
+
+/// Charge `bytes` resent to a subscriber's NACK budget; `false` when the
+/// budget refuses them (or the subscriber is gone).
+fn charge_nack_bytes(table: &Table, stream_id: u64, peer: SocketAddr, bytes: u64) -> bool {
+    table
+        .lock()
+        .unwrap()
+        .get_mut(&stream_id)
+        .and_then(|entry| entry.subscribers.get_mut(&peer))
+        .is_some_and(|subscriber| subscriber.nack_interval.charge_bytes(Instant::now(), bytes))
 }
 
 #[derive(Debug, Default)]
@@ -1173,10 +1234,26 @@ pub(crate) async fn run_edge_udp(
                     stats.bad_tokens.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
-                answer_nack(
-                    &sockets, &router, &table, config, &stats, peer, stream_id, &parts,
-                )
-                .await;
+                // The control loop answers from the compact ring only; parts
+                // that need a cache read or an encode (a 4K part takes
+                // milliseconds) are answered on a task of their own, so a
+                // lossy listener's NACKs do not hold up the other clients'
+                // SUBs, refreshes and NACKs.
+                if let Some((misses, repair)) =
+                    answer_nack(&sockets, &table, &stats, peer, stream_id, &parts)
+                {
+                    let sockets = sockets.clone();
+                    let router = router.clone();
+                    let table = Arc::clone(&table);
+                    let stats = Arc::clone(&stats);
+                    tokio::spawn(async move {
+                        answer_nack_from_cache(
+                            &sockets, &router, &table, config, &stats, peer, stream_id, misses,
+                            repair,
+                        )
+                        .await;
+                    });
+                }
             }
             _ => {}
         }
@@ -1186,23 +1263,24 @@ pub(crate) async fn run_edge_udp(
 /// Send a compact-lane subscriber the parts that it asks for again: each
 /// part that was sent to it already (the cache-fed sender has passed it, or
 /// the fast lane or cut-through carried it; the others are still due),
-/// within its NACK budget, from the compact ring, else from the cache (a
-/// part too large for one datagram as a RaptorQ object with its repair).
-#[allow(clippy::too_many_arguments)]
-async fn answer_nack(
+/// within its NACK budget (parts and bytes), from the compact ring. Returns
+/// the granted parts that the ring does not hold, with the subscriber's
+/// repair, for [`answer_nack_from_cache`]; it never waits.
+pub(crate) fn answer_nack(
     sockets: &EdgeSockets,
-    router: &AppRouter,
     table: &Table,
-    config: EdgeUdpConfig,
     stats: &EdgeUdpStats,
     peer: SocketAddr,
     stream_id: u64,
     parts: &[u64],
-) {
+) -> Option<(Vec<u64>, RepairPolicy)> {
     stats
         .nack_parts
         .fetch_add(parts.len() as u64, Ordering::Relaxed);
-    let (granted, repair) = {
+    let out = sockets.out_for_stream(stream_id);
+    let mut answered = 0_usize;
+    let mut misses = Vec::new();
+    let repair = {
         let mut table = table.lock().unwrap();
         let Some(subscriber) = table
             .get_mut(&stream_id)
@@ -1211,19 +1289,15 @@ async fn answer_nack(
             stats
                 .nack_refused
                 .fetch_add(parts.len() as u64, Ordering::Relaxed);
-            return;
+            return None;
         };
         if subscriber.compact.is_none() {
             stats
                 .nack_refused
                 .fetch_add(parts.len() as u64, Ordering::Relaxed);
-            return;
+            return None;
         }
         let now = Instant::now();
-        if now.duration_since(subscriber.nack_interval.0) >= NACK_INTERVAL {
-            subscriber.nack_interval = (now, 0);
-        }
-        let mut granted = Vec::new();
         for part in parts {
             let sent = *part < subscriber.next_part
                 || subscriber.cut_slots.contains(part)
@@ -1234,20 +1308,21 @@ async fn answer_nack(
             if !sent || *part < subscriber.first_part {
                 continue;
             }
-            if subscriber.nack_interval.1 >= NACK_BUDGET {
+            if !subscriber.nack_interval.grant_part(now) {
                 break;
             }
-            subscriber.nack_interval.1 += 1;
-            granted.push(*part);
-        }
-        (granted, subscriber.repair)
-    };
-    stats
-        .nack_refused
-        .fetch_add((parts.len() - granted.len()) as u64, Ordering::Relaxed);
-    let out = sockets.out_for_stream(stream_id);
-    for part in granted {
-        if let Some(kept) = sockets.compact().get(stream_id, part) {
+            let Some(kept) = sockets.compact().get(stream_id, *part) else {
+                misses.push(*part);
+                answered += 1;
+                continue;
+            };
+            if !subscriber
+                .nack_interval
+                .charge_bytes(now, kept.len() as u64)
+            {
+                break;
+            }
+            answered += 1;
             let datagram = compact_marked(&kept, 0, true);
             if matches!(
                 out.send(stats, &datagram, peer),
@@ -1255,6 +1330,36 @@ async fn answer_nack(
             ) {
                 stats.nack_resent.fetch_add(1, Ordering::Relaxed);
             }
+        }
+        subscriber.repair
+    };
+    stats
+        .nack_refused
+        .fetch_add((parts.len() - answered) as u64, Ordering::Relaxed);
+    (!misses.is_empty()).then_some((misses, repair))
+}
+
+/// The granted parts of a NACK that the compact ring did not hold: read
+/// from the cache and sent, compact when they fit one datagram, else whole
+/// as the cache-fed lane sends them, encoded on the blocking pool. Each is
+/// charged to the subscriber's byte budget before it is sent.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn answer_nack_from_cache(
+    sockets: &EdgeSockets,
+    router: &AppRouter,
+    table: &Table,
+    config: EdgeUdpConfig,
+    stats: &EdgeUdpStats,
+    peer: SocketAddr,
+    stream_id: u64,
+    parts: Vec<u64>,
+    repair: RepairPolicy,
+) {
+    let out = sockets.out_for_stream(stream_id);
+    let mut refused = 0_u64;
+    for part in parts {
+        if refused > 0 {
+            refused += 1;
             continue;
         }
         let Some((bytes, _)) = router.cache.get_part_for_stream_id(stream_id, part).await else {
@@ -1262,6 +1367,10 @@ async fn answer_nack(
         };
         let object = part_object(router, stream_id, part, bytes).await;
         if let Some(kept) = sockets.compact().of_object(&object) {
+            if !charge_nack_bytes(table, stream_id, peer, kept.len() as u64) {
+                refused += 1;
+                continue;
+            }
             let datagram = compact_marked(&kept, 0, true);
             if matches!(
                 out.send(stats, &datagram, peer),
@@ -1271,11 +1380,25 @@ async fn answer_nack(
             }
             continue;
         }
-        // Too large for one datagram: the whole part, as the cache-fed lane
-        // sends it.
-        send_object(out, config, stats, &object, &[(peer, repair)]).await;
+        // Too large for one datagram: the whole part with its repair, as
+        // the cache-fed lane sends it.
+        let estimate = (object.payload.len() as u64)
+            .saturating_mul(1_000 + u64::from(repair.permille))
+            / 1_000;
+        if !charge_nack_bytes(table, stream_id, peer, estimate) {
+            refused += 1;
+            continue;
+        }
+        let symbol_size = config.symbol_size;
+        let encoded =
+            tokio::task::spawn_blocking(move || encode_object(&object, symbol_size, repair)).await;
+        let Ok(Ok(datagrams)) = encoded else {
+            continue;
+        };
+        send_datagrams(out, config, stats, &datagrams, &[peer]).await;
         stats.nack_resent.fetch_add(1, Ordering::Relaxed);
     }
+    stats.nack_refused.fetch_add(refused, Ordering::Relaxed);
 }
 
 async fn send_control(socket: &UdpSocket, peer: SocketAddr, control: &Control) {
@@ -1512,7 +1635,7 @@ async fn admit(
                 fast: fast.clone(),
                 compact,
                 first_part,
-                nack_interval: (Instant::now(), 0),
+                nack_interval: NackInterval::new(Instant::now()),
             },
         );
         let start = !std::mem::replace(&mut entry.running, true);
@@ -1572,33 +1695,44 @@ async fn send_object(
                 return;
             }
         };
-        // Interleave the subscribers, so that one of them does not wait for
-        // the whole of a large part to be sent to the others.
-        if config.batch_send && out.queue.is_some() {
-            let batch: Vec<(&[u8], SocketAddr)> = datagrams
-                .iter()
-                .flat_map(|datagram| peers.iter().map(move |peer| (datagram.as_slice(), *peer)))
-                .collect();
-            out.send_many(stats, true, false, &batch);
-            continue;
-        }
-        for datagram in &datagrams {
-            for peer in &peers {
-                if out.queue.is_some() {
-                    // A full socket queues the datagram for this client and
-                    // does not hold up the others.
-                    out.send(stats, datagram, *peer);
-                    continue;
+        send_datagrams(out, config, stats, &datagrams, &peers).await;
+    }
+}
+
+/// Send the datagrams of one encoded object to each of `peers`.
+async fn send_datagrams(
+    out: ClientOut<'_>,
+    config: EdgeUdpConfig,
+    stats: &EdgeUdpStats,
+    datagrams: &[Vec<u8>],
+    peers: &[SocketAddr],
+) {
+    // Interleave the subscribers, so that one of them does not wait for
+    // the whole of a large part to be sent to the others.
+    if config.batch_send && out.queue.is_some() {
+        let batch: Vec<(&[u8], SocketAddr)> = datagrams
+            .iter()
+            .flat_map(|datagram| peers.iter().map(move |peer| (datagram.as_slice(), *peer)))
+            .collect();
+        out.send_many(stats, true, false, &batch);
+        return;
+    }
+    for datagram in datagrams {
+        for peer in peers {
+            if out.queue.is_some() {
+                // A full socket queues the datagram for this client and
+                // does not hold up the others.
+                out.send(stats, datagram, *peer);
+                continue;
+            }
+            match out.socket.send_to(datagram, *peer).await {
+                Ok(sent) => {
+                    stats.datagrams.fetch_add(1, Ordering::Relaxed);
+                    stats.bytes.fetch_add(sent as u64, Ordering::Relaxed);
                 }
-                match out.socket.send_to(datagram, *peer).await {
-                    Ok(sent) => {
-                        stats.datagrams.fetch_add(1, Ordering::Relaxed);
-                        stats.bytes.fetch_add(sent as u64, Ordering::Relaxed);
-                    }
-                    Err(error) => {
-                        stats.send_errors.fetch_add(1, Ordering::Relaxed);
-                        debug!(%peer, error = %error, "edge client UDP send failed");
-                    }
+                Err(error) => {
+                    stats.send_errors.fetch_add(1, Ordering::Relaxed);
+                    debug!(%peer, error = %error, "edge client UDP send failed");
                 }
             }
         }
@@ -3054,6 +3188,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_nack_interval_bounds_the_parts_and_the_bytes_sent_again() {
+        let start = Instant::now();
+        let mut interval = NackInterval::new(start);
+        for _ in 0..NACK_BUDGET {
+            assert!(interval.grant_part(start));
+        }
+        assert!(!interval.grant_part(start));
+        // The next interval has its budget again.
+        let next = start + NACK_INTERVAL;
+        assert!(interval.grant_part(next));
+
+        // Bytes: small compact parts fit many times; whole 4K parts (52 KB)
+        // two at most, not the 200 parts of the part budget.
+        let mut interval = NackInterval::new(start);
+        let mut sent = 0;
+        while interval.charge_bytes(start, 52_000) {
+            sent += 1;
+        }
+        assert_eq!(sent, 2);
+        assert!(interval.charge_bytes(next, 52_000));
+        // One part larger than the budget is still sent, as the first of
+        // its interval, and nothing after it.
+        let mut interval = NackInterval::new(start);
+        assert!(interval.charge_bytes(start, NACK_BUDGET_BYTES * 2));
+        assert!(!interval.charge_bytes(start, 100));
+        let mut interval = NackInterval::new(start);
+        let mut small = 0;
+        while interval.charge_bytes(start, 330) {
+            small += 1;
+        }
+        assert!(small >= NACK_BUDGET as usize, "{small}");
+    }
+
+    #[test]
     fn a_subscriber_resumes_within_its_playout_deadline() {
         // The oldest part within 500 ms of 5 ms parts: 100 parts back.
         let floor = Some(1_400);
@@ -3119,7 +3287,7 @@ mod tests {
             fast: None,
             compact: None,
             first_part: 0,
-            nack_interval: (admitted_at, 0),
+            nack_interval: NackInterval::new(admitted_at),
         }
     }
 
