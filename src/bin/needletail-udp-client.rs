@@ -33,9 +33,9 @@
 //! (with IP and UDP headers) and their rate, beside the parts' own bytes.
 
 use anyhow::{anyhow, bail, Context, Result};
-use av_mesh::client_udp::{
-    CompactPlan, Control, ObjectKind, ObjectReceiver, PartObject, RepairPolicy, REFRESH,
-};
+use av_mesh::client_compact::NackTiming;
+use av_mesh::client_session::{Received, SessionConfig, UdpSession};
+use av_mesh::client_udp::{ObjectKind, PartObject};
 use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use http::{Request, StatusCode};
@@ -51,32 +51,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Semaphore};
 use tokio_rustls::TlsConnector;
-
-/// An edge that has not answered the compact lane's requests for this long
-/// (and three of them) is asked without it.
-const COMPACT_FALLBACK_AFTER: Duration = Duration::from_millis(1_500);
-
-/// Whether a client that asked for the compact lane and has had no answer
-/// (no token, no OK) to `unanswered` requests over `waited` asks without it
-/// from now on: three requests and 1.5 s (wave 7 review: a lost ARP request
-/// held the first datagrams of a lossy path for a second, and the client
-/// left the compact lane, and so the fast lane, for the whole run).
-fn falls_back_from_compact(
-    compact_asked: bool,
-    answered: bool,
-    unanswered: u32,
-    waited: Duration,
-) -> bool {
-    compact_asked && !answered && unanswered >= 3 && waited >= COMPACT_FALLBACK_AFTER
-}
-
-/// Whether an OK (compact or not) to a request with `plan` means the edge
-/// refused the short form: it asked for the compact lane in the short form
-/// and was refused the lane. An edge older than the short form refuses a
-/// plan word with it (`C...7`); the client asks again with the long form.
-fn drops_short_header(compact: bool, compact_asked: bool, plan: CompactPlan) -> bool {
-    !compact && compact_asked && plan.short_header
-}
 
 #[derive(Debug, Clone, Parser)]
 #[command(
@@ -553,27 +527,6 @@ struct VerifyJob {
     payload: Bytes,
 }
 
-async fn subscribe(
-    socket: &UdpSocket,
-    target: SocketAddr,
-    args: &Args,
-    from_part: Option<u64>,
-    repair: RepairPolicy,
-    compact: Option<CompactPlan>,
-    token: Option<u64>,
-) {
-    let control = Control::Subscribe {
-        stream_id: args.stream,
-        from_part,
-        repair,
-        token,
-        fast_lane: args.fast_lane,
-        compact,
-    };
-    // A failed send is a lost request: the next refresh repeats it.
-    let _ = socket.send_to(&control.encode(), target).await;
-}
-
 fn set_receive_buffer(socket: &UdpSocket, bytes: usize) {
     use std::os::fd::AsRawFd;
     let value = bytes as libc::c_int;
@@ -742,14 +695,29 @@ async fn main() -> Result<()> {
         report
     });
 
-    let mut receiver = ObjectReceiver::new();
-    receiver
-        .compact
-        .set_nack_timing(av_mesh::client_compact::NackTiming {
-            delay: Duration::from_micros(args.nack_delay_us),
-            retry_floor: Duration::from_micros(args.nack_retry_floor_us),
-            silence: args.silence_nack,
-        });
+    // The protocol of one subscription: av_mesh::client_session, as the
+    // load generator runs it.
+    let mut session = UdpSession::new(
+        SessionConfig {
+            stream_id: args.stream,
+            repair_permille: args.repair_permille,
+            min_repair: args.min_repair,
+            silence: Duration::from_millis(args.silence_ms),
+            answer: Duration::from_millis(args.answer_ms),
+            fixed_repair: args.fixed_repair,
+            fast_lane: args.fast_lane,
+            compact: args.compact,
+            compact_burst_rows: args.compact_burst_rows,
+            compact_short_header: args.compact_short_header,
+            nack_timing: NackTiming {
+                delay: Duration::from_micros(args.nack_delay_us),
+                retry_floor: Duration::from_micros(args.nack_retry_floor_us),
+                silence: args.silence_nack,
+            },
+            known_parts: 0,
+        },
+        Instant::now(),
+    );
     let mut received: BTreeMap<u64, usize> = BTreeMap::new();
     let mut gaps: BTreeSet<u64> = BTreeSet::new();
     let mut duplicates = 0_u64;
@@ -769,7 +737,6 @@ async fn main() -> Result<()> {
     let since_start = |started: Instant| started.elapsed().as_secs_f64() * 1_000.0;
     let mut moves = Vec::new();
     let mut caches_used = Vec::new();
-    let mut first_subscribed_part: Option<u64> = None;
     let mut parts_out = match &args.write_parts {
         Some(path) => Some(std::fs::File::create(path)?),
         None => None,
@@ -781,40 +748,6 @@ async fn main() -> Result<()> {
     let mut skip: BTreeSet<String> = BTreeSet::new();
     let mut move_reason = String::from("start");
     let mut buf = vec![0_u8; 65_536];
-    // The compact lane's repair while it is asked for and served; the
-    // RaptorQ lane's (as before wave 5) otherwise.
-    let base_for =
-        |compact: bool| RepairPolicy::base_for_lane(compact, args.repair_permille, args.min_repair);
-    let mut base_repair = base_for(args.compact);
-    // The edge left last, with the token that it gave, for an UNSUB.
-    let mut leaving: Option<(SocketAddr, u64)> = None;
-    // Until the path is measured, plan for some loss.
-    let mut repair = if args.fixed_repair {
-        base_repair
-    } else {
-        RepairPolicy::for_loss(av_mesh::client_udp::UNMEASURED_LOSS, base_repair)
-    };
-    let mut loss_estimate: Option<f64> = None;
-    let mut loss_samples: Vec<f64> = Vec::new();
-    let mut repair_changes = 0_u64;
-    // The compact lane's plan: window repair alone until the path shows
-    // loss.
-    // The short form, until an edge refuses it (see the OK without C).
-    let mut short_header = args.compact_short_header;
-    let mut short_header_dropped = 0_u64;
-    let mut plan = CompactPlan::CLEAN.with_short_header(short_header);
-    let mut plan_changes = 0_u64;
-    let mut burst_estimate: Option<f64> = None;
-    // The compact plan follows a smoother estimate: NACK covers what a
-    // short rise of the loss leaves, so it need not rise at once.
-    let mut compact_estimate: Option<f64> = None;
-    let mut burst_samples: Vec<f64> = Vec::new();
-    let mut compact_confirmed = false;
-    // Whether the edge in use is asked for the compact lane, and how many
-    // edges did not answer a request with it and were asked without.
-    let mut compact_asked = args.compact;
-    let mut compact_fallbacks = 0_u64;
-    let mut nack_datagrams = 0_u64;
     let mut first_published_us: Option<u64> = None;
     let mut last_published_us: Option<u64> = None;
     // The end of the run: the last part taken, and the holes before it
@@ -822,6 +755,14 @@ async fn main() -> Result<()> {
     let drain = Duration::from_millis(args.drain_ms);
     let mut drain_last: Option<u64> = None;
     let mut drain_missing: BTreeSet<u64> = BTreeSet::new();
+    // The control datagrams that the session hands out, sent in order.
+    let mut outbox: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
+    async fn flush(socket: &UdpSocket, outbox: &mut Vec<(SocketAddr, Vec<u8>)>) {
+        for (to, datagram) in outbox.drain(..) {
+            // A failed send is a lost request: the next refresh repeats it.
+            let _ = socket.send_to(&datagram, to).await;
+        }
+    }
 
     'caches: while Instant::now() < deadline {
         let (caches, port) = match assignment(&http, &args, current.as_deref()).await {
@@ -908,23 +849,6 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
-        // Leave the last edge, so that it stops sending at once, and decode
-        // the new edge's symbols apart from the old edge's.
-        if let Some((old, token)) = leaving.take() {
-            let _ = socket
-                .send_to(
-                    &Control::Unsubscribe {
-                        stream_id: args.stream,
-                        token,
-                    }
-                    .encode(),
-                    old,
-                )
-                .await;
-        }
-        if current.is_some() {
-            receiver.new_flow();
-        }
         if let Some(previous) = &current {
             if previous != &cache.node_id {
                 moves.push(MoveRecord {
@@ -938,50 +862,25 @@ async fn main() -> Result<()> {
         }
         current = Some(cache.node_id.clone());
         caches_used.push(cache.node_id.clone());
-        let mut token: Option<u64> = None;
-        // Each edge is asked for the compact lane again, with its repair.
-        if compact_asked != args.compact {
-            compact_asked = args.compact;
-            base_repair = base_for(compact_asked);
-            repair = if args.fixed_repair {
-                base_repair
-            } else {
-                RepairPolicy::for_loss(
-                    loss_estimate.unwrap_or(av_mesh::client_udp::UNMEASURED_LOSS),
-                    base_repair,
-                )
-            };
-        }
-        subscribe(
-            &socket,
-            target,
-            &args,
-            next_part,
-            repair,
-            compact_asked.then_some(plan),
-            token,
-        )
-        .await;
+        // Leave the last edge (UNSUB), and subscribe at this one.
+        session.begin(target, next_part, Instant::now(), &mut |to, datagram| {
+            outbox.push((to, datagram.to_vec()))
+        });
+        flush(&socket, &mut outbox).await;
         startup.first_request_ms.get_or_insert(since_start(started));
-        let asked_at = Instant::now();
-        // The last request sent, for the round trip that its answer
-        // measures, and the requests that this edge has not answered.
-        let mut last_request_at = asked_at;
-        let mut unanswered = 1_u32;
-        let mut last_datagram = Instant::now();
-        // Until the cache answers, the request is repeated often.
-        let mut next_refresh = Instant::now() + Duration::from_millis(300);
-        let mut next_loss_check = Instant::now() + Duration::from_millis(150);
-        let mut subscribed = false;
 
         loop {
             let now = Instant::now();
-            if now >= deadline && drain_last.is_none() && subscribed && !drain.is_zero() {
+            if now >= deadline
+                && drain_last.is_none()
+                && session.is_subscribed()
+                && !drain.is_zero()
+            {
                 let last = received.keys().chain(gaps.iter()).max().copied();
                 let first = received
                     .keys()
                     .chain(gaps.iter())
-                    .chain(first_subscribed_part.iter())
+                    .chain(session.first_subscribed_part.iter())
                     .min()
                     .copied();
                 if let (Some(first), Some(last)) = (first, last) {
@@ -993,22 +892,13 @@ async fn main() -> Result<()> {
             }
             let draining =
                 drain_last.is_some() && !drain_missing.is_empty() && now < deadline + drain;
+            // The drain waits for NACK answers: no move for a silence then.
+            session.hold = draining;
             if now >= deadline && !draining {
-                if let Some(token) = token {
-                    let _ = socket
-                        .send_to(
-                            &Control::Unsubscribe {
-                                stream_id: args.stream,
-                                token,
-                            }
-                            .encode(),
-                            target,
-                        )
-                        .await;
-                }
+                session.leave(&mut |to, datagram| outbox.push((to, datagram.to_vec())));
+                flush(&socket, &mut outbox).await;
                 break 'caches;
             }
-            leaving = token.map(|token| (target, token));
             // The playlist read beside the subscription: an error before
             // the subscription is answered sends the client on, as a read
             // before it did.
@@ -1024,154 +914,31 @@ async fn main() -> Result<()> {
                     Ok(Err(error)) => Some(format!("playlist failed: {error:#}")),
                     Err(error) => Some(format!("playlist read failed: {error}")),
                 };
-                if let (Some(failure), false) = (failure, subscribed) {
+                if let (Some(failure), false) = (failure, session.is_subscribed()) {
                     eprintln!("{}: {failure}", cache.node_id);
                     skip.insert(cache.node_id.clone());
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue 'caches;
                 }
             }
-            if !draining
-                && !subscribed
-                && now.duration_since(asked_at) > Duration::from_millis(args.answer_ms)
-            {
-                move_reason = format!("no-answer-{}ms", args.answer_ms);
+            let fallbacks = session.compact_fallbacks;
+            let failed = session.poll(now, &mut |to, datagram| {
+                outbox.push((to, datagram.to_vec()))
+            });
+            flush(&socket, &mut outbox).await;
+            if session.compact_fallbacks > fallbacks {
+                eprintln!(
+                    "{}: no answer to the compact lane: asking without it",
+                    cache.node_id
+                );
+            }
+            if let Some(reason) = failed {
+                move_reason = reason;
                 skip.insert(cache.node_id.clone());
                 continue 'caches;
             }
-            if !draining
-                && subscribed
-                && now.duration_since(last_datagram) > Duration::from_millis(args.silence_ms)
-            {
-                move_reason = format!("silence-{}ms", args.silence_ms);
-                skip.insert(cache.node_id.clone());
-                continue 'caches;
-            }
-            if now >= next_loss_check {
-                next_loss_check = now + Duration::from_millis(150);
-                if let Some(loss) = receiver.take_loss(repair) {
-                    loss_samples.push(loss);
-                    // Rise at once, fall slowly.
-                    let estimate = match loss_estimate {
-                        Some(previous) if loss < previous => previous * 0.8 + loss * 0.2,
-                        _ => loss,
-                    };
-                    loss_estimate = Some(estimate);
-                    let smooth = av_mesh::client_compact::smoothed_loss(compact_estimate, loss);
-                    compact_estimate = Some(smooth);
-                    if let Some(burst) = receiver.compact.take_burst() {
-                        burst_samples.push(burst);
-                        burst_estimate = Some(match burst_estimate {
-                            Some(previous) => previous * 0.7 + burst * 0.3,
-                            None => burst,
-                        });
-                    }
-                    if !args.fixed_repair {
-                        let wanted = RepairPolicy::for_loss(estimate, base_repair);
-                        if wanted != repair {
-                            repair = wanted;
-                            repair_changes += 1;
-                            next_refresh = now;
-                        }
-                        let wanted = CompactPlan::for_measured_with(
-                            smooth,
-                            burst_estimate.unwrap_or(1.0),
-                            args.compact_burst_rows,
-                        )
-                        .with_short_header(short_header);
-                        if wanted != plan {
-                            plan = wanted;
-                            plan_changes += 1;
-                            next_refresh = now;
-                        }
-                    }
-                }
-            }
-            if compact_confirmed {
-                if let Some(token) = token {
-                    let parts = receiver.nacks_due(now);
-                    if !parts.is_empty() {
-                        nack_datagrams += 1;
-                        let _ = socket
-                            .send_to(
-                                &Control::Nack {
-                                    stream_id: args.stream,
-                                    token,
-                                    parts,
-                                }
-                                .encode(),
-                                target,
-                            )
-                            .await;
-                    }
-                }
-            }
-            if now >= next_refresh {
-                // An edge that has not answered two requests for the compact
-                // lane (an edge older than the lane drops them) is asked
-                // without it, on the RaptorQ lane with its repair: for the
-                // rest of the run, so only after 1.5 s of silence (a lost ARP
-                // request alone holds a path's first datagrams for a second;
-                // wave 7 review).
-                if falls_back_from_compact(
-                    compact_asked,
-                    token.is_some() || subscribed,
-                    unanswered,
-                    asked_at.elapsed(),
-                ) {
-                    compact_asked = false;
-                    compact_fallbacks += 1;
-                    eprintln!(
-                        "{}: no answer to the compact lane: asking without it",
-                        cache.node_id
-                    );
-                    base_repair = base_for(false);
-                    repair = if args.fixed_repair {
-                        base_repair
-                    } else {
-                        RepairPolicy::for_loss(
-                            loss_estimate.unwrap_or(av_mesh::client_udp::UNMEASURED_LOSS),
-                            base_repair,
-                        )
-                    };
-                }
-                // Before the edge answers, keep asking from the same part.
-                subscribe(
-                    &socket,
-                    target,
-                    &args,
-                    if subscribed { None } else { next_part },
-                    repair,
-                    compact_asked.then_some(plan),
-                    token,
-                )
-                .await;
-                last_request_at = Instant::now();
-                if token.is_none() && !subscribed {
-                    unanswered += 1;
-                }
-                next_refresh = now
-                    + if subscribed {
-                        REFRESH
-                    } else {
-                        Duration::from_millis(300)
-                    };
-            }
-            let silence_at = if subscribed {
-                last_datagram + Duration::from_millis(args.silence_ms)
-            } else {
-                asked_at + Duration::from_millis(args.answer_ms)
-            };
             let end = if draining { deadline + drain } else { deadline };
-            let mut wake = end
-                .min(next_refresh)
-                .min(next_loss_check)
-                .min(silence_at + Duration::from_millis(1));
-            if compact_confirmed {
-                if let Some(at) = receiver.compact.next_nack_at() {
-                    wake = wake.min(at);
-                }
-            }
+            let wake = end.min(session.next_wake());
             let wait = wake.saturating_duration_since(now);
             let (len, peer, kernel_us) =
                 match tokio::time::timeout(wait, recv_timestamped(&socket, &mut buf)).await {
@@ -1179,99 +946,35 @@ async fn main() -> Result<()> {
                     Ok(Err(_)) => continue,
                     Err(_) => continue,
                 };
-            if peer.ip() != target.ip() {
-                continue;
+            let dropped = session.short_header_dropped;
+            let outcome =
+                session.on_datagram(peer, &buf[..len], Instant::now(), &mut |to, datagram| {
+                    outbox.push((to, datagram.to_vec()))
+                });
+            flush(&socket, &mut outbox).await;
+            if session.short_header_dropped > dropped {
+                eprintln!(
+                    "{}: the compact lane was refused with the short form: asking with the long form",
+                    cache.node_id
+                );
             }
-            last_datagram = Instant::now();
-            if let Some(control) = Control::decode(&buf[..len]) {
-                match control {
-                    Control::Token { token: given, .. } => {
-                        startup.token_ms.get_or_insert(since_start(started));
-                        if token != Some(given) {
-                            if token.is_none() {
-                                // A request and its answer: the round trip
-                                // that the NACKs wait for.
-                                receiver.compact.set_rtt(
-                                    last_datagram.saturating_duration_since(last_request_at),
-                                );
-                            }
-                            token = Some(given);
-                            subscribe(
-                                &socket,
-                                target,
-                                &args,
-                                next_part,
-                                repair,
-                                compact_asked.then_some(plan),
-                                token,
-                            )
-                            .await;
-                            last_request_at = Instant::now();
-                        }
-                    }
-                    Control::Subscribed {
-                        next_part: first,
-                        compact,
-                        ..
-                    } => {
-                        // An edge older than the short form refuses a plan
-                        // word with it (C...7) and serves the RaptorQ lane:
-                        // asked again at once with the long form (wave 7
-                        // review). An edge that refuses the lane for
-                        // another reason refuses that too.
-                        if drops_short_header(compact, compact_asked, plan) {
-                            short_header = false;
-                            short_header_dropped += 1;
-                            plan = plan.with_short_header(false);
-                            eprintln!(
-                                "{}: the compact lane was refused with the short form: asking with the long form",
-                                cache.node_id
-                            );
-                            next_refresh = Instant::now();
-                            continue;
-                        }
-                        if !subscribed {
-                            startup.subscribed_ms.get_or_insert(since_start(started));
-                            first_subscribed_part.get_or_insert(first);
-                            receiver.expect(args.stream, first, compact);
-                        }
-                        compact_confirmed = compact;
-                        subscribed = true;
-                        next_refresh = Instant::now() + REFRESH;
-                        // An edge that does not serve the compact lane (OK
-                        // without C): the RaptorQ lane's repair, at once.
-                        let wanted_base = base_for(compact);
-                        if wanted_base != base_repair {
-                            base_repair = wanted_base;
-                            repair = if args.fixed_repair {
-                                base_repair
-                            } else {
-                                RepairPolicy::for_loss(
-                                    loss_estimate.unwrap_or(av_mesh::client_udp::UNMEASURED_LOSS),
-                                    base_repair,
-                                )
-                            };
-                            next_refresh = Instant::now();
-                        }
-                    }
-                    Control::Move { reason, .. } | Control::Refused { reason, .. } => {
-                        move_reason = reason;
-                        skip.insert(cache.node_id.clone());
-                        continue 'caches;
-                    }
-                    _ => {}
+            match outcome {
+                Received::Media => {}
+                Received::Move(reason) => {
+                    move_reason = reason;
+                    skip.insert(cache.node_id.clone());
+                    continue 'caches;
                 }
-                continue;
+                _ => continue,
             }
-            let objects = receiver.push_all(&buf[..len]);
-            let fast_envelope = receiver.last_fast_envelope_bytes;
-            let compact_fast = std::mem::take(&mut receiver.last_compact_fast_lane);
+            let fast_envelope = session.receiver.last_fast_envelope_bytes;
+            let compact_fast = std::mem::take(&mut session.receiver.last_compact_fast_lane);
             let arrival_us = now_unix_us();
             let kernel_us = kernel_us.filter(|kernel| *kernel <= arrival_us);
             if let Some(kernel) = kernel_us {
                 host_ms.push(arrival_us.saturating_sub(kernel) as f64 / 1_000.0);
             }
-            for object in objects {
+            while let Some(object) = session.next_object() {
                 let PartObject {
                     kind,
                     part,
@@ -1301,8 +1004,9 @@ async fn main() -> Result<()> {
                         if first_part_ms.is_none() {
                             first_part_ms = Some(since_start(started));
                             startup.first_part_ms = first_part_ms;
-                            startup.first_part_after_named =
-                                first_subscribed_part.map(|named| part.saturating_sub(named));
+                            startup.first_part_after_named = session
+                                .first_subscribed_part
+                                .map(|named| part.saturating_sub(named));
                         }
                         match fast_envelope {
                             Some(envelope) => {
@@ -1370,7 +1074,16 @@ async fn main() -> Result<()> {
         }
     }
     tokio::time::sleep(Duration::from_millis(600)).await;
-    let _ = receiver.take_loss(repair);
+    let _ = session.receiver.take_loss(session.repair);
+    let since = |at: Option<Instant>| {
+        at.map(|at| at.saturating_duration_since(started).as_secs_f64() * 1_000.0)
+    };
+    startup.token_ms = since(session.first_token_at);
+    startup.subscribed_ms = since(session.first_subscribed_at);
+    let receiver = &session.receiver;
+    let repair = session.repair;
+    let plan = session.plan;
+    let compact_asked = session.compact_asked;
     drop(verify_tx);
     let verify = verifier.await.ok();
 
@@ -1397,7 +1110,7 @@ async fn main() -> Result<()> {
     let first = received
         .keys()
         .chain(gaps.iter())
-        .chain(first_subscribed_part.iter())
+        .chain(session.first_subscribed_part.iter())
         .min()
         .copied();
     let last = received.keys().chain(gaps.iter()).max().copied();
@@ -1441,10 +1154,10 @@ async fn main() -> Result<()> {
         lost_datagrams_settled: receiver.lost_datagrams,
         datagram_loss: (receiver.sent_datagrams > 0)
             .then(|| receiver.lost_datagrams as f64 / receiver.sent_datagrams as f64),
-        loss_estimate_max: loss_samples.iter().copied().reduce(f64::max),
+        loss_estimate_max: session.loss_max,
         final_repair_permille: repair.permille,
         final_min_repair: repair.min_symbols,
-        repair_changes,
+        repair_changes: session.repair_changes,
         final_loss_ppm: repair.loss_ppm,
         flows: receiver.flows,
         payload_bytes,
@@ -1453,8 +1166,8 @@ async fn main() -> Result<()> {
         wire_per_payload: (payload_bytes > 0)
             .then(|| receiver.wire_bytes as f64 / payload_bytes as f64),
         compact_asked,
-        compact_fallbacks,
-        compact_short_header_dropped: short_header_dropped,
+        compact_fallbacks: session.compact_fallbacks,
+        compact_short_header_dropped: session.short_header_dropped,
         nack_timing: format!(
             "delay {} us, retry floor {} us, silence {}",
             args.nack_delay_us, args.nack_retry_floor_us, args.silence_nack
@@ -1467,10 +1180,10 @@ async fn main() -> Result<()> {
             .compact
             .rtt()
             .map(|rtt| rtt.as_secs_f64() * 1_000.0),
-        compact_confirmed,
+        compact_confirmed: session.compact_confirmed,
         final_compact_plan: compact_asked.then(|| plan.word()),
-        compact_plan_changes: plan_changes,
-        burst_estimate_max: burst_samples.iter().copied().reduce(f64::max),
+        compact_plan_changes: session.plan_changes,
+        burst_estimate_max: session.burst_max,
         compact: CompactReport {
             datagrams: stats.datagrams,
             parts: stats.parts,
@@ -1480,7 +1193,7 @@ async fn main() -> Result<()> {
             repair_datagrams: stats.repair_datagrams,
             recovered_by_window: stats.recovered,
             nack_parts_sent: stats.nacked,
-            nack_datagrams_sent: nack_datagrams,
+            nack_datagrams_sent: session.nack_datagrams,
             holes_abandoned: stats.abandoned,
             errors: stats.errors,
         },
@@ -1524,24 +1237,6 @@ mod tests {
         let args =
             Args::try_parse_from(base.into_iter().chain(["--playlist-first", "true"])).unwrap();
         assert!(args.playlist_first);
-    }
-
-    /// Wave 7 review: the compact lane is given up only after three
-    /// unanswered requests and 1.5 s, and an edge that refuses the short
-    /// form is asked again with the long form (once: the plan then has none).
-    #[test]
-    fn the_compact_lane_is_given_up_late_and_the_short_form_first() {
-        let second = Duration::from_millis(600);
-        assert!(!falls_back_from_compact(true, false, 3, second));
-        assert!(!falls_back_from_compact(true, false, 2, Duration::from_secs(2)));
-        assert!(falls_back_from_compact(true, false, 3, COMPACT_FALLBACK_AFTER));
-        assert!(!falls_back_from_compact(true, true, 9, Duration::from_secs(9)));
-        assert!(!falls_back_from_compact(false, false, 9, Duration::from_secs(9)));
-        let short = CompactPlan::CLEAN.with_short_header(true);
-        assert!(drops_short_header(false, true, short));
-        assert!(!drops_short_header(true, true, short));
-        assert!(!drops_short_header(false, false, short));
-        assert!(!drops_short_header(false, true, short.with_short_header(false)));
     }
 
     #[test]

@@ -37700,4 +37700,7 @@ mod tests {
     /// Time to first audio (wave 7, item 8): a UDP subscriber is admitted
     /// on the edge's first part and gets it with its OK.
     mod first_audio;
+    /// The load mode: thousands of simulated UDP listeners against an edge
+    /// in this process, and their cost per listener.
+    mod load_mode;
 }
