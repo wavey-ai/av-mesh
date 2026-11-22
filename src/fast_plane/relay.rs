@@ -9,6 +9,7 @@ use super::burst_copy::BurstCopies;
 use super::dedup::FirstArrival;
 use super::edge_clients::{ClientPlan, EdgeFastLane, UpstreamRepair};
 use super::lease::{LeaseChildren, LeaseSnapshot, LeaseSnapshotStats, LeaseTake};
+use super::loss_report::LossMeter;
 use super::sys::{self, RecvBatch, RECV_BATCH};
 use super::view::RlsView;
 use super::{class_addr, StreamClasses, TrafficClass};
@@ -28,7 +29,7 @@ use av_mesh::relay_ingress::{
 use av_mesh::udp_fec::UdpFecReceiver;
 use bytes::Bytes;
 use media_object::ObjectKey;
-use raptorq_datagram_fec::MediaDatagramRole;
+use raptorq_datagram_fec::{MediaDatagramRole, MediaObjectKind};
 use relay_session::RelayLimits;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -81,6 +82,10 @@ pub struct RelayClassConfig {
     /// audio source symbol to the compiled children again this long after
     /// it forwarded it (see `burst_copy`); 0 sends no copy.
     pub burst_copy_ms: u64,
+    /// `--relay-loss-report` (wave 7 item 2): the audio thread measures the
+    /// loss of each parent lane and reports it to the parent (see
+    /// `loss_report`).
+    pub loss_report: bool,
     /// Tests: the tee of this class panics on its first datagram.
     #[cfg(test)]
     pub test_tee_panic: Option<TrafficClass>,
@@ -98,6 +103,7 @@ impl Default for RelayClassConfig {
             edge_clients: None,
             holes: None,
             burst_copy_ms: 0,
+            loss_report: false,
             #[cfg(test)]
             test_tee_panic: None,
         }
@@ -196,6 +202,10 @@ pub struct FastPlaneStats {
     /// full socket).
     pub burst_copies: AtomicU64,
     pub burst_copies_dropped: AtomicU64,
+    /// Loss reports (RLR1) sent to parents, and the highest loss (ppm) that
+    /// the audio thread measures on a parent lane now.
+    pub loss_reports: AtomicU64,
+    pub parent_loss_ppm: AtomicU64,
     /// The lease children, whose counters the snapshot reports.
     pub lease: OnceLock<Arc<LeaseChildren>>,
 }
@@ -225,6 +235,8 @@ pub struct FastPlaneSnapshot {
     pub gso_fallbacks: u64,
     pub burst_copies: u64,
     pub burst_copies_dropped: u64,
+    pub loss_reports: u64,
+    pub parent_loss_ppm: u64,
     pub lease_children: LeaseSnapshotStats,
 }
 
@@ -253,6 +265,8 @@ impl FastPlaneStats {
             gso_fallbacks: load(&self.gso_fallbacks),
             burst_copies: load(&self.burst_copies),
             burst_copies_dropped: load(&self.burst_copies_dropped),
+            loss_reports: load(&self.loss_reports),
+            parent_loss_ppm: load(&self.parent_loss_ppm),
             lease_children: self
                 .lease
                 .get()
@@ -336,6 +350,9 @@ struct PlannedSend {
     message: u16,
     path: u16,
     role: MediaDatagramRole,
+    /// The send takes a burst copy (a source to a compiled child; not the
+    /// one-symbol source of a repair lane).
+    copy: bool,
 }
 
 /// A source symbol held back from a warm repair-only child, buffered for
@@ -554,16 +571,26 @@ impl RelayDownstreamForwarder {
     fn plan_fast(&self, message: usize, view: &RlsView<'_>, plan: &mut ForwardPlan) {
         let role = view.role;
         let mut object = None;
+        // A one-symbol audio object has nothing a repair lane could carry
+        // but its symbol when its parent sent no repair (wave 7 item 2):
+        // the repair-lane child takes the source, so it still has a copy
+        // from this forwarder beside its primary's.
+        let single_symbol = matches!(role, MediaDatagramRole::Source)
+            && view.source_symbols == 1
+            && view.kind == MediaObjectKind::Audio
+            && self.repair_lane_single_symbol();
         for (index, path) in self.paths.iter().enumerate() {
             let promoted = path.promoted.load(Ordering::Relaxed);
-            let failover_source = promoted
-                && path.role == RelayForwardRole::Repair
-                && matches!(role, MediaDatagramRole::Source);
-            if path.role.permits(role) || failover_source {
+            let repair_lane_source =
+                path.role == RelayForwardRole::Repair && matches!(role, MediaDatagramRole::Source);
+            let failover_source = promoted && repair_lane_source;
+            let single_symbol_source = single_symbol && repair_lane_source && !failover_source;
+            if path.role.permits(role) || failover_source || single_symbol_source {
                 plan.groups[path.group].push(PlannedSend {
                     message: message as u16,
                     path: index as u16,
                     role,
+                    copy: !single_symbol_source,
                 });
                 continue;
             }
@@ -748,7 +775,11 @@ struct ClassThread {
     lease: Option<Arc<LeaseChildren>>,
     edge_clients: Option<Arc<EdgeFastLane>>,
     burst_copy_ms: u64,
+    loss_report: bool,
 }
+
+/// How often the audio thread looks at its loss meters.
+const LOSS_POLL: Duration = Duration::from_millis(100);
 
 struct Pending {
     message: usize,
@@ -816,6 +847,13 @@ impl ClassThread {
         let mut copies = (self.class == TrafficClass::Audio && self.forwarder.is_some())
             .then(|| BurstCopies::new(self.burst_copy_ms.saturating_mul(1_000)))
             .flatten();
+        // The loss of each parent lane, on the audio thread.
+        let mut meters: Vec<LossMeter> = if self.loss_report && self.class == TrafficClass::Audio {
+            self.sockets.iter().map(|_| LossMeter::new()).collect()
+        } else {
+            Vec::new()
+        };
+        let mut last_loss_poll = Instant::now();
         while !self.stop.load(Ordering::Relaxed) {
             // No longer than the next copy's due time.
             let timeout = copies
@@ -855,6 +893,7 @@ impl ClassThread {
                         &mut clients,
                         &mut gso,
                         copies.as_mut(),
+                        meters.get_mut(index),
                     );
                     if received < RECV_BATCH {
                         break;
@@ -864,7 +903,28 @@ impl ClassThread {
             if let Some(copies) = copies.as_mut() {
                 self.send_copies(copies);
             }
+            if !meters.is_empty() && last_loss_poll.elapsed() >= LOSS_POLL {
+                last_loss_poll = Instant::now();
+                self.report_loss(&fds, &mut meters, last_loss_poll);
+            }
         }
+    }
+
+    /// Send each parent whose lane's loss changed (or is still above zero)
+    /// its report, from the socket its symbols come to.
+    fn report_loss(&self, fds: &[std::os::fd::RawFd], meters: &mut [LossMeter], now: Instant) {
+        let mut worst = 0_u32;
+        for (index, meter) in meters.iter_mut().enumerate() {
+            if let Some((peer, report)) = meter.poll(now) {
+                if sys::send_batch(fds[index], 1, |_| (&report[..], peer)).unwrap_or(0) == 1 {
+                    self.stats.loss_reports.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            worst = worst.max(meter.loss_ppm());
+        }
+        self.stats
+            .parent_loss_ppm
+            .store(u64::from(worst), Ordering::Relaxed);
     }
 
     /// Send the burst copies that are due, after the batch's own sends.
@@ -904,6 +964,7 @@ impl ClassThread {
         clients: &mut ClientPlan,
         gso: &mut bool,
         copies: Option<&mut BurstCopies>,
+        mut meter: Option<&mut LossMeter>,
     ) {
         let now_us = now_unix_us();
         let now = Instant::now();
@@ -980,6 +1041,9 @@ impl ClassThread {
                 continue;
             }
             self.failover.observe(path, view.role, now);
+            if let Some(meter) = meter.as_deref_mut() {
+                meter.observe(peer, view.packet_sequence, now);
+            }
             let key = dedup.key(
                 view.tenant,
                 view.stream,
@@ -1020,7 +1084,7 @@ impl ClassThread {
                 for (group, sends) in plan.groups.iter().enumerate() {
                     for send in sends
                         .iter()
-                        .filter(|send| matches!(send.role, MediaDatagramRole::Source))
+                        .filter(|send| matches!(send.role, MediaDatagramRole::Source) && send.copy)
                     {
                         copies.push(
                             batch.data(usize::from(send.message)),
@@ -1548,6 +1612,7 @@ pub async fn run_relay_class_ingest(
             lease: config.lease.clone(),
             edge_clients: config.edge_clients.clone(),
             burst_copy_ms: config.burst_copy_ms,
+            loss_report: config.loss_report,
         };
         match std::thread::Builder::new()
             .name(format!("needletail-fast-{}", class.as_str()))

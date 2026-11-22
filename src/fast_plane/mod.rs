@@ -17,6 +17,7 @@ pub mod burst_copy;
 pub mod dedup;
 pub mod edge_clients;
 pub mod lease;
+pub mod loss_report;
 pub mod relay;
 pub mod sys;
 pub mod view;

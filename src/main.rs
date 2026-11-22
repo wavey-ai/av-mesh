@@ -1323,6 +1323,35 @@ struct Args {
     )]
     relay_burst_copy_ms: u64,
 
+    /// Wave 7 item 2: a repair-lane child of the fast plane (a compiled
+    /// child given `:repair`) takes the source symbol of a one-symbol audio
+    /// object as well. The contributor sends a 1 ms part as one symbol with
+    /// no repair on a clean path; without this the repair lane carries
+    /// nothing of it, and the long-haul child has one parent's copy only.
+    /// The source to a repair lane takes no burst copy. `false`: repair only,
+    /// as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_REPAIR_LANE_SINGLE_SYMBOL",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_repair_lane_single_symbol: bool,
+
+    /// Wave 7 item 2: the audio fast-plane thread measures the loss of the
+    /// packet sequences of each parent lane and reports it to the parent
+    /// (RLR1, 16 bytes: when it changes, and once a second while above zero;
+    /// a clean lane sends nothing). The contributor sizes the copies of a
+    /// one-symbol audio part to it (av-contrib --relay-audio-copies
+    /// measured). Needs --relay-class-threads.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_LOSS_REPORT",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_loss_report: bool,
+
     /// Datagrams each class's tee holds before the fast plane drops its tee
     /// copy (counted as tee_dropped; forwarding is never held back).
     #[arg(
@@ -2965,6 +2994,7 @@ async fn main() -> Result<()> {
     if let Some(forwarder) = &relay_forwarder {
         forwarder.set_nonblocking(args.relay_forward_nonblocking);
         forwarder.set_batch(args.relay_forward_batch);
+        forwarder.set_repair_lane_single_symbol(args.relay_repair_lane_single_symbol);
         fast_path_report.record_relay_forward_sockets(
             forwarder.socket_groups.len(),
             forwarder.shared_socket_count(),
@@ -3030,6 +3060,7 @@ async fn main() -> Result<()> {
         tee_capacity: args.relay_class_tee_capacity,
         video_gso: args.relay_video_gso,
         burst_copy_ms: args.relay_burst_copy_ms,
+        loss_report: args.relay_loss_report,
         lease: lease_children,
         edge_clients: fast_lane.clone(),
         holes: hole_trigger.clone(),
@@ -4649,6 +4680,9 @@ struct RelayDownstreamForwarder {
     /// Hand one datagram to every child of a shared source socket, and a
     /// warm-source replay to its child, in one `sendmmsg` call.
     batch: AtomicBool,
+    /// `--relay-repair-lane-single-symbol`: a repair-lane child takes the
+    /// source of a one-symbol audio object (fast plane).
+    repair_lane_single_symbol: AtomicBool,
     hop_journal: OnceLock<Arc<HopJournal>>,
     /// Children whose non-blocking send a test reports as full, as a bit
     /// set of path indexes.
@@ -4794,6 +4828,7 @@ impl RelayDownstreamForwarder {
             failover_last_transition_unix_ms: AtomicU64::new(0),
             nonblocking: AtomicBool::new(true),
             batch: AtomicBool::new(true),
+            repair_lane_single_symbol: AtomicBool::new(true),
             hop_journal: OnceLock::new(),
             #[cfg(test)]
             test_would_block: AtomicU64::new(0),
@@ -5071,6 +5106,16 @@ impl RelayDownstreamForwarder {
                 .with_peer(Some(child)),
         );
     }
+
+    fn set_repair_lane_single_symbol(&self, enabled: bool) {
+        self.repair_lane_single_symbol
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    fn repair_lane_single_symbol(&self) -> bool {
+        self.repair_lane_single_symbol.load(Ordering::Relaxed)
+    }
+
 
     fn set_nonblocking(&self, nonblocking: bool) {
         self.nonblocking.store(nonblocking, Ordering::Relaxed);
@@ -36689,6 +36734,7 @@ mod tests {
                 edge_clients: None,
                 holes: None,
                 burst_copy_ms: 0,
+                loss_report: false,
                 test_tee_panic: Some(fast_plane::TrafficClass::Audio),
             },
         )
@@ -37141,6 +37187,10 @@ mod tests {
     /// Burst copies on the long-haul lanes: a burst of loss cannot take a
     /// part at the next forwarder.
     mod burst_copy;
+
+    /// Copies sized to loss: a repair lane carries a one-symbol audio
+    /// part's symbol, and parent lanes hear their measured loss.
+    mod repair_lane;
 
     /// An edge's fixed costs per part from its hop journal: receipt, wake,
     /// work and the send to its UDP clients.
