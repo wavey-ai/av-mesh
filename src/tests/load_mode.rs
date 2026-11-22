@@ -324,6 +324,16 @@ fn load_mode_counts_every_part_of_every_listener() {
     let bucketed: u64 = buckets.iter().map(|pair| pair[1].as_u64().unwrap()).sum();
     assert_eq!(bucketed, parts, "the buckets hold every part");
     assert_eq!(total["ttfp_ms"]["count"], 20);
+    // Each listener's OK, no later than its first part (wave 7 item 8: the
+    // first part comes with the OK).
+    assert_eq!(total["ttok_ms"]["count"], 20, "{summary:#}");
+    assert!(
+        total["ttok_ms"]["p50"].as_f64().unwrap() <= total["ttfp_ms"]["p50"].as_f64().unwrap(),
+        "{summary:#}"
+    );
+    // The wave 7 lanes: the compact lane in the short form, never given up.
+    assert_eq!(total["compact_fallbacks"], 0, "{summary:#}");
+    assert_eq!(total["short_header_dropped"], 0, "{summary:#}");
     assert_eq!(total["listeners_with_parts"], 20);
     assert_eq!(summary["per_edge"].as_object().unwrap().len(), 1);
     // One line an interval, and the final one after the drain.

@@ -217,10 +217,19 @@ pub struct Counters {
     /// accounting began again.
     pub resets: u64,
     pub first_parts: u64,
+    /// Edges that did not answer a listener's compact `SUB` in 1.5 s and
+    /// were asked without the compact lane (the RaptorQ lane from then on),
+    /// and edges that refused the short form and were asked with the long
+    /// form (wave 7).
+    pub compact_fallbacks: u64,
+    pub short_header_dropped: u64,
     /// Publication to arrival of each new part, µs.
     pub latency: Histogram,
     /// Listener start (its first `SUB`) to its first part, µs.
     pub ttfp: Histogram,
+    /// Listener start to its first `OK`, µs: with `ttfp`, the time to first
+    /// audio split into the handshake and the first part after it.
+    pub ttok: Histogram,
     /// Kernel receive timestamp to processing, µs: the load host's own lag.
     pub recv_lag: Histogram,
 }
@@ -249,8 +258,11 @@ impl Counters {
         self.truncated += other.truncated;
         self.resets += other.resets;
         self.first_parts += other.first_parts;
+        self.compact_fallbacks += other.compact_fallbacks;
+        self.short_header_dropped += other.short_header_dropped;
         self.latency.merge(&other.latency);
         self.ttfp.merge(&other.ttfp);
+        self.ttok.merge(&other.ttok);
         self.recv_lag.merge(&other.recv_lag);
     }
 
@@ -284,8 +296,11 @@ impl Counters {
             "truncated": self.truncated,
             "resets": self.resets,
             "first_parts": self.first_parts,
+            "compact_fallbacks": self.compact_fallbacks,
+            "short_header_dropped": self.short_header_dropped,
             "latency_ms": self.latency.summary_ms(),
             "ttfp_ms": self.ttfp.summary_ms(),
+            "ttok_ms": self.ttok.summary_ms(),
             "recv_lag_ms": self.recv_lag.summary_ms(),
         });
         if gauges {
@@ -735,6 +750,8 @@ struct Seen {
     datagrams: u64,
     wire: u64,
     errors: u64,
+    compact_fallbacks: u64,
+    short_header_dropped: u64,
 }
 
 struct Listener {
@@ -744,6 +761,7 @@ struct Listener {
     session: UdpSession,
     started: Instant,
     first_part: bool,
+    subscribed_once: bool,
     track: Box<PartTrack>,
     scheduled: Instant,
     seen: Seen,
@@ -847,6 +865,16 @@ fn handle_datagram(
             if first {
                 track.begin(next_part);
             }
+            if !listener.subscribed_once {
+                listener.subscribed_once = true;
+                let lag_us = datagram
+                    .kernel_us
+                    .map_or(0, |kernel_us| now_us.saturating_sub(kernel_us));
+                edge.ttok.record(
+                    (now.saturating_duration_since(listener.started).as_micros() as u64)
+                        .saturating_sub(lag_us),
+                );
+            }
             return None;
         }
         Received::Move(reason) => return Some(reason),
@@ -944,6 +972,8 @@ fn collect_one(listener: &mut Listener, counters: &mut [Counters], gauges: bool)
             datagrams: receiver.datagrams,
             wire: receiver.wire_bytes,
             errors: receiver.errors,
+            compact_fallbacks: listener.session.compact_fallbacks,
+            short_header_dropped: listener.session.short_header_dropped,
         };
         let seen = listener.seen;
         edge.recovered += now.recovered.saturating_sub(seen.recovered);
@@ -954,6 +984,10 @@ fn collect_one(listener: &mut Listener, counters: &mut [Counters], gauges: bool)
         edge.datagrams += now.datagrams.saturating_sub(seen.datagrams);
         edge.bytes_in += now.wire.saturating_sub(seen.wire);
         edge.decode_errors += now.errors.saturating_sub(seen.errors);
+        edge.compact_fallbacks += now.compact_fallbacks.saturating_sub(seen.compact_fallbacks);
+        edge.short_header_dropped += now
+            .short_header_dropped
+            .saturating_sub(seen.short_header_dropped);
         listener.seen = now;
     }
 }
@@ -1055,6 +1089,7 @@ fn worker(worker: usize, config: Arc<LoadConfig>, shared: Arc<Shared>, tx: mpsc:
                     session,
                     started: now,
                     first_part: false,
+                    subscribed_once: false,
                     track: PartTrack::new(),
                     scheduled,
                     seen: Seen::default(),
@@ -1751,8 +1786,11 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
             "truncated": counters.truncated,
             "resets": counters.resets,
             "listeners_with_parts": counters.first_parts,
+            "compact_fallbacks": counters.compact_fallbacks,
+            "short_header_dropped": counters.short_header_dropped,
             "latency_ms": counters.latency.summary_with_buckets(),
             "ttfp_ms": counters.ttfp.summary_with_buckets(),
+            "ttok_ms": counters.ttok.summary_with_buckets(),
             "recv_lag_ms": counters.recv_lag.summary_with_buckets(),
         })
     };
