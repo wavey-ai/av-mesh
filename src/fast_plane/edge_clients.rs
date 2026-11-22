@@ -1668,7 +1668,16 @@ impl Fanout {
                 let in_hand = Arc::clone(&in_hand);
                 std::thread::Builder::new()
                     .name(format!("nt-fanout-{}{index}", class.as_str()))
-                    .spawn(move || run_fanout(&work_rx, &free_tx, &lane, class, &in_hand))?
+                    .spawn(move || {
+                        // Not the class thread's real-time priority or CPU.
+                        if let Err(error) = sys::set_ordinary() {
+                            tracing::warn!(
+                                error,
+                                "a fan-out thread keeps the class thread's scheduling"
+                            );
+                        }
+                        run_fanout(&work_rx, &free_tx, &lane, class, &in_hand);
+                    })?
             };
             shards.push(FanoutShard {
                 work: Some(work_tx),

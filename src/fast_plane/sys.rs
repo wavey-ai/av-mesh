@@ -848,6 +848,39 @@ pub fn set_fifo(priority: i32) -> Result<(), String> {
     }
 }
 
+/// Run the calling thread as an ordinary one: SCHED_OTHER at nice 0, on
+/// the CPUs of the process's main thread. A thread inherits the policy, the
+/// priority and the CPUs of the thread that started it: a helper started by
+/// a SCHED_FIFO class thread pinned to one CPU would otherwise share that
+/// CPU with it at its priority, and hold it.
+pub fn set_ordinary() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let param = libc::sched_param { sched_priority: 0 };
+        // SAFETY: pid 0 is the calling thread; the parameter is valid.
+        if unsafe { libc::sched_setscheduler(0, libc::SCHED_OTHER, &param) } != 0 {
+            return Err(format!("SCHED_OTHER: {}", io::Error::last_os_error()));
+        }
+        set_nice(0)?;
+        // SAFETY: a zeroed cpu_set_t is valid; sched_getaffinity writes at
+        // most its size; getpid is the main thread's id.
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            let size = std::mem::size_of::<libc::cpu_set_t>();
+            if libc::sched_getaffinity(libc::getpid(), size, &mut set) != 0
+                || libc::sched_setaffinity(0, size, &set) != 0
+            {
+                return Err(format!("CPUs of the process: {}", io::Error::last_os_error()));
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(())
+    }
+}
+
 /// Set the nice value of the calling thread.
 pub fn set_nice(nice: i32) -> Result<(), String> {
     #[cfg(target_os = "linux")]
@@ -903,6 +936,28 @@ mod tests {
             }
             Err(error) => assert_eq!(error.raw_os_error(), Some(libc::EPERM)),
         }
+    }
+
+    /// A helper of a pinned thread runs on the process's CPUs again.
+    #[test]
+    fn an_ordinary_thread_runs_on_the_cpus_of_the_process() {
+        let count = |set: &libc::cpu_set_t| unsafe { libc::CPU_COUNT(set) };
+        let affinity = |tid: libc::pid_t| unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::sched_getaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &mut set);
+            set
+        };
+        let process = count(&affinity(unsafe { libc::getpid() }));
+        std::thread::spawn(move || {
+            crate::fast_path::pin_current_thread(0).unwrap();
+            assert_eq!(count(&affinity(0)), 1);
+            set_ordinary().unwrap();
+            assert_eq!(count(&affinity(0)), process);
+            let policy = unsafe { libc::sched_getscheduler(0) };
+            assert_eq!(policy, libc::SCHED_OTHER);
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
