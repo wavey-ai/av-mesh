@@ -1235,6 +1235,20 @@ struct Args {
     )]
     relay_class_realtime: bool,
 
+    /// The video fast-plane thread hands each child a batch's 4K symbols as
+    /// UDP GSO messages (UDP_SEGMENT, up to 64 symbols in one pass through
+    /// the stack) instead of one send per symbol per child. The per-symbol,
+    /// per-child send was what saturated the relays at 25 Mbit/s 4K. A host
+    /// without UDP GSO is detected on the first send and the thread goes on
+    /// without it. `false` sends every symbol on its own.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_VIDEO_GSO",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_video_gso: bool,
+
     /// Datagrams each class's tee holds before the fast plane drops its tee
     /// copy (counted as tee_dropped; forwarding is never held back).
     #[arg(
@@ -2620,6 +2634,7 @@ async fn main() -> Result<()> {
         cpus: args.relay_class_cpus.0,
         realtime: args.relay_class_realtime,
         tee_capacity: args.relay_class_tee_capacity,
+        video_gso: args.relay_video_gso,
         ..Default::default()
     };
     let fec_ingest_task = match (fec_socket, class_sockets) {
@@ -34458,6 +34473,105 @@ mod tests {
         relay.stop().await;
     }
 
+    /// A 4K object forwarded by the video thread to two children, with or
+    /// without UDP GSO: every child receives every symbol once, byte for
+    /// byte and in order; with GSO the symbols leave in a few messages.
+    async fn forward_a_4k_object(video_gso: bool) -> fast_plane::relay::FastPlaneSnapshot {
+        let (first_audio, first_video) = bind_class_pair(1_000).await;
+        let (second_audio, second_video) = bind_class_pair(1_000).await;
+        let relay = start_fast_relay_with(
+            ParentPath::Secondary,
+            &[
+                (first_audio.local_addr().unwrap(), RelayForwardRole::All),
+                (second_audio.local_addr().unwrap(), RelayForwardRole::Source),
+            ],
+            fast_plane::relay::RelayClassConfig {
+                port_offset: 1_000,
+                cpus: [None, None],
+                realtime: false,
+                tee_capacity: 4_096,
+                video_gso,
+                ..Default::default()
+            },
+        )
+        .await;
+        let deadline = now_unix_us() + 5_000_000;
+        let part: Vec<u8> = (0..200_000_u32).map(|byte| (byte % 251) as u8).collect();
+        let bundle = encode_test_canonical_fmp4_bundle_with_duration(1, 0, None, &part, None, true);
+        let (sources, _) = fast_test_symbols(
+            &bundle,
+            relay_session::MediaPriority::VideoKey,
+            1_152,
+            1_024,
+            0,
+            deadline,
+        );
+        assert!(
+            sources.len() > 150,
+            "a 4K part of {} symbols",
+            sources.len()
+        );
+        // As the contributor sends the primary lane: the part's source
+        // symbols in one burst.
+        let symbols = sources.clone();
+        for symbol in &symbols {
+            relay
+                .primary_sender
+                .send_to(symbol, relay.primary_video.unwrap())
+                .await
+                .unwrap();
+        }
+        let first = receive_all(&first_video, symbols.len()).await;
+        let second = receive_all(&second_video, sources.len()).await;
+        assert_nothing_more(&first_video).await;
+        assert_nothing_more(&second_video).await;
+        assert_nothing_more(&first_audio).await;
+        let first: Vec<Vec<u8>> = first.into_iter().map(|(bytes, _)| bytes).collect();
+        let second: Vec<Vec<u8>> = second.into_iter().map(|(bytes, _)| bytes).collect();
+        assert_eq!(
+            first, symbols,
+            "a child of every role has every symbol in order"
+        );
+        assert_eq!(second, sources, "a source child has every source in order");
+        wait_for_part(&relay.cache, 1, 0).await;
+        let stats = relay.stats();
+        assert_eq!(
+            stats.video_forwarded,
+            (symbols.len() + sources.len()) as u64
+        );
+        relay.stop().await;
+        stats
+    }
+
+    #[tokio::test]
+    async fn fast_plane_video_leaves_in_gso_messages_and_arrives_as_sent() {
+        let with_gso = forward_a_4k_object(true).await;
+        if with_gso.gso_fallbacks == 0 {
+            assert_eq!(with_gso.gso_datagrams, with_gso.video_forwarded);
+            // About 64 symbols a message: a handful of passes through the
+            // stack instead of one for each of hundreds of symbols.
+            assert!(
+                with_gso.gso_messages * 8 < with_gso.gso_datagrams,
+                "{with_gso:?}"
+            );
+        } else {
+            assert_eq!(with_gso.gso_messages, 0, "the fallback sends every symbol");
+        }
+        let without = forward_a_4k_object(false).await;
+        assert_eq!(without.gso_datagrams, 0);
+        assert_eq!(without.gso_messages, 0);
+        assert_eq!(without.gso_fallbacks, 0);
+    }
+
+    #[test]
+    fn the_relay_video_gso_flag_defaults_on_and_can_be_turned_off() {
+        let args = Args::try_parse_from(["av-mesh"]).unwrap();
+        assert!(args.relay_video_gso);
+        assert!(fast_plane::relay::RelayClassConfig::default().video_gso);
+        let args = Args::try_parse_from(["av-mesh", "--relay-video-gso", "false"]).unwrap();
+        assert!(!args.relay_video_gso);
+    }
+
     #[tokio::test]
     async fn fast_plane_forwards_everything_when_its_tee_is_full() {
         let (child, _) = bind_class_pair(1_000).await;
@@ -34932,6 +35046,7 @@ mod tests {
                 cpus: [None, None],
                 realtime: false,
                 tee_capacity: 1_024,
+                video_gso: true,
                 test_tee_panic: Some(fast_plane::TrafficClass::Audio),
             },
         )

@@ -61,6 +61,10 @@ pub struct RelayClassConfig {
     /// Audio at SCHED_FIFO 10, video at nice -10, where the host allows.
     pub realtime: bool,
     pub tee_capacity: usize,
+    /// `--relay-video-gso`: the video thread hands each child the symbols
+    /// of a drained batch as UDP GSO messages (one pass through the stack
+    /// for up to 64 symbols) instead of one `sendmmsg` entry per symbol.
+    pub video_gso: bool,
     /// Tests: the tee of this class panics on its first datagram.
     #[cfg(test)]
     pub test_tee_panic: Option<TrafficClass>,
@@ -73,6 +77,7 @@ impl Default for RelayClassConfig {
             cpus: [None, None],
             realtime: true,
             tee_capacity: DEFAULT_TEE_CAPACITY,
+            video_gso: true,
             #[cfg(test)]
             test_tee_panic: None,
         }
@@ -161,6 +166,12 @@ pub struct FastPlaneStats {
     pub realtime_threads: AtomicU64,
     pub pinned_threads: AtomicU64,
     pub threads: AtomicU64,
+    /// Video datagrams sent inside UDP GSO messages.
+    pub gso_datagrams: AtomicU64,
+    /// UDP GSO messages (each one pass through the stack).
+    pub gso_messages: AtomicU64,
+    /// Threads that found UDP GSO unavailable and send without it.
+    pub gso_fallbacks: AtomicU64,
 }
 
 /// What `/api/mesh` reports of the fast plane.
@@ -183,6 +194,9 @@ pub struct FastPlaneSnapshot {
     pub send_errors: u64,
     pub truncated: u64,
     pub kernel_dropped: u64,
+    pub gso_datagrams: u64,
+    pub gso_messages: u64,
+    pub gso_fallbacks: u64,
 }
 
 impl FastPlaneStats {
@@ -205,6 +219,9 @@ impl FastPlaneStats {
             send_errors: load(&self.send_errors),
             truncated: load(&self.truncated),
             kernel_dropped: load(&self.kernel_dropped),
+            gso_datagrams: load(&self.gso_datagrams),
+            gso_messages: load(&self.gso_messages),
+            gso_fallbacks: load(&self.gso_fallbacks),
         }
     }
 }
@@ -411,13 +428,16 @@ impl RelayDownstreamForwarder {
     }
 
     /// Send a plan: one non-blocking `sendmmsg` per source socket, then one
-    /// more try for what the kernel did not take. Never waits.
+    /// more try for what the kernel did not take. Never waits. With `gso`
+    /// (video only) a child's run of equal symbols is one UDP GSO message;
+    /// a host without UDP GSO clears `gso` and the batch goes without it.
     fn send_fast_plan(
         &self,
         class: TrafficClass,
         batch: &RecvBatch,
         plan: &mut ForwardPlan,
         stats: &FastPlaneStats,
+        gso: &mut bool,
     ) {
         let ForwardPlan {
             groups,
@@ -431,14 +451,40 @@ impl RelayDownstreamForwarder {
             }
             let fd = self.class_fd(class, group);
             let started = Instant::now();
-            let sent = sys::send_batch(fd, sends.len(), |index| {
+            let message = |index: usize| {
                 let send = sends[index];
                 (
                     batch.data(usize::from(send.message)),
                     self.class_target(class, usize::from(send.path)),
                 )
-            })
-            .unwrap_or(0);
+            };
+            let mut sent = None;
+            if *gso && class == TrafficClass::Video {
+                match sys::send_gso_batch(fd, sends.len(), message) {
+                    Ok(gso_sent) => {
+                        stats
+                            .gso_datagrams
+                            .fetch_add(gso_sent.datagrams as u64, Ordering::Relaxed);
+                        stats
+                            .gso_messages
+                            .fetch_add(gso_sent.messages as u64, Ordering::Relaxed);
+                        sent = Some(gso_sent.datagrams);
+                    }
+                    Err(error) if sys::gso_unsupported(&error) => {
+                        *gso = false;
+                        stats.gso_fallbacks.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            error = %error,
+                            "UDP GSO is unavailable: the video thread sends each symbol on its own"
+                        );
+                    }
+                    Err(_) => sent = Some(0),
+                }
+            }
+            let sent = match sent {
+                Some(sent) => sent,
+                None => sys::send_batch(fd, sends.len(), message).unwrap_or(0),
+            };
             let sent_us = now_unix_us();
             let elapsed = started.elapsed();
             for send in &sends[..sent] {
@@ -489,6 +535,7 @@ struct ClassThread {
     stop: Arc<AtomicBool>,
     cpu: Option<usize>,
     realtime: bool,
+    video_gso: bool,
 }
 
 struct Pending {
@@ -546,6 +593,8 @@ impl ClassThread {
             |forwarder| ForwardPlan::new(forwarder.socket_groups.len(), forwarder.warm_paths()),
         );
         let mut pending = Vec::with_capacity(RECV_BATCH);
+        // UDP GSO for video until the host refuses it once.
+        let mut gso = self.video_gso && self.class == TrafficClass::Video;
         let mut kernel_dropped = vec![0_u32; self.sockets.len()];
         while !self.stop.load(Ordering::Relaxed) {
             let ready = match sys::wait_readable(&fds, STOP_POLL_MS) {
@@ -578,6 +627,7 @@ impl ClassThread {
                         &mut dedup,
                         &mut plan,
                         &mut pending,
+                        &mut gso,
                     );
                     if received < RECV_BATCH {
                         break;
@@ -596,6 +646,7 @@ impl ClassThread {
         dedup: &mut FirstArrival,
         plan: &mut ForwardPlan,
         pending: &mut Vec<Pending>,
+        gso: &mut bool,
     ) {
         let now_us = now_unix_us();
         let now = Instant::now();
@@ -683,7 +734,7 @@ impl ClassThread {
             });
         }
         if let Some(forwarder) = &self.forwarder {
-            forwarder.send_fast_plan(class, batch, plan, &self.stats);
+            forwarder.send_fast_plan(class, batch, plan, &self.stats, gso);
             // Held-back sources are kept only once every child has its
             // datagrams, in this class's own buffers.
             forwarder.buffer_fast_warm(class, batch, plan, now_us);
@@ -1122,6 +1173,7 @@ pub async fn run_relay_class_ingest(
             stop: Arc::clone(&stop),
             cpu: config.cpus[class.index()],
             realtime: config.realtime,
+            video_gso: config.video_gso,
         };
         match std::thread::Builder::new()
             .name(format!("needletail-fast-{}", class.as_str()))
@@ -1173,6 +1225,7 @@ pub async fn run_relay_class_ingest(
     info!(
         threads = threads.len(),
         port_offset = config.port_offset,
+        video_gso = config.video_gso,
         children = forwarder
             .as_ref()
             .map_or(0, |forwarder| forwarder.paths.len()),
