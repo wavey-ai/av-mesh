@@ -166,26 +166,46 @@ impl CompactPlan {
     }
 
     /// The plan for a path that loses `loss` of the datagrams, in losses of
-    /// `burst` datagrams in a row on average. Copies keep a random loss from
+    /// `burst` compact datagrams in a row on average (copies included, see
+    /// [`CompactReceiver::take_burst`]). Copies keep a random loss from
     /// delaying a part (until fewer than [`RESIDUAL_TARGET`] of the parts
-    /// would need a NACK); they share a burst, so a bursty path gets at
-    /// most one and more window repair instead.
+    /// would need a NACK). A part's copies go out right behind it, so a
+    /// burst takes them with it: a bursty path gets no copies, and window
+    /// repair rows for the burst instead (a burst of `b` parts in a window
+    /// is recovered from `b` rows).
     pub fn for_measured(loss: f64, burst: f64) -> Self {
+        Self::for_measured_with(loss, burst, true)
+    }
+
+    /// [`Self::for_measured`], or with `burst_rows` false the plan of
+    /// before (needletail-udp-client `--compact-burst-rows false`): a
+    /// bursty path keeps one copy and gets at most two more rows.
+    pub fn for_measured_with(loss: f64, burst: f64, burst_rows: bool) -> Self {
         if !(loss >= CLEAN_LOSS) {
             return Self::CLEAN;
         }
         let planned = (loss * 1.5 + 0.002).min(0.3);
-        let bursty = burst >= 2.0;
+        let window = 16_u8;
+        if burst_rows && burst >= 2.0 {
+            let expected = planned * f64::from(window);
+            let rows = 1 + expected.ceil() as u8 + (burst.ceil() as u8).saturating_sub(1).min(4);
+            return Self {
+                copies: 0,
+                window,
+                window_repair: rows.min(MAX_WINDOW_REPAIR),
+            }
+            .bounded();
+        }
         let mut copies = 0_u8;
         let mut residual = planned;
         while residual > RESIDUAL_TARGET && copies < MAX_COPIES {
             copies += 1;
             residual *= planned;
         }
+        let bursty = burst >= 2.0;
         if bursty && copies > 1 {
             copies = 1;
         }
-        let window = 16_u8;
         let expected = residual * f64::from(window);
         let mut window_repair = 1 + expected.ceil() as u8;
         if bursty {
@@ -1136,8 +1156,11 @@ impl CompactReceiver {
 
     /// Settle the counts of parts and windows older than the settle time:
     /// (datagrams received, datagrams sent) of the originals and copies of
-    /// parts and of window repair since the last call. Runs of parts lost
-    /// whole are counted as bursts.
+    /// parts and of window repair since the last call. Runs of datagrams
+    /// lost in a row are counted as bursts: all the datagrams of a part
+    /// lost whole, and the lost ones of a part that came (which end the
+    /// run). A copy lost with its part is part of the burst, so a burst
+    /// that copies cannot beat reads as one.
     pub fn take_counts(&mut self, now: Instant) -> (u64, u64) {
         let settled: Vec<u64> = self
             .counts
@@ -1148,11 +1171,11 @@ impl CompactReceiver {
         let (mut received, mut sent) = (0_u64, 0_u64);
         for part in settled {
             let count = self.counts.remove(&part).unwrap();
-            received += u64::from(count.received.min(count.sent));
+            let came = count.received.min(count.sent);
+            received += u64::from(came);
             sent += u64::from(count.sent);
-            if count.received == 0 {
-                self.run += 1;
-            } else if self.run > 0 {
+            self.run += u64::from(count.sent - came);
+            if came > 0 && self.run > 0 {
                 self.burst_sum += self.run;
                 self.burst_runs += 1;
                 self.run = 0;
@@ -1177,8 +1200,8 @@ impl CompactReceiver {
         (received, sent)
     }
 
-    /// The mean length of the runs of parts lost whole since the last call,
-    /// if any run ended.
+    /// The mean length of the runs of compact datagrams lost in a row since
+    /// the last call, if any run ended.
     pub fn take_burst(&mut self) -> Option<f64> {
         if self.burst_runs == 0 {
             return None;
@@ -1568,8 +1591,9 @@ mod tests {
         let mut receiver = CompactReceiver::new();
         receiver.expect_from(0, true);
         let start = Instant::now();
-        // Parts 0..100 with one copy each; parts 10..13 lost whole (a burst
-        // of three), part 50's copy lost.
+        // Parts 0..100 with one copy each; parts 10..13 lost whole with
+        // their copies (a burst of six datagrams), part 50's copy lost (a
+        // burst of one).
         for part in 0..100_u64 {
             let mut datagram = encode_part(part, 0, &payload(part, 20)).unwrap();
             set_flags(&mut datagram, 1, false);
@@ -1584,7 +1608,47 @@ mod tests {
         let (received, sent) = receiver.take_counts(start + SETTLE);
         assert_eq!(sent, 200);
         assert_eq!(received, 200 - 6 - 1);
-        assert_eq!(receiver.take_burst(), Some(3.0));
+        assert_eq!(receiver.take_burst(), Some(3.5));
         assert_eq!(receiver.take_burst(), None);
+    }
+
+    /// With back-to-back copies, a burst that takes one part takes its
+    /// copy: the bursts read in datagrams make a gemodel path bursty (a
+    /// count of parts lost whole read about one), and its plan then sends
+    /// no copies but window rows for the burst.
+    #[test]
+    fn a_burst_that_takes_a_part_and_its_copy_reads_as_a_burst() {
+        let mut receiver = CompactReceiver::new();
+        receiver.expect_from(0, true);
+        let start = Instant::now();
+        // A burst of four datagrams (parts 10 and 11 and their copies), one
+        // of one (part 30's copy: a part that came ends a run) and one of
+        // two (part 31 and its copy): 7 / 3.
+        let lost = |part: u64, copy: bool| match part {
+            10 | 11 | 31 => true,
+            30 => copy,
+            _ => false,
+        };
+        for part in 0..60_u64 {
+            let mut datagram = encode_part(part, 0, &payload(part, 20)).unwrap();
+            set_flags(&mut datagram, 1, false);
+            for copy in [false, true] {
+                if !lost(part, copy) {
+                    receiver.push(&datagram, start, 0);
+                }
+            }
+        }
+        receiver.take_counts(start + SETTLE);
+        let burst = receiver.take_burst().unwrap();
+        assert!((burst - 7.0 / 3.0).abs() < 1e-9, "{burst}");
+        let plan = CompactPlan::for_measured(0.048, burst);
+        assert_eq!(plan.copies, 0, "{plan:?}");
+        assert!(plan.window_repair >= 4, "{plan:?}");
+        // Random loss: copies, as before.
+        let random = CompactPlan::for_measured(0.01, 1.0);
+        assert_eq!(random.copies, 1);
+        // The plan of before, for the A/B: one copy and two more rows.
+        let before = CompactPlan::for_measured_with(0.048, burst, false);
+        assert_eq!((before.copies, before.window_repair), (1, 4), "{before:?}");
     }
 }

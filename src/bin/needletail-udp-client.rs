@@ -120,6 +120,12 @@ struct Args {
     /// asked again without it.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     compact: bool,
+    /// On a path whose losses come in bursts (runs of two or more compact
+    /// datagrams, copies included), plan no copies (a part's copies go out
+    /// right behind it and a burst takes them too) and window repair rows
+    /// for the burst. `false`: one copy and at most two more rows, as before.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    compact_burst_rows: bool,
 }
 
 fn now_unix_us() -> u64 {
@@ -791,8 +797,11 @@ async fn main() -> Result<()> {
                             repair_changes += 1;
                             next_refresh = now;
                         }
-                        let wanted =
-                            CompactPlan::for_measured(smooth, burst_estimate.unwrap_or(1.0));
+                        let wanted = CompactPlan::for_measured_with(
+                            smooth,
+                            burst_estimate.unwrap_or(1.0),
+                            args.compact_burst_rows,
+                        );
                         if wanted != plan {
                             plan = wanted;
                             plan_changes += 1;
