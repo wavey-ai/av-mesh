@@ -126,10 +126,34 @@ struct Args {
     /// for the burst. `false`: one copy and at most two more rows, as before.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     compact_burst_rows: bool,
+    /// Wait before the first NACK of a hole that a later part showed, in
+    /// µs (wave 6: 250; before, 1,000, when the cache-fed lane could trail
+    /// its fast-lane neighbours).
+    #[arg(long, default_value_t = av_mesh::client_compact::FAST_NACK_DELAY.as_micros() as u64)]
+    nack_delay_us: u64,
+    /// The floor of the wait between NACKs of a hole, in µs (one and a half
+    /// round trips when longer; wave 6: 2,000; before, 5,000).
+    #[arg(long, default_value_t = av_mesh::client_compact::FAST_NACK_RETRY.as_micros() as u64)]
+    nack_retry_floor_us: u64,
+    /// NACK the parts that are due when no part has come for an interval
+    /// and a margin past the next one's due time, and again each interval
+    /// while the silence lasts (a burst on the path), up to 50 ms. `false`:
+    /// a hole is asked for only once a later part shows it, as before.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    silence_nack: bool,
+    /// At the end of the run, keep receiving for up to this long (ms) to
+    /// fill the holes among the parts received so far, by NACK, so that a
+    /// part lost just before the end is not counted missing; parts past the
+    /// last one are not taken. 0: stop at the end, as before.
+    #[arg(long, default_value_t = 300)]
+    drain_ms: u64,
     /// Write one line for each part received, in part order: part number,
     /// arrival time (Unix µs), bytes, publication and availability times as
-    /// the object carries them. With --write-parts, a measurement tool can
-    /// find each part's bytes (the lengths give the offsets).
+    /// the object carries them, and the kernel's receive time of the
+    /// datagram (Unix µs, SO_TIMESTAMPNS; 0 where the host gives none):
+    /// arrival minus kernel time is the delay on the listener's host. With
+    /// --write-parts, a measurement tool can find each part's bytes (the
+    /// lengths give the offsets).
     #[arg(long)]
     arrivals: Option<PathBuf>,
 }
@@ -408,6 +432,9 @@ struct Report {
     compact_fallbacks: u64,
     /// The round trip to the edge that the NACKs wait for.
     nack_rtt_ms: Option<f64>,
+    /// The NACK timing asked for, and the interval between parts measured.
+    nack_timing: String,
+    part_interval_ms: Option<f64>,
     compact_confirmed: bool,
     final_compact_plan: Option<String>,
     compact_plan_changes: u64,
@@ -428,6 +455,9 @@ struct Report {
     fast_epoch_changes: u64,
     verify: Option<VerifyReport>,
     publish_to_arrival_ms: Percentiles,
+    /// Each datagram's kernel receive time -> the client read it: the
+    /// listener host's own delay (scheduling, a busy CPU).
+    kernel_to_arrival_ms: Percentiles,
     available_to_arrival_ms: Percentiles,
     time_to_first_part_ms: Option<f64>,
 }
@@ -505,6 +535,91 @@ fn set_receive_buffer(socket: &UdpSocket, bytes: usize) {
     }
 }
 
+/// Ask for the kernel's receive time of every datagram (SO_TIMESTAMPNS).
+fn enable_kernel_timestamps(socket: &UdpSocket) {
+    use std::os::fd::AsRawFd;
+    let on: libc::c_int = 1;
+    // SAFETY: a valid fd and an int option of its size.
+    let _ = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_TIMESTAMPNS,
+            (&on as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+}
+
+/// Receive one datagram, with its sender and the kernel's receive time
+/// (Unix µs) when the socket gives one.
+async fn recv_timestamped(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, SocketAddr, Option<u64>)> {
+    use std::os::fd::AsRawFd;
+    socket
+        .async_io(tokio::io::Interest::READABLE, || {
+            let mut address: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+            let mut control = [0_u64; 8];
+            let mut iov = libc::iovec {
+                iov_base: buf.as_mut_ptr().cast(),
+                iov_len: buf.len(),
+            };
+            // SAFETY: every pointer is to a buffer that lives for the call.
+            let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+            message.msg_name = std::ptr::from_mut(&mut address).cast();
+            message.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            message.msg_iov = &mut iov;
+            message.msg_iovlen = 1;
+            message.msg_control = control.as_mut_ptr().cast();
+            message.msg_controllen = std::mem::size_of_val(&control) as _;
+            let len = unsafe {
+                libc::recvmsg(socket.as_raw_fd(), &mut message, libc::MSG_DONTWAIT)
+            };
+            if len < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut kernel_us = None;
+            // SAFETY: the kernel filled msg_control with well-formed cmsg
+            // headers up to msg_controllen; CMSG_* walk only inside it.
+            unsafe {
+                let mut cmsg = libc::CMSG_FIRSTHDR(&message);
+                while !cmsg.is_null() {
+                    if (*cmsg).cmsg_level == libc::SOL_SOCKET
+                        && (*cmsg).cmsg_type == libc::SCM_TIMESTAMPNS
+                    {
+                        let time =
+                            std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::timespec>());
+                        kernel_us = Some(
+                            (time.tv_sec as u64)
+                                .saturating_mul(1_000_000)
+                                .saturating_add(time.tv_nsec as u64 / 1_000),
+                        );
+                    }
+                    cmsg = libc::CMSG_NXTHDR(&message, cmsg);
+                }
+            }
+            // SAFETY: the kernel wrote an address of msg_namelen bytes.
+            let peer = unsafe {
+                socket2::SockAddr::try_init(|target, target_len| {
+                    std::ptr::copy_nonoverlapping(
+                        std::ptr::from_ref(&address).cast::<u8>(),
+                        target.cast::<u8>(),
+                        message.msg_namelen as usize,
+                    );
+                    *target_len = message.msg_namelen;
+                    Ok(())
+                })
+            }?
+            .1
+            .as_socket()
+            .ok_or_else(|| std::io::Error::other("a datagram from no IP address"))?;
+            Ok((len as usize, peer, kernel_us))
+        })
+        .await
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -518,6 +633,7 @@ async fn main() -> Result<()> {
     let deadline = started + Duration::from_secs(args.duration_seconds);
     let socket = UdpSocket::bind(args.bind.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap())).await?;
     set_receive_buffer(&socket, args.receive_buffer_bytes);
+    enable_kernel_timestamps(&socket);
 
     // Verification runs beside reception, with bounded concurrency.
     let (verify_tx, mut verify_rx) = mpsc::unbounded_channel::<VerifyJob>();
@@ -568,6 +684,13 @@ async fn main() -> Result<()> {
     });
 
     let mut receiver = ObjectReceiver::new();
+    receiver
+        .compact
+        .set_nack_timing(av_mesh::client_compact::NackTiming {
+            delay: Duration::from_micros(args.nack_delay_us),
+            retry_floor: Duration::from_micros(args.nack_retry_floor_us),
+            silence: args.silence_nack,
+        });
     let mut received: BTreeMap<u64, usize> = BTreeMap::new();
     let mut gaps: BTreeSet<u64> = BTreeSet::new();
     let mut duplicates = 0_u64;
@@ -579,6 +702,8 @@ async fn main() -> Result<()> {
     let mut fast_envelope_bytes = Vec::new();
     let mut fast_envelope_overhead = Vec::new();
     let mut publish_ms = Vec::new();
+    // Datagram at the kernel -> at the client (the listener host's delay).
+    let mut host_ms = Vec::new();
     let mut available_ms = Vec::new();
     let mut first_part_ms = None;
     let mut moves = Vec::new();
@@ -589,7 +714,7 @@ async fn main() -> Result<()> {
         None => None,
     };
     let mut written_parts: BTreeMap<u64, Bytes> = BTreeMap::new();
-    let mut arrivals: BTreeMap<u64, (u64, usize, u64, u64)> = BTreeMap::new();
+    let mut arrivals: BTreeMap<u64, (u64, usize, u64, u64, u64)> = BTreeMap::new();
 
     let mut current: Option<String> = None;
     let mut skip: BTreeSet<String> = BTreeSet::new();
@@ -629,6 +754,11 @@ async fn main() -> Result<()> {
     let mut nack_datagrams = 0_u64;
     let mut first_published_us: Option<u64> = None;
     let mut last_published_us: Option<u64> = None;
+    // The end of the run: the last part taken, and the holes before it
+    // that the drain waits for.
+    let drain = Duration::from_millis(args.drain_ms);
+    let mut drain_last: Option<u64> = None;
+    let mut drain_missing: BTreeSet<u64> = BTreeSet::new();
 
     'caches: while Instant::now() < deadline {
         let (caches, port) = match assignment(&http, &args, current.as_deref()).await {
@@ -754,7 +884,25 @@ async fn main() -> Result<()> {
 
         loop {
             let now = Instant::now();
-            if now >= deadline {
+            if now >= deadline && drain_last.is_none() && subscribed && !drain.is_zero() {
+                let last = received.keys().chain(gaps.iter()).max().copied();
+                let first = received
+                    .keys()
+                    .chain(gaps.iter())
+                    .chain(first_subscribed_part.iter())
+                    .min()
+                    .copied();
+                if let (Some(first), Some(last)) = (first, last) {
+                    drain_last = Some(last);
+                    drain_missing = (first..=last)
+                        .filter(|part| !received.contains_key(part) && !gaps.contains(part))
+                        .collect();
+                }
+            }
+            let draining = drain_last.is_some()
+                && !drain_missing.is_empty()
+                && now < deadline + drain;
+            if now >= deadline && !draining {
                 if let Some(token) = token {
                     let _ = socket
                         .send_to(
@@ -770,12 +918,16 @@ async fn main() -> Result<()> {
                 break 'caches;
             }
             leaving = token.map(|token| (target, token));
-            if !subscribed && now.duration_since(asked_at) > Duration::from_millis(args.answer_ms) {
+            if !draining
+                && !subscribed
+                && now.duration_since(asked_at) > Duration::from_millis(args.answer_ms)
+            {
                 move_reason = format!("no-answer-{}ms", args.answer_ms);
                 skip.insert(cache.node_id.clone());
                 continue 'caches;
             }
-            if subscribed
+            if !draining
+                && subscribed
                 && now.duration_since(last_datagram) > Duration::from_millis(args.silence_ms)
             {
                 move_reason = format!("silence-{}ms", args.silence_ms);
@@ -888,7 +1040,8 @@ async fn main() -> Result<()> {
             } else {
                 asked_at + Duration::from_millis(args.answer_ms)
             };
-            let mut wake = deadline
+            let end = if draining { deadline + drain } else { deadline };
+            let mut wake = end
                 .min(next_refresh)
                 .min(next_loss_check)
                 .min(silence_at + Duration::from_millis(1));
@@ -898,7 +1051,7 @@ async fn main() -> Result<()> {
                 }
             }
             let wait = wake.saturating_duration_since(now);
-            let (len, peer) = match tokio::time::timeout(wait, socket.recv_from(&mut buf)).await {
+            let (len, peer, kernel_us) = match tokio::time::timeout(wait, recv_timestamped(&socket, &mut buf)).await {
                 Ok(Ok(received)) => received,
                 Ok(Err(_)) => continue,
                 Err(_) => continue,
@@ -974,6 +1127,10 @@ async fn main() -> Result<()> {
             let fast_envelope = receiver.last_fast_envelope_bytes;
             let compact_fast = std::mem::take(&mut receiver.last_compact_fast_lane);
             let arrival_us = now_unix_us();
+            let kernel_us = kernel_us.filter(|kernel| *kernel <= arrival_us);
+            if let Some(kernel) = kernel_us {
+                host_ms.push(arrival_us.saturating_sub(kernel) as f64 / 1_000.0);
+            }
             for object in objects {
                 let PartObject {
                     kind,
@@ -985,10 +1142,15 @@ async fn main() -> Result<()> {
                 } = object;
                 match kind {
                     ObjectKind::Init => init_objects += 1,
+                    // Past the end of the run: not taken.
+                    ObjectKind::Gap | ObjectKind::Part
+                        if drain_last.is_some_and(|last| part > last) => {}
                     ObjectKind::Gap => {
+                        drain_missing.remove(&part);
                         gaps.insert(part);
                     }
                     ObjectKind::Part => {
+                        drain_missing.remove(&part);
                         if received.contains_key(&part) {
                             duplicates += 1;
                             continue;
@@ -1034,7 +1196,13 @@ async fn main() -> Result<()> {
                         if args.arrivals.is_some() {
                             arrivals.insert(
                                 part,
-                                (arrival_us, payload.len(), published_unix_us, available_unix_us),
+                                (
+                                    arrival_us,
+                                    payload.len(),
+                                    published_unix_us,
+                                    available_unix_us,
+                                    kernel_us.unwrap_or(0),
+                                ),
                             );
                         }
                         if parts_out.is_some() {
@@ -1062,9 +1230,13 @@ async fn main() -> Result<()> {
     let verify = verifier.await.ok();
 
     if let Some(path) = &args.arrivals {
-        let mut text = String::from("part,arrival_unix_us,bytes,published_unix_us,available_unix_us\n");
-        for (part, (arrival, bytes, published, available)) in &arrivals {
-            text.push_str(&format!("{part},{arrival},{bytes},{published},{available}\n"));
+        let mut text = String::from(
+            "part,arrival_unix_us,bytes,published_unix_us,available_unix_us,kernel_unix_us\n",
+        );
+        for (part, (arrival, bytes, published, available, kernel)) in &arrivals {
+            text.push_str(&format!(
+                "{part},{arrival},{bytes},{published},{available},{kernel}\n"
+            ));
         }
         std::fs::write(path, text).with_context(|| format!("write {}", path.display()))?;
     }
@@ -1137,6 +1309,14 @@ async fn main() -> Result<()> {
             .then(|| receiver.wire_bytes as f64 / payload_bytes as f64),
         compact_asked,
         compact_fallbacks,
+        nack_timing: format!(
+            "delay {} us, retry floor {} us, silence {}",
+            args.nack_delay_us, args.nack_retry_floor_us, args.silence_nack
+        ),
+        part_interval_ms: receiver
+            .compact
+            .part_interval()
+            .map(|interval| interval.as_secs_f64() * 1_000.0),
         nack_rtt_ms: receiver
             .compact
             .rtt()
@@ -1167,6 +1347,7 @@ async fn main() -> Result<()> {
         fast_epoch_changes: receiver.fast_epoch_changes,
         verify: if args.verify_http { verify } else { None },
         publish_to_arrival_ms: percentiles(publish_ms),
+        kernel_to_arrival_ms: percentiles(host_ms),
         available_to_arrival_ms: percentiles(available_ms),
         time_to_first_part_ms: first_part_ms,
     };

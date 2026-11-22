@@ -644,6 +644,72 @@ pub const NACK_DELAY: Duration = Duration::from_millis(1);
 /// trip's wait, if that is longer).
 pub const NACK_RETRY: Duration = Duration::from_millis(5);
 pub const MAX_NACK_RETRY: Duration = Duration::from_millis(100);
+/// The NACK timing of before wave 6: [`NACK_DELAY`], [`NACK_RETRY`] as
+/// the floor of the retry, and no NACK while the stream is silent.
+///
+/// Wave 6 (W4): a client whose parts come on the fast lane sees a hole as
+/// soon as the next part arrives (the cache-fed lane no longer trails its
+/// neighbours by a millisecond), so the first NACK waits
+/// [`FAST_NACK_DELAY`]; a NACK is repeated after one and a half round trips
+/// with a floor of [`FAST_NACK_RETRY`]; and when no part arrives for an
+/// interval and a margin past the next one's due time (a burst on the
+/// client's path takes every datagram), the client asks for the parts due
+/// since, and asks again while the silence lasts, each interval at first
+/// and then less often (each answer sent into the burst is lost, and the
+/// last ones arrive as it ends), for at most [`SILENCE_NACK_FOR`]; the
+/// part that ends the silence asks for them all again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NackTiming {
+    /// The wait before the first NACK of a hole that a later part showed.
+    pub delay: Duration,
+    /// The floor of the wait between NACKs of a hole.
+    pub retry_floor: Duration,
+    /// NACK the parts due while the stream is silent.
+    pub silence: bool,
+}
+
+impl NackTiming {
+    pub const BEFORE: Self = Self {
+        delay: NACK_DELAY,
+        retry_floor: NACK_RETRY,
+        silence: false,
+    };
+}
+
+impl Default for NackTiming {
+    fn default() -> Self {
+        Self {
+            delay: FAST_NACK_DELAY,
+            retry_floor: FAST_NACK_RETRY,
+            silence: true,
+        }
+    }
+}
+
+/// The first NACK of a hole on the fast lane (see [`NackTiming`]).
+pub const FAST_NACK_DELAY: Duration = Duration::from_micros(250);
+/// The floor of the NACK retry on the fast lane (see [`NackTiming`]).
+pub const FAST_NACK_RETRY: Duration = Duration::from_millis(2);
+/// A silence is NACKed for at most this long: a longer one is a stall of
+/// the stream (or of the path) that NACKs every interval would only load
+/// the edge with; the parts' holes are then asked for as they show.
+pub const SILENCE_NACK_FOR: Duration = Duration::from_millis(50);
+/// The parts ahead of the last one that a silence asks for, at most.
+pub const SILENCE_NACK_PARTS: u64 = 32;
+/// The margin past the next part's due time before a silence is NACKed:
+/// at least this, and at least one part interval.
+const SILENCE_MARGIN: Duration = Duration::from_micros(500);
+/// A shorter gap between two parts' arrivals (parts read together) is no
+/// sample of the interval between parts.
+const MIN_INTERVAL_SAMPLE: Duration = Duration::from_micros(50);
+/// The wait between NACKs during a silence: at least this, and at least
+/// one part interval.
+const SILENCE_RETRY: Duration = Duration::from_millis(1);
+/// The NACKs of one hole during a silence, at most: 0, 1, 3, 5, 9 and 13
+/// intervals after it is first asked for. 32 holes of a silence then ask
+/// for 192 parts, under the edge's NACK budget of 200 parts in 100 ms.
+const SILENCE_NACKS_PER_HOLE: u16 = 6;
+
 /// A hole is given up after this long, or after this many NACKs.
 pub const HOLE_GIVE_UP: Duration = Duration::from_millis(1_000);
 pub const MAX_NACKS_PER_HOLE: u8 = 12;
@@ -671,6 +737,9 @@ struct Hole {
     /// It was delivered as a gap: the NACK asks for the part in case the
     /// edge has it now.
     gap: bool,
+    /// NACKs of it sent during a silence (not counted against
+    /// [`MAX_NACKS_PER_HOLE`]; at most [`SILENCE_NACKS_PER_HOLE`]).
+    silence_nacks: u16,
 }
 
 #[derive(Debug)]
@@ -738,6 +807,18 @@ pub struct CompactReceiver {
     gapped: BTreeSet<u64>,
     /// The round trip of the client's path to its edge, if measured.
     rtt: Option<Duration>,
+    /// When the highest part last advanced, and the interval between
+    /// parts (an average of the originals' arrivals).
+    highest_at: Option<Instant>,
+    interval: Option<Duration>,
+    /// The mean deviation of the originals' spacing from the interval (as
+    /// RFC 3550's jitter): the silence's margin covers four of it.
+    jitter: Duration,
+    /// See [`NackTiming`]; `None` is the default.
+    timing: Option<NackTiming>,
+    /// The `highest_at` whose silence has been noted: the silence's own
+    /// holes wake the client after that.
+    silence_noted: Option<Instant>,
     /// The source generation of the parts, once a datagram named one, and
     /// the generations before it (their late datagrams are dropped).
     generation: Option<u8>,
@@ -766,6 +847,8 @@ impl CompactReceiver {
         self.delivered_order.clear();
         self.windows.clear();
         self.highest = None;
+        self.highest_at = None;
+        self.silence_noted = None;
         self.holes.clear();
         self.counts.clear();
         self.window_counts.clear();
@@ -786,11 +869,83 @@ impl CompactReceiver {
         self.rtt
     }
 
+    /// The NACK timing (see [`NackTiming`]; the default is wave 6's).
+    pub fn set_nack_timing(&mut self, timing: NackTiming) {
+        self.timing = Some(timing);
+    }
+
+    pub fn nack_timing(&self) -> NackTiming {
+        self.timing.unwrap_or_default()
+    }
+
+    /// The interval between parts, as measured.
+    pub fn part_interval(&self) -> Option<Duration> {
+        self.interval
+    }
+
+    /// The silence after the highest part past which the next parts are
+    /// NACKed: one interval for the next part, and a margin.
+    fn silence_after(&self) -> Option<Duration> {
+        let interval = self.interval?;
+        Some(interval + interval.max(SILENCE_MARGIN).max(self.jitter * 4))
+    }
+
+    /// When the stream goes silent, the parts due since the highest are
+    /// holes (not loss until a later part shows them): NACKed now, and each
+    /// interval while the silence lasts.
+    fn note_silence(&mut self, now: Instant) {
+        if !self.active || !self.nack_timing().silence {
+            return;
+        }
+        let (Some(highest), Some(at), Some(interval), Some(after)) = (
+            self.highest,
+            self.highest_at,
+            self.interval,
+            self.silence_after(),
+        ) else {
+            return;
+        };
+        let silent = now.saturating_duration_since(at);
+        if silent < after {
+            return;
+        }
+        self.silence_noted = Some(at);
+        if silent > SILENCE_NACK_FOR {
+            return;
+        }
+        let due = 1 + ((silent - after).as_micros() / interval.as_micros().max(1)) as u64;
+        for part in highest + 1..=highest + due.min(SILENCE_NACK_PARTS) {
+            if self.delivered.contains(&part) {
+                continue;
+            }
+            self.holes.entry(part).or_insert(Hole {
+                since: now,
+                next_nack: now,
+                nacks: 0,
+                last_nack: None,
+                gap: false,
+                silence_nacks: 0,
+            });
+        }
+    }
+
+    /// Whether the stream is silent now, for NACKs every interval.
+    fn silent(&self, now: Instant) -> Option<Duration> {
+        if !self.nack_timing().silence {
+            return None;
+        }
+        let at = self.highest_at?;
+        let after = self.silence_after()?;
+        let silent = now.saturating_duration_since(at);
+        (silent >= after && silent <= SILENCE_NACK_FOR)
+            .then(|| self.interval.unwrap_or(SILENCE_RETRY).max(SILENCE_RETRY))
+    }
+
     /// The wait between the first two NACKs of a hole: [`NACK_RETRY`], or
     /// one and a half round trips if that is longer.
     pub fn nack_retry(&self) -> Duration {
-        self.rtt
-            .map_or(NACK_RETRY, |rtt| NACK_RETRY.max(rtt * 3 / 2))
+        let floor = self.nack_timing().retry_floor;
+        self.rtt.map_or(floor, |rtt| floor.max(rtt * 3 / 2))
     }
 
     /// A part came as a gap: remember it, and ask for the part again a
@@ -810,6 +965,7 @@ impl CompactReceiver {
                     nacks: 0,
                     last_nack: None,
                     gap: true,
+                    silence_nacks: 0,
                 },
             );
         }
@@ -887,18 +1043,27 @@ impl CompactReceiver {
             }
         }
         self.holes.remove(&part);
+        let delay = self.nack_timing().delay;
         match self.highest {
             Some(highest) if part > highest => {
+                self.highest_at = Some(now);
                 if self.active && part - highest <= MAX_HOLE_RUN {
                     for hole in highest + 1..part {
                         if !self.delivered.contains(&hole) {
-                            self.holes.entry(hole).or_insert(Hole {
+                            let entry = self.holes.entry(hole).or_insert(Hole {
                                 since: now,
-                                next_nack: now + NACK_DELAY,
+                                next_nack: now + delay,
                                 nacks: 0,
                                 last_nack: None,
                                 gap: false,
+                                silence_nacks: 0,
                             });
+                            // Asked for during the silence that this part
+                            // ends: the answers went into the burst, so it
+                            // is asked for again now, as a new hole is.
+                            if entry.silence_nacks > 0 {
+                                entry.next_nack = entry.next_nack.min(now + delay);
+                            }
                             self.counts.entry(hole).or_insert(Count {
                                 received: 0,
                                 sent: 1 + self.last_copies,
@@ -910,7 +1075,10 @@ impl CompactReceiver {
                 self.highest = Some(part);
             }
             Some(_) => {}
-            None => self.highest = Some(part),
+            None => {
+                self.highest = Some(part);
+                self.highest_at = Some(now);
+            }
         }
         true
     }
@@ -965,6 +1133,7 @@ impl CompactReceiver {
                     if let Some(Hole {
                         nacks: 1,
                         last_nack: Some(at),
+                        silence_nacks: 0,
                         ..
                     }) = self.holes.get(&part)
                     {
@@ -972,6 +1141,24 @@ impl CompactReceiver {
                         self.set_rtt(sample);
                     }
                 } else {
+                    // The interval between parts, from the originals that
+                    // advance the highest part.
+                    if let (Some(highest), Some(at)) = (self.highest, self.highest_at) {
+                        let sample = (part > highest && part - highest <= MAX_HOLE_RUN)
+                            .then(|| now.saturating_duration_since(at) / (part - highest) as u32)
+                            // Parts read together say nothing of the interval.
+                            .filter(|sample| *sample >= MIN_INTERVAL_SAMPLE);
+                        if let Some(sample) = sample {
+                            if let Some(interval) = self.interval {
+                                let deviation = sample.abs_diff(interval);
+                                self.jitter = (self.jitter * 15 + deviation) / 16;
+                            }
+                            self.interval = Some(match self.interval {
+                                Some(interval) => (interval * 7 + sample) / 8,
+                                None => sample,
+                            });
+                        }
+                    }
                     self.last_copies = view.copies;
                     let count = self.counts.entry(part).or_insert(Count {
                         received: 0,
@@ -1133,29 +1320,48 @@ impl CompactReceiver {
     /// The parts to ask the edge for now: holes whose time has come, at
     /// most `limit`. Holes too old are given up.
     pub fn nacks_due(&mut self, now: Instant, limit: usize) -> Vec<u64> {
+        self.note_silence(now);
+        let silent = self.silent(now);
         let mut due = Vec::new();
         let mut abandoned = Vec::new();
         let retry = self.nack_retry();
         let most = MAX_NACK_RETRY.max(retry);
+        let highest = self.highest;
         for (part, hole) in self.holes.iter_mut() {
             if now.duration_since(hole.since) >= HOLE_GIVE_UP || hole.nacks >= MAX_NACKS_PER_HOLE {
                 abandoned.push((*part, hole.gap));
                 continue;
             }
             if hole.next_nack <= now && due.len() < limit {
-                hole.nacks += 1;
-                let backoff = retry
-                    .saturating_mul(1 << (hole.nacks - 1).min(8))
-                    .min(most);
-                hole.next_nack = now + backoff;
+                // While the stream is silent, the holes are asked for again
+                // and again (what the edge sends into a burst is lost):
+                // each interval at first, then less often, and at most
+                // SILENCE_NACKS_PER_HOLE times, so that a long burst does
+                // not spend the edge's NACK budget (200 parts in 100 ms);
+                // the part that ends the silence asks for them again.
+                if let Some(every) = silent {
+                    if hole.silence_nacks >= SILENCE_NACKS_PER_HOLE {
+                        hole.next_nack = now + SILENCE_NACK_FOR;
+                        continue;
+                    }
+                    hole.silence_nacks += 1;
+                    hole.next_nack = now + every * (1 << (hole.silence_nacks / 2).min(3));
+                } else {
+                    hole.nacks += 1;
+                    let backoff = retry
+                        .saturating_mul(1 << (hole.nacks - 1).min(8))
+                        .min(most);
+                    hole.next_nack = now + backoff;
+                }
                 hole.last_nack = Some(now);
                 due.push(*part);
             }
         }
         for (part, gap) in abandoned {
             self.holes.remove(&part);
-            // A gap that never filled was delivered as a gap: not lost.
-            if !gap {
+            // A gap that never filled was delivered as a gap: not lost; nor
+            // is a part past the highest that a silence asked for.
+            if !gap && highest.is_some_and(|highest| part < highest) {
                 self.stats.abandoned += 1;
             }
         }
@@ -1163,9 +1369,19 @@ impl CompactReceiver {
         due
     }
 
-    /// When the next NACK is due, if a hole waits.
+    /// When the next NACK is due, if a hole waits, or when the stream will
+    /// have been silent long enough to NACK the parts due.
     pub fn next_nack_at(&self) -> Option<Instant> {
-        self.holes.values().map(|hole| hole.next_nack).min()
+        let holes = self.holes.values().map(|hole| hole.next_nack).min();
+        let silence = (self.active
+            && self.nack_timing().silence
+            && self.silence_noted != self.highest_at)
+            .then(|| Some(self.highest_at? + self.silence_after()?))
+            .flatten();
+        match (holes, silence) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     pub fn holes(&self) -> usize {
@@ -1234,6 +1450,153 @@ impl CompactReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn before() -> CompactReceiver {
+        let mut receiver = CompactReceiver::new();
+        receiver.set_nack_timing(NackTiming::BEFORE);
+        receiver
+    }
+
+    /// A receiver of `parts` parts from `first`, one each `interval`, from
+    /// `start`; returns when the last one came.
+    fn fed(
+        receiver: &mut CompactReceiver,
+        first: u64,
+        parts: u64,
+        start: Instant,
+        interval: Duration,
+    ) -> Instant {
+        receiver.expect_from(first, true);
+        let mut at = start;
+        for part in first..first + parts {
+            at = start + interval * (part - first) as u32;
+            receiver.push(&encode_part(part, 0, &payload(part, 10)).unwrap(), at, 0);
+        }
+        at
+    }
+
+    #[test]
+    fn a_hole_is_asked_for_a_quarter_millisecond_after_a_later_part_shows_it() {
+        let mut receiver = CompactReceiver::new();
+        assert_eq!(receiver.nack_timing(), NackTiming::default());
+        let start = Instant::now();
+        let ms = Duration::from_millis(1);
+        let last = fed(&mut receiver, 10, 10, start, ms);
+        assert_eq!(receiver.part_interval(), Some(ms));
+        // Part 20 is lost; 21 shows it.
+        let at = last + ms * 2;
+        receiver.push(&encode_part(21, 0, &payload(21, 10)).unwrap(), at, 0);
+        assert!(receiver.nacks_due(at, 64).is_empty());
+        assert_eq!(receiver.nacks_due(at + FAST_NACK_DELAY, 64), vec![20]);
+        // Repeated after the 2 ms floor (no round trip measured), not before.
+        assert!(receiver.nacks_due(at + FAST_NACK_DELAY + ms, 64).is_empty());
+        // (By then 22 is overdue too, and asked for as a silence.)
+        assert!(receiver
+            .nacks_due(at + FAST_NACK_DELAY + FAST_NACK_RETRY, 64)
+            .contains(&20));
+    }
+
+    #[test]
+    fn a_silence_asks_for_the_parts_due_each_interval_until_they_come() {
+        let mut receiver = CompactReceiver::new();
+        let start = Instant::now();
+        let ms = Duration::from_millis(1);
+        let last = fed(&mut receiver, 100, 20, start, ms);
+        // Part 120 is due at last + 1 ms; it is asked for 2 ms after the
+        // last part (one interval and the margin), not sooner.
+        assert_eq!(receiver.next_nack_at(), Some(last + ms * 2));
+        assert!(receiver.nacks_due(last + Duration::from_micros(1_900), 64).is_empty());
+        assert_eq!(receiver.nacks_due(last + ms * 2, 64), vec![120]);
+        // A millisecond on: 120 again (its answer went into the burst) and
+        // 121, now due; then 120 waits two intervals.
+        assert!(receiver.next_nack_at().unwrap() <= last + ms * 3);
+        assert_eq!(receiver.nacks_due(last + ms * 3, 64), vec![120, 121]);
+        assert_eq!(receiver.nacks_due(last + ms * 4, 64), vec![121, 122]);
+        // The burst ends: 123 comes; 120-122 are holes now, asked for
+        // again after the delay of a new hole.
+        let end = last + ms * 4 + Duration::from_micros(300);
+        receiver.push(&encode_part(123, 0, &payload(123, 10)).unwrap(), end, 0);
+        assert_eq!(receiver.holes(), 3);
+        assert!(receiver.nacks_due(end, 64).is_empty());
+        assert_eq!(
+            receiver.nacks_due(end + FAST_NACK_DELAY, 64),
+            vec![120, 121, 122]
+        );
+        for part in [120_u64, 121, 122] {
+            let mut again = encode_part(part, 0, &payload(part, 10)).unwrap();
+            set_flags(&mut again, 0, true);
+            assert_eq!(receiver.push(&again, end, 0).len(), 1);
+        }
+        assert_eq!(receiver.holes(), 0);
+        // A silence-asked part that no part shows lost is not abandoned
+        // as loss when the stream stops.
+        assert!(receiver.nacks_due(end + ms * 3, 64).contains(&124));
+        receiver.nacks_due(end + HOLE_GIVE_UP + ms * 4, 64);
+        assert_eq!(receiver.holes(), 0);
+        assert_eq!(receiver.stats.abandoned, 0);
+    }
+
+    #[test]
+    fn a_long_silence_stops_the_nacks_and_does_not_spin() {
+        let mut receiver = CompactReceiver::new();
+        let start = Instant::now();
+        let ms = Duration::from_millis(1);
+        let last = fed(&mut receiver, 0, 10, start, ms);
+        // First seen 60 ms on (a stalled client): nothing is asked for, and
+        // no wake-up is due any more.
+        assert!(receiver.nacks_due(last + ms * 60, 64).is_empty());
+        assert_eq!(receiver.holes(), 0);
+        assert_eq!(receiver.next_nack_at(), None);
+        // A silence NACKed from its start stops being repeated each
+        // interval after SILENCE_NACK_FOR: the holes back off.
+        let mut other = CompactReceiver::new();
+        let last = fed(&mut other, 0, 10, start, ms);
+        let mut sent = 0;
+        let mut at = last;
+        while at < last + SILENCE_NACK_FOR {
+            sent += other.nacks_due(at, 64).len();
+            at += Duration::from_micros(250);
+        }
+        // At most 32 parts, each asked for at most 6 times during the
+        // silence: under the edge's NACK budget (200 parts in 100 ms).
+        assert!(sent <= 192, "{sent} NACKs during the silence");
+        while at < last + ms * 120 {
+            other.nacks_due(at, 64);
+            at += Duration::from_micros(250);
+        }
+        assert!(other.holes() > 0);
+        let quiet = other.nacks_due(at, 64).len() + other.nacks_due(at + ms, 64).len();
+        assert!(quiet <= 32, "{quiet} NACKs a millisecond after the silence");
+    }
+
+    #[test]
+    fn a_jittery_path_waits_longer_before_it_asks_for_a_silence() {
+        let mut receiver = CompactReceiver::new();
+        receiver.expect_from(0, true);
+        let start = Instant::now();
+        // 1 ms parts that arrive 0.9 ms early or late in turn.
+        let mut at = start;
+        for part in 0..200_u64 {
+            let offset = if part % 2 == 0 { 0 } else { 900 };
+            at = start + Duration::from_micros(part * 1_000 + offset);
+            receiver.push(&encode_part(part, 0, &payload(part, 10)).unwrap(), at, 0);
+        }
+        let silence = receiver.next_nack_at().unwrap() - at;
+        assert!(
+            silence > Duration::from_millis(4),
+            "a silence is asked for after {silence:?}"
+        );
+    }
+
+    #[test]
+    fn the_timing_of_before_asks_for_nothing_during_a_silence() {
+        let mut receiver = before();
+        let start = Instant::now();
+        let ms = Duration::from_millis(1);
+        let last = fed(&mut receiver, 0, 10, start, ms);
+        assert_eq!(receiver.next_nack_at(), None);
+        assert!(receiver.nacks_due(last + ms * 5, 64).is_empty());
+    }
 
     fn payload(part: u64, len: usize) -> Vec<u8> {
         (0..len).map(|i| (i as u64 * 7 + part * 13) as u8).collect()
@@ -1520,7 +1883,9 @@ mod tests {
 
     #[test]
     fn a_hole_is_asked_for_after_the_delay_and_again_until_given_up() {
-        let mut receiver = CompactReceiver::new();
+        // The timing of before wave 6 (needletail-udp-client --silence-nack
+        // false --nack-delay-us 1000 --nack-retry-floor-us 5000).
+        let mut receiver = before();
         receiver.expect_from(10, true);
         let start = Instant::now();
         for part in [10_u64, 11, 14] {
@@ -1565,7 +1930,9 @@ mod tests {
 
     #[test]
     fn a_part_that_comes_after_its_gap_is_delivered_and_the_gap_is_asked_for() {
-        let mut receiver = CompactReceiver::new();
+        // The timing of before wave 6 (needletail-udp-client --silence-nack
+        // false --nack-delay-us 1000 --nack-retry-floor-us 5000).
+        let mut receiver = before();
         receiver.expect_from(20, true);
         let start = Instant::now();
         receiver.push(&encode_part(20, 0, &payload(20, 10)).unwrap(), start, 0);
@@ -1598,7 +1965,9 @@ mod tests {
 
     #[test]
     fn nacks_are_not_repeated_before_a_round_trip() {
-        let mut receiver = CompactReceiver::new();
+        // The timing of before wave 6 (needletail-udp-client --silence-nack
+        // false --nack-delay-us 1000 --nack-retry-floor-us 5000).
+        let mut receiver = before();
         receiver.expect_from(10, true);
         receiver.set_rtt(Duration::from_millis(30));
         assert_eq!(receiver.nack_retry(), Duration::from_millis(45));
@@ -1618,11 +1987,18 @@ mod tests {
             vec![11]
         );
         // A short path keeps the 5 ms floor.
-        let mut near = CompactReceiver::new();
+        let mut near = before();
         near.set_rtt(Duration::from_micros(200));
         assert_eq!(near.nack_retry(), NACK_RETRY);
+        // Wave 6's floor is 2 ms.
+        let mut fast = CompactReceiver::new();
+        fast.set_rtt(Duration::from_micros(200));
+        assert_eq!(fast.nack_retry(), FAST_NACK_RETRY);
+        let mut far = CompactReceiver::new();
+        far.set_rtt(Duration::from_millis(30));
+        assert_eq!(far.nack_retry(), Duration::from_millis(45));
         // The answer to a hole's only NACK measures the round trip.
-        let mut measured = CompactReceiver::new();
+        let mut measured = before();
         measured.expect_from(0, true);
         for part in [0_u64, 2] {
             measured.push(&encode_part(part, 0, &payload(part, 10)).unwrap(), start, 0);
