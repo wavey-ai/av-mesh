@@ -109,7 +109,10 @@ fn cpu_jiffies(cpus: &[usize]) -> (u64, u64) {
     for line in text.lines() {
         let mut fields = line.split_whitespace();
         let Some(name) = fields.next() else { continue };
-        let Some(cpu) = name.strip_prefix("cpu").and_then(|n| n.parse::<usize>().ok()) else {
+        let Some(cpu) = name
+            .strip_prefix("cpu")
+            .and_then(|n| n.parse::<usize>().ok())
+        else {
             continue;
         };
         if !cpus.contains(&cpu) {
@@ -278,9 +281,8 @@ fn listener_worker(
         }
         let timeout = if coalesce.is_zero() { 5 } else { 0 };
         // SAFETY: the events buffer outlives the call.
-        let ready = unsafe {
-            libc::epoll_wait(epoll, events.as_mut_ptr(), events.len() as i32, timeout)
-        };
+        let ready =
+            unsafe { libc::epoll_wait(epoll, events.as_mut_ptr(), events.len() as i32, timeout) };
         let (from, to) = (
             load.window_from.load(Ordering::Relaxed),
             load.window_to.load(Ordering::Relaxed),
@@ -591,7 +593,9 @@ fn run(run: &Run, ip: u8) -> Value {
                 continue;
             };
             let from = window_from.max(first);
-            let lost = (from..=window_to).filter(|part| !listener.has(*part)).count() as u64;
+            let lost = (from..=window_to)
+                .filter(|part| !listener.has(*part))
+                .count() as u64;
             expected += window_to.saturating_sub(from) + 1;
             missing += lost;
             listeners_missing += u64::from(lost > 0);
@@ -712,9 +716,18 @@ fn listeners_of_the_fan_out_threads_get_every_part_and_the_ingest_every_symbol()
     // Both forwarders' copy of each part.
     let received = edge["ingest_received"].as_u64().unwrap();
     assert!(received + 4 >= 2 * parts, "{line:#}");
-    assert!(edge["lane_fanout_batches"].as_u64().unwrap() > 0, "{line:#}");
-    assert!(edge["lane_fanout_sends"].as_u64().unwrap() >= 40 * parts, "{line:#}");
-    assert!(line["udp_sent_parts"].as_u64().unwrap() >= parts, "{line:#}");
+    assert!(
+        edge["lane_fanout_batches"].as_u64().unwrap() > 0,
+        "{line:#}"
+    );
+    assert!(
+        edge["lane_fanout_sends"].as_u64().unwrap() >= 40 * parts,
+        "{line:#}"
+    );
+    assert!(
+        line["udp_sent_parts"].as_u64().unwrap() >= parts,
+        "{line:#}"
+    );
 }
 
 #[test]
@@ -831,11 +844,20 @@ fn fanout_send_cost_per_datagram() {
         targets
     } else {
         (0..dests)
-            .map(|index| SocketAddr::from(([10, 99, 1 + (index / 250) as u8, 1 + (index % 250) as u8], 40_000)))
+            .map(|index| {
+                SocketAddr::from((
+                    [10, 99, 1 + (index / 250) as u8, 1 + (index % 250) as u8],
+                    40_000,
+                ))
+            })
             .collect()
     };
-    let socket = std::net::UdpSocket::bind(if loopback { "127.0.0.1:0" } else { "10.99.0.1:0" })
-        .unwrap();
+    let socket = std::net::UdpSocket::bind(if loopback {
+        "127.0.0.1:0"
+    } else {
+        "10.99.0.1:0"
+    })
+    .unwrap();
     let _ = socket2::SockRef::from(&socket).set_send_buffer_size(4 << 20);
     let fd = socket.as_raw_fd();
     let payload = vec![0x5a_u8; bytes];

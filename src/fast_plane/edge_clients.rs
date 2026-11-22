@@ -491,8 +491,10 @@ impl EdgeFastLane {
     pub fn set_fanout(&self, threads: usize, inline_sends: usize) {
         self.fanout_threads
             .store(threads.min(64) as u32, Ordering::Relaxed);
-        self.fanout_inline_sends
-            .store(inline_sends.min(u32::MAX as usize) as u32, Ordering::Relaxed);
+        self.fanout_inline_sends.store(
+            inline_sends.min(u32::MAX as usize) as u32,
+            Ordering::Relaxed,
+        );
     }
 
     fn fanout(&self) -> (usize, usize) {
@@ -504,7 +506,11 @@ impl EdgeFastLane {
 
     /// The hop journal's `udp_sent` of a send made off the class thread.
     fn journal_udp_sent(&self, stream_id: u64, part: u64, peer: SocketAddr, sent_us: u64) {
-        if let Some(journal) = self.armed.get().and_then(|armed| armed.sockets.hop_journal()) {
+        if let Some(journal) = self
+            .armed
+            .get()
+            .and_then(|armed| armed.sockets.hop_journal())
+        {
             journal.record_udp_sent(stream_id, part, peer, sent_us);
         }
     }
@@ -1486,8 +1492,7 @@ impl ClientPlan {
                 copied[message] = true;
                 let start = message * REWRAP_BYTES;
                 let len = usize::from(self.lens[message]);
-                into.buffers[start..start + len]
-                    .copy_from_slice(&self.buffers[start..start + len]);
+                into.buffers[start..start + len].copy_from_slice(&self.buffers[start..start + len]);
                 into.lens[message] = self.lens[message];
                 let compact_len = usize::from(self.compact_lens[message]);
                 into.compact_lens[message] = self.compact_lens[message];
@@ -1651,10 +1656,8 @@ impl Fanout {
     ) -> std::io::Result<Self> {
         let mut shards = Vec::with_capacity(threads);
         for index in 0..threads {
-            let (work_tx, work_rx) =
-                std::sync::mpsc::sync_channel::<Box<ClientPlan>>(FANOUT_DEPTH);
-            let (free_tx, free_rx) =
-                std::sync::mpsc::sync_channel::<Box<ClientPlan>>(FANOUT_DEPTH);
+            let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<Box<ClientPlan>>(FANOUT_DEPTH);
+            let (free_tx, free_rx) = std::sync::mpsc::sync_channel::<Box<ClientPlan>>(FANOUT_DEPTH);
             // FANOUT_DEPTH plans in all: one spare, the rest free.
             for _ in 1..FANOUT_DEPTH {
                 let _ = free_tx.send(Box::new(ClientPlan::new()));
@@ -1868,7 +1871,8 @@ mod tests {
             }
             for (index, client) in clients.iter().enumerate() {
                 assert!(client.claim_fast(part));
-                let peer = SocketAddr::from(([10, 0, (index / 200) as u8, (index % 200) as u8], 50_000));
+                let peer =
+                    SocketAddr::from(([10, 0, (index / 200) as u8, (index % 200) as u8], 50_000));
                 for _ in 0..1 + compact.map_or(0, usize::from) {
                     plan.sends.push(PlannedClient {
                         message: message as u16,
@@ -1999,7 +2003,11 @@ mod tests {
                     assert!(clients[*index].has_fast(100), "still the fast lane's");
                 }
             } else {
-                assert_eq!(shed, behind.len() as u64, "shard 0's sends of the batch shed");
+                assert_eq!(
+                    shed,
+                    behind.len() as u64,
+                    "shard 0's sends of the batch shed"
+                );
                 for index in &behind {
                     assert!(
                         clients[*index].claim_cache(100),
@@ -2031,7 +2039,10 @@ mod tests {
     #[test]
     fn the_fan_out_defaults_to_two_threads_past_a_few_clients() {
         let lane = EdgeFastLane::new(0);
-        assert_eq!(lane.fanout(), (DEFAULT_FANOUT_THREADS, DEFAULT_FANOUT_INLINE_SENDS));
+        assert_eq!(
+            lane.fanout(),
+            (DEFAULT_FANOUT_THREADS, DEFAULT_FANOUT_INLINE_SENDS)
+        );
         assert_eq!(DEFAULT_FANOUT_THREADS, 2);
         lane.set_fanout(0, 10);
         assert_eq!(lane.fanout(), (0, 10));

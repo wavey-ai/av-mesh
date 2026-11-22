@@ -156,6 +156,14 @@ struct Args {
     /// lengths give the offsets).
     #[arg(long)]
     arrivals: Option<PathBuf>,
+    /// Read the assigned cache's media playlist before subscribing, as
+    /// before (wave 7 item 8). By default the client subscribes right after
+    /// the assignment and reads the playlist beside the subscription: a
+    /// cache whose playlist answers with an error before the subscription
+    /// is answered is still left. With --verify-http the playlist is read
+    /// first either way (it names the parts' extension).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    playlist_first: bool,
 }
 
 fn now_unix_us() -> u64 {
@@ -387,6 +395,21 @@ fn percentiles(mut values: Vec<f64>) -> Percentiles {
     }
 }
 
+/// When each step of the start took place, in ms from the client's start
+/// (the first time it happened): the time to first audio, step by step.
+#[derive(Debug, Default, Serialize)]
+struct Startup {
+    assignment_ms: Option<f64>,
+    /// The playlist read (beside the subscription unless --playlist-first).
+    playlist_ms: Option<f64>,
+    first_request_ms: Option<f64>,
+    token_ms: Option<f64>,
+    subscribed_ms: Option<f64>,
+    first_part_ms: Option<f64>,
+    /// The first part received, after the part that the OK named.
+    first_part_after_named: Option<u64>,
+}
+
 #[derive(Debug, Serialize)]
 struct Report {
     schema: &'static str,
@@ -460,6 +483,7 @@ struct Report {
     kernel_to_arrival_ms: Percentiles,
     available_to_arrival_ms: Percentiles,
     time_to_first_part_ms: Option<f64>,
+    startup: Startup,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -706,6 +730,8 @@ async fn main() -> Result<()> {
     let mut host_ms = Vec::new();
     let mut available_ms = Vec::new();
     let mut first_part_ms = None;
+    let mut startup = Startup::default();
+    let since_start = |started: Instant| started.elapsed().as_secs_f64() * 1_000.0;
     let mut moves = Vec::new();
     let mut caches_used = Vec::new();
     let mut first_subscribed_part: Option<u64> = None;
@@ -769,6 +795,7 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
+        startup.assignment_ms.get_or_insert(since_start(started));
         let port = args.udp_port.or(port).ok_or_else(|| {
             anyhow!("no client UDP port: the entry point names none; pass --udp-port")
         })?;
@@ -788,8 +815,35 @@ async fn main() -> Result<()> {
             .max()
             .map(|part| part + 1);
         let playlist_path = format!("{}/{}/stream.m3u8", cache.base.path, args.stream);
-        let extension = match http.get(&cache.base.authority, &playlist_path).await {
-            Ok((StatusCode::OK, body)) => playlist_parts(&String::from_utf8_lossy(&body)).1,
+        // Unless it is read first, the playlist is read beside the
+        // subscription; its answer can still send the client on.
+        let mut playlist_check = None;
+        if !args.playlist_first && !args.verify_http {
+            let (http, authority, path) = (
+                http.clone(),
+                cache.base.authority.clone(),
+                playlist_path.clone(),
+            );
+            playlist_check = Some(tokio::spawn(
+                async move { http.get(&authority, &path).await },
+            ));
+        }
+        let read_first = playlist_check.is_none();
+        let extension = match async {
+            if read_first {
+                http.get(&cache.base.authority, &playlist_path).await
+            } else {
+                Ok((StatusCode::OK, Bytes::new()))
+            }
+        }
+        .await
+        {
+            Ok((StatusCode::OK, body)) => {
+                if read_first {
+                    startup.playlist_ms.get_or_insert(since_start(started));
+                }
+                playlist_parts(&String::from_utf8_lossy(&body)).1
+            }
             Ok((status, _)) => {
                 eprintln!("{}: playlist answered {status}", cache.node_id);
                 skip.insert(cache.node_id.clone());
@@ -871,6 +925,7 @@ async fn main() -> Result<()> {
             token,
         )
         .await;
+        startup.first_request_ms.get_or_insert(since_start(started));
         let asked_at = Instant::now();
         // The last request sent, for the round trip that its answer
         // measures, and the requests that this edge has not answered.
@@ -918,6 +973,28 @@ async fn main() -> Result<()> {
                 break 'caches;
             }
             leaving = token.map(|token| (target, token));
+            // The playlist read beside the subscription: an error before
+            // the subscription is answered sends the client on, as a read
+            // before it did.
+            if playlist_check
+                .as_ref()
+                .is_some_and(|check| check.is_finished())
+            {
+                let answer = playlist_check.take().expect("finished").await;
+                startup.playlist_ms.get_or_insert(since_start(started));
+                let failure = match answer {
+                    Ok(Ok((StatusCode::OK, _))) => None,
+                    Ok(Ok((status, _))) => Some(format!("playlist answered {status}")),
+                    Ok(Err(error)) => Some(format!("playlist failed: {error:#}")),
+                    Err(error) => Some(format!("playlist read failed: {error}")),
+                };
+                if let (Some(failure), false) = (failure, subscribed) {
+                    eprintln!("{}: {failure}", cache.node_id);
+                    skip.insert(cache.node_id.clone());
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue 'caches;
+                }
+            }
             if !draining
                 && !subscribed
                 && now.duration_since(asked_at) > Duration::from_millis(args.answer_ms)
@@ -1063,6 +1140,7 @@ async fn main() -> Result<()> {
             if let Some(control) = Control::decode(&buf[..len]) {
                 match control {
                     Control::Token { token: given, .. } => {
+                        startup.token_ms.get_or_insert(since_start(started));
                         if token != Some(given) {
                             if token.is_none() {
                                 // A request and its answer: the round trip
@@ -1091,6 +1169,7 @@ async fn main() -> Result<()> {
                         ..
                     } => {
                         if !subscribed {
+                            startup.subscribed_ms.get_or_insert(since_start(started));
                             first_subscribed_part.get_or_insert(first);
                             receiver.expect(args.stream, first, compact);
                         }
@@ -1158,7 +1237,12 @@ async fn main() -> Result<()> {
                         // A part that came after its gap (the edge got it
                         // late) is received, not a gap.
                         gaps.remove(&part);
-                        first_part_ms.get_or_insert(started.elapsed().as_secs_f64() * 1_000.0);
+                        if first_part_ms.is_none() {
+                            first_part_ms = Some(since_start(started));
+                            startup.first_part_ms = first_part_ms;
+                            startup.first_part_after_named =
+                                first_subscribed_part.map(|named| part.saturating_sub(named));
+                        }
                         match fast_envelope {
                             Some(envelope) => {
                                 fast_lane_parts += 1;
@@ -1350,7 +1434,58 @@ async fn main() -> Result<()> {
         kernel_to_arrival_ms: percentiles(host_ms),
         available_to_arrival_ms: percentiles(available_ms),
         time_to_first_part_ms: first_part_ms,
+        startup,
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Wave 7 item 8: the playlist is read beside the subscription by
+    /// default; --playlist-first true reads it first, as before.
+    #[test]
+    fn the_playlist_is_read_beside_the_subscription_unless_asked_first() {
+        let base = [
+            "needletail-udp-client",
+            "--entry",
+            "https://edge:19444",
+            "--stream",
+            "3001",
+            "--tls-ca",
+            "/ca.pem",
+        ];
+        let args = Args::try_parse_from(base).unwrap();
+        assert!(!args.playlist_first);
+        let args =
+            Args::try_parse_from(base.into_iter().chain(["--playlist-first", "true"])).unwrap();
+        assert!(args.playlist_first);
+    }
+
+    #[test]
+    fn the_report_names_each_step_of_the_start() {
+        let startup = Startup {
+            assignment_ms: Some(3.0),
+            playlist_ms: None,
+            first_request_ms: Some(3.1),
+            token_ms: Some(3.6),
+            subscribed_ms: Some(4.2),
+            first_part_ms: Some(4.4),
+            first_part_after_named: Some(0),
+        };
+        let json = serde_json::to_value(&startup).unwrap();
+        for key in [
+            "assignment_ms",
+            "playlist_ms",
+            "first_request_ms",
+            "token_ms",
+            "subscribed_ms",
+            "first_part_ms",
+            "first_part_after_named",
+        ] {
+            assert!(json.get(key).is_some(), "{key}");
+        }
+    }
 }

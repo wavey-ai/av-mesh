@@ -1891,6 +1891,31 @@ struct Args {
     )]
     client_udp_send_twins: bool,
 
+    /// Time to first audio (wave 7 item 8): a UDP subscription is admitted
+    /// as soon as the edge holds a part of the stream, woken by the part's
+    /// arrival. `false` waits, as a playlist request does, until the edge's
+    /// copy of the playlist is playable (a whole segment; up to 4 s for a
+    /// copy that the subscription opened) and looks for a part every 20 ms,
+    /// as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_ADMIT_ON_FIRST_PART",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    client_udp_admit_on_first_part: bool,
+
+    /// A new UDP subscriber gets the part it starts at (the newest) with its
+    /// `OK`, not when the stream's sender next looks, which can be a part
+    /// later (wave 7 item 8). `false` as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_FIRST_PART_AT_ONCE",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    client_udp_first_part_at_once: bool,
+
     /// An edge that has heard none of its cache-mesh parents for this long
     /// has lost them: it answers 503 for a part or a playlist reload that it
     /// would otherwise hold, and moves its UDP clients. Keep it above the
@@ -3441,6 +3466,8 @@ async fn main() -> Result<()> {
                 inline_complete_bytes: args.client_udp_inline_complete_bytes,
                 gso: args.client_udp_gso,
                 compact: args.client_udp_compact,
+                admit_on_first_part: args.client_udp_admit_on_first_part,
+                first_part_at_once: args.client_udp_first_part_at_once,
             },
             Arc::clone(&router.edge_udp_stats),
             edge_cut_through.clone(),
@@ -17855,6 +17882,17 @@ impl AppRouter {
     /// playlist that has readers. The edge cannot serve this one, and the
     /// reader must be sent to another edge.
     async fn ensure_playlist_copy(&self, stream_id: u64) -> bool {
+        self.ensure_playlist_copy_with(stream_id, true).await
+    }
+
+    /// The demand of a reader's first playlist request, without the wait
+    /// for the copy to be playable: a UDP client needs the newest part, not
+    /// a playlist of whole segments (wave 7 item 8).
+    async fn open_playlist_demand(&self, stream_id: u64) -> bool {
+        self.ensure_playlist_copy_with(stream_id, false).await
+    }
+
+    async fn ensure_playlist_copy_with(&self, stream_id: u64, wait_playable: bool) -> bool {
         if !self.playlist_demand.config.enabled {
             return true;
         }
@@ -17895,7 +17933,7 @@ impl AppRouter {
             }
         }
         let waited_ms = now_ms.saturating_sub(touch.opened_unix_ms);
-        if waited_ms < PLAYLIST_WARM_WAIT_MS {
+        if wait_playable && waited_ms < PLAYLIST_WARM_WAIT_MS {
             self.cache
                 .wait_for_playlist_copy(
                     stream_id,
@@ -37468,4 +37506,7 @@ mod tests {
     /// Edge capacity (wave 7, item 10): listeners of 1 ms parts per edge,
     /// and an ingest that never drops for the fan-out.
     mod edge_capacity;
+    /// Time to first audio (wave 7, item 8): a UDP subscriber is admitted
+    /// on the edge's first part and gets it with its OK.
+    mod first_audio;
 }

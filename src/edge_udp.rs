@@ -117,6 +117,15 @@ pub(crate) struct EdgeUdpConfig {
     /// (`--client-udp-compact`; `false`: they get the RaptorQ lane, as
     /// before).
     pub compact: bool,
+    /// Admit a subscriber as soon as the edge holds a part of its stream,
+    /// woken by the part's arrival (`--client-udp-admit-on-first-part`,
+    /// wave 7 item 8; `false`: once the edge's playlist copy is playable,
+    /// a whole segment, looked at every 20 ms, as before).
+    pub admit_on_first_part: bool,
+    /// Send a new subscriber the part it starts at with its `OK`
+    /// (`--client-udp-first-part-at-once`; `false`: the stream's sender
+    /// sends it when it next looks, up to a part later, as before).
+    pub first_part_at_once: bool,
 }
 
 impl EdgeUdpConfig {
@@ -133,6 +142,8 @@ impl EdgeUdpConfig {
             inline_complete_bytes: DEFAULT_INLINE_COMPLETE_BYTES,
             gso: true,
             compact: true,
+            admit_on_first_part: true,
+            first_part_at_once: true,
         }
     }
 }
@@ -1207,8 +1218,14 @@ pub(crate) async fn run_edge_udp(
     // The send-only twins' share of the requests, watched for reading only.
     let twins = match &sockets.send_twins {
         Some([audio, video]) => Some([
-            tokio::io::unix::AsyncFd::with_interest(Arc::clone(audio), tokio::io::Interest::READABLE)?,
-            tokio::io::unix::AsyncFd::with_interest(Arc::clone(video), tokio::io::Interest::READABLE)?,
+            tokio::io::unix::AsyncFd::with_interest(
+                Arc::clone(audio),
+                tokio::io::Interest::READABLE,
+            )?,
+            tokio::io::unix::AsyncFd::with_interest(
+                Arc::clone(video),
+                tokio::io::Interest::READABLE,
+            )?,
         ]),
         None => None,
     };
@@ -1606,6 +1623,28 @@ async fn move_reason(router: &AppRouter) -> Option<&'static str> {
     None
 }
 
+/// The stream's newest part once the edge holds one, woken by the parts'
+/// arrival; `None` at `deadline`.
+async fn wait_for_head(router: &AppRouter, stream_id: u64, deadline: Instant) -> Option<u64> {
+    let mut updates = router.cache.part_updates.subscribe();
+    loop {
+        if let Some(head) = head_part(router, stream_id).await {
+            return Some(head);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        // A bound on the wait, in case an update is missed between the
+        // look and the subscription's mark.
+        let _ = tokio::time::timeout(
+            (deadline - now).min(Duration::from_millis(50)),
+            updates.changed(),
+        )
+        .await;
+    }
+}
+
 async fn head_part(router: &AppRouter, stream_id: u64) -> Option<u64> {
     router
         .cache
@@ -1716,6 +1755,7 @@ async fn admit(
     fast_lane: bool,
     compact: Option<CompactPlan>,
 ) {
+    let admitted_in = Instant::now();
     let reason = match move_reason(&router).await {
         // A client sent away for lost parents that comes back at once has
         // found no better edge: it is taken, not sent away again.
@@ -1746,8 +1786,14 @@ async fn admit(
         .await;
         return;
     }
-    // The same demand as the first playlist request of a reader.
-    if !router.ensure_playlist_copy(stream_id).await {
+    // The same demand as the first playlist request of a reader (without
+    // its wait for a playable copy, when admitted on the first part).
+    let demand = if config.admit_on_first_part {
+        router.open_playlist_demand(stream_id).await
+    } else {
+        router.ensure_playlist_copy(stream_id).await
+    };
+    if !demand {
         stats.refusals.fetch_add(1, Ordering::Relaxed);
         send_control(
             &socket,
@@ -1761,14 +1807,18 @@ async fn admit(
         return;
     }
     let deadline = Instant::now() + ADMIT_WAIT;
-    let head = loop {
-        if let Some(head) = head_part(&router, stream_id).await {
-            break Some(head);
+    let head = if config.admit_on_first_part {
+        wait_for_head(&router, stream_id, deadline).await
+    } else {
+        loop {
+            if let Some(head) = head_part(&router, stream_id).await {
+                break Some(head);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        if Instant::now() >= deadline {
-            break None;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
     };
     let Some(head) = head else {
         stats.refusals.fetch_add(1, Ordering::Relaxed);
@@ -1845,6 +1895,29 @@ async fn admit(
         },
     )
     .await;
+    // Its first part at once, not when the stream's sender next looks (it
+    // may be waiting for the part after). Every lane takes a part for a
+    // subscriber once, so no lane sends it again.
+    if config.first_part_at_once {
+        if let Some((bytes, _)) = router
+            .cache
+            .get_part_for_stream_id(stream_id, first_part)
+            .await
+        {
+            deliver(
+                sockets.out_for_stream(stream_id),
+                sockets.compact(),
+                &router,
+                &table,
+                config,
+                &stats,
+                stream_id,
+                first_part,
+                Some(bytes),
+            )
+            .await;
+        }
+    }
     info!(
         %peer,
         stream_id,
@@ -1852,6 +1925,7 @@ async fn admit(
         head,
         fast_lane = fast.is_some(),
         compact = compact.map(|plan| plan.word()),
+        admit_ms = admitted_in.elapsed().as_secs_f64() * 1_000.0,
         "edge client UDP subscription"
     );
     if start_sender {
