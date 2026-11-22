@@ -3189,8 +3189,11 @@ async fn main() -> Result<()> {
     }
     let node_demand = (args.relay_demand_report && args.relay_controlled_local).then(|| {
         let demand = Arc::new(fast_plane::demand::NodeDemand::default());
-        let (mesh, forwarder, out) =
-            (Arc::clone(&mesh_handle), relay_forwarder.clone(), Arc::clone(&demand));
+        let (mesh, forwarder, out) = (
+            Arc::clone(&mesh_handle),
+            relay_forwarder.clone(),
+            Arc::clone(&demand),
+        );
         demand_tasks.push(tokio::spawn(async move {
             let mut tick = tokio::time::interval(fast_plane::demand::DEMAND_REPORT_INTERVAL);
             tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -9415,10 +9418,13 @@ impl LiveTsCache {
                     Some(gap / self.parts_per_segment as u64)
                 };
                 if let Some(segment_id) = segment_id {
-                    groups
-                        .entry(segment_id)
-                        .or_default()
-                        .push((*gap, part_target_us, false, 0, true));
+                    groups.entry(segment_id).or_default().push((
+                        *gap,
+                        part_target_us,
+                        false,
+                        0,
+                        true,
+                    ));
                 }
             }
             for group in groups.values_mut() {
@@ -9459,7 +9465,9 @@ impl LiveTsCache {
             // window whose key frame never came: it stays.
             groups.retain(|_segment_id, group| {
                 group.first().is_some_and(
-                    |(_sequence, _duration_us, keyframe, _available_unix_us, gap)| *keyframe || *gap,
+                    |(_sequence, _duration_us, keyframe, _available_unix_us, gap)| {
+                        *keyframe || *gap
+                    },
                 )
             });
         } else if groups.len() > 1 {
@@ -9472,9 +9480,11 @@ impl LiveTsCache {
                 if groups
                     .get(&first_segment)
                     .and_then(|group| group.first())
-                    .is_some_and(|(sequence, _duration_us, _keyframe, _available_unix_us, _)| {
-                        *sequence != expected_first_sequence
-                    })
+                    .is_some_and(
+                        |(sequence, _duration_us, _keyframe, _available_unix_us, _)| {
+                            *sequence != expected_first_sequence
+                        },
+                    )
                 {
                     groups.remove(&first_segment);
                 }
@@ -9496,9 +9506,11 @@ impl LiveTsCache {
             && groups
                 .last_key_value()
                 .and_then(|(_segment_id, group)| group.last())
-                .is_some_and(|(_sequence, duration_us, _keyframe, _available_unix_us, gap)| {
-                    !*gap && part_ends_segment_short(*duration_us, part_target_us)
-                });
+                .is_some_and(
+                    |(_sequence, duration_us, _keyframe, _available_unix_us, gap)| {
+                        !*gap && part_ends_segment_short(*duration_us, part_target_us)
+                    },
+                );
         let segment_is_complete = |segment_id: u64, group_len: usize| {
             if keyframe_aligned_segments {
                 Some(segment_id) != open_segment_id || open_segment_ended_short
@@ -9512,9 +9524,11 @@ impl LiveTsCache {
             .map(|(_segment_id, group)| {
                 group
                     .iter()
-                    .map(|(_sequence, duration_us, _keyframe, _available_unix_us, _)| {
-                        u64::from(*duration_us)
-                    })
+                    .map(
+                        |(_sequence, duration_us, _keyframe, _available_unix_us, _)| {
+                            u64::from(*duration_us)
+                        },
+                    )
                     .sum::<u64>()
             })
             .max();
@@ -9584,13 +9598,15 @@ impl LiveTsCache {
             .values()
             .next()
             .and_then(|group| group.first())
-            .filter(|(_sequence, _duration_us, _keyframe, available_unix_us, _)| {
-                *available_unix_us > 0
-            })
-            .and_then(|(_sequence, duration_us, _keyframe, available_unix_us, _)| {
-                let start_unix_us = available_unix_us.saturating_sub(u64::from(*duration_us));
-                format_hls_program_date_time(start_unix_us)
-            });
+            .filter(
+                |(_sequence, _duration_us, _keyframe, available_unix_us, _)| *available_unix_us > 0,
+            )
+            .and_then(
+                |(_sequence, duration_us, _keyframe, available_unix_us, _)| {
+                    let start_unix_us = available_unix_us.saturating_sub(u64::from(*duration_us));
+                    format_hls_program_date_time(start_unix_us)
+                },
+            );
         if let Some(program_date_time) = program_date_time {
             out.push_str(&format!("#EXT-X-PROGRAM-DATE-TIME:{program_date_time}\n"));
         }
@@ -11977,6 +11993,12 @@ struct RelaySessionIngressSnapshot {
     conflict_drops: u64,
     authentication_drops: u64,
     deadline_drops: u64,
+    #[serde(default)]
+    compact_decoded_objects: u64,
+    #[serde(default)]
+    compact_unknown_descriptor: u64,
+    #[serde(default)]
+    compact_descriptors_learned: u64,
     downstream_children: u64,
     forwarded_source_datagrams: u64,
     forwarded_repair_datagrams: u64,
@@ -12131,6 +12153,9 @@ impl From<RelayIngressSnapshot> for RelaySessionIngressSnapshot {
             conflict_drops: snapshot.counters.conflict_drops,
             authentication_drops: snapshot.counters.authentication_drops,
             deadline_drops: snapshot.counters.deadline_drops,
+            compact_decoded_objects: snapshot.counters.compact_decoded_objects,
+            compact_unknown_descriptor: snapshot.counters.compact_unknown_descriptor,
+            compact_descriptors_learned: snapshot.counters.compact_descriptors_learned,
             ..Self::default()
         }
     }
@@ -14868,6 +14893,27 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
         "av_mesh_relay_session_fec_recovered_source_symbols_total {}\n",
         snapshot.relay_session.fec_recovered_source_symbols
     ));
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_relay_session_compact_total",
+        "Compact (RLC1) audio objects: rebuilt, not rebuilt for want of a descriptor, and whole audio objects that carried one.",
+        "counter",
+    );
+    for (outcome, value) in [
+        ("decoded", snapshot.relay_session.compact_decoded_objects),
+        (
+            "unknown_descriptor",
+            snapshot.relay_session.compact_unknown_descriptor,
+        ),
+        (
+            "descriptor",
+            snapshot.relay_session.compact_descriptors_learned,
+        ),
+    ] {
+        output.push_str(&format!(
+            "av_mesh_relay_session_compact_total{{outcome=\"{outcome}\"}} {value}\n"
+        ));
+    }
     push_prometheus_metric_header(
         &mut output,
         "av_mesh_relay_session_drops_total",
@@ -36117,6 +36163,62 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         (wire(&encoded.source_symbols), wire(&encoded.repair_symbols))
+    }
+
+    /// The compact (RLC1) datagrams of an audio envelope, as the
+    /// contributor sends them with --relay-compact-audio (wave 7 item 3):
+    /// `None` when `sender` sends this part whole (the caller sends its
+    /// RLS1 symbols), else its source datagram and `copies` repair copies.
+    fn fast_test_compact(
+        envelope: &[u8],
+        sender: &mut playlists::compact_object::CompactSender,
+        now_us: u64,
+        deadline_us: u64,
+        copies: u32,
+    ) -> Option<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
+        use playlists::compact_object::{self as compact_object, CompactDecision, CompactHeader};
+        static SEQUENCE: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(0x4000_0000);
+        let object = media_object::decode(envelope).unwrap();
+        let CompactDecision::Slim(slim) = sender.decide(&object, envelope, now_us) else {
+            return None;
+        };
+        let key = object.key();
+        let first = SEQUENCE.fetch_add(1 + copies, Ordering::Relaxed);
+        let header = CompactHeader {
+            generation: FAST_GENERATION,
+            subscription_id: FAST_SUBSCRIPTION,
+            deadline_us,
+            role: 0,
+            kind: 3,
+            path: 0,
+            tenant: compact_object::static_name(&compact_object::TENANT_CODES, key.tenant())?,
+            stream: key.stream(),
+            track: compact_object::static_name(&compact_object::TRACK_CODES, key.track())?,
+            epoch: key.epoch(),
+            group: key.group(),
+            object: key.object(),
+            version: key.version(),
+            packet_sequence: first,
+            esi: 0,
+        };
+        let source = compact_object::encode_datagram(&header, &slim).unwrap();
+        let repairs = (0..copies)
+            .map(|index| {
+                compact_object::encode_datagram(
+                    &CompactHeader {
+                        role: 1,
+                        path: 1,
+                        esi: 1 + index,
+                        packet_sequence: first + 1 + index,
+                        ..header
+                    },
+                    &slim,
+                )
+                .unwrap()
+            })
+            .collect();
+        Some((vec![source], repairs))
     }
 
     fn fast_audio_symbols(stream_id: u64, sequence: u64, deadline_us: u64) -> Vec<Vec<u8>> {

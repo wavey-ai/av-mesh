@@ -710,6 +710,23 @@ impl EdgeFastLane {
         if let Some(kept) = ring.get_part(view.object) {
             return Some(kept);
         }
+        // A compact (RLC1) datagram of an opaque part: the slim object
+        // holds the part itself, and every copy is whole.
+        if let Some(slim) = view.slim {
+            if view.track != "opaque-audio" {
+                return None;
+            }
+            let slim = playlists::compact_object::SlimView::parse(slim).ok()?;
+            if slim.object != view.object {
+                return None;
+            }
+            let published_us = slim
+                .published_unix_ns()
+                .map_or(0, |ns| u64::try_from(ns / 1_000).unwrap_or(0));
+            let mut datagram = compact::encode_part(view.object, published_us, slim.payload)?;
+            compact::set_generation(&mut datagram, ring.generation());
+            return Some(ring.put(view.object, bytes::Bytes::from(datagram)));
+        }
         let header = DatagramFecHeader::decode(view.fec).ok()?;
         if header.source_symbols != 1 || view.esi != 0 {
             return None;
@@ -805,16 +822,14 @@ impl EdgeFastLane {
         let list: Vec<(&[u8], SocketAddr)> = claimed
             .iter()
             .flat_map(|(peer, copies)| {
-                std::iter::repeat_n(
-                    (marked[copies].as_slice(), *peer),
-                    1 + usize::from(*copies),
-                )
+                std::iter::repeat_n((marked[copies].as_slice(), *peer), 1 + usize::from(*copies))
             })
             .collect();
-        let (delivered, _) = armed
-            .sockets
-            .out_for_stream(stream_id)
-            .send_many(&armed.stats, true, false, &list);
+        let (delivered, _) =
+            armed
+                .sockets
+                .out_for_stream(stream_id)
+                .send_many(&armed.stats, true, false, &list);
         self.stats
             .compact_parts
             .fetch_add(claimed.len() as u64, Ordering::Relaxed);
@@ -1034,7 +1049,6 @@ pub struct ClientPlan {
 const REPAIR_MEMO: usize = 64;
 /// Marked copies of a compact datagram: one for each count of copies.
 const COMPACT_VARIANTS: usize = compact::MAX_COPIES as usize + 1;
-
 fn compact_at(message: usize, copies: u8) -> usize {
     (message * COMPACT_VARIANTS + usize::from(copies)) * compact::MAX_DATAGRAM
 }
@@ -1147,12 +1161,21 @@ impl ClientPlan {
         }
         let part = view.object;
         let start = message * REWRAP_BYTES;
-        let Some(len) = rewrap_fast(
-            view.fec,
-            part,
-            &mut self.buffers[start..start + REWRAP_BYTES],
-        ) else {
-            return;
+        // A compact (RLC1) datagram has no symbol to rewrap: its compact
+        // clients get the part, its RaptorQ-lane clients the cache-fed
+        // lane's symbols.
+        let compact_feed = view.is_compact();
+        let len = if compact_feed {
+            0
+        } else {
+            let Some(len) = rewrap_fast(
+                view.fec,
+                part,
+                &mut self.buffers[start..start + REWRAP_BYTES],
+            ) else {
+                return;
+            };
+            len
         };
         self.lens[message] = len as u16;
         self.compact_lens[message] = 0;
@@ -1166,7 +1189,8 @@ impl ClientPlan {
                 .observe(self.now_ns, len as u64);
         }
         let k = u32::from(view.source_symbols);
-        let repair_ordinal = view.esi.checked_sub(k);
+        // Every copy of a compact part is the part.
+        let repair_ordinal = view.esi.checked_sub(k).filter(|_| !compact_feed);
         // The compact datagram of a one-symbol object, made at most once.
         let mut compact_made: Option<bool> = None;
         for group in groups {
@@ -1190,6 +1214,12 @@ impl ClientPlan {
                     }
                 }
             }
+            if compact_feed && copies.is_none() {
+                lane.stats
+                    .not_eligible
+                    .fetch_add(group.clients.len() as u64, Ordering::Relaxed);
+                continue;
+            }
             if let (None, Some(ordinal)) = (copies, repair_ordinal) {
                 if ordinal >= self.repair_symbols(group.repair, k) {
                     lane.stats
@@ -1207,6 +1237,11 @@ impl ClientPlan {
                     continue;
                 }
                 let fresh = !client.has_fast(part);
+                // A compact part's copies are the same part: the first
+                // that arrives goes, the others do not.
+                if compact_feed && !fresh {
+                    continue;
+                }
                 if !client.claim_fast(part) {
                     continue;
                 }
@@ -2157,7 +2192,11 @@ mod tests {
             }
             // A frame's last message: within the bound, and spread over
             // more than one slice (it is paced, not sent at once).
-            assert!(last - now <= pacing.max_delay_us * 1_000, "{mbps}: {}", last - now);
+            assert!(
+                last - now <= pacing.max_delay_us * 1_000,
+                "{mbps}: {}",
+                last - now
+            );
             assert!(last - now >= 1_000_000, "{mbps}: {}", last - now);
             pacer.next.clear();
         }

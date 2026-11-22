@@ -352,7 +352,7 @@ fn measure(feed: Feed, payload: Payload, listeners: usize, seconds: u64) -> Stri
         let (published, arrived) = (*published as i64, *arrived as i64);
         total.push(arrived - published);
         let receipt = match feed {
-            Feed::Fast => at(HopStage::RelayFirst, *part),
+            Feed::Fast | Feed::FastCompact => at(HopStage::RelayFirst, *part),
             Feed::Mesh => at(HopStage::MeshFirst, *part),
         };
         let sent = at(HopStage::UdpSent, *part);

@@ -43,7 +43,13 @@ pub struct RlsView<'a> {
     pub source_symbols: u16,
     /// The encoding symbol id of the RaptorQ payload id.
     pub esi: u32,
+    /// A compact datagram's slim object (wave 7 item 3; `fec` is empty and
+    /// `payload_hash` zero then): every copy of the part carries it whole.
+    pub slim: Option<&'a [u8]>,
 }
+
+/// The payload hash a compact datagram's view reports: it carries none.
+static NO_HASH: [u8; 32] = [0; 32];
 
 /// Why a datagram is not a valid RLS1 datagram. The fast plane only counts
 /// these; the tee's full decode reports the reason.
@@ -137,6 +143,9 @@ impl<'a> RlsView<'a> {
         }
         if input.len() < HEADER_LEN {
             return Err(ViewError("truncated"));
+        }
+        if playlists::compact_object::is_compact_datagram(input) {
+            return Self::parse_compact(input);
         }
         if input[..4] != *b"RLS1" {
             return Err(ViewError("not RLS1"));
@@ -250,7 +259,56 @@ impl<'a> RlsView<'a> {
             packet_sequence: header.packet_sequence,
             source_symbols: header.source_symbols,
             esi: u32::from_be_bytes([0, payload[1], payload[2], payload[3]]),
+            slim: None,
         })
+    }
+
+    /// A compact (RLC1) datagram: one symbol, its slim object for a symbol.
+    fn parse_compact(input: &'a [u8]) -> Result<Self, ViewError> {
+        let (header, slim) =
+            playlists::compact_object::parse_datagram(input).map_err(|error| ViewError(error.0))?;
+        TopologyGeneration::new(header.generation).map_err(|_| ViewError("generation"))?;
+        SubscriptionId::new(header.subscription_id).map_err(|_| ViewError("subscription"))?;
+        let (role, path_intent) = match (header.role, header.path) {
+            (0, 0) => (MediaDatagramRole::Source, MediaPathIntent::PrimarySource),
+            (1, 1) => (MediaDatagramRole::Repair, MediaPathIntent::SecondaryRepair),
+            _ => return Err(ViewError("path intent")),
+        };
+        let kind = match header.kind {
+            0 => MediaObjectKind::Initialization,
+            1 => MediaObjectKind::CodecConfig,
+            2 => MediaObjectKind::VideoKeyframe,
+            3 => MediaObjectKind::Audio,
+            4 => MediaObjectKind::VideoDelta,
+            _ => MediaObjectKind::Data,
+        };
+        Ok(Self {
+            generation: header.generation,
+            subscription_id: header.subscription_id,
+            deadline_us: header.deadline_us,
+            role,
+            kind,
+            path_intent,
+            tenant: header.tenant,
+            stream: header.stream,
+            track: header.track,
+            epoch: header.epoch,
+            group: header.group,
+            object: header.object,
+            version: header.version,
+            payload_hash: &NO_HASH,
+            fec: &[],
+            block_id: 0,
+            packet_sequence: header.packet_sequence,
+            source_symbols: 1,
+            esi: header.esi,
+            slim: Some(slim),
+        })
+    }
+
+    /// Whether the datagram is a compact (RLC1) one.
+    pub const fn is_compact(&self) -> bool {
+        self.slim.is_some()
     }
 
     /// The numeric stream id, as the node's caches key it.
@@ -479,5 +537,57 @@ mod tests {
                 "{best:?} per datagram"
             );
         }
+    }
+
+    /// A compact (RLC1) datagram reads as the same view, with its slim
+    /// object and no RQD2 datagram.
+    #[test]
+    fn a_compact_datagram_reads_as_a_one_symbol_view() {
+        use playlists::compact_object::{encode_datagram, CompactHeader};
+        let header = CompactHeader {
+            generation: 4,
+            subscription_id: 9,
+            deadline_us: 1_763_812_350_000_000,
+            role: 1,
+            kind: 3,
+            path: 1,
+            tenant: "default",
+            stream: "3001",
+            track: "opaque-audio",
+            epoch: 77,
+            group: 0,
+            object: 123_456,
+            version: 1,
+            packet_sequence: 0xabcd_0001,
+            esi: 2,
+        };
+        let wire = encode_datagram(&header, b"\x01slim object").unwrap();
+        let view = RlsView::parse(&wire, RelayLimits::default()).unwrap();
+        assert!(view.is_compact());
+        assert_eq!(view.slim, Some(b"\x01slim object".as_slice()));
+        assert_eq!(
+            (view.generation, view.subscription_id, view.deadline_us),
+            (4, 9, 1_763_812_350_000_000)
+        );
+        assert_eq!(view.role, MediaDatagramRole::Repair);
+        assert_eq!(view.path_intent, MediaPathIntent::SecondaryRepair);
+        assert_eq!(view.kind, MediaObjectKind::Audio);
+        assert_eq!(
+            (view.tenant, view.stream, view.track),
+            ("default", "3001", "opaque-audio")
+        );
+        assert_eq!(
+            (view.epoch, view.group, view.object, view.version),
+            (77, 0, 123_456, 1)
+        );
+        assert_eq!(
+            (view.packet_sequence, view.esi, view.source_symbols),
+            (0xabcd_0001, 2, 1)
+        );
+        assert_eq!(view.stream_id(), Some(3001));
+        assert!(view.fec.is_empty());
+        // A role that its path does not match is refused, as for RLS1.
+        let crossed = encode_datagram(&CompactHeader { path: 0, ..header }, b"\x01x").unwrap();
+        assert!(RlsView::parse(&crossed, RelayLimits::default()).is_err());
     }
 }

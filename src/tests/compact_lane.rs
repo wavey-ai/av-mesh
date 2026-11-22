@@ -774,12 +774,23 @@ impl MeshEdge {
 pub(super) enum Feed {
     Fast,
     Mesh,
+    /// The fast plane, its audio parts sent as the contributor sends them
+    /// with --relay-compact-audio: compact RLC1 datagrams, and a whole part
+    /// every 100 ms for the descriptor (wave 7 item 3).
+    FastCompact,
 }
 
 pub(super) enum AnyEdge {
     Fast(LaneEdge),
     Mesh(MeshEdge),
+    FastCompact(
+        LaneEdge,
+        std::sync::Mutex<playlists::compact_object::CompactSender>,
+    ),
 }
+
+/// How often a compact feed sends a part whole.
+const COMPACT_WHOLE_EVERY_US: u64 = 100_000;
 
 impl AnyEdge {
     /// The edge, and the next part to publish.
@@ -798,26 +809,35 @@ impl AnyEdge {
                 let (edge, next) = MeshEdge::start(payload, stream_id, true).await;
                 (Self::Mesh(edge), next)
             }
+            Feed::FastCompact => {
+                let (Self::Fast(edge), next) =
+                    Box::pin(Self::start(Feed::Fast, payload, stream_id, ip)).await
+                else {
+                    unreachable!("a fast edge")
+                };
+                let sender = playlists::compact_object::CompactSender::new(COMPACT_WHOLE_EVERY_US);
+                (Self::FastCompact(edge, std::sync::Mutex::new(sender)), next)
+            }
         }
     }
 
     pub(super) fn client_port(&self) -> SocketAddr {
         match self {
-            Self::Fast(edge) => edge.client_port,
+            Self::Fast(edge) | Self::FastCompact(edge, _) => edge.client_port,
             Self::Mesh(edge) => edge.client_port,
         }
     }
 
     pub(super) fn cache(&self) -> &Arc<LiveTsCache> {
         match self {
-            Self::Fast(edge) => &edge.cache,
+            Self::Fast(edge) | Self::FastCompact(edge, _) => &edge.cache,
             Self::Mesh(edge) => &edge.cache,
         }
     }
 
     pub(super) fn stats(&self) -> &Arc<edge_udp::EdgeUdpStats> {
         match self {
-            Self::Fast(edge) => &edge.stats,
+            Self::Fast(edge) | Self::FastCompact(edge, _) => &edge.stats,
             Self::Mesh(edge) => &edge.stats,
         }
     }
@@ -830,12 +850,23 @@ impl AnyEdge {
                     .await;
             }
             Self::Mesh(edge) => edge.publish(stream_id, &envelope).await,
+            Self::FastCompact(edge, sender) => {
+                let compact = crate::tests::fast_test_compact(
+                    &envelope,
+                    &mut sender.lock().unwrap(),
+                    sequence * payload.part_us(),
+                    now_unix_us() + 30_000_000,
+                    1,
+                );
+                let symbols = compact.unwrap_or_else(|| payload.symbols(&envelope));
+                edge.send(false, &symbols, false).await;
+            }
         }
     }
 
     pub(super) async fn stop(self) {
         match self {
-            Self::Fast(edge) => edge.stop().await,
+            Self::Fast(edge) | Self::FastCompact(edge, _) => edge.stop().await,
             Self::Mesh(edge) => edge.stop().await,
         }
     }
@@ -899,7 +930,7 @@ async fn compact_listeners_lose_nothing(feed: Feed, payload: Payload, ip: u8) {
     for (index, loss) in paths.into_iter().enumerate() {
         // The fast lane's edge also serves a listener without F1 (the
         // cache-fed lane) on the bursty path.
-        let lanes: &[bool] = if feed == Feed::Fast && index == 3 {
+        let lanes: &[bool] = if feed != Feed::Mesh && index == 3 {
             &[true, false]
         } else {
             &[true]
@@ -965,7 +996,7 @@ async fn compact_listeners_lose_nothing(feed: Feed, payload: Payload, ip: u8) {
         // the few that the cache-fed lane sent first, and those that loss
         // took), and the cache-fed lane sends the rest unmarked.
         if run.compact_confirmed {
-            if feed == Feed::Fast && name.contains("F1=true") {
+            if feed != Feed::Mesh && name.contains("F1=true") {
                 assert!(
                     run.fast_lane_parts as f64 >= 0.8 * received,
                     "{name}: {} of {received} parts came marked as the fast lane's",
@@ -984,7 +1015,8 @@ async fn compact_listeners_lose_nothing(feed: Feed, payload: Payload, ip: u8) {
         // The wire of a clean path: one datagram a part and a window's
         // repair (1/32), nothing more.
         if name.contains("clean") {
-            let ceiling = (payload.media_len() + av_mesh::client_compact::HEADER_LEN + 28) as f64 * 1.06;
+            let ceiling =
+                (payload.media_len() + av_mesh::client_compact::HEADER_LEN + 28) as f64 * 1.06;
             assert!(
                 datagrams_per_part <= 1.06 && bytes_per_part <= ceiling,
                 "{name}: {datagrams_per_part:.3} datagrams and {bytes_per_part:.0} B a part \
@@ -1005,6 +1037,24 @@ async fn compact_listeners_lose_nothing(feed: Feed, payload: Payload, ip: u8) {
         );
     }
     println!("{}", report.join("\n"));
+    if feed == Feed::FastCompact {
+        // The edge's LL-HLS parts are the contributor's parts byte for
+        // byte, though most came as slim objects: the tee rebuilt their
+        // envelopes from the descriptor.
+        for (part, bytes) in &served {
+            assert_eq!(
+                bytes.as_ref(),
+                payload.envelope(stream_id, *part).1.as_slice(),
+                "part {part} is the contributor's part"
+            );
+        }
+        let relay = edge.cache().relay_ingress_snapshot();
+        assert!(
+            relay.compact_decoded_objects >= parts - first - 2 * (parts - first) / 100 - 2,
+            "{relay:?}: the parts but the whole ones came compact"
+        );
+        assert!(relay.compact_descriptors_learned > 0, "{relay:?}");
+    }
     let stats = edge.stats();
     assert!(stats.compact_parts.load(Ordering::Relaxed) > 0);
     assert!(stats.compact_window_repair.load(Ordering::Relaxed) > 0);
@@ -1015,6 +1065,13 @@ async fn compact_listeners_lose_nothing(feed: Feed, payload: Payload, ip: u8) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn compact_listeners_of_the_fast_lane_lose_nothing_through_loss_and_bursts() {
     compact_listeners_lose_nothing(Feed::Fast, Payload::Pcm, 21).await;
+}
+
+/// An edge fed compact RLC1 datagrams (wave 7 item 3): its compact
+/// listeners, its RaptorQ-lane listener and its LL-HLS parts lose nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compact_listeners_of_a_compact_fed_edge_lose_nothing_through_loss_and_bursts() {
+    compact_listeners_lose_nothing(Feed::FastCompact, Payload::Opus1, 29).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1088,7 +1145,11 @@ async fn a_compact_listener_of_4k_loses_nothing_at_one_percent() {
             run.nack_parts,
             on_time * 100.0
         );
-        assert!(on_time >= 0.98, "{name}: {:.1} % of frames on time", on_time * 100.0);
+        assert!(
+            on_time >= 0.98,
+            "{name}: {:.1} % of frames on time",
+            on_time * 100.0
+        );
         assert!(p99 <= 100.0, "{name}: p99 {p99:.2} ms");
     }
     edge.stop().await;
@@ -1387,12 +1448,8 @@ fn the_compact_flag_defaults_on_and_can_be_turned_off() {
 fn the_fast_lane_mark_defaults_on_and_can_be_turned_off() {
     let args = Args::try_parse_from(["av-mesh"]).unwrap();
     assert!(args.client_udp_compact_mark_fast_lane);
-    let args = Args::try_parse_from([
-        "av-mesh",
-        "--client-udp-compact-mark-fast-lane",
-        "false",
-    ])
-    .unwrap();
+    let args =
+        Args::try_parse_from(["av-mesh", "--client-udp-compact-mark-fast-lane", "false"]).unwrap();
     assert!(!args.client_udp_compact_mark_fast_lane);
 }
 

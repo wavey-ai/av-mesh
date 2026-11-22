@@ -24,8 +24,8 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use av_mesh::relay_ingress::{
-    is_relay_session_datagram, PeerAdmission, RelayIngressError, RelayIngressOutcome,
-    RelayIngressSnapshot, RelayUdpDispatch, RelayUdpDispatchOutcome,
+    is_relay_datagram, PeerAdmission, RelayIngressError, RelayIngressOutcome, RelayIngressSnapshot,
+    RelayUdpDispatch, RelayUdpDispatchOutcome,
 };
 use av_mesh::udp_fec::UdpFecReceiver;
 use bytes::Bytes;
@@ -577,13 +577,7 @@ impl RelayDownstreamForwarder {
     /// its role, in compiled order. A source symbol held back from a warm
     /// repair-only child is noted, and kept for a later promotion only once
     /// the batch is sent (`buffer_fast_warm`), as `forward` keeps it.
-    fn plan_fast(
-        &self,
-        message: usize,
-        view: &RlsView<'_>,
-        plan: &mut ForwardPlan,
-        now: Instant,
-    ) {
+    fn plan_fast(&self, message: usize, view: &RlsView<'_>, plan: &mut ForwardPlan, now: Instant) {
         let role = view.role;
         let mut object = None;
         // Renditions that a child's subtree does not read stay off its lane
@@ -1082,7 +1076,7 @@ impl ClassThread {
                 rx_us,
                 admitted: None,
             };
-            if !is_relay_session_datagram(received.data) {
+            if !is_relay_datagram(received.data) {
                 pending.push(unchecked);
                 continue;
             }
@@ -1248,6 +1242,9 @@ fn merge_snapshots(snapshots: &[RelayIngressSnapshot; 2]) -> RelayIngressSnapsho
     a.conflict_drops += v.conflict_drops;
     a.authentication_drops += v.authentication_drops;
     a.deadline_drops += v.deadline_drops;
+    a.compact_decoded_objects += v.compact_decoded_objects;
+    a.compact_unknown_descriptor += v.compact_unknown_descriptor;
+    a.compact_descriptors_learned += v.compact_descriptors_learned;
     merged
 }
 

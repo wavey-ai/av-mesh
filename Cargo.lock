@@ -2894,7 +2894,7 @@ dependencies = [
 [[package]]
 name = "playlists"
 version = "0.2.0"
-source = "git+https://github.com/wavey-ai/playlists.git?rev=de82b6c17c38d63c7b49ae49846a089988f918d7#de82b6c17c38d63c7b49ae49846a089988f918d7"
+source = "git+https://github.com/wavey-ai/playlists.git?rev=4023d2e0761e876c6b92c6580550e3e2daa9b962#4023d2e0761e876c6b92c6580550e3e2daa9b962"
 dependencies = [
  "access-unit 0.1.5",
  "arc-swap",
@@ -2902,6 +2902,7 @@ dependencies = [
  "chrono",
  "flate2",
  "libc",
+ "media-object",
  "raptorq",
  "raptorq-datagram-fec",
  "socket2 0.6.5",
