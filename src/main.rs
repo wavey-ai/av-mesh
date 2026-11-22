@@ -226,6 +226,13 @@ const CACHE_MESH_ANNOUNCE_MS: u64 = 100;
 /// round trip: 400 ms tripped while parents were alive but slow to decode,
 /// and moved UDP clients between edges every few milliseconds.
 const EDGE_PARENTS_SILENT_MS: u64 = 1_500;
+/// Default of --edge-liveness-cache-us: far below the parents' silence that
+/// counts, and long enough that a thousand requests a second ask the mesh
+/// a few hundred times.
+const DEFAULT_EDGE_LIVENESS_CACHE_US: u64 = 5_000;
+/// The longest that a part request ahead of the stream waits at a time
+/// with --edge-part-wait-due before it looks at the parents again.
+const EDGE_PART_WAIT_SLICE_MS: u64 = 100;
 /// Minimum time between two hole repair requests for one stream: ten parts
 /// of the stream, from 5 ms up to this, and no less than one part of up to
 /// 100 ms.
@@ -246,6 +253,66 @@ fn edge_hole_repair_grace(part_us: u64) -> Duration {
         EDGE_HOLE_REPAIR_MIN_GRACE_US,
         EDGE_HOLE_REPAIR_GRACE_MS * 1_000,
     ))
+}
+
+/// How long a part request waits before it looks again for a hole to
+/// repair (--edge-part-wait-due): a part that is not yet due (ahead of the
+/// newest part `head`) until it is due, `seq - head` parts later, plus the
+/// grace, and at most `slice`; a part behind the newest part (a hole) the
+/// grace.
+fn part_wait_until_due(
+    head: Option<u64>,
+    seq: u64,
+    part_us: u64,
+    grace: Duration,
+    slice: Duration,
+) -> Duration {
+    match head {
+        Some(head) if seq > head => {
+            let due = Duration::from_micros((seq - head).saturating_mul(part_us.max(1)));
+            due.saturating_add(grace).min(slice).max(grace)
+        }
+        _ => grace,
+    }
+}
+
+/// Whether the parents are lost, as an edge last asked, and when.
+#[derive(Debug)]
+struct LivenessCache {
+    ttl_us: u64,
+    /// When the answer was taken (0: never), and the answer.
+    asked_unix_us: AtomicU64,
+    lost: AtomicBool,
+}
+
+impl LivenessCache {
+    fn new(ttl_us: u64) -> Self {
+        Self {
+            ttl_us,
+            asked_unix_us: AtomicU64::new(0),
+            lost: AtomicBool::new(false),
+        }
+    }
+
+    /// The answer, if it is at most the TTL old.
+    fn get(&self, now_us: u64) -> Option<bool> {
+        if self.ttl_us == 0 {
+            return None;
+        }
+        let asked = self.asked_unix_us.load(Ordering::Acquire);
+        (asked != 0 && now_us.saturating_sub(asked) < self.ttl_us)
+            .then(|| self.lost.load(Ordering::Acquire))
+    }
+
+    fn set(&self, now_us: u64, lost: bool) {
+        if self.ttl_us == 0 {
+            return;
+        }
+        // The answer first, then its time: a reader that sees the new time
+        // sees the new answer.
+        self.lost.store(lost, Ordering::Release);
+        self.asked_unix_us.store(now_us.max(1), Ordering::Release);
+    }
 }
 
 /// Minimum time between two hole repair requests for a stream with parts
@@ -1493,6 +1560,41 @@ struct Args {
     )]
     client_udp_move_hold_down_ms: u64,
 
+    /// Hand the datagrams of a part for all of its UDP clients to the
+    /// kernel in one sendmmsg, not one sendto each. `false` is the
+    /// behaviour from before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_BATCH_SEND",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    client_udp_batch_send: bool,
+
+    /// A cut-through part of at most this many bytes has its client repair
+    /// encoded and sent where it decoded (the cache-mesh receive task or the
+    /// cut-through thread), not on a thread of the blocking pool woken for
+    /// each part. 0 is the behaviour from before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_INLINE_COMPLETE_BYTES",
+        default_value_t = edge_udp::DEFAULT_INLINE_COMPLETE_BYTES
+    )]
+    client_udp_inline_complete_bytes: usize,
+
+    /// With --client-udp-batch-send, a client's datagrams of a part leave
+    /// as one UDP GSO message (UDP_SEGMENT): one pass through the kernel's
+    /// stack for the part's repair instead of one per datagram. A host that
+    /// refuses GSO is sent to without it. `false` is the behaviour from
+    /// before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_GSO",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    client_udp_gso: bool,
+
     /// An edge that has heard none of its cache-mesh parents for this long
     /// has lost them: it answers 503 for a part or a playlist reload that it
     /// would otherwise hold, and moves its UDP clients. Keep it above the
@@ -1529,6 +1631,42 @@ struct Args {
         action = clap::ArgAction::Set
     )]
     mesh_liveness_on_receipt: bool,
+
+    /// A part request ahead of the edge's newest part waits for the part
+    /// until it is due (its distance from the newest part, in parts of the
+    /// stream, plus the hole repair grace; at most
+    /// EDGE_PART_WAIT_SLICE_MS at a time) instead of waking every hole
+    /// repair grace (3 ms at 1 ms parts) to look again. `false` is the
+    /// behaviour from before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_EDGE_PART_WAIT_DUE",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    edge_part_wait_due: bool,
+
+    /// An edge answers whether it has lost its parents from an answer at
+    /// most this old (microseconds), instead of asking the cache mesh for
+    /// every request. 0 asks for every request (the behaviour from before).
+    #[arg(
+        long,
+        env = "NEEDLETAIL_EDGE_LIVENESS_CACHE_US",
+        default_value_t = DEFAULT_EDGE_LIVENESS_CACHE_US
+    )]
+    edge_liveness_cache_us: u64,
+
+    /// A playlist render reads only the slots of the window written since
+    /// the last render, and knows the others from it, instead of reading
+    /// and decoding every part of the window (12,000 at 1 ms parts) each
+    /// time. `false` is the behaviour from before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_PLAYLIST_SCAN_MEMO",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    playlist_scan_memo: bool,
 
     #[arg(long, default_value_t = 9444)]
     http_port: u16,
@@ -2277,6 +2415,7 @@ async fn main() -> Result<()> {
     )
     .await;
     cache.set_canonical_gap_hold(Duration::from_millis(args.canonical_gap_hold_ms));
+    cache.set_playlist_scan_memo(args.playlist_scan_memo);
     cache.set_part_hold_back_floor(Duration::from_millis(args.part_hold_back_ms));
     let link_telemetry = Arc::new(LinkTelemetry::new(
         node_id.clone(),
@@ -2732,6 +2871,8 @@ async fn main() -> Result<()> {
             .saturating_mul(3)
             .max(REGION_SILENCE_MIN_FRESH_MS),
     )
+    .with_liveness_cache(args.edge_liveness_cache_us)
+    .with_part_wait_due(args.edge_part_wait_due)
     .with_regional_view_ttl(REGIONAL_VIEW_TTL)
     .with_playlist_demand(playlist_demand)
     .with_client_udp_port(args.client_udp_bind.map(|bind| bind.port()))
@@ -2820,6 +2961,9 @@ async fn main() -> Result<()> {
                 send_queue: Duration::from_millis(args.client_udp_send_queue_ms),
                 playout: Duration::from_millis(args.client_udp_playout_ms),
                 move_hold_down: Duration::from_millis(args.client_udp_move_hold_down_ms),
+                batch_send: args.client_udp_batch_send,
+                inline_complete_bytes: args.client_udp_inline_complete_bytes,
+                gso: args.client_udp_gso,
             },
             Arc::clone(&router.edge_udp_stats),
             edge_cut_through.clone(),
@@ -6291,6 +6435,70 @@ struct CachedPlaylist {
     body: String,
 }
 
+/// What a playlist render learned of each slot of a stream's window
+/// (--playlist-scan-memo): when the slot was written, and the media kind of
+/// the part in it, or `None` for a slot with no media. A slot written since
+/// is read again. A part that carries an initialization section is never
+/// kept: the render takes the section from it each time.
+#[derive(Debug, Default)]
+struct PlaylistScanMemo {
+    stream_id: u64,
+    /// The sequence of `slots[0]`.
+    first: u64,
+    slots: VecDeque<Option<(u64, Option<LiveMediaKind>)>>,
+}
+
+/// The most slots a scan memo holds: far more than any window.
+const PLAYLIST_SCAN_MEMO_MAX_SLOTS: usize = 1 << 20;
+
+impl PlaylistScanMemo {
+    fn for_stream(stream_id: u64) -> Self {
+        Self {
+            stream_id,
+            ..Self::default()
+        }
+    }
+
+    fn get(&self, sequence: u64) -> Option<(u64, Option<LiveMediaKind>)> {
+        let index = usize::try_from(sequence.checked_sub(self.first)?).ok()?;
+        self.slots.get(index).copied().flatten()
+    }
+
+    fn set(&mut self, sequence: u64, entry: Option<(u64, Option<LiveMediaKind>)>) {
+        if self.slots.is_empty() || sequence < self.first {
+            // The first slot, or a stream that started again below it.
+            if entry.is_none() {
+                return;
+            }
+            self.slots.clear();
+            self.first = sequence;
+        }
+        let Ok(index) = usize::try_from(sequence - self.first) else {
+            return;
+        };
+        if index >= PLAYLIST_SCAN_MEMO_MAX_SLOTS {
+            self.slots.clear();
+            self.first = sequence;
+            self.slots.push_back(entry);
+            return;
+        }
+        if index >= self.slots.len() {
+            self.slots.resize(index + 1, None);
+        }
+        self.slots[index] = entry;
+    }
+
+    /// Forget the slots before `first`.
+    fn trim_below(&mut self, first: u64) {
+        while self.first < first && self.slots.pop_front().is_some() {
+            self.first += 1;
+        }
+        if self.slots.is_empty() {
+            self.first = first;
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HlsReloadPosition {
     msn: u64,
@@ -6328,6 +6536,18 @@ struct LiveTsCache {
     canonical_gap_last_log_unix_ms: AtomicU64,
     part_updates: watch::Sender<u64>,
     playlist_cache: Vec<StdRwLock<Option<CachedPlaylist>>>,
+    /// The scan memo of the playlist in each playlist slot.
+    playlist_scan_memos: Vec<StdMutex<Option<PlaylistScanMemo>>>,
+    /// One render at a time of the playlist in each playlist slot, with the
+    /// scan memo: readers that reload together (a crowd that started
+    /// together does) wait for one render and take it, or render from the
+    /// memo that it left, instead of each scanning the window.
+    playlist_render_locks: Vec<AsyncMutex<()>>,
+    /// A playlist render reads a slot of its window only when it was
+    /// written since the last render (--playlist-scan-memo).
+    playlist_scan_memo: AtomicBool,
+    /// Slots that playlist renders read and decoded.
+    playlist_scan_reads: AtomicU64,
     /// Parts of streams that found every playlist slot in use by a live
     /// stream.
     stream_slot_refusals: AtomicU64,
@@ -6409,6 +6629,12 @@ impl LiveTsCache {
         let playlist_cache = (0..options.num_playlists)
             .map(|_| StdRwLock::new(None))
             .collect();
+        let playlist_scan_memos = (0..options.num_playlists)
+            .map(|_| StdMutex::new(None))
+            .collect();
+        let playlist_render_locks = (0..options.num_playlists)
+            .map(|_| AsyncMutex::new(()))
+            .collect();
         let chunk_cache = Arc::new(ChunkCache::new(options));
         let _ = chunk_cache.get_or_create_stream_idx(stream_id).await;
         let (part_updates, _) = watch::channel(0);
@@ -6437,6 +6663,10 @@ impl LiveTsCache {
             canonical_gap_last_log_unix_ms: AtomicU64::new(0),
             part_updates,
             playlist_cache,
+            playlist_scan_memos,
+            playlist_render_locks,
+            playlist_scan_memo: AtomicBool::new(true),
+            playlist_scan_reads: AtomicU64::new(0),
             stream_slot_refusals: AtomicU64::new(0),
             relay_ingress: StdRwLock::new(RelaySessionIngressSnapshot::default()),
             relay_failover_controller: StdRwLock::new(RelayFailoverControllerSnapshot::default()),
@@ -6455,6 +6685,106 @@ impl LiveTsCache {
 
     fn set_fast_plane_stats(&self, stats: Arc<fast_plane::relay::FastPlaneStats>) {
         let _ = self.fast_plane.set(stats);
+    }
+
+    /// A playlist render reads only the slots written since the last one
+    /// (`true`), or every slot of the window (`false`, as before).
+    fn set_playlist_scan_memo(&self, memo: bool) {
+        self.playlist_scan_memo.store(memo, Ordering::Relaxed);
+    }
+
+    /// Take the scan memo of a stream out of its playlist slot (a new one
+    /// if the slot held another stream's), to put back after the scan.
+    fn take_playlist_scan_memo(&self, stream_id: u64, stream_idx: usize) -> PlaylistScanMemo {
+        self.playlist_scan_memos
+            .get(stream_idx)
+            .and_then(|memo| {
+                memo.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+            })
+            .filter(|memo| memo.stream_id == stream_id)
+            .unwrap_or_else(|| PlaylistScanMemo::for_stream(stream_id))
+    }
+
+    fn put_playlist_scan_memo(&self, stream_idx: usize, memo: PlaylistScanMemo) {
+        if let Some(slot) = self.playlist_scan_memos.get(stream_idx) {
+            *slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(memo);
+        }
+    }
+
+    /// The parts of a stream's window that have media, oldest first, with
+    /// the media kind of the newest and the last initialization section
+    /// found in them.
+    async fn scan_playlist_window(
+        &self,
+        stream_id: u64,
+        stream_idx: usize,
+        first: usize,
+        last: usize,
+    ) -> (Vec<u64>, Option<LiveMediaKind>, Option<Bytes>) {
+        let mut available = Vec::new();
+        let mut latest_media_kind = None;
+        let mut discovered_init = None;
+        if !self.playlist_scan_memo.load(Ordering::Relaxed) {
+            for seq in first..=last {
+                if let Some((bytes, _hash)) = self.chunk_cache.get(stream_idx, seq).await {
+                    let slot = LiveSlotPayload::decode_for_stream(bytes, stream_id);
+                    if slot.has_media() {
+                        latest_media_kind = Some(slot.media_kind());
+                        if let Some(init) = slot.init() {
+                            discovered_init = Some(init);
+                        }
+                        available.push(seq as u64);
+                    }
+                }
+            }
+            return (available, latest_media_kind, discovered_init);
+        }
+        let mut memo = self.take_playlist_scan_memo(stream_id, stream_idx);
+        for seq in first..=last {
+            let sequence = seq as u64;
+            // When the slot was written, without a lock: a slot that holds
+            // no part of the stream has no time.
+            let Some(written_us) = self.chunk_cache.written_unix_us(stream_idx, seq) else {
+                memo.set(sequence, None);
+                continue;
+            };
+            if let Some((memo_written_us, kind)) = memo.get(sequence) {
+                if memo_written_us == written_us {
+                    if let Some(kind) = kind {
+                        latest_media_kind = Some(kind);
+                        available.push(sequence);
+                    }
+                    continue;
+                }
+            }
+            self.playlist_scan_reads.fetch_add(1, Ordering::Relaxed);
+            let Some((bytes, _hash)) = self.chunk_cache.get(stream_idx, seq).await else {
+                memo.set(sequence, None);
+                continue;
+            };
+            let slot = LiveSlotPayload::decode_for_stream(bytes, stream_id);
+            if !slot.has_media() {
+                memo.set(sequence, Some((written_us, None)));
+                continue;
+            }
+            let kind = slot.media_kind();
+            latest_media_kind = Some(kind);
+            available.push(sequence);
+            match slot.init() {
+                Some(init) => {
+                    discovered_init = Some(init);
+                    memo.set(sequence, None);
+                }
+                None => memo.set(sequence, Some((written_us, Some(kind)))),
+            }
+        }
+        memo.trim_below(first as u64);
+        self.put_playlist_scan_memo(stream_idx, memo);
+        (available, latest_media_kind, discovered_init)
     }
 
     fn set_hop_journal(&self, journal: Arc<HopJournal>) {
@@ -7720,26 +8050,29 @@ impl LiveTsCache {
                 && self.get_init_for_stream_id(stream_id).await.is_some();
             return self.empty_playlist(0, media_kind, include_map);
         };
-        let version = self.chunk_cache.version(stream_idx).unwrap_or_default();
+        let mut version = self.chunk_cache.version(stream_idx).unwrap_or_default();
         if let Some(playlist) = self.cached_playlist(stream_id, stream_idx, version) {
             return playlist;
         }
-        let first = last.saturating_sub(self.window_parts_for(stream_id).await.saturating_sub(1));
-        let mut available = Vec::new();
-        let mut latest_media_kind = None;
-        let mut discovered_init = None;
-        for seq in first..=last {
-            if let Some((bytes, _hash)) = self.chunk_cache.get(stream_idx, seq).await {
-                let slot = LiveSlotPayload::decode_for_stream(bytes, stream_id);
-                if slot.has_media() {
-                    latest_media_kind = Some(slot.media_kind());
-                    if let Some(init) = slot.init() {
-                        discovered_init = Some(init);
-                    }
-                    available.push(seq as u64);
+        let _rendering = match self.playlist_render_locks.get(stream_idx) {
+            Some(lock) if self.playlist_scan_memo.load(Ordering::Relaxed) => {
+                let guard = lock.lock().await;
+                // The render that this one waited for may be the one it
+                // wants.
+                version = self.chunk_cache.version(stream_idx).unwrap_or_default();
+                if let Some(playlist) = self.cached_playlist(stream_id, stream_idx, version) {
+                    return playlist;
                 }
+                Some(guard)
             }
-        }
+            _ => None,
+        };
+        // The newest part now: the render waited for may have made room.
+        let last = self.chunk_cache.last(stream_idx).unwrap_or(last);
+        let first = last.saturating_sub(self.window_parts_for(stream_id).await.saturating_sub(1));
+        let (available, latest_media_kind, discovered_init) = self
+            .scan_playlist_window(stream_id, stream_idx, first, last)
+            .await;
         if available.is_empty() {
             let media_kind = self
                 .media_kind_hint(stream_id)
@@ -7785,13 +8118,6 @@ impl LiveTsCache {
             // entry for a moment. Listing it now would give it the nominal
             // duration of the node and no independent flag. It is listed
             // when its entry is recorded, which invalidates this playlist.
-            let available = match observations {
-                Some(parts) if !parts.is_empty() => available
-                    .into_iter()
-                    .filter(|sequence| parts.contains_key(sequence))
-                    .collect::<Vec<_>>(),
-                _ => available,
-            };
             // A stamped stream has the part target that its contributor
             // declares. Another stream has its longest part, and no less
             // than the nominal part of the node.
@@ -7804,39 +8130,44 @@ impl LiveTsCache {
                     .unwrap_or(nominal_part_duration_us)
                     .max(nominal_part_duration_us),
             };
-            let available = available
-                .into_iter()
-                .map(|sequence| {
-                    let duration_us = observations
-                        .and_then(|parts| parts.get(&sequence))
-                        .and_then(|part| part.duration_us)
-                        .unwrap_or(nominal_part_duration_us);
-                    let keyframe = observations
-                        .and_then(|parts| parts.get(&sequence))
-                        .is_some_and(|part| part.keyframe);
-                    let fmp4_segment_id = observations
-                        .and_then(|parts| parts.get(&sequence))
-                        .and_then(|part| part.fmp4_segment_id);
-                    let stamped_part = observations
-                        .and_then(|parts| parts.get(&sequence))
-                        .and_then(|part| part.stamped_part);
+            let entry = |sequence: u64, part: Option<&RetainedPartObservation>| {
+                (
+                    sequence,
+                    part.and_then(|part| part.duration_us)
+                        .unwrap_or(nominal_part_duration_us),
+                    part.is_some_and(|part| part.keyframe),
+                    part.and_then(|part| part.fmp4_segment_id),
                     // The publication time is written by the contributor, so
                     // every cache derives the same program date and time. The
-                    // local arrival time is the fallback for a part without it.
-                    let available_unix_us = observations
-                        .and_then(|parts| parts.get(&sequence))
-                        .map(|part| part.published_unix_us.unwrap_or(part.available_unix_us))
-                        .unwrap_or_default();
-                    (
-                        sequence,
-                        duration_us,
-                        keyframe,
-                        fmp4_segment_id,
-                        available_unix_us,
-                        stamped_part,
-                    )
-                })
-                .collect::<Vec<_>>();
+                    // local arrival time is the fallback for a part without
+                    // it.
+                    part.map(|part| part.published_unix_us.unwrap_or(part.available_unix_us))
+                        .unwrap_or_default(),
+                    part.and_then(|part| part.stamped_part),
+                )
+            };
+            let available = match observations {
+                Some(parts) if !parts.is_empty() => {
+                    // One ordered walk of the window's observations beside
+                    // the parts, not a lookup of each part for each field.
+                    let mut observed = parts
+                        .range(available.first().copied().unwrap_or(0)..)
+                        .peekable();
+                    available
+                        .into_iter()
+                        .filter_map(|sequence| {
+                            while observed.next_if(|(seen, _)| **seen < sequence).is_some() {}
+                            observed
+                                .next_if(|(seen, _)| **seen == sequence)
+                                .map(|(_, part)| entry(sequence, Some(part)))
+                        })
+                        .collect::<Vec<_>>()
+                }
+                _ => available
+                    .into_iter()
+                    .map(|sequence| entry(sequence, None))
+                    .collect::<Vec<_>>(),
+            };
             (
                 part_target_us,
                 declared.map(|(_, target_us)| u64::from(target_us)),
@@ -8050,6 +8381,10 @@ impl LiveTsCache {
             .max(1);
         let first_parted_segment =
             last_segment.saturating_sub(parted_window_segments.saturating_sub(1));
+        use std::fmt::Write as _;
+        // Nearly every part of a stream has the same duration: its text is
+        // written once and copied.
+        let mut part_duration_text = (u32::MAX, String::new());
         for (segment, group) in groups {
             let mut segment_duration_us = 0_u64;
             for (seq, duration_us, keyframe, _available_unix_us) in &group {
@@ -8063,15 +8398,20 @@ impl LiveTsCache {
                     } else {
                         ""
                     };
+                if part_duration_text.0 != *duration_us {
+                    part_duration_text.1.clear();
+                    push_seconds(&mut part_duration_text.1, u64::from(*duration_us));
+                    part_duration_text.0 = *duration_us;
+                }
                 out.push_str("#EXT-X-PART:DURATION=");
-                push_seconds(&mut out, u64::from(*duration_us));
-                out.push_str(&format!(",URI=\"part{seq}.{extension}\"{independent}\n"));
+                out.push_str(&part_duration_text.1);
+                let _ = writeln!(out, ",URI=\"part{seq}.{extension}\"{independent}");
             }
             if segment_is_complete(segment, group.len()) {
                 out.push_str("#EXTINF:");
                 push_seconds(&mut out, segment_duration_us);
                 out.push_str(",\n");
-                out.push_str(&format!("seg{segment}.{extension}\n"));
+                let _ = writeln!(out, "seg{segment}.{extension}");
             }
         }
 
@@ -8151,8 +8491,20 @@ impl LiveTsCache {
     }
 
     async fn remember_media_kind(&self, stream_id: u64, media_kind: LiveMediaKind) {
+        // Every part read remembers the kind of its stream, which is nearly
+        // always known already: a shared lock to look, the exclusive one
+        // only to change it.
+        if self.state.read().await.stream_media_kinds.get(&stream_id) == Some(&media_kind) {
+            return;
+        }
         let mut state = self.state.write().await;
         state.stream_media_kinds.insert(stream_id, media_kind);
+    }
+
+    /// The newest stored part of a stream, without waiting for a lock.
+    fn stream_head(&self, stream_id: u64) -> Option<u64> {
+        let stream_idx = self.chunk_cache.stream_idx(stream_id)?;
+        self.chunk_cache.last(stream_idx).map(|last| last as u64)
     }
 
     async fn media_kind_hint(&self, stream_id: u64) -> Option<LiveMediaKind> {
@@ -15718,6 +16070,12 @@ struct AppRouter {
     /// the last this many milliseconds says the same (see
     /// `region_wide_silence`).
     region_silence_fresh_ms: Option<u64>,
+    /// Whether the parents are lost, as last asked, and when (see
+    /// --edge-liveness-cache-us).
+    liveness: Arc<LivenessCache>,
+    /// A part request ahead of the stream waits until the part is due
+    /// (--edge-part-wait-due).
+    part_wait_due: bool,
     /// Entry points of neighbouring regions: pathway name and base URL.
     failover_entries: Arc<Vec<(String, String)>>,
     edge_load: EdgeLoad,
@@ -15855,6 +16213,8 @@ impl AppRouter {
             hls_rendition_stale_ms: DEFAULT_HLS_RENDITION_STALE_MS,
             parents_silent_after: None,
             region_silence_fresh_ms: None,
+            liveness: Arc::new(LivenessCache::new(DEFAULT_EDGE_LIVENESS_CACHE_US)),
+            part_wait_due: true,
             failover_entries: Arc::new(Vec::new()),
             edge_load,
             edge_lifecycle_config: edge_lifecycle_config.normalized(),
@@ -15909,6 +16269,7 @@ impl AppRouter {
     /// `None` never treats the parents as lost.
     fn with_parents_silent_after(mut self, limit: Option<Duration>) -> Self {
         self.parents_silent_after = limit;
+        self.liveness = Arc::new(LivenessCache::new(self.liveness.ttl_us));
         self
     }
 
@@ -15917,6 +16278,22 @@ impl AppRouter {
     /// most `fresh_ms` old.
     fn with_region_silence_holds(mut self, holds: bool, fresh_ms: u64) -> Self {
         self.region_silence_fresh_ms = holds.then_some(fresh_ms);
+        // A router with other rules does not share the answers of this one.
+        self.liveness = Arc::new(LivenessCache::new(self.liveness.ttl_us));
+        self
+    }
+
+    /// Reuse the answer to whether the parents are lost for this long (0:
+    /// ask for every request).
+    fn with_liveness_cache(mut self, ttl_us: u64) -> Self {
+        self.liveness = Arc::new(LivenessCache::new(ttl_us));
+        self
+    }
+
+    /// A part request ahead of the stream waits until the part is due
+    /// (`true`), or looks again every hole repair grace (`false`).
+    fn with_part_wait_due(mut self, due: bool) -> Self {
+        self.part_wait_due = due;
         self
     }
 
@@ -17645,6 +18022,20 @@ impl AppRouter {
     /// --edge-region-silence-holds): no other edge of the region would do
     /// better, and readers sent away would come back.
     async fn parents_are_lost(&self) -> bool {
+        if self.parents_silent_after.is_none() || self.cache_mesh_role != CacheMeshRole::Edge {
+            return false;
+        }
+        let now_us = now_unix_us();
+        if let Some(lost) = self.liveness.get(now_us) {
+            return lost;
+        }
+        let lost = self.ask_parents_are_lost().await;
+        self.liveness.set(now_us, lost);
+        lost
+    }
+
+    /// [`Self::parents_are_lost`], asked of the cache mesh and the region.
+    async fn ask_parents_are_lost(&self) -> bool {
         let Some(limit) = self.parents_silent_after else {
             return false;
         };
@@ -17690,6 +18081,7 @@ impl AppRouter {
         }
         let deadline = Instant::now() + Duration::from_millis(PART_WAIT_MS);
         let mut requests = 0_u32;
+        let mut part_us = None;
         loop {
             let now = Instant::now();
             if now >= deadline {
@@ -17702,8 +18094,26 @@ impl AppRouter {
                     None => Err(ParentsLost),
                 };
             }
-            let part_us = self.cache.state.read().await.stream_part_us(stream_id);
-            let wait_until = (now + edge_hole_repair_grace(part_us)).min(deadline);
+            let part_us = match part_us {
+                Some(part_us) if self.part_wait_due => part_us,
+                _ => {
+                    let read = self.cache.state.read().await.stream_part_us(stream_id);
+                    *part_us.insert(read)
+                }
+            };
+            let grace = edge_hole_repair_grace(part_us);
+            let wait = if self.part_wait_due {
+                part_wait_until_due(
+                    self.cache.stream_head(stream_id),
+                    seq,
+                    part_us,
+                    grace,
+                    Duration::from_millis(EDGE_PART_WAIT_SLICE_MS),
+                )
+            } else {
+                grace
+            };
+            let wait_until = (now + wait).min(deadline);
             if let Some(part) = self
                 .cache
                 .get_part_until_for_stream_id(stream_id, seq, wait_until)
@@ -35480,4 +35890,7 @@ mod tests {
             report.join("\n")
         );
     }
+
+    /// The cost of an edge per part, counted (an ignored measurement).
+    mod edge_cost;
 }

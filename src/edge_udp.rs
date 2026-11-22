@@ -56,6 +56,9 @@ pub(crate) const DEFAULT_SEND_QUEUE_MS: u64 = 250;
 pub(crate) const DEFAULT_PLAYOUT_MS: u64 = 500;
 /// Default of --client-udp-move-hold-down-ms.
 pub(crate) const DEFAULT_MOVE_HOLD_DOWN_MS: u64 = 3_000;
+/// Default of --client-udp-inline-complete-bytes: an audio part, and not a
+/// 4K frame, whose encode takes milliseconds.
+pub(crate) const DEFAULT_INLINE_COMPLETE_BYTES: usize = 16_384;
 /// Most datagrams that the send queues of one socket hold, whatever their
 /// age: about 40 MB of full datagrams.
 const SEND_QUEUE_MAX_DATAGRAMS: usize = 32_768;
@@ -75,6 +78,16 @@ pub(crate) struct EdgeUdpConfig {
     /// admission, and a client moved away for that is taken back within
     /// this of its move (zero: no hold-down).
     pub move_hold_down: Duration,
+    /// Hand the datagrams of a part for all its clients to the kernel in
+    /// one `sendmmsg` (`false`: one `sendto` each).
+    pub batch_send: bool,
+    /// A cut-through part of at most this many bytes is completed (its
+    /// repair encoded and sent) where it decoded; a larger one on the
+    /// blocking pool, as every part was before (zero).
+    pub inline_complete_bytes: usize,
+    /// A client's datagrams of a completed part leave as one UDP GSO
+    /// message (`UDP_SEGMENT`) in the batch, not one message each.
+    pub gso: bool,
 }
 
 impl EdgeUdpConfig {
@@ -87,6 +100,9 @@ impl EdgeUdpConfig {
             send_queue: Duration::from_millis(DEFAULT_SEND_QUEUE_MS),
             playout: Duration::from_millis(DEFAULT_PLAYOUT_MS),
             move_hold_down: Duration::from_millis(DEFAULT_MOVE_HOLD_DOWN_MS),
+            batch_send: true,
+            inline_complete_bytes: DEFAULT_INLINE_COMPLETE_BYTES,
+            gso: true,
         }
     }
 }
@@ -178,6 +194,85 @@ impl ClientOut<'_> {
             Some(queue) => queue.send(datagram, peer),
             None => try_send_counted(self.socket, stats, datagram, peer),
         }
+    }
+}
+
+/// The host refused UDP GSO on a client socket: the edge sends without it
+/// from then on.
+static CLIENT_GSO_REFUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+impl ClientOut<'_> {
+    /// Send each datagram to its client now, or queue it if the socket is
+    /// full; never waits. With `batch`, as many as the socket takes leave
+    /// in one `sendmmsg` and the rest as [`Self::send`] would send them;
+    /// with `gso` as well, a run of datagrams of one size to one client is
+    /// one GSO message of the batch. Returns how many were sent or queued,
+    /// and how many found the socket full with nowhere to wait.
+    pub(crate) fn send_many(
+        &self,
+        stats: &EdgeUdpStats,
+        batch: bool,
+        gso: bool,
+        datagrams: &[(&[u8], SocketAddr)],
+    ) -> (usize, usize) {
+        let mut first = 0;
+        // A client with datagrams waiting has the new ones queued behind
+        // them: the batch is only for a socket with nothing queued.
+        let batch = batch
+            && datagrams.len() > 1
+            && self
+                .queue
+                .is_none_or(|queue| queue.waiting.load(Ordering::Acquire) == 0);
+        if batch && gso && !CLIENT_GSO_REFUSED.load(Ordering::Relaxed) {
+            use std::os::fd::AsRawFd;
+            match crate::fast_plane::sys::send_gso_batch(
+                self.socket.as_raw_fd(),
+                datagrams.len(),
+                |index| datagrams[index],
+            ) {
+                Ok(sent) => {
+                    let bytes: usize = datagrams[..sent.datagrams]
+                        .iter()
+                        .map(|(datagram, _)| datagram.len())
+                        .sum();
+                    stats
+                        .datagrams
+                        .fetch_add(sent.datagrams as u64, Ordering::Relaxed);
+                    stats.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+                    first = sent.datagrams;
+                }
+                Err(error) if crate::fast_plane::sys::gso_unsupported(&error) => {
+                    CLIENT_GSO_REFUSED.store(true, Ordering::Relaxed);
+                    warn!(error = %error, "edge client UDP: no GSO on this host, sending without it");
+                }
+                Err(_) => {}
+            }
+        } else if batch {
+            if let Ok(sent) =
+                crate::fast_path::try_send_batch(self.socket, datagrams.len(), |index| {
+                    datagrams[index]
+                })
+            {
+                let bytes: usize = datagrams[..sent]
+                    .iter()
+                    .map(|(datagram, _)| datagram.len())
+                    .sum();
+                stats.datagrams.fetch_add(sent as u64, Ordering::Relaxed);
+                stats.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+                first = sent;
+            }
+        }
+        let mut delivered = first;
+        let mut blocked = 0;
+        for (datagram, peer) in &datagrams[first..] {
+            match self.send(stats, datagram, *peer) {
+                SendOutcome::Sent | SendOutcome::Queued => delivered += 1,
+                SendOutcome::Blocked => blocked += 1,
+                SendOutcome::Failed => {}
+            }
+        }
+        (delivered, blocked)
     }
 }
 
@@ -893,6 +988,14 @@ async fn send_object(
         };
         // Interleave the subscribers, so that one of them does not wait for
         // the whole of a large part to be sent to the others.
+        if config.batch_send && out.queue.is_some() {
+            let batch: Vec<(&[u8], SocketAddr)> = datagrams
+                .iter()
+                .flat_map(|datagram| peers.iter().map(move |peer| (datagram.as_slice(), *peer)))
+                .collect();
+            out.send_many(stats, true, false, &batch);
+            continue;
+        }
         for datagram in &datagrams {
             for peer in &peers {
                 if out.queue.is_some() {
@@ -1391,8 +1494,18 @@ fn send_now(
     datagram: &[u8],
     clients: &[(SocketAddr, RepairPolicy)],
 ) -> bool {
-    let mut all = true;
     let out = inner.sockets.out_for_stream(stream_id);
+    if inner.config.batch_send {
+        let batch: Vec<(&[u8], SocketAddr)> =
+            clients.iter().map(|(peer, _)| (datagram, *peer)).collect();
+        let (delivered, blocked) = out.send_many(&inner.stats, true, false, &batch);
+        inner
+            .stats
+            .cut_through_datagrams
+            .fetch_add(delivered as u64, Ordering::Relaxed);
+        return blocked == 0;
+    }
+    let mut all = true;
     for (peer, _) in clients {
         match out.send(&inner.stats, datagram, *peer) {
             SendOutcome::Sent | SendOutcome::Queued => {
@@ -1554,15 +1667,15 @@ impl CacheMeshReceiveObserver for CutThrough {
             return;
         };
         let key = (peer, header.block_id);
-        let mut state = inner.state.lock().unwrap();
-        let (stream_id, slot) = match state.routes.get(&key) {
+        let mut guard = inner.state.lock().unwrap();
+        let (stream_id, slot) = match guard.routes.get(&key) {
             Some(route) => (route.stream_id, route.slot),
             None => match chunk_frame_slot(frame) {
                 Some(found) => found,
                 None => return,
             },
         };
-        let state = &mut *state;
+        let state = &mut *guard;
         let Some(claim) = state.slots.get_mut(&(stream_id, slot)) else {
             state
                 .decoded_unclaimed
@@ -1618,16 +1731,38 @@ impl CacheMeshReceiveObserver for CutThrough {
                 })
                 .collect()
         };
+        let max_symbol = inner.config.symbol_size;
+        let batch = Batch {
+            send: inner.config.batch_send,
+            gso: inner.config.gso,
+        };
+        if frame.len() <= inner.config.inline_complete_bytes {
+            // A small part encodes in microseconds: complete it here rather
+            // than wake a thread of the blocking pool for it, and without
+            // the cut-through state locked.
+            drop(guard);
+            complete(
+                inner.sockets.out_for_stream(stream_id),
+                &inner.stats,
+                max_symbol,
+                batch,
+                slot,
+                frame,
+                job,
+                &clients,
+            );
+            return;
+        }
         let frame = frame.to_vec();
         let sockets = inner.sockets.clone();
         let stats = Arc::clone(&inner.stats);
-        let max_symbol = inner.config.symbol_size;
         // Encoding a 4K part takes milliseconds: not on the receive task.
         tokio::task::spawn_blocking(move || {
             complete(
                 sockets.out_for_stream(stream_id),
                 &stats,
                 max_symbol,
+                batch,
                 slot,
                 &frame,
                 job,
@@ -1720,10 +1855,21 @@ enum CompleteJob {
     Whole,
 }
 
+/// How [`complete`] hands its datagrams to the kernel.
+#[derive(Clone, Copy)]
+struct Batch {
+    /// One `sendmmsg` for the part's datagrams to all its clients.
+    send: bool,
+    /// Each client's datagrams as one GSO message of it.
+    gso: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn complete(
     out: ClientOut<'_>,
     stats: &EdgeUdpStats,
     max_symbol: u16,
+    batch: Batch,
     slot: u64,
     frame: &[u8],
     job: CompleteJob,
@@ -1771,6 +1917,31 @@ fn complete(
                 (datagrams, send)
             }
         };
+        if batch.send && out.queue.is_some() {
+            // Sent, or queued until the socket takes it: no wait. With GSO
+            // a client's datagrams are together, one message of the batch;
+            // without it the clients take turns, datagram by datagram.
+            let list: Vec<(&[u8], SocketAddr)> = if batch.gso {
+                peers
+                    .iter()
+                    .flat_map(|peer| {
+                        send.iter()
+                            .filter_map(|index| datagrams.get(*index))
+                            .map(move |datagram| (datagram.as_slice(), *peer))
+                    })
+                    .collect()
+            } else {
+                send.iter()
+                    .filter_map(|index| datagrams.get(*index))
+                    .flat_map(|datagram| peers.iter().map(move |peer| (datagram.as_slice(), *peer)))
+                    .collect()
+            };
+            let (delivered, _) = out.send_many(stats, true, batch.gso, &list);
+            stats
+                .cut_through_datagrams
+                .fetch_add(delivered as u64, Ordering::Relaxed);
+            continue;
+        }
         for index in send {
             let Some(datagram) = datagrams.get(index) else {
                 continue;
@@ -2029,6 +2200,59 @@ mod tests {
             got.push(buf[..len].to_vec());
         }
         got
+    }
+
+    /// A part's datagrams to several clients leave in one batch, with or
+    /// without GSO, with or without a send queue: each client receives its
+    /// own, whole and in order, and each counts once.
+    #[tokio::test]
+    async fn a_batch_reaches_each_client_whole_and_in_order() {
+        for (queue, gso) in [(true, true), (true, false), (false, true), (false, false)] {
+            let sender = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            sender.writable().await.unwrap();
+            let stats = Arc::new(EdgeUdpStats::default());
+            let send_queue = queue.then(|| {
+                SendQueue::start(
+                    Arc::clone(&sender),
+                    Duration::from_millis(250),
+                    Arc::clone(&stats),
+                )
+            });
+            let out = ClientOut {
+                socket: &sender,
+                queue: send_queue.as_ref(),
+            };
+            let clients = [
+                UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+                UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+                UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            ];
+            // Three repair datagrams of one size for each client, and a
+            // shorter last one, as GSO allows; client by client.
+            let datagrams: Vec<Vec<u8>> = (0..4_u8)
+                .map(|index| vec![index; if index == 3 { 40 } else { 100 }])
+                .collect();
+            let list: Vec<(&[u8], SocketAddr)> = clients
+                .iter()
+                .flat_map(|client| {
+                    let to = client.local_addr().unwrap();
+                    datagrams
+                        .iter()
+                        .map(move |datagram| (datagram.as_slice(), to))
+                })
+                .collect();
+            let (delivered, blocked) = out.send_many(&stats, true, gso, &list);
+            assert_eq!((delivered, blocked), (12, 0), "queue {queue}, gso {gso}");
+            for client in &clients {
+                assert_eq!(
+                    receive(client, 4).await,
+                    datagrams,
+                    "queue {queue}, gso {gso}"
+                );
+            }
+            assert_eq!(stats.datagrams.load(Ordering::Relaxed), 12);
+            assert_eq!(stats.bytes.load(Ordering::Relaxed), 3 * 340);
+        }
     }
 
     /// A datagram that found the socket full waits in its client's queue and

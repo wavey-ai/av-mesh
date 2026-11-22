@@ -135,6 +135,9 @@ struct EdgeAdmissionInner {
     rejected_requests: AtomicU64,
     admitted_sessions: AtomicU64,
     sessions: Mutex<HashMap<String, PlaybackSession>>,
+    /// When a request last pruned the idle sessions (elapsed ms + 1; 0:
+    /// never). A request prunes at most every SESSION_PRUNE_INTERVAL_MS.
+    sessions_pruned_ms: AtomicU64,
     playlist_bps: Mutex<HashMap<u64, u64>>,
     /// Requests that a reader of each playlist makes in a second.
     playlist_request_rate: Mutex<HashMap<u64, u64>>,
@@ -167,6 +170,7 @@ impl EdgeAdmission {
                 rejected_requests: AtomicU64::new(0),
                 admitted_sessions: AtomicU64::new(0),
                 sessions: Mutex::new(HashMap::new()),
+                sessions_pruned_ms: AtomicU64::new(0),
                 playlist_bps: Mutex::new(HashMap::new()),
                 playlist_request_rate: Mutex::new(HashMap::new()),
             }),
@@ -193,9 +197,31 @@ impl EdgeAdmission {
     }
 
     pub fn admit_playback(&self, request: PlaybackRequest<'_>) -> PlaybackAdmission {
-        let overloaded = self.snapshot().overloaded;
+        // Every playback request asks: only the overload state, not the
+        // whole snapshot, which walks every session twice.
+        let overloaded = self.overloaded_at(self.inner.started.elapsed().as_secs());
         let elapsed_ms = self.elapsed_ms();
         self.admit_playback_at(request, overloaded, elapsed_ms)
+    }
+
+    /// Whether the measured egress overloads the node at `second`, with the
+    /// hysteresis of the snapshot, which it updates.
+    fn overloaded_at(&self, second: u64) -> bool {
+        let (observed_bps, observation_seconds) = self
+            .inner
+            .window
+            .lock()
+            .map(|mut window| window.rate(second, self.inner.config.window_seconds))
+            .unwrap_or((0, 0));
+        let was_overloaded = self.inner.overloaded.load(Ordering::Relaxed);
+        let overloaded = if was_overloaded {
+            observed_bps >= self.inner.config.recovery_bps()
+        } else {
+            observation_seconds >= self.inner.config.min_sustained_seconds
+                && observed_bps >= self.inner.config.admission_bps()
+        };
+        self.inner.overloaded.store(overloaded, Ordering::Relaxed);
+        overloaded
     }
 
     /// Record the measured bit rate of a playlist that this node holds. A new
@@ -449,11 +475,22 @@ impl EdgeAdmission {
             .sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        prune_sessions(
-            &mut sessions,
-            elapsed_ms,
-            self.inner.config.session_idle_seconds,
-        );
+        // A walk of every session for every request is quadratic in the
+        // readers: prune now and then. A session is idle after seconds.
+        let pruned = self.inner.sessions_pruned_ms.load(Ordering::Relaxed);
+        if pruned == 0
+            || elapsed_ms < pruned - 1
+            || elapsed_ms - (pruned - 1) >= SESSION_PRUNE_INTERVAL_MS
+        {
+            prune_sessions(
+                &mut sessions,
+                elapsed_ms,
+                self.inner.config.session_idle_seconds,
+            );
+            self.inner
+                .sessions_pruned_ms
+                .store(elapsed_ms + 1, Ordering::Relaxed);
+        }
         if let Some(session) = sessions.get_mut(session_id) {
             session.last_seen_ms = elapsed_ms;
             if request.stream_id.is_some() {
@@ -596,6 +633,9 @@ fn permille(value: u64, limit: u64) -> u32 {
     let scaled = u128::from(value) * 1_000 / u128::from(limit);
     scaled.min(u128::from(u32::MAX)) as u32
 }
+
+/// How often a playback request prunes the idle sessions at most.
+const SESSION_PRUNE_INTERVAL_MS: u64 = 250;
 
 fn prune_sessions(sessions: &mut HashMap<String, PlaybackSession>, now_ms: u64, idle_seconds: u64) {
     let idle_ms = idle_seconds.saturating_mul(1_000);
