@@ -1352,6 +1352,32 @@ struct Args {
     )]
     relay_loss_report: bool,
 
+    /// Wave 7 item 5: renditions of one source, `;`-separated groups of
+    /// `,`-separated stream ids (the DAW lane's FLAC, Opus and PCM from base
+    /// stream 2001 are "2001,3001,4001"). A forwarder sends a rendition of a
+    /// group on a compiled (long-haul) lane only when the child's subtree
+    /// reads it, reads no rendition of the group (a source nobody reads
+    /// stays live), or has not reported its demand for 2 s (fails open).
+    /// The contributor takes the same flag for its own lanes. Empty (the
+    /// default for now): nothing is held back. Not yet the default: the
+    /// first reader of a held rendition waited 3.8 s for its first part in
+    /// London, and in New York joined at the stale head of the held stream
+    /// and counted every part since as missing.
+    #[arg(long, env = "NEEDLETAIL_RELAY_DEMAND_RENDITIONS", default_value = "")]
+    relay_demand_renditions: fast_plane::demand::RenditionGroups,
+
+    /// Wave 7 item 5: report this node's demand to its relay parents every
+    /// 250 ms (RLD1: the streams that its cache-mesh children lease, that
+    /// it subscribes to, and that its compiled children report). Needs
+    /// --relay-class-threads.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_DEMAND_REPORT",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_demand_report: bool,
+
     /// Datagrams each class's tee holds before the fast plane drops its tee
     /// copy (counted as tee_dropped; forwarding is never held back).
     #[arg(
@@ -3025,6 +3051,7 @@ async fn main() -> Result<()> {
         forwarder.set_nonblocking(args.relay_forward_nonblocking);
         forwarder.set_batch(args.relay_forward_batch);
         forwarder.set_repair_lane_single_symbol(args.relay_repair_lane_single_symbol);
+        forwarder.set_demand_groups(args.relay_demand_renditions.clone());
         fast_path_report.record_relay_forward_sockets(
             forwarder.socket_groups.len(),
             forwarder.shared_socket_count(),
@@ -3045,6 +3072,36 @@ async fn main() -> Result<()> {
                 forwarder.snapshot()
             }),
     );
+    // Wave 7 item 5: the children's demand in, this node's demand out.
+    let mut demand_tasks = Vec::new();
+    if let Some(forwarder) = &relay_forwarder {
+        if forwarder.demand_groups().is_some() {
+            demand_tasks.extend(forwarder.spawn_demand_readers());
+        }
+    }
+    let node_demand = (args.relay_demand_report && args.relay_controlled_local).then(|| {
+        let demand = Arc::new(fast_plane::demand::NodeDemand::default());
+        let (mesh, forwarder, out) =
+            (Arc::clone(&mesh_handle), relay_forwarder.clone(), Arc::clone(&demand));
+        demand_tasks.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(fast_plane::demand::DEMAND_REPORT_INTERVAL);
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let mut streams: Vec<u64> = mesh
+                    .served_subscriptions()
+                    .iter()
+                    .map(|served| served.stream_id)
+                    .collect();
+                streams.extend(mesh.subscribed_streams());
+                if let Some(forwarder) = &forwarder {
+                    streams.extend(forwarder.child_demand(Instant::now()));
+                }
+                out.set(streams);
+            }
+        }));
+        demand
+    });
     let relay_failover_listener_tasks = start_relay_failover_listeners(
         &args.relay_failover_listeners,
         relay_forwarder.as_ref(),
@@ -3094,6 +3151,7 @@ async fn main() -> Result<()> {
         video_gso: args.relay_video_gso,
         burst_copy_ms: args.relay_burst_copy_ms,
         loss_report: args.relay_loss_report,
+        demand: node_demand,
         lease: lease_children,
         edge_clients: fast_lane.clone(),
         holes: hole_trigger.clone(),
@@ -3431,6 +3489,9 @@ async fn main() -> Result<()> {
     let _ = handle.finished_rx.await;
     if ingest_failure.is_none() {
         let _ = fec_ingest_task.await;
+    }
+    for task in &demand_tasks {
+        task.abort();
     }
     for task in relay_failover_listener_tasks.into_iter().chain(lease_tasks) {
         let _ = task.await;
@@ -4683,6 +4744,8 @@ struct RelayForwardPath {
     /// buffering never holds an audio one back, and audio objects never
     /// push a 4K object out. The single receive loop uses the audio one.
     warm_sources: [StdMutex<WarmSourceReplayBuffer>; 2],
+    /// The child's last demand report (`RLD1`, wave 7 item 5).
+    demand: fast_plane::demand::DemandSlot,
 }
 
 struct RelayDownstreamForwarder {
@@ -4725,6 +4788,9 @@ struct RelayDownstreamForwarder {
     /// `--relay-repair-lane-single-symbol`: a repair-lane child takes the
     /// source of a one-symbol audio object (fast plane).
     repair_lane_single_symbol: AtomicBool,
+    /// `--relay-demand-renditions`: renditions held off a compiled lane
+    /// whose child does not read them. Unset or empty: none.
+    demand_groups: OnceLock<fast_plane::demand::RenditionGroups>,
     hop_journal: OnceLock<Arc<HopJournal>>,
     /// Children whose non-blocking send a test reports as full, as a bit
     /// set of path indexes.
@@ -4839,6 +4905,7 @@ impl RelayDownstreamForwarder {
                 role: endpoint.role,
                 promoted: AtomicBool::new(false),
                 warm_sources: Default::default(),
+                demand: Default::default(),
             });
         }
         Ok(Some(Arc::new(Self {
@@ -4871,6 +4938,7 @@ impl RelayDownstreamForwarder {
             nonblocking: AtomicBool::new(true),
             batch: AtomicBool::new(true),
             repair_lane_single_symbol: AtomicBool::new(true),
+            demand_groups: OnceLock::new(),
             hop_journal: OnceLock::new(),
             #[cfg(test)]
             test_would_block: AtomicU64::new(0),
@@ -5158,6 +5226,62 @@ impl RelayDownstreamForwarder {
         self.repair_lane_single_symbol.load(Ordering::Relaxed)
     }
 
+    fn set_demand_groups(&self, groups: fast_plane::demand::RenditionGroups) {
+        let _ = self.demand_groups.set(groups);
+    }
+
+    fn demand_groups(&self) -> Option<&fast_plane::demand::RenditionGroups> {
+        self.demand_groups.get().filter(|groups| !groups.is_empty())
+    }
+
+    /// The streams that the compiled children report fresh demand for.
+    fn child_demand(&self, now: Instant) -> Vec<u64> {
+        let mut out = Vec::new();
+        for path in &self.paths {
+            if let Some(report) = path.demand.fresh(now) {
+                out.extend_from_slice(&report.1);
+            }
+        }
+        out
+    }
+
+    /// Read the children's demand reports (`RLD1`) that arrive on the
+    /// source sockets (and their video twins, which share the address):
+    /// each is the report of the path whose child sent it.
+    fn spawn_demand_readers(self: &Arc<Self>) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut sockets: Vec<Arc<UdpSocket>> = self
+            .socket_groups
+            .iter()
+            .map(|group| Arc::clone(&self.paths[group[0]].socket))
+            .collect();
+        sockets.extend(self.video_sockets.iter().cloned());
+        sockets
+            .into_iter()
+            .map(|socket| {
+                let forwarder = Arc::clone(self);
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 2_048];
+                    loop {
+                        let Ok((len, from)) = socket.recv_from(&mut buf).await else {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            continue;
+                        };
+                        let Some(streams) = fast_plane::demand::decode_demand(&buf[..len]) else {
+                            continue;
+                        };
+                        let now = Instant::now();
+                        for path in forwarder
+                            .paths
+                            .iter()
+                            .filter(|path| path.target == from || path.video_target == from)
+                        {
+                            path.demand.record(streams.clone(), now);
+                        }
+                    }
+                })
+            })
+            .collect()
+    }
 
     fn set_nonblocking(&self, nonblocking: bool) {
         self.nonblocking.store(nonblocking, Ordering::Relaxed);
@@ -36777,6 +36901,7 @@ mod tests {
                 holes: None,
                 burst_copy_ms: 0,
                 loss_report: false,
+                demand: None,
                 test_tee_panic: Some(fast_plane::TrafficClass::Audio),
             },
         )

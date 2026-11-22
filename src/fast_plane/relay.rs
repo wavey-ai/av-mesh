@@ -7,6 +7,7 @@
 
 use super::burst_copy::BurstCopies;
 use super::dedup::FirstArrival;
+use super::demand::{NodeDemand, DEMAND_REPORT_INTERVAL};
 use super::edge_clients::{ClientPlan, EdgeFastLane, UpstreamRepair};
 use super::lease::{LeaseChildren, LeaseSnapshot, LeaseSnapshotStats, LeaseTake};
 use super::loss_report::LossMeter;
@@ -86,6 +87,9 @@ pub struct RelayClassConfig {
     /// loss of each parent lane and reports it to the parent (see
     /// `loss_report`).
     pub loss_report: bool,
+    /// `--relay-demand-report` (wave 7 item 5): the audio thread sends each
+    /// relay parent this node's demand (`RLD1`, see `demand`).
+    pub demand: Option<Arc<NodeDemand>>,
     /// Tests: the tee of this class panics on its first datagram.
     #[cfg(test)]
     pub test_tee_panic: Option<TrafficClass>,
@@ -104,6 +108,7 @@ impl Default for RelayClassConfig {
             holes: None,
             burst_copy_ms: 0,
             loss_report: false,
+            demand: None,
             #[cfg(test)]
             test_tee_panic: None,
         }
@@ -206,6 +211,8 @@ pub struct FastPlaneStats {
     /// the audio thread measures on a parent lane now.
     pub loss_reports: AtomicU64,
     pub parent_loss_ppm: AtomicU64,
+    /// Demand reports (RLD1) sent to parents.
+    pub demand_reports: AtomicU64,
     /// The lease children, whose counters the snapshot reports.
     pub lease: OnceLock<Arc<LeaseChildren>>,
 }
@@ -237,6 +244,7 @@ pub struct FastPlaneSnapshot {
     pub burst_copies_dropped: u64,
     pub loss_reports: u64,
     pub parent_loss_ppm: u64,
+    pub demand_reports: u64,
     pub lease_children: LeaseSnapshotStats,
 }
 
@@ -267,6 +275,7 @@ impl FastPlaneStats {
             burst_copies_dropped: load(&self.burst_copies_dropped),
             loss_reports: load(&self.loss_reports),
             parent_loss_ppm: load(&self.parent_loss_ppm),
+            demand_reports: load(&self.demand_reports),
             lease_children: self
                 .lease
                 .get()
@@ -568,9 +577,20 @@ impl RelayDownstreamForwarder {
     /// its role, in compiled order. A source symbol held back from a warm
     /// repair-only child is noted, and kept for a later promotion only once
     /// the batch is sent (`buffer_fast_warm`), as `forward` keeps it.
-    fn plan_fast(&self, message: usize, view: &RlsView<'_>, plan: &mut ForwardPlan) {
+    fn plan_fast(
+        &self,
+        message: usize,
+        view: &RlsView<'_>,
+        plan: &mut ForwardPlan,
+        now: Instant,
+    ) {
         let role = view.role;
         let mut object = None;
+        // Renditions that a child's subtree does not read stay off its lane
+        // (wave 7 item 5).
+        let gate = self
+            .demand_groups()
+            .and_then(|groups| view.stream_id().map(|stream| (groups, stream)));
         // A one-symbol audio object has nothing a repair lane could carry
         // but its symbol when its parent sent no repair (wave 7 item 2):
         // the repair-lane child takes the source, so it still has a copy
@@ -580,6 +600,13 @@ impl RelayDownstreamForwarder {
             && view.kind == MediaObjectKind::Audio
             && self.repair_lane_single_symbol();
         for (index, path) in self.paths.iter().enumerate() {
+            if let Some((groups, stream)) = gate {
+                let report = path.demand.fresh(now);
+                if !groups.allows(stream, report.as_ref().map(|report| report.1.as_slice())) {
+                    self.filtered_datagrams.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            }
             let promoted = path.promoted.load(Ordering::Relaxed);
             let repair_lane_source =
                 path.role == RelayForwardRole::Repair && matches!(role, MediaDatagramRole::Source);
@@ -776,6 +803,7 @@ struct ClassThread {
     edge_clients: Option<Arc<EdgeFastLane>>,
     burst_copy_ms: u64,
     loss_report: bool,
+    demand: Option<Arc<NodeDemand>>,
 }
 
 /// How often the audio thread looks at its loss meters.
@@ -854,6 +882,7 @@ impl ClassThread {
             Vec::new()
         };
         let mut last_loss_poll = Instant::now();
+        let mut last_demand_report: Option<Instant> = None;
         while !self.stop.load(Ordering::Relaxed) {
             // No longer than the next copy's due time.
             let timeout = copies
@@ -906,6 +935,33 @@ impl ClassThread {
             if !meters.is_empty() && last_loss_poll.elapsed() >= LOSS_POLL {
                 last_loss_poll = Instant::now();
                 self.report_loss(&fds, &mut meters, last_loss_poll);
+            }
+            if self.demand.is_some()
+                && last_demand_report.is_none_or(|at| at.elapsed() >= DEMAND_REPORT_INTERVAL)
+            {
+                last_demand_report = Some(Instant::now());
+                self.report_demand(&fds);
+            }
+        }
+    }
+
+    /// Send every relay parent this node's demand, from each audio socket:
+    /// a parent knows its child by the address its symbols go to, and
+    /// ignores a report from any other (a promoted secondary parent sends
+    /// to the primary socket, so the admission's path does not say which).
+    fn report_demand(&self, fds: &[std::os::fd::RawFd]) {
+        let Some(demand) = &self.demand else {
+            return;
+        };
+        let report = demand.report();
+        if report.is_empty() {
+            return;
+        }
+        for peer in self.admissions.keys() {
+            for fd in fds {
+                if sys::send_batch(*fd, 1, |_| (report.as_slice(), *peer)).unwrap_or(0) == 1 {
+                    self.stats.demand_reports.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -1060,7 +1116,7 @@ impl ClassThread {
                 continue;
             }
             if let Some(forwarder) = &self.forwarder {
-                forwarder.plan_fast(message, &view, plan);
+                forwarder.plan_fast(message, &view, plan, now);
             }
             if let Some((_, snapshot)) = &lease {
                 plan_lease(snapshot, class, message, &view, plan);
@@ -1613,6 +1669,9 @@ pub async fn run_relay_class_ingest(
             edge_clients: config.edge_clients.clone(),
             burst_copy_ms: config.burst_copy_ms,
             loss_report: config.loss_report,
+            demand: (class == TrafficClass::Audio)
+                .then(|| config.demand.clone())
+                .flatten(),
         };
         match std::thread::Builder::new()
             .name(format!("needletail-fast-{}", class.as_str()))

@@ -236,3 +236,121 @@ async fn a_clean_lane_sends_no_report() {
     assert_eq!(snapshot.parent_loss_ppm, 0);
 }
 
+/// Wave 7 item 5: a compiled child that reports reading Opus only gets no
+/// PCM; a child without a report gets everything; a stream of no group goes
+/// to both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_compiled_lane_carries_only_the_renditions_its_child_reads() {
+    let (reader, _reader_video) = bind_class_pair(1_000).await;
+    let (silent, _silent_video) = bind_class_pair(1_000).await;
+    let relay = start_fast_relay_with(
+        ParentPath::Secondary,
+        &[
+            (reader.local_addr().unwrap(), RelayForwardRole::All),
+            (silent.local_addr().unwrap(), RelayForwardRole::All),
+        ],
+        fast_plane::relay::RelayClassConfig {
+            port_offset: 1_000,
+            cpus: [None, None],
+            realtime: false,
+            tee_capacity: 8_192,
+            ..Default::default()
+        },
+    )
+    .await;
+    let forwarder = relay.forwarder.clone().unwrap();
+    forwarder.set_demand_groups("2001,3001,4001".parse().unwrap());
+    let readers = forwarder.spawn_demand_readers();
+    // The reader's child reports Opus, to the socket its symbols come from.
+    let source = forwarder.paths[0].socket.local_addr().unwrap();
+    reader
+        .send_to(&fast_plane::demand::encode_demand(&[3001]), source)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for stream in [3001_u64, 4001, 7] {
+        for (sources, _) in encoded_parts(stream, 5, 300, 1_200, 0) {
+            relay
+                .primary_sender
+                .send_to(&sources[0], relay.primary_audio)
+                .await
+                .unwrap();
+        }
+    }
+    let streams = |datagram: &[u8]| {
+        RlsView::parse(datagram, RelayLimits::default())
+            .unwrap()
+            .stream_id()
+            .unwrap()
+    };
+    let mut got = [Vec::new(), Vec::new()];
+    for (index, socket) in [&reader, &silent].into_iter().enumerate() {
+        let mut buf = [0_u8; 4_096];
+        while let Ok(Ok((len, _))) =
+            tokio::time::timeout(Duration::from_millis(300), socket.recv_from(&mut buf)).await
+        {
+            got[index].push(streams(&buf[..len]));
+        }
+    }
+    for task in readers {
+        task.abort();
+    }
+    relay.stop().await;
+    let count = |list: &Vec<u64>, stream: u64| list.iter().filter(|s| **s == stream).count();
+    assert_eq!(count(&got[0], 3001), 5, "{:?}", got[0]);
+    assert_eq!(count(&got[0], 4001), 0, "{:?}", got[0]);
+    assert_eq!(count(&got[0], 7), 5, "{:?}", got[0]);
+    assert_eq!(count(&got[1], 4001), 5, "no report: every rendition {:?}", got[1]);
+}
+
+/// The senders of the demand reports that arrive at `socket` within a
+/// report interval or two (each report must say Opus).
+async fn demand_heard(socket: &UdpSocket) -> Vec<SocketAddr> {
+    let mut from = Vec::new();
+    let mut buf = [0_u8; 256];
+    while let Ok(Ok((len, sender))) =
+        tokio::time::timeout(Duration::from_millis(600), socket.recv_from(&mut buf)).await
+    {
+        assert_eq!(fast_plane::demand::decode_demand(&buf[..len]), Some(vec![3001]));
+        if !from.contains(&sender) {
+            from.push(sender);
+        }
+        if from.len() == 2 {
+            break;
+        }
+    }
+    from
+}
+
+/// A node tells its relay parents its demand every 250 ms, from each of
+/// its audio sockets (the parent takes the one from the address its
+/// symbols go to).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_reports_its_demand_to_its_parents() {
+    let (child, _child_video) = bind_class_pair(1_000).await;
+    let demand = Arc::new(fast_plane::demand::NodeDemand::default());
+    demand.set(vec![3001]);
+    let relay = start_fast_relay_with(
+        ParentPath::Secondary,
+        &[(child.local_addr().unwrap(), RelayForwardRole::All)],
+        fast_plane::relay::RelayClassConfig {
+            port_offset: 1_000,
+            cpus: [None, None],
+            realtime: false,
+            tee_capacity: 8_192,
+            demand: Some(Arc::clone(&demand)),
+            ..Default::default()
+        },
+    )
+    .await;
+    // Each parent hears the demand from both audio sockets, within a
+    // report interval or two.
+    let primary = demand_heard(&relay.primary_sender).await;
+    let secondary = demand_heard(&relay.secondary_sender).await;
+    for from in [&primary, &secondary] {
+        assert!(from.contains(&relay.primary_audio), "{from:?}");
+        assert!(from.contains(&relay.secondary_audio), "{from:?}");
+    }
+    assert!(relay.stats().demand_reports >= 4);
+    relay.stop().await;
+}
