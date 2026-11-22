@@ -152,10 +152,23 @@ impl DemandSlot {
 pub struct NodeDemand(arc_swap::ArcSwap<Vec<u8>>);
 
 impl NodeDemand {
+    /// Report `streams`. More than [`MAX_DEMAND_STREAMS`] would not fit one
+    /// report: the node then reports nothing, and its parents fail open,
+    /// rather than drop the highest ids and hold back renditions that are
+    /// read (wave 7 review).
     pub fn set(&self, mut streams: Vec<u64>) {
         streams.sort_unstable();
         streams.dedup();
+        if streams.len() > MAX_DEMAND_STREAMS {
+            self.clear();
+            return;
+        }
         self.0.store(Arc::new(encode_demand(&streams)));
+    }
+
+    /// Report nothing: the node's demand is unknown.
+    pub fn clear(&self) {
+        self.0.store(Arc::new(Vec::new()));
     }
 
     /// The `RLD1` datagram to send; empty before the first `set`.
@@ -216,5 +229,11 @@ mod tests {
         assert!(node.report().is_empty());
         node.set(vec![4001, 3001, 3001]);
         assert_eq!(decode_demand(&node.report()), Some(vec![3001, 4001]));
+        // Too many streams for one report: none, so the parents fail open.
+        node.set((0..=MAX_DEMAND_STREAMS as u64).collect());
+        assert!(node.report().is_empty());
+        node.set(vec![3001]);
+        node.clear();
+        assert!(node.report().is_empty());
     }
 }

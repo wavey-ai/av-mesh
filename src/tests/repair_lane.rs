@@ -451,3 +451,51 @@ fn the_repair_lane_flags_default_on_and_turn_off() {
     .unwrap();
     assert!(!args.relay_repair_lane_burst_copy);
 }
+
+/// Wave 7 review: a forwarder passes its children's demand up only while
+/// every child has reported: a child that has not (an older node, a lost
+/// report) makes the forwarder's demand unknown, so its parents fail open
+/// instead of holding back what that child reads. A forwarder reads the
+/// reports without rendition groups of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forwarder_passes_its_childrens_demand_only_when_each_has_reported() {
+    let (reader, _reader_video) = bind_class_pair(1_000).await;
+    let (silent, _silent_video) = bind_class_pair(1_000).await;
+    let relay = start_fast_relay_with(
+        ParentPath::Secondary,
+        &[
+            (reader.local_addr().unwrap(), RelayForwardRole::All),
+            (silent.local_addr().unwrap(), RelayForwardRole::All),
+        ],
+        fast_plane::relay::RelayClassConfig {
+            port_offset: 1_000,
+            cpus: [None, None],
+            realtime: false,
+            tee_capacity: 8_192,
+            ..Default::default()
+        },
+    )
+    .await;
+    let forwarder = relay.forwarder.clone().unwrap();
+    assert!(forwarder.demand_groups().is_none(), "no groups here");
+    let readers = forwarder.spawn_demand_readers();
+    let source = forwarder.paths[0].socket.local_addr().unwrap();
+    reader
+        .send_to(&fast_plane::demand::encode_demand(&[3001]), source)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(forwarder.child_demand(Instant::now()), None);
+    silent
+        .send_to(&fast_plane::demand::encode_demand(&[4001]), source)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut demand = forwarder.child_demand(Instant::now()).unwrap();
+    demand.sort_unstable();
+    assert_eq!(demand, vec![3001, 4001]);
+    for reader in readers {
+        reader.abort();
+    }
+    relay.stop().await;
+}

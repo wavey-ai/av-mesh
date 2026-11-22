@@ -3214,14 +3214,19 @@ async fn main() -> Result<()> {
                 forwarder.snapshot()
             }),
     );
-    // Wave 7 item 5: the children's demand in, this node's demand out.
+    // Wave 7 item 5: the children's demand in, this node's demand out. A
+    // forwarder reads its children's reports whenever it reports its own
+    // demand (which includes theirs), with rendition groups or without:
+    // a first forwarder without groups must still pass its long-haul
+    // children's demand to a contributor that has them.
     let mut demand_tasks = Vec::new();
+    let reports_demand = args.relay_demand_report && args.relay_controlled_local;
     if let Some(forwarder) = &relay_forwarder {
-        if forwarder.demand_groups().is_some() {
+        if forwarder.demand_groups().is_some() || reports_demand {
             demand_tasks.extend(forwarder.spawn_demand_readers());
         }
     }
-    let node_demand = (args.relay_demand_report && args.relay_controlled_local).then(|| {
+    let node_demand = reports_demand.then(|| {
         let demand = Arc::new(fast_plane::demand::NodeDemand::default());
         let (mesh, forwarder, out) = (
             Arc::clone(&mesh_handle),
@@ -3240,7 +3245,13 @@ async fn main() -> Result<()> {
                     .collect();
                 streams.extend(mesh.subscribed_streams());
                 if let Some(forwarder) = &forwarder {
-                    streams.extend(forwarder.child_demand(Instant::now()));
+                    match forwarder.child_demand(Instant::now()) {
+                        Some(children) => streams.extend(children),
+                        None => {
+                            out.clear();
+                            continue;
+                        }
+                    }
                 }
                 out.set(streams);
             }
@@ -5398,15 +5409,16 @@ impl RelayDownstreamForwarder {
         self.demand_groups.get().filter(|groups| !groups.is_empty())
     }
 
-    /// The streams that the compiled children report fresh demand for.
-    fn child_demand(&self, now: Instant) -> Vec<u64> {
+    /// The streams that the compiled children report fresh demand for;
+    /// `None` while a child has no fresh report (an older node, one with
+    /// --relay-demand-report false, a lost report): this node's demand is
+    /// then unknown, and it reports none, so its parents fail open.
+    fn child_demand(&self, now: Instant) -> Option<Vec<u64>> {
         let mut out = Vec::new();
         for path in &self.paths {
-            if let Some(report) = path.demand.fresh(now) {
-                out.extend_from_slice(&report.1);
-            }
+            out.extend_from_slice(&path.demand.fresh(now)?.1);
         }
-        out
+        Some(out)
     }
 
     /// Read the children's demand reports (`RLD1`) that arrive on the
