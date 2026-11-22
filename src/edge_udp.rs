@@ -384,6 +384,9 @@ pub(crate) struct EdgeSockets {
     compact: Arc<CompactStore>,
     /// The node's hop journal, for `udp_sent`.
     journal: Option<Arc<HopJournal>>,
+    /// Send-only twins of the pair (audio, video): see
+    /// [`Self::with_send_twins`].
+    send_twins: Option<[Arc<std::net::UdpSocket>; 2]>,
 }
 
 /// Where a stream's datagrams leave from: its socket, and the socket's send
@@ -579,6 +582,7 @@ impl EdgeSockets {
             fast_lane: None,
             compact: Arc::default(),
             journal: None,
+            send_twins: None,
         }
     }
 
@@ -592,7 +596,40 @@ impl EdgeSockets {
             fast_lane: None,
             compact: Arc::default(),
             journal: None,
+            send_twins: None,
         }
+    }
+
+    /// Send-only twins of the pair (`--client-udp-send-twins`, wave 7 item
+    /// 10): two more sockets on the pair's address, in its SO_REUSEPORT
+    /// group, that the fast lane's threads send from. The runtime watches
+    /// the pair's sockets for writing too, and every datagram that leaves a
+    /// socket so watched wakes it when the kernel frees the datagram: a
+    /// fan-out of 1 ms parts to hundreds of clients kept the runtime's
+    /// threads busy waking. The twins are watched for reading only (the
+    /// control loop reads the clients' requests that the group hands them).
+    pub(crate) fn with_send_twins(
+        mut self,
+        audio: std::net::UdpSocket,
+        video: std::net::UdpSocket,
+    ) -> Self {
+        self.send_twins = Some([Arc::new(audio), Arc::new(video)]);
+        self
+    }
+
+    /// The descriptor that the fast lane sends a class from: its send-only
+    /// twin, else its socket.
+    pub(crate) fn send_fd(&self, class: TrafficClass) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        match &self.send_twins {
+            Some(twins) if self.video.is_some() => twins[class.index()].as_raw_fd(),
+            _ => self.class_socket(class).as_raw_fd(),
+        }
+    }
+
+    /// The hop journal that `udp_sent` goes to, if any.
+    pub(crate) fn hop_journal(&self) -> Option<&Arc<HopJournal>> {
+        self.journal.as_ref()
     }
 
     /// Journal the parts sent to clients (`udp_sent`) in `journal`, if it
@@ -927,6 +964,22 @@ async fn drain_send_queue(queue: std::sync::Weak<SendQueue>) {
     }
 }
 
+/// A request that the SO_REUSEPORT group handed a send-only twin.
+async fn recv_twin(
+    socket: Option<&tokio::io::unix::AsyncFd<Arc<std::net::UdpSocket>>>,
+    buffer: &mut [u8],
+) -> std::io::Result<(usize, SocketAddr)> {
+    let Some(socket) = socket else {
+        return std::future::pending().await;
+    };
+    loop {
+        let mut guard = socket.readable().await?;
+        if let Ok(result) = guard.try_io(|inner| inner.get_ref().recv_from(buffer)) {
+            return result;
+        }
+    }
+}
+
 async fn recv_optional(
     socket: Option<&Arc<UdpSocket>>,
     buffer: &mut [u8],
@@ -1151,16 +1204,27 @@ pub(crate) async fn run_edge_udp(
     let tokens = Tokens(RandomState::new());
     let mut audio_buf = vec![0_u8; 2_048];
     let mut video_buf = vec![0_u8; 2_048];
+    // The send-only twins' share of the requests, watched for reading only.
+    let twins = match &sockets.send_twins {
+        Some([audio, video]) => Some([
+            tokio::io::unix::AsyncFd::with_interest(Arc::clone(audio), tokio::io::Interest::READABLE)?,
+            tokio::io::unix::AsyncFd::with_interest(Arc::clone(video), tokio::io::Interest::READABLE)?,
+        ]),
+        None => None,
+    };
+    let mut twin_bufs = [vec![0_u8; 2_048], vec![0_u8; 2_048]];
     info!(
         bind = %sockets.audio.local_addr()?,
         class_sockets = sockets.video.is_some(),
         "edge client UDP (RaptorQ FEC) listening"
     );
     loop {
-        let (len, peer, from_video) = tokio::select! {
+        let [twin_audio_buf, twin_video_buf] = &mut twin_bufs;
+        // Which socket: 0 audio, 1 video, 2 and 3 their send-only twins.
+        let (len, peer, source) = tokio::select! {
             _ = shutdown_rx.changed() => return Ok(()),
             received = sockets.audio.recv_from(&mut audio_buf) => match received {
-                Ok((len, peer)) => (len, peer, false),
+                Ok((len, peer)) => (len, peer, 0),
                 Err(error) => {
                     // An ICMP port unreachable of a departed client surfaces
                     // here on some kernels; it is not fatal.
@@ -1169,22 +1233,40 @@ pub(crate) async fn run_edge_udp(
                 }
             },
             received = recv_optional(sockets.video.as_ref(), &mut video_buf) => match received {
-                Ok((len, peer)) => (len, peer, true),
+                Ok((len, peer)) => (len, peer, 1),
+                Err(error) => {
+                    debug!(error = %error, "edge client UDP receive error");
+                    continue;
+                }
+            },
+            received = recv_twin(twins.as_ref().map(|twins| &twins[0]), twin_audio_buf) => match received {
+                Ok((len, peer)) => (len, peer, 2),
+                Err(error) => {
+                    debug!(error = %error, "edge client UDP receive error");
+                    continue;
+                }
+            },
+            received = recv_twin(twins.as_ref().map(|twins| &twins[1]), twin_video_buf) => match received {
+                Ok((len, peer)) => (len, peer, 3),
                 Err(error) => {
                     debug!(error = %error, "edge client UDP receive error");
                     continue;
                 }
             },
         };
-        // Answer from the socket the request came to; both have the
-        // client's address.
-        let (socket, request) = if from_video {
-            (
+        // Answer from the socket (or the twin's socket) the request came
+        // to; all have the client's address.
+        let (socket, request) = match source {
+            1 => (
                 sockets.video.as_ref().expect("received on it"),
                 &video_buf[..len],
-            )
-        } else {
-            (&sockets.audio, &audio_buf[..len])
+            ),
+            3 => (
+                sockets.video.as_ref().expect("a twin of the pair"),
+                &twin_bufs[1][..len],
+            ),
+            2 => (&sockets.audio, &twin_bufs[0][..len]),
+            _ => (&sockets.audio, &audio_buf[..len]),
         };
         let socket = Arc::clone(socket);
         let Some(control) = Control::decode(request) else {
@@ -2170,6 +2252,9 @@ pub(crate) fn window_repair_now(
     }
 }
 
+/// Send `part` to the subscribers due for it on this lane; `true` if it
+/// went to any (a part that the fast lane carried to every subscriber
+/// needs no more here, its window repair included).
 #[allow(clippy::too_many_arguments)]
 async fn deliver(
     out: ClientOut<'_>,
@@ -2181,7 +2266,7 @@ async fn deliver(
     stream_id: u64,
     part: u64,
     bytes: Option<Bytes>,
-) {
+) -> bool {
     let Due {
         blocks: mut targets,
         compact: compact_targets,
@@ -2203,7 +2288,7 @@ async fn deliver(
         .await;
     }
     if targets.is_empty() && compact_targets.is_empty() {
-        return;
+        return false;
     }
     let object = match bytes {
         Some(bytes) => {
@@ -2251,6 +2336,7 @@ async fn deliver(
             out.journal_sent(stream_id, part, targets.first().map(|t| t.0));
         }
     }
+    true
 }
 
 async fn run_stream_sender(
@@ -2463,7 +2549,7 @@ async fn run_stream_sender(
                     }
                 }
             };
-            deliver(
+            let sent = deliver(
                 out,
                 sockets.compact(),
                 &router,
@@ -2475,15 +2561,19 @@ async fn run_stream_sender(
                 bytes,
             )
             .await;
-            window_repair_now(
-                &sockets,
-                &table,
-                config.batch_send,
-                &stats,
-                stream_id,
-                part,
-                None,
-            );
+            // A part that the fast lane carried to every subscriber had its
+            // window repair there.
+            if sent {
+                window_repair_now(
+                    &sockets,
+                    &table,
+                    config.batch_send,
+                    &stats,
+                    stream_id,
+                    part,
+                    None,
+                );
+            }
             last_sent = Instant::now();
             continue;
         }
@@ -2510,7 +2600,7 @@ async fn run_stream_sender(
         };
         match waited {
             Ok(Ok(Some((bytes, _)))) => {
-                deliver(
+                let sent = deliver(
                     out,
                     sockets.compact(),
                     &router,
@@ -2522,15 +2612,17 @@ async fn run_stream_sender(
                     Some(bytes),
                 )
                 .await;
-                window_repair_now(
-                    &sockets,
-                    &table,
-                    config.batch_send,
-                    &stats,
-                    stream_id,
-                    part,
-                    None,
-                );
+                if sent {
+                    window_repair_now(
+                        &sockets,
+                        &table,
+                        config.batch_send,
+                        &stats,
+                        stream_id,
+                        part,
+                        None,
+                    );
+                }
                 last_sent = Instant::now();
             }
             Ok(Err(ParentsLost)) => {

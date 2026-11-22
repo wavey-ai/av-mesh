@@ -264,6 +264,18 @@ impl LaneEdge {
 
     /// With holes found by part distance (`hole_distance` not zero).
     async fn start_with(ip: Ipv4Addr, hole_distance: Duration) -> Self {
+        Self::start_with_capacity(ip, hole_distance, 64, true).await
+    }
+
+    /// An edge that takes up to `max_subscribers` UDP clients, its fast lane
+    /// sending from the client sockets' send-only twins (`send_twins`) or
+    /// from the sockets themselves.
+    pub(super) async fn start_with_capacity(
+        ip: Ipv4Addr,
+        hole_distance: Duration,
+        max_subscribers: usize,
+        send_twins: bool,
+    ) -> Self {
         let (ports, sockets) = bind_edge_class_ports(ip);
         let forwarders = [
             UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap(),
@@ -321,10 +333,11 @@ impl LaneEdge {
         })
         .await;
         let router = app_router_for_tests(Arc::clone(&cache), mesh);
-        let client_sockets = bind_edge_class_sockets(
+        let client_sockets = bind_edge_class_sockets_with(
             "127.0.0.1:0".parse().unwrap(),
             4 << 20,
             cache.stream_classes(),
+            send_twins,
         )
         .unwrap()
         .with_fast_lane(Some(Arc::clone(&lane)))
@@ -334,7 +347,7 @@ impl LaneEdge {
             .local_addr()
             .unwrap();
         let stats: Arc<edge_udp::EdgeUdpStats> = Arc::default();
-        let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, 64);
+        let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, max_subscribers);
         // A host stall must not make the cache-fed lane skip a part it owes.
         config.playout = Duration::from_secs(5);
         let udp = tokio::spawn(edge_udp::run_edge_udp(

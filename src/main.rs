@@ -1852,6 +1852,45 @@ struct Args {
     )]
     client_udp_compact_mark_fast_lane: bool,
 
+    /// Fan-out threads of the edge's audio class thread (wave 7 item 10):
+    /// a batch of more than --client-udp-fanout-inline-sends sends to fast-
+    /// lane clients goes to these threads, each with the sends of its own
+    /// clients, and one that is a few batches behind has its sends shed
+    /// (the cache-fed lane serves those parts) rather than hold the class
+    /// thread: the ingest of the edge (and its LL-HLS commit) never drops a
+    /// part because of the fan-out. 0 sends every batch from the class
+    /// thread, as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_FANOUT_THREADS",
+        default_value_t = fast_plane::edge_clients::DEFAULT_FANOUT_THREADS
+    )]
+    client_udp_fanout_threads: usize,
+
+    /// The most sends of a batch that the audio class thread makes itself
+    /// with fan-out threads (a batch for a few clients needs no hand-off).
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_FANOUT_INLINE_SENDS",
+        default_value_t = fast_plane::edge_clients::DEFAULT_FANOUT_INLINE_SENDS
+    )]
+    client_udp_fanout_inline_sends: usize,
+
+    /// The fast lane sends from send-only twins of the client sockets (the
+    /// same address, in their SO_REUSEPORT group) that the runtime watches
+    /// for reading only (wave 7 item 10). A socket that the runtime watches
+    /// for writing wakes it as the kernel frees each datagram sent: with
+    /// hundreds of clients of 1 ms parts that cost the runtime's threads
+    /// about as much as the sends. `false` sends from the client sockets,
+    /// as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_SEND_TWINS",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    client_udp_send_twins: bool,
+
     /// An edge that has heard none of its cache-mesh parents for this long
     /// has lost them: it answers 503 for a part or a playlist reload that it
     /// would otherwise hold, and moves its UDP clients. Keep it above the
@@ -2520,11 +2559,24 @@ fn configure_udp_socket_buffers(
     })
 }
 
-/// The edge's client sockets as an audio/video pair on one address.
+/// The edge's client sockets as an audio/video pair on one address, with
+/// their send-only twins (`--client-udp-send-twins`).
+#[cfg(test)]
 fn bind_edge_class_sockets(
     bind: SocketAddr,
     buffer_bytes: usize,
     classes: &fast_plane::StreamClasses,
+) -> Result<edge_udp::EdgeSockets> {
+    bind_edge_class_sockets_with(bind, buffer_bytes, classes, true)
+}
+
+/// The edge's client sockets as an audio/video pair on one address, and
+/// with `send_twins` a send-only twin of each for the fast lane.
+fn bind_edge_class_sockets_with(
+    bind: SocketAddr,
+    buffer_bytes: usize,
+    classes: &fast_plane::StreamClasses,
+    send_twins: bool,
 ) -> Result<edge_udp::EdgeSockets> {
     let audio = fast_plane::sys::bind_reuseport(bind)
         .with_context(|| format!("failed to bind edge client UDP on {bind}"))?;
@@ -2532,10 +2584,29 @@ fn bind_edge_class_sockets(
     let video = fast_plane::sys::bind_reuseport(local)
         .with_context(|| format!("failed to bind the video twin of edge client UDP on {local}"))?;
     fast_plane::sys::set_priority(&audio, fast_plane::sys::AUDIO_SO_PRIORITY)?;
+    let twins = if send_twins {
+        let twin = || {
+            fast_plane::sys::bind_reuseport(local).with_context(|| {
+                format!("failed to bind a send-only twin of edge client UDP on {local}")
+            })
+        };
+        let (audio_twin, video_twin) = (twin()?, twin()?);
+        fast_plane::sys::set_priority(&audio_twin, fast_plane::sys::AUDIO_SO_PRIORITY)?;
+        Some((audio_twin, video_twin))
+    } else {
+        None
+    };
     for (socket, purpose) in [
         (&audio, "edge client UDP audio"),
         (&video, "edge client UDP video"),
-    ] {
+    ]
+    .into_iter()
+    .chain(twins.iter().flat_map(|(audio_twin, video_twin)| {
+        [
+            (audio_twin, "edge client UDP audio send twin"),
+            (video_twin, "edge client UDP video send twin"),
+        ]
+    })) {
         let state = configure_udp_socket_buffers(socket, buffer_bytes, purpose)?;
         if !state.target_met() {
             warn!(
@@ -2546,12 +2617,20 @@ fn bind_edge_class_sockets(
             );
         }
     }
-    info!(bind = %local, "edge client UDP: an audio and a video socket on one address");
-    Ok(edge_udp::EdgeSockets::pair(
+    info!(
+        bind = %local,
+        send_twins = twins.is_some(),
+        "edge client UDP: an audio and a video socket on one address"
+    );
+    let sockets = edge_udp::EdgeSockets::pair(
         UdpSocket::from_std(audio)?,
         UdpSocket::from_std(video)?,
         classes.clone(),
-    ))
+    );
+    Ok(match twins {
+        Some((audio_twin, video_twin)) => sockets.with_send_twins(audio_twin, video_twin),
+        None => sockets,
+    })
 }
 
 async fn bind_buffered_udp_ingress(
@@ -2800,6 +2879,10 @@ async fn main() -> Result<()> {
         lane.set_compact_fast_parse(args.client_udp_compact_fast_parse);
         lane.set_compact_top_up(args.client_udp_compact_top_up);
         lane.set_compact_mark(args.client_udp_compact_mark_fast_lane);
+        lane.set_fanout(
+            args.client_udp_fanout_threads,
+            args.client_udp_fanout_inline_sends,
+        );
         lane.set_video_pacing(Some(fast_plane::edge_clients::VideoPacing {
             percent: args.client_udp_video_pace_percent,
             max_delay_us: args.client_udp_video_pace_max_ms.saturating_mul(1_000),
@@ -3331,7 +3414,12 @@ async fn main() -> Result<()> {
             );
         }
         let sockets = if class_sockets && mesh_split {
-            bind_edge_class_sockets(bind, args.udp_socket_buffer_bytes, cache.stream_classes())?
+            bind_edge_class_sockets_with(
+                bind,
+                args.udp_socket_buffer_bytes,
+                cache.stream_classes(),
+                args.client_udp_send_twins,
+            )?
         } else {
             edge_udp::EdgeSockets::single(
                 bind_buffered_udp_ingress(bind, args.udp_socket_buffer_bytes, "edge client UDP")
@@ -37376,4 +37464,8 @@ mod tests {
     /// 4K past 164 Mbit/s: a forwarder's video thread and an edge's video
     /// clients, at 200 Mbit/s, and their processor time per Mbit/s.
     mod video_throughput;
+
+    /// Edge capacity (wave 7, item 10): listeners of 1 ms parts per edge,
+    /// and an ingest that never drops for the fan-out.
+    mod edge_capacity;
 }

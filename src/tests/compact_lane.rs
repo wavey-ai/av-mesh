@@ -45,6 +45,9 @@ pub(super) enum Payload {
     /// 1 ms PCM: an opaque part of a 16-byte header and 48 stereo 24-bit
     /// samples.
     Pcm,
+    /// 1 ms Opus Custom at 320 kbit/s: an opaque part of a 16-byte SoundKit
+    /// header and a 40-byte packet.
+    Opus1,
     /// 4K at 25 Mbit/s and 60 frames a second: one fMP4 frame a part.
     Video4k,
 }
@@ -54,6 +57,7 @@ impl Payload {
         match self {
             Self::Opus => "Opus 2.5 ms 256 kbit/s",
             Self::Pcm => "PCM 1 ms 48 kHz 24-bit stereo",
+            Self::Opus1 => "Opus 1 ms Custom 320 kbit/s",
             Self::Video4k => "4K 25 Mbit/s 60 fps",
         }
     }
@@ -61,7 +65,7 @@ impl Payload {
     pub(super) fn part_us(self) -> u64 {
         match self {
             Self::Opus => 2_500,
-            Self::Pcm => 1_000,
+            Self::Pcm | Self::Opus1 => 1_000,
             Self::Video4k => 16_667,
         }
     }
@@ -71,6 +75,7 @@ impl Payload {
         match self {
             Self::Opus => 16 + 80,
             Self::Pcm => 16 + 288,
+            Self::Opus1 => 16 + 40,
             Self::Video4k => 25_000_000 / 8 / 60,
         }
     }
@@ -80,6 +85,7 @@ impl Payload {
         match self {
             Self::Opus => 256_000.0,
             Self::Pcm => 48_000.0 * 2.0 * 24.0,
+            Self::Opus1 => 320_000.0,
             Self::Video4k => 25_000_000.0,
         }
     }
@@ -196,7 +202,7 @@ impl Payload {
     /// The contributor's RelaySession symbols of an envelope: audio parts
     /// one symbol and one repair symbol, a 4K frame in 1,088-byte symbols
     /// with a tenth of repair.
-    fn symbols(self, envelope: &[u8]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    pub(super) fn symbols(self, envelope: &[u8]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
         let deadline = now_unix_us() + 30_000_000;
         if self.video() {
             let sources = envelope.len().div_ceil(1_088) as u32;
@@ -809,7 +815,7 @@ impl AnyEdge {
         }
     }
 
-    fn stats(&self) -> &Arc<edge_udp::EdgeUdpStats> {
+    pub(super) fn stats(&self) -> &Arc<edge_udp::EdgeUdpStats> {
         match self {
             Self::Fast(edge) => &edge.stats,
             Self::Mesh(edge) => &edge.stats,

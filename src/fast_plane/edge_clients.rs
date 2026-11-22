@@ -46,6 +46,19 @@
 //!   `fq` qdisc holds each message until then, so a client gets a 4K frame
 //!   at its rate instead of at the NIC's line rate, with no timer on the
 //!   thread. Other qdiscs send at once. Audio is never paced.
+//! - Fan-out off the ingest thread (`--client-udp-fanout-threads`, wave 7
+//!   item 10): a send to a client costs the kernel about as much as the
+//!   class thread's whole receipt of the symbol, so an audio class thread
+//!   that sent each 1 ms part to a few hundred clients itself fell behind
+//!   its own socket, and the edge's ingest (and with it the LL-HLS commit)
+//!   lost parts to the fan-out. The audio thread still plans the sends (the
+//!   claims, the rewrap and the compact datagram), but a batch of more than
+//!   `--client-udp-fanout-inline-sends` sends (or any batch while earlier
+//!   ones are still out) goes to fan-out threads, each with the sends of
+//!   its own clients (by address, so that a client's parts stay in order).
+//!   A thread that has [`FANOUT_DEPTH`] batches in hand is not waited for:
+//!   its clients' sends of the batch are shed (their parts go back to the
+//!   cache-fed lane) and the class thread reads on.
 
 use super::sys;
 use super::view::RlsView;
@@ -61,7 +74,7 @@ use raptorq_datagram_fec::{
 use serde::Serialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 use tracing::debug;
@@ -350,6 +363,13 @@ pub struct FastLaneStats {
     pub paced_messages: AtomicU64,
     pub paced_clamped: AtomicU64,
     pub txtime_refused: AtomicU64,
+    /// Fan-out off the ingest thread: shard batches handed to the fan-out
+    /// threads, their sends, and the sends shed because a thread had
+    /// [`FANOUT_DEPTH`] batches in hand (their parts go back to the
+    /// cache-fed lane).
+    pub fanout_batches: AtomicU64,
+    pub fanout_sends: AtomicU64,
+    pub fanout_shed: AtomicU64,
 }
 
 /// What `/api/mesh` reports of the fast client lane.
@@ -377,6 +397,10 @@ pub struct FastLaneSnapshot {
     pub paced_messages: u64,
     pub paced_clamped: u64,
     pub txtime_refused: u64,
+    pub fanout_threads: u64,
+    pub fanout_batches: u64,
+    pub fanout_sends: u64,
+    pub fanout_shed: u64,
 }
 
 struct Armed {
@@ -417,6 +441,11 @@ pub struct EdgeFastLane {
     pace_percent: AtomicU32,
     pace_max_delay_us: AtomicU64,
     txtime: AtomicU8,
+    /// Fan-out threads of the audio class thread (0: it sends every batch
+    /// itself, as before), and the most sends of a batch that it sends
+    /// itself.
+    fanout_threads: AtomicU32,
+    fanout_inline_sends: AtomicU32,
     pub stats: FastLaneStats,
 }
 
@@ -450,8 +479,34 @@ impl EdgeFastLane {
             pace_percent: AtomicU32::new(0),
             pace_max_delay_us: AtomicU64::new(0),
             txtime: AtomicU8::new(TXTIME_UNSET),
+            fanout_threads: AtomicU32::new(DEFAULT_FANOUT_THREADS as u32),
+            fanout_inline_sends: AtomicU32::new(DEFAULT_FANOUT_INLINE_SENDS as u32),
             stats: FastLaneStats::default(),
         })
+    }
+
+    /// The audio class thread hands batches of more than `inline_sends`
+    /// sends to `threads` fan-out threads (`0`: it sends every batch itself,
+    /// as before). Read when the thread first needs them.
+    pub fn set_fanout(&self, threads: usize, inline_sends: usize) {
+        self.fanout_threads
+            .store(threads.min(64) as u32, Ordering::Relaxed);
+        self.fanout_inline_sends
+            .store(inline_sends.min(u32::MAX as usize) as u32, Ordering::Relaxed);
+    }
+
+    fn fanout(&self) -> (usize, usize) {
+        (
+            self.fanout_threads.load(Ordering::Relaxed) as usize,
+            self.fanout_inline_sends.load(Ordering::Relaxed) as usize,
+        )
+    }
+
+    /// The hop journal's `udp_sent` of a send made off the class thread.
+    fn journal_udp_sent(&self, stream_id: u64, part: u64, peer: SocketAddr, sent_us: u64) {
+        if let Some(journal) = self.armed.get().and_then(|armed| armed.sockets.hop_journal()) {
+            journal.record_udp_sent(stream_id, part, peer, sent_us);
+        }
     }
 
     /// Pace each video client (`Some`), or send video at once (`None`, as
@@ -531,8 +586,10 @@ impl EdgeFastLane {
 
     /// Give the lane its client sockets and subscriber table.
     pub fn arm(&self, sockets: EdgeSockets, table: Table, stats: Arc<EdgeUdpStats>) {
-        let audio = sockets.class_socket(TrafficClass::Audio).as_raw_fd();
-        let video = sockets.class_socket(TrafficClass::Video).as_raw_fd();
+        // The send-only twins of the client sockets when there are (no
+        // runtime is woken by their sends), else the sockets themselves.
+        let audio = sockets.send_fd(TrafficClass::Audio);
+        let video = sockets.send_fd(TrafficClass::Video);
         if self
             .armed
             .set(Armed {
@@ -623,6 +680,10 @@ impl EdgeFastLane {
             paced_messages: load(&self.stats.paced_messages),
             paced_clamped: load(&self.stats.paced_clamped),
             txtime_refused: load(&self.stats.txtime_refused),
+            fanout_threads: self.fanout().0 as u64,
+            fanout_batches: load(&self.stats.fanout_batches),
+            fanout_sends: load(&self.stats.fanout_sends),
+            fanout_shed: load(&self.stats.fanout_shed),
         }
     }
 
@@ -947,8 +1008,9 @@ pub struct ClientPlan {
     video: bool,
     /// CLOCK_MONOTONIC at the start of the batch (video only).
     now_ns: u64,
-    /// The stream of each message of the batch.
+    /// The stream and the part of each message of the batch.
     streams: [u64; sys::RECV_BATCH],
+    parts: [u64; sys::RECV_BATCH],
     pacer: Pacer,
     runs: Vec<(usize, usize)>,
     departures: Vec<u64>,
@@ -993,6 +1055,7 @@ impl ClientPlan {
             video: false,
             now_ns: 0,
             streams: [0; sys::RECV_BATCH],
+            parts: [0; sys::RECV_BATCH],
             pacer: Pacer::default(),
             runs: Vec::with_capacity(sys::RECV_BATCH),
             departures: Vec::with_capacity(sys::RECV_BATCH),
@@ -1088,6 +1151,7 @@ impl ClientPlan {
         self.lens[message] = len as u16;
         self.compact_lens[message] = 0;
         self.streams[message] = stream_id;
+        self.parts[message] = part;
         if self.video {
             self.pacer
                 .rates
@@ -1402,6 +1466,100 @@ impl ClientPlan {
         self.window_repair(lane);
     }
 
+    /// The sends planned for the batch so far.
+    pub fn pending_sends(&self) -> usize {
+        self.sends.len()
+    }
+
+    /// The sends of the clients of fan-out `shard` (of `shards`), into
+    /// `into` (cleared first), with the bytes of the messages that they
+    /// send, and the batch's window repair if `with_repair`.
+    fn split_into(&self, shard: usize, shards: usize, into: &mut ClientPlan, with_repair: bool) {
+        into.clear();
+        let mut copied = [false; sys::RECV_BATCH];
+        for send in &self.sends {
+            if shard_of(send.peer, shards) != shard {
+                continue;
+            }
+            let message = usize::from(send.message);
+            if !copied[message] {
+                copied[message] = true;
+                let start = message * REWRAP_BYTES;
+                let len = usize::from(self.lens[message]);
+                into.buffers[start..start + len]
+                    .copy_from_slice(&self.buffers[start..start + len]);
+                into.lens[message] = self.lens[message];
+                let compact_len = usize::from(self.compact_lens[message]);
+                into.compact_lens[message] = self.compact_lens[message];
+                if compact_len > 0 {
+                    for copies in 0..COMPACT_VARIANTS as u8 {
+                        let at = compact_at(message, copies);
+                        into.compact_buffers[at..at + compact_len]
+                            .copy_from_slice(&self.compact_buffers[at..at + compact_len]);
+                    }
+                }
+                into.streams[message] = self.streams[message];
+                into.parts[message] = self.parts[message];
+            }
+            into.sends.push(PlannedClient {
+                client: into.clients.len() as u32,
+                ..*send
+            });
+            into.clients
+                .push(Arc::clone(&self.clients[send.client as usize]));
+        }
+        if with_repair {
+            into.compact_sent.extend_from_slice(&self.compact_sent);
+        }
+    }
+
+    /// Shed the sends of fan-out `shard` (of `shards`) unsent: each part
+    /// claimed for one of its clients goes back to the cache-fed lane.
+    /// Returns the sends shed.
+    fn shed_shard(&self, shard: usize, shards: usize, lane: &EdgeFastLane) -> u64 {
+        let mut shed = 0;
+        for send in &self.sends {
+            if shard_of(send.peer, shards) != shard {
+                continue;
+            }
+            shed += 1;
+            if send.source {
+                self.clients[send.client as usize].give_back(send.part);
+            }
+        }
+        if shed > 0 {
+            lane.stats.fanout_shed.fetch_add(shed, Ordering::Relaxed);
+        }
+        shed
+    }
+
+    /// The batch's sends went to the fan-out threads (or were shed); its
+    /// window repair too, unless `repair_kept` (no thread took the batch:
+    /// this thread sends the repair, which is rare and small).
+    fn handed_off(&mut self, lane: &EdgeFastLane, repair_kept: bool) {
+        self.sends.clear();
+        self.clients.clear();
+        if repair_kept {
+            self.window_repair(lane);
+        }
+        self.compact_sent.clear();
+    }
+
+    /// The hop journal's `udp_sent` of each message that this plan sent
+    /// (a fan-out thread's; the class thread's go with the tee's copy).
+    fn journal_sent(&self, lane: &EdgeFastLane) {
+        for (message, peer) in self.first_sent.iter().enumerate() {
+            if let Some(peer) = peer {
+                lane.journal_udp_sent(
+                    self.streams[message],
+                    self.parts[message],
+                    *peer,
+                    self.sent_us,
+                );
+            }
+        }
+    }
+
     /// The window repair of the windows that the batch's compact parts
     /// complete, from this thread: a window's repair does not wait for the
     /// cache-fed lane to work its way to the window's end.
@@ -1441,6 +1599,211 @@ impl ClientPlan {
     }
 }
 
+// ------------------------------------------------------------------ fan-out
+
+/// Default of `--client-udp-fanout-threads`.
+pub const DEFAULT_FANOUT_THREADS: usize = 2;
+/// Default of `--client-udp-fanout-inline-sends`: a batch for a few clients
+/// is sent by the class thread itself (no hand-off, no wake of another
+/// thread); its cost is a small part of a part's interval.
+pub const DEFAULT_FANOUT_INLINE_SENDS: usize = 32;
+/// Batches that a fan-out thread may have in hand before the class thread
+/// sheds its clients' sends of a batch rather than wait: a few parts of
+/// 1 ms.
+pub const FANOUT_DEPTH: usize = 8;
+
+/// The fan-out shard of a client: fixed by its address, so that all its
+/// sends go from the same thread, in order.
+fn shard_of(peer: SocketAddr, shards: usize) -> usize {
+    if shards <= 1 {
+        return 0;
+    }
+    let ip = match peer.ip() {
+        std::net::IpAddr::V4(ip) => u64::from(u32::from(ip)),
+        std::net::IpAddr::V6(ip) => {
+            let bits = u128::from(ip);
+            (bits as u64) ^ ((bits >> 64) as u64)
+        }
+    };
+    let mixed = (ip << 16 | u64::from(peer.port())).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    ((mixed >> 32) % shards as u64) as usize
+}
+
+struct FanoutShard {
+    work: Option<std::sync::mpsc::SyncSender<Box<ClientPlan>>>,
+    free: std::sync::mpsc::Receiver<Box<ClientPlan>>,
+    spare: Option<Box<ClientPlan>>,
+    /// Batches handed to the thread and not yet sent.
+    in_hand: Arc<AtomicU32>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// The fan-out threads of a class thread.
+struct Fanout {
+    shards: Vec<FanoutShard>,
+}
+
+impl Fanout {
+    fn start(
+        lane: &Arc<EdgeFastLane>,
+        class: TrafficClass,
+        threads: usize,
+    ) -> std::io::Result<Self> {
+        let mut shards = Vec::with_capacity(threads);
+        for index in 0..threads {
+            let (work_tx, work_rx) =
+                std::sync::mpsc::sync_channel::<Box<ClientPlan>>(FANOUT_DEPTH);
+            let (free_tx, free_rx) =
+                std::sync::mpsc::sync_channel::<Box<ClientPlan>>(FANOUT_DEPTH);
+            // FANOUT_DEPTH plans in all: one spare, the rest free.
+            for _ in 1..FANOUT_DEPTH {
+                let _ = free_tx.send(Box::new(ClientPlan::new()));
+            }
+            let in_hand = Arc::new(AtomicU32::new(0));
+            let thread = {
+                let lane = Arc::clone(lane);
+                let in_hand = Arc::clone(&in_hand);
+                std::thread::Builder::new()
+                    .name(format!("nt-fanout-{}{index}", class.as_str()))
+                    .spawn(move || run_fanout(&work_rx, &free_tx, &lane, class, &in_hand))?
+            };
+            shards.push(FanoutShard {
+                work: Some(work_tx),
+                free: free_rx,
+                spare: Some(Box::new(ClientPlan::new())),
+                in_hand,
+                thread: Some(thread),
+            });
+        }
+        tracing::info!(
+            class = class.as_str(),
+            threads,
+            "edge client UDP: the fan-out to clients runs off the ingest thread"
+        );
+        Ok(Self { shards })
+    }
+
+    /// Whether a fan-out thread still has batches in hand.
+    fn busy(&self) -> bool {
+        self.shards
+            .iter()
+            .any(|shard| shard.in_hand.load(Ordering::Acquire) > 0)
+    }
+
+    /// Hand each shard's sends of the batch to its thread, or shed them if
+    /// the thread has [`FANOUT_DEPTH`] batches in hand. Never waits.
+    fn dispatch(&mut self, plan: &mut ClientPlan, lane: &EdgeFastLane) {
+        let shards = self.shards.len();
+        // The batch's window repair goes with the first shard that takes it.
+        let mut repair_kept = !plan.compact_sent.is_empty();
+        for (index, shard) in self.shards.iter_mut().enumerate() {
+            let Some(mut next) = shard.spare.take().or_else(|| shard.free.try_recv().ok()) else {
+                plan.shed_shard(index, shards, lane);
+                continue;
+            };
+            plan.split_into(index, shards, &mut next, repair_kept);
+            if next.sends.is_empty() && next.compact_sent.is_empty() {
+                shard.spare = Some(next);
+                continue;
+            }
+            let sends = next.sends.len() as u64;
+            let with_repair = !next.compact_sent.is_empty();
+            shard.in_hand.fetch_add(1, Ordering::AcqRel);
+            match shard.work.as_ref().map(|work| work.try_send(next)) {
+                Some(Ok(())) => {
+                    repair_kept &= !with_repair;
+                    lane.stats.fanout_batches.fetch_add(1, Ordering::Relaxed);
+                    lane.stats.fanout_sends.fetch_add(sends, Ordering::Relaxed);
+                }
+                Some(Err(
+                    std::sync::mpsc::TrySendError::Full(back)
+                    | std::sync::mpsc::TrySendError::Disconnected(back),
+                )) => {
+                    shard.in_hand.fetch_sub(1, Ordering::AcqRel);
+                    back.shed_shard(0, 1, lane);
+                    shard.spare = Some(back);
+                }
+                None => {
+                    shard.in_hand.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+        }
+        plan.handed_off(lane, repair_kept);
+    }
+}
+
+impl Drop for Fanout {
+    fn drop(&mut self) {
+        for shard in &mut self.shards {
+            shard.work = None;
+        }
+        for shard in &mut self.shards {
+            if let Some(thread) = shard.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+fn run_fanout(
+    work: &std::sync::mpsc::Receiver<Box<ClientPlan>>,
+    free: &std::sync::mpsc::SyncSender<Box<ClientPlan>>,
+    lane: &EdgeFastLane,
+    class: TrafficClass,
+    in_hand: &AtomicU32,
+) {
+    while let Ok(mut plan) = work.recv() {
+        plan.send(lane, class);
+        plan.journal_sent(lane);
+        in_hand.fetch_sub(1, Ordering::AcqRel);
+        if free.try_send(plan).is_err() {
+            break;
+        }
+    }
+}
+
+/// How a class thread sends its batches to the edge's clients: itself, or
+/// through its fan-out threads (started when first needed).
+#[derive(Default)]
+pub struct ClientSender {
+    fanout: Option<Fanout>,
+    /// The fan-out threads could not start: the class thread sends.
+    failed: bool,
+}
+
+impl ClientSender {
+    /// Send the batch's planned sends (see the module's documentation).
+    pub fn send(&mut self, plan: &mut ClientPlan, lane: &Arc<EdgeFastLane>, class: TrafficClass) {
+        let (threads, inline_sends) = lane.fanout();
+        let offload = class == TrafficClass::Audio
+            && threads > 0
+            && !self.failed
+            && (plan.pending_sends() > inline_sends
+                || self.fanout.as_ref().is_some_and(Fanout::busy));
+        if !offload {
+            plan.send(lane, class);
+            return;
+        }
+        if self.fanout.is_none() {
+            match Fanout::start(lane, class, threads) {
+                Ok(fanout) => self.fanout = Some(fanout),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "the fan-out threads did not start: the class thread sends to its clients"
+                    );
+                    self.failed = true;
+                    plan.send(lane, class);
+                    return;
+                }
+            }
+        }
+        if let Some(fanout) = self.fanout.as_mut() {
+            fanout.dispatch(plan, lane);
+        }
+    }
+}
+
 /// The upstream repair of each stream's objects, as the tee sees it: the
 /// most repair ordinals of the newest object and of the one before it. The
 /// edge's top-up of a decoded object assumes the larger of the two arrived
@@ -1477,6 +1840,203 @@ impl UpstreamRepair {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plan of `messages` audio parts (part 100 + message) to `peers`
+    /// clients, each part claimed for each client on the fast lane as
+    /// `plan` claims it; message 1 a compact part with a copy, and a window
+    /// repair to send.
+    fn audio_plan(messages: usize, peers: usize) -> (ClientPlan, Vec<Arc<FastClient>>) {
+        let mut plan = ClientPlan::new();
+        let clients: Vec<Arc<FastClient>> = (0..peers).map(|_| FastClient::new(0)).collect();
+        for message in 0..messages {
+            let part = 100 + message as u64;
+            let start = message * REWRAP_BYTES;
+            plan.lens[message] = 300;
+            for (index, byte) in plan.buffers[start..start + 300].iter_mut().enumerate() {
+                *byte = (index + message * 7) as u8;
+            }
+            plan.streams[message] = 4001;
+            plan.parts[message] = part;
+            let compact = (message == 1).then_some(1_u8);
+            plan.compact_lens[message] = 0;
+            if compact.is_some() {
+                plan.compact_lens[message] = 70;
+                for copies in 0..COMPACT_VARIANTS as u8 {
+                    let at = compact_at(message, copies);
+                    plan.compact_buffers[at..at + 70].fill(0xC0 | copies);
+                }
+            }
+            for (index, client) in clients.iter().enumerate() {
+                assert!(client.claim_fast(part));
+                let peer = SocketAddr::from(([10, 0, (index / 200) as u8, (index % 200) as u8], 50_000));
+                for _ in 0..1 + compact.map_or(0, usize::from) {
+                    plan.sends.push(PlannedClient {
+                        message: message as u16,
+                        compact,
+                        source: true,
+                        part,
+                        peer,
+                        client: plan.clients.len() as u32,
+                    });
+                }
+                plan.clients.push(Arc::clone(client));
+            }
+        }
+        plan.compact_sent.push((4001, 101, 32));
+        (plan, clients)
+    }
+
+    /// The fan-out (wave 7 item 10): a batch splits into its shards' sends,
+    /// each client in one shard (so its parts leave in order from one
+    /// thread), every send in exactly one, with the bytes of the messages
+    /// that it sends and the window repair in one shard only.
+    #[test]
+    fn a_batch_splits_into_shards_each_client_in_one_and_every_send_once() {
+        let (plan, _clients) = audio_plan(3, 120);
+        let shards = 3;
+        let mut parts: Vec<ClientPlan> = (0..shards).map(|_| ClientPlan::new()).collect();
+        let mut repair_kept = true;
+        let mut seen: Vec<(u16, SocketAddr, Option<u8>)> = Vec::new();
+        for (shard, into) in parts.iter_mut().enumerate() {
+            plan.split_into(shard, shards, into, repair_kept);
+            repair_kept &= into.compact_sent.is_empty();
+            assert!(!into.sends.is_empty(), "120 clients reach every shard");
+            for send in &into.sends {
+                assert_eq!(shard_of(send.peer, shards), shard);
+                // The send names its own client in the shard's plan.
+                assert!(into.clients[send.client as usize].has_fast(send.part));
+                let message = usize::from(send.message);
+                let start = message * REWRAP_BYTES;
+                assert_eq!(into.lens[message], plan.lens[message]);
+                assert_eq!(
+                    into.buffers[start..start + 300],
+                    plan.buffers[start..start + 300]
+                );
+                if let Some(copies) = send.compact {
+                    let at = compact_at(message, copies);
+                    assert_eq!(into.compact_lens[message], 70);
+                    assert_eq!(
+                        into.compact_buffers[at..at + 70],
+                        plan.compact_buffers[at..at + 70]
+                    );
+                }
+                assert_eq!(into.parts[message], 100 + message as u64);
+                assert_eq!(into.streams[message], 4001);
+                seen.push((send.message, send.peer, send.compact));
+            }
+        }
+        assert!(!repair_kept, "one shard took the window repair");
+        let with_repair = parts
+            .iter()
+            .filter(|part| part.compact_sent == plan.compact_sent)
+            .count();
+        assert_eq!(with_repair, 1);
+        let mut all: Vec<(u16, SocketAddr, Option<u8>)> = plan
+            .sends
+            .iter()
+            .map(|send| (send.message, send.peer, send.compact))
+            .collect();
+        all.sort();
+        seen.sort();
+        assert_eq!(seen, all, "every send in exactly one shard");
+        // One shard: everything.
+        let mut one = ClientPlan::new();
+        plan.split_into(0, 1, &mut one, true);
+        assert_eq!(one.sends.len(), plan.sends.len());
+    }
+
+    /// A fan-out thread that has FANOUT_DEPTH batches in hand is not
+    /// waited for: its clients' sends of the next batch are shed and their
+    /// parts go back to the cache-fed lane; the others' are handed on.
+    #[test]
+    fn a_fan_out_thread_behind_sheds_its_clients_sends_to_the_cache_fed_lane() {
+        let lane = EdgeFastLane::new(0);
+        let mut receivers = Vec::new();
+        let mut shards = Vec::new();
+        for _ in 0..2 {
+            let (work_tx, work_rx) = std::sync::mpsc::sync_channel(FANOUT_DEPTH);
+            let (free_tx, free_rx) = std::sync::mpsc::sync_channel(FANOUT_DEPTH);
+            for _ in 1..FANOUT_DEPTH {
+                free_tx.send(Box::new(ClientPlan::new())).unwrap();
+            }
+            shards.push(FanoutShard {
+                work: Some(work_tx),
+                free: free_rx,
+                spare: Some(Box::new(ClientPlan::new())),
+                in_hand: Arc::new(AtomicU32::new(0)),
+                thread: None,
+            });
+            // Shard 0's thread never takes its batches; shard 1's sends
+            // them at once (gives its plans back).
+            receivers.push((work_rx, free_tx));
+        }
+        let mut fanout = Fanout { shards };
+        let mut handed = 0;
+        for batch in 0..=FANOUT_DEPTH {
+            let (mut plan, clients) = audio_plan(1, 40);
+            fanout.dispatch(&mut plan, &lane);
+            assert!(plan.sends.is_empty() && plan.compact_sent.is_empty());
+            // Shard 1's thread.
+            let (work, free) = &receivers[1];
+            while let Ok(mut done) = work.try_recv() {
+                done.clear();
+                done.sends.clear();
+                fanout.shards[1].in_hand.fetch_sub(1, Ordering::AcqRel);
+                free.send(done).unwrap();
+                handed += 1;
+            }
+            let shed = lane.stats.fanout_shed.load(Ordering::Relaxed);
+            let behind: Vec<usize> = (0..40)
+                .filter(|index| {
+                    let peer = SocketAddr::from(([10, 0, 0, *index as u8], 50_000));
+                    shard_of(peer, 2) == 0
+                })
+                .collect();
+            assert!(!behind.is_empty());
+            if batch < FANOUT_DEPTH {
+                assert_eq!(shed, 0, "batch {batch} is in hand, not shed");
+                for index in &behind {
+                    assert!(clients[*index].has_fast(100), "still the fast lane's");
+                }
+            } else {
+                assert_eq!(shed, behind.len() as u64, "shard 0's sends of the batch shed");
+                for index in &behind {
+                    assert!(
+                        clients[*index].claim_cache(100),
+                        "the part went back to the cache-fed lane"
+                    );
+                }
+                for index in (0..40).filter(|index| !behind.contains(index)) {
+                    assert!(clients[index].has_fast(100), "shard 1 took its sends");
+                }
+            }
+        }
+        assert_eq!(handed, FANOUT_DEPTH + 1, "shard 1's thread had every batch");
+        assert!(fanout.busy(), "shard 0 still has its batches in hand");
+        assert_eq!(
+            lane.stats.fanout_batches.load(Ordering::Relaxed),
+            (2 * FANOUT_DEPTH + 1) as u64
+        );
+        // Shard 0's batches are all still there, each with its window
+        // repair (the first shard that takes a batch takes its repair).
+        let (work, _) = &receivers[0];
+        let mut in_hand = 0;
+        while let Ok(batch) = work.try_recv() {
+            assert_eq!(batch.compact_sent, vec![(4001, 101, 32)]);
+            in_hand += 1;
+        }
+        assert_eq!(in_hand, FANOUT_DEPTH);
+    }
+
+    #[test]
+    fn the_fan_out_defaults_to_two_threads_past_a_few_clients() {
+        let lane = EdgeFastLane::new(0);
+        assert_eq!(lane.fanout(), (DEFAULT_FANOUT_THREADS, DEFAULT_FANOUT_INLINE_SENDS));
+        assert_eq!(DEFAULT_FANOUT_THREADS, 2);
+        lane.set_fanout(0, 10);
+        assert_eq!(lane.fanout(), (0, 10));
+        assert_eq!(lane.snapshot_stats().fanout_threads, 0);
+    }
 
     /// 4K on the edge's fast lane: the plan interleaves the clients symbol
     /// by symbol; grouped for GSO, each client's symbols of a part are one

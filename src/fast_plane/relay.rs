@@ -8,7 +8,7 @@
 use super::burst_copy::BurstCopies;
 use super::dedup::FirstArrival;
 use super::demand::{NodeDemand, DEMAND_REPORT_INTERVAL};
-use super::edge_clients::{ClientPlan, EdgeFastLane, UpstreamRepair};
+use super::edge_clients::{ClientPlan, ClientSender, EdgeFastLane, UpstreamRepair};
 use super::lease::{LeaseChildren, LeaseSnapshot, LeaseSnapshotStats, LeaseTake};
 use super::loss_report::LossMeter;
 use super::sys::{self, RecvBatch, RECV_BATCH};
@@ -870,6 +870,9 @@ impl ClassThread {
         let mut clients = ClientPlan::new()
             .with_gso(gso)
             .with_video(self.class == TrafficClass::Video);
+        // The sends to the edge's clients: by this thread, or by fan-out
+        // threads (wave 7 item 10).
+        let mut client_sender = ClientSender::default();
         let mut kernel_dropped = vec![0_u32; self.sockets.len()];
         // Burst copies of the audio sources for the compiled children.
         let mut copies = (self.class == TrafficClass::Audio && self.forwarder.is_some())
@@ -920,6 +923,7 @@ impl ClassThread {
                         &mut plan,
                         &mut pending,
                         &mut clients,
+                        &mut client_sender,
                         &mut gso,
                         copies.as_mut(),
                         meters.get_mut(index),
@@ -1018,6 +1022,7 @@ impl ClassThread {
         plan: &mut ForwardPlan,
         pending: &mut Vec<Pending>,
         clients: &mut ClientPlan,
+        client_sender: &mut ClientSender,
         gso: &mut bool,
         copies: Option<&mut BurstCopies>,
         mut meter: Option<&mut LossMeter>,
@@ -1036,7 +1041,7 @@ impl ClassThread {
         // The edge's fast-lane clients as they are now, without a lock.
         let edge_clients = self
             .edge_clients
-            .as_deref()
+            .as_ref()
             .map(|lane| (lane, lane.load()))
             .filter(|(_, snapshot)| !snapshot.streams.is_empty());
         clients.clear();
@@ -1172,9 +1177,9 @@ impl ClassThread {
             );
         }
         // The edge's clients after its children, in one sendmmsg from the
-        // client socket of the class.
+        // client socket of the class (or, for many, from fan-out threads).
         if let Some((lane, _)) = &edge_clients {
-            clients.send(lane, class);
+            client_sender.send(clients, lane, class);
         }
         // The tee copies come after every child has its datagrams.
         for entry in pending.drain(..) {
