@@ -616,6 +616,11 @@ impl EdgeFastLane {
     fn compact_of(&self, stream_id: u64, view: &RlsView<'_>) -> Option<bytes::Bytes> {
         let armed = self.armed.get()?;
         let ring = armed.sockets.compact().ring(stream_id);
+        // A part of an older source epoch is late; a newer epoch (the
+        // contributor restarted) forgets the old one's parts.
+        if !ring.observe_epoch(view.epoch) {
+            return None;
+        }
         // A gap kept (the cache-fed lane gave the part up) gives way to the
         // part.
         if let Some(kept) = ring.get_part(view.object) {
@@ -634,8 +639,9 @@ impl EdgeFastLane {
                 if part.stream_id != stream_id || part.object != view.object {
                     return None;
                 }
-                let datagram =
+                let mut datagram =
                     compact::encode_part(view.object, part.published_unix_us, part.media)?;
+                compact::set_generation(&mut datagram, ring.generation());
                 return Some(ring.put(view.object, bytes::Bytes::from(datagram)));
             }
         }
@@ -649,7 +655,8 @@ impl EdgeFastLane {
         let (media, _init) = av_mesh::canonical_slot::slot_media(&part.slot, part.stream_id)?;
         let published =
             av_mesh::canonical_slot::object_published_unix_us(&part.object).unwrap_or(0);
-        let datagram = compact::encode_part(view.object, published, &media)?;
+        let mut datagram = compact::encode_part(view.object, published, &media)?;
+        compact::set_generation(&mut datagram, ring.generation());
         Some(ring.put(view.object, bytes::Bytes::from(datagram)))
     }
 
@@ -685,10 +692,11 @@ impl EdgeFastLane {
         let canonical = match ring.get_part(part) {
             Some(kept) => kept,
             None => {
-                let Some(datagram) = compact_of_envelope(stream_id, part, envelope) else {
+                let Some(mut datagram) = compact_of_envelope(stream_id, part, envelope) else {
                     self.stats.compact_failed.fetch_add(1, Ordering::Relaxed);
                     return;
                 };
+                compact::set_generation(&mut datagram, ring.generation());
                 ring.put(part, bytes::Bytes::from(datagram))
             }
         };

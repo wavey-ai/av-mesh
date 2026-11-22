@@ -195,16 +195,62 @@ pub(crate) struct EdgeUdpStats {
 #[derive(Default)]
 pub(crate) struct CompactStore {
     streams: dashmap::DashMap<u64, Arc<CompactRing>>,
+    /// The newest source epoch of each stream that this edge has seen,
+    /// rings or not (a ring made later starts there).
+    epochs: dashmap::DashMap<u64, u64>,
 }
 
 pub(crate) struct CompactRing {
     slots: Box<[Mutex<Option<(u64, Bytes)>>]>,
+    /// The source epoch of the parts kept (0: not known yet). A contributor
+    /// restart counts its parts again: the parts of the old epoch must not
+    /// answer for the new ones.
+    epoch: AtomicU64,
 }
 
 impl CompactRing {
-    fn new() -> Self {
+    fn new(epoch: u64) -> Self {
         Self {
             slots: (0..COMPACT_RING).map(|_| Mutex::new(None)).collect(),
+            epoch: AtomicU64::new(epoch),
+        }
+    }
+
+    /// The source epoch of a part about to be kept or sent: a newer one
+    /// than the ring's forgets every part kept; an older one is late, and
+    /// `false`.
+    pub(crate) fn observe_epoch(&self, epoch: u64) -> bool {
+        let mut current = self.epoch.load(Ordering::Acquire);
+        loop {
+            if epoch == current || epoch == 0 {
+                return true;
+            }
+            if epoch < current {
+                return false;
+            }
+            match self.epoch.compare_exchange_weak(
+                current,
+                epoch,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(now) => current = now,
+            }
+        }
+        if current != 0 {
+            for slot in self.slots.iter() {
+                *slot.lock().unwrap() = None;
+            }
+        }
+        true
+    }
+
+    /// The generation byte of the ring's epoch (0: not known).
+    pub(crate) fn generation(&self) -> u8 {
+        match self.epoch.load(Ordering::Acquire) {
+            0 => 0,
+            epoch => compact::generation_of_epoch(epoch),
         }
     }
 
@@ -249,12 +295,28 @@ impl CompactStore {
         if let Some(ring) = self.streams.get(&stream_id) {
             return Arc::clone(&ring);
         }
+        let epoch = self.epochs.get(&stream_id).map_or(0, |epoch| *epoch);
         Arc::clone(
             &self
                 .streams
                 .entry(stream_id)
-                .or_insert_with(|| Arc::new(CompactRing::new())),
+                .or_insert_with(|| Arc::new(CompactRing::new(epoch))),
         )
+    }
+
+    /// A stream's source epoch, as the cache took it up: a new one forgets
+    /// the stream's kept parts.
+    pub(crate) fn observe_epoch(&self, stream_id: u64, epoch: u64) {
+        {
+            let mut known = self.epochs.entry(stream_id).or_insert(epoch);
+            if *known > epoch {
+                return;
+            }
+            *known = epoch;
+        }
+        if let Some(ring) = self.streams.get(&stream_id).map(|ring| Arc::clone(&ring)) {
+            ring.observe_epoch(epoch);
+        }
     }
 
     pub(crate) fn get(&self, stream_id: u64, part: u64) -> Option<Bytes> {
@@ -276,13 +338,14 @@ impl CompactStore {
                 return Some(kept);
             }
         }
-        let datagram = match object.kind {
+        let mut datagram = match object.kind {
             ObjectKind::Part => {
                 compact::encode_part(object.part, object.published_unix_us, &object.payload)?
             }
             ObjectKind::Gap => compact::encode_gap(object.part),
             ObjectKind::Init => return None,
         };
+        compact::set_generation(&mut datagram, ring.generation());
         Some(ring.put(object.part, Bytes::from(datagram)))
     }
 
@@ -1056,6 +1119,15 @@ pub(crate) async fn run_edge_udp(
     mut shutdown_rx: watch::Receiver<()>,
 ) -> anyhow::Result<()> {
     let sockets = sockets.with_send_queues(config.send_queue, &stats);
+    // A contributor restart counts its parts again: the compact lane
+    // forgets the old epoch's parts, and stamps the new one's generation.
+    let store = Arc::clone(sockets.compact());
+    router
+        .cache
+        .on_source_epoch(Arc::new(move |stream_id, epoch| {
+            store.observe_epoch(stream_id, epoch);
+        }))
+        .await;
     let table: Table = Arc::default();
     let moved: MovedAway = Arc::default();
     if let Some(lane) = sockets.fast_lane() {
@@ -3307,6 +3379,48 @@ mod tests {
         assert_eq!(store.of_object(&gap), Some(kept.clone()));
         let other = Bytes::from(compact::encode_part(40, 7, b"other").unwrap());
         assert_eq!(store.ring(9).put(40, other), kept);
+    }
+
+    #[test]
+    fn a_new_source_epoch_forgets_the_compact_parts_of_the_old() {
+        let store = CompactStore::default();
+        let object = |part: u64, payload: &'static [u8]| PartObject {
+            kind: ObjectKind::Part,
+            datagrams: 0,
+            stream_id: 9,
+            part,
+            available_unix_us: 0,
+            published_unix_us: 0,
+            payload: Bytes::from_static(payload),
+        };
+        let old_epoch = 1_700_000_000_000_000;
+        store.observe_epoch(9, old_epoch);
+        let old = store.of_object(&object(40, b"old epoch")).unwrap();
+        assert_eq!(
+            compact::parse(&old).unwrap().generation,
+            compact::generation_of_epoch(old_epoch)
+        );
+        // The contributor restarts and counts its parts again: part 40 of
+        // the new epoch is not the old one's, and its generation is new.
+        let new_epoch = old_epoch + 60_000_000;
+        store.observe_epoch(9, new_epoch);
+        assert_eq!(store.get(9, 40), None);
+        let new = store.of_object(&object(40, b"new epoch")).unwrap();
+        let view = compact::parse(&new).unwrap();
+        assert_eq!(view.payload, b"new epoch");
+        assert_eq!(view.generation, compact::generation_of_epoch(new_epoch));
+        // A late part of the old epoch (the fast lane) is refused, and an
+        // older epoch from the cache changes nothing.
+        let ring = store.ring(9);
+        assert!(!ring.observe_epoch(old_epoch));
+        store.observe_epoch(9, old_epoch);
+        assert_eq!(store.get(9, 40), Some(new));
+        // A ring made after the epoch was taken up starts in it.
+        store.observe_epoch(10, new_epoch);
+        assert_eq!(
+            store.ring(10).generation(),
+            compact::generation_of_epoch(new_epoch)
+        );
     }
 
     #[test]

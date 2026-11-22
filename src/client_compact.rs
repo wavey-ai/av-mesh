@@ -7,11 +7,22 @@
 //! 46-byte object header) for every 2.5 ms Opus part made about 4 KB of
 //! datagrams for a part of a hundred bytes. On the compact lane:
 //!
-//! - A part is one datagram of a 20-byte header and the LL-HLS part bytes
-//!   ([`encode_part`]): the part number and the publication time in 32 bits
-//!   each (a client extends them, see [`extend_u32`]), the payload length
-//!   and a CRC-32. A gap (a part the edge never had) is the same header with
-//!   no payload.
+//! - A part is one datagram of an 11-byte header and the LL-HLS part bytes
+//!   ([`encode_part`]): a byte of magic and kind, the flags, the source
+//!   generation (see below), and the part number and the publication time
+//!   in 32 bits each (a client extends them, see [`extend_u32`]). The UDP
+//!   length is the payload's length and the UDP checksum covers the bytes;
+//!   only a part recovered from window repair carries its length and a
+//!   CRC-32, inside the repair ([`encode_window_repair`]). A gap (a part the
+//!   edge never had) is the same header with no payload. With IPv4 and UDP
+//!   (28 bytes), a 96-byte Opus part is 135 bytes on the wire, 1.41 times
+//!   the part: one datagram per 2.5 ms part cannot come near 1.2 times, the
+//!   IP and UDP headers alone are 29 % of it.
+//! - The generation byte is a digest of the contributor's source epoch: a
+//!   contributor restart counts its part numbers again, and a client that
+//!   sees a new generation forgets the old one's parts
+//!   ([`CompactReceiver::push`]), so that it NACKs the new parts and does
+//!   not drop them as duplicates. 0: unknown.
 //! - Per-part copies: a client on a lossy path asks for `copies` more sends
 //!   of each part, back to back, so that a part lost on a random-loss path
 //!   still arrives at once (its latency stays the latency of the path).
@@ -39,9 +50,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-/// The first bytes of a compact datagram.
-pub const MAGIC: [u8; 4] = *b"NTC1";
-pub const HEADER_LEN: usize = 20;
+/// The first byte of a compact datagram, less its kind (the low two bits):
+/// not an ASCII byte (the controls are text) and not `R` (RQD2).
+pub const MAGIC: u8 = 0xC0;
+const MAGIC_MASK: u8 = 0xFC;
+pub const HEADER_LEN: usize = 11;
 /// The largest compact datagram: under 1,280 bytes (the smallest IPv6 path
 /// MTU) with its IP and UDP headers, as every client datagram is.
 pub const MAX_DATAGRAM: usize = 1_200;
@@ -54,7 +67,12 @@ pub const MAX_WINDOW_REPAIR: u8 = 8;
 /// The bytes of IPv4 and UDP headers that every datagram costs on the wire.
 pub const IP_UDP_HEADER_BYTES: usize = 28;
 
-const FLAGS_AT: usize = 5;
+const FLAGS_AT: usize = 1;
+const GENERATION_AT: usize = 2;
+const PART_AT: usize = 3;
+const FIELD_AT: usize = 7;
+/// The length and CRC-32 that a part carries inside window repair.
+const REPAIR_PREFIX: usize = 6;
 const FLAG_COPIES: u8 = 0x07;
 const FLAG_RETRANSMIT: u8 = 0x08;
 /// Rows of the Cauchy code: the repair of one window has at most this many.
@@ -208,32 +226,33 @@ pub fn extend_u32(reference: u64, low: u32) -> u64 {
         .unwrap_or(candidate)
 }
 
-fn crc(datagram: &[u8]) -> u32 {
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(&datagram[..FLAGS_AT]);
-    hasher.update(&[0]);
-    hasher.update(&datagram[FLAGS_AT + 1..16]);
-    hasher.update(&datagram[HEADER_LEN..]);
-    hasher.finalize()
+/// The generation byte of a source epoch: a digest of all its bytes,
+/// never 0 (which a datagram of an unknown epoch carries).
+pub fn generation_of_epoch(epoch: u64) -> u8 {
+    let folded = epoch.to_le_bytes().iter().fold(0_u8, |acc, byte| {
+        acc.rotate_left(3) ^ byte
+    });
+    if folded == 0 {
+        1
+    } else {
+        folded
+    }
 }
 
 fn encode(kind: Kind, part_low: u32, field: [u8; 4], payload: &[u8]) -> Vec<u8> {
     let mut datagram = Vec::with_capacity(HEADER_LEN + payload.len());
-    datagram.extend_from_slice(&MAGIC);
-    datagram.push(kind.code());
+    datagram.push(MAGIC | kind.code());
     datagram.push(0);
-    datagram.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    datagram.push(0);
     datagram.extend_from_slice(&part_low.to_be_bytes());
     datagram.extend_from_slice(&field);
-    datagram.extend_from_slice(&[0; 4]);
     datagram.extend_from_slice(payload);
-    let crc = crc(&datagram);
-    datagram[16..20].copy_from_slice(&crc.to_be_bytes());
     datagram
 }
 
 /// The compact datagram of a part, in its canonical form (no copies, not a
-/// retransmission); `None` when the part does not fit one datagram.
+/// retransmission, generation 0 until [`set_generation`]); `None` when the
+/// part does not fit one datagram.
 pub fn encode_part(part: u64, published_unix_us: u64, payload: &[u8]) -> Option<Vec<u8>> {
     if payload.len() > MAX_PAYLOAD {
         return None;
@@ -251,8 +270,16 @@ pub fn encode_gap(part: u64) -> Vec<u8> {
     encode(Kind::Gap, part as u32, [0; 4], &[])
 }
 
+/// Mark a datagram with the source generation of its part (see
+/// [`generation_of_epoch`]).
+pub fn set_generation(datagram: &mut [u8], generation: u8) {
+    if datagram.len() > GENERATION_AT {
+        datagram[GENERATION_AT] = generation;
+    }
+}
+
 /// Mark a datagram with the copies sent of it and as a retransmission (or
-/// not); the CRC does not cover these.
+/// not); they are not part of its canonical form.
 pub fn set_flags(datagram: &mut [u8], copies: u8, retransmit: bool) {
     if datagram.len() > FLAGS_AT {
         datagram[FLAGS_AT] = (copies & FLAG_COPIES) | if retransmit { FLAG_RETRANSMIT } else { 0 };
@@ -268,13 +295,13 @@ pub fn canonical(datagram: &[u8]) -> Vec<u8> {
 }
 
 pub fn is_compact(datagram: &[u8]) -> bool {
-    datagram.len() >= HEADER_LEN && datagram[..4] == MAGIC
+    datagram.len() >= HEADER_LEN && datagram[0] & MAGIC_MASK == MAGIC
 }
 
 /// Whether a compact datagram is a gap: a part the edge did not have when
 /// it sent it, which the part itself replaces if the edge gets it later.
 pub fn is_gap(datagram: &[u8]) -> bool {
-    is_compact(datagram) && datagram[4] == Kind::Gap.code()
+    is_compact(datagram) && datagram[0] & !MAGIC_MASK == Kind::Gap.code()
 }
 
 /// A compact datagram, checked.
@@ -283,6 +310,8 @@ pub struct View<'a> {
     pub kind: Kind,
     pub copies: u8,
     pub retransmit: bool,
+    /// The source generation of the part (0: unknown).
+    pub generation: u8,
     pub part_low: u32,
     /// The publication time's low 32 bits (a part), or the window, row and
     /// rows of a repair datagram.
@@ -290,28 +319,48 @@ pub struct View<'a> {
     pub payload: &'a [u8],
 }
 
-/// Parse a compact datagram (trailing zeros after its payload, as a window
-/// recovers it, are ignored); `None` if it is not one or its CRC fails.
+/// Parse a compact datagram: its payload is the rest of it. `None` if it
+/// is not one.
 pub fn parse(datagram: &[u8]) -> Option<View<'_>> {
     if !is_compact(datagram) {
         return None;
     }
-    let kind = Kind::from_code(datagram[4])?;
+    let kind = Kind::from_code(datagram[0] & !MAGIC_MASK)?;
     let flags = datagram[FLAGS_AT];
-    let len = usize::from(u16::from_be_bytes([datagram[6], datagram[7]]));
-    let datagram = datagram.get(..HEADER_LEN + len)?;
-    let stated = u32::from_be_bytes(datagram[16..20].try_into().ok()?);
-    if crc(datagram) != stated {
-        return None;
-    }
     Some(View {
         kind,
         copies: flags & FLAG_COPIES,
         retransmit: flags & FLAG_RETRANSMIT != 0,
-        part_low: u32::from_be_bytes(datagram[8..12].try_into().ok()?),
-        field: datagram[12..16].try_into().ok()?,
+        generation: datagram[GENERATION_AT],
+        part_low: u32::from_be_bytes(datagram[PART_AT..PART_AT + 4].try_into().ok()?),
+        field: datagram[FIELD_AT..FIELD_AT + 4].try_into().ok()?,
         payload: &datagram[HEADER_LEN..],
     })
+}
+
+/// The symbol that window repair codes for a part: its canonical datagram
+/// behind its length and its CRC-32, so that a recovered part (zero padded
+/// to the repair's length) is cut to its length and checked.
+fn repair_symbol(canonical: &[u8]) -> Vec<u8> {
+    let mut symbol = Vec::with_capacity(REPAIR_PREFIX + canonical.len());
+    symbol.extend_from_slice(&(canonical.len() as u16).to_be_bytes());
+    symbol.extend_from_slice(&crc32fast::hash(canonical).to_be_bytes());
+    symbol.extend_from_slice(canonical);
+    symbol
+}
+
+/// The canonical datagram in a recovered repair symbol, if its length and
+/// CRC hold (else empty: not a datagram).
+fn from_repair_symbol(symbol: &[u8]) -> Vec<u8> {
+    let Some(prefix) = symbol.get(..REPAIR_PREFIX) else {
+        return Vec::new();
+    };
+    let len = usize::from(u16::from_be_bytes([prefix[0], prefix[1]]));
+    let stated = u32::from_be_bytes([prefix[2], prefix[3], prefix[4], prefix[5]]);
+    match symbol.get(REPAIR_PREFIX..REPAIR_PREFIX + len) {
+        Some(canonical) if crc32fast::hash(canonical) == stated => canonical.to_vec(),
+        _ => Vec::new(),
+    }
 }
 
 // ------------------------------------------------------------------ GF(256)
@@ -388,27 +437,39 @@ fn coefficient(row: u8, column: usize) -> u8 {
 }
 
 /// The repair datagrams (rows `0..rows`) of the window of parts that starts
-/// at `first_part`: `symbols` are the canonical datagrams of its parts, in
-/// order.
-pub fn encode_window_repair(first_part: u64, symbols: &[&[u8]], rows: u8) -> Vec<Vec<u8>> {
-    let k = symbols.len();
+/// at `first_part`: `datagrams` are the canonical datagrams of its parts, in
+/// order. The rows code each one behind its length and CRC-32.
+pub fn encode_window_repair(first_part: u64, datagrams: &[&[u8]], rows: u8) -> Vec<Vec<u8>> {
+    let k = datagrams.len();
     let rows = usize::from(rows).min(MAX_ROWS);
     if k == 0 || k > usize::from(MAX_WINDOW) || rows == 0 {
         return Vec::new();
     }
-    let t = symbols.iter().map(|symbol| symbol.len()).max().unwrap_or(0);
+    let symbols: Vec<Vec<u8>> = datagrams
+        .iter()
+        .map(|datagram| repair_symbol(datagram))
+        .collect();
+    let t = symbols.iter().map(Vec::len).max().unwrap_or(0);
+    // The rows are of the parts' generation.
+    let generation = datagrams
+        .first()
+        .and_then(|datagram| datagram.get(GENERATION_AT))
+        .copied()
+        .unwrap_or(0);
     (0..rows)
         .map(|row| {
             let mut parity = vec![0_u8; t];
             for (column, symbol) in symbols.iter().enumerate() {
                 GF.mul_add(&mut parity, symbol, coefficient(row as u8, column));
             }
-            encode(
+            let mut datagram = encode(
                 Kind::Repair,
                 first_part as u32,
                 [k as u8, row as u8, rows as u8, 0],
                 &parity,
-            )
+            );
+            set_generation(&mut datagram, generation);
+            datagram
         })
         .collect()
 }
@@ -418,10 +479,8 @@ pub fn encode_window_repair(first_part: u64, symbols: &[&[u8]], rows: u8) -> Vec
 /// the rows it states, which the client's loss count reads, rewritten.
 pub fn with_rows_sent(datagram: &[u8], rows: u8) -> Vec<u8> {
     let mut datagram = datagram.to_vec();
-    if is_compact(&datagram) && datagram[4] == Kind::Repair.code() {
-        datagram[14] = rows;
-        let crc = crc(&datagram);
-        datagram[16..20].copy_from_slice(&crc.to_be_bytes());
+    if is_compact(&datagram) && datagram[0] & !MAGIC_MASK == Kind::Repair.code() {
+        datagram[FIELD_AT + 2] = rows;
     }
     datagram
 }
@@ -429,9 +488,31 @@ pub fn with_rows_sent(datagram: &[u8], rows: u8) -> Vec<u8> {
 /// Recover the missing parts of a window of `k` parts from repair rows of
 /// `t` bytes. `known[i]` is the canonical datagram of the window's `i`-th
 /// part, if the client has it. Returns each recovered part's index and its
-/// datagram, zero padded to `t` bytes; `None` if more parts are missing
+/// canonical datagram (empty if its length or CRC fails: the edge's bytes
+/// of a part differ from the client's); `None` if more parts are missing
 /// than there are rows (or none is).
 pub fn recover_window(
+    known: &[Option<&[u8]>],
+    t: usize,
+    rows: &[(u8, &[u8])],
+) -> Option<Vec<(usize, Vec<u8>)>> {
+    let symbols: Vec<Option<Vec<u8>>> = known
+        .iter()
+        .map(|datagram| datagram.map(repair_symbol))
+        .collect();
+    let known: Vec<Option<&[u8]>> = symbols.iter().map(|symbol| symbol.as_deref()).collect();
+    let recovered = recover_symbols(&known, t, rows)?;
+    Some(
+        recovered
+            .into_iter()
+            .map(|(index, symbol)| (index, from_repair_symbol(&symbol)))
+            .collect(),
+    )
+}
+
+/// [`recover_window`] on the repair symbols: each recovered symbol zero
+/// padded to `t` bytes.
+fn recover_symbols(
     known: &[Option<&[u8]>],
     t: usize,
     rows: &[(u8, &[u8])],
@@ -587,6 +668,10 @@ pub struct CompactStats {
     pub nacked: u64,
     /// Holes given up.
     pub abandoned: u64,
+    /// New source generations (contributor restarts) seen, and datagrams
+    /// of an older generation dropped.
+    pub generation_changes: u64,
+    pub stale_generation: u64,
 }
 
 /// The receiving side of the compact lane.
@@ -616,6 +701,10 @@ pub struct CompactReceiver {
     gapped: BTreeSet<u64>,
     /// The round trip of the client's path to its edge, if measured.
     rtt: Option<Duration>,
+    /// The source generation of the parts, once a datagram named one, and
+    /// the generations before it (their late datagrams are dropped).
+    generation: Option<u8>,
+    old_generations: VecDeque<u8>,
     pub stats: CompactStats,
 }
 
@@ -686,6 +775,35 @@ impl CompactReceiver {
                     gap: true,
                 },
             );
+        }
+    }
+
+    /// The source generation of a datagram: a new one (the contributor
+    /// restarted, and counts its parts again) starts a new flow, so that
+    /// the new parts are not taken for the old ones' duplicates and their
+    /// holes are NACKed; one of the last few generations is late, and
+    /// `false` drops its datagram. 0 (unknown) is always taken.
+    fn take_generation(&mut self, generation: u8) -> bool {
+        if generation == 0 {
+            return true;
+        }
+        match self.generation {
+            Some(current) if current == generation => true,
+            _ if self.old_generations.contains(&generation) => false,
+            Some(current) => {
+                self.old_generations.push_back(current);
+                if self.old_generations.len() > 4 {
+                    self.old_generations.pop_front();
+                }
+                self.new_flow();
+                self.generation = Some(generation);
+                self.stats.generation_changes += 1;
+                true
+            }
+            None => {
+                self.generation = Some(generation);
+                true
+            }
         }
     }
 
@@ -768,6 +886,10 @@ impl CompactReceiver {
             self.stats.errors += 1;
             return Vec::new();
         };
+        if !self.take_generation(view.generation) {
+            self.stats.stale_generation += 1;
+            return Vec::new();
+        }
         self.active = true;
         let part = self.part_number(view.part_low);
         let mut out = Vec::new();
@@ -1077,32 +1199,35 @@ mod tests {
     }
 
     #[test]
-    fn a_part_is_one_datagram_with_a_twenty_byte_header() {
+    fn a_part_is_one_datagram_with_an_eleven_byte_header() {
+        assert_eq!(HEADER_LEN, 11);
         let bytes = payload(9, 96);
         let datagram = encode_part(9, 1_700_000_000_123_456, &bytes).unwrap();
         assert_eq!(datagram.len(), HEADER_LEN + 96);
+        // A 2.5 ms Opus part of 96 bytes: 135 bytes on the wire, 1.41 times
+        // the part (IPv4 and UDP are 28 of them).
+        assert_eq!(datagram.len() + IP_UDP_HEADER_BYTES, 135);
         let view = parse(&datagram).unwrap();
         assert_eq!(view.kind, Kind::Part);
         assert_eq!(view.part_low, 9);
+        assert_eq!(view.generation, 0);
         assert_eq!(view.payload, bytes.as_slice());
         assert_eq!(
             extend_u32(1_700_000_000_200_000, u32::from_be_bytes(view.field)),
             1_700_000_000_123_456
         );
-        // Flags do not change the CRC, and are not in the canonical form.
+        // Flags are not in the canonical form; the generation is.
         let mut marked = datagram.clone();
+        set_generation(&mut marked, 7);
+        let stamped = marked.clone();
         set_flags(&mut marked, 2, true);
         let view = parse(&marked).unwrap();
-        assert_eq!((view.copies, view.retransmit), (2, true));
-        assert_eq!(canonical(&marked), datagram);
-        // A corrupt byte fails the CRC.
-        let mut corrupt = datagram.clone();
-        corrupt[30] ^= 1;
-        assert!(parse(&corrupt).is_none());
-        // Trailing zeros (a recovered, padded datagram) are ignored.
-        let mut padded = datagram.clone();
-        padded.extend_from_slice(&[0; 40]);
-        assert_eq!(parse(&padded).unwrap().payload, bytes.as_slice());
+        assert_eq!((view.copies, view.retransmit, view.generation), (2, true, 7));
+        assert_eq!(canonical(&marked), stamped);
+        // Not a compact datagram: text controls, an RQD2 header.
+        assert!(!is_compact(b"SUB 4001 0 C0.32.1 ok"));
+        assert!(!is_compact(b"RQD2 and the rest of a header"));
+        assert!(is_gap(&encode_gap(3)) && !is_gap(&datagram));
         assert!(encode_part(1, 0, &vec![0; MAX_PAYLOAD + 1]).is_none());
         assert_eq!(
             encode_part(1, 0, &vec![0; MAX_PAYLOAD]).unwrap().len(),
@@ -1167,6 +1292,65 @@ mod tests {
         }
     }
 
+    /// A recovered part whose bytes differ from the edge's (the client holds
+    /// other bytes for a part of the window) fails its CRC: it is not
+    /// delivered as a part.
+    #[test]
+    fn a_recovered_part_is_checked_by_its_crc() {
+        let symbols: Vec<Vec<u8>> = (0..4_u64)
+            .map(|part| encode_part(part, 0, &payload(part, 30)).unwrap())
+            .collect();
+        let refs: Vec<&[u8]> = symbols.iter().map(Vec::as_slice).collect();
+        let repair = encode_window_repair(0, &refs, 1);
+        let row = parse(&repair[0]).unwrap();
+        let mut other = symbols[1].clone();
+        other[HEADER_LEN + 3] ^= 0x40;
+        let known = [Some(refs[0]), Some(other.as_slice()), None, Some(refs[3])];
+        let recovered = recover_window(&known, row.payload.len(), &[(0, row.payload)]).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert!(recovered[0].1.is_empty(), "a wrong part was recovered");
+        assert!(parse(&recovered[0].1).is_none());
+    }
+
+    /// A contributor restart: the edge stamps the new epoch's generation; the
+    /// client forgets the old epoch's parts, NACKs the new epoch's holes and
+    /// delivers its parts though they have the old parts' numbers, and drops
+    /// the old epoch's late datagrams.
+    #[test]
+    fn a_new_source_generation_starts_a_new_flow() {
+        let start = Instant::now();
+        let old = generation_of_epoch(1_700_000_000_000_000);
+        let new = generation_of_epoch(1_700_000_100_000_000);
+        assert_ne!(old, new);
+        assert_ne!(generation_of_epoch(0), 0);
+        let stamped = |part: u64, generation: u8| {
+            let mut datagram = encode_part(part, 0, &payload(part, 10)).unwrap();
+            set_generation(&mut datagram, generation);
+            datagram
+        };
+        let mut receiver = CompactReceiver::new();
+        receiver.expect_from(1_000, true);
+        for part in 1_000..1_010 {
+            assert_eq!(receiver.push(&stamped(part, old), start, 0).len(), 1);
+        }
+        // The new epoch counts from 0: its parts are delivered, not taken
+        // for old ones, and its holes are NACKed.
+        assert_eq!(receiver.push(&stamped(0, new), start, 0).len(), 1);
+        assert_eq!(receiver.stats.generation_changes, 1);
+        assert_eq!(receiver.push(&stamped(2, new), start, 0).len(), 1);
+        assert_eq!(receiver.holes(), 1);
+        let later = start + Duration::from_millis(5);
+        assert_eq!(receiver.nacks_due(later, 16), vec![1]);
+        // A late datagram of the old epoch is dropped, and does not switch
+        // back.
+        assert!(receiver.push(&stamped(1_010, old), later, 0).is_empty());
+        assert_eq!(receiver.stats.stale_generation, 1);
+        assert_eq!(receiver.push(&stamped(1, new), later, 0).len(), 1);
+        assert_eq!(receiver.stats.generation_changes, 1);
+        // Generation 0 (not known) is taken in any flow.
+        assert_eq!(receiver.push(&stamped(3, 0), later, 0).len(), 1);
+    }
+
     /// Any `r` lost parts of a window are recovered from `r` rows, for every
     /// choice of the lost parts and of the rows that arrived.
     #[test]
@@ -1194,8 +1378,9 @@ mod tests {
             .iter()
             .map(|datagram| parse(datagram).unwrap())
             .collect();
+        // Each part is coded behind its length and CRC.
         let t = views[0].payload.len();
-        assert_eq!(t, symbols.iter().map(Vec::len).max().unwrap());
+        assert_eq!(t, symbols.iter().map(Vec::len).max().unwrap() + REPAIR_PREFIX);
         for lost_mask in 1_u32..(1 << k) {
             let lost = lost_mask.count_ones() as usize;
             if lost > 4 {
@@ -1211,10 +1396,10 @@ mod tests {
                 .collect();
             let recovered = recover_window(&known, t, &rows).unwrap();
             assert_eq!(recovered.len(), lost);
-            for (index, padded) in recovered {
-                let view = parse(&padded).unwrap();
-                assert_eq!(&padded[..symbols[index].len()], symbols[index].as_slice());
-                assert_eq!(view.part_low, 100 + index as u32);
+            for (index, datagram) in recovered {
+                // Cut to its length: the part's datagram, byte for byte.
+                assert_eq!(datagram, symbols[index]);
+                assert_eq!(parse(&datagram).unwrap().part_low, 100 + index as u32);
             }
             // One row fewer than the losses is not enough.
             assert!(recover_window(&known, t, &rows[1..]).is_none());

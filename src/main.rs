@@ -289,6 +289,9 @@ impl std::str::FromStr for RepairHorizon {
     }
 }
 
+/// Told (stream, source epoch) when a stream takes up a source epoch.
+type SourceEpochObserver = Arc<dyn Fn(u64, u64) + Send + Sync>;
+
 /// The repair delays that a node has seen: for each part that arrived after
 /// a later part of its stream, how long after that later part.
 #[derive(Debug, Default)]
@@ -6953,6 +6956,9 @@ struct LiveTsCache {
     /// The least that the measured (auto) horizon may be: the burst copy
     /// delay plus a margin, or [`REPAIR_HORIZON_MIN_MS`].
     repair_horizon_floor_us: AtomicU64,
+    /// Told each source epoch that a stream takes up (the edge's compact
+    /// lane forgets the parts of the old one).
+    source_epoch_observers: StdMutex<Vec<SourceEpochObserver>>,
     /// Releases of a hole by the repair horizon, and the parts they listed
     /// as gaps.
     repair_horizon_releases: AtomicU64,
@@ -7095,6 +7101,7 @@ impl LiveTsCache {
             repair_delays: StdMutex::new(RepairDelays::default()),
             repair_horizon_auto_us: AtomicU64::new(REPAIR_HORIZON_INITIAL_MS * 1_000),
             repair_horizon_floor_us: AtomicU64::new(REPAIR_HORIZON_MIN_MS * 1_000),
+            source_epoch_observers: StdMutex::new(Vec::new()),
             repair_horizon_releases: AtomicU64::new(0),
             late_gap_fills: AtomicU64::new(0),
             gap_parts: StdMutex::new(HashMap::new()),
@@ -7380,6 +7387,36 @@ impl LiveTsCache {
     /// Configure the repair horizon of the live path (`--canonical-repair-horizon`).
     fn set_repair_horizon(&self, horizon: RepairHorizon) {
         self.repair_horizon.store(horizon.code(), Ordering::Relaxed);
+    }
+
+    /// Tell `observer` (stream, epoch) of every source epoch that a stream
+    /// takes up from now on, and of each stream's epoch now.
+    async fn on_source_epoch(&self, observer: SourceEpochObserver) {
+        let current: Vec<(u64, u64)> = self
+            .state
+            .read()
+            .await
+            .stream_canonical_epoch
+            .iter()
+            .map(|(stream_id, epoch)| (*stream_id, *epoch))
+            .collect();
+        for (stream_id, epoch) in current {
+            observer(stream_id, epoch);
+        }
+        self.source_epoch_observers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(observer);
+    }
+
+    fn note_source_epoch(&self, stream_id: u64, epoch: u64) {
+        let observers = self
+            .source_epoch_observers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for observer in observers.iter() {
+            observer(stream_id, epoch);
+        }
     }
 
     /// The floor of the measured horizon for long-haul lanes that send
@@ -8109,6 +8146,7 @@ impl LiveTsCache {
                     .stream_canonical_epoch
                     .entry(stream_id)
                     .or_insert(source_epoch);
+                self.note_source_epoch(stream_id, source_epoch);
                 info!(
                     stream_id,
                     source_epoch, "took up the canonical source epoch of the cache-mesh copy"
@@ -8125,6 +8163,7 @@ impl LiveTsCache {
                     || source_epoch >= process_started_unix_us)
                     .then(|| now_unix_us().checked_sub(source_epoch))
                     .flatten();
+                self.note_source_epoch(stream_id, source_epoch);
                 let mut state = self.state.write().await;
                 state.stream_canonical_epoch.insert(stream_id, source_epoch);
                 state
@@ -8466,6 +8505,9 @@ impl LiveTsCache {
             _ => {}
         }
 
+        if let Some(epoch) = record.epoch.filter(|epoch| previous_epoch != Some(*epoch)) {
+            self.note_source_epoch(stream_id, epoch);
+        }
         let mut state = self.state.write().await;
         if let Some(epoch) = record.epoch {
             state.stream_canonical_epoch.insert(stream_id, epoch);
