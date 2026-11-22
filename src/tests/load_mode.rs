@@ -176,11 +176,11 @@ fn run_bench(bench: &Bench, ip: u8) -> BenchResult {
     };
     std::thread::sleep(Duration::from_millis(300));
 
-    let mut config = LoadConfig::new(
-        SessionConfig::new(stream_id),
-        vec![edge.client_port()],
-        bench.listeners,
-    );
+    let mut session = SessionConfig::new(stream_id);
+    // LOAD_BENCH_SHORT_HEADER=0: the listeners ask for the 11-byte long
+    // form (as before wave 7 item 9).
+    session.compact_short_header = env_u64("LOAD_BENCH_SHORT_HEADER", 1) != 0;
+    let mut config = LoadConfig::new(session, vec![edge.client_port()], bench.listeners);
     config.duration = Duration::from_secs(bench.seconds);
     config.threads = bench.threads;
     config.start_rate = 4_000.0;
@@ -425,6 +425,7 @@ fn load_mode_cost_per_listener() {
         "listeners": listeners,
         "load_threads": threads,
         "coalesce_us": env_u64("LOAD_BENCH_COALESCE_US", 0),
+        "short_header": env_u64("LOAD_BENCH_SHORT_HEADER", 1) != 0,
         "feed": std::env::var("LOAD_BENCH_FEED").unwrap_or_else(|_| "fast".into()),
         "edge_threads": edge_threads,
         "window_s": result.window_s,
@@ -455,6 +456,11 @@ fn load_mode_cost_per_listener() {
             "max": total["latency_ms"]["max"],
         },
         "ttfp_ms": {"p50": total["ttfp_ms"]["p50"], "p99": total["ttfp_ms"]["p99"]},
+        "ttok_ms": {"p50": total["ttok_ms"]["p50"], "p99": total["ttok_ms"]["p99"]},
+        // Bytes on the wire (IP and UDP headers included) a part received.
+        "wire_bytes_per_part": total["bytes_in"].as_f64().unwrap_or(0.0)
+            / total["parts"].as_f64().unwrap_or(0.0).max(1.0),
+        "compact_fallbacks": total["compact_fallbacks"],
         "recv_lag_ms": {
             "p50": total["recv_lag_ms"]["p50"],
             "p99": total["recv_lag_ms"]["p99"],
