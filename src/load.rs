@@ -300,6 +300,11 @@ impl Counters {
 
 const TRACK: u64 = 4_096;
 const TRACK_WORDS: usize = (TRACK / 64) as usize;
+/// A part far from a listener's others starts its accounting again only
+/// when the next far part follows it within this many parts (a contributor
+/// restart, or a listener that was away): one stray part (a late copy, a
+/// misread number) is counted late and changes nothing.
+const JUMP_CONFIRM: u64 = 256;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Mark {
@@ -317,6 +322,9 @@ struct PartTrack {
     highest: Option<u64>,
     got: [u64; TRACK_WORDS],
     gap: [u64; TRACK_WORDS],
+    /// The last far part (and whether it was a gap), until the next part
+    /// confirms the jump or a near part shows it was a stray.
+    jump: Option<(u64, bool)>,
 }
 
 impl PartTrack {
@@ -327,7 +335,18 @@ impl PartTrack {
             highest: None,
             got: [0; TRACK_WORDS],
             gap: [0; TRACK_WORDS],
+            jump: None,
         })
+    }
+
+    fn set(&mut self, part: u64, gap: bool) {
+        let (word, bit) = (((part % TRACK) / 64) as usize, 1_u64 << (part % 64));
+        if gap {
+            self.gap[word] |= bit;
+        } else {
+            self.got[word] |= bit;
+        }
+        self.highest = Some(self.highest.map_or(part, |highest| highest.max(part)));
     }
 
     fn begin(&mut self, first: u64) {
@@ -367,10 +386,23 @@ impl PartTrack {
             self.begin(part);
         }
         // A contributor restart counts its parts again; a jump far ahead
-        // is one too (or a listener that was away): start again there.
+        // is one too (or a listener that was away): start again there, once
+        // a second far part confirms it. A single far part is a stray.
         if part + TRACK < self.next_settle || part >= self.next_settle + 16 * TRACK {
-            counters.resets += 1;
-            self.reset(part);
+            match self.jump {
+                Some((first, first_gap)) if part > first && part - first <= JUMP_CONFIRM => {
+                    counters.resets += 1;
+                    self.reset(first);
+                    self.set(first, first_gap);
+                    self.jump = None;
+                }
+                _ => {
+                    self.jump = Some((part, gap));
+                    return Mark::Late;
+                }
+            }
+        } else {
+            self.jump = None;
         }
         if part < self.next_settle {
             return Mark::Late;
@@ -535,6 +567,8 @@ fn now_unix_us() -> u64 {
 
 // ------------------------------------------------------------------ receive
 
+/// The pause before a worker tries again to make a socket that failed.
+const START_RETRY: Duration = Duration::from_millis(100);
 const BATCH: usize = 32;
 const DATAGRAM: usize = 2_048;
 const CONTROL_WORDS: usize = 16;
@@ -819,8 +853,13 @@ fn handle_datagram(
         Received::Control | Received::Ignored => return None,
     }
     let arrival_us = datagram.kernel_us.unwrap_or(now_us);
-    if let Some(kernel_us) = datagram.kernel_us {
-        edge.recv_lag.record(now_us.saturating_sub(kernel_us));
+    // The load host's own lag: the time from the kernel's receive timestamp
+    // to now, which neither the latency nor the time to first part holds.
+    let lag_us = datagram
+        .kernel_us
+        .map_or(0, |kernel_us| now_us.saturating_sub(kernel_us));
+    if datagram.kernel_us.is_some() {
+        edge.recv_lag.record(lag_us);
     }
     while let Some(object) = session.next_object() {
         match object.kind {
@@ -838,8 +877,10 @@ fn handle_datagram(
                     if !listener.first_part {
                         listener.first_part = true;
                         edge.first_parts += 1;
-                        edge.ttfp
-                            .record(now.saturating_duration_since(listener.started).as_micros() as u64);
+                        edge.ttfp.record(
+                            (now.saturating_duration_since(listener.started).as_micros() as u64)
+                                .saturating_sub(lag_us),
+                        );
                     }
                     if let Some(arrivals) = &mut listener.arrivals {
                         arrivals.insert(
@@ -878,10 +919,20 @@ fn move_listener(listener: &mut Listener, config: &LoadConfig, counters: &mut [C
 
 fn collect_deltas(listeners: &mut [Listener], counters: &mut [Counters]) {
     for listener in listeners {
+        collect_one(listener, counters, true);
+    }
+}
+
+/// A listener's counters since the last interval into its edge's, with
+/// the gauges (`active`, `up`) when `gauges` (not for one that stops).
+fn collect_one(listener: &mut Listener, counters: &mut [Counters], gauges: bool) {
+    {
         let edge = &mut counters[listener.edge];
-        edge.active += 1;
-        if listener.session.is_subscribed() {
-            edge.up += 1;
+        if gauges {
+            edge.active += 1;
+            if listener.session.is_subscribed() {
+                edge.up += 1;
+            }
         }
         let receiver = &listener.session.receiver;
         let now = Seen {
@@ -929,6 +980,9 @@ fn worker(worker: usize, config: Arc<LoadConfig>, shared: Arc<Shared>, tx: mpsc:
     let rate = (config.start_rate / threads as f64).max(1.0);
     let mut budget = 1.0_f64;
     let mut budget_at = Instant::now();
+    // A socket that could not be made (no file or port left) is tried again
+    // after a pause, so that `start_errors` counts failures, not loops.
+    let mut start_retry_at = Instant::now();
     let mut busy_ns = 0_u64;
     let mut last_read = Instant::now();
     let mut cpu_before = thread_cpu_ns();
@@ -967,13 +1021,14 @@ fn worker(worker: usize, config: Arc<LoadConfig>, shared: Arc<Shared>, tx: mpsc:
             let wanted = share(shared.target.load(Ordering::Relaxed), worker, threads);
             budget = (budget + now.duration_since(budget_at).as_secs_f64() * rate).min(rate * 0.05 + 1.0);
             budget_at = now;
-            while listeners.len() < wanted && budget >= 1.0 {
+            while listeners.len() < wanted && budget >= 1.0 && now >= start_retry_at {
                 budget -= 1.0;
                 let index = worker + listeners.len() * threads;
                 let socket = match listener_socket(&config, index) {
                     Ok(socket) => socket,
                     Err(_) => {
                         counters[index % edges].start_errors += 1;
+                        start_retry_at = now + START_RETRY;
                         break;
                     }
                 };
@@ -1022,6 +1077,8 @@ fn worker(worker: usize, config: Arc<LoadConfig>, shared: Arc<Shared>, tx: mpsc:
                         std::ptr::null_mut(),
                     );
                 }
+                // What it received since the last interval counts too.
+                collect_one(&mut listener, &mut counters, false);
                 let edge = listener.edge;
                 if let Some(highest) = listener.track.highest {
                     listener.track.settle(highest + 1, &mut counters[edge]);
@@ -1047,12 +1104,18 @@ fn worker(worker: usize, config: Arc<LoadConfig>, shared: Arc<Shared>, tx: mpsc:
             let failed = listener.session.poll(now, &mut |to, bytes| {
                 let _ = socket.send_to(bytes, to);
             });
-            if let Some(_reason) = failed {
-                if !draining {
+            let mut wake = listener.session.next_wake();
+            if failed.is_some() {
+                if draining {
+                    // It stays failed until the run ends: polling it again
+                    // would find the same (at every turn of the loop).
+                    wake = drain_until;
+                } else {
                     move_listener(listener, &config, &mut counters, now);
+                    wake = listener.session.next_wake();
                 }
             }
-            listener.scheduled = listener.session.next_wake().max(now + Duration::from_micros(50));
+            listener.scheduled = wake.max(now + Duration::from_micros(50));
             heap.push(Reverse((listener.scheduled, slot)));
         }
         // Wait for datagrams until the next timer.
@@ -1176,17 +1239,66 @@ fn worker(worker: usize, config: Arc<LoadConfig>, shared: Arc<Shared>, tx: mpsc:
 // ------------------------------------------------------------------ the host
 
 /// The load host's own counters.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct HostSample {
     process_ticks: u64,
     host_busy: u64,
     host_total: u64,
+    /// (busy, total) ticks of each processor: a receive queue's softirq
+    /// can fill one while the host as a whole is not busy.
+    cores: Vec<(u64, u64)>,
     udp_in_errors: u64,
     udp_rcvbuf_errors: u64,
+    /// Datagrams dropped before any socket: by the NICs (`/proc/net/dev`
+    /// receive drops, loopback aside) and by the kernel's receive backlog
+    /// (`/proc/net/softnet_stat`). `UdpRcvbufErrors` does not count them.
+    nic_rx_drops: u64,
+    softnet_drops: u64,
+}
+
+/// The busiest processor's share of busy time between two samples.
+fn core_busy_max(before: &HostSample, after: &HostSample) -> f64 {
+    after
+        .cores
+        .iter()
+        .zip(&before.cores)
+        .filter_map(|((busy, total), (busy_before, total_before))| {
+            let total = total.saturating_sub(*total_before);
+            (total > 0).then(|| busy.saturating_sub(*busy_before) as f64 / total as f64)
+        })
+        .fold(0.0, f64::max)
+}
+
+/// The receive drops of `/proc/net/dev` (every interface but `lo`).
+fn parse_net_dev_drops(text: &str) -> u64 {
+    text.lines()
+        .skip(2)
+        .filter_map(|line| {
+            let (name, data) = line.split_once(':')?;
+            if name.trim() == "lo" {
+                return None;
+            }
+            data.split_whitespace().nth(3)?.parse::<u64>().ok()
+        })
+        .sum()
+}
+
+/// The backlog drops of `/proc/net/softnet_stat` (hexadecimal, the second
+/// column of each processor's line).
+fn parse_softnet_drops(text: &str) -> u64 {
+    text.lines()
+        .filter_map(|line| u64::from_str_radix(line.split_whitespace().nth(1)?, 16).ok())
+        .sum()
 }
 
 fn host_sample() -> HostSample {
     let mut sample = HostSample::default();
+    if let Ok(dev) = std::fs::read_to_string("/proc/net/dev") {
+        sample.nic_rx_drops = parse_net_dev_drops(&dev);
+    }
+    if let Ok(softnet) = std::fs::read_to_string("/proc/net/softnet_stat") {
+        sample.softnet_drops = parse_softnet_drops(&softnet);
+    }
     if let Ok(stat) = std::fs::read_to_string("/proc/self/stat") {
         // The fields after the command name (which may hold spaces).
         if let Some(rest) = stat.rsplit_once(')').map(|(_, rest)| rest) {
@@ -1199,16 +1311,18 @@ fn host_sample() -> HostSample {
         }
     }
     if let Ok(stat) = std::fs::read_to_string("/proc/stat") {
-        if let Some(line) = stat.lines().next() {
-            let values: Vec<u64> = line
-                .split_whitespace()
-                .skip(1)
-                .filter_map(|v| v.parse().ok())
-                .collect();
+        for line in stat.lines().take_while(|line| line.starts_with("cpu")) {
+            let mut fields = line.split_whitespace();
+            let name = fields.next().unwrap_or("");
+            let values: Vec<u64> = fields.filter_map(|v| v.parse().ok()).collect();
             let total: u64 = values.iter().take(8).sum();
             let idle = values.get(3).copied().unwrap_or(0) + values.get(4).copied().unwrap_or(0);
-            sample.host_total = total;
-            sample.host_busy = total - idle;
+            if name == "cpu" {
+                sample.host_total = total;
+                sample.host_busy = total.saturating_sub(idle);
+            } else {
+                sample.cores.push((total.saturating_sub(idle), total));
+            }
         }
     }
     if let Ok(snmp) = std::fs::read_to_string("/proc/net/snmp") {
@@ -1267,33 +1381,53 @@ pub fn raise_file_limit() -> u64 {
 
 // ------------------------------------------------------------------ the run
 
-/// Saturation of the load host in an interval, if any, and why: its CPU,
-/// a worker that was busy nearly all the time, timers or datagrams handled
-/// late, or the kernel dropping datagrams for full sockets.
-fn saturation(
+/// Receive drops before the sockets (NIC and backlog) in an interval above
+/// which the load host counts as saturated: a few are other traffic.
+const NIC_DROPS_LIMIT: u64 = 10;
+/// A processor this busy (a receive queue's softirq, a worker) saturates
+/// the load host even when the host as a whole is not busy.
+const CORE_BUSY_LIMIT: f64 = 0.95;
+
+/// What the load host measured in an interval, for [`saturation`].
+#[derive(Debug, Clone, Copy, Default)]
+struct HostInterval {
     host_busy: f64,
+    core_busy_max: f64,
     worker_busy_max: f64,
     lateness_p99_us: u64,
     recv_lag_p99_us: u64,
     rcvbuf_errors: u64,
     socket_drops: u64,
-    lag_limit_us: u64,
-) -> Vec<&'static str> {
+    nic_drops: u64,
+}
+
+/// Saturation of the load host in an interval, if any, and why: its CPU
+/// or one processor of it, a worker that was busy nearly all the time,
+/// timers or datagrams handled late (`lag_limit_us`: the limit plus the
+/// --coalesce-us wait, which delays both on purpose), the kernel dropping
+/// datagrams for full sockets, or before them (NIC, backlog).
+fn saturation(host: &HostInterval, lag_limit_us: u64) -> Vec<&'static str> {
     let mut reasons = Vec::new();
-    if host_busy > 0.9 {
+    if host.host_busy > 0.9 {
         reasons.push("host-cpu");
     }
-    if worker_busy_max > 0.9 {
+    if host.core_busy_max > CORE_BUSY_LIMIT {
+        reasons.push("core-busy");
+    }
+    if host.worker_busy_max > 0.9 {
         reasons.push("worker-busy");
     }
-    if lateness_p99_us > lag_limit_us {
+    if host.lateness_p99_us > lag_limit_us {
         reasons.push("timers-late");
     }
-    if recv_lag_p99_us > lag_limit_us {
+    if host.recv_lag_p99_us > lag_limit_us {
         reasons.push("receive-lag");
     }
-    if rcvbuf_errors > 0 || socket_drops > 0 {
+    if host.rcvbuf_errors > 0 || host.socket_drops > 0 {
         reasons.push("receive-drops");
+    }
+    if host.nic_drops > NIC_DROPS_LIMIT {
+        reasons.push("nic-drops");
     }
     reasons
 }
@@ -1361,6 +1495,10 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
     let mut first_saturated: Option<Value> = None;
     let mut lines = 0_u64;
     let mut rss_mb_max = 0.0_f64;
+    let mut nic_drops_total = 0_u64;
+    let mut core_busy_max_run = 0.0_f64;
+    // Timers and datagrams wait up to --coalesce-us on purpose.
+    let lag_limit_us = (config.lag_limit + config.coalesce).as_micros() as u64;
 
     while done < config.threads {
         let elapsed = shared.t0.elapsed();
@@ -1451,10 +1589,15 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
                 .udp_rcvbuf_errors
                 .saturating_sub(host_before.udp_rcvbuf_errors);
             let in_errors = host.udp_in_errors.saturating_sub(host_before.udp_in_errors);
+            let nic_drops = host.nic_rx_drops.saturating_sub(host_before.nic_rx_drops)
+                + host.softnet_drops.saturating_sub(host_before.softnet_drops);
+            let core_max = core_busy_max(&host_before, &host);
             host_before = host;
             host_at = Instant::now();
             rcvbuf_total += rcvbuf;
             in_errors_total += in_errors;
+            nic_drops_total += nic_drops;
+            core_busy_max_run = core_busy_max_run.max(core_max);
             let mut total = Counters::default();
             for counters in &by_edge {
                 total.merge(counters);
@@ -1469,13 +1612,17 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
             worker_busy_max_run = worker_busy_max_run.max(busy_max);
             host_busy_max_run = host_busy_max_run.max(host_busy);
             let reasons = saturation(
-                host_busy,
-                busy_max,
-                lateness.quantile(0.99).unwrap_or(0),
-                total.recv_lag.quantile(0.99).unwrap_or(0),
-                rcvbuf,
-                total.socket_drops,
-                config.lag_limit.as_micros() as u64,
+                &HostInterval {
+                    host_busy,
+                    core_busy_max: core_max,
+                    worker_busy_max: busy_max,
+                    lateness_p99_us: lateness.quantile(0.99).unwrap_or(0),
+                    recv_lag_p99_us: total.recv_lag.quantile(0.99).unwrap_or(0),
+                    rcvbuf_errors: rcvbuf,
+                    socket_drops: total.socket_drops,
+                    nic_drops,
+                },
+                lag_limit_us,
             );
             let t = (interval + 1) as f64 * interval_s;
             let mut per_edge = Map::new();
@@ -1498,6 +1645,8 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
                 "load_host": {
                     "process_cpu_cores": process_cores,
                     "host_cpu_busy": host_busy,
+                    "core_busy_max": core_max,
+                    "nic_rx_drops": nic_drops,
                     "worker_busy": worker_busy,
                     "worker_cpu": worker_cpu,
                     "timer_lateness_ms": lateness.summary_ms(),
@@ -1640,6 +1789,8 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
             "cpu_cores_per_1000_listeners": (peak_active > 0)
                 .then(|| cpu_cores.max() as f64 / 1_000.0 / peak_active as f64 * 1_000.0),
             "host_cpu_busy_max": host_busy_max_run,
+            "core_busy_max": core_busy_max_run,
+            "nic_rx_drops": nic_drops_total,
             "worker_busy_max": worker_busy_max_run,
             "udp_rcvbuf_errors": rcvbuf_total,
             "udp_in_errors": in_errors_total,
@@ -1753,9 +1904,37 @@ mod tests {
         assert_eq!(counters.missing, 2);
         // A restart (parts from 0 again) starts the accounting again.
         let mut counters = Counters::default();
-        track.mark(10_000_000, false, 1_000, &mut counters);
+        assert_eq!(track.mark(10_000_000, false, 1_000, &mut counters), Mark::Late);
+        assert_eq!(counters.resets, 0);
+        assert_eq!(track.mark(10_000_001, false, 1_000, &mut counters), Mark::New);
         assert_eq!(counters.resets, 1);
         assert_eq!(counters.missing, 0);
+        // The part that showed the jump is received, not missing.
+        track.settle(10_000_002, &mut counters);
+        assert_eq!(counters.missing, 0);
+    }
+
+    #[test]
+    fn one_stray_part_far_behind_or_ahead_changes_nothing() {
+        let mut track = PartTrack::new();
+        let mut counters = Counters::default();
+        track.begin(0);
+        for part in 0..10_000_u64 {
+            assert_eq!(track.mark(part, false, 1_500, &mut counters), Mark::New);
+            if part == 8_000 {
+                // A copy of a part 8,000 behind, and a misread number far
+                // ahead: late, and the accounting goes on.
+                assert_eq!(track.mark(10, false, 1_500, &mut counters), Mark::Late);
+                assert_eq!(track.mark(1 << 40, false, 1_500, &mut counters), Mark::Late);
+            }
+        }
+        track.settle(10_000, &mut counters);
+        assert_eq!((counters.resets, counters.missing, counters.gaps), (0, 0, 0));
+        // Two far parts that do not follow each other are strays too.
+        assert_eq!(track.mark(5, false, 1_500, &mut counters), Mark::Late);
+        assert_eq!(track.mark(4, false, 1_500, &mut counters), Mark::Late);
+        assert_eq!(track.mark(10_000, false, 1_500, &mut counters), Mark::New);
+        assert_eq!(counters.resets, 0);
     }
 
     #[test]
@@ -1794,10 +1973,70 @@ mod tests {
 
     #[test]
     fn saturation_names_its_reasons() {
-        assert!(saturation(0.5, 0.5, 100, 100, 0, 0, 5_000).is_empty());
+        let calm = HostInterval {
+            host_busy: 0.5,
+            core_busy_max: 0.6,
+            worker_busy_max: 0.5,
+            lateness_p99_us: 100,
+            recv_lag_p99_us: 100,
+            nic_drops: 3,
+            ..HostInterval::default()
+        };
+        assert!(saturation(&calm, 5_000).is_empty());
+        let busy = HostInterval {
+            host_busy: 0.95,
+            core_busy_max: 0.99,
+            worker_busy_max: 0.99,
+            lateness_p99_us: 10_000,
+            recv_lag_p99_us: 10_000,
+            rcvbuf_errors: 1,
+            socket_drops: 0,
+            nic_drops: 500,
+        };
         assert_eq!(
-            saturation(0.95, 0.99, 10_000, 10_000, 1, 0, 5_000),
-            vec!["host-cpu", "worker-busy", "timers-late", "receive-lag", "receive-drops"]
+            saturation(&busy, 5_000),
+            vec![
+                "host-cpu",
+                "core-busy",
+                "worker-busy",
+                "timers-late",
+                "receive-lag",
+                "receive-drops",
+                "nic-drops"
+            ]
         );
+        // One processor full (a receive queue's softirq) while the host is
+        // not: drops before the sockets follow, which no socket counts.
+        let one_core = HostInterval {
+            core_busy_max: 1.0,
+            nic_drops: 40,
+            ..calm
+        };
+        assert_eq!(saturation(&one_core, 5_000), vec!["core-busy", "nic-drops"]);
+        // --coalesce-us 4000 delays timers and datagrams on purpose: the
+        // limit is 5 ms past it.
+        let coalesced = HostInterval {
+            lateness_p99_us: 4_600,
+            recv_lag_p99_us: 4_300,
+            ..calm
+        };
+        assert!(saturation(&coalesced, 5_000 + 4_000).is_empty());
+    }
+
+    #[test]
+    fn drops_before_the_sockets_and_the_busiest_processor() {
+        let dev = "Inter-|   Receive                                                |  Transmit\n                    face |bytes    packets errs drop fifo frame compressed multicast|bytes\n                       lo: 100 10 0 7 0 0 0 0 100 10 0 0 0 0 0 0\n                     eth0: 5000 50 0 3 0 0 0 0 100 10 0 0 0 0 0 0\n                     eth1: 9000 90 0 11 0 0 0 0 100 10 0 0 0 0 0 0\n";
+        assert_eq!(parse_net_dev_drops(dev), 14);
+        let softnet = "0001e240 0000000a 00000003 00000000\n00000010 00000005 00000000 00000000\n";
+        assert_eq!(parse_softnet_drops(softnet), 15);
+        let before = HostSample {
+            cores: vec![(10, 100), (50, 100)],
+            ..HostSample::default()
+        };
+        let after = HostSample {
+            cores: vec![(20, 200), (148, 200)],
+            ..HostSample::default()
+        };
+        assert!((core_busy_max(&before, &after) - 0.98).abs() < 1e-9);
     }
 }
