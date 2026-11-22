@@ -30,9 +30,12 @@ channel.
 The first implementation keeps the mesh transport intentionally small:
 
 - `playlists::mesh` provides UDP-FEC cache discovery and slot replication using
-  the reusable `raptorq-datagram-fec` crate. Seed peers and private-subnet
-  broadcast discovery only bootstrap the peer set. Normal mesh `HELLO` frames
-  gossip known peer addresses after that.
+  the reusable `raptorq-datagram-fec` crate. The mesh takes datagrams only from
+  authorized peers: those listed with `--peer` and those that private-subnet
+  broadcast discovery adds. Mesh `HELLO` frames gossip peer addresses, but a
+  gossiped or unknown sender joins only if it is authorized, so a distributor
+  lists its edges and an edge lists its distributors. Refused datagrams count
+  in `rx_unauthorized_datagrams`.
 - Cache nodes use `--cache-mesh-role edge|distributor|peer`. An edge is a leaf.
   It receives from same-region distributors and never forwards cache data.
   Production cache nodes enable same-region validation for the mesh protocol.
@@ -467,9 +470,10 @@ cargo run --features private-subnet-discovery -- \
   --private-discovery-mesh-port 9101
 ```
 
-`--peer` remains useful as a seed list. Private discovery adds peers at runtime
-from UDP broadcast announcements, then normal mesh `HELLO` frames gossip peer
-addresses. Telemetry fills in the observable node topology for the operator UI.
+`--peer` lists and authorizes peers; a node that no peer lists is refused by
+it. Private discovery adds and authorizes peers at runtime from UDP broadcast
+announcements, and mesh `HELLO` frames gossip the addresses of authorized
+peers. Telemetry fills in the observable node topology for the operator UI.
 
 For Linode-backed provisioning and private-subnet discovery together:
 
@@ -913,8 +917,9 @@ This is not the final multi-protocol edge deployment yet. The current milestone
 proves the shared-cache behavior needed by the requested mesh:
 
 1. A node can discover configured peers with UDP-FEC `HELLO` frames, gossip
-   those peer addresses through the mesh, and with the optional private-subnet
-   discovery feature it can add 10.x subnet peers discovered by UDP broadcast.
+   those peer addresses through the mesh (a gossiped peer joins only if it is
+   authorized), and with the optional private-subnet discovery feature it can
+   add and authorize 10.x subnet peers discovered by UDP broadcast.
 2. A node can ingest opaque stream bytes from UDP-FEC or a contributor frontend
    such as `av-contrib`, then write media parts to a `playlists::ChunkCache`.
 3. Peers replicate those slots over the shared Wavey RaptorQ-FEC datagram

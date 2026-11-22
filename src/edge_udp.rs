@@ -1456,16 +1456,22 @@ pub(crate) async fn answer_nack_from_cache(
     repair: RepairPolicy,
 ) {
     let out = sockets.out_for_stream(stream_id);
+    // One handle reads every granted part. A stream that is not in the
+    // cache has none of them.
+    let Some(handle) = router.cache.chunk_cache.resolve_stream(stream_id) else {
+        return;
+    };
     let mut refused = 0_u64;
     for part in parts {
         if refused > 0 {
             refused += 1;
             continue;
         }
-        let Some((bytes, _)) = router.cache.get_part_for_stream_id(stream_id, part).await else {
+        let Some((bytes, _)) = router.cache.get_part_for_handle(handle, part).await else {
             continue;
         };
-        let object = part_object(router, stream_id, part, bytes).await;
+        let times = router.cache.part_times_for_handle(handle, part).await;
+        let object = part_object_with_times(stream_id, part, bytes, times);
         if let Some(kept) = sockets.compact().of_object(&object) {
             if !charge_nack_bytes(table, stream_id, peer, kept.len() as u64) {
                 refused += 1;
@@ -1842,6 +1848,15 @@ async fn send_datagrams(
 
 async fn part_object(router: &AppRouter, stream_id: u64, part: u64, bytes: Bytes) -> PartObject {
     let times = router.cache.part_times_unix_us(stream_id, part).await;
+    part_object_with_times(stream_id, part, bytes, times)
+}
+
+fn part_object_with_times(
+    stream_id: u64,
+    part: u64,
+    bytes: Bytes,
+    times: Option<crate::PartTimes>,
+) -> PartObject {
     PartObject {
         kind: ObjectKind::Part,
         datagrams: 0,

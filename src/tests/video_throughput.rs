@@ -1037,7 +1037,8 @@ async fn tee_cost_of_a_4k_frame() {
         peer,
         ParentPath::PromotedSecondary,
     );
-    let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 2_048, 64).await;
+    // Slots of the node's default --slot-kb, which a 4K frame fits.
+    let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 2_048, 2_048).await;
     let (mut push, mut decode_last, mut commit) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
     let mut datagrams = 0;
     for frame in &frames {

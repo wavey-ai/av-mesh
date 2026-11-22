@@ -57,7 +57,7 @@ use link_telemetry::{LinkObservation, LinkTelemetry};
 #[cfg(feature = "linode-provisioner")]
 use linode::{regions::REGIONS as LINODE_REGIONS, LinodeClient};
 use media_object::{MediaObject, ObjectKind, Stage, WIRE_MAGIC};
-use playlists::chunk_cache::{ChunkCache, PutIfAbsentResult};
+use playlists::chunk_cache::{ChunkCache, PutIfAbsentResult, StreamHandle};
 use playlists::m3u8_manifest::push_seconds;
 use playlists::mesh::{
     AppliedSlot, CacheMesh, CacheMeshConfig, CacheMeshFecStats, CacheMeshHandle,
@@ -1115,6 +1115,18 @@ fn soundkit_duration_us(samples: u64, sample_rate: u32) -> Option<u32> {
     u32::try_from(us).ok()
 }
 
+/// A stored part slot as a reader takes it: its media, the slot's hash, its
+/// kind and its init segment. `None` for a slot without media.
+fn decode_part_slot(
+    stream_id: u64,
+    bytes: Bytes,
+    hash: u64,
+) -> Option<(Bytes, u64, LiveMediaKind, Option<Bytes>)> {
+    let slot = LiveSlotPayload::decode_for_stream(bytes, stream_id);
+    slot.has_media()
+        .then(|| (slot.media(), hash, slot.media_kind(), slot.init()))
+}
+
 fn encode_fmp4_slot(init: &[u8], media: &[u8]) -> Result<Bytes> {
     let init_len = u32::try_from(init.len()).context("fMP4 init is too large")?;
     let media_len = u32::try_from(media.len()).context("fMP4 fragment is too large")?;
@@ -1148,23 +1160,16 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:9101")]
     mesh_bind: SocketAddr,
 
+    /// A cache-mesh peer, as host:port of its --mesh-bind. The mesh takes
+    /// datagrams only from authorized peers: the peers listed here and those
+    /// that private-subnet discovery adds. A node that is not listed is not
+    /// learned from its hello, so a distributor lists its edges and an edge
+    /// lists its distributors.
     #[arg(long = "peer")]
     peers: Vec<String>,
 
     #[arg(long, default_value_t = DEFAULT_MESH_SYNC_INTERVAL_MS)]
     mesh_sync_interval_ms: u64,
-
-    /// Send a part to the cache-mesh children as soon as the contiguous
-    /// watermark reaches it, not at the next sync tick. The tick stays as
-    /// the backstop for warm-up pacing and lease work. `false` restores the
-    /// polled sender.
-    #[arg(
-        long,
-        env = "NEEDLETAIL_MESH_SYNC_ON_PUBLISH",
-        default_value_t = true,
-        action = clap::ArgAction::Set
-    )]
-    mesh_sync_on_publish: bool,
 
     /// Part events that the hop journal keeps in memory and serves on
     /// /api/hops. Zero turns the journal off. Unset, the journal holds
@@ -1800,17 +1805,6 @@ struct Args {
         action = clap::ArgAction::Set
     )]
     edge_region_silence_holds: bool,
-
-    /// A cache-mesh parent is heard when any datagram of it is read off a
-    /// mesh socket (either class), before FEC decode; `false` hears it only
-    /// when one of its frames decodes (the behaviour from before).
-    #[arg(
-        long,
-        env = "NEEDLETAIL_MESH_LIVENESS_ON_RECEIPT",
-        default_value_t = true,
-        action = clap::ArgAction::Set
-    )]
-    mesh_liveness_on_receipt: bool,
 
     /// A part request ahead of the edge's newest part waits for the part
     /// until it is due (its distance from the newest part, in parts of the
@@ -2654,7 +2648,6 @@ async fn main() -> Result<()> {
 
     let mut mesh_transport = MeshTransportConfigSnapshot {
         sync_interval_ms: args.mesh_sync_interval_ms,
-        sync_on_publish: args.mesh_sync_on_publish,
         min_repair_symbols: args.mesh_repair_symbols,
         repair_ratio: args.mesh_repair_ratio,
         max_repair_symbols: args.mesh_max_repair_symbols,
@@ -2716,9 +2709,7 @@ async fn main() -> Result<()> {
             args.udp_socket_buffer_bytes
         })
         .with_applied_tx(mesh_applied_tx);
-    let mesh_config =
-        with_low_latency_mesh_options(mesh_config, args.mesh_sync_on_publish, &hop_journal)
-            .with_liveness_on_receipt(args.mesh_liveness_on_receipt);
+    let mesh_config = with_low_latency_mesh_options(mesh_config, &hop_journal);
     // An edge with a client UDP port forwards the parts that reach it over
     // the cache mesh to its UDP clients as their datagrams arrive.
     // With a class-split mesh each class's receive task feeds a cut-through
@@ -6855,7 +6846,9 @@ impl MediaAccessUnitResponse {
 
 #[derive(Debug, Clone)]
 struct CachedPlaylist {
-    stream_id: u64,
+    /// The stream lifetime the playlist was rendered from: a stream that
+    /// takes the index again starts a new playlist.
+    handle: StreamHandle,
     version: u64,
     body: String,
 }
@@ -6864,10 +6857,12 @@ struct CachedPlaylist {
 /// (--playlist-scan-memo): when the slot was written, and the media kind of
 /// the part in it, or `None` for a slot with no media. A slot written since
 /// is read again. A part that carries an initialization section is never
-/// kept: the render takes the section from it each time.
-#[derive(Debug, Default)]
+/// kept: the render takes the section from it each time. A memo belongs to
+/// one lifetime of a stream: a stream that takes the index again, or the
+/// same stream restarted, starts a new one.
+#[derive(Debug)]
 struct PlaylistScanMemo {
-    stream_id: u64,
+    handle: StreamHandle,
     /// The sequence of `slots[0]`.
     first: u64,
     slots: VecDeque<Option<(u64, Option<LiveMediaKind>)>>,
@@ -6877,10 +6872,11 @@ struct PlaylistScanMemo {
 const PLAYLIST_SCAN_MEMO_MAX_SLOTS: usize = 1 << 20;
 
 impl PlaylistScanMemo {
-    fn for_stream(stream_id: u64) -> Self {
+    fn for_handle(handle: StreamHandle) -> Self {
         Self {
-            stream_id,
-            ..Self::default()
+            handle,
+            first: 0,
+            slots: VecDeque::new(),
         }
     }
 
@@ -7069,7 +7065,12 @@ impl LiveTsCache {
             num_playlists: playlist_slots.max(1),
             max_segments: 1,
             max_parts_per_segment: ring_parts,
+            // The cache refuses a part larger than a slot and an
+            // initialization larger than `init_size_kb`. An initialization
+            // also travels inside a part slot, so a slot bounds both; the
+            // mesh's largest frame follows the larger of the two.
             buffer_size_kb: slot_kb,
+            init_size_kb: slot_kb,
             ..CacheOptions::default()
         };
         let playlist_cache = (0..options.num_playlists)
@@ -7082,7 +7083,7 @@ impl LiveTsCache {
             .map(|_| AsyncMutex::new(()))
             .collect();
         let chunk_cache = Arc::new(ChunkCache::new(options));
-        let _ = chunk_cache.get_or_create_stream_idx(stream_id).await;
+        chunk_cache.resolve_or_create_stream(stream_id).await;
         let (part_updates, _) = watch::channel(0);
         let mut state = LiveState::new();
         state.segment_seed_parts = parts_per_segment.max(1) as u64;
@@ -7149,22 +7150,23 @@ impl LiveTsCache {
         self.playlist_scan_memo.store(memo, Ordering::Relaxed);
     }
 
-    /// Take the scan memo of a stream out of its playlist slot (a new one
-    /// if the slot held another stream's), to put back after the scan.
-    fn take_playlist_scan_memo(&self, stream_id: u64, stream_idx: usize) -> PlaylistScanMemo {
+    /// Take the scan memo of a stream's lifetime out of its playlist slot (a
+    /// new one if the slot held another lifetime's), to put back after the
+    /// scan.
+    fn take_playlist_scan_memo(&self, handle: StreamHandle) -> PlaylistScanMemo {
         self.playlist_scan_memos
-            .get(stream_idx)
+            .get(handle.index())
             .and_then(|memo| {
                 memo.lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take()
             })
-            .filter(|memo| memo.stream_id == stream_id)
-            .unwrap_or_else(|| PlaylistScanMemo::for_stream(stream_id))
+            .filter(|memo| memo.handle == handle)
+            .unwrap_or_else(|| PlaylistScanMemo::for_handle(handle))
     }
 
-    fn put_playlist_scan_memo(&self, stream_idx: usize, memo: PlaylistScanMemo) {
-        if let Some(slot) = self.playlist_scan_memos.get(stream_idx) {
+    fn put_playlist_scan_memo(&self, memo: PlaylistScanMemo) {
+        if let Some(slot) = self.playlist_scan_memos.get(memo.handle.index()) {
             *slot
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(memo);
@@ -7176,17 +7178,17 @@ impl LiveTsCache {
     /// found in them.
     async fn scan_playlist_window(
         &self,
-        stream_id: u64,
-        stream_idx: usize,
+        handle: StreamHandle,
         first: usize,
         last: usize,
     ) -> (Vec<u64>, Option<LiveMediaKind>, Option<Bytes>) {
+        let stream_id = handle.stream_id();
         let mut available = Vec::new();
         let mut latest_media_kind = None;
         let mut discovered_init = None;
         if !self.playlist_scan_memo.load(Ordering::Relaxed) {
             for seq in first..=last {
-                if let Some((bytes, _hash)) = self.chunk_cache.get(stream_idx, seq).await {
+                if let Some((bytes, _hash)) = self.chunk_cache.get_for_handle(handle, seq).await {
                     let slot = LiveSlotPayload::decode_for_stream(bytes, stream_id);
                     if slot.has_media() {
                         latest_media_kind = Some(slot.media_kind());
@@ -7199,12 +7201,12 @@ impl LiveTsCache {
             }
             return (available, latest_media_kind, discovered_init);
         }
-        let mut memo = self.take_playlist_scan_memo(stream_id, stream_idx);
+        let mut memo = self.take_playlist_scan_memo(handle);
         for seq in first..=last {
             let sequence = seq as u64;
             // When the slot was written, without a lock: a slot that holds
             // no part of the stream has no time.
-            let Some(written_us) = self.chunk_cache.written_unix_us(stream_idx, seq) else {
+            let Some(written_us) = self.chunk_cache.written_unix_us_for_handle(handle, seq) else {
                 memo.set(sequence, None);
                 continue;
             };
@@ -7218,7 +7220,7 @@ impl LiveTsCache {
                 }
             }
             self.playlist_scan_reads.fetch_add(1, Ordering::Relaxed);
-            let Some((bytes, _hash)) = self.chunk_cache.get(stream_idx, seq).await else {
+            let Some((bytes, _hash)) = self.chunk_cache.get_for_handle(handle, seq).await else {
                 memo.set(sequence, None);
                 continue;
             };
@@ -7239,7 +7241,7 @@ impl LiveTsCache {
             }
         }
         memo.trim_below(first as u64);
-        self.put_playlist_scan_memo(stream_idx, memo);
+        self.put_playlist_scan_memo(memo);
         (available, latest_media_kind, discovered_init)
     }
 
@@ -7257,10 +7259,9 @@ impl LiveTsCache {
 
     /// The contiguous watermark of a stream, for the hop journal: `None`
     /// when the journal is off, so that a node without it does no lookup.
-    async fn journal_watermark(&self, stream_id: u64) -> Option<Option<usize>> {
+    fn journal_watermark(&self, handle: Option<StreamHandle>) -> Option<Option<usize>> {
         self.hops()?;
-        let stream_idx = self.chunk_cache.get_stream_idx(stream_id).await;
-        Some(stream_idx.and_then(|stream_idx| self.chunk_cache.last(stream_idx)))
+        Some(handle.and_then(|handle| self.chunk_cache.last_for_handle(handle)))
     }
 
     /// Journal the watermark stage for every part from the part after
@@ -7556,34 +7557,33 @@ impl LiveTsCache {
 
     /// How long after the first stored part beyond it `part` came, if one
     /// is stored within the next 16: the time that its hole was open. Lock
-    /// free: two atomic loads a slot.
-    fn hole_open_us(&self, stream_idx: usize, part: usize, committed_us: u64) -> Option<u64> {
+    /// free: the registry's check and the slot tag, a slot.
+    fn hole_open_us(&self, handle: StreamHandle, part: usize, committed_us: u64) -> Option<u64> {
         (1..=16).find_map(|step| {
             let later = part.checked_add(step)?;
             self.chunk_cache
-                .written_unix_us(stream_idx, later)
+                .written_unix_us_for_handle(handle, later)
                 .map(|written_us| committed_us.saturating_sub(written_us))
         })
     }
 
-    /// A canonical part was just stored: when a later part of its stream
-    /// was stored before it, it filled a hole. How long the hole was open is
-    /// a repair delay, which the measured repair horizon is made of; a part
-    /// already listed as a gap is a late fill, kept for later readers.
-    fn observe_late_part(&self, stream_id: u64, seq: u64, committed_us: u64) {
-        if self.fill_gap_part(stream_id, seq) {
+    /// A canonical part was just stored, by the commit that resolved
+    /// `handle`: when a later part of its stream was stored before it, it
+    /// filled a hole. How long the hole was open is a repair delay, which
+    /// the measured repair horizon is made of; a part already listed as a
+    /// gap is a late fill, kept for later readers.
+    fn observe_late_part(&self, handle: StreamHandle, seq: u64, committed_us: u64) {
+        if self.fill_gap_part(handle.stream_id(), seq) {
             self.late_gap_fills.fetch_add(1, Ordering::Relaxed);
         }
-        let (Some(stream_idx), Ok(part)) =
-            (self.chunk_cache.stream_idx(stream_id), usize::try_from(seq))
-        else {
+        let Ok(part) = usize::try_from(seq) else {
             return;
         };
         // In order (no later part stored): nothing to measure. A part a
         // moment behind a later one was reordered, or came from the other
         // parent: not a repair.
         if let Some(delay_us) = self
-            .hole_open_us(stream_idx, part, committed_us)
+            .hole_open_us(handle, part, committed_us)
             .filter(|delay_us| *delay_us >= REPAIR_REORDER_GRACE_US)
         {
             self.record_repair_delay(delay_us);
@@ -7639,9 +7639,10 @@ impl LiveTsCache {
     /// watermark moves to the newest stored slot that is itself older than the
     /// hold; the write that follows resumes contiguous publication from there.
     ///
-    /// The caller must hold the stream's canonical commit lock. A stream with
-    /// no hole costs one stream-index lookup and one watermark comparison.
-    async fn release_held_canonical_gap(&self, stream_id: u64, committing_slot: usize) {
+    /// The caller must hold the stream's canonical commit lock, and passes
+    /// the handle that it resolved for the commit. A stream with no hole
+    /// costs one watermark load and one comparison.
+    async fn release_held_canonical_gap(&self, handle: StreamHandle, committing_slot: usize) {
         // The hold is a length of time. Count it in the parts of this stream,
         // not in the nominal parts of the node.
         let hold_ms = self.canonical_gap_hold_ms.load(Ordering::Relaxed);
@@ -7649,13 +7650,13 @@ impl LiveTsCache {
             return;
         }
         if let Some(horizon_us) = self.repair_horizon_us() {
-            self.release_holes_past_horizon(stream_id, Some(committing_slot), horizon_us)
+            self.release_holes_past_horizon(handle, Some(committing_slot), horizon_us)
                 .await;
             return;
         }
         let hold_parts = hold_ms
             .saturating_mul(1_000)
-            .div_ceil(self.state.read().await.stream_part_us(stream_id));
+            .div_ceil(self.state.read().await.stream_part_us(handle.stream_id()));
         if hold_parts == 0 {
             return;
         }
@@ -7665,18 +7666,15 @@ impl LiveTsCache {
         else {
             return;
         };
-        let Some(stream_idx) = self.chunk_cache.get_stream_idx(stream_id).await else {
-            return;
-        };
         // Nothing is published before the first canonical media object, so
         // an empty watermark has no hole to release.
-        let Some(last) = self.chunk_cache.last(stream_idx) else {
+        let Some(last) = self.chunk_cache.last_for_handle(handle) else {
             return;
         };
         if last >= ceiling {
             return;
         }
-        self.advance_canonical_watermark(stream_id, stream_idx, last, ceiling, false)
+        self.advance_canonical_watermark(handle, last, ceiling, false)
             .await;
     }
 
@@ -7687,16 +7685,17 @@ impl LiveTsCache {
     /// written: the walk stops there, since its write continues the
     /// contiguous publication. Returns the new watermark.
     ///
-    /// The caller must hold the stream's canonical commit lock.
+    /// The caller must hold the stream's canonical commit lock. The walk
+    /// reads each slot through `handle`, resolved once by the caller.
     async fn release_holes_past_horizon(
         &self,
-        stream_id: u64,
+        handle: StreamHandle,
         committing: Option<usize>,
         horizon_us: u64,
     ) -> Option<usize> {
-        let stream_idx = self.chunk_cache.get_stream_idx(stream_id).await?;
+        let stream_id = handle.stream_id();
         // Nothing is published before the first canonical media object.
-        let last = self.chunk_cache.last(stream_idx)?;
+        let last = self.chunk_cache.last_for_handle(handle)?;
         let first = last.checked_add(1)?;
         // The part right after the watermark: no hole (the common case
         // costs no lock).
@@ -7725,7 +7724,7 @@ impl LiveTsCache {
             if committing == Some(slot) {
                 break;
             }
-            match self.chunk_cache.written_unix_us(stream_idx, slot) {
+            match self.chunk_cache.written_unix_us_for_handle(handle, slot) {
                 None => in_hole = true,
                 Some(written_us) => {
                     // A hole is as old as the first part stored after it.
@@ -7739,7 +7738,7 @@ impl LiveTsCache {
         }
         let ceiling = ceiling.filter(|ceiling| *ceiling > last)?;
         let watermark = self
-            .advance_canonical_watermark(stream_id, stream_idx, last, ceiling, false)
+            .advance_canonical_watermark(handle, last, ceiling, false)
             .await?;
         self.repair_horizon_releases.fetch_add(1, Ordering::Relaxed);
         Some(watermark)
@@ -7764,10 +7763,10 @@ impl LiveTsCache {
         let mut released = 0;
         for (stream_id, head) in candidates {
             // Most streams have no hole: one lookup and one comparison.
-            let Some(stream_idx) = self.chunk_cache.stream_idx(stream_id) else {
+            let Some(handle) = self.chunk_cache.resolve_stream(stream_id) else {
                 continue;
             };
-            let Some(last) = self.chunk_cache.last(stream_idx) else {
+            let Some(last) = self.chunk_cache.last_for_handle(handle) else {
                 continue;
             };
             if last as u64 >= head {
@@ -7783,8 +7782,13 @@ impl LiveTsCache {
                 continue;
             };
             let _commit_guard = commit_lock.lock().await;
+            // The stream may have been retired or restarted while the lock
+            // was awaited: resolve it again under the lock.
+            let Some(handle) = self.chunk_cache.resolve_stream(stream_id) else {
+                continue;
+            };
             if let Some(watermark) = self
-                .release_holes_past_horizon(stream_id, None, horizon_us)
+                .release_holes_past_horizon(handle, None, horizon_us)
                 .await
             {
                 released += 1;
@@ -7845,17 +7849,17 @@ impl LiveTsCache {
             let Some(head) = head.and_then(|head| usize::try_from(head).ok()) else {
                 continue;
             };
-            let Some(stream_idx) = self.chunk_cache.get_stream_idx(stream_id).await else {
+            let Some(handle) = self.chunk_cache.resolve_stream(stream_id) else {
                 continue;
             };
-            let Some(last) = self.chunk_cache.last(stream_idx) else {
+            let Some(last) = self.chunk_cache.last_for_handle(handle) else {
                 continue;
             };
             if last >= head {
                 continue;
             }
             if let Some(watermark) = self
-                .advance_canonical_watermark(stream_id, stream_idx, last, head, true)
+                .advance_canonical_watermark(handle, last, head, true)
                 .await
             {
                 flushed += 1;
@@ -7871,26 +7875,25 @@ impl LiveTsCache {
     /// `(last, ceiling]`, returning the new watermark.
     ///
     /// `ChunkCache` exposes no direct watermark control, so the stored bytes
-    /// of that slot are republished unchanged through `add_for_stream_id`,
+    /// of that slot are republished unchanged through `add_for_handle`,
     /// which publishes the slot identity as the new watermark. The caller must
     /// hold the stream's canonical commit lock so the slot cannot be replaced
-    /// between the read and the republication.
+    /// between the read and the republication. A handle that has gone stale
+    /// (the stream was retired, or its index given to another stream)
+    /// republishes nothing.
     async fn advance_canonical_watermark(
         &self,
-        stream_id: u64,
-        stream_idx: usize,
+        handle: StreamHandle,
         last: usize,
         ceiling: usize,
         idle_flush: bool,
     ) -> Option<usize> {
+        let stream_id = handle.stream_id();
         let first_unpublished = last.checked_add(1)?;
         let scan_floor =
             first_unpublished.max(ceiling.saturating_sub(CANONICAL_GAP_SCAN_LIMIT - 1));
         for candidate in (scan_floor..=ceiling).rev() {
-            let Some((bytes, _hash)) = self
-                .chunk_cache
-                .get_for_stream_id(stream_id, candidate)
-                .await
+            let Some((bytes, _hash)) = self.chunk_cache.get_for_handle(handle, candidate).await
             else {
                 continue;
             };
@@ -7909,7 +7912,7 @@ impl LiveTsCache {
             for slot in retained_start..candidate {
                 if self
                     .chunk_cache
-                    .get_for_stream_id(stream_id, slot)
+                    .get_for_handle(handle, slot)
                     .await
                     .is_none()
                 {
@@ -7918,31 +7921,22 @@ impl LiveTsCache {
                 }
             }
 
-            match self
+            if let Err(error) = self
                 .chunk_cache
-                .add_for_stream_id(stream_id, candidate, bytes)
+                .add_for_handle(handle, candidate, bytes)
                 .await
             {
-                Ok(published_idx) if published_idx == stream_idx => {}
-                Ok(published_idx) => {
-                    warn!(
-                        stream_id,
-                        stream_idx,
-                        published_idx,
-                        "canonical stream cache index changed while releasing a gap"
-                    );
-                    return None;
-                }
-                Err(error) => {
-                    warn!(
-                        stream_id,
-                        watermark = last,
-                        candidate,
-                        error,
-                        "canonical gap release could not republish a stored slot"
-                    );
-                    return None;
-                }
+                // A stale handle ("Stale stream handle") means the stream
+                // was retired or its index given to another stream since the
+                // caller resolved it.
+                warn!(
+                    stream_id,
+                    watermark = last,
+                    candidate,
+                    error,
+                    "canonical gap release could not republish a stored slot"
+                );
+                return None;
             }
             if let Some(journal) = self.hops() {
                 // The stored parts behind the released hole are visible now.
@@ -7951,7 +7945,7 @@ impl LiveTsCache {
                     if slot == candidate
                         || self
                             .chunk_cache
-                            .get_for_stream_id(stream_id, slot)
+                            .get_for_handle(handle, slot)
                             .await
                             .is_some()
                     {
@@ -8164,7 +8158,7 @@ impl LiveTsCache {
                     source_epoch, "took up the canonical source epoch of the cache-mesh copy"
                 );
             } else if previous_epoch != Some(source_epoch) {
-                self.chunk_cache.zero_stream_id(stream_id).await;
+                self.chunk_cache.zero_stream_id(stream_id);
                 self.forget_gap_parts(stream_id);
                 // A relay may restart and inherit an epoch that has already
                 // been active for minutes or hours. Its source age is not an
@@ -8308,24 +8302,47 @@ impl LiveTsCache {
                 encode_canonical_live_slot(stream_id, &object, payload, media_kind)?
             };
             let cached_bytes = cached_payload.len();
-            // Runs before the write so the contiguous publication performed by
-            // this commit resumes directly behind a released hole.
-            self.release_held_canonical_gap(stream_id, slot_id).await;
-            let watermark_before = self.journal_watermark(stream_id).await;
-            let write_result = self
-                .chunk_cache
-                .put_if_absent_contiguous_for_stream_id(
-                    stream_id,
-                    slot_id,
-                    subscription_base_object,
-                    cached_payload,
-                )
-                .await
-                .map_err(|err| anyhow!("canonical stream cache write failed: {err}"))?;
+            // One handle serves the whole commit: the gap release, the write,
+            // its time and the late-part check. The commit lock keeps the
+            // stream from being retired or restarted under it. A stream's
+            // first part is written by stream ID, which checks the write
+            // before it creates the stream, so a refused part takes no slot.
+            let existing = self.chunk_cache.resolve_stream(stream_id);
+            if let Some(handle) = existing {
+                // Runs before the write so the contiguous publication
+                // performed by this commit resumes directly behind a
+                // released hole.
+                self.release_held_canonical_gap(handle, slot_id).await;
+            }
+            let watermark_before = self.journal_watermark(existing);
+            let write_result = match existing {
+                Some(handle) => {
+                    self.chunk_cache
+                        .put_if_absent_contiguous_for_handle(
+                            handle,
+                            slot_id,
+                            subscription_base_object,
+                            cached_payload,
+                        )
+                        .await
+                }
+                None => {
+                    self.chunk_cache
+                        .put_if_absent_contiguous_for_stream_id(
+                            stream_id,
+                            slot_id,
+                            subscription_base_object,
+                            cached_payload,
+                        )
+                        .await
+                }
+            }
+            .map_err(|err| anyhow!("canonical stream cache write failed: {err}"))?;
+            let handle = existing.or_else(|| self.chunk_cache.resolve_stream(stream_id));
             // The time the cache stored with the slot, which a reader woken
             // by the write already reports.
-            let committed_us = self
-                .part_written_unix_us(stream_id, seq)
+            let committed_us = handle
+                .and_then(|handle| self.chunk_cache.written_unix_us_for_handle(handle, slot_id))
                 .unwrap_or_else(now_unix_us);
             if write_result == PutIfAbsentResult::HashConflict {
                 bail!(
@@ -8333,11 +8350,13 @@ impl LiveTsCache {
                 );
             }
             if write_result == PutIfAbsentResult::Inserted {
-                self.observe_late_part(stream_id, seq, committed_us);
+                if let Some(handle) = handle {
+                    self.observe_late_part(handle, seq, committed_us);
+                }
                 if let Some(journal) = self.hops() {
                     journal.record_part(HopStage::Committed, stream_id, seq, committed_us);
                     if let Some(before) = watermark_before {
-                        let after = self.journal_watermark(stream_id).await.flatten();
+                        let after = self.journal_watermark(handle).flatten();
                         self.journal_watermark_advance(stream_id, before, after, seq, committed_us);
                     }
                 }
@@ -8451,9 +8470,9 @@ impl LiveTsCache {
     /// The source epoch of the newest part of a stream that the cache mesh
     /// wrote into the cache, if it carries one.
     async fn mesh_copy_epoch(&self, stream_id: u64) -> Option<u64> {
-        let stream_idx = self.chunk_cache.get_stream_idx(stream_id).await?;
-        let last = self.chunk_cache.last(stream_idx)?;
-        let (bytes, _) = self.chunk_cache.get_for_stream_id(stream_id, last).await?;
+        let handle = self.chunk_cache.resolve_stream(stream_id)?;
+        let last = self.chunk_cache.last_for_handle(handle)?;
+        let (bytes, _) = self.chunk_cache.get_for_handle(handle, last).await?;
         MeshPartRecord::from_slot(&bytes, stream_id)?.epoch
     }
 
@@ -8561,7 +8580,7 @@ impl LiveTsCache {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if cached_playlist
                 .as_ref()
-                .is_some_and(|cached| cached.stream_id == stream_id)
+                .is_some_and(|cached| cached.handle.stream_id() == stream_id)
             {
                 *cached_playlist = None;
             }
@@ -8669,16 +8688,16 @@ impl LiveTsCache {
     /// again and again. A full node now keeps what it has. A stream that
     /// has had no part for `STREAM_SLOT_IDLE_MS` gives up its slot.
     async fn make_room_for(&self, stream_id: u64) -> Result<()> {
-        if self.chunk_cache.get_stream_idx(stream_id).await.is_some() {
+        if self.chunk_cache.resolve_stream(stream_id).is_some() {
             return Ok(());
         }
         let slots = self.chunk_cache.options.num_playlists;
-        if self.chunk_cache.stream_ids().await.len() < slots {
+        if self.chunk_cache.stream_handles().len() < slots {
             return Ok(());
         }
         self.retire_streams_idle_before(now_unix_ms().saturating_sub(STREAM_SLOT_IDLE_MS))
             .await;
-        if self.chunk_cache.stream_ids().await.len() < slots {
+        if self.chunk_cache.stream_handles().len() < slots {
             return Ok(());
         }
         let refused = self.stream_slot_refusals.fetch_add(1, Ordering::Relaxed) + 1;
@@ -8721,7 +8740,7 @@ impl LiveTsCache {
                 continue;
             }
 
-            self.chunk_cache.zero_stream_id(stream_id).await;
+            self.chunk_cache.zero_stream_id(stream_id);
             self.state.write().await.forget_stream(stream_id);
             self.forget_gap_parts(stream_id);
             for cached_playlist in &self.playlist_cache {
@@ -8730,7 +8749,7 @@ impl LiveTsCache {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if cached_playlist
                     .as_ref()
-                    .is_some_and(|cached| cached.stream_id == stream_id)
+                    .is_some_and(|cached| cached.handle.stream_id() == stream_id)
                 {
                     *cached_playlist = None;
                 }
@@ -8853,26 +8872,49 @@ impl LiveTsCache {
     }
 
     async fn playlist_for_stream_id(&self, stream_id: u64) -> String {
-        let Some((stream_idx, last)) = self.stream_position_for_id(stream_id).await else {
-            let media_kind = self
-                .media_kind_hint(stream_id)
-                .await
-                .unwrap_or(LiveMediaKind::Fmp4);
-            let include_map = media_kind == LiveMediaKind::Fmp4
-                && self.get_init_for_stream_id(stream_id).await.is_some();
-            return self.empty_playlist(0, media_kind, include_map);
-        };
-        let mut version = self.chunk_cache.version(stream_idx).unwrap_or_default();
-        if let Some(playlist) = self.cached_playlist(stream_id, stream_idx, version) {
+        let mut attempts = 0;
+        loop {
+            let Some((handle, last)) = self.stream_position_for_id(stream_id).await else {
+                let media_kind = self
+                    .media_kind_hint(stream_id)
+                    .await
+                    .unwrap_or(LiveMediaKind::Fmp4);
+                let include_map = media_kind == LiveMediaKind::Fmp4
+                    && self.get_init_for_stream_id(stream_id).await.is_some();
+                return self.empty_playlist(0, media_kind, include_map);
+            };
+            let playlist = self.playlist_for_handle(handle, last).await;
+            attempts += 1;
+            // The stream was retired or restarted while its playlist was
+            // rendered, so the rendering may hold parts of the lifetime that
+            // ended. Render the current one, once.
+            if attempts >= 2 || self.chunk_cache.version_for_handle(handle).is_some() {
+                return playlist;
+            }
+        }
+    }
+
+    /// The playlist of one lifetime of a stream, whose contiguous watermark
+    /// was `last`.
+    async fn playlist_for_handle(&self, handle: StreamHandle, last: usize) -> String {
+        let stream_id = handle.stream_id();
+        let mut version = self
+            .chunk_cache
+            .version_for_handle(handle)
+            .unwrap_or_default();
+        if let Some(playlist) = self.cached_playlist(handle, version) {
             return playlist;
         }
-        let _rendering = match self.playlist_render_locks.get(stream_idx) {
+        let _rendering = match self.playlist_render_locks.get(handle.index()) {
             Some(lock) if self.playlist_scan_memo.load(Ordering::Relaxed) => {
                 let guard = lock.lock().await;
                 // The render that this one waited for may be the one it
                 // wants.
-                version = self.chunk_cache.version(stream_idx).unwrap_or_default();
-                if let Some(playlist) = self.cached_playlist(stream_id, stream_idx, version) {
+                version = self
+                    .chunk_cache
+                    .version_for_handle(handle)
+                    .unwrap_or_default();
+                if let Some(playlist) = self.cached_playlist(handle, version) {
                     return playlist;
                 }
                 Some(guard)
@@ -8880,11 +8922,10 @@ impl LiveTsCache {
             _ => None,
         };
         // The newest part now: the render waited for may have made room.
-        let last = self.chunk_cache.last(stream_idx).unwrap_or(last);
+        let last = self.chunk_cache.last_for_handle(handle).unwrap_or(last);
         let first = last.saturating_sub(self.window_parts_for(stream_id).await.saturating_sub(1));
-        let (available, latest_media_kind, discovered_init) = self
-            .scan_playlist_window(stream_id, stream_idx, first, last)
-            .await;
+        let (available, latest_media_kind, discovered_init) =
+            self.scan_playlist_window(handle, first, last).await;
         if available.is_empty() {
             let media_kind = self
                 .media_kind_hint(stream_id)
@@ -8893,7 +8934,7 @@ impl LiveTsCache {
             let include_map = media_kind == LiveMediaKind::Fmp4
                 && self.get_init_for_stream_id(stream_id).await.is_some();
             let playlist = self.empty_playlist(last, media_kind, include_map);
-            return self.cache_playlist(stream_id, stream_idx, version, playlist);
+            return self.cache_playlist(handle, version, playlist);
         }
         if let Some(init) = discovered_init {
             self.remember_stream_init(stream_id, init).await;
@@ -8917,7 +8958,7 @@ impl LiveTsCache {
                 "suppressing fMP4 live playlist until init segment is available"
             );
             let playlist = self.waiting_playlist(false);
-            return self.cache_playlist(stream_id, stream_idx, version, playlist);
+            return self.cache_playlist(handle, version, playlist);
         }
 
         let next_part = available.last().copied().unwrap_or(0) + 1;
@@ -9287,31 +9328,25 @@ impl LiveTsCache {
         out.push_str(&format!(
             "#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part{next_part}.{extension}\"\n"
         ));
-        self.cache_playlist(stream_id, stream_idx, version, out)
+        self.cache_playlist(handle, version, out)
     }
 
-    fn cached_playlist(&self, stream_id: u64, stream_idx: usize, version: u64) -> Option<String> {
-        let cached = self.playlist_cache.get(stream_idx)?.read().ok()?;
+    fn cached_playlist(&self, handle: StreamHandle, version: u64) -> Option<String> {
+        let cached = self.playlist_cache.get(handle.index())?.read().ok()?;
         cached
             .as_ref()
-            .filter(|cached| cached.stream_id == stream_id && cached.version == version)
+            .filter(|cached| cached.handle == handle && cached.version == version)
             .map(|cached| cached.body.clone())
     }
 
-    fn cache_playlist(
-        &self,
-        stream_id: u64,
-        stream_idx: usize,
-        version: u64,
-        body: String,
-    ) -> String {
-        if self.chunk_cache.version(stream_idx) != Some(version) {
+    fn cache_playlist(&self, handle: StreamHandle, version: u64, body: String) -> String {
+        if self.chunk_cache.version_for_handle(handle) != Some(version) {
             return body;
         }
-        if let Some(cache) = self.playlist_cache.get(stream_idx) {
+        if let Some(cache) = self.playlist_cache.get(handle.index()) {
             if let Ok(mut cached) = cache.write() {
                 *cached = Some(CachedPlaylist {
-                    stream_id,
+                    handle,
                     version,
                     body: body.clone(),
                 });
@@ -9372,8 +9407,10 @@ impl LiveTsCache {
 
     /// The newest stored part of a stream, without waiting for a lock.
     fn stream_head(&self, stream_id: u64) -> Option<u64> {
-        let stream_idx = self.chunk_cache.stream_idx(stream_id)?;
-        self.chunk_cache.last(stream_idx).map(|last| last as u64)
+        let handle = self.chunk_cache.resolve_stream(stream_id)?;
+        self.chunk_cache
+            .last_for_handle(handle)
+            .map(|last| last as u64)
     }
 
     async fn media_kind_hint(&self, stream_id: u64) -> Option<LiveMediaKind> {
@@ -9407,7 +9444,7 @@ impl LiveTsCache {
             return Some(init);
         }
 
-        let (stream_idx, last) = self.stream_position_for_id(stream_id).await?;
+        let (handle, last) = self.stream_position_for_id(stream_id).await?;
         // A stream without an initialization section, such as opaque audio,
         // has none in any part. Each part is looked at once: without this
         // mark every request for the Multivariant Playlist of such a stream
@@ -9425,7 +9462,7 @@ impl LiveTsCache {
             .retained_start(last)
             .max(scanned.map_or(0, |slot| slot.saturating_add(1)));
         for seq in (first..=last).rev() {
-            let Some((bytes, _hash)) = self.chunk_cache.get(stream_idx, seq).await else {
+            let Some((bytes, _hash)) = self.chunk_cache.get_for_handle(handle, seq).await else {
                 continue;
             };
             let slot = LiveSlotPayload::decode_for_stream(bytes, stream_id);
@@ -9442,14 +9479,15 @@ impl LiveTsCache {
         None
     }
 
-    async fn stream_position(&self) -> Option<(usize, usize)> {
+    async fn stream_position(&self) -> Option<(StreamHandle, usize)> {
         self.stream_position_for_id(self.stream_id).await
     }
 
-    async fn stream_position_for_id(&self, stream_id: u64) -> Option<(usize, usize)> {
-        let stream_idx = self.chunk_cache.get_stream_idx(stream_id).await?;
-        let last = self.chunk_cache.last(stream_idx)?;
-        Some((stream_idx, last))
+    /// The current lifetime of a stream and its contiguous watermark.
+    async fn stream_position_for_id(&self, stream_id: u64) -> Option<(StreamHandle, usize)> {
+        let handle = self.chunk_cache.resolve_stream(stream_id)?;
+        let last = self.chunk_cache.last_for_handle(handle)?;
+        Some((handle, last))
     }
 
     async fn get_part_for_stream_id(&self, stream_id: u64, seq: u64) -> Option<(Bytes, u64)> {
@@ -9474,11 +9512,23 @@ impl LiveTsCache {
             .chunk_cache
             .get_for_stream_id(stream_id, seq as usize)
             .await?;
-        let slot = LiveSlotPayload::decode_for_stream(bytes, stream_id);
-        if slot.has_media() {
-            return Some((slot.media(), hash, slot.media_kind(), slot.init()));
+        decode_part_slot(stream_id, bytes, hash)
+    }
+
+    /// [`Self::get_part_for_stream_id`] for a stream that the caller
+    /// resolved once to read many of its parts.
+    async fn get_part_for_handle(&self, handle: StreamHandle, seq: u64) -> Option<(Bytes, u64)> {
+        let stream_id = handle.stream_id();
+        let (bytes, hash) = self
+            .chunk_cache
+            .get_for_handle(handle, usize::try_from(seq).ok()?)
+            .await?;
+        let (media, hash, media_kind, init) = decode_part_slot(stream_id, bytes, hash)?;
+        if let Some(init) = init {
+            self.remember_stream_init(stream_id, init).await;
         }
-        None
+        self.remember_media_kind(stream_id, media_kind).await;
+        Some((media, hash))
     }
 
     async fn part_available_unix_us(&self, stream_id: u64, seq: u64) -> Option<u64> {
@@ -9504,6 +9554,26 @@ impl LiveTsCache {
     /// cache, and stands in for the time the cache had the part.
     async fn part_times_unix_us(&self, stream_id: u64, seq: u64) -> Option<PartTimes> {
         let written_unix_us = self.part_written_unix_us(stream_id, seq);
+        self.part_times_written_at(stream_id, seq, written_unix_us)
+            .await
+    }
+
+    /// [`Self::part_times_unix_us`] for a stream that the caller resolved
+    /// once to read many of its parts.
+    async fn part_times_for_handle(&self, handle: StreamHandle, seq: u64) -> Option<PartTimes> {
+        let written_unix_us = usize::try_from(seq)
+            .ok()
+            .and_then(|slot| self.chunk_cache.written_unix_us_for_handle(handle, slot));
+        self.part_times_written_at(handle.stream_id(), seq, written_unix_us)
+            .await
+    }
+
+    async fn part_times_written_at(
+        &self,
+        stream_id: u64,
+        seq: u64,
+        written_unix_us: Option<u64>,
+    ) -> Option<PartTimes> {
         let recorded = self
             .state
             .read()
@@ -9558,14 +9628,14 @@ impl LiveTsCache {
         after: Option<u64>,
         start_at_oldest: bool,
     ) -> Option<(u64, Bytes, u64)> {
-        let (stream_idx, last) = self.stream_position_for_id(stream_id).await?;
+        let (handle, last) = self.stream_position_for_id(stream_id).await?;
         if let Some(after) = after {
             let start = after.checked_add(1)?;
             if start as usize > last {
                 return None;
             }
             for seq in start as usize..=last {
-                if let Some((bytes, hash)) = self.chunk_cache.get(stream_idx, seq).await {
+                if let Some((bytes, hash)) = self.chunk_cache.get_for_handle(handle, seq).await {
                     let slot = LiveSlotPayload::decode_for_stream(bytes, stream_id);
                     if slot.has_media() {
                         if let Some(init) = slot.init() {
@@ -9586,7 +9656,7 @@ impl LiveTsCache {
             (first..=last).rev().collect()
         };
         for seq in sequences {
-            if let Some((bytes, hash)) = self.chunk_cache.get(stream_idx, seq).await {
+            if let Some((bytes, hash)) = self.chunk_cache.get_for_handle(handle, seq).await {
                 let slot = LiveSlotPayload::decode_for_stream(bytes, stream_id);
                 if slot.has_media() {
                     if let Some(init) = slot.init() {
@@ -10165,14 +10235,19 @@ impl LiveTsCache {
         let retained_start = head
             .saturating_sub(self.window_parts.saturating_sub(1) as u64)
             .max(base);
+        let handle = self.chunk_cache.resolve_stream(stream_id);
         let mut gaps = 0_u64;
         for object in retained_start..=head {
-            if self
-                .chunk_cache
-                .get_for_stream_id(stream_id, usize::try_from(object).ok()?)
-                .await
-                .is_none()
-            {
+            let slot = usize::try_from(object).ok()?;
+            let present = match handle {
+                Some(handle) => self
+                    .chunk_cache
+                    .get_for_handle(handle, slot)
+                    .await
+                    .is_some(),
+                None => false,
+            };
+            if !present {
                 gaps = gaps.saturating_add(1);
             }
         }
@@ -10290,10 +10365,10 @@ impl LiveTsCache {
             )
         };
         for (stream_id, retained) in retained_streams {
-            let Some(stream_idx) = self.chunk_cache.get_stream_idx(stream_id).await else {
+            let Some(handle) = self.chunk_cache.resolve_stream(stream_id) else {
                 continue;
             };
-            let Some(last) = self.chunk_cache.last(stream_idx) else {
+            let Some(last) = self.chunk_cache.last_for_handle(handle) else {
                 continue;
             };
             let latest_part = last as u64;
@@ -10301,7 +10376,7 @@ impl LiveTsCache {
                 retained.latest_bytes
             } else {
                 self.chunk_cache
-                    .get(stream_idx, last)
+                    .get_for_handle(handle, last)
                     .await
                     .map(|(payload, _)| payload.len())
             };
@@ -10415,15 +10490,15 @@ impl LiveTsCache {
         stream_id: u64,
         window_parts: usize,
     ) -> Option<usize> {
-        let stream_idx = self.chunk_cache.get_stream_idx(stream_id).await?;
-        let last = self.chunk_cache.last(stream_idx)?;
+        let handle = self.chunk_cache.resolve_stream(stream_id)?;
+        let last = self.chunk_cache.last_for_handle(handle)?;
         let start = last
             .saturating_sub(window_parts.saturating_sub(1))
             .max(self.chunk_cache.retained_start(last));
         for seq in start..=last {
             let present = self
                 .chunk_cache
-                .get(stream_idx, seq)
+                .get_for_handle(handle, seq)
                 .await
                 .map(|(bytes, hash)| hash != 0 || !bytes.is_empty())
                 .unwrap_or(false);
@@ -10436,17 +10511,17 @@ impl LiveTsCache {
 
     /// Whether this node stores any slot of the stream.
     async fn has_stream_slots(&self, stream_id: u64) -> bool {
-        match self.chunk_cache.get_stream_idx(stream_id).await {
-            Some(stream_idx) => self.chunk_cache.last(stream_idx).is_some(),
+        match self.chunk_cache.resolve_stream(stream_id) {
+            Some(handle) => self.chunk_cache.last_for_handle(handle).is_some(),
             None => false,
         }
     }
 
     async fn replica_request_from_slot(&self, stream_id: u64) -> usize {
-        let Some(stream_idx) = self.chunk_cache.get_stream_idx(stream_id).await else {
+        let Some(handle) = self.chunk_cache.resolve_stream(stream_id) else {
             return 0;
         };
-        let Some(last) = self.chunk_cache.last(stream_idx) else {
+        let Some(last) = self.chunk_cache.last_for_handle(handle) else {
             return 0;
         };
 
@@ -10455,7 +10530,7 @@ impl LiveTsCache {
         for seq in retained_start..=last {
             let present = self
                 .chunk_cache
-                .get(stream_idx, seq)
+                .get_for_handle(handle, seq)
                 .await
                 .map(|(bytes, hash)| hash != 0 || !bytes.is_empty())
                 .unwrap_or(false);
@@ -11787,7 +11862,6 @@ impl From<CacheMeshFecStats> for MeshFecRuntimeSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct MeshTransportConfigSnapshot {
     sync_interval_ms: u64,
-    sync_on_publish: bool,
     min_repair_symbols: u32,
     repair_ratio: f32,
     max_repair_symbols: u32,
@@ -11801,7 +11875,6 @@ impl Default for MeshTransportConfigSnapshot {
     fn default() -> Self {
         Self {
             sync_interval_ms: DEFAULT_MESH_SYNC_INTERVAL_MS,
-            sync_on_publish: true,
             min_repair_symbols: DEFAULT_MESH_FEC_REPAIR_SYMBOLS,
             repair_ratio: DEFAULT_MESH_FEC_REPAIR_RATIO,
             max_repair_symbols: DEFAULT_MESH_FEC_MAX_REPAIR_SYMBOLS,
@@ -13343,15 +13416,13 @@ fn journal_mesh_applied(cache: &LiveTsCache, applied: &AppliedSlot, committed_us
     );
 }
 
-/// The low-latency options of the cache mesh: send a part as soon as it is
-/// published, unless `sync_on_publish` is off, and journal each part sent to
-/// a child when the journal records.
+/// The low-latency options of the cache mesh: journal each part sent to a
+/// child when the journal records. The mesh always sends a part as soon as
+/// it is published.
 fn with_low_latency_mesh_options(
     config: CacheMeshConfig,
-    sync_on_publish: bool,
     journal: &Arc<HopJournal>,
 ) -> CacheMeshConfig {
-    let config = config.with_sync_on_publish(sync_on_publish);
     if journal.is_enabled() {
         config.with_send_observer(mesh_sent_journal_observer(Arc::clone(journal)))
     } else {
@@ -14192,11 +14263,6 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
             "av_mesh_transport_sync_interval_seconds",
             "Configured cache-mesh replication scan interval in seconds.",
             snapshot.mesh_transport.sync_interval_ms as f64 / 1_000.0,
-        ),
-        (
-            "av_mesh_transport_sync_on_publish",
-            "1 when the cache mesh sends a part as soon as it is published, 0 when it waits for the sync tick.",
-            f64::from(u8::from(snapshot.mesh_transport.sync_on_publish)),
         ),
         (
             "av_mesh_transport_fec_repair_ratio",
@@ -15606,7 +15672,7 @@ fn derive_mesh_alerts(
         alerts.push(MeshAlert {
             level: "warn",
             code: "linode_private_discovery_inactive",
-            message: "Linode provisioning is configured, but private-subnet discovery is not active; new VLAN nodes may need explicit seed peers.".into(),
+            message: "Linode provisioning is configured, but private-subnet discovery is not active; new VLAN nodes need explicit peers: the cache mesh takes datagrams only from the peers that each node lists with --peer, in both directions.".into(),
             count: 1,
             last_seen_unix_ms: Some(now),
             node_id: Some(local_node_id.to_owned()),
@@ -18793,10 +18859,9 @@ impl AppRouter {
                 let Some(stream_id) = request.stream_id else {
                     return "local warm skipped: missing stream id".into();
                 };
-                let _ = self
-                    .cache
+                self.cache
                     .chunk_cache
-                    .get_or_create_stream_idx(stream_id)
+                    .resolve_or_create_stream(stream_id)
                     .await;
                 self.request_replica_for_stream(
                     stream_id,
@@ -19162,10 +19227,10 @@ impl AppRouter {
         let Ok(slot) = usize::try_from(seq) else {
             return false;
         };
-        let Some(stream_idx) = self.cache.chunk_cache.get_stream_idx(stream_id).await else {
+        let Some(handle) = self.cache.chunk_cache.resolve_stream(stream_id) else {
             return false;
         };
-        let Some(head) = self.cache.chunk_cache.last(stream_idx) else {
+        let Some(head) = self.cache.chunk_cache.last_for_handle(handle) else {
             return false;
         };
         // A part at or beyond the stored head has not been published to this
@@ -19199,7 +19264,7 @@ impl AppRouter {
             && self
                 .cache
                 .chunk_cache
-                .get_for_stream_id(stream_id, slot + count as usize)
+                .get_for_handle(handle, slot + count as usize)
                 .await
                 .is_none()
         {
@@ -23077,7 +23142,7 @@ mod tests {
             .unwrap();
         let _ = cache.playlist_for_stream_id(stream_id).await;
 
-        assert!(cache.chunk_cache.get_stream_idx(stream_id).await.is_some());
+        assert!(cache.chunk_cache.resolve_stream(stream_id).is_some());
         assert!(cache.part_available_unix_us(stream_id, 1).await.is_some());
         assert!(cache
             .canonical_commit_locks
@@ -23091,12 +23156,12 @@ mod tests {
                 .await,
             1
         );
-        assert!(cache.chunk_cache.get_stream_idx(stream_id).await.is_none());
+        assert!(cache.chunk_cache.resolve_stream(stream_id).is_none());
         assert!(cache.playlist_cache.iter().all(|cached| cached
             .read()
             .unwrap()
             .as_ref()
-            .is_none_or(|entry| entry.stream_id != stream_id)));
+            .is_none_or(|entry| entry.handle.stream_id() != stream_id)));
         assert!(!cache
             .canonical_commit_locks
             .lock()
@@ -23179,15 +23244,15 @@ mod tests {
             cache.get_part_for_stream_id(stream_id, 1).await.unwrap().0,
             Bytes::from_static(b"moofmdat-one")
         );
-        let stream_idx = cache.chunk_cache.get_stream_idx(stream_id).await.unwrap();
-        assert_eq!(cache.chunk_cache.last(stream_idx), Some(1));
+        let handle = cache.chunk_cache.resolve_stream(stream_id).unwrap();
+        assert_eq!(cache.chunk_cache.last_for_handle(handle), Some(1));
 
-        let version = cache.chunk_cache.version(stream_idx).unwrap();
+        let version = cache.chunk_cache.version_for_handle(handle).unwrap();
         cache
             .commit_stream_payload(stream_id, part_zero)
             .await
             .unwrap();
-        assert_eq!(cache.chunk_cache.version(stream_idx), Some(version));
+        assert_eq!(cache.chunk_cache.version_for_handle(handle), Some(version));
 
         let conflicting_zero = encode_test_canonical_fmp4_object(
             stream_id,
@@ -23714,16 +23779,16 @@ mod tests {
         let edge_addr = unused_loopback_addr();
         let parent_cache = canonical_gap_test_cache().await;
         let edge_cache = canonical_gap_test_cache().await;
-        // Neither mesh pushes during the test, so only a repair request can
-        // deliver the missing part: no tick in the test and no send on
-        // publication.
+        // The parent pushes nothing to the edge during the test, so only a
+        // repair request can deliver the missing part: no tick in the test,
+        // and a part is sent on publication only to a child that holds a
+        // lease for its playlist, which the edge never takes.
         let mut parent_config = CacheMeshConfig::new("hole-parent", "uk", parent_addr)
             .with_peer(edge_addr)
-            .with_sync_on_publish(false);
+            .with_replication(ReplicationMode::Demand);
         parent_config.sync_interval = Duration::from_secs(60);
-        let mut edge_config = CacheMeshConfig::new("hole-edge", "uk", edge_addr)
-            .with_peer(parent_addr)
-            .with_sync_on_publish(false);
+        let mut edge_config =
+            CacheMeshConfig::new("hole-edge", "uk", edge_addr).with_peer(parent_addr);
         edge_config.sync_interval = Duration::from_secs(60);
         let parent_mesh = CacheMesh::new(Arc::clone(&parent_cache.chunk_cache), parent_config)
             .start()
@@ -23941,8 +24006,8 @@ mod tests {
 
     /// The contiguous watermark exactly as the cache-mesh sync loop reads it.
     async fn canonical_gap_test_watermark(cache: &LiveTsCache, stream_id: u64) -> Option<usize> {
-        let stream_idx = cache.chunk_cache.get_stream_idx(stream_id).await?;
-        cache.chunk_cache.last(stream_idx)
+        let handle = cache.chunk_cache.resolve_stream(stream_id)?;
+        cache.chunk_cache.last_for_handle(handle)
     }
 
     /// Slot presence exactly as the cache-mesh sync loop reads it.
@@ -23951,10 +24016,10 @@ mod tests {
         stream_id: u64,
         sequence: usize,
     ) -> bool {
-        let stream_idx = cache.chunk_cache.get_stream_idx(stream_id).await.unwrap();
+        let handle = cache.chunk_cache.resolve_stream(stream_id).unwrap();
         cache
             .chunk_cache
-            .get(stream_idx, sequence)
+            .get_for_handle(handle, sequence)
             .await
             .is_some_and(|(bytes, hash)| hash != 0 || !bytes.is_empty())
     }
@@ -24153,11 +24218,11 @@ mod tests {
                 canonical_gap_test_watermark(&legacy, stream_id).await,
                 "watermark after committing part {sequence}"
             );
-            let stream_idx = cache.chunk_cache.get_stream_idx(stream_id).await.unwrap();
-            let legacy_idx = legacy.chunk_cache.get_stream_idx(stream_id).await.unwrap();
+            let handle = cache.chunk_cache.resolve_stream(stream_id).unwrap();
+            let legacy_handle = legacy.chunk_cache.resolve_stream(stream_id).unwrap();
             assert_eq!(
-                cache.chunk_cache.version(stream_idx),
-                legacy.chunk_cache.version(legacy_idx),
+                cache.chunk_cache.version_for_handle(handle),
+                legacy.chunk_cache.version_for_handle(legacy_handle),
                 "cache writes after committing part {sequence}"
             );
         }
@@ -24221,12 +24286,8 @@ mod tests {
             canonical_gap_test_watermark(&cache, gapped_stream).await,
             Some(4)
         );
-        let complete_idx = cache
-            .chunk_cache
-            .get_stream_idx(complete_stream)
-            .await
-            .unwrap();
-        let complete_version = cache.chunk_cache.version(complete_idx);
+        let complete_handle = cache.chunk_cache.resolve_stream(complete_stream).unwrap();
+        let complete_version = cache.chunk_cache.version_for_handle(complete_handle);
 
         let committed_ms = now_unix_ms();
         assert_eq!(
@@ -24266,7 +24327,10 @@ mod tests {
             canonical_gap_test_watermark(&cache, complete_stream).await,
             Some(8)
         );
-        assert_eq!(cache.chunk_cache.version(complete_idx), complete_version);
+        assert_eq!(
+            cache.chunk_cache.version_for_handle(complete_handle),
+            complete_version
+        );
         assert_eq!(
             cache
                 .flush_idle_canonical_gaps(committed_ms + hold_ms + 2_000)
@@ -26942,7 +27006,7 @@ mod tests {
             .await;
 
         assert!(response.ok);
-        assert!(cache.chunk_cache.get_stream_idx(88).await.is_some());
+        assert!(cache.chunk_cache.resolve_stream(88).is_some());
         assert_eq!(response.command.unwrap().kind, ControlKind::WarmStream);
         assert!(router
             .control
@@ -27247,12 +27311,7 @@ mod tests {
 
         timeout(Duration::from_secs(3), async {
             loop {
-                if collector_cache
-                    .chunk_cache
-                    .get_stream_idx(77)
-                    .await
-                    .is_some()
-                {
+                if collector_cache.chunk_cache.resolve_stream(77).is_some() {
                     break;
                 }
                 sleep(Duration::from_millis(25)).await;
@@ -27573,7 +27632,7 @@ mod tests {
         let envelope: ControlEnvelope = serde_json::from_slice(&message.data()[0]).unwrap();
         assert_eq!(envelope.target_node_ids, vec!["jp-edge-1"]);
         assert_eq!(envelope.request.region.as_deref(), Some("jp-east"));
-        assert!(cache.chunk_cache.get_stream_idx(77).await.is_none());
+        assert!(cache.chunk_cache.resolve_stream(77).is_none());
         mesh.shutdown();
     }
 
@@ -27705,7 +27764,7 @@ mod tests {
         assert_eq!(envelope.request.stream_id, Some(77));
         assert_eq!(envelope.request.region.as_deref(), Some("jp-east"));
         assert_eq!(envelope.target_node_ids, vec!["jp-full", "jp-healthy"]);
-        assert!(cache.chunk_cache.get_stream_idx(77).await.is_none());
+        assert!(cache.chunk_cache.resolve_stream(77).is_none());
         mesh.shutdown();
     }
 
@@ -27731,7 +27790,7 @@ mod tests {
         };
 
         assert!(router.ingest_tcp_changes_payload(payload).await.unwrap());
-        assert!(cache.chunk_cache.get_stream_idx(92).await.is_some());
+        assert!(cache.chunk_cache.resolve_stream(92).is_some());
         assert!(router.control.recent().await.iter().any(|command| {
             command.kind == ControlKind::WarmStream && command.status.contains("central")
         }));
@@ -27760,7 +27819,7 @@ mod tests {
         };
 
         assert!(!router.ingest_tcp_changes_payload(payload).await.unwrap());
-        assert!(cache.chunk_cache.get_stream_idx(93).await.is_none());
+        assert!(cache.chunk_cache.resolve_stream(93).is_none());
         mesh.shutdown();
     }
 
@@ -27834,8 +27893,7 @@ mod tests {
         assert_eq!(response.status, StatusCode::ACCEPTED);
         assert!(cache
             .chunk_cache
-            .get_stream_idx(SNOWFLAKE_STREAM_ID)
-            .await
+            .resolve_stream(SNOWFLAKE_STREAM_ID)
             .is_some());
         let commands = router.control.recent().await;
         assert_eq!(commands.len(), 2);
@@ -27876,7 +27934,7 @@ mod tests {
             .iter()
             .any(|command| command.kind == ControlKind::WarmStream
                 && command.status.contains("published AVMC control")));
-        assert!(cache.chunk_cache.get_stream_idx(77).await.is_none());
+        assert!(cache.chunk_cache.resolve_stream(77).is_none());
         let message = rx.recv().await.unwrap();
         assert_eq!(message.tag(), CONTROL_TAG);
         let envelope: ControlEnvelope = serde_json::from_slice(&message.data()[0]).unwrap();
@@ -29834,7 +29892,7 @@ mod tests {
         assert_eq!(
             cache.stream_position_for_id(stream_id).await,
             Some((
-                cache.chunk_cache.get_stream_idx(stream_id).await.unwrap(),
+                cache.chunk_cache.resolve_stream(stream_id).unwrap(),
                 sequence as usize
             ))
         );
@@ -32794,7 +32852,6 @@ mod tests {
                     .with_peer(edge_addr)
                     .with_role(MeshRole::Distributor)
                     .with_announce_interval(Duration::from_millis(40))
-                    .with_sync_on_publish(true)
                     .with_socket_buffer_bytes(8 << 20)
                     .with_class_port_offset(offset)
                     .with_stream_classifier(classify(&parent_cache)),
@@ -33287,7 +33344,6 @@ mod tests {
         let args = Args::try_parse_from(["av-mesh"]).unwrap();
         assert_eq!(args.edge_parents_silent_ms, 1_500);
         assert!(args.edge_region_silence_holds);
-        assert!(args.mesh_liveness_on_receipt);
         assert_eq!(args.client_udp_send_queue_ms, 250);
         assert_eq!(args.client_udp_playout_ms, 500);
         assert_eq!(args.client_udp_move_hold_down_ms, 3_000);
@@ -33297,7 +33353,6 @@ mod tests {
             "400",
             "--edge-region-silence-holds",
             "false",
-            "--mesh-liveness-on-receipt=false",
             "--client-udp-send-queue-ms",
             "0",
             "--client-udp-playout-ms",
@@ -33308,7 +33363,6 @@ mod tests {
         .unwrap();
         assert_eq!(args.edge_parents_silent_ms, 400);
         assert!(!args.edge_region_silence_holds);
-        assert!(!args.mesh_liveness_on_receipt);
         assert_eq!(args.client_udp_send_queue_ms, 0);
         assert_eq!(args.client_udp_playout_ms, 0);
         assert_eq!(args.client_udp_move_hold_down_ms, 0);
@@ -33385,7 +33439,6 @@ mod tests {
             .unwrap()
             .normalized()
             .unwrap();
-        assert!(args.mesh_sync_on_publish);
         assert!(args.relay_forward_nonblocking);
         // Unset, the journal holds 30 s of 2.5 ms parts, and no less than
         // the fixed default.
@@ -33398,8 +33451,6 @@ mod tests {
 
         let args = Args::try_parse_from([
             "av-mesh",
-            "--mesh-sync-on-publish",
-            "false",
             "--relay-forward-nonblocking=false",
             "--hop-journal-capacity",
             "0",
@@ -33407,30 +33458,25 @@ mod tests {
         .unwrap()
         .normalized()
         .unwrap();
-        assert!(!args.mesh_sync_on_publish);
         assert!(!args.relay_forward_nonblocking);
         assert_eq!(args.hop_journal_capacity, Some(0));
 
-        let args = Args::try_parse_from(["av-mesh", "--mesh-sync-on-publish", "true"]).unwrap();
-        assert!(args.mesh_sync_on_publish);
+        // The mesh always sends on publish: there is no flag to turn it off.
+        assert!(Args::try_parse_from(["av-mesh", "--mesh-sync-on-publish", "true"]).is_err());
         // A bare flag is not accepted, so that `false` cannot be lost.
         assert!(Args::try_parse_from(["av-mesh", "--relay-forward-nonblocking"]).is_err());
 
-        // The flag and the journal reach the cache-mesh configuration.
+        // The journal reaches the cache-mesh configuration.
         let journal = Arc::new(HopJournal::new("n", 8));
         let config = with_low_latency_mesh_options(
             CacheMeshConfig::new("n", "uk", unused_loopback_addr()),
-            false,
             &journal,
         );
-        assert!(!config.sync_on_publish);
         assert!(format!("{config:?}").contains("send_observer: Some(..)"));
         let config = with_low_latency_mesh_options(
             CacheMeshConfig::new("n", "uk", unused_loopback_addr()),
-            true,
             &Arc::new(HopJournal::new("n", 0)),
         );
-        assert!(config.sync_on_publish);
         assert!(format!("{config:?}").contains("send_observer: None"));
     }
 
@@ -34241,7 +34287,7 @@ mod tests {
         /// first tick of its sync task, at start, chooses the edge as a
         /// child. With a long `sync_interval` no other tick comes during a
         /// test: a part reaches the edge only if it is sent on publication.
-        async fn start(sync_on_publish: bool, sync_interval: Duration) -> Self {
+        async fn start(sync_interval: Duration) -> Self {
             let distributor_addr = unused_loopback_addr();
             let edge_addr = unused_loopback_addr();
             let distributor = journaled_test_cache("distributor").await;
@@ -34251,7 +34297,6 @@ mod tests {
                 CacheMeshConfig::new("hop-distributor", "uk", distributor_addr)
                     .with_role(CacheMeshRole::Distributor)
                     .with_peer(edge_addr),
-                sync_on_publish,
                 &distributor_journal,
             );
             distributor_config.sync_interval = sync_interval;
@@ -34318,7 +34363,7 @@ mod tests {
         use tokio::time::timeout;
 
         // No tick after the first one: every part must leave on publication.
-        let pair = HopMeshPair::start(true, Duration::from_secs(60)).await;
+        let pair = HopMeshPair::start(Duration::from_secs(60)).await;
         let (distributor, edge, router) = (&pair.distributor, &pair.edge, &pair.router);
         let stream_id = 77;
         for sequence in 0..4_u64 {
@@ -34393,31 +34438,6 @@ mod tests {
         assert!(received
             .iter()
             .all(|event| event.peer == Some(pair.distributor_addr)));
-        pair.shutdown();
-    }
-
-    #[tokio::test]
-    async fn without_sync_on_publish_a_part_waits_for_the_tick() {
-        // The only tick that runs is the first one, before the part.
-        let pair = HopMeshPair::start(false, Duration::from_secs(60)).await;
-        let stream_id = 78;
-        pair.commit(stream_id, 0).await;
-        assert_eq!(
-            hop_events(&pair.distributor, HopStage::Committed, stream_id).len(),
-            1
-        );
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            hop_events(&pair.distributor, HopStage::MeshSent, stream_id).is_empty(),
-            "the distributor sent a part between ticks"
-        );
-        assert!(hop_events(&pair.edge, HopStage::EdgeCommitted, stream_id).is_empty());
-        assert!(pair
-            .edge
-            .chunk_cache
-            .get_for_stream_id(stream_id, 0)
-            .await
-            .is_none());
         pair.shutdown();
     }
 
@@ -35642,7 +35662,9 @@ mod tests {
             fast_plane::TrafficClass::Video,
             RelayIngressParentPath::Secondary,
         );
-        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        // Slots that hold the tests' 4K parts (up to 400 KB): the cache
+        // refuses a part larger than its slot.
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 512).await;
         cache.set_hop_journal(Arc::new(HopJournal::new("relay-london", 4_096)));
         if let Some(forwarder) = &forwarder {
             forwarder.set_hop_journal(Arc::new(HopJournal::new("relay-london", 4_096)));
@@ -36802,7 +36824,6 @@ mod tests {
                 .with_peer(edge_addr)
                 .with_class_port_offset(offset)
                 .with_stream_classifier(classify(&distributor)),
-            true,
             &journal,
         );
         // Behind the marker (where the edge's cut-through is): the class of
@@ -36973,7 +36994,6 @@ mod tests {
                     .with_peer(edge_addr)
                     .with_role(MeshRole::Distributor)
                     .with_announce_interval(Duration::from_millis(40))
-                    .with_sync_on_publish(true)
                     .with_socket_buffer_bytes(8 << 20)
                     .with_class_port_offset(offset)
                     .with_stream_classifier(classify(&parent_cache)),

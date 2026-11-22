@@ -269,7 +269,9 @@ impl LaneEdge {
             UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap(),
             UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap(),
         ];
-        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 2_048, 64).await;
+        // Slots of the node's default --slot-kb: the merged cache refuses a
+        // part larger than its slot, and a 4K frame is hundreds of kB.
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 2_048, 2_048).await;
         // The edge's hop journal, as a node keeps one (`--hop-journal-capacity`).
         let journal = Arc::new(HopJournal::new("edge-lane", 1 << 18));
         cache.set_hop_journal(Arc::clone(&journal));

@@ -229,13 +229,13 @@ impl HoleTrigger {
     fn ask(&self, stream_id: u64, from: u64, upto: u64, parents: usize) {
         let chunk_cache = &self.cache.chunk_cache;
         // A stream this node holds nothing of yet has no holes.
-        if chunk_cache.stream_idx(stream_id).is_none() {
+        let Some(handle) = chunk_cache.resolve_stream(stream_id) else {
             return;
-        }
+        };
         let missing = |slot: u64| {
             usize::try_from(slot).is_ok_and(|slot| {
                 chunk_cache
-                    .written_unix_us_for_stream_id(stream_id, slot)
+                    .written_unix_us_for_handle(handle, slot)
                     .is_none()
             })
         };

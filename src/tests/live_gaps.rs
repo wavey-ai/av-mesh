@@ -64,8 +64,8 @@ async fn commit(cache: &LiveTsCache, sequence: u64) {
 }
 
 async fn watermark(cache: &LiveTsCache) -> Option<usize> {
-    let stream_idx = cache.chunk_cache.get_stream_idx(STREAM).await?;
-    cache.chunk_cache.last(stream_idx)
+    let handle = cache.chunk_cache.resolve_stream(STREAM)?;
+    cache.chunk_cache.last_for_handle(handle)
 }
 
 #[test]
