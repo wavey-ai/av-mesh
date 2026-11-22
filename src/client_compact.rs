@@ -656,6 +656,9 @@ pub const MAX_HOLE_RUN: u64 = 256;
 pub const MAX_GAP_HOLES: usize = 64;
 /// Parts that the receiver remembers (for windows and duplicates).
 const MEMORY: usize = 4_096;
+/// The fewest parts whose bytes a receiver keeps for window repair: a
+/// window spans at most [`MAX_WINDOW`] parts.
+pub const MIN_KNOWN_PARTS: usize = 2 * MAX_WINDOW as usize;
 /// A part, or a window, is counted for loss once its datagrams have had
 /// this long to arrive.
 const SETTLE: Duration = Duration::from_millis(150);
@@ -742,12 +745,29 @@ pub struct CompactReceiver {
     /// the generations before it (their late datagrams are dropped).
     generation: Option<u8>,
     old_generations: VecDeque<u8>,
+    /// Parts whose bytes are kept for window repair (0: [`MEMORY`]).
+    known_parts: usize,
     pub stats: CompactStats,
 }
 
 impl CompactReceiver {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Keep the bytes of the last `parts` parts for window repair (at
+    /// least [`MIN_KNOWN_PARTS`]), not 4,096: a load host that runs
+    /// thousands of receivers keeps a few hundred each.
+    pub fn set_known_parts(&mut self, parts: usize) {
+        self.known_parts = parts.max(MIN_KNOWN_PARTS);
+    }
+
+    fn known_limit(&self) -> usize {
+        if self.known_parts == 0 {
+            MEMORY
+        } else {
+            self.known_parts
+        }
     }
 
     /// The part that the edge will send first (its `OK`): the reference
@@ -861,7 +881,7 @@ impl CompactReceiver {
     fn remember(&mut self, part: u64, datagram: Vec<u8>) {
         if self.known.insert(part, datagram).is_none() {
             self.known_order.push_back(part);
-            if self.known_order.len() > MEMORY {
+            if self.known_order.len() > self.known_limit() {
                 if let Some(old) = self.known_order.pop_front() {
                     self.known.remove(&old);
                 }
@@ -1234,6 +1254,26 @@ impl CompactReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_receiver_keeps_the_bytes_of_as_many_parts_as_it_is_told() {
+        let now = Instant::now();
+        let mut default = CompactReceiver::new();
+        let mut small = CompactReceiver::new();
+        small.set_known_parts(200);
+        for receiver in [&mut default, &mut small] {
+            receiver.expect_from(0, true);
+            for part in 0..5_000_u64 {
+                let datagram = encode_part(part, 1, &payload(part, 300)).unwrap();
+                assert_eq!(receiver.push(&datagram, now, 1).len(), 1);
+            }
+        }
+        assert_eq!(default.known.len(), MEMORY);
+        assert_eq!(small.known.len(), 200);
+        // Never fewer than a window needs.
+        small.set_known_parts(1);
+        assert_eq!(small.known_limit(), MIN_KNOWN_PARTS);
+    }
 
     fn payload(part: u64, len: usize) -> Vec<u8> {
         (0..len).map(|i| (i as u64 * 7 + part * 13) as u8).collect()
