@@ -108,12 +108,37 @@ impl LeaseChild {
     }
 }
 
+/// The children of one stream, and when the fast plane last fed them.
+#[derive(Debug)]
+struct LeaseStream {
+    /// Indexes into the snapshot's `children`.
+    children: Box<[u16]>,
+    /// When the class thread last planned a datagram of the stream to a
+    /// child (unix µs), kept across rebuilds while the stream has a lease.
+    fed_us: Arc<AtomicU64>,
+}
+
 /// The children of each stream, as the class threads read them.
 #[derive(Debug, Default)]
 pub struct LeaseSnapshot {
-    /// Indexes into `children`, by the stream id as RLS1 carries it.
-    streams: HashMap<Box<str>, Box<[u16]>>,
+    /// By the stream id as RLS1 carries it.
+    streams: HashMap<Box<str>, LeaseStream>,
     pub children: Box<[Arc<LeaseChild>]>,
+}
+
+/// The decimal form of a stream id, as RLS1 carries it, without allocating.
+fn stream_digits(stream_id: u64, digits: &mut [u8; 20]) -> &str {
+    let mut at = digits.len();
+    let mut value = stream_id;
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    std::str::from_utf8(&digits[at..]).unwrap_or_default()
 }
 
 impl LeaseSnapshot {
@@ -121,27 +146,35 @@ impl LeaseSnapshot {
     /// whether this forwarder is its primary. No allocation.
     pub fn feeds(&self, ip: IpAddr, stream_id: u64) -> Option<bool> {
         let mut digits = [0_u8; 20];
-        let mut at = digits.len();
-        let mut value = stream_id;
-        loop {
-            at -= 1;
-            digits[at] = b'0' + (value % 10) as u8;
-            value /= 10;
-            if value == 0 {
-                break;
-            }
-        }
-        let stream = std::str::from_utf8(&digits[at..]).ok()?;
-        self.children_of(stream)
+        self.children_of(stream_digits(stream_id, &mut digits))
             .iter()
             .map(|&child| &self.children[usize::from(child)])
             .find(|child| child.ip == ip)
             .map(|child| child.primary)
     }
 
+    /// When the fast plane last fed stream `stream_id` to its children here
+    /// (unix µs; 0: never, or no lease). No allocation.
+    pub fn fed_us(&self, stream_id: u64) -> u64 {
+        let mut digits = [0_u8; 20];
+        self.streams
+            .get(stream_digits(stream_id, &mut digits))
+            .map_or(0, |stream| stream.fed_us.load(Ordering::Relaxed))
+    }
+
     /// The children of a stream, in a stable order.
     pub fn children_of(&self, stream: &str) -> &[u16] {
-        self.streams.get(stream).map_or(&[], |children| children)
+        self.streams
+            .get(stream)
+            .map_or(&[], |stream| &stream.children)
+    }
+
+    /// The children of a stream, and the clock of its last feed, which the
+    /// class thread sets when it plans a datagram to them.
+    pub fn children_and_clock_of(&self, stream: &str) -> Option<(&[u16], &AtomicU64)> {
+        self.streams
+            .get(stream)
+            .map(|stream| (&*stream.children, &*stream.fed_us))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -150,7 +183,10 @@ impl LeaseSnapshot {
 
     /// (child, stream) pairs.
     pub fn pairs(&self) -> usize {
-        self.streams.values().map(|children| children.len()).sum()
+        self.streams
+            .values()
+            .map(|stream| stream.children.len())
+            .sum()
     }
 }
 
@@ -161,6 +197,14 @@ impl LeaseSnapshot {
 /// primary of: their secondary forwarder still pushes). Video keeps the
 /// push. The lease children are set in `slot` once they run; until then
 /// nothing is filtered.
+///
+/// A lease says the fast plane should feed the pair, not that it does: a
+/// pair is filtered only while the class thread fed the stream to the lease
+/// children within the last [`FAST_PLANE_FED_WINDOW_US`]. If this
+/// forwarder's relay ingest of the stream stops (its parents lost, a
+/// subscription or generation mismatch, a stalled class thread) while its
+/// cache still gets the parts another way, the push resumes, and the edge's
+/// hole repair has arrivals to measure from (wave 7 review).
 pub fn live_push_filter(
     slot: Arc<std::sync::OnceLock<Arc<LeaseChildren>>>,
     classes: super::StreamClasses,
@@ -173,12 +217,18 @@ pub fn live_push_filter(
         let Some(lease) = slot.get() else {
             return false;
         };
-        lease
-            .load()
+        let snapshot = lease.load();
+        snapshot
             .feeds(peer.ip(), stream_id)
             .is_some_and(|primary| primary || !primary_only)
+            && crate::now_unix_us().saturating_sub(snapshot.fed_us(stream_id))
+                <= FAST_PLANE_FED_WINDOW_US
     })
 }
+
+/// A pair counts as fed by the fast plane for this long after its stream's
+/// last datagram to the lease children.
+pub const FAST_PLANE_FED_WINDOW_US: u64 = 100_000;
 
 /// Counters of the lease children.
 #[derive(Debug, Default)]
@@ -217,6 +267,8 @@ pub struct LeaseChildren {
 struct Known {
     children: BTreeMap<IpAddr, Arc<LeaseChild>>,
     refused: HashSet<IpAddr>,
+    /// The feed clock of each leased stream, kept across rebuilds.
+    fed: HashMap<Box<str>, Arc<AtomicU64>>,
 }
 
 impl std::fmt::Debug for LeaseChildren {
@@ -375,15 +427,24 @@ impl LeaseChildren {
                 }
             }
         }
+        known.fed.retain(|stream, _| streams.contains_key(stream));
+        let streams = streams
+            .into_iter()
+            .map(|(stream, mut children)| {
+                children.sort_unstable();
+                let fed_us = Arc::clone(known.fed.entry(stream.clone()).or_default());
+                (
+                    stream,
+                    LeaseStream {
+                        children: children.into_boxed_slice(),
+                        fed_us,
+                    },
+                )
+            })
+            .collect();
         drop(known);
         let snapshot = LeaseSnapshot {
-            streams: streams
-                .into_iter()
-                .map(|(stream, mut children)| {
-                    children.sort_unstable();
-                    (stream, children.into_boxed_slice())
-                })
-                .collect(),
+            streams,
             children: children.into_boxed_slice(),
         };
         self.stats
@@ -608,6 +669,19 @@ mod tests {
         // Nothing is filtered before the lease children run.
         assert!(!none(peer("10.0.0.5"), 4001));
         slot.set(Arc::clone(&lease)).unwrap();
+        // Nor while the fast plane has not fed the stream: a lease is not
+        // a delivery.
+        assert!(!none(peer("10.0.0.5"), 4001));
+        let feed = |stream: &str, at_us: u64| {
+            lease
+                .load()
+                .children_and_clock_of(stream)
+                .unwrap()
+                .1
+                .store(at_us, Ordering::Relaxed);
+        };
+        feed("4001", crate::now_unix_us());
+        feed("18446744073709551615", crate::now_unix_us());
         // `none`: no audio push to any child the fast plane feeds.
         assert!(none(peer("10.0.0.5"), 4001));
         assert!(none(peer("10.0.0.6"), 4001));
@@ -617,6 +691,22 @@ mod tests {
         // Video keeps the push; a child without a lease here is no pair.
         assert!(!none(peer("10.0.0.6"), 1));
         assert!(!none(peer("10.0.0.7"), 4001));
+        // The feed stops (the relay ingest of the stream stopped): the
+        // push resumes once the window has passed, for both modes.
+        feed(
+            "4001",
+            crate::now_unix_us() - FAST_PLANE_FED_WINDOW_US - 1_000,
+        );
+        assert!(!none(peer("10.0.0.5"), 4001));
+        assert!(!primary(peer("10.0.0.5"), 4001));
+        assert!(none(peer("10.0.0.6"), u64::MAX), "another stream still fed");
+        // The clock outlives a rebuild of the snapshot.
+        feed("4001", crate::now_unix_us());
+        lease.rebuild(&[
+            served("10.0.0.5:9101", 4001),
+            served("10.0.0.6:9101", 4001),
+        ]);
+        assert!(none(peer("10.0.0.5"), 4001));
     }
 
     #[test]

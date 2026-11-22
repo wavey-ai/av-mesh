@@ -429,9 +429,17 @@ fn plan_lease(
     message: usize,
     view: &RlsView<'_>,
     plan: &mut ForwardPlan,
+    now_us: u64,
 ) {
     let mut object = None;
-    for &child in snapshot.children_of(view.stream) {
+    let Some((children, fed_us)) = snapshot.children_and_clock_of(view.stream) else {
+        return;
+    };
+    if !children.is_empty() {
+        // The cache mesh's push filter reads it (wave 7 item 4).
+        fed_us.store(now_us, Ordering::Relaxed);
+    }
+    for &child in children {
         match snapshot.children[usize::from(child)].takes(class, view.role) {
             LeaseTake::Send => plan.lease.push(PlannedLease {
                 message: message as u16,
@@ -1128,7 +1136,7 @@ impl ClassThread {
                 forwarder.plan_fast(message, &view, plan, now);
             }
             if let Some((_, snapshot)) = &lease {
-                plan_lease(snapshot, class, message, &view, plan);
+                plan_lease(snapshot, class, message, &view, plan, now_us);
             }
             if let Some((lane, snapshot)) = &edge_clients {
                 clients.plan(lane, snapshot, message, &view);
