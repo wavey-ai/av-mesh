@@ -52,7 +52,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tracing::debug;
 
@@ -257,6 +257,10 @@ pub struct EdgeFastLane {
     fds: [AtomicU64; 2],
     rank: u32,
     next_sequence: AtomicU32,
+    /// The compact datagram of a part is made from its envelope read in
+    /// place (`--client-udp-compact-fast-parse`), not from a full decode and
+    /// slot.
+    compact_fast_parse: AtomicBool,
     pub stats: FastLaneStats,
 }
 
@@ -280,8 +284,15 @@ impl EdgeFastLane {
             fds: [AtomicU64::new(u64::MAX), AtomicU64::new(u64::MAX)],
             rank,
             next_sequence: AtomicU32::new(0),
+            compact_fast_parse: AtomicBool::new(true),
             stats: FastLaneStats::default(),
         })
+    }
+
+    /// Make compact datagrams from the envelope read in place (`true`, the
+    /// default) or from the full decode and slot, as before (`false`).
+    pub fn set_compact_fast_parse(&self, fast: bool) {
+        self.compact_fast_parse.store(fast, Ordering::Relaxed);
     }
 
     /// Give the lane its client sockets and subscriber table.
@@ -392,6 +403,18 @@ impl EdgeFastLane {
         }
         let symbol = header.payload(view.fec).ok()?;
         let envelope = symbol.get(4..4 + header.transfer_length as usize)?;
+        // The part read in place: no decode, no slot, no allocation but the
+        // datagram's. Anything it does not plainly read takes the decode.
+        if self.compact_fast_parse.load(Ordering::Relaxed) {
+            if let Some(part) = av_mesh::canonical_slot::envelope_part(envelope) {
+                if part.stream_id != stream_id || part.object != view.object {
+                    return None;
+                }
+                let datagram =
+                    compact::encode_part(view.object, part.published_unix_us, part.media)?;
+                return Some(ring.put(view.object, bytes::Bytes::from(datagram)));
+            }
+        }
         let part = av_mesh::canonical_slot::canonical_part_from_envelope(
             bytes::Bytes::copy_from_slice(envelope),
         )
@@ -552,6 +575,11 @@ pub struct ClientPlan {
     turns: HashMap<SocketAddr, u32>,
     /// Video is sent as UDP GSO messages until the host refuses it once.
     gso: bool,
+    /// The first client that each message of the batch was handed to the
+    /// kernel for, and when the batch's sends returned (the hop journal's
+    /// `udp_sent`, recorded by the tee).
+    first_sent: [Option<SocketAddr>; sys::RECV_BATCH],
+    sent_us: u64,
 }
 
 const REPAIR_MEMO: usize = 64;
@@ -581,6 +609,8 @@ impl ClientPlan {
             memo_next: 0,
             turns: HashMap::new(),
             gso: false,
+            first_sent: [None; sys::RECV_BATCH],
+            sent_us: 0,
         }
     }
 
@@ -590,9 +620,21 @@ impl ClientPlan {
         self
     }
 
+    /// Start a batch.
     pub fn clear(&mut self) {
         self.sends.clear();
         self.clients.clear();
+        self.first_sent = [None; sys::RECV_BATCH];
+    }
+
+    /// The first client that the batch's `message` was handed to the kernel
+    /// for, and when: `None` if it went to no client.
+    pub fn sent_to(&self, message: usize) -> Option<(SocketAddr, u64)> {
+        self.first_sent
+            .get(message)
+            .copied()
+            .flatten()
+            .map(|peer| (peer, self.sent_us))
     }
 
     fn repair_symbols(&mut self, policy: RepairPolicy, k: u32) -> u32 {
@@ -756,7 +798,8 @@ impl ClientPlan {
             return;
         }
         let Some(fd) = lane.fd(class) else {
-            self.clear();
+            self.sends.clear();
+            self.clients.clear();
             return;
         };
         let use_gso = self.gso && class == TrafficClass::Video;
@@ -807,7 +850,10 @@ impl ClientPlan {
         };
         let mut delivered = sent as u64;
         let (mut would_block, mut errors, mut given_back) = (0_u64, 0_u64, 0_u64);
-        let (sends, clients) = (&self.sends, &self.clients);
+        let (sends, clients, first_sent) = (&self.sends, &self.clients, &mut self.first_sent);
+        for send in &sends[..sent.min(sends.len())] {
+            first_sent[usize::from(send.message)].get_or_insert(send.peer);
+        }
         // One more try each for what the kernel did not take, until the
         // socket is full: the rest are refused without a syscall each.
         sys::send_rest(
@@ -818,6 +864,8 @@ impl ClientPlan {
                 match outcome {
                     sys::RestOutcome::Sent => {
                         delivered += 1;
+                        let send = &sends[index];
+                        first_sent[usize::from(send.message)].get_or_insert(send.peer);
                         return;
                     }
                     sys::RestOutcome::WouldBlock => would_block += 1,
@@ -840,7 +888,9 @@ impl ClientPlan {
             }
         }
         lane.stats.datagrams.fetch_add(delivered, Ordering::Relaxed);
-        self.clear();
+        self.sent_us = crate::now_unix_us();
+        self.sends.clear();
+        self.clients.clear();
     }
 }
 

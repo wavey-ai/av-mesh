@@ -356,6 +356,200 @@ pub fn slot_media(payload: &Bytes, stream_id: u64) -> Option<(Bytes, Option<Byte
     decode_fmp4_slot(payload).or_else(|| Some((payload.clone(), None)))
 }
 
+/// The part of a canonical media-object envelope, read in place (see
+/// [`envelope_part`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnvelopePart<'a> {
+    pub stream_id: u64,
+    pub object: u64,
+    /// The `Published` stage timestamp in µs since the epoch, 0 without one
+    /// (as [`object_published_unix_us`] reads it).
+    pub published_unix_us: u64,
+    /// The LL-HLS part bytes: [`slot_media`] of the slot that
+    /// [`canonical_part_from_envelope`] builds.
+    pub media: &'a [u8],
+}
+
+/// Reads a canonical media-object envelope in place.
+struct EnvelopeReader<'a> {
+    input: &'a [u8],
+    at: usize,
+}
+
+impl<'a> EnvelopeReader<'a> {
+    fn take(&mut self, len: usize) -> Option<&'a [u8]> {
+        let end = self.at.checked_add(len)?;
+        let bytes = self.input.get(self.at..end)?;
+        self.at = end;
+        Some(bytes)
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+
+    fn flag(&mut self) -> Option<bool> {
+        match self.u8()? {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_be_bytes(self.take(2)?.try_into().ok()?))
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_be_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_be_bytes(self.take(8)?.try_into().ok()?))
+    }
+
+    fn string(&mut self) -> Option<&'a [u8]> {
+        let len = usize::from(self.u16()?);
+        self.take(len)
+    }
+
+    /// An object key: (stream, object, payload hash).
+    fn key(&mut self) -> Option<(&'a [u8], u64, &'a [u8])> {
+        self.string()?; // tenant
+        let stream = self.string()?;
+        self.string()?; // track
+        self.u64()?; // epoch
+        self.u64()?; // group
+        let object = self.u64()?;
+        self.u32()?; // version
+        let hash = self.take(32)?;
+        Some((stream, object, hash))
+    }
+
+    /// A clock timestamp: its time in ns.
+    fn timestamp(&mut self) -> Option<i64> {
+        let ns = i64::from_be_bytes(self.take(8)?.try_into().ok()?);
+        self.string()?; // clock id
+        if self.u8()? > 3 {
+            return None; // confidence level
+        }
+        if self.flag()? {
+            self.u64()?; // maximum error
+        }
+        Some(ns)
+    }
+}
+
+/// The part bytes and publication time of a canonical media-object envelope,
+/// read in place: no allocation, no copy, and nothing decoded beyond what
+/// the part needs. The same bytes as [`slot_media`] of the slot that
+/// [`canonical_part_from_envelope`] builds, and the same time as
+/// [`object_published_unix_us`] of its object; the payload hash is checked,
+/// as the decode checks it.
+///
+/// `None` for whatever is not plainly such a part (not media, not a numeric
+/// stream, a Soundkit bundle, an empty payload, a malformed layout): the
+/// caller then takes the full decode, which decides. The full decode also
+/// checks the envelope's other canonical rules (orders, limits), which this
+/// does not; the node's commit applies them to the same object.
+pub fn envelope_part(envelope: &[u8]) -> Option<EnvelopePart<'_>> {
+    if envelope.len() < 12 || envelope[..4] != WIRE_MAGIC {
+        return None;
+    }
+    if envelope[4..6] != media_object::WIRE_VERSION.to_be_bytes() || envelope[6..8] != [0, 0] {
+        return None;
+    }
+    let declared = u32::from_be_bytes(envelope[8..12].try_into().ok()?) as usize;
+    if declared != envelope.len() - 12 {
+        return None;
+    }
+    let mut reader = EnvelopeReader {
+        input: envelope,
+        at: 12,
+    };
+    if reader.u8()? != ObjectKind::Media as u8 {
+        return None;
+    }
+    reader.flag()?; // keyframe
+    if reader.u16()? != 0 {
+        return None;
+    }
+    let (stream, object, hash) = reader.key()?;
+    let stream_id = std::str::from_utf8(stream).ok()?.parse::<u64>().ok()?;
+    reader.u64()?; // configuration epoch
+    for _ in 0..2 {
+        // The deadline and the capture timestamp.
+        if reader.flag()? {
+            reader.timestamp()?;
+        }
+    }
+    let mut published_ns: Option<i64> = None;
+    for _ in 0..reader.u16()? {
+        let stage = reader.u8()?;
+        if stage > Stage::PlayerPresented as u8 {
+            return None;
+        }
+        let ns = reader.timestamp()?;
+        if stage == Stage::Published as u8 && published_ns.is_none() {
+            published_ns = Some(ns);
+        }
+    }
+    for _ in 0..reader.u16()? {
+        reader.key()?;
+    }
+    let (mut container, mut payload_format): (Option<&[u8]>, Option<&[u8]>) = (None, None);
+    for _ in 0..reader.u16()? {
+        let key = reader.string()?;
+        let len = reader.u32()? as usize;
+        let value = reader.take(len)?;
+        match key {
+            b"container" => container = Some(value),
+            b"payload-format" => payload_format = Some(value),
+            _ => {}
+        }
+    }
+    let len = reader.u32()? as usize;
+    let payload = reader.take(len)?;
+    if reader.at != envelope.len() || payload.is_empty() {
+        return None;
+    }
+    if payload_format == Some(SOUNDKIT_V2_BUNDLE_FORMAT) {
+        return None;
+    }
+    if media_object::PayloadHash::digest(payload)
+        .as_bytes()
+        .as_slice()
+        != hash
+    {
+        return None;
+    }
+    let media = if container == Some(b"fmp4".as_slice())
+        && payload_format == Some(b"fmp4-slot-v1".as_slice())
+    {
+        if payload.len() < MESH_FMP4_SLOT_HEADER_LEN || !payload.starts_with(MESH_FMP4_SLOT_MAGIC) {
+            return None;
+        }
+        let init_len = u32::from_be_bytes(payload[8..12].try_into().ok()?) as usize;
+        let media_len = u32::from_be_bytes(payload[12..16].try_into().ok()?) as usize;
+        let start = MESH_FMP4_SLOT_HEADER_LEN.checked_add(init_len)?;
+        if start.checked_add(media_len)? != payload.len() {
+            return None;
+        }
+        &payload[start..]
+    } else {
+        payload
+    };
+    let published_unix_us = published_ns
+        .and_then(|ns| u64::try_from(ns).ok())
+        .map_or(0, |ns| ns / 1_000);
+    Some(EnvelopePart {
+        stream_id,
+        object,
+        published_unix_us,
+        media,
+    })
+}
+
 /// When the contributor published the object, in µs since the epoch: its
 /// `Published` stage timestamp.
 pub fn object_published_unix_us(object: &MediaObject) -> Option<u64> {
@@ -463,6 +657,169 @@ mod tests {
         let last = bad.len() - 1;
         bad[last] ^= 1;
         assert!(canonical_part_from_envelope(Bytes::from(bad)).is_err());
+    }
+
+    /// The slow path that the in-place reader stands for: the decode, the
+    /// slot, its part bytes and the publication time.
+    fn decoded_part(envelope: &[u8]) -> Option<(u64, u64, u64, Bytes)> {
+        let part = canonical_part_from_envelope(Bytes::copy_from_slice(envelope)).ok()?;
+        let (media, _) = slot_media(&part.slot, part.stream_id)?;
+        Some((
+            part.stream_id,
+            part.object.key().object(),
+            object_published_unix_us(&part.object).unwrap_or(0),
+            media,
+        ))
+    }
+
+    #[test]
+    fn the_in_place_reader_finds_the_part_that_the_decode_finds() {
+        use media_object::{ClockConfidence, ClockTimestamp, StageTimestamp};
+        let stamp = |ns: i64, confidence: ClockConfidence| {
+            ClockTimestamp::new(ns, "system:realtime:av-contrib", confidence).unwrap()
+        };
+        let mut fmp4 = MESH_FMP4_SLOT_MAGIC.to_vec();
+        fmp4.extend_from_slice(&4_u32.to_be_bytes());
+        fmp4.extend_from_slice(&5_u32.to_be_bytes());
+        fmp4.extend_from_slice(b"initmedia");
+        let mut fmp4_no_init = MESH_FMP4_SLOT_MAGIC.to_vec();
+        fmp4_no_init.extend_from_slice(&0_u32.to_be_bytes());
+        fmp4_no_init.extend_from_slice(&5_u32.to_be_bytes());
+        fmp4_no_init.extend_from_slice(b"media");
+        let opaque: [(&str, &[u8]); 2] = [
+            ("container", b"opaque"),
+            ("payload-format", b"opaque-part-v1"),
+        ];
+        let fmp4_meta: [(&str, &[u8]); 2] =
+            [("container", b"fmp4"), ("payload-format", b"fmp4-slot-v1")];
+        let cases: Vec<(Vec<(&str, &[u8])>, Vec<u8>, bool, bool)> = vec![
+            // (metadata, payload, stage stamps and a deadline, a dependency)
+            (
+                opaque.to_vec(),
+                (0..304).map(|i| i as u8).collect(),
+                true,
+                false,
+            ),
+            (opaque.to_vec(), b"opus".to_vec(), false, false),
+            (fmp4_meta.to_vec(), fmp4.clone(), true, true),
+            (fmp4_meta.to_vec(), fmp4_no_init, true, false),
+            // An fMP4 container without the slot format: the whole payload.
+            (vec![("container", b"fmp4".as_slice())], fmp4, true, false),
+            (
+                vec![("content-type", b"video/mp2t".as_slice())],
+                b"ts".to_vec(),
+                true,
+                true,
+            ),
+            (Vec::new(), b"bare".to_vec(), false, false),
+        ];
+        for (index, (metadata, payload, stamped, dependent)) in cases.into_iter().enumerate() {
+            let key = ObjectKey::for_payload(
+                "default",
+                "4001",
+                "main",
+                3,
+                1,
+                9 + index as u64,
+                1,
+                &payload,
+            )
+            .unwrap();
+            let mut builder = MediaObject::builder(key, ObjectKind::Media, payload.clone());
+            if stamped {
+                builder = builder
+                    .with_deadline(stamp(
+                        1_700_000_005_000_000_000,
+                        ClockConfidence::estimated(1_000),
+                    ))
+                    .with_capture_timestamp(stamp(
+                        1_699_999_999_000_000_000,
+                        ClockConfidence::unknown(),
+                    ))
+                    .with_stage_timestamp(StageTimestamp::new(
+                        Stage::Packaged,
+                        stamp(
+                            1_700_000_000_000_000_000,
+                            ClockConfidence::estimated(1_000_000),
+                        ),
+                    ))
+                    .with_stage_timestamp(StageTimestamp::new(
+                        Stage::Published,
+                        stamp(
+                            1_700_000_000_000_123_456,
+                            ClockConfidence::estimated(1_000_000),
+                        ),
+                    ));
+            }
+            if dependent {
+                builder = builder.with_dependency(
+                    ObjectKey::for_payload("default", "4001", "main-init", 3, 0, 0, 1, b"init")
+                        .unwrap(),
+                );
+            }
+            for (name, value) in &metadata {
+                builder = builder.with_metadata(*name, value.to_vec());
+            }
+            let object = builder.build().unwrap();
+            let wire = envelope(&object);
+            let fast =
+                envelope_part(&wire).unwrap_or_else(|| panic!("case {index}: read in place"));
+            let (stream_id, sequence, published, media) =
+                decoded_part(&wire).unwrap_or_else(|| panic!("case {index}: decoded"));
+            assert_eq!(fast.stream_id, stream_id, "case {index}");
+            assert_eq!(fast.object, sequence, "case {index}");
+            assert_eq!(fast.published_unix_us, published, "case {index}");
+            assert_eq!(fast.media, media.as_ref(), "case {index}");
+            if stamped {
+                assert_eq!(fast.published_unix_us, 1_700_000_000_000_123);
+            }
+        }
+    }
+
+    #[test]
+    fn the_in_place_reader_refuses_what_the_decode_refuses() {
+        let opaque: [(&str, &[u8]); 2] = [
+            ("container", b"opaque"),
+            ("payload-format", b"opaque-part-v1"),
+        ];
+        let good = object(&opaque, b"payload", ObjectKind::Media);
+        let wire = envelope(&good);
+        assert!(envelope_part(&wire).is_some());
+        // A corrupt payload fails its hash; a cut envelope its length.
+        let mut corrupt = wire.to_vec();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 1;
+        assert!(envelope_part(&corrupt).is_none());
+        assert!(decoded_part(&corrupt).is_none());
+        assert!(envelope_part(&wire[..wire.len() - 1]).is_none());
+        assert!(envelope_part(b"not an envelope").is_none());
+        // Not media; a Soundkit bundle; a stream that is not numeric.
+        let init = object(&[], b"ftyp", ObjectKind::Initialization);
+        assert!(envelope_part(&envelope(&init)).is_none());
+        let bundle = object(
+            &[("payload-format", SOUNDKIT_V2_BUNDLE_FORMAT)],
+            b"bundle",
+            ObjectKind::Media,
+        );
+        assert!(envelope_part(&envelope(&bundle)).is_none());
+        assert!(decoded_part(&envelope(&bundle)).is_none());
+        let key =
+            ObjectKey::for_payload("default", "studio", "main", 3, 0, 9, 1, b"payload").unwrap();
+        let named = MediaObject::builder(key, ObjectKind::Media, b"payload".to_vec())
+            .build()
+            .unwrap();
+        assert!(envelope_part(&envelope(&named)).is_none());
+        assert!(decoded_part(&envelope(&named)).is_none());
+        // A slot whose lengths do not match its payload.
+        let mut slot = MESH_FMP4_SLOT_MAGIC.to_vec();
+        slot.extend_from_slice(&4_u32.to_be_bytes());
+        slot.extend_from_slice(&9_u32.to_be_bytes());
+        slot.extend_from_slice(b"initmedia");
+        let fmp4: [(&str, &[u8]); 2] =
+            [("container", b"fmp4"), ("payload-format", b"fmp4-slot-v1")];
+        let bad_slot = object(&fmp4, &slot, ObjectKind::Media);
+        assert!(envelope_part(&envelope(&bad_slot)).is_none());
+        assert!(decoded_part(&envelope(&bad_slot)).is_none());
     }
 
     /// The module stays free of anything that does not build for wasm32.

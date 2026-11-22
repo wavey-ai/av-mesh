@@ -1264,6 +1264,18 @@ struct Args {
     )]
     relay_class_realtime: bool,
 
+    /// SO_BUSY_POLL, in µs, on the audio fast-plane thread's receive
+    /// sockets (forwarders and edges): with the host's net.core.busy_poll
+    /// above zero, the thread's poll() polls the device queue for that long
+    /// before it sleeps, instead of waiting for the interrupt and the
+    /// wake-up (`relay_first -> relay_woken` in the hop journal). An A/B
+    /// for a lab (wave 5, W1): it spends a CPU on the audio thread while it
+    /// polls. Above net.core.busy_read it needs CAP_NET_ADMIN; a refusal is
+    /// logged once and the sockets run without it. 0 (the default) leaves
+    /// busy polling off.
+    #[arg(long, env = "NEEDLETAIL_FAST_BUSY_POLL_US", default_value_t = 0)]
+    fast_busy_poll_us: u32,
+
     /// The video fast-plane thread hands each child a batch's 4K symbols as
     /// UDP GSO messages (UDP_SEGMENT, up to 64 symbols in one pass through
     /// the stack) instead of one send per symbol per child. The per-symbol,
@@ -1684,6 +1696,21 @@ struct Args {
         action = clap::ArgAction::Set
     )]
     client_udp_compact: bool,
+
+    /// The fast lane makes a part's compact datagram on the class thread
+    /// from the contributor's envelope read in place (the part bytes and its
+    /// publication time, payload hash checked), before it sends: no decode,
+    /// no slot, no allocation but the datagram. That took about 20 µs at the
+    /// median and 45 µs at p99 of each part's send in the loopback bench
+    /// (wave 5, W1). `false` decodes the envelope and builds its slot, as
+    /// before. The bytes are the same either way.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_COMPACT_FAST_PARSE",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    client_udp_compact_fast_parse: bool,
 
     /// An edge that has heard none of its cache-mesh parents for this long
     /// has lost them: it answers 503 for a part or a playlist reload that it
@@ -2639,6 +2666,9 @@ async fn main() -> Result<()> {
         && args.relay_controlled_local
         && fast_plane::sys::supported())
     .then(|| fast_plane::edge_clients::EdgeFastLane::new(args.client_udp_edge_rank));
+    if let Some(lane) = &fast_lane {
+        lane.set_compact_fast_parse(args.client_udp_compact_fast_parse);
+    }
     if fast_lane.is_some() && args.client_udp_cut_through {
         info!("edge client UDP: the fast lane runs, so cut-through is off (--client-udp-fast-lane false turns it back on)");
     }
@@ -2802,6 +2832,7 @@ async fn main() -> Result<()> {
                 &format!("relay {} ingest", socket.class.as_str()),
             );
         }
+        apply_fast_busy_poll(&sockets, args.fast_busy_poll_us);
         Some(sockets)
     } else {
         None
@@ -3122,7 +3153,9 @@ async fn main() -> Result<()> {
             )
         };
         Some(tokio::spawn(edge_udp::run_edge_udp(
-            sockets.with_fast_lane(fast_lane.clone()),
+            sockets
+                .with_fast_lane(fast_lane.clone())
+                .with_hop_journal(Some(Arc::clone(&hop_journal))),
             router.clone(),
             edge_udp::EdgeUdpConfig {
                 symbol_size: args.client_udp_symbol_size,
@@ -6380,6 +6413,36 @@ async fn process_udp_fec_ingest_datagram_inner(
 /// Journal the arrival of a RelaySession symbol: `relay_first` for the
 /// first symbol of an object, and `relay_decoded` when the symbol completed
 /// it.
+/// `--fast-busy-poll-us` on the audio class receive sockets; a refusal is
+/// said once and leaves them without it.
+fn apply_fast_busy_poll(sockets: &[fast_plane::relay::ClassSocket], micros: u32) {
+    if micros == 0 {
+        return;
+    }
+    let audio = sockets
+        .iter()
+        .filter(|socket| socket.class == fast_plane::TrafficClass::Audio);
+    let mut set = 0;
+    for socket in audio {
+        match fast_plane::sys::set_busy_poll(&socket.socket, micros) {
+            Ok(()) => set += 1,
+            Err(error) => {
+                info!(
+                    micros,
+                    error = %error,
+                    "--fast-busy-poll-us refused: the audio fast-plane sockets run without busy polling"
+                );
+                return;
+            }
+        }
+    }
+    info!(
+        micros,
+        sockets = set,
+        "audio fast-plane sockets busy-poll (needs net.core.busy_poll above zero for poll())"
+    );
+}
+
 fn journal_relay_symbol(
     cache: &LiveTsCache,
     key: &media_object::ObjectKey,
@@ -36804,4 +36867,8 @@ mod tests {
     /// Burst copies on the long-haul lanes: a burst of loss cannot take a
     /// part at the next forwarder.
     mod burst_copy;
+
+    /// An edge's fixed costs per part from its hop journal: receipt, wake,
+    /// work and the send to its UDP clients.
+    mod edge_fixed_cost;
 }

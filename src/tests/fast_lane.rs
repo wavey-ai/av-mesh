@@ -270,6 +270,9 @@ impl LaneEdge {
             UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap(),
         ];
         let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 2_048, 64).await;
+        // The edge's hop journal, as a node keeps one (`--hop-journal-capacity`).
+        let journal = Arc::new(HopJournal::new("edge-lane", 1 << 18));
+        cache.set_hop_journal(Arc::clone(&journal));
         let lane = EdgeFastLane::new(0);
         let mesh = Arc::new(
             CacheMesh::new(
@@ -322,7 +325,8 @@ impl LaneEdge {
             cache.stream_classes(),
         )
         .unwrap()
-        .with_fast_lane(Some(Arc::clone(&lane)));
+        .with_fast_lane(Some(Arc::clone(&lane)))
+        .with_hop_journal(Some(journal));
         let client_port = client_sockets
             .class_socket(fast_plane::TrafficClass::Audio)
             .local_addr()

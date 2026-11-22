@@ -22,6 +22,7 @@
 
 use crate::fast_plane::edge_clients::{EdgeFastLane, FastClient, FastGroup};
 use crate::fast_plane::{StreamClasses, TrafficClass};
+use crate::hop_journal::HopJournal;
 use crate::{AppRouter, ParentsLost};
 use av_mesh::client_compact as compact;
 use av_mesh::client_udp::{
@@ -294,6 +295,8 @@ pub(crate) struct EdgeSockets {
     fast_lane: Option<Arc<EdgeFastLane>>,
     /// The compact lane's datagrams, shared by every lane.
     compact: Arc<CompactStore>,
+    /// The node's hop journal, for `udp_sent`.
+    journal: Option<Arc<HopJournal>>,
 }
 
 /// Where a stream's datagrams leave from: its socket, and the socket's send
@@ -302,6 +305,7 @@ pub(crate) struct EdgeSockets {
 pub(crate) struct ClientOut<'a> {
     socket: &'a Arc<UdpSocket>,
     queue: Option<&'a Arc<SendQueue>>,
+    journal: Option<&'a HopJournal>,
 }
 
 /// What became of one datagram for one client.
@@ -316,6 +320,14 @@ pub(crate) enum SendOutcome {
 }
 
 impl ClientOut<'_> {
+    /// The hop journal's `udp_sent`: a send of `part` to `peer` (the first
+    /// client of the send) was just handed to the kernel.
+    pub(crate) fn journal_sent(&self, stream_id: u64, part: u64, peer: Option<SocketAddr>) {
+        if let (Some(journal), Some(peer)) = (self.journal, peer) {
+            journal.record_udp_sent(stream_id, part, peer, crate::now_unix_us());
+        }
+    }
+
     /// Send now, or queue if the socket is full; never waits.
     pub(crate) fn send(
         &self,
@@ -479,6 +491,7 @@ impl EdgeSockets {
             video_queue: None,
             fast_lane: None,
             compact: Arc::default(),
+            journal: None,
         }
     }
 
@@ -491,7 +504,15 @@ impl EdgeSockets {
             video_queue: None,
             fast_lane: None,
             compact: Arc::default(),
+            journal: None,
         }
+    }
+
+    /// Journal the parts sent to clients (`udp_sent`) in `journal`, if it
+    /// keeps events.
+    pub(crate) fn with_hop_journal(mut self, journal: Option<Arc<HopJournal>>) -> Self {
+        self.journal = journal.filter(|journal| journal.is_enabled());
+        self
     }
 
     /// The compact lane's datagrams.
@@ -546,10 +567,12 @@ impl EdgeSockets {
             (Some(video), TrafficClass::Video) => ClientOut {
                 socket: video,
                 queue: self.video_queue.as_ref(),
+                journal: self.journal.as_deref(),
             },
             _ => ClientOut {
                 socket: &self.audio,
                 queue: self.audio_queue.as_ref(),
+                journal: self.journal.as_deref(),
             },
         }
     }
@@ -1911,10 +1934,14 @@ async fn deliver(
             gap_object(stream_id, part)
         }
     };
+    let is_part = object.kind == ObjectKind::Part;
     if !compact_targets.is_empty() {
         match store.of_object(&object) {
             Some(canonical) => {
                 send_compact(out, config, stats, &canonical, &compact_targets).await;
+                if is_part {
+                    out.journal_sent(stream_id, part, compact_targets.first().map(|t| t.0));
+                }
             }
             // Too large for one datagram: a RaptorQ object, as for the rest.
             None => targets.extend(
@@ -1926,6 +1953,9 @@ async fn deliver(
     }
     if !targets.is_empty() {
         send_object(out, config, stats, &object, &targets).await;
+        if is_part {
+            out.journal_sent(stream_id, part, targets.first().map(|t| t.0));
+        }
     }
 }
 
@@ -2382,6 +2412,7 @@ fn send_now(
 fn send_compact_now(
     inner: &CutInner,
     stream_id: u64,
+    part: u64,
     canonical: &[u8],
     clients: &[(SocketAddr, RepairPolicy, CompactPlan)],
 ) {
@@ -2412,6 +2443,7 @@ fn send_compact_now(
     } else {
         out.send_each(&inner.stats, &list)
     };
+    out.journal_sent(stream_id, part, clients.first().map(|c| c.0));
     inner
         .stats
         .cut_through_datagrams
@@ -2473,6 +2505,13 @@ fn forward_symbol(
         };
         route.sequence = route.sequence.wrapping_add(1);
         *done = send_now(inner, route.stream_id, &datagram, clients);
+        if client_esi == 0 {
+            inner.sockets.out_for_stream(route.stream_id).journal_sent(
+                route.stream_id,
+                route.slot,
+                clients.first().map(|c| c.0),
+            );
+        }
     }
 }
 
@@ -2633,6 +2672,10 @@ impl CacheMeshReceiveObserver for CutThrough {
             send: inner.config.batch_send,
             gso: inner.config.gso,
         };
+        // Another parent's block: the clients' first datagrams of the part.
+        let first_client = matches!(job, CompleteJob::Whole)
+            .then(|| clients.first().map(|c| c.0))
+            .flatten();
         if completes_inline(
             frame.len(),
             inner.config.inline_complete_bytes,
@@ -2642,8 +2685,9 @@ impl CacheMeshReceiveObserver for CutThrough {
             // than wake a thread of the blocking pool for it, and without
             // the cut-through state locked.
             drop(guard);
+            let out = inner.sockets.out_for_stream(stream_id);
             complete(
-                inner.sockets.out_for_stream(stream_id),
+                out,
                 &inner.stats,
                 max_symbol,
                 batch,
@@ -2652,6 +2696,7 @@ impl CacheMeshReceiveObserver for CutThrough {
                 job,
                 &clients,
             );
+            out.journal_sent(stream_id, slot, first_client);
             return;
         }
         let frame = frame.to_vec();
@@ -2659,16 +2704,9 @@ impl CacheMeshReceiveObserver for CutThrough {
         let stats = Arc::clone(&inner.stats);
         // Encoding a 4K part takes milliseconds: not on the receive task.
         tokio::task::spawn_blocking(move || {
-            complete(
-                sockets.out_for_stream(stream_id),
-                &stats,
-                max_symbol,
-                batch,
-                slot,
-                &frame,
-                job,
-                &clients,
-            )
+            let out = sockets.out_for_stream(stream_id);
+            complete(out, &stats, max_symbol, batch, slot, &frame, job, &clients);
+            out.journal_sent(stream_id, slot, first_client);
         });
     }
 }
@@ -2987,7 +3025,7 @@ fn new_route(
             .collect()
     };
     if let Some(canonical) = &compact {
-        send_compact_now(inner, stream_id, canonical, &compact_clients);
+        send_compact_now(inner, stream_id, slot, canonical, &compact_clients);
     }
     if clients.is_empty() {
         return route;
@@ -3210,6 +3248,7 @@ mod tests {
             let out = ClientOut {
                 socket: &sender,
                 queue: send_queue.as_ref(),
+                journal: None,
             };
             let clients = [
                 UdpSocket::bind("127.0.0.1:0").await.unwrap(),
@@ -3361,6 +3400,7 @@ mod tests {
         let out = ClientOut {
             socket: &sender,
             queue: Some(&queue),
+            journal: None,
         };
         let list: Vec<(&[u8], SocketAddr)> = vec![
             (b"w2", to_waiting),

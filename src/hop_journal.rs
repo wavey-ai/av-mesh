@@ -22,6 +22,11 @@ pub const DEFAULT_HOP_JOURNAL_CAPACITY: usize = 262_144;
 /// by taking the earliest.
 const SEEN_TABLE_SLOTS: usize = 16_384;
 
+/// `udp_sent` events kept for one part: one for each send of the part (a
+/// `sendmmsg` to many clients is one send, naming its first client), as
+/// `reply` keeps the first replies.
+pub const UDP_SENT_PER_PART: u32 = 4;
+
 /// Events copied out of the ring under one hold of its lock when the journal
 /// is read, so that a reader never holds back the media for long. The copy
 /// is a plain copy of about 90 KB; the filter runs after the lock is released.
@@ -55,9 +60,15 @@ pub enum HopStage {
     EdgePlaylist,
     /// An HTTP response for the part was handed to the server.
     Reply,
-    /// A mode-2 UDP listener was sent the part.
-    #[allow(dead_code)]
+    /// A mode-2 UDP listener was sent the part: the first datagram of the
+    /// part handed to the kernel for a client (`peer`), at most a few
+    /// events a part (`n`), one for each send of it.
     UdpSent,
+    /// A fast-plane class thread read the part's first symbol off its socket
+    /// (user space). `relay_first` is the kernel's receive time of the same
+    /// datagram (SO_TIMESTAMPNS), so `relay_woken - relay_first` is the
+    /// thread's wake-up and the wire ends at `relay_first`.
+    RelayWoken,
 }
 
 impl HopStage {
@@ -75,6 +86,7 @@ impl HopStage {
             Self::EdgePlaylist => "edge_playlist",
             Self::Reply => "reply",
             Self::UdpSent => "udp_sent",
+            Self::RelayWoken => "relay_woken",
         }
     }
 }
@@ -230,6 +242,16 @@ impl HopJournal {
         }
         ring.push(event, self.capacity);
         Some(ordinal)
+    }
+
+    /// A send of `part` to a mode-2 UDP client (`peer`, the first client of
+    /// the send) handed to the kernel at `t_us`: kept for the first
+    /// [`UDP_SENT_PER_PART`] sends of the part.
+    pub fn record_udp_sent(&self, stream: u64, part: u64, peer: SocketAddr, t_us: u64) {
+        self.record_counted(
+            HopEvent::new(HopStage::UdpSent, stream, part, t_us).with_peer(Some(peer)),
+            UDP_SENT_PER_PART,
+        );
     }
 
     /// The matching events, oldest first. The ring is copied in chunks, so
@@ -395,6 +417,7 @@ mod tests {
             (HopStage::EdgePlaylist, "edge_playlist"),
             (HopStage::Reply, "reply"),
             (HopStage::UdpSent, "udp_sent"),
+            (HopStage::RelayWoken, "relay_woken"),
         ];
         for (stage, name) in names {
             assert_eq!(stage.as_str(), name);

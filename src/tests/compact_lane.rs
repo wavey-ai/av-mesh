@@ -50,7 +50,7 @@ pub(super) enum Payload {
 }
 
 impl Payload {
-    fn name(self) -> &'static str {
+    pub(super) fn name(self) -> &'static str {
         match self {
             Self::Opus => "Opus 2.5 ms 256 kbit/s",
             Self::Pcm => "PCM 1 ms 48 kHz 24-bit stereo",
@@ -58,7 +58,7 @@ impl Payload {
         }
     }
 
-    fn part_us(self) -> u64 {
+    pub(super) fn part_us(self) -> u64 {
         match self {
             Self::Opus => 2_500,
             Self::Pcm => 1_000,
@@ -84,7 +84,7 @@ impl Payload {
         }
     }
 
-    fn video(self) -> bool {
+    pub(super) fn video(self) -> bool {
         self == Self::Video4k
     }
 
@@ -306,15 +306,18 @@ pub(super) enum Mode {
 #[derive(Default)]
 pub(super) struct Shared {
     /// Count the wire from now on (and stop counting when cleared).
-    measuring: AtomicBool,
+    pub(super) measuring: AtomicBool,
     /// Bytes and datagrams of media counted, with their IP and UDP headers.
     wire_bytes: AtomicU64,
     datagrams: AtomicU64,
     /// The last part published: the listener stops once it has it and the
     /// edge has been quiet for a while.
-    last: AtomicU64,
+    pub(super) last: AtomicU64,
     /// Publication to arrival of each part measured, in µs.
     latencies_us: std::sync::Mutex<Vec<u64>>,
+    /// Each part measured: its number, publication and arrival (µs since
+    /// the epoch), for the hop journal's breakdown.
+    pub(super) arrivals: std::sync::Mutex<Vec<(u64, u64, u64)>>,
 }
 
 impl Shared {
@@ -510,11 +513,17 @@ pub(super) async fn listen(
                         && !run.parts.contains_key(&object.part)
                         && shared.measuring.load(Ordering::Relaxed)
                     {
+                        let arrived = now_unix_us();
                         shared
                             .latencies_us
                             .lock()
                             .unwrap()
-                            .push(now_unix_us().saturating_sub(object.published_unix_us));
+                            .push(arrived.saturating_sub(object.published_unix_us));
+                        shared.arrivals.lock().unwrap().push((
+                            object.part,
+                            object.published_unix_us,
+                            arrived,
+                        ));
                     }
                     let entry = run
                         .parts
@@ -603,6 +612,9 @@ impl MeshEdge {
         let parent_addrs: Vec<SocketAddr> = parents.iter().map(|(addr, ..)| *addr).collect();
         let cache =
             LiveTsCache::with_ring(1, Duration::from_micros(2_500), 400, 12_000, 64, 8, 0).await;
+        // The edge's hop journal, as a node keeps one.
+        let journal = Arc::new(HopJournal::new("edge-1", 1 << 18));
+        cache.set_hop_journal(Arc::clone(&journal));
         let cut = Arc::new(edge_udp::CutThrough::default());
         let (applied_tx, applied_rx) = mpsc::unbounded_channel();
         let mesh = Arc::new(
@@ -639,7 +651,7 @@ impl MeshEdge {
         ));
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let _ = SockRef::from(&socket).set_send_buffer_size(16 << 20);
-        let sockets = edge_udp::EdgeSockets::single(socket);
+        let sockets = edge_udp::EdgeSockets::single(socket).with_hop_journal(Some(journal));
         let client_port = sockets.for_stream(0).local_addr().unwrap();
         let stats: Arc<edge_udp::EdgeUdpStats> = Arc::default();
         let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, 4_096);
@@ -714,19 +726,19 @@ impl MeshEdge {
 
 /// Which edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Feed {
+pub(super) enum Feed {
     Fast,
     Mesh,
 }
 
-enum AnyEdge {
+pub(super) enum AnyEdge {
     Fast(LaneEdge),
     Mesh(MeshEdge),
 }
 
 impl AnyEdge {
     /// The edge, and the next part to publish.
-    async fn start(feed: Feed, payload: Payload, stream_id: u64, ip: u8) -> (Self, u64) {
+    pub(super) async fn start(feed: Feed, payload: Payload, stream_id: u64, ip: u8) -> (Self, u64) {
         match feed {
             Feed::Fast => {
                 let edge = LaneEdge::start(loopback(ip)).await;
@@ -744,14 +756,14 @@ impl AnyEdge {
         }
     }
 
-    fn client_port(&self) -> SocketAddr {
+    pub(super) fn client_port(&self) -> SocketAddr {
         match self {
             Self::Fast(edge) => edge.client_port,
             Self::Mesh(edge) => edge.client_port,
         }
     }
 
-    fn cache(&self) -> &Arc<LiveTsCache> {
+    pub(super) fn cache(&self) -> &Arc<LiveTsCache> {
         match self {
             Self::Fast(edge) => &edge.cache,
             Self::Mesh(edge) => &edge.cache,
@@ -765,7 +777,7 @@ impl AnyEdge {
         }
     }
 
-    async fn publish(&self, payload: Payload, stream_id: u64, sequence: u64) {
+    pub(super) async fn publish(&self, payload: Payload, stream_id: u64, sequence: u64) {
         let (envelope, _) = payload.envelope(stream_id, sequence);
         match self {
             Self::Fast(edge) => {
@@ -776,7 +788,7 @@ impl AnyEdge {
         }
     }
 
-    async fn stop(self) {
+    pub(super) async fn stop(self) {
         match self {
             Self::Fast(edge) => edge.stop().await,
             Self::Mesh(edge) => edge.stop().await,
@@ -786,7 +798,13 @@ impl AnyEdge {
 
 /// Publish parts `from..to` at the payload's pace (behind a slow host it
 /// catches up, never more than a few parts at once).
-async fn publish_paced(edge: &AnyEdge, payload: Payload, stream_id: u64, from: u64, to: u64) {
+pub(super) async fn publish_paced(
+    edge: &AnyEdge,
+    payload: Payload,
+    stream_id: u64,
+    from: u64,
+    to: u64,
+) {
     let start = Instant::now();
     for sequence in from..to {
         let due = start + Duration::from_micros(payload.part_us() * (sequence - from));

@@ -311,6 +311,11 @@ struct TeeItem {
     bytes: Bytes,
     /// Arrival time: the kernel's when the socket reports it.
     rx_us: u64,
+    /// When the thread read it off the socket (its batch's wake-up).
+    woken_us: u64,
+    /// The edge's fast client lane handed the symbol to the kernel for this
+    /// client (the first of its send) at this time.
+    client_sent: Option<(SocketAddr, u64)>,
     kind: TeeKind,
 }
 
@@ -1049,6 +1054,8 @@ impl ClassThread {
                 path: entry.path,
                 bytes: Bytes::copy_from_slice(batch.data(entry.message)),
                 rx_us: entry.rx_us,
+                woken_us: now_us,
+                client_sent: clients.sent_to(entry.message),
                 kind,
             };
             if self.tee.try_send(item).is_err() {
@@ -1056,6 +1063,26 @@ impl ClassThread {
             }
         }
     }
+}
+
+/// `relay_woken`: when the class thread read the part's first symbol off its
+/// socket, beside `relay_first`, the kernel's receive time of it.
+fn journal_woken(cache: &LiveTsCache, key: &ObjectKey, peer: SocketAddr, woken_us: u64) {
+    let Some(journal) = cache.hops() else {
+        return;
+    };
+    let Ok(stream) = key.stream().parse::<u64>() else {
+        return;
+    };
+    journal.record_first(
+        crate::hop_journal::HopEvent::new(
+            crate::hop_journal::HopStage::RelayWoken,
+            stream,
+            key.object(),
+            woken_us,
+        )
+        .with_peer(Some(peer)),
+    );
 }
 
 /// The relay ingress snapshots of both tees, merged for `/api/mesh`.
@@ -1310,6 +1337,7 @@ impl Tee {
         match self.dispatch.push(peer, &item.bytes, item.rx_us) {
             Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Buffered { key, .. })) => {
                 journal_relay_symbol(&self.cache, &key, peer, item.rx_us, None);
+                journal_woken(&self.cache, &key, peer, item.woken_us);
                 journal_forward(&key);
                 self.mark_class(key.stream(), video_kind);
             }
@@ -1327,6 +1355,7 @@ impl Tee {
                     item.rx_us,
                     Some(now_unix_us()),
                 );
+                journal_woken(&self.cache, object.key(), peer, item.woken_us);
                 journal_forward(object.key());
                 self.mark_class(object.key().stream(), video_kind);
                 let stream = object.key().stream().to_owned();
@@ -1396,6 +1425,14 @@ impl Tee {
                     error = %error,
                     "RelaySession datagram rejected at configured dispatch seam"
                 );
+            }
+        }
+        // The fast lane's send of the symbol to its clients (udp_sent).
+        if let (Some((client, sent_us)), Some(view), Some(journal)) =
+            (item.client_sent, &fast_view, self.cache.hops())
+        {
+            if let Some(stream_id) = view.stream_id() {
+                journal.record_udp_sent(stream_id, view.object, client, sent_us);
             }
         }
         // The part this symbol is of shows the holes the distance behind it,

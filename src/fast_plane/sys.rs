@@ -86,6 +86,27 @@ pub fn set_priority(socket: &impl AsRawFd, priority: i32) -> io::Result<()> {
     }
 }
 
+/// Set SO_BUSY_POLL: a receive on the socket, and a poll() of it when the
+/// host's net.core.busy_poll is above zero, polls the device queue for up to
+/// `micros` before it sleeps. A value above net.core.busy_read needs
+/// CAP_NET_ADMIN (EPERM without it).
+pub fn set_busy_poll(socket: &impl AsRawFd, micros: u32) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        setsockopt_int(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_BUSY_POLL,
+            libc::c_int::try_from(micros).unwrap_or(libc::c_int::MAX),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (socket, micros);
+        Ok(())
+    }
+}
+
 /// Ask for a kernel receive timestamp (SO_TIMESTAMPNS) and the socket's
 /// drop counter (SO_RXQ_OVFL) on every received message.
 pub fn enable_receive_metadata(socket: &impl AsRawFd) -> io::Result<()> {
@@ -749,6 +770,30 @@ mod tests {
     /// Once the socket refuses a message as full, the rest of the batch
     /// costs no syscall each; an error of one destination does not stop
     /// the others.
+    #[test]
+    fn busy_poll_is_set_or_refused_for_want_of_the_privilege() {
+        let socket = bind_plain("127.0.0.1:0".parse().unwrap()).unwrap();
+        match set_busy_poll(&socket, 1) {
+            Ok(()) => {
+                let mut value: libc::c_int = 0;
+                let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                // SAFETY: a plain getsockopt of a c_int on a live descriptor.
+                let result = unsafe {
+                    libc::getsockopt(
+                        socket.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_BUSY_POLL,
+                        std::ptr::from_mut(&mut value).cast(),
+                        &mut len,
+                    )
+                };
+                assert_eq!(result, 0);
+                assert_eq!(value, 1);
+            }
+            Err(error) => assert_eq!(error.raw_os_error(), Some(libc::EPERM)),
+        }
+    }
+
     #[test]
     fn the_rest_of_a_batch_stops_at_the_first_full_socket() {
         let mut tries = Vec::new();
