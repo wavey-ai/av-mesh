@@ -234,7 +234,16 @@ fn run_bench(bench: &Bench, ip: u8) -> BenchResult {
         }
     }
     pub_rt.block_on(async {
-        let _ = tokio::time::timeout(Duration::from_secs(10), publisher).await;
+        let mut publisher = publisher;
+        // A publisher still pacing (a debug build lags its clock) holds the
+        // edge: end it, so that the edge can be stopped below.
+        if tokio::time::timeout(Duration::from_secs(10), &mut publisher)
+            .await
+            .is_err()
+        {
+            publisher.abort();
+            let _ = publisher.await;
+        }
     });
     let edge_udp = {
         let stats = edge.stats();
