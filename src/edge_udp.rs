@@ -63,6 +63,9 @@ pub(crate) const DEFAULT_INLINE_COMPLETE_BYTES: usize = 16_384;
 /// Most datagrams that the send queues of one socket hold, whatever their
 /// age: about 40 MB of full datagrams.
 const SEND_QUEUE_MAX_DATAGRAMS: usize = 32_768;
+/// Datagrams that one drain round takes under the lock and sends, without
+/// it, in one `sendmmsg`.
+const DRAIN_SLICE: usize = 256;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct EdgeUdpConfig {
@@ -222,56 +225,35 @@ impl ClientOut<'_> {
         gso: bool,
         datagrams: &[(&[u8], SocketAddr)],
     ) -> (usize, usize) {
-        let mut first = 0;
+        if !batch || datagrams.len() <= 1 {
+            return self.send_each(stats, datagrams);
+        }
         // A client with datagrams waiting has the new ones queued behind
-        // them: the batch is only for a socket with nothing queued.
-        let batch = batch
-            && datagrams.len() > 1
-            && self
-                .queue
-                .is_none_or(|queue| queue.waiting.load(Ordering::Acquire) == 0);
-        if batch && gso && !CLIENT_GSO_REFUSED.load(Ordering::Relaxed) {
-            use std::os::fd::AsRawFd;
-            match crate::fast_plane::sys::send_gso_batch(
-                self.socket.as_raw_fd(),
-                datagrams.len(),
-                |index| datagrams[index],
-            ) {
-                Ok(sent) => {
-                    let bytes: usize = datagrams[..sent.datagrams]
-                        .iter()
-                        .map(|(datagram, _)| datagram.len())
-                        .sum();
-                    stats
-                        .datagrams
-                        .fetch_add(sent.datagrams as u64, Ordering::Relaxed);
-                    stats.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
-                    first = sent.datagrams;
-                }
-                Err(error) if crate::fast_plane::sys::gso_unsupported(&error) => {
-                    CLIENT_GSO_REFUSED.store(true, Ordering::Relaxed);
-                    warn!(error = %error, "edge client UDP: no GSO on this host, sending without it");
-                }
-                Err(_) => {}
-            }
-        } else if batch {
-            if let Ok(sent) =
-                crate::fast_path::try_send_batch(self.socket, datagrams.len(), |index| {
-                    datagrams[index]
-                })
-            {
-                let bytes: usize = datagrams[..sent]
+        // them, under one lock; the other clients' still leave in the
+        // batch (and with GSO).
+        if let Some(queue) = self
+            .queue
+            .filter(|queue| queue.waiting.load(Ordering::Acquire) > 0)
+        {
+            let waiting = queue.waiting_peers();
+            if !waiting.is_empty() {
+                let (behind, free): (Vec<_>, Vec<_>) = datagrams
                     .iter()
-                    .map(|(datagram, _)| datagram.len())
-                    .sum();
-                stats.datagrams.fetch_add(sent as u64, Ordering::Relaxed);
-                stats.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
-                first = sent;
+                    .copied()
+                    .partition(|(_, peer)| waiting.contains(peer));
+                let (queued, blocked) = queue.enqueue_many(&behind, true);
+                let (sent, refused) = self.send_batched(stats, gso, &free);
+                return (queued + sent, blocked + refused);
             }
         }
-        let mut delivered = first;
+        self.send_batched(stats, gso, datagrams)
+    }
+
+    /// Each datagram as [`Self::send`] sends it.
+    fn send_each(&self, stats: &EdgeUdpStats, datagrams: &[(&[u8], SocketAddr)]) -> (usize, usize) {
+        let mut delivered = 0;
         let mut blocked = 0;
-        for (datagram, peer) in &datagrams[first..] {
+        for (datagram, peer) in datagrams {
             match self.send(stats, datagram, *peer) {
                 SendOutcome::Sent | SendOutcome::Queued => delivered += 1,
                 SendOutcome::Blocked => blocked += 1,
@@ -279,6 +261,63 @@ impl ClientOut<'_> {
             }
         }
         (delivered, blocked)
+    }
+
+    /// As many as the socket takes in one `sendmmsg` (with `gso`, a run of
+    /// datagrams of one size to one client is one GSO message of it); the
+    /// rest, which the socket refused, queued under one lock (or, without
+    /// a queue, as [`Self::send`] would send them).
+    fn send_batched(
+        &self,
+        stats: &EdgeUdpStats,
+        gso: bool,
+        datagrams: &[(&[u8], SocketAddr)],
+    ) -> (usize, usize) {
+        if datagrams.is_empty() {
+            return (0, 0);
+        }
+        let mut first = 0;
+        if gso && !CLIENT_GSO_REFUSED.load(Ordering::Relaxed) {
+            use std::os::fd::AsRawFd;
+            match crate::fast_plane::sys::send_gso_batch(
+                self.socket.as_raw_fd(),
+                datagrams.len(),
+                |index| datagrams[index],
+            ) {
+                Ok(sent) => first = sent.datagrams,
+                Err(error) if crate::fast_plane::sys::gso_unsupported(&error) => {
+                    CLIENT_GSO_REFUSED.store(true, Ordering::Relaxed);
+                    warn!(error = %error, "edge client UDP: no GSO on this host, sending without it");
+                    return self.send_batched(stats, false, datagrams);
+                }
+                Err(_) => {}
+            }
+        } else if let Ok(sent) =
+            crate::fast_path::try_send_batch(self.socket, datagrams.len(), |index| datagrams[index])
+        {
+            first = sent;
+        }
+        let bytes: usize = datagrams[..first]
+            .iter()
+            .map(|(datagram, _)| datagram.len())
+            .sum();
+        stats.datagrams.fetch_add(first as u64, Ordering::Relaxed);
+        stats.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        let rest = &datagrams[first..];
+        if rest.is_empty() {
+            return (first, 0);
+        }
+        let (delivered, blocked) = match self.queue {
+            // The socket refused the batch's next datagram: the rest wait,
+            // under one lock, without a syscall each (the drain sends them,
+            // and drops one that fails).
+            Some(queue) => {
+                stats.would_block.fetch_add(1, Ordering::Relaxed);
+                queue.enqueue_many(rest, true)
+            }
+            None => self.send_each(stats, rest),
+        };
+        (first + delivered, blocked)
     }
 }
 
@@ -401,9 +440,15 @@ pub(crate) struct SendQueue {
     /// Datagrams waiting, all clients: zero lets a send skip the lock.
     waiting: std::sync::atomic::AtomicUsize,
     clients: Mutex<HashMap<SocketAddr, std::collections::VecDeque<(Instant, Bytes)>>>,
+    /// The drain is sending copies of the queues' first datagrams without
+    /// the lock: they stay at the front until it has, so nothing else may
+    /// drop them.
+    sending: std::sync::atomic::AtomicBool,
     wake: tokio::sync::Notify,
     stats: Arc<EdgeUdpStats>,
 }
+
+type ClientQueues = HashMap<SocketAddr, std::collections::VecDeque<(Instant, Bytes)>>;
 
 impl SendQueue {
     fn start(socket: Arc<UdpSocket>, limit: Duration, stats: Arc<EdgeUdpStats>) -> Arc<Self> {
@@ -412,6 +457,7 @@ impl SendQueue {
             limit,
             waiting: std::sync::atomic::AtomicUsize::new(0),
             clients: Mutex::new(HashMap::new()),
+            sending: std::sync::atomic::AtomicBool::new(false),
             wake: tokio::sync::Notify::new(),
             stats,
         });
@@ -433,8 +479,49 @@ impl SendQueue {
     /// Queue behind the client's waiting datagrams; a client with none
     /// tries the socket first (unless it just did).
     fn enqueue(&self, datagram: &[u8], peer: SocketAddr, tried: bool) -> SendOutcome {
-        let now = Instant::now();
-        let mut clients = self.clients.lock().unwrap();
+        let outcome = {
+            let mut clients = self.clients.lock().unwrap();
+            self.enqueue_locked(&mut clients, Instant::now(), datagram, peer, tried)
+        };
+        if outcome == SendOutcome::Queued {
+            self.wake.notify_one();
+        }
+        outcome
+    }
+
+    /// [`Self::enqueue`] of several datagrams under one lock. Returns how
+    /// many were sent or queued, and how many found the queues full.
+    fn enqueue_many(&self, datagrams: &[(&[u8], SocketAddr)], tried: bool) -> (usize, usize) {
+        let (mut delivered, mut blocked, mut queued) = (0, 0, false);
+        {
+            let mut clients = self.clients.lock().unwrap();
+            let now = Instant::now();
+            for (datagram, peer) in datagrams {
+                match self.enqueue_locked(&mut clients, now, datagram, *peer, tried) {
+                    SendOutcome::Sent => delivered += 1,
+                    SendOutcome::Queued => {
+                        delivered += 1;
+                        queued = true;
+                    }
+                    SendOutcome::Blocked => blocked += 1,
+                    SendOutcome::Failed => {}
+                }
+            }
+        }
+        if queued {
+            self.wake.notify_one();
+        }
+        (delivered, blocked)
+    }
+
+    fn enqueue_locked(
+        &self,
+        clients: &mut ClientQueues,
+        now: Instant,
+        datagram: &[u8],
+        peer: SocketAddr,
+        tried: bool,
+    ) -> SendOutcome {
         let waiting_here = clients.get(&peer).is_some_and(|queue| !queue.is_empty());
         if !waiting_here && !tried {
             match try_send_counted(&self.socket, &self.stats, datagram, peer) {
@@ -447,62 +534,133 @@ impl SendQueue {
             return SendOutcome::Blocked;
         }
         let queue = clients.entry(peer).or_default();
-        // What the limit already condemns goes now, not at the next drain.
-        while queue
-            .front()
-            .is_some_and(|(at, _)| now.duration_since(*at) > self.limit)
-        {
-            queue.pop_front();
-            self.waiting.fetch_sub(1, Ordering::AcqRel);
-            self.stats.send_queue_drops.fetch_add(1, Ordering::Relaxed);
+        // What the limit already condemns goes now, not at the next drain
+        // (unless the drain is sending the front of the queues).
+        if !self.sending.load(Ordering::Acquire) {
+            while queue
+                .front()
+                .is_some_and(|(at, _)| now.duration_since(*at) > self.limit)
+            {
+                queue.pop_front();
+                self.waiting.fetch_sub(1, Ordering::AcqRel);
+                self.stats.send_queue_drops.fetch_add(1, Ordering::Relaxed);
+            }
         }
         queue.push_back((now, Bytes::copy_from_slice(datagram)));
         self.waiting.fetch_add(1, Ordering::AcqRel);
         self.stats.send_queued.fetch_add(1, Ordering::Relaxed);
-        drop(clients);
-        self.wake.notify_one();
         SendOutcome::Queued
+    }
+
+    /// The clients that have datagrams waiting.
+    fn waiting_peers(&self) -> std::collections::HashSet<SocketAddr> {
+        let clients = self.clients.lock().unwrap();
+        clients
+            .iter()
+            .filter(|(_, queue)| !queue.is_empty())
+            .map(|(peer, _)| *peer)
+            .collect()
     }
 
     /// Send what the socket takes, a datagram of each client in turn, and
     /// drop what is too old. `true` when the socket filled up before the
     /// queues were empty.
+    ///
+    /// The lock is held only to take a slice of at most [`DRAIN_SLICE`]
+    /// datagrams (copies: they stay at the front of their queues) and to
+    /// remove what was sent; the slice leaves in one `sendmmsg` without
+    /// it, so a sender that queues meanwhile waits for neither.
     fn drain(&self) -> bool {
-        let mut clients = self.clients.lock().unwrap();
-        let now = Instant::now();
-        let mut blocked = false;
-        while !blocked && self.waiting.load(Ordering::Acquire) > 0 {
-            let mut progressed = false;
-            for (peer, queue) in clients.iter_mut() {
-                let Some((at, datagram)) = queue.pop_front() else {
-                    continue;
-                };
-                if now.duration_since(at) > self.limit {
-                    self.waiting.fetch_sub(1, Ordering::AcqRel);
-                    self.stats.send_queue_drops.fetch_add(1, Ordering::Relaxed);
-                    progressed = true;
-                    continue;
+        let mut slice: Vec<(SocketAddr, Bytes)> = Vec::with_capacity(DRAIN_SLICE);
+        loop {
+            slice.clear();
+            {
+                let mut clients = self.clients.lock().unwrap();
+                let now = Instant::now();
+                for queue in clients.values_mut() {
+                    while queue
+                        .front()
+                        .is_some_and(|(at, _)| now.duration_since(*at) > self.limit)
+                    {
+                        queue.pop_front();
+                        self.waiting.fetch_sub(1, Ordering::AcqRel);
+                        self.stats.send_queue_drops.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
-                match try_send_counted(&self.socket, &self.stats, &datagram, *peer) {
-                    SendOutcome::Blocked => {
-                        // Not a would-block of a new datagram: undo the count.
-                        self.stats.would_block.fetch_sub(1, Ordering::Relaxed);
-                        queue.push_front((at, datagram));
-                        blocked = true;
+                clients.retain(|_, queue| !queue.is_empty());
+                // A datagram of each client in turn.
+                let mut depth = 0;
+                while slice.len() < DRAIN_SLICE {
+                    let before = slice.len();
+                    for (peer, queue) in clients.iter() {
+                        if let Some((_, datagram)) = queue.get(depth) {
+                            slice.push((*peer, datagram.clone()));
+                            if slice.len() == DRAIN_SLICE {
+                                break;
+                            }
+                        }
+                    }
+                    if slice.len() == before {
                         break;
                     }
-                    _ => {
-                        self.waiting.fetch_sub(1, Ordering::AcqRel);
-                        progressed = true;
+                    depth += 1;
+                }
+                if slice.is_empty() {
+                    return false;
+                }
+                self.sending.store(true, Ordering::Release);
+            }
+            let mut sent = crate::fast_path::try_send_batch(&self.socket, slice.len(), |index| {
+                (&slice[index].1[..], slice[index].0)
+            })
+            .unwrap_or(0);
+            // The datagram the batch stopped at: the socket is full, or
+            // this one failed (dropped, so that it does not stop the rest).
+            let mut failed = None;
+            let mut full = false;
+            if sent < slice.len() {
+                let (peer, datagram) = &slice[sent];
+                match self.socket.try_send_to(datagram, *peer) {
+                    Ok(_) => sent += 1,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => full = true,
+                    Err(error) => {
+                        debug!(%peer, error = %error, "edge client UDP queued send failed");
+                        failed = Some(sent);
                     }
                 }
             }
-            if !progressed {
-                break;
+            let bytes: usize = slice[..sent]
+                .iter()
+                .map(|(_, datagram)| datagram.len())
+                .sum();
+            self.stats
+                .datagrams
+                .fetch_add(sent as u64, Ordering::Relaxed);
+            self.stats.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+            {
+                let mut clients = self.clients.lock().unwrap();
+                let done = slice[..sent]
+                    .iter()
+                    .chain(failed.map(|index| &slice[index]));
+                for (peer, _) in done {
+                    if clients
+                        .get_mut(peer)
+                        .and_then(|queue| queue.pop_front())
+                        .is_some()
+                    {
+                        self.waiting.fetch_sub(1, Ordering::AcqRel);
+                    }
+                }
+                self.sending.store(false, Ordering::Release);
+                clients.retain(|_, queue| !queue.is_empty());
+            }
+            if failed.is_some() {
+                self.stats.send_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            if full {
+                return true;
             }
         }
-        clients.retain(|_, queue| !queue.is_empty());
-        blocked
     }
 }
 
@@ -2567,6 +2725,101 @@ mod tests {
         assert_eq!(queue.waiting.load(Ordering::Relaxed), 0);
     }
 
+    /// The drain sends in slices of at most DRAIN_SLICE, each client's
+    /// datagrams in order, and leaves nothing waiting.
+    #[tokio::test]
+    async fn the_drain_sends_in_slices_each_client_in_order() {
+        let sender = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        sender.writable().await.unwrap();
+        let clients = [
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        ];
+        for client in &clients {
+            let _ = socket2::SockRef::from(client).set_recv_buffer_size(4 << 20);
+        }
+        let stats = Arc::new(EdgeUdpStats::default());
+        let queue = SendQueue {
+            socket: Arc::clone(&sender),
+            limit: Duration::from_secs(5),
+            waiting: std::sync::atomic::AtomicUsize::new(0),
+            clients: Mutex::new(HashMap::new()),
+            sending: std::sync::atomic::AtomicBool::new(false),
+            wake: tokio::sync::Notify::new(),
+            stats: Arc::clone(&stats),
+        };
+        let per_client = DRAIN_SLICE + 100;
+        let payloads: Vec<Vec<u8>> = (0..per_client)
+            .map(|index| (index as u32).to_be_bytes().to_vec())
+            .collect();
+        let list: Vec<(&[u8], SocketAddr)> = (0..per_client)
+            .flat_map(|index| {
+                clients
+                    .iter()
+                    .map(move |client| (index, client.local_addr().unwrap()))
+            })
+            .map(|(index, peer)| (payloads[index].as_slice(), peer))
+            .collect();
+        assert_eq!(queue.enqueue_many(&list, true), (list.len(), 0));
+        assert_eq!(queue.waiting.load(Ordering::Relaxed), list.len());
+        while queue.drain() {
+            sender.writable().await.unwrap();
+        }
+        assert_eq!(queue.waiting.load(Ordering::Relaxed), 0);
+        for client in &clients {
+            assert_eq!(receive(client, per_client).await, payloads);
+        }
+        assert_eq!(stats.datagrams.load(Ordering::Relaxed), list.len() as u64);
+    }
+
+    /// A client with datagrams waiting has its new ones queued behind them;
+    /// the other clients' still leave in the batch, at once.
+    #[tokio::test]
+    async fn a_waiting_client_does_not_take_the_batch_from_the_others() {
+        let sender = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        sender.writable().await.unwrap();
+        let waiting = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let free = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stats = Arc::new(EdgeUdpStats::default());
+        // No drain task: the test drains by hand.
+        let queue = Arc::new(SendQueue {
+            socket: Arc::clone(&sender),
+            limit: Duration::from_secs(5),
+            waiting: std::sync::atomic::AtomicUsize::new(0),
+            clients: Mutex::new(HashMap::new()),
+            sending: std::sync::atomic::AtomicBool::new(false),
+            wake: tokio::sync::Notify::new(),
+            stats: Arc::clone(&stats),
+        });
+        let to_waiting = waiting.local_addr().unwrap();
+        let to_free = free.local_addr().unwrap();
+        // As if the socket had refused the first.
+        assert_eq!(queue.enqueue(b"w1", to_waiting, true), SendOutcome::Queued);
+        let out = ClientOut {
+            socket: &sender,
+            queue: Some(&queue),
+        };
+        let list: Vec<(&[u8], SocketAddr)> = vec![
+            (b"w2", to_waiting),
+            (b"f1", to_free),
+            (b"f2", to_free),
+            (b"w3", to_waiting),
+        ];
+        assert_eq!(out.send_many(&stats, true, false, &list), (4, 0));
+        // The free client's left at once; the waiting one's are queued.
+        assert_eq!(
+            receive(&free, 2).await,
+            vec![b"f1".to_vec(), b"f2".to_vec()]
+        );
+        assert_eq!(queue.waiting.load(Ordering::Relaxed), 3);
+        assert!(!queue.drain());
+        assert_eq!(
+            receive(&waiting, 3).await,
+            vec![b"w1".to_vec(), b"w2".to_vec(), b"w3".to_vec()]
+        );
+    }
+
     /// A datagram older than the limit is dropped, not sent, and counted.
     #[tokio::test]
     async fn a_queued_datagram_older_than_the_limit_is_dropped_and_counted() {
@@ -2579,6 +2832,7 @@ mod tests {
             limit: Duration::from_millis(20),
             waiting: std::sync::atomic::AtomicUsize::new(0),
             clients: Mutex::new(HashMap::new()),
+            sending: std::sync::atomic::AtomicBool::new(false),
             wake: tokio::sync::Notify::new(),
             stats: Arc::clone(&stats),
         };

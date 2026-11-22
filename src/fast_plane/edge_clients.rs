@@ -545,11 +545,6 @@ impl ClientPlan {
         r
     }
 
-    fn buffer(&self, message: usize) -> &[u8] {
-        let start = message * REWRAP_BYTES;
-        &self.buffers[start..start + usize::from(self.lens[message])]
-    }
-
     /// Plan the sends of one admitted first-arrival symbol to the stream's
     /// fast-lane clients.
     pub fn plan(
