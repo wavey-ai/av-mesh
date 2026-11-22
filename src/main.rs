@@ -36469,6 +36469,13 @@ mod tests {
             65_536,
         )
         .await;
+        // The warm child holds every source back, the one-symbol audio
+        // part's too (without the repair lane's single symbol of wave 7).
+        relay
+            .forwarder
+            .as_ref()
+            .unwrap()
+            .set_repair_lane_single_symbol(false);
         // Far enough ahead for a debug build to encode the 4K objects first.
         let deadline = now_unix_us() + 300_000_000;
         let mut video = Vec::new();
@@ -36732,6 +36739,9 @@ mod tests {
         )
         .await;
         let forwarder = Arc::clone(relay.forwarder.as_ref().unwrap());
+        // Repair only until the promotion, the one-symbol audio parts too
+        // (without the repair lane's single symbol of wave 7).
+        forwarder.set_repair_lane_single_symbol(false);
         let deadline = now_unix_us() + 5_000_000;
         let mut audio_sources = Vec::new();
         let mut audio_repairs = Vec::new();
