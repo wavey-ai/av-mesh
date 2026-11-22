@@ -1,6 +1,7 @@
 //! Copies sized to loss (wave 7 item 2), the forwarder's half: a repair
 //! lane carries the one symbol of a one-symbol audio part, and the audio
-//! thread reports the loss of each parent lane (RLR1) to the parent.
+//! thread reports the loss of each parent lane (RLR1) to the parent,
+//! measured against the parent's ledgers (RLL1).
 
 use super::*;
 use crate::fast_plane::loss_report::decode_loss_report;
@@ -149,8 +150,14 @@ async fn a_part_of_several_symbols_keeps_its_sources_off_the_repair_lane() {
     assert!(at_repair.is_empty(), "{at_repair:?}");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_audio_thread_reports_the_loss_of_its_parent_lane() {
+/// Send the primary lane `parts` (sources, and the repair too with
+/// `with_repair`), one part a millisecond, skipping the datagrams that
+/// `lost` names, with a ledger (RLL1) of what was sent every 250 sent; then
+/// collect the reports that the lane's socket hears.
+async fn lane_with_ledgers(
+    with_repair: bool,
+    lost: impl Fn(u64) -> bool,
+) -> (Vec<(u32, u32)>, fast_plane::relay::FastPlaneSnapshot) {
     let (child, _child_video) = bind_class_pair(1_000).await;
     let relay = start_fast_relay_with(
         ParentPath::Secondary,
@@ -165,42 +172,89 @@ async fn the_audio_thread_reports_the_loss_of_its_parent_lane() {
         },
     )
     .await;
-    // 2,000 parts at 1 ms, every 20th lost on the way (5 %).
-    let parts = encoded_parts(4001, 2_000, 300, 1_200, 0);
+    // 2,000 parts at 1 ms, each with one repair symbol from one encoder: a
+    // lane without the repair sees every other packet sequence go missing.
+    let parts = encoded_parts(4001, 2_000, 300, 1_200, 1);
     let started = Instant::now();
-    for (index, (sources, _)) in parts.iter().enumerate() {
-        if index % 20 == 7 {
-            continue;
+    let mut sent = 0_u64;
+    let mut index = 0_u64;
+    for (part, (sources, repair)) in parts.iter().enumerate() {
+        tokio::time::sleep_until((started + Duration::from_millis(part as u64)).into()).await;
+        let datagrams = if with_repair {
+            vec![&sources[0], &repair[0]]
+        } else {
+            vec![&sources[0]]
+        };
+        for datagram in datagrams {
+            if !lost(index) {
+                relay
+                    .primary_sender
+                    .send_to(datagram, relay.primary_audio)
+                    .await
+                    .unwrap();
+            }
+            index += 1;
+            sent += 1;
+            if sent % 250 == 0 {
+                relay
+                    .primary_sender
+                    .send_to(
+                        &fast_plane::loss_report::encode_ledger(sent),
+                        relay.primary_audio,
+                    )
+                    .await
+                    .unwrap();
+            }
         }
-        tokio::time::sleep_until((started + Duration::from_millis(index as u64)).into()).await;
-        relay
-            .primary_sender
-            .send_to(&sources[0], relay.primary_audio)
-            .await
-            .unwrap();
     }
     // The parent's lane socket hears the reports.
     let mut reports = Vec::new();
     let mut buf = [0_u8; 64];
     while let Ok(Ok((len, from))) = tokio::time::timeout(
-        Duration::from_millis(700),
+        Duration::from_millis(1_200),
         relay.primary_sender.recv_from(&mut buf),
     )
     .await
     {
         assert_eq!(from, relay.primary_audio, "from the socket the symbols came to");
         reports.push(decode_loss_report(&buf[..len]).expect("an RLR1 report"));
+        if reports.len() > 64 {
+            break;
+        }
     }
     let snapshot = relay.stats();
     relay.stop().await;
+    (reports, snapshot)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_audio_thread_reports_the_loss_of_its_parent_lane() {
+    // Every 20th datagram lost on the way (5 %).
+    let (reports, snapshot) = lane_with_ledgers(true, |index| index % 20 == 7).await;
     let (last, _) = *reports.last().expect("a lossy lane is reported");
     assert!((35_000..=65_000).contains(&last), "{reports:?}");
     assert!(snapshot.loss_reports >= reports.len() as u64);
     assert!(snapshot.parent_loss_ppm > 0);
 }
 
+/// The wave 7 review's latch: a lane that carries the sources only, beside
+/// a secondary that carries the repair, saw half of the encoder's packet
+/// sequences go missing and reported 50 % loss. Against the ledger it
+/// reports none, and a clean lane is reported as clean (zero, once a
+/// second), so the contributor can tell it from a forwarder that says
+/// nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_clean_lane_sends_no_report() {
+async fn a_lane_of_sources_only_reports_no_loss() {
+    let (reports, snapshot) = lane_with_ledgers(false, |_| false).await;
+    assert!(!reports.is_empty(), "a clean lane is reported as clean");
+    assert!(reports.iter().all(|&(loss, _)| loss == 0), "{reports:?}");
+    assert_eq!(snapshot.parent_loss_ppm, 0);
+}
+
+/// A lane whose parent sends no ledger (every lane below the first
+/// forwarders) is not measured and not reported.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lane_without_ledgers_sends_no_report() {
     let (child, _) = bind_class_pair(1_000).await;
     let relay = start_fast_relay_with(
         ParentPath::Secondary,
@@ -218,6 +272,10 @@ async fn a_clean_lane_sends_no_report() {
     let parts = encoded_parts(4001, 1_200, 300, 1_200, 0);
     let started = Instant::now();
     for (index, (sources, _)) in parts.iter().enumerate() {
+        // Lossy, too: without a ledger there is nothing to measure.
+        if index % 10 == 3 {
+            continue;
+        }
         tokio::time::sleep_until((started + Duration::from_millis(index as u64)).into()).await;
         relay
             .primary_sender
@@ -231,7 +289,7 @@ async fn a_clean_lane_sends_no_report() {
             .await;
     let snapshot = relay.stats();
     relay.stop().await;
-    assert!(heard.is_err(), "a clean lane is not reported");
+    assert!(heard.is_err(), "nothing is reported without a ledger");
     assert_eq!(snapshot.loss_reports, 0);
     assert_eq!(snapshot.parent_loss_ppm, 0);
 }

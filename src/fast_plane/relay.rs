@@ -10,7 +10,7 @@ use super::dedup::FirstArrival;
 use super::demand::{NodeDemand, DEMAND_REPORT_INTERVAL};
 use super::edge_clients::{ClientPlan, ClientSender, EdgeFastLane, UpstreamRepair};
 use super::lease::{LeaseChildren, LeaseSnapshot, LeaseSnapshotStats, LeaseTake};
-use super::loss_report::LossMeter;
+use super::loss_report::{decode_ledger, LossMeter};
 use super::sys::{self, RecvBatch, RECV_BATCH};
 use super::view::RlsView;
 use super::{class_addr, StreamClasses, TrafficClass};
@@ -208,7 +208,8 @@ pub struct FastPlaneStats {
     pub burst_copies: AtomicU64,
     pub burst_copies_dropped: AtomicU64,
     /// Loss reports (RLR1) sent to parents, and the highest loss (ppm) that
-    /// the audio thread measures on a parent lane now.
+    /// the audio thread measures on a parent lane now (only lanes whose
+    /// parent sends ledgers, RLL1, are measured: the contributor's).
     pub loss_reports: AtomicU64,
     pub parent_loss_ppm: AtomicU64,
     /// Demand reports (RLD1) sent to parents.
@@ -1077,8 +1078,20 @@ impl ClassThread {
                 admitted: None,
             };
             if !is_relay_datagram(received.data) {
+                // A parent's ledger (RLL1) for the loss meter of this lane.
+                if let Some(meter) = meter.as_deref_mut() {
+                    if let Some(sent) = decode_ledger(received.data) {
+                        meter.ledger(peer, sent, *kernel_dropped, now);
+                        continue;
+                    }
+                }
                 pending.push(unchecked);
                 continue;
+            }
+            // Every relay datagram that arrived counts against the parent's
+            // ledger, admitted or not: the meter measures the path.
+            if let Some(meter) = meter.as_deref_mut() {
+                meter.observe(peer);
             }
             // An RLS1 datagram that is malformed, or that its peer's session
             // does not admit, is counted and dropped here: the tee could only
@@ -1096,9 +1109,6 @@ impl ClassThread {
                 continue;
             }
             self.failover.observe(path, view.role, now);
-            if let Some(meter) = meter.as_deref_mut() {
-                meter.observe(peer, view.packet_sequence, now);
-            }
             let key = dedup.key(
                 view.tenant,
                 view.stream,

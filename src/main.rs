@@ -1338,12 +1338,14 @@ struct Args {
     )]
     relay_repair_lane_single_symbol: bool,
 
-    /// Wave 7 item 2: the audio fast-plane thread measures the loss of the
-    /// packet sequences of each parent lane and reports it to the parent
-    /// (RLR1, 16 bytes: when it changes, and once a second while above zero;
-    /// a clean lane sends nothing). The contributor sizes the copies of a
-    /// one-symbol audio part to it (av-contrib --relay-audio-copies
-    /// measured). Needs --relay-class-threads.
+    /// Wave 7 item 2: the audio fast-plane thread measures the loss of each
+    /// parent lane whose parent sends ledgers (RLL1, the contributor: the
+    /// datagrams it sent on the lane), less this node's own receive-queue
+    /// drops, and reports it to the parent (RLR1 version 2, 16 bytes: when
+    /// it changes, and once a second while ledgers arrive, zero included).
+    /// The contributor sizes the copies of a one-symbol audio part to it
+    /// (av-contrib --relay-audio-copies measured). Needs
+    /// --relay-class-threads.
     #[arg(
         long,
         env = "NEEDLETAIL_RELAY_LOSS_REPORT",
