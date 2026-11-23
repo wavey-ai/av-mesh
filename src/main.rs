@@ -14725,6 +14725,11 @@ struct ControlEnvelope {
 #[derive(Debug, Clone, Default)]
 struct NodeLifecycle {
     draining: Arc<RwLock<bool>>,
+    /// When the node last began to drain (`None` while it serves).
+    draining_since: Arc<StdMutex<Option<Instant>>>,
+    /// Woken when the node begins or stops draining: the telemetry
+    /// publisher advertises the change at once instead of at its next tick.
+    changed: Arc<tokio::sync::Notify>,
 }
 
 impl NodeLifecycle {
@@ -14733,7 +14738,23 @@ impl NodeLifecycle {
     }
 
     async fn set_draining(&self, draining: bool) {
-        *self.draining.write().await = draining;
+        let was = std::mem::replace(&mut *self.draining.write().await, draining);
+        if was != draining {
+            *self.draining_since.lock().unwrap() = draining.then(Instant::now);
+            // A stored permit when the publisher is not waiting yet.
+            self.changed.notify_one();
+        }
+    }
+
+    /// How much longer a draining node waits before its first moves, so
+    /// that the advertisement saying it drains (sent at once on the change)
+    /// reaches the entry points first: otherwise the movers of an edge
+    /// drained at the same moment are sent to this one, and moved again.
+    fn drain_advert_wait(&self, now: Instant, grace: Duration) -> Option<Duration> {
+        let since = (*self.draining_since.lock().unwrap())?;
+        grace
+            .checked_sub(now.saturating_duration_since(since))
+            .filter(|wait| !wait.is_zero())
     }
 }
 
@@ -18726,31 +18747,32 @@ fn start_telemetry_publisher(
     Some(tokio::spawn(async move {
         let mut ticker = interval(Duration::from_millis(interval_ms));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let lifecycle_changed = Arc::clone(&router.lifecycle.changed);
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => return,
-                _ = ticker.tick() => {
-                    let snapshot = router.local_mesh_snapshot().await;
-                    if let Some(fec) = &fec {
-                        match encode_mesh_telemetry_binary(&snapshot) {
-                            Ok(payload) => fec.submit(&snapshot, payload, interval_ms),
-                            Err(_) => fec.monitor.record_encode_error(),
-                        }
-                    }
-                    if let Some(tx) = &tcp_tx {
-                        let Ok(json) = serde_json::to_vec(&snapshot) else {
-                            continue;
-                        };
-                        let message = TcpChangesMessage::new(
-                            TELEMETRY_TAG,
-                            vec![Bytes::from(json)],
-                        );
-                        match tx.try_send(message) {
-                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
-                            Err(mpsc::error::TrySendError::Closed(_)) if fec.is_none() => return,
-                            Err(mpsc::error::TrySendError::Closed(_)) => {}
-                        }
-                    }
+                _ = ticker.tick() => {}
+                // A drain or resume is advertised at once (the entry points
+                // stop sending readers to a draining node before it moves
+                // its own); the ticks go on as before.
+                _ = lifecycle_changed.notified() => {}
+            }
+            let snapshot = router.local_mesh_snapshot().await;
+            if let Some(fec) = &fec {
+                match encode_mesh_telemetry_binary(&snapshot) {
+                    Ok(payload) => fec.submit(&snapshot, payload, interval_ms),
+                    Err(_) => fec.monitor.record_encode_error(),
+                }
+            }
+            if let Some(tx) = &tcp_tx {
+                let Ok(json) = serde_json::to_vec(&snapshot) else {
+                    continue;
+                };
+                let message = TcpChangesMessage::new(TELEMETRY_TAG, vec![Bytes::from(json)]);
+                match tx.try_send(message) {
+                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) if fec.is_none() => return,
+                    Err(mpsc::error::TrySendError::Closed(_)) => {}
                 }
             }
         }
@@ -30189,6 +30211,95 @@ mod tests {
         assert_eq!(envelope.id, command.id);
         assert_eq!(envelope.origin_node_id, "test-node");
         assert_eq!(envelope.kind, ControlKind::WarmStream);
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_drain_is_advertised_at_once_and_its_moves_wait_for_it() {
+        use tokio::time::timeout;
+
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
+        let (tx, mut rx) = mpsc::channel(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        // A tick a minute: only the first snapshot comes from the ticker.
+        let task =
+            start_telemetry_publisher(router.clone(), 60_000, Some(tx), None, shutdown_rx).unwrap();
+        let draining_of = |message: TcpChangesMessage| {
+            let snapshot: MeshSnapshot = serde_json::from_slice(&message.data()[0]).unwrap();
+            snapshot.node.draining
+        };
+        let first = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!draining_of(first));
+        let now = Instant::now();
+        assert_eq!(
+            router
+                .lifecycle
+                .drain_advert_wait(now, edge_udp::DRAIN_ADVERT_GRACE),
+            None
+        );
+
+        router
+            .execute_control(
+                ControlKind::DrainNode,
+                ControlRequest {
+                    node_id: Some(router.node.node_id.clone()),
+                    region: None,
+                    stream_id: None,
+                },
+            )
+            .await;
+        let drained = timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("the drain is advertised before the next tick")
+            .unwrap();
+        assert!(draining_of(drained));
+        // Its moves wait out the rest of the grace from the drain's start.
+        let wait = router
+            .lifecycle
+            .drain_advert_wait(Instant::now(), edge_udp::DRAIN_ADVERT_GRACE)
+            .expect("a drain this young waits");
+        assert!(wait <= edge_udp::DRAIN_ADVERT_GRACE && wait > Duration::from_millis(50));
+        assert_eq!(
+            router.lifecycle.drain_advert_wait(
+                Instant::now() + edge_udp::DRAIN_ADVERT_GRACE,
+                edge_udp::DRAIN_ADVERT_GRACE
+            ),
+            None
+        );
+        // Draining again changes nothing and is not advertised again.
+        router.lifecycle.set_draining(true).await;
+        assert!(timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .is_err());
+
+        router
+            .execute_control(
+                ControlKind::ResumeNode,
+                ControlRequest {
+                    node_id: Some(router.node.node_id.clone()),
+                    region: None,
+                    stream_id: None,
+                },
+            )
+            .await;
+        let resumed = timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("the resume is advertised at once")
+            .unwrap();
+        assert!(!draining_of(resumed));
+        assert_eq!(
+            router
+                .lifecycle
+                .drain_advert_wait(Instant::now(), edge_udp::DRAIN_ADVERT_GRACE),
+            None
+        );
+        drop(shutdown_tx);
+        let _ = task.await;
         mesh.shutdown();
     }
 

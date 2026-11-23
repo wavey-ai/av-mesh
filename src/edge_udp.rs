@@ -3117,7 +3117,17 @@ async fn run_stream_sender(
             if !paced {
                 drain = None;
             }
-            if let Some(reason) = reason {
+            // A drain begun a moment ago waits until the entry points have
+            // heard that it drains, so that its movers are not sent to
+            // another edge drained at the same moment (sent away again).
+            let advert_wait = if reason == Some("draining") {
+                router.lifecycle.drain_advert_wait(now, DRAIN_ADVERT_GRACE)
+            } else {
+                None
+            };
+            if let Some(wait) = advert_wait {
+                housekeeping_at = now + wait;
+            } else if let Some(reason) = reason {
                 // Lost parents do not move a subscriber that came by a
                 // move within the hold-down: it may have just come from an
                 // edge that lost its parents too. A subscriber that did not
@@ -3519,6 +3529,10 @@ pub(crate) fn insert_test_subscribers(
 
 /// How often a paced drain sends its next share (Phase AM item 9).
 const DRAIN_TICK: Duration = Duration::from_millis(50);
+
+/// The time a drain gives its advertisement (sent at once when the node
+/// begins to drain) to reach the entry points before the first moves.
+pub(crate) const DRAIN_ADVERT_GRACE: Duration = Duration::from_millis(100);
 
 /// A paced drain of one stream's subscribers (Phase AM item 9): by
 /// `started + spread` every subscriber that was there at the start has
