@@ -394,6 +394,14 @@ pub const fn keeps_long_form(part_low: u64) -> bool {
     part_low % LONG_FORM_EVERY == 0
 }
 
+/// A part whose publication time is unknown (0: an edge that took it from
+/// a copy without its time) keeps the long form: the short form's 24 bits
+/// of 0 would be extended to a time up to 8.4 s off (wave 9 review: parts
+/// at an edge taking a new copy reached clients up to 8 s off).
+fn unknown_time(view: &View<'_>) -> bool {
+    view.field == [0; 4]
+}
+
 /// Whether a datagram is a part in the short form.
 pub fn is_short(datagram: &[u8]) -> bool {
     datagram.len() >= SHORT_HEADER_LEN && datagram[0] & SHORT_MAGIC_MASK == SHORT_MAGIC
@@ -411,7 +419,8 @@ pub fn shorten(datagram: &[u8]) -> Option<Vec<u8>> {
 /// [`shorten`], into `out` (cleared first).
 pub fn shorten_into(datagram: &[u8], out: &mut Vec<u8>) -> Option<()> {
     let view = parse(datagram)?;
-    if view.kind != Kind::Part || keeps_long_form(u64::from(view.part_low)) {
+    if view.kind != Kind::Part || keeps_long_form(u64::from(view.part_low)) || unknown_time(&view)
+    {
         return None;
     }
     out.clear();
@@ -428,7 +437,8 @@ pub fn shorten_into(datagram: &[u8], out: &mut Vec<u8>) -> Option<()> {
 pub fn shorten_in_place(buffer: &mut [u8], len: usize) -> Option<usize> {
     let datagram = buffer.get(..len)?;
     let view = parse(datagram)?;
-    if view.kind != Kind::Part || keeps_long_form(u64::from(view.part_low)) {
+    if view.kind != Kind::Part || keeps_long_form(u64::from(view.part_low)) || unknown_time(&view)
+    {
         return None;
     }
     let flags = datagram[FLAGS_AT] & !SHORT_MAGIC_MASK;
@@ -2426,8 +2436,17 @@ mod tests {
                 );
             }
         }
-        // Gaps and repair keep the long form, and so does every 256th part.
+        // Gaps and repair keep the long form, and so does every 256th part,
+        // and a part whose time is unknown (0: the short form would make a
+        // time up to 8.4 s off of it).
         assert_eq!(shorten(&encode_gap(5)), None);
+        let unknown = encode_part(9, 0, &bytes).unwrap();
+        assert_eq!(shorten(&unknown), None);
+        let mut in_place = unknown.clone();
+        assert_eq!(shorten_in_place(&mut in_place, unknown.len()), None);
+        // A time whose low 32 bits are 0 but not 0 itself is rare (one in
+        // 2^32 µs) and only keeps the long form too.
+        assert!(shorten(&encode_part(9, 1 << 32, &bytes).unwrap()).is_none());
         for part in [0_u64, 256, 65_536, 1 << 32] {
             let long = encode_part(part, 1_700_000_000_000_000, &bytes).unwrap();
             assert!(keeps_long_form(part));
