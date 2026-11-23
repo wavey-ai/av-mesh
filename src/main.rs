@@ -127,6 +127,21 @@ const DEFAULT_HLS_FAILOVER_BANDWIDTH_BPS: u64 = 4_000_000;
 const DEFAULT_HLS_RENDITION_STALE_MS: u64 = 5_000;
 const MAX_TELEMETRY_FEC_TARGETS: usize = 16;
 const DEFAULT_UDP_SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
+/// `--cache-mesh-video-warm-parts`: a number of parts, or `window` (None:
+/// the window the child asks for).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VideoWarmParts(Option<usize>);
+
+fn parse_video_warm_parts(value: &str) -> Result<VideoWarmParts, String> {
+    if value.eq_ignore_ascii_case("window") {
+        return Ok(VideoWarmParts(None));
+    }
+    value
+        .parse::<usize>()
+        .map(|parts| VideoWarmParts(Some(parts)))
+        .map_err(|_| format!("expected a number of parts or `window`, not {value:?}"))
+}
 const DEFAULT_MAX_RELAY_DOWNSTREAM_CHILDREN: usize = 4;
 const DEFAULT_RELAY_PRIMARY_SILENCE_MS: u64 = 250;
 const DEFAULT_RELAY_PRIMARY_RECOVERY_MS: u64 = 2_000;
@@ -2790,6 +2805,23 @@ struct Args {
     )]
     cache_mesh_warm_second_parent: bool,
 
+    /// Wave 9 D: the warm-up window that a distributor sends a new copy of a
+    /// video playlist, in parts: `window` sends what the child asks for (the
+    /// audio window, --cache-mesh-warm-parts), as before. Default 0: a video
+    /// copy starts at the live part. A 4K copy warmed at the audio window's
+    /// length was minutes of parts trickled at --cache-mesh-warm-kbps for the
+    /// whole run, after its readers had started live, each part in one burst
+    /// (a 5.9 MB first frame of a clip filled an edge's video receive queue);
+    /// a reader or a moved client that needs an earlier part asks for it
+    /// (hole repair), and the fast plane feeds a video copy its live parts.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CACHE_MESH_VIDEO_WARM_PARTS",
+        default_value = "0",
+        value_parser = parse_video_warm_parts
+    )]
+    cache_mesh_video_warm_parts: VideoWarmParts,
+
     /// Wave 8 stage 5 (AM 13): a cache whose copy of a playlist is more
     /// than this many parts behind the newest copy in the region is
     /// stalled for it and takes no reader of it. Zero (the default) turns
@@ -3557,6 +3589,7 @@ async fn main() -> Result<()> {
         .with_release_unranked_parents(args.cache_mesh_release_unranked_parents)
         .with_avoid_draining_parents(args.cache_mesh_avoid_draining_parents)
         .with_warm_from_second_parent(args.cache_mesh_warm_second_parent)
+        .with_video_backfill_parts(args.cache_mesh_video_warm_parts.0)
         .with_socket_buffer_bytes(if args.cache_mesh_socket_buffer_bytes > 0 {
             args.cache_mesh_socket_buffer_bytes
         } else {
@@ -40190,6 +40223,14 @@ mod tests {
         .unwrap();
         assert!(!args.relay_video_gro);
         assert_eq!(args.slot_kb, 2_048);
+        let args = Args::try_parse_from(["av-mesh"]).unwrap();
+        assert_eq!(args.cache_mesh_video_warm_parts, VideoWarmParts(Some(0)));
+        for (value, parts) in [("window", None), ("WINDOW", None), ("12", Some(12))] {
+            let args =
+                Args::try_parse_from(["av-mesh", "--cache-mesh-video-warm-parts", value]).unwrap();
+            assert_eq!(args.cache_mesh_video_warm_parts, VideoWarmParts(parts), "{value}");
+        }
+        assert!(Args::try_parse_from(["av-mesh", "--cache-mesh-video-warm-parts", "-1"]).is_err());
     }
 
     #[tokio::test]
