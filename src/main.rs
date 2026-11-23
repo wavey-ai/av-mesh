@@ -14,7 +14,7 @@ mod link_telemetry;
 use anyhow::{anyhow, bail, Context, Result};
 use assignment::{
     assign, assign_udp_in_region, standby_rank, AssignedCache, Assignment, AssignmentError,
-    AssignmentPolicy, AssignmentRequest, CacheCandidate,
+    AssignmentPolicy, AssignmentRequest, CacheCandidate, FULL_LOAD_PERMILLE,
 };
 use async_trait::async_trait;
 use av_mesh::relay_ingress::{
@@ -2290,6 +2290,35 @@ struct Args {
     )]
     client_udp_datagram_capacity: u64,
 
+    /// Wave 9 C2: an edge's load_permille (and so the free capacity that
+    /// the entry points see) is at least its process's CPU over its
+    /// available CPUs (affinity and cgroup quota), so that LL-HLS readers
+    /// and any per-listener work that its bytes do not show count: a lab
+    /// edge with 3 readers of 1 ms parts read 300-570 permille by bytes at
+    /// 135-148 % of its 200 % CPU. `false`: bytes, datagrams and sessions
+    /// alone, as before.
+    #[arg(long, env = "NEEDLETAIL_CPU_LOAD", default_value_t = true, action = clap::ArgAction::Set)]
+    cpu_load: bool,
+
+    /// Wave 9 C2: the share of its available CPUs, in percent, at which an
+    /// edge's CPU term reads 1,000 permille (as the egress term reads 1,000
+    /// at --egress-admission-percent of the capacity).
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CPU_LOAD_FULL_PERCENT",
+        default_value_t = edge_admission::DEFAULT_CPU_LOAD_FULL_PERCENT,
+        value_parser = clap::value_parser!(u8).range(1..=100)
+    )]
+    cpu_load_full_percent: u8,
+
+    /// Wave 9 C2: the CPU term is the mean over this many ms.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CPU_LOAD_WINDOW_MS",
+        default_value_t = edge_admission::DEFAULT_CPU_LOAD_WINDOW_MS
+    )]
+    cpu_load_window_ms: u64,
+
     /// Phase AM item 8: a new UDP subscription is refused (`edge-busy`)
     /// while this edge's egress is overloaded, as a new HLS session is. A
     /// client that moves here (it names its next part) is still taken.
@@ -4037,6 +4066,22 @@ async fn main() -> Result<()> {
         telemetry_peer_monitor.clone(),
         ingest_shutdown_rx.clone(),
     );
+    if args.cpu_load && cache_mesh_role == CacheMeshRole::Edge {
+        // Wave 9 C2: the edge's CPU over its CPUs in its load.
+        let cpus = edge_admission::available_cpus();
+        router.edge_load.egress.set_cpu_counter(
+            Arc::new(edge_admission::process_cpu_us),
+            cpus,
+            args.cpu_load_full_percent,
+            args.cpu_load_window_ms,
+        );
+        info!(
+            cpus,
+            full_percent = args.cpu_load_full_percent,
+            window_ms = args.cpu_load_window_ms,
+            "edge load counts the process's CPU"
+        );
+    }
     let edge_udp_task = if let Some(bind) = args.client_udp_bind {
         if args.client_udp_egress_load {
             // Phase AM item 8: the client lanes' bytes are this node's
@@ -13736,6 +13781,9 @@ struct EdgeServiceSnapshot {
     /// Load in thousandths of the admission limit of this cache.
     #[serde(default)]
     load_permille: u32,
+    /// The CPU term of that load (wave 9 C2, `--cpu-load`).
+    #[serde(default)]
+    cpu_permille: u32,
     /// Requests that this cache answers in a second with its processor
     /// full. Zero when it charges a session its bit rate alone.
     #[serde(default)]
@@ -13819,8 +13867,10 @@ struct ClientUdpGauges {
     /// active_playback_sessions).
     hls_sessions: u64,
     /// Load in thousandths of the admission limit, client UDP egress
-    /// included (--client-udp-egress-load).
+    /// included (--client-udp-egress-load), and the CPU (--cpu-load).
     load_permille: u32,
+    /// The CPU term of the load (wave 9 C2).
+    cpu_permille: u32,
     /// Measured egress, bits a second, client UDP included.
     egress_observed_bps: u64,
     /// Bytes the client UDP lanes sent, IP and UDP headers included.
@@ -13887,6 +13937,7 @@ impl EdgeServiceSnapshot {
             session_limit: load.egress.session_limit,
             committed_bps: load.egress.committed_bps,
             load_permille: load.egress.load_permille,
+            cpu_permille: load.egress.cpu_permille,
             egress_request_capacity: 0,
             playlists: Vec::new(),
             draining: node.draining,
@@ -19381,6 +19432,7 @@ impl AppRouter {
             draining: self.lifecycle.is_draining().await,
             hls_sessions: egress.active_sessions,
             load_permille: egress.load_permille,
+            cpu_permille: egress.cpu_permille,
             egress_observed_bps: egress.observed_bps,
             egress_wire_bytes: stats.egress_wire_bytes(),
             load_refusals: stats.load_refusals.load(Ordering::Relaxed),
@@ -19752,8 +19804,15 @@ impl AppRouter {
                     // to the cache since the cache last wrote its
                     // advertisement are not in it yet: they count here.
                     free_bps: (edge.egress_admission_bps > 0).then(|| {
+                        // The bytes' headroom, or the load's (its CPU and
+                        // datagram terms, wave 9 C2) if less.
+                        let by_load = (u128::from(edge.egress_admission_bps)
+                            * u128::from(FULL_LOAD_PERMILLE.saturating_sub(edge.load_permille))
+                            / u128::from(FULL_LOAD_PERMILLE))
+                            as u64;
                         edge.egress_admission_bps
                             .saturating_sub(edge.egress_observed_bps.max(edge.committed_bps))
+                            .min(by_load)
                             .saturating_sub(if is_local {
                                 0
                             } else {
@@ -27665,6 +27724,7 @@ mod tests {
             session_limit: 0,
             committed_bps: 0,
             load_permille: 0,
+            cpu_permille: 0,
             egress_request_capacity: 0,
             playlists: Vec::new(),
             draining: false,

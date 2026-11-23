@@ -97,10 +97,127 @@ pub struct EdgeAdmissionSnapshot {
     #[serde(default)]
     pub committed_bps: u64,
     /// Load in thousandths of the admission limit: the largest of observed
-    /// egress, committed egress and sessions. At 1,000 the node admits no new
-    /// session.
+    /// egress, committed egress, sessions and the process's CPU (wave 9
+    /// C2). At 1,000 the node admits no new session.
     #[serde(default)]
     pub load_permille: u32,
+    /// The CPU term of the load (wave 9 C2, `--cpu-load`): the process's
+    /// CPU time over its available CPUs in the last few seconds, in
+    /// thousandths of `--cpu-load-full-percent` of them. 0 without it.
+    #[serde(default)]
+    pub cpu_permille: u32,
+}
+
+/// The process's CPU time so far (user and system), in microseconds;
+/// `None` when it cannot be read (wave 9 C2).
+pub type CpuCounter = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
+/// Default of `--cpu-load-full-percent`: the share of the available CPUs
+/// at which the CPU term reads 1,000 permille, as the egress term reads
+/// 1,000 at the admission percent of its capacity.
+pub const DEFAULT_CPU_LOAD_FULL_PERCENT: u8 = 85;
+
+/// Default of `--cpu-load-window-ms`: the CPU term is the mean over this
+/// long, so that one busy second (a crowd's admission, a GC of the cache)
+/// does not read as a full node.
+pub const DEFAULT_CPU_LOAD_WINDOW_MS: u64 = 5_000;
+
+/// Samples of the CPU counter closer together than this are not kept.
+const CPU_SAMPLE_SPACING_MS: u64 = 200;
+
+/// The CPU term of the load (wave 9 C2): samples of the process's CPU
+/// time, and the mean over the window from them.
+struct CpuSource {
+    read: CpuCounter,
+    cpus: u32,
+    full_percent: u8,
+    window_ms: u64,
+    window: CpuWindow,
+}
+
+impl std::fmt::Debug for CpuSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CpuSource")
+            .field("cpus", &self.cpus)
+            .field("full_percent", &self.full_percent)
+            .field("window_ms", &self.window_ms)
+            .finish()
+    }
+}
+
+/// Samples of a cumulative CPU time: (ms since start, CPU µs).
+#[derive(Debug, Default, Clone)]
+pub(crate) struct CpuWindow {
+    samples: VecDeque<(u64, u64)>,
+}
+
+impl CpuWindow {
+    /// Keep a sample (one every `CPU_SAMPLE_SPACING_MS` at most), and the
+    /// samples of the last `window_ms` with the one just before them.
+    pub(crate) fn record(&mut self, at_ms: u64, cpu_us: u64, window_ms: u64) {
+        if let Some(&(last_ms, last_us)) = self.samples.back() {
+            if at_ms < last_ms.saturating_add(CPU_SAMPLE_SPACING_MS) || cpu_us < last_us {
+                return;
+            }
+        }
+        self.samples.push_back((at_ms, cpu_us));
+        let oldest = at_ms.saturating_sub(window_ms);
+        while self.samples.len() > 2 && self.samples[1].0 <= oldest {
+            self.samples.pop_front();
+        }
+    }
+
+    /// The CPU term: CPU time over wall time between the first and last
+    /// samples, over `cpus` CPUs, in thousandths of `full_percent` of them.
+    /// `None` until the samples span half a second.
+    pub(crate) fn permille(&self, cpus: u32, full_percent: u8) -> Option<u32> {
+        let (first_ms, first_us) = *self.samples.front()?;
+        let (last_ms, last_us) = *self.samples.back()?;
+        let wall_ms = last_ms.checked_sub(first_ms).filter(|wall| *wall >= 500)?;
+        Some(cpu_permille(
+            last_us.saturating_sub(first_us),
+            wall_ms.saturating_mul(1_000),
+            cpus,
+            full_percent,
+        ))
+    }
+}
+
+/// CPU time `cpu_us` in `wall_us` of wall time, as thousandths of
+/// `full_percent` of `cpus` CPUs.
+pub(crate) fn cpu_permille(cpu_us: u64, wall_us: u64, cpus: u32, full_percent: u8) -> u32 {
+    let full = u128::from(wall_us)
+        * u128::from(cpus.max(1))
+        * u128::from(full_percent.clamp(1, 100))
+        / 100;
+    if full == 0 {
+        return 0;
+    }
+    (u128::from(cpu_us) * 1_000 / full).min(u128::from(u32::MAX)) as u32
+}
+
+/// The process's CPU time so far, user and system, in microseconds.
+pub fn process_cpu_us() -> Option<u64> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes the timespec it is given.
+    if unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut time) } != 0 {
+        return None;
+    }
+    Some(
+        u64::try_from(time.tv_sec).ok()?.saturating_mul(1_000_000)
+            + u64::try_from(time.tv_nsec).ok()? / 1_000,
+    )
+}
+
+/// The CPUs this process may run on: its affinity and its cgroup's quota
+/// (a lab node's CPUQuota, an instance's vCPUs).
+pub fn available_cpus() -> u32 {
+    std::thread::available_parallelism()
+        .map(|count| u32::try_from(count.get()).unwrap_or(u32::MAX))
+        .unwrap_or(1)
 }
 
 /// What a new playback session would add to the node.
@@ -154,6 +271,8 @@ struct EdgeAdmissionInner {
     started: Instant,
     window: Mutex<RollingEgressWindow>,
     counters: Mutex<Vec<CounterSource>>,
+    /// The CPU term (wave 9 C2), once set.
+    cpu: Mutex<Option<CpuSource>>,
     overloaded: AtomicBool,
     rejected_requests: AtomicU64,
     admitted_sessions: AtomicU64,
@@ -190,6 +309,7 @@ impl EdgeAdmission {
                 started: Instant::now(),
                 window: Mutex::new(RollingEgressWindow::default()),
                 counters: Mutex::new(Vec::new()),
+                cpu: Mutex::new(None),
                 overloaded: AtomicBool::new(false),
                 rejected_requests: AtomicU64::new(0),
                 admitted_sessions: AtomicU64::new(0),
@@ -232,6 +352,56 @@ impl EdgeAdmission {
                 last,
                 last_second: second,
             });
+    }
+
+    /// Count the process's CPU in the load (wave 9 C2): `read` gives its
+    /// CPU time, `cpus` the CPUs it may use, and the mean over `window_ms`
+    /// at `full_percent` of them reads 1,000 permille. An edge's LL-HLS
+    /// readers (and any per-listener work) cost CPU that their bytes do
+    /// not show: 3 readers of 1 ms parts and ~50 UDP listeners took a lab
+    /// edge to 135-148 % of its 200 % while its bytes read 300-570 permille.
+    pub fn set_cpu_counter(
+        &self,
+        read: CpuCounter,
+        cpus: u32,
+        full_percent: u8,
+        window_ms: u64,
+    ) {
+        let mut window = CpuWindow::default();
+        if let Some(cpu_us) = read() {
+            window.record(self.elapsed_ms(), cpu_us, window_ms);
+        }
+        *self
+            .inner
+            .cpu
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(CpuSource {
+            read,
+            cpus: cpus.max(1),
+            full_percent: full_percent.clamp(1, 100),
+            window_ms: window_ms.max(1_000),
+            window,
+        });
+    }
+
+    /// The CPU term now (a sample taken), 0 without a CPU counter.
+    fn cpu_permille_now(&self) -> u32 {
+        let elapsed_ms = self.elapsed_ms();
+        let mut cpu = self
+            .inner
+            .cpu
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(source) = cpu.as_mut() else {
+            return 0;
+        };
+        if let Some(cpu_us) = (source.read)() {
+            source.window.record(elapsed_ms, cpu_us, source.window_ms);
+        }
+        source
+            .window
+            .permille(source.cpus, source.full_percent)
+            .unwrap_or(0)
     }
 
     /// Whether the node is overloaded now (the measured egress, with the
@@ -525,6 +695,8 @@ impl EdgeAdmission {
         if session_limit > 0 {
             load_permille = load_permille.max(permille(active_sessions, session_limit));
         }
+        let cpu_permille = self.cpu_permille_now();
+        load_permille = load_permille.max(cpu_permille);
         if overloaded {
             load_permille = load_permille.max(1_000);
         }
@@ -543,6 +715,7 @@ impl EdgeAdmission {
             session_limit,
             committed_bps,
             load_permille,
+            cpu_permille,
         }
     }
 
@@ -1069,5 +1242,69 @@ mod tests {
             PlaybackAdmission::Rejected
         );
         assert_eq!(admission.active_sessions_at(7_000), 0);
+    }
+
+    #[test]
+    fn the_cpu_term_is_the_mean_over_its_window_of_the_cpus_at_the_full_percent() {
+        // 1.7 CPUs busy of 2, full at 85 %: 1,000.
+        assert_eq!(cpu_permille(1_700_000, 1_000_000, 2, 85), 1_000);
+        // 0.85 of 2 at 85 %: 500; any time over no wall time: 0.
+        assert_eq!(cpu_permille(850_000, 1_000_000, 2, 85), 500);
+        assert_eq!(cpu_permille(5, 0, 2, 85), 0);
+        let mut window = CpuWindow::default();
+        assert_eq!(window.permille(2, 85), None);
+        // A sample every 250 ms of 1 CPU busy for 4 s, then 2 CPUs busy
+        // for one second: the 5 s mean, not the last second's.
+        for step in 0..=16 {
+            window.record(step * 250, step * 250_000, 5_000);
+        }
+        for step in 17..=20 {
+            window.record(step * 250, 4_000_000 + (step - 16) * 500_000, 5_000);
+        }
+        // (4 s x 1 CPU + 1 s x 2 CPUs) / 5 s = 1.2 CPUs of 1.7: 705.
+        assert_eq!(window.permille(2, 85), Some(705));
+        // Samples closer than the spacing, or that go back, are not kept.
+        let kept = window.samples.len();
+        window.record(20 * 250 + 10, 9_000_000, 5_000);
+        window.record(21 * 250, 5_999_999, 5_000);
+        assert_eq!(window.samples.len(), kept);
+        // Only the window and the sample before it stay.
+        assert!(window.samples.front().unwrap().0 <= 20 * 250 - 5_000);
+        assert!(window.samples.len() <= 22);
+    }
+
+    #[test]
+    fn the_load_is_the_cpu_term_when_the_cpu_is_busier_than_the_bytes() {
+        let admission = admission();
+        let cpu = Arc::new(AtomicU64::new(0));
+        let read = Arc::clone(&cpu);
+        admission.set_cpu_counter(
+            Arc::new(move || Some(read.load(Ordering::Relaxed))),
+            2,
+            DEFAULT_CPU_LOAD_FULL_PERCENT,
+            DEFAULT_CPU_LOAD_WINDOW_MS,
+        );
+        let snapshot = admission.snapshot();
+        assert_eq!(snapshot.cpu_permille, 0);
+        assert_eq!(snapshot.load_permille, 0);
+        // 1.02 CPUs busy for 0.6 s of wall time (a sample at the start and
+        // one now): 600 permille of 1.7 CPUs.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let elapsed_us = admission.elapsed_ms() * 1_000;
+        cpu.store(elapsed_us * 102 / 100, Ordering::Relaxed);
+        let snapshot = admission.snapshot();
+        assert!(
+            (560..=640).contains(&snapshot.cpu_permille),
+            "{snapshot:?}"
+        );
+        assert_eq!(snapshot.load_permille, snapshot.cpu_permille);
+        // Bytes above it are the load again.
+        admission.record_bytes_at(admission.inner.started.elapsed().as_secs(), 1_000_000_000);
+        let snapshot = admission.snapshot();
+        assert!(snapshot.load_permille >= 1_000, "{snapshot:?}");
+        // Without a counter the term is 0, as before.
+        assert_eq!(EdgeAdmission::default().snapshot().cpu_permille, 0);
+        assert!(process_cpu_us().is_some());
+        assert!(available_cpus() >= 1);
     }
 }
