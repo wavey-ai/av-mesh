@@ -126,11 +126,34 @@ pub struct EdgeAdmission {
     inner: Arc<EdgeAdmissionInner>,
 }
 
+/// A cumulative count of bytes that the node sends without passing them
+/// through [`EdgeAdmission::record_bytes`]: the client UDP lanes, whose
+/// real-time senders count into atomics and take no lock (Phase AM item 8).
+/// It is read when the load is read, and what it rose by since the last
+/// read is spread over the seconds in between.
+pub type EgressCounter = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+struct CounterSource {
+    read: EgressCounter,
+    last: u64,
+    last_second: u64,
+}
+
+impl std::fmt::Debug for CounterSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CounterSource")
+            .field("last", &self.last)
+            .field("last_second", &self.last_second)
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 struct EdgeAdmissionInner {
     config: EdgeAdmissionConfig,
     started: Instant,
     window: Mutex<RollingEgressWindow>,
+    counters: Mutex<Vec<CounterSource>>,
     overloaded: AtomicBool,
     rejected_requests: AtomicU64,
     admitted_sessions: AtomicU64,
@@ -166,6 +189,7 @@ impl EdgeAdmission {
                 config: config.normalized(),
                 started: Instant::now(),
                 window: Mutex::new(RollingEgressWindow::default()),
+                counters: Mutex::new(Vec::new()),
                 overloaded: AtomicBool::new(false),
                 rejected_requests: AtomicU64::new(0),
                 admitted_sessions: AtomicU64::new(0),
@@ -192,6 +216,69 @@ impl EdgeAdmission {
         self.snapshot_at(second)
     }
 
+    /// Count the egress of `read` (cumulative bytes) in the observed rate,
+    /// and so in `load_permille` and the free capacity that the node
+    /// advertises, and in its overload. What it counted before now is not
+    /// egress of the window.
+    pub fn add_egress_counter(&self, read: EgressCounter) {
+        let second = self.inner.started.elapsed().as_secs();
+        let last = read();
+        self.inner
+            .counters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(CounterSource {
+                read,
+                last,
+                last_second: second,
+            });
+    }
+
+    /// Whether the node is overloaded now (the measured egress, with the
+    /// snapshot's hysteresis): a new client is refused while it is.
+    pub fn overloaded_now(&self) -> bool {
+        self.overloaded_at(self.inner.started.elapsed().as_secs())
+    }
+
+    /// The counters' rise since their last read into the window, spread
+    /// evenly over the seconds since then (within the window).
+    fn fold_counters(&self, second: u64) {
+        let mut counters = self
+            .inner
+            .counters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if counters.is_empty() {
+            return;
+        }
+        let window_seconds = self.inner.config.window_seconds;
+        let mut window = self
+            .inner
+            .window
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for source in counters.iter_mut() {
+            let value = (source.read)();
+            let delta = value.saturating_sub(source.last);
+            source.last = value;
+            let from = source.last_second;
+            source.last_second = source.last_second.max(second);
+            if delta == 0 {
+                continue;
+            }
+            // The seconds after the last read up to this one; a read in the
+            // same second books it there.
+            let seconds = second.saturating_sub(from).max(1);
+            let first = second + 1 - seconds;
+            let share = delta / seconds;
+            let mut rest = delta - share * seconds;
+            for at in first.max(second.saturating_sub(window_seconds.saturating_sub(1)))..=second {
+                let bytes = share + std::mem::take(&mut rest);
+                window.record(at, bytes, window_seconds);
+            }
+        }
+    }
+
     pub fn record_rejection(&self) {
         self.inner.rejected_requests.fetch_add(1, Ordering::Relaxed);
     }
@@ -207,6 +294,7 @@ impl EdgeAdmission {
     /// Whether the measured egress overloads the node at `second`, with the
     /// hysteresis of the snapshot, which it updates.
     fn overloaded_at(&self, second: u64) -> bool {
+        self.fold_counters(second);
         let (observed_bps, observation_seconds) = self
             .inner
             .window
@@ -397,6 +485,7 @@ impl EdgeAdmission {
     }
 
     fn snapshot_at(&self, second: u64) -> EdgeAdmissionSnapshot {
+        self.fold_counters(second);
         let (observed_bps, observation_seconds) = self
             .inner
             .window
@@ -576,14 +665,27 @@ struct EgressBucket {
 
 impl RollingEgressWindow {
     fn record(&mut self, second: u64, bytes: u64, window_seconds: u64) {
-        self.prune(second, window_seconds);
-        if let Some(last) = self.buckets.back_mut() {
-            if last.second == second {
-                last.bytes = last.bytes.saturating_add(bytes);
-                return;
-            }
+        let newest = self.buckets.back().map_or(second, |last| last.second.max(second));
+        self.prune(newest, window_seconds);
+        if newest.saturating_sub(second) >= window_seconds {
+            return;
         }
-        self.buckets.push_back(EgressBucket { second, bytes });
+        // Mostly the newest second; the counters folded at a read can book
+        // a few seconds before it (the buckets stay in order).
+        match self
+            .buckets
+            .iter()
+            .rposition(|bucket| bucket.second <= second)
+        {
+            Some(index) if self.buckets[index].second == second => {
+                let bucket = &mut self.buckets[index];
+                bucket.bytes = bucket.bytes.saturating_add(bytes);
+            }
+            Some(index) => self
+                .buckets
+                .insert(index + 1, EgressBucket { second, bytes }),
+            None => self.buckets.push_front(EgressBucket { second, bytes }),
+        }
     }
 
     fn rate(&mut self, second: u64, window_seconds: u64) -> (u64, u64) {
@@ -723,6 +825,44 @@ mod tests {
             stream_id: Some(stream_id),
             draining: false,
         }
+    }
+
+    /// Phase AM item 8: egress that the node counts in an atomic (the
+    /// client UDP lanes) is in the observed rate, the load and the free
+    /// capacity, spread over the seconds since the last read.
+    #[test]
+    fn a_counter_of_udp_egress_is_in_the_load() {
+        let admission = EdgeAdmission::new(EdgeAdmissionConfig {
+            capacity_bps: 100_000,
+            admission_percent: 80,
+            recovery_percent: 60,
+            window_seconds: 4,
+            min_sustained_seconds: 2,
+            ..EdgeAdmissionConfig::default()
+        });
+        let sent = Arc::new(AtomicU64::new(5_000));
+        let read = Arc::clone(&sent);
+        admission.add_egress_counter(Arc::new(move || read.load(Ordering::Relaxed)));
+        // What it had counted before it was added is not egress.
+        assert_eq!(admission.snapshot_at(0).observed_bps, 0);
+        // 4,000 bytes over 4 seconds read at once: 1,000 bytes a second.
+        sent.fetch_add(4_000, Ordering::Relaxed);
+        let snapshot = admission.snapshot_at(4);
+        assert_eq!(snapshot.observation_seconds, 4);
+        assert_eq!(snapshot.observed_bps, 8_000);
+        assert_eq!(snapshot.load_permille, 100, "8 kbit/s of an 80 kbit/s limit");
+        // HTTP bytes add to it in the same seconds.
+        admission.record_bytes_at(4, 4_000);
+        assert_eq!(admission.snapshot_at(4).observed_bps, 16_000);
+        // A rise past the limit, sustained, overloads the node.
+        sent.fetch_add(80_000, Ordering::Relaxed);
+        let snapshot = admission.snapshot_at(6);
+        assert!(snapshot.overloaded, "{snapshot:?}");
+        assert!(snapshot.load_permille >= 1_000, "{snapshot:?}");
+        // A read long after books only the window's share.
+        sent.fetch_add(100_000, Ordering::Relaxed);
+        let snapshot = admission.snapshot_at(106);
+        assert_eq!(snapshot.observed_bps, 100_000 * 8 / 100);
     }
 
     #[test]

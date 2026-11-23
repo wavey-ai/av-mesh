@@ -2092,6 +2092,31 @@ struct Args {
     )]
     client_udp_nack_edge_rate: u32,
 
+    /// Phase AM item 8: the bytes that the client UDP lanes send (every
+    /// lane, with IP and UDP headers) count in the egress that this node
+    /// measures, so in its advertised load_permille and free capacity, its
+    /// overload and the admission of readers. `false`: HTTP responses only,
+    /// as before (a UDP-only edge then advertises no load).
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_EGRESS_LOAD",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    client_udp_egress_load: bool,
+
+    /// Phase AM item 8: a new UDP subscription is refused (`edge-busy`)
+    /// while this edge's egress is overloaded, as a new HLS session is. A
+    /// client that moves here (it names its next part) is still taken.
+    /// `false`: only --client-udp-max-subscribers refuses, as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_ADMIT_BY_LOAD",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    client_udp_admit_by_load: bool,
+
     /// An edge that has heard none of its cache-mesh parents for this long
     /// has lost them: it answers 503 for a part or a playlist reload that it
     /// would otherwise hold, and moves its UDP clients. Keep it above the
@@ -3627,6 +3652,15 @@ async fn main() -> Result<()> {
         ingest_shutdown_rx.clone(),
     );
     let edge_udp_task = if let Some(bind) = args.client_udp_bind {
+        if args.client_udp_egress_load {
+            // Phase AM item 8: the client lanes' bytes are this node's
+            // egress too (read when the load is, from their counters).
+            let stats = Arc::clone(&router.edge_udp_stats);
+            router
+                .edge_load
+                .egress
+                .add_egress_counter(Arc::new(move || stats.egress_wire_bytes()));
+        }
         // The pair sends by the class of a stream, which an edge learns only
         // from the class socket of a split cache mesh: without the split
         // every stream would look like audio and its 4K would leave from the
@@ -3673,6 +3707,7 @@ async fn main() -> Result<()> {
                 batched_admission: args.client_udp_batched_admission,
                 resume_from_request: args.client_udp_resume_from_request,
                 nack_edge_rate: args.client_udp_nack_edge_rate,
+                admit_by_load: args.client_udp_admit_by_load,
             },
             Arc::clone(&router.edge_udp_stats),
             edge_cut_through.clone(),
@@ -12212,6 +12247,9 @@ struct MeshApiSnapshot {
     edge_services: Vec<EdgeServiceSnapshot>,
     connections: Vec<ConnectionSnapshot>,
     streams: Vec<StreamTelemetry>,
+    /// This node's client UDP gauges, when it serves UDP clients.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_udp: Option<ClientUdpGauges>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -13062,6 +13100,32 @@ struct EdgeServiceSnapshot {
     /// own from one of the whole region.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     parents_silent_ms: Option<u64>,
+    /// Client UDP subscribers now, a live gauge (Phase AM item 8); `None`
+    /// on a node that serves no UDP client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    udp_subscribers: Option<u64>,
+}
+
+/// The live gauges of a node's client UDP lane, on /api/mesh/local and
+/// /api/assignment (Phase AM item 8): what an autoscaler waits on before it
+/// stops a drained node, beside the counters.
+#[derive(Debug, Clone, Default, Serialize)]
+struct ClientUdpGauges {
+    /// Subscribers now (every stream).
+    subscribers: Option<u64>,
+    draining: bool,
+    /// LL-HLS playback sessions now (the same as the edge service's
+    /// active_playback_sessions).
+    hls_sessions: u64,
+    /// Load in thousandths of the admission limit, client UDP egress
+    /// included (--client-udp-egress-load).
+    load_permille: u32,
+    /// Measured egress, bits a second, client UDP included.
+    egress_observed_bps: u64,
+    /// Bytes the client UDP lanes sent, IP and UDP headers included.
+    egress_wire_bytes: u64,
+    /// New subscriptions refused because the egress was overloaded.
+    load_refusals: u64,
 }
 
 /// One playlist that a cache holds. This is what a cache advertises to the
@@ -13124,6 +13188,7 @@ impl EdgeServiceSnapshot {
             playlists: Vec::new(),
             draining: node.draining,
             parents_silent_ms: None,
+            udp_subscribers: None,
         }
     }
 
@@ -13331,6 +13396,11 @@ impl EdgeLoad {
 
     fn admission_snapshot(&self) -> EdgeAdmissionSnapshot {
         self.egress.snapshot()
+    }
+
+    /// Whether the egress is overloaded now (client UDP lanes included).
+    fn overloaded_now(&self) -> bool {
+        self.egress.overloaded_now()
     }
 
     fn record_rejection(&self) {
@@ -14770,6 +14840,7 @@ impl MeshApiSnapshot {
             edge_services,
             connections,
             streams,
+            client_udp: None,
         }
     }
 }
@@ -18096,6 +18167,9 @@ impl AppRouter {
             cache_mesh_role_label(self.cache_mesh_role),
         );
         edge_service.egress_request_capacity = self.edge_load.egress.request_capacity_per_sec();
+        if self.client_udp_port.is_some() {
+            edge_service.udp_subscribers = self.edge_udp_stats.live_subscribers();
+        }
         if self.cache_mesh_role == CacheMeshRole::Edge {
             edge_service.parents_silent_ms = self
                 .mesh
@@ -18197,7 +18271,25 @@ impl AppRouter {
         snapshot.edge_hole_repair_requests =
             self.demand.hole_repair_requests.load(Ordering::Relaxed);
         snapshot.cache_replication = self.cache_replication_snapshot();
+        snapshot.client_udp = self.client_udp_gauges().await;
         snapshot
+    }
+
+    /// The client UDP lane's live gauges (Phase AM item 8), when this node
+    /// serves UDP clients.
+    async fn client_udp_gauges(&self) -> Option<ClientUdpGauges> {
+        self.client_udp_port?;
+        let stats = &self.edge_udp_stats;
+        let egress = self.edge_load.admission_snapshot();
+        Some(ClientUdpGauges {
+            subscribers: stats.live_subscribers(),
+            draining: self.lifecycle.is_draining().await,
+            hls_sessions: egress.active_sessions,
+            load_permille: egress.load_permille,
+            egress_observed_bps: egress.observed_bps,
+            egress_wire_bytes: stats.egress_wire_bytes(),
+            load_refusals: stats.load_refusals.load(Ordering::Relaxed),
+        })
     }
 
     async fn prometheus_metrics(&self) -> Bytes {
@@ -19219,6 +19311,7 @@ impl AppRouter {
                     "draining": cache.draining,
                     "overloaded": cache.overloaded,
                     "load_permille": cache.load_permille,
+                    "free_bps": cache.free_bps,
                     "head_part": cache.head_part,
                 })
             })
@@ -19232,6 +19325,7 @@ impl AppRouter {
                 (StatusCode::SERVICE_UNAVAILABLE, None, Some(error))
             }
         };
+        let gauges = self.client_udp_gauges().await;
         let body = serde_json::json!({
             "entry_point": self.node.node_id,
             "region": self.node.region,
@@ -19281,6 +19375,13 @@ impl AppRouter {
                 })
             }),
         });
+        // Phase AM item 8: the live gauges beside the counters.
+        let mut body = body;
+        if let (Some(block), Some(gauges)) = (body["client_udp"].as_object_mut(), gauges) {
+            if let Ok(serde_json::Value::Object(gauges)) = serde_json::to_value(gauges) {
+                block.extend(gauges);
+            }
+        }
         response(
             status,
             Some(Bytes::from(body.to_string())),
@@ -26118,6 +26219,7 @@ mod tests {
             playlists: Vec::new(),
             draining: false,
             parents_silent_ms: None,
+            udp_subscribers: None,
         });
         let mut snapshot = TelemetryAggregator::default().snapshot(local).await;
         assert!(!snapshot
@@ -34011,6 +34113,262 @@ mod tests {
         mesh.shutdown();
     }
 
+    /// Subscribe a test client to stream 77 of `edge` (the token dance) and
+    /// return the edge's answer: `Subscribed` or `Refused`.
+    async fn subscribe_udp_for_tests(
+        client: &UdpSocket,
+        edge: SocketAddr,
+        from_part: Option<u64>,
+    ) -> av_mesh::client_udp::Control {
+        use av_mesh::client_udp::{Control, RepairPolicy};
+        let subscribe = |token| {
+            Control::Subscribe {
+                stream_id: 77,
+                from_part,
+                repair: RepairPolicy {
+                    permille: 0,
+                    min_symbols: 0,
+                    loss_ppm: 0,
+                },
+                token,
+                fast_lane: false,
+                compact: None,
+            }
+            .encode()
+        };
+        let mut buf = vec![0_u8; 65_536];
+        client.send_to(&subscribe(None), edge).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (len, _) = client.recv_from(&mut buf).await.unwrap();
+                match Control::decode(&buf[..len]) {
+                    Some(Control::Token { token, .. }) => {
+                        client.send_to(&subscribe(Some(token)), edge).await.unwrap();
+                    }
+                    Some(answer @ (Control::Subscribed { .. } | Control::Refused { .. })) => {
+                        break answer
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the edge answers the subscription")
+    }
+
+    /// Phase AM item 8: what the client UDP lanes send is the edge's
+    /// egress (its advertised load and free capacity, and its overload),
+    /// an overloaded edge refuses a new subscription but takes a client
+    /// that moves to it, and the live gauges (subscribers, draining, HLS
+    /// sessions) are on /api/assignment and /api/mesh/local.
+    #[tokio::test]
+    async fn client_udp_egress_is_in_the_load_and_its_gauges_are_live() {
+        use av_mesh::client_udp::Control;
+
+        let cache = LiveTsCache::new(1, Duration::from_millis(250), 4, 32, 64).await;
+        for sequence in 0..6_u64 {
+            cache
+                .commit_stream_payload(
+                    77,
+                    encode_test_canonical_fmp4_bundle_with_duration(
+                        77,
+                        sequence,
+                        (sequence == 0).then_some(b"ftyp-fLaC-moov".as_slice()),
+                        &[sequence as u8; 4_000],
+                        Some(250),
+                        true,
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let mut router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
+        // 200 kbit/s: a few clients' cached parts overload it.
+        router.edge_load = EdgeLoad::new(EdgeAdmissionConfig {
+            capacity_bps: 200_000,
+            window_seconds: 2,
+            min_sustained_seconds: 1,
+            ..EdgeAdmissionConfig::default()
+        });
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let edge = socket.local_addr().unwrap();
+        router.client_udp_port = Some(edge.port());
+        let stats = Arc::clone(&router.edge_udp_stats);
+        router
+            .edge_load
+            .egress
+            .add_egress_counter(Arc::new(move || stats.egress_wire_bytes()));
+        // No load before any client.
+        let api: serde_json::Value = serde_json::from_slice(
+            get_for_tests(&router, "/api/assignment?stream=77")
+                .await
+                .body
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(api["client_udp"]["load_permille"], 0, "{api:#}");
+        assert!(api["client_udp"]["subscribers"].is_null(), "not serving yet: {api:#}");
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, 16);
+        config.playout = Duration::ZERO;
+        let task = tokio::spawn(edge_udp::run_edge_udp(
+            edge_udp::EdgeSockets::single(socket),
+            router.clone(),
+            config,
+            Arc::clone(&router.edge_udp_stats),
+            Vec::new(),
+            shutdown_rx,
+        ));
+        // Three clients, each sent the six cached parts.
+        let mut clients = Vec::new();
+        for _ in 0..3 {
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let answer = subscribe_udp_for_tests(&client, edge, Some(0)).await;
+            assert!(matches!(answer, Control::Subscribed { .. }), "{answer:?}");
+            clients.push(client);
+        }
+        let stats = Arc::clone(&router.edge_udp_stats);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stats.bytes.load(Ordering::Relaxed) < 3 * 6 * 4_000 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the parts go out");
+        let wire = stats.egress_wire_bytes();
+        assert_eq!(
+            wire,
+            stats.bytes.load(Ordering::Relaxed)
+                + stats.datagrams.load(Ordering::Relaxed) * edge_udp::UDP_IP_HEADER_BYTES
+        );
+        let api: serde_json::Value = serde_json::from_slice(
+            get_for_tests(&router, "/api/assignment?stream=77")
+                .await
+                .body
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        let block = &api["client_udp"];
+        assert_eq!(block["subscribers"], 3, "{api:#}");
+        assert_eq!(block["draining"], false);
+        assert_eq!(block["hls_sessions"], 0);
+        assert!(block["egress_wire_bytes"].as_u64().unwrap() >= wire, "{api:#}");
+        // ~73 kB in a window of at most 2 s: more than the 170 kbit/s that
+        // the edge admits.
+        assert!(block["egress_observed_bps"].as_u64().unwrap() >= 290_000, "{api:#}");
+        assert!(block["load_permille"].as_u64().unwrap() >= 1_000, "{api:#}");
+        let local: serde_json::Value = serde_json::from_slice(
+            get_for_tests(&router, "/api/mesh/local")
+                .await
+                .body
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(local["client_udp"]["subscribers"], 3, "{local:#}");
+        let own = local["edge_services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["node_id"] == router.node.node_id)
+            .unwrap()
+            .clone();
+        assert_eq!(own["udp_subscribers"], 3);
+        assert!(own["egress_observed_bps"].as_u64().unwrap() >= 290_000, "{own:#}");
+        let snapshot = router.edge_load.admission_snapshot();
+        assert!(snapshot.overloaded, "{snapshot:?}");
+        // Overloaded: a new listener is refused, a moving one is taken.
+        let newcomer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        match subscribe_udp_for_tests(&newcomer, edge, None).await {
+            Control::Refused { reason, .. } => assert_eq!(reason, "edge-busy"),
+            other => panic!("expected edge-busy, got {other:?}"),
+        }
+        assert_eq!(stats.load_refusals.load(Ordering::Relaxed), 1);
+        let mover = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let answer = subscribe_udp_for_tests(&mover, edge, Some(5)).await;
+        assert!(matches!(answer, Control::Subscribed { .. }), "{answer:?}");
+        assert_eq!(stats.live_subscribers(), Some(4));
+        // Draining shows on the gauges.
+        router.lifecycle.set_draining(true).await;
+        let api: serde_json::Value = serde_json::from_slice(
+            get_for_tests(&router, "/api/assignment?stream=77")
+                .await
+                .body
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(api["client_udp"]["draining"], true, "{api:#}");
+        let _ = shutdown_tx.send(());
+        task.await.unwrap().unwrap();
+        mesh.shutdown();
+    }
+
+    /// Without the counter (--client-udp-egress-load false) and with
+    /// --client-udp-admit-by-load false, the edge is as before: no load
+    /// from UDP and every new subscription taken.
+    #[tokio::test]
+    async fn without_the_am8_flags_udp_egress_is_not_load() {
+        use av_mesh::client_udp::Control;
+
+        let cache = LiveTsCache::new(1, Duration::from_millis(250), 4, 32, 64).await;
+        for sequence in 0..6_u64 {
+            cache
+                .commit_stream_payload(
+                    77,
+                    encode_test_canonical_fmp4_bundle_with_duration(
+                        77,
+                        sequence,
+                        (sequence == 0).then_some(b"ftyp-fLaC-moov".as_slice()),
+                        &[sequence as u8; 4_000],
+                        Some(250),
+                        true,
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let mut router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
+        router.edge_load = EdgeLoad::new(EdgeAdmissionConfig {
+            capacity_bps: 1_000,
+            window_seconds: 2,
+            min_sustained_seconds: 1,
+            ..EdgeAdmissionConfig::default()
+        });
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let edge = socket.local_addr().unwrap();
+        router.client_udp_port = Some(edge.port());
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, 16);
+        config.playout = Duration::ZERO;
+        config.admit_by_load = false;
+        let task = tokio::spawn(edge_udp::run_edge_udp(
+            edge_udp::EdgeSockets::single(socket),
+            router.clone(),
+            config,
+            Arc::clone(&router.edge_udp_stats),
+            Vec::new(),
+            shutdown_rx,
+        ));
+        for from_part in [Some(0), None, None] {
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let answer = subscribe_udp_for_tests(&client, edge, from_part).await;
+            assert!(matches!(answer, Control::Subscribed { .. }), "{answer:?}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let snapshot = router.edge_load.admission_snapshot();
+        assert_eq!(snapshot.observed_bps, 0);
+        assert!(!snapshot.overloaded);
+        assert_eq!(router.edge_udp_stats.live_subscribers(), Some(3));
+        let _ = shutdown_tx.send(());
+        task.await.unwrap().unwrap();
+        mesh.shutdown();
+    }
+
     /// A client that moves to an edge names a part that is past its playout
     /// deadline: the edge starts it at the oldest part within the deadline,
     /// not at the named part (which would make it wait behind a backlog).
@@ -34136,6 +34494,23 @@ mod tests {
         assert_eq!(args.client_udp_fanout_nice, 99);
         assert_eq!(args.client_udp_nack_edge_rate, 0);
         assert_eq!(args.relay_class_fallback_nice, 0);
+    }
+
+    #[test]
+    fn the_phase_am_edge_flags_default_on_and_can_be_turned_off() {
+        let args = Args::try_parse_from(["av-mesh"]).unwrap();
+        assert!(args.client_udp_egress_load);
+        assert!(args.client_udp_admit_by_load);
+        let args = Args::try_parse_from([
+            "av-mesh",
+            "--client-udp-egress-load",
+            "false",
+            "--client-udp-admit-by-load",
+            "false",
+        ])
+        .unwrap();
+        assert!(!args.client_udp_egress_load);
+        assert!(!args.client_udp_admit_by_load);
     }
 
     #[test]

@@ -158,6 +158,12 @@ pub(crate) struct EdgeUdpConfig {
     /// only each subscriber's budget, as before): a NACK storm from an
     /// overloaded edge's clients does not take the CPU its sends need.
     pub nack_edge_rate: u32,
+    /// A new subscription (not a client that moves here, which names its
+    /// next part) is refused `edge-busy` while the edge's egress, its
+    /// client UDP lanes included, is overloaded
+    /// (`--client-udp-admit-by-load`, Phase AM item 8; `false`: only
+    /// `--client-udp-max-subscribers` refuses, as before).
+    pub admit_by_load: bool,
 }
 
 impl EdgeUdpConfig {
@@ -182,6 +188,7 @@ impl EdgeUdpConfig {
             batched_admission: true,
             resume_from_request: true,
             nack_edge_rate: DEFAULT_NACK_EDGE_RATE,
+            admit_by_load: true,
         }
     }
 }
@@ -273,6 +280,47 @@ pub(crate) struct EdgeUdpStats {
     pub nack_refused: AtomicU64,
     /// NACKed parts refused for the edge's budget (wave 8).
     pub nack_edge_capped: AtomicU64,
+    /// The subscriber table, once the edge serves clients: the live gauge
+    /// of subscribers is read from it (Phase AM item 8).
+    pub table: OnceLock<LiveTable>,
+    /// New subscriptions refused because the edge's egress was overloaded
+    /// (`--client-udp-admit-by-load`, Phase AM item 8).
+    pub load_refusals: AtomicU64,
+}
+
+/// The subscriber table, for the live gauges.
+pub(crate) struct LiveTable(pub(crate) Table);
+
+impl std::fmt::Debug for LiveTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LiveTable")
+    }
+}
+
+/// IPv4 and UDP headers of a datagram: the client lanes' load counts them,
+/// as a NIC's limit does (a 1 ms Opus part is ~95 bytes of payload).
+pub(crate) const UDP_IP_HEADER_BYTES: u64 = 28;
+
+impl EdgeUdpStats {
+    /// Subscribers now (every stream), or `None` before the edge serves
+    /// clients.
+    pub(crate) fn live_subscribers(&self) -> Option<u64> {
+        let table = self.table.get()?;
+        Some(subscriber_count(&table.0) as u64)
+    }
+
+    /// Bytes that the client lanes sent, every lane (cache-fed,
+    /// cut-through, compact, NACK answers, window repair and the fast lane),
+    /// with their IP and UDP headers.
+    pub(crate) fn egress_wire_bytes(&self) -> u64 {
+        let mut bytes = self.bytes.load(Ordering::Relaxed)
+            + self.datagrams.load(Ordering::Relaxed) * UDP_IP_HEADER_BYTES;
+        if let Some(lane) = self.fast_lane.get() {
+            bytes += lane.stats.bytes.load(Ordering::Relaxed)
+                + lane.stats.datagrams.load(Ordering::Relaxed) * UDP_IP_HEADER_BYTES;
+        }
+        bytes
+    }
 }
 
 /// The compact datagrams of each stream's recent parts, in their canonical
@@ -1318,6 +1366,7 @@ pub(crate) async fn run_edge_udp(
         }))
         .await;
     let table: Table = Arc::default();
+    let _ = stats.table.set(LiveTable(Arc::clone(&table)));
     let moved: MovedAway = Arc::default();
     if let Some(lane) = sockets.fast_lane() {
         let _ = stats.fast_lane.set(Arc::clone(lane));
@@ -1995,6 +2044,22 @@ async fn admit(
             &Control::Move {
                 stream_id,
                 reason: reason.into(),
+            },
+        )
+        .await;
+        return;
+    }
+    // Phase AM item 8: an overloaded edge takes no new listener (one that
+    // moves here is taken: refused everywhere, it would be stranded).
+    if config.admit_by_load && from_part.is_none() && router.edge_load.overloaded_now() {
+        stats.refusals.fetch_add(1, Ordering::Relaxed);
+        stats.load_refusals.fetch_add(1, Ordering::Relaxed);
+        send_control(
+            &socket,
+            peer,
+            &Control::Refused {
+                stream_id,
+                reason: "edge-busy".into(),
             },
         )
         .await;

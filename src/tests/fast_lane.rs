@@ -685,6 +685,14 @@ async fn an_edge_sends_each_part_once_to_fast_lane_clients_joining_anywhere() {
     }
     let lane = edge.lane.snapshot_stats();
     assert!(lane.parts > 0 && lane.datagrams > 0, "{lane:?}");
+    // Phase AM item 8: the lane counts its bytes (the edge's load reads
+    // them), at least a few dozen a datagram.
+    assert!(lane.bytes >= lane.datagrams * 32, "{lane:?}");
+    assert!(
+        edge.stats.egress_wire_bytes()
+            >= lane.bytes + lane.datagrams * edge_udp::UDP_IP_HEADER_BYTES,
+        "the edge's wire bytes hold the fast lane's: {lane:?}"
+    );
     assert!(
         lane.top_up_datagrams > 0,
         "the edge tops the clients' repair up: {lane:?}"

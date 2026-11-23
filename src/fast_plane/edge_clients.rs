@@ -330,6 +330,9 @@ impl FastSnapshot {
 pub struct FastLaneStats {
     /// Fast-lane datagrams handed to the kernel (one per client).
     pub datagrams: AtomicU64,
+    /// Their UDP payload bytes (Phase AM item 8: the edge's load counts
+    /// them).
+    pub bytes: AtomicU64,
     /// Parts claimed for a client on the fast lane.
     pub parts: AtomicU64,
     /// Datagrams that found the client socket full: not waited for.
@@ -443,6 +446,8 @@ pub struct FastLaneSnapshot {
     pub fanout_lag_over_1ms: u64,
     #[serde(default)]
     pub fanout_inline_sends: u64,
+    #[serde(default)]
+    pub bytes: u64,
 }
 
 struct Armed {
@@ -908,6 +913,7 @@ impl EdgeFastLane {
             fanout_lag_max_us: load(&self.stats.fanout_lag_max_us),
             fanout_lag_over_1ms: load(&self.stats.fanout_lag_over_1ms),
             fanout_inline_sends: load(&self.stats.fanout_inline_sends),
+            bytes: load(&self.stats.bytes),
         }
     }
 
@@ -1754,10 +1760,12 @@ impl ClientPlan {
             }
         }
         let mut delivered = sent as u64;
+        let mut bytes = 0_u64;
         let (mut would_block, mut errors, mut given_back) = (0_u64, 0_u64, 0_u64);
         let (sends, clients, first_sent) = (&self.sends, &self.clients, &mut self.first_sent);
-        for send in &sends[..sent.min(sends.len())] {
+        for (index, send) in sends[..sent.min(sends.len())].iter().enumerate() {
             first_sent[usize::from(send.message)].get_or_insert(send.peer);
+            bytes += message(index).0.len() as u64;
         }
         // One more try each for what the kernel did not take, until the
         // socket is full: the rest are refused without a syscall each.
@@ -1769,6 +1777,7 @@ impl ClientPlan {
                 match outcome {
                     sys::RestOutcome::Sent => {
                         delivered += 1;
+                        bytes += message(index).0.len() as u64;
                         let send = &sends[index];
                         first_sent[usize::from(send.message)].get_or_insert(send.peer);
                         return;
@@ -1793,6 +1802,7 @@ impl ClientPlan {
             }
         }
         lane.stats.datagrams.fetch_add(delivered, Ordering::Relaxed);
+        lane.stats.bytes.fetch_add(bytes, Ordering::Relaxed);
         self.sent_us = crate::now_unix_us();
         self.sends.clear();
         self.clients.clear();
