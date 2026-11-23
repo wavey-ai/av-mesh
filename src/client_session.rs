@@ -247,6 +247,11 @@ pub struct UdpSession {
     // The edge in use.
     target: Option<SocketAddr>,
     from_part: Option<u64>,
+    /// The edge in use has sent a part (or a repair datagram) since the
+    /// request: it serves this client, so a repeated request no longer
+    /// names `from_part` (an edge that has admitted the client would go
+    /// back to it and send those parts again; wave 9 review).
+    media_here: bool,
     token: Option<u64>,
     subscribed: bool,
     asked_at: Instant,
@@ -312,6 +317,7 @@ impl UdpSession {
             moved_for_silence: false,
             target: None,
             from_part: None,
+            media_here: false,
             token: None,
             subscribed: false,
             asked_at: now,
@@ -416,6 +422,7 @@ impl UdpSession {
         self.compact_retry_at = None;
         self.target = Some(target);
         self.from_part = from_part;
+        self.media_here = false;
         self.token = None;
         self.pending = None;
         // Each edge is asked for the compact lane again, with its repair.
@@ -576,8 +583,9 @@ impl UdpSession {
                 self.base_repair = self.config.base_for(false);
                 self.repair = self.policy_for_base();
             }
-            // Before the edge answers, keep asking from the same part.
-            let from = if self.subscribed {
+            // Before the edge answers, keep asking from the same part
+            // (until it sends parts: it has admitted the client).
+            let from = if self.subscribed || self.media_here {
                 None
             } else {
                 self.from_part
@@ -649,15 +657,19 @@ impl UdpSession {
                 Control::Token { token: given, .. } => {
                     self.first_token_at.get_or_insert(now);
                     if self.token != Some(given) {
-                        if self.token.is_none() {
-                            // A request and its answer: the round trip that
-                            // the NACKs wait for.
+                        // A request and its answer: the round trip that
+                        // the NACKs wait for. Not when the request was
+                        // repeated (Karn): the answer may be to an earlier
+                        // copy, and the time since the last one is short
+                        // of the round trip (wave 9 review).
+                        if self.token.is_none() && self.repeats == 0 {
                             let rtt = now.saturating_duration_since(self.last_request_at);
                             self.receiver.compact.set_rtt(rtt);
                             self.rtt = Some(rtt);
                         }
                         self.token = Some(given);
-                        send(target, &self.subscribe_datagram(self.from_part));
+                        let from = self.from_part.filter(|_| !self.media_here);
+                        send(target, &self.subscribe_datagram(from));
                         self.last_request_at = now;
                         // The request with the token is a new request: its
                         // own repeats, from the first wait.
@@ -731,6 +743,7 @@ impl UdpSession {
             }
         } else {
             self.moved_for_silence = false;
+            self.media_here = true;
             self.pending = self.receiver.push(datagram);
             Received::Media
         }
@@ -818,6 +831,62 @@ mod tests {
         assert_eq!(session.next_refresh - now, UNANSWERED_REFRESH);
         session.poll(now + UNANSWERED_REFRESH, &mut |_, _| {});
         assert_eq!(session.next_refresh - now, UNANSWERED_REFRESH * 2);
+    }
+
+    /// Wave 9 review: an answer to a repeated request gives no round trip
+    /// (Karn), and once the edge sends parts a repeated request no longer
+    /// names the part to resume from (the edge would go back to it).
+    #[test]
+    fn a_repeated_request_gives_no_round_trip_and_stops_naming_its_part() {
+        let now = Instant::now();
+        let mut session = UdpSession::new(SessionConfig::new(4001), now);
+        session.begin(edge(), Some(500), now, &mut |_, _| {});
+        // The first request is repeated at 25 ms; the token comes at 45 ms
+        // (an answer to either: 45 or 20 ms).
+        let repeat = session.next_wake();
+        assert_eq!(repeat - now, Duration::from_millis(25));
+        session.poll(repeat, &mut |_, _| {});
+        let token = Control::Token { stream_id: 4001, token: 9 }.encode();
+        let answered = now + Duration::from_millis(45);
+        let mut sent: Vec<Vec<u8>> = Vec::new();
+        session.on_datagram(edge(), &token, answered, &mut |_, datagram| {
+            sent.push(datagram.to_vec())
+        });
+        assert_eq!(session.rtt, None);
+        // So the request with the token waits the first retry, not 3 x 20.
+        assert_eq!(session.next_refresh - answered, Duration::from_millis(25));
+        match Control::decode(&sent[0]) {
+            Some(Control::Subscribe { from_part, .. }) => assert_eq!(from_part, Some(500)),
+            other => panic!("{other:?}"),
+        }
+        // Unrepeated, the answer is a sample.
+        let mut fresh = UdpSession::new(SessionConfig::new(4001), now);
+        fresh.begin(edge(), None, now, &mut |_, _| {});
+        fresh.on_datagram(edge(), &token, answered, &mut |_, _| {});
+        assert_eq!(fresh.rtt, Some(Duration::from_millis(45)));
+        // A part comes before the OK (the OK is lost): the next repeat
+        // names no part.
+        let published = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64;
+        let part = crate::client_compact::encode_part(500, published, b"pcm").unwrap();
+        let at = answered + Duration::from_millis(2);
+        assert_eq!(
+            session.on_datagram(edge(), &part, at, &mut |_, _| {}),
+            Received::Media
+        );
+        let wake = session.next_refresh;
+        let mut repeated: Vec<Vec<u8>> = Vec::new();
+        session.poll(wake, &mut |_, datagram| repeated.push(datagram.to_vec()));
+        let sub = repeated
+            .iter()
+            .find_map(|datagram| match Control::decode(datagram) {
+                Some(Control::Subscribe { from_part, token, .. }) => Some((from_part, token)),
+                _ => None,
+            })
+            .expect("a repeated SUB");
+        assert_eq!(sub, (None, Some(9)));
     }
 
     #[test]
@@ -1020,7 +1089,10 @@ mod tests {
             session.begin(edge(), None, now, &mut send);
             let token = Control::Token { stream_id: 3, token: 4 }.encode();
             session.on_datagram(edge(), &token, now, &mut send);
-            let long = crate::client_compact::encode_part(70_000, 0, b"pcm").unwrap();
+            // A known publication time: a part without one keeps the long
+            // form (wave 9 review).
+            let long =
+                crate::client_compact::encode_part(70_000, 1_700_000_000_000_000, b"pcm").unwrap();
             let short = crate::client_compact::shorten(&long).expect("short form");
             assert_eq!(
                 session.on_datagram(edge(), &short, now, &mut send),
@@ -1084,7 +1156,8 @@ mod tests {
         let token = Control::Token { stream_id: 3, token: 4 }.encode();
         session.on_datagram(edge(), &token, now, &mut send);
         for part in 70_000..70_004_u64 {
-            let long = crate::client_compact::encode_part(part, 0, b"pcm").unwrap();
+            let long =
+                crate::client_compact::encode_part(part, 1_700_000_000_000_000, b"pcm").unwrap();
             let short = crate::client_compact::shorten(&long).expect("short form");
             session.on_datagram(edge(), &short, now, &mut send);
         }
