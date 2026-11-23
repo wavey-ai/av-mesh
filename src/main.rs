@@ -1437,8 +1437,8 @@ struct Args {
     /// such a pair; the edge keeps its lease, its warm-up window and its
     /// hole repair (replica requests). `secondary`: only the edge's
     /// secondary forwarder pushes. `all`: every leased pair is pushed, as
-    /// before. Video streams are always pushed. Inert without lease
-    /// children.
+    /// before. Video streams follow --cache-mesh-fast-plane-video-push.
+    /// Inert without lease children.
     #[arg(
         long,
         env = "NEEDLETAIL_CACHE_MESH_FAST_PLANE_PUSH",
@@ -1446,6 +1446,27 @@ struct Args {
         default_value_t = CacheMeshFastPlanePush::Nothing
     )]
     cache_mesh_fast_plane_push: CacheMeshFastPlanePush,
+
+    /// Wave 8 stage 3: the same for a video stream. An edge with a lease at
+    /// both of its forwarders took a 4K stream four ways: the primary's
+    /// RLS1 sources and the secondary's repair on the fast plane, and a
+    /// full cache-mesh push from each forwarder (3.6 times the stream on
+    /// its link; at 160-247 Mbit/s every edge dropped at its cache-mesh
+    /// video socket, as the referee's did in wave 7). `none` (the default):
+    /// no live push of a video stream to an edge that the fast plane feeds
+    /// it to; the edge has the primary's sources and the secondary's repair,
+    /// its failover promotes the secondary's sources when the primary goes
+    /// silent, and its hole repair (replica requests) and warm-up window
+    /// stay. `secondary`: the forwarder that feeds the edge the sources (its
+    /// primary, or one whose failover promoted it) does not push; the other,
+    /// which feeds it repair only, does. `all`: as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CACHE_MESH_FAST_PLANE_VIDEO_PUSH",
+        value_enum,
+        default_value_t = CacheMeshFastPlanePush::Nothing
+    )]
+    cache_mesh_fast_plane_video_push: CacheMeshFastPlanePush,
 
     /// Source address of the symbols to lease children (an audio socket
     /// and its video twin on it): each edge binds it as its parent
@@ -3122,13 +3143,17 @@ async fn main() -> Result<()> {
     // push filter reads them from this slot once they run.
     let lease_push_slot: Arc<std::sync::OnceLock<Arc<fast_plane::lease::LeaseChildren>>> =
         Arc::default();
-    let mesh_config = match args.cache_mesh_fast_plane_push {
+    let mesh_config = match (
+        args.cache_mesh_fast_plane_push,
+        args.cache_mesh_fast_plane_video_push,
+    ) {
         _ if !(args.relay_lease_children && args.relay_lease_bind.is_some()) => mesh_config,
-        CacheMeshFastPlanePush::All => mesh_config,
-        mode => mesh_config.with_live_push_filter(fast_plane::lease::live_push_filter(
+        (CacheMeshFastPlanePush::All, CacheMeshFastPlanePush::All) => mesh_config,
+        (audio, video) => mesh_config.with_live_push_filter(fast_plane::lease::live_push_filter(
             Arc::clone(&lease_push_slot),
             cache.stream_classes().clone(),
-            mode == CacheMeshFastPlanePush::Secondary,
+            audio.live_push(),
+            video.live_push(),
         )),
     };
     let mesh_chunk_cache = Arc::clone(&cache.chunk_cache);
@@ -4298,13 +4323,23 @@ enum RelayForwardRole {
     Repair,
 }
 
-/// `--cache-mesh-fast-plane-push`.
+/// `--cache-mesh-fast-plane-push`, `--cache-mesh-fast-plane-video-push`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CacheMeshFastPlanePush {
     All,
     Secondary,
     #[value(name = "none")]
     Nothing,
+}
+
+impl CacheMeshFastPlanePush {
+    const fn live_push(self) -> fast_plane::lease::LivePush {
+        match self {
+            Self::All => fast_plane::lease::LivePush::All,
+            Self::Secondary => fast_plane::lease::LivePush::Secondary,
+            Self::Nothing => fast_plane::lease::LivePush::Nothing,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -37035,6 +37070,32 @@ mod tests {
         assert_eq!(without.gso_datagrams, 0);
         assert_eq!(without.gso_messages, 0);
         assert_eq!(without.gso_fallbacks, 0);
+    }
+
+    #[test]
+    fn the_cache_mesh_push_flags_default_to_no_push_of_a_fed_pair() {
+        let args = Args::try_parse_from(["av-mesh"]).unwrap();
+        assert_eq!(
+            args.cache_mesh_fast_plane_push,
+            CacheMeshFastPlanePush::Nothing
+        );
+        assert_eq!(
+            args.cache_mesh_fast_plane_video_push,
+            CacheMeshFastPlanePush::Nothing
+        );
+        for (value, mode) in [
+            ("all", CacheMeshFastPlanePush::All),
+            ("secondary", CacheMeshFastPlanePush::Secondary),
+            ("none", CacheMeshFastPlanePush::Nothing),
+        ] {
+            let args = Args::try_parse_from([
+                "av-mesh",
+                "--cache-mesh-fast-plane-video-push",
+                value,
+            ])
+            .unwrap();
+            assert_eq!(args.cache_mesh_fast_plane_video_push, mode);
+        }
     }
 
     #[test]

@@ -89,6 +89,12 @@ pub struct LeaseChild {
 }
 
 impl LeaseChild {
+    /// The child's failover controller promoted this forwarder: it takes
+    /// video in full here.
+    pub fn is_promoted(&self) -> bool {
+        self.promoted.load(Ordering::Relaxed)
+    }
+
     /// The lane rule: audio in full to every child; video in full to the
     /// children this forwarder is primary for (or that promoted it), and
     /// repair only to the others, whose sources are kept warm.
@@ -144,13 +150,19 @@ fn stream_digits(stream_id: u64, digits: &mut [u8; 20]) -> &str {
 impl LeaseSnapshot {
     /// Whether the child at `ip` takes stream `stream_id` here, and if so
     /// whether this forwarder is its primary. No allocation.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn feeds(&self, ip: IpAddr, stream_id: u64) -> Option<bool> {
+        self.child_feeding(ip, stream_id).map(|child| child.primary)
+    }
+
+    /// The child at `ip`, if it takes stream `stream_id` here. No
+    /// allocation.
+    pub fn child_feeding(&self, ip: IpAddr, stream_id: u64) -> Option<&LeaseChild> {
         let mut digits = [0_u8; 20];
         self.children_of(stream_digits(stream_id, &mut digits))
             .iter()
-            .map(|&child| &self.children[usize::from(child)])
+            .map(|&child| &*self.children[usize::from(child)])
             .find(|child| child.ip == ip)
-            .map(|child| child.primary)
     }
 
     /// When the fast plane last fed stream `stream_id` to its children here
@@ -190,13 +202,35 @@ impl LeaseSnapshot {
     }
 }
 
-/// The cache mesh's live push filter of a forwarder (wave 7 item 4,
-/// `--cache-mesh-fast-plane-push`): an audio stream's parts are not pushed
-/// over the cache mesh to a lease child that the fast plane feeds them to
-/// (with `primary_only`, only to the children this forwarder is the
-/// primary of: their secondary forwarder still pushes). Video keeps the
-/// push. The lease children are set in `slot` once they run; until then
-/// nothing is filtered.
+/// What a forwarder still pushes over the cache mesh to a lease child that
+/// its fast plane feeds a stream to (`--cache-mesh-fast-plane-push` for
+/// audio, `--cache-mesh-fast-plane-video-push` for video).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LivePush {
+    /// Every leased pair is pushed, as before wave 7.
+    All,
+    /// Only the forwarder that does not feed the child the stream in full
+    /// pushes: the edge's secondary (for video, until the edge promotes it).
+    Secondary,
+    /// No pair that the fast plane feeds is pushed.
+    Nothing,
+}
+
+/// The cache mesh's live push filter of a forwarder (wave 7 item 4; video
+/// wave 8 stage 3): a stream's parts are not pushed over the cache mesh to
+/// a lease child that the fast plane feeds them to. With
+/// [`LivePush::Secondary`] only the children that take the stream in full
+/// from this forwarder are filtered (audio: those it is the primary of;
+/// video: those it is the primary of or that promoted it), so their other
+/// forwarder still pushes. The lease children are set in `slot` once they
+/// run; until then nothing is filtered.
+///
+/// Video (wave 8 stage 3): an edge with a lease at both of its forwarders
+/// took a 4K stream four ways, the primary's RLS1 sources and the
+/// secondary's repair on the fast plane and both forwarders' cache-mesh
+/// pushes (about 3.1 times the stream on its VLAN link locally), and each
+/// forwarder pushed every edge a full copy. The referee's edges dropped at
+/// the cache-mesh video socket (wave 7, 100-440 k datagrams each).
 ///
 /// A lease says the fast plane should feed the pair, not that it does: a
 /// pair is filtered only while the class thread fed the stream to the lease
@@ -208,19 +242,24 @@ impl LeaseSnapshot {
 pub fn live_push_filter(
     slot: Arc<std::sync::OnceLock<Arc<LeaseChildren>>>,
     classes: super::StreamClasses,
-    primary_only: bool,
+    audio: LivePush,
+    video: LivePush,
 ) -> playlists::mesh::CacheMeshLivePushFilter {
     Arc::new(move |peer: SocketAddr, stream_id: u64| {
-        if classes.class(stream_id) == TrafficClass::Video {
+        let is_video = classes.class(stream_id) == TrafficClass::Video;
+        let mode = if is_video { video } else { audio };
+        if mode == LivePush::All {
             return false;
         }
         let Some(lease) = slot.get() else {
             return false;
         };
         let snapshot = lease.load();
-        snapshot
-            .feeds(peer.ip(), stream_id)
-            .is_some_and(|primary| primary || !primary_only)
+        let Some(child) = snapshot.child_feeding(peer.ip(), stream_id) else {
+            return false;
+        };
+        let in_full = child.primary || (is_video && child.is_promoted());
+        (mode == LivePush::Nothing || in_full)
             && crate::now_unix_us().saturating_sub(snapshot.fed_us(stream_id))
                 <= FAST_PLANE_FED_WINDOW_US
     })
@@ -663,8 +702,18 @@ mod tests {
         let classes = crate::fast_plane::StreamClasses::default();
         classes.mark_video(1);
         let slot = Arc::new(std::sync::OnceLock::new());
-        let none = live_push_filter(Arc::clone(&slot), classes.clone(), false);
-        let primary = live_push_filter(Arc::clone(&slot), classes, true);
+        let none = live_push_filter(
+            Arc::clone(&slot),
+            classes.clone(),
+            LivePush::Nothing,
+            LivePush::All,
+        );
+        let primary = live_push_filter(
+            Arc::clone(&slot),
+            classes,
+            LivePush::Secondary,
+            LivePush::All,
+        );
         let peer = |ip: &str| -> SocketAddr { format!("{ip}:9101").parse().unwrap() };
         // Nothing is filtered before the lease children run.
         assert!(!none(peer("10.0.0.5"), 4001));
@@ -707,6 +756,72 @@ mod tests {
             served("10.0.0.6:9101", 4001),
         ]);
         assert!(none(peer("10.0.0.5"), 4001));
+    }
+
+    #[test]
+    fn the_video_push_filter_keeps_the_push_of_a_child_that_takes_only_repair_here() {
+        // This forwarder is 10.0.0.5's primary and 10.0.0.6's secondary.
+        let lease = lease(16, &["10.0.0.5"]);
+        lease.rebuild(&[served("10.0.0.5:9101", 1), served("10.0.0.6:9101", 1)]);
+        let classes = crate::fast_plane::StreamClasses::default();
+        classes.mark_video(1);
+        let slot = Arc::new(std::sync::OnceLock::new());
+        slot.set(Arc::clone(&lease)).unwrap();
+        let filter = |video| {
+            live_push_filter(Arc::clone(&slot), classes.clone(), LivePush::All, video)
+        };
+        let (all, secondary, none) = (
+            filter(LivePush::All),
+            filter(LivePush::Secondary),
+            filter(LivePush::Nothing),
+        );
+        let peer = |ip: &str| -> SocketAddr { format!("{ip}:9101").parse().unwrap() };
+        let fed = |at_us: u64| {
+            lease
+                .load()
+                .children_and_clock_of("1")
+                .unwrap()
+                .1
+                .store(at_us, Ordering::Relaxed);
+        };
+        // Not fed yet: every pair is pushed.
+        assert!(!secondary(peer("10.0.0.5"), 1));
+        assert!(!none(peer("10.0.0.5"), 1));
+        fed(crate::now_unix_us());
+        // `all`: video is pushed as before.
+        assert!(!all(peer("10.0.0.5"), 1));
+        assert!(!all(peer("10.0.0.6"), 1));
+        // `secondary`: the child that takes the stream in full here (its
+        // primary) is not pushed; the repair-only child still is.
+        assert!(secondary(peer("10.0.0.5"), 1));
+        assert!(!secondary(peer("10.0.0.6"), 1));
+        // Once the repair-only child promotes this forwarder it takes the
+        // sources here, and its push stops too; a demotion brings it back.
+        let six: IpAddr = "10.0.0.6".parse().unwrap();
+        assert_eq!(
+            lease.apply_failover(six, FailoverForwardMode::SourceAndRepair),
+            Some(true)
+        );
+        assert!(secondary(peer("10.0.0.6"), 1));
+        lease.apply_failover(six, FailoverForwardMode::RepairOnly);
+        assert!(!secondary(peer("10.0.0.6"), 1));
+        // `none`: no pair the fast plane feeds is pushed.
+        assert!(none(peer("10.0.0.5"), 1));
+        assert!(none(peer("10.0.0.6"), 1));
+        // The audio mode does not touch video, nor the video mode audio.
+        lease.rebuild(&[served("10.0.0.5:9101", 4001)]);
+        lease
+            .load()
+            .children_and_clock_of("4001")
+            .unwrap()
+            .1
+            .store(crate::now_unix_us(), Ordering::Relaxed);
+        assert!(!none(peer("10.0.0.5"), 4001));
+        // The feed stops: the push resumes once the window has passed.
+        lease.rebuild(&[served("10.0.0.5:9101", 1)]);
+        fed(crate::now_unix_us() - FAST_PLANE_FED_WINDOW_US - 1_000);
+        assert!(!secondary(peer("10.0.0.5"), 1));
+        assert!(!none(peer("10.0.0.5"), 1));
     }
 
     #[test]
