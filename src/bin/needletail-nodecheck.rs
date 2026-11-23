@@ -234,7 +234,8 @@ fn run(command: Command) -> Result<ExitCode> {
             println!("{}", serde_json::to_string(&done)?);
         }
         Command::EchoServe(args) => {
-            let socket = UdpSocket::bind(args.bind).with_context(|| format!("bind {}", args.bind))?;
+            let socket =
+                UdpSocket::bind(args.bind).with_context(|| format!("bind {}", args.bind))?;
             echo_serve(&socket, stop_on_signals())?;
         }
         Command::EchoSend(args) => {
@@ -264,8 +265,14 @@ extern "C" fn on_stop_signal(_signal: libc::c_int) {
 fn stop_on_signals() -> &'static AtomicBool {
     // SAFETY: the handler only stores to an atomic.
     unsafe {
-        libc::signal(libc::SIGTERM, on_stop_signal as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGINT, on_stop_signal as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGTERM,
+            on_stop_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            on_stop_signal as *const () as libc::sighandler_t,
+        );
     }
     &STOP
 }
@@ -314,9 +321,7 @@ fn watch(
     let mut since_us = 0;
     let mut write_new = |out: &mut dyn Write| -> Result<()> {
         let report = journal.query(Some(since_us));
-        if let Some(last) = report.last_t_us() {
-            since_us = last + 1;
-        }
+        since_us = report.upto_us + 1;
         out.write_all(journal.render_report(&report).as_bytes())?;
         out.flush()?;
         Ok(())
@@ -726,8 +731,7 @@ fn recv_stamped(
             if (*header).cmsg_level == libc::SOL_SOCKET
                 && (*header).cmsg_type == libc::SCM_TIMESTAMPNS
             {
-                let time: libc::timespec =
-                    std::ptr::read_unaligned(libc::CMSG_DATA(header).cast());
+                let time: libc::timespec = std::ptr::read_unaligned(libc::CMSG_DATA(header).cast());
                 stamp = Some(time.tv_sec as u64 * 1_000_000 + time.tv_nsec as u64 / 1_000);
             }
             header = libc::CMSG_NXTHDR(&message, header);
@@ -740,7 +744,8 @@ fn socket_addr(name: &libc::sockaddr_storage) -> Option<SocketAddr> {
     match libc::c_int::from(name.ss_family) {
         libc::AF_INET => {
             // SAFETY: the family says the storage holds a sockaddr_in.
-            let v4 = unsafe { &*(name as *const libc::sockaddr_storage).cast::<libc::sockaddr_in>() };
+            let v4 =
+                unsafe { &*(name as *const libc::sockaddr_storage).cast::<libc::sockaddr_in>() };
             Some(SocketAddr::V4(SocketAddrV4::new(
                 Ipv4Addr::from(u32::from_be(v4.sin_addr.s_addr)),
                 u16::from_be(v4.sin_port),
@@ -927,7 +932,9 @@ fn analyze_echoes(echoes: &[Option<Echo>], spacing_us: u64) -> EchoAnalysis {
         }
         let members = &received[index..=end];
         let (first, last) = (members[0].0, members[members.len() - 1].0);
-        let from = index.checked_sub(1).map_or(0, |before| received[before].0 + 1);
+        let from = index
+            .checked_sub(1)
+            .map_or(0, |before| received[before].0 + 1);
         let to = received.get(end + 1).map_or(echoes.len(), |&(seq, _)| seq);
         let stamps = members.iter().map(|(_, echo)| echo.server_us);
         let spread = stamps.clone().max().unwrap_or(0) - stamps.min().unwrap_or(0);
@@ -1111,7 +1118,10 @@ fn steal_and_total(stat: &str, cpus: &[u16]) -> (u64, u64) {
         }
         // user nice system idle iowait irq softirq steal (guest time is
         // inside user already)
-        let values: Vec<u64> = fields.take(8).filter_map(|field| field.parse().ok()).collect();
+        let values: Vec<u64> = fields
+            .take(8)
+            .filter_map(|field| field.parse().ok())
+            .collect();
         total += values.iter().sum::<u64>();
         steal += values.get(7).copied().unwrap_or(0);
     }
@@ -1262,7 +1272,10 @@ mod tests {
     /// Allow the calling thread the first `count` of its CPUs, so that the
     /// tick threads it starts are that many.
     fn keep_cpus(count: usize) -> Vec<u16> {
-        let cpus: Vec<u16> = stall_journal::allowed_cpus().into_iter().take(count).collect();
+        let cpus: Vec<u16> = stall_journal::allowed_cpus()
+            .into_iter()
+            .take(count)
+            .collect();
         // SAFETY: a zeroed cpu_set_t is empty; CPU_SET writes inside it.
         unsafe {
             let mut set: libc::cpu_set_t = std::mem::zeroed();
@@ -1304,13 +1317,19 @@ mod tests {
         let Command::Warm(warm) = parse("nodecheck warm") else {
             panic!("warm");
         };
-        assert_eq!((warm.leave_mb, warm.chunk_mb, warm.max_seconds), (384, 64, 60));
+        assert_eq!(
+            (warm.leave_mb, warm.chunk_mb, warm.max_seconds),
+            (384, 64, 60)
+        );
         let Command::Touch(touch) =
             parse("nodecheck touch --mb 400 --rate-mb-s 2 --thp always --out t.ndjson")
         else {
             panic!("touch");
         };
-        assert_eq!((touch.mb, touch.rate_mb_s, touch.thp), (400, 2.0, Some(Thp::Always)));
+        assert_eq!(
+            (touch.mb, touch.rate_mb_s, touch.thp),
+            (400, 2.0, Some(Thp::Always))
+        );
         assert!(matches!(
             parse("nodecheck echo-serve --bind 0.0.0.0:7400"),
             Command::EchoServe(_)
@@ -1327,7 +1346,11 @@ mod tests {
         };
         assert!(!boot.warm);
         assert_eq!(
-            (boot.check_seconds, boot.max_stop_ms, boot.max_steal_permille),
+            (
+                boot.check_seconds,
+                boot.max_stop_ms,
+                boot.max_steal_permille
+            ),
             (0, 20, 10)
         );
         let Command::Boot(boot) = parse("nodecheck boot --out o --warm --check-seconds 60") else {
@@ -1339,7 +1362,8 @@ mod tests {
     #[test]
     fn warm_touches_what_it_reports_and_stops_at_its_limit() {
         // Sized from what the kernel says, less the reserve.
-        let meminfo = "MemTotal:        4005060 kB\nMemFree:  3700000 kB\nMemAvailable:    3866624 kB\n";
+        let meminfo =
+            "MemTotal:        4005060 kB\nMemFree:  3700000 kB\nMemAvailable:    3866624 kB\n";
         let available = mem_available_bytes(meminfo).unwrap();
         assert_eq!(available, 3_866_624 * 1_024);
         assert_eq!(warm_bytes(available, 384), available - 384 * MB);
@@ -1385,7 +1409,10 @@ mod tests {
             max_stop_ms: 20,
             max_steal_permille: 10,
         };
-        assert_eq!(verdict(&stopped, &CheckReport::default(), &args), "warm-timeout");
+        assert_eq!(
+            verdict(&stopped, &CheckReport::default(), &args),
+            "warm-timeout"
+        );
         assert_eq!(verdict(&report, &CheckReport::default(), &args), "ok");
     }
 
@@ -1459,7 +1486,10 @@ mod tests {
             }
         }
         // Oldest first, and a node name on every line.
-        let times: Vec<u64> = lines.iter().map(|line| line["t_us"].as_u64().unwrap()).collect();
+        let times: Vec<u64> = lines
+            .iter()
+            .map(|line| line["t_us"].as_u64().unwrap())
+            .collect();
         assert!(times.windows(2).all(|pair| pair[0] <= pair[1]));
         assert!(lines.iter().all(|line| line["node"].is_string()));
     }
@@ -1487,8 +1517,10 @@ mod tests {
         assert!(done.seconds >= 0.05, "the rate was kept: {done:?}");
         assert_eq!(done.thp, "never");
         let lines = json_lines(&out);
-        let slow: Vec<&serde_json::Value> =
-            lines.iter().filter(|line| line["kind"] == "touch").collect();
+        let slow: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|line| line["kind"] == "touch")
+            .collect();
         assert!(
             slow.iter()
                 .any(|line| line["page"] == 100 && line["dur_us"].as_u64().unwrap() >= 2_000),
@@ -1497,7 +1529,10 @@ mod tests {
         assert_eq!(slow.len() as u64, done.slow);
         let secs: Vec<&serde_json::Value> =
             lines.iter().filter(|line| line["kind"] == "sec").collect();
-        let counted: u64 = secs.iter().map(|line| line["pages"].as_u64().unwrap()).sum();
+        let counted: u64 = secs
+            .iter()
+            .map(|line| line["pages"].as_u64().unwrap())
+            .sum();
         assert_eq!(counted, 1_024, "every page in a second's line");
         assert_eq!(lines.last().unwrap()["kind"], "touch_done");
     }
@@ -1598,7 +1633,10 @@ mod tests {
         .unwrap();
         stop.store(true, Ordering::Relaxed);
         serving.join().unwrap();
-        assert_eq!((summary.sent, summary.received, summary.lost), (1_000, 1_000, 0));
+        assert_eq!(
+            (summary.sent, summary.received, summary.lost),
+            (1_000, 1_000, 0)
+        );
         assert!(summary.rtt_max_us < 1_000_000, "{summary:?}");
         assert_eq!(json_lines(&out).last().unwrap()["kind"], "echo");
     }
@@ -1650,7 +1688,10 @@ mod tests {
         let check = &record["check"];
         assert_eq!(check["seconds"], 1);
         assert!(check["stops_over_20ms"].as_u64().unwrap() >= 1, "{check}");
-        assert!(check["stop_max_ms"].as_u64().unwrap() >= HOLD_MS - 5, "{check}");
+        assert!(
+            check["stop_max_ms"].as_u64().unwrap() >= HOLD_MS - 5,
+            "{check}"
+        );
         assert!(check["late_max_us"].as_u64().unwrap() >= (HOLD_MS - 5) * 1_000);
         for field in ["cpus", "stopped_ms", "steal_permille"] {
             assert!(check[field].is_u64(), "{field} in {check}");

@@ -19291,8 +19291,12 @@ impl AppRouter {
 
     /// `GET /api/stalls?since_us=<t>`: the stall journal of this node as
     /// NDJSON, oldest first: every event with its cause and every kept
-    /// `sec` line, or those recorded at `t` or later. It reads no cache and
-    /// is no session.
+    /// `sec` line, or those recorded at `t` or later, up to the moment the
+    /// read began. An earlier event whose cause or scope a stopped tick of
+    /// this read decides comes again: a collector keys events by kind,
+    /// thread and start (`t_us - span_us`), keeps the later line, and asks
+    /// next from the last `t_us` it saw plus one. It reads no cache and is
+    /// no session.
     ///
     /// The read copies the ring and works the causes out over all of it, so
     /// it runs on a blocking thread, as the hop journal's does.

@@ -32,11 +32,17 @@
 //! pass ends. The read joins each event to the stopped ticks of its CPU.
 //!
 //! **Reading by time.** `t_us` is taken under the ring's lock and is
-//! strictly increasing over everything the journal holds, so a reader that
-//! asks again with `since_us` = the last `t_us` it saw plus one misses
-//! nothing. A merge moves an event's `t_us` forward, so such a reader sees a
-//! merged event again, grown: the same event has the same kind, thread and
-//! start (`t_us - span_us`), and the later line replaces the earlier.
+//! strictly increasing over everything the journal holds. A read returns
+//! what was stamped up to the moment it began ([`StallReport::upto_us`]) and
+//! leaves everything stamped or merged later to the next read, so a reader
+//! that asks again with `since_us` = the last `t_us` it saw plus one misses
+//! nothing. Two things come back again, and the later line replaces the
+//! earlier (the same event has the same kind, thread and start,
+//! `t_us - span_us`):
+//! - an event that grew by a merge: its `t_us` moved forward;
+//! - an event whose cause or scope a stopped tick new to this read decides.
+//!   That tick is recorded after the event it explains (see **Cause**), so
+//!   a read that falls between the two gave the event without it.
 
 use serde::Serialize;
 use std::fmt::Write as _;
@@ -369,16 +375,10 @@ pub struct SecLine {
 pub struct StallReport {
     pub events: Vec<StallLine>,
     pub secs: Vec<SecLine>,
-}
-
-impl StallReport {
-    /// The latest `t_us` of the report: a reader that comes back with
-    /// `since_us` one after it misses nothing.
-    pub fn last_t_us(&self) -> Option<u64> {
-        let events = self.events.last().map(|line| line.event.t_us);
-        let secs = self.secs.last().map(|line| line.t_us);
-        events.max(secs)
-    }
+    /// The last `t_us` stamped when the read began: the report holds
+    /// nothing later, and a reader that comes back with `since_us` one
+    /// after it misses nothing.
+    pub upto_us: u64,
 }
 
 /// What `/api/mesh/local` reports of the journal. The tick counters are
@@ -738,22 +738,58 @@ impl StallJournal {
 
     /// The journal's events, each with its cause, and its `sec` lines, both
     /// oldest first: everything, or what was recorded at `since_us` or
-    /// later. The cause is worked out over the whole ring. Off the hot
-    /// paths: it copies the ring and sorts it.
+    /// later, up to the moment the read began. An earlier event whose cause
+    /// or scope a stopped tick of this read decides comes again. The cause
+    /// is worked out over the whole ring. Off the hot paths: it copies the
+    /// ring and sorts it.
     pub fn query(&self, since_us: Option<u64>) -> StallReport {
         if self.capacity == 0 {
             return StallReport::default();
         }
+        let upto_us = self.lock().last_t_us;
+        self.read_upto(since_us.unwrap_or(0), upto_us)
+    }
+
+    /// [`Self::query`] of what was stamped from `since_us` to `upto_us`.
+    /// The rings are copied a chunk at a time and recorders go on between
+    /// the chunks: whatever they stamp or merge has a time after `upto_us`
+    /// and is left to the next read.
+    fn read_upto(&self, since_us: u64, upto_us: u64) -> StallReport {
         let events = self.copy_out(|ring| (&ring.events[..], ring.pushed));
         let mut secs = self.copy_out(|ring| (&ring.secs[..], ring.secs_pushed));
         let tick_cpus = self.lock().tick_cpus.clone();
-        let since_us = since_us.unwrap_or(0);
-        let mut events = classify(&events, &tick_cpus);
-        events.retain(|line| line.event.t_us >= since_us);
+        let mut lines = classify(&events, &tick_cpus);
+        let fresh =
+            Stops::new(lines.iter().map(|line| &line.event).filter(|event| {
+                event.is_stopped_tick() && (since_us..=upto_us).contains(&event.t_us)
+            }));
+        lines.retain(|line| {
+            let event = &line.event;
+            if event.t_us > upto_us {
+                return false;
+            }
+            if event.t_us >= since_us {
+                return true;
+            }
+            let (start_us, end_us) = (event.start_us(), event.t_us);
+            match event.thread {
+                StallThread::Tick(cpu) => {
+                    line.cause == Cause::Stopped
+                        && tick_cpus
+                            .iter()
+                            .any(|&other| other != cpu && fresh.touches(other, start_us, end_us))
+                }
+                _ => fresh.touches(event.cpu, start_us, end_us),
+            }
+        });
         // A merge moves an event's time forward, out of the ring's order.
-        events.sort_by_key(|line| line.event.t_us);
-        secs.retain(|line| line.t_us >= since_us);
-        StallReport { events, secs }
+        lines.sort_by_key(|line| line.event.t_us);
+        secs.retain(|line| (since_us..=upto_us).contains(&line.t_us));
+        StallReport {
+            events: lines,
+            secs,
+            upto_us,
+        }
     }
 
     /// [`Self::query`] as NDJSON, one line an event or a CPU's second,
@@ -890,6 +926,12 @@ impl Stops {
                 shared.min(late_sum).min(share.max(longest))
             })
             .sum()
+    }
+
+    /// Whether `cpu` has a stop sharing any time with the interval.
+    fn touches(&self, cpu: u16, start_us: u64, end_us: u64) -> bool {
+        self.meeting(cpu, start_us, end_us)
+            .any(|(_, shared)| shared > 0)
     }
 
     /// Whether `cpu` was stopped for half or more of the interval.
@@ -2148,15 +2190,21 @@ mod tests {
             })
             .collect();
         // The tick it had seen grew by a merge: the same kind, thread and
-        // start, a later time and a higher count.
+        // start, a later time and a higher count. The events of its CPU
+        // that the grown stop covers come again with the cause it gives.
         assert_eq!(first.events[0].event.start_us(), 997_000);
         assert_eq!(
             seen,
             vec![
+                (StallKind::RxLate, 1_000_001, 997_901, 1),
+                (StallKind::SendSlow, 1_000_002, 998_902, 1),
                 (StallKind::Tick, 1_004_000, 997_000, 2),
                 (StallKind::TeeLag, 1_500_000, 1_490_000, 1),
             ]
         );
+        assert!(second.events[..2]
+            .iter()
+            .all(|line| line.cause == Cause::Stopped));
         // Only the filter is by time: the cause is worked out over the
         // whole ring.
         let stopped_before = journal.query(Some(1_500_000));
@@ -2278,6 +2326,113 @@ mod tests {
         assert_eq!(cause_of(0, 1_500_000, 4_000), Cause::Stopped);
         // The 300 ms stop at the head of CPU 1's run.
         assert_eq!(cause_of(1, 3_000_000, 300_000), Cause::Stopped);
+    }
+
+    #[test]
+    fn a_read_takes_what_was_stamped_before_it_began() {
+        let journal = journal(64, &[0, 1]);
+        journal.put(
+            Some(999_000),
+            event(StallKind::ClassPass, StallThread::Audio, 1, 2_500),
+        );
+        journal.put(Some(1_000_000), tick(0, 3_000, 0));
+        // The read begins.
+        let upto_us = journal.lock().last_t_us;
+        // Recorders go on while it copies: a new event, a CPU's second, and
+        // a tick that grows the one already stamped.
+        journal.put(
+            Some(1_000_100),
+            event(StallKind::RxLate, StallThread::Video, 1, 2_100),
+        );
+        let mut secs = [SecLine {
+            steal: 2,
+            ..SecLine::default()
+        }];
+        assert!(journal.put_secs(Some(1_000_200), &mut secs, false));
+        journal.put(Some(1_004_000), tick(0, 2_500, 0));
+        let first = journal.read_upto(0, upto_us);
+        // Nothing stamped after the read began; the tick that grew is in
+        // the next read, whole.
+        let times = |report: &StallReport| -> Vec<(StallKind, u64)> {
+            report
+                .events
+                .iter()
+                .map(|line| (line.event.kind, line.event.t_us))
+                .collect()
+        };
+        assert_eq!(times(&first), vec![(StallKind::ClassPass, 999_000)]);
+        assert!(first.secs.is_empty());
+        assert_eq!(first.upto_us, 1_000_000);
+        let next = journal.query(Some(first.upto_us + 1));
+        assert_eq!(
+            times(&next),
+            vec![(StallKind::RxLate, 1_000_100), (StallKind::Tick, 1_004_000)]
+        );
+        assert_eq!(next.events[1].event.start_us(), 997_000);
+        assert_eq!(next.events[1].event.n, 2);
+        assert_eq!(
+            next.secs.iter().map(|line| line.t_us).collect::<Vec<_>>(),
+            vec![1_000_200]
+        );
+        assert_eq!(next.upto_us, 1_004_000);
+        assert_eq!(
+            journal.query(Some(next.upto_us + 1)),
+            StallReport {
+                upto_us: 1_004_000,
+                ..StallReport::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_cause_decided_after_a_read_comes_again() {
+        let journal = journal(64, &[0, 1]);
+        // Both CPUs are stopped for 300 ms. The audio thread on CPU 1 books
+        // its pass first; the tick threads run only after it.
+        journal.put(
+            Some(10_000_000),
+            event(StallKind::ClassPass, StallThread::Audio, 1, 300_000),
+        );
+        let first = journal.query(None);
+        assert_eq!(causes(&first.events), vec![(Cause::Own, None)]);
+        journal.put(Some(10_000_100), tick(0, 299_000, 50));
+        let second = journal.query(Some(first.upto_us + 1));
+        // CPU 0's stop says nothing yet of CPU 1, nor of the pass on it.
+        assert_eq!(
+            causes(&second.events),
+            vec![(Cause::Stopped, Some(Scope::One))]
+        );
+        journal.put(Some(10_040_000), tick(1, 330_000, 200));
+        let third = journal.query(Some(second.upto_us + 1));
+        let seen: Vec<(StallKind, u64, Cause, Option<Scope>)> = third
+            .events
+            .iter()
+            .map(|line| (line.event.kind, line.event.t_us, line.cause, line.scope))
+            .collect();
+        // CPU 1's stop decides the pass and CPU 0's scope: both come again.
+        assert_eq!(
+            seen,
+            vec![
+                (StallKind::ClassPass, 10_000_000, Cause::Stopped, None),
+                (
+                    StallKind::Tick,
+                    10_000_100,
+                    Cause::Stopped,
+                    Some(Scope::All)
+                ),
+                (
+                    StallKind::Tick,
+                    10_040_000,
+                    Cause::Stopped,
+                    Some(Scope::All)
+                ),
+            ]
+        );
+        // A tick that stops nothing sends nothing again.
+        journal.put(Some(10_100_000), tick(1, 30_000, 29_000));
+        let fourth = journal.query(Some(third.upto_us + 1));
+        assert_eq!(causes(&fourth.events), vec![(Cause::Starved, None)]);
+        assert!(journal.query(Some(fourth.upto_us + 1)).events.is_empty());
     }
 
     #[test]
