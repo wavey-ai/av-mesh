@@ -28,7 +28,7 @@ use av_mesh::client_compact as compact;
 use av_mesh::client_udp::{
     block_id, cut_through_block_id, cut_through_symbol_size, encode_block, encode_object, geometry,
     source_datagram, CompactPlan, Control, ObjectKind, PartObject, RepairPolicy, KEEPALIVE,
-    MIN_FIRST_REQUEST_BYTES, SUBSCRIPTION_TTL,
+    MIN_ASSIGN_REQUEST_BYTES, MIN_FIRST_REQUEST_BYTES, SUBSCRIPTION_TTL,
 };
 use bytes::Bytes;
 use playlists::mesh::{chunk_frame_slot, CacheMeshReceiveObserver};
@@ -182,6 +182,9 @@ pub(crate) struct EdgeUdpConfig {
     /// parts between a new subscriber's first part and the fast lane's
     /// first part for it wait with it: 200-300 ms late on a cold edge).
     pub prompt_sender: bool,
+    /// Answer a client's `ASSIGN` (`--client-udp-assign`, wave 9 B) with the
+    /// assignment that `/api/assignment` gives over HTTPS.
+    pub assign: bool,
 }
 
 impl EdgeUdpConfig {
@@ -210,6 +213,7 @@ impl EdgeUdpConfig {
             drain_spread: Duration::from_millis(DEFAULT_DRAIN_SPREAD_MS),
             keepalive: Duration::from_millis(DEFAULT_KEEPALIVE_MS),
             prompt_sender: true,
+            assign: true,
         }
     }
 }
@@ -277,6 +281,10 @@ pub(crate) struct EdgeUdpStats {
     pub send_errors: AtomicU64,
     pub tokens_sent: AtomicU64,
     pub bad_tokens: AtomicU64,
+    /// Wave 9 B: `ASSIGN` requests answered, and those not answered (too
+    /// short, too many at once, or the answer would be longer).
+    pub assignments: AtomicU64,
+    pub assignments_dropped: AtomicU64,
     /// Parts forwarded cut-through, and their datagrams.
     pub cut_through_parts: AtomicU64,
     pub cut_through_datagrams: AtomicU64,
@@ -1447,6 +1455,7 @@ pub(crate) async fn run_edge_udp(
     let rebuilds: Arc<Rebuilds> = Arc::default();
     let mut nack_budget = EdgeNackBudget::new(config.nack_edge_rate, Instant::now());
     let tokens = Tokens(RandomState::new());
+    let assigning: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
     let mut audio_buf = vec![0_u8; 2_048];
     let mut video_buf = vec![0_u8; 2_048];
     // The send-only twins' share of the requests, watched for reading only.
@@ -1717,10 +1726,73 @@ pub(crate) async fn run_edge_udp(
                     });
                 }
             }
+            Control::Assign {
+                stream_id,
+                nonce,
+                session,
+                skip,
+                current,
+            } => {
+                // Wave 9 B: the assignment over UDP. Answered only to a
+                // padded request, never with more bytes than it carried,
+                // and on a task of its own (the assignment reads the
+                // region's adverts), a bounded number at once.
+                if !config.assign
+                    || len < MIN_ASSIGN_REQUEST_BYTES
+                    || assigning.load(Ordering::Relaxed) >= MAX_ASSIGNMENTS_IN_FLIGHT
+                {
+                    stats.assignments_dropped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                assigning.fetch_add(1, Ordering::Relaxed);
+                let (router, stats, assigning) =
+                    (router.clone(), Arc::clone(&stats), Arc::clone(&assigning));
+                tokio::spawn(async move {
+                    let (port, mut caches) = router
+                        .udp_assignment(stream_id, &session, &skip, current.as_deref())
+                        .await;
+                    let answer = loop {
+                        let answer = Control::Assigned {
+                            stream_id,
+                            nonce,
+                            port,
+                            caches: caches.clone(),
+                        }
+                        .encode();
+                        if answer.len() <= len || caches.is_empty() {
+                            break answer;
+                        }
+                        // The last cache that fits: the failover order is
+                        // cut from its end (the assigned cache first).
+                        let failover_at = caches.iter().position(|cache| cache.failover);
+                        match failover_at {
+                            Some(at) if at > 1 => {
+                                caches.remove(at - 1);
+                            }
+                            _ => {
+                                caches.pop();
+                            }
+                        }
+                    };
+                    if answer.len() <= len {
+                        stats.assignments.fetch_add(1, Ordering::Relaxed);
+                        if let Err(error) = socket.send_to(&answer, peer).await {
+                            debug!(%peer, error = %error, "edge client UDP assignment send failed");
+                        }
+                    } else {
+                        stats.assignments_dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                    assigning.fetch_sub(1, Ordering::Relaxed);
+                });
+            }
             _ => {}
         }
     }
 }
+
+/// Wave 9 B: `ASSIGN` requests answered at once at most; more are dropped
+/// (the client repeats its request).
+const MAX_ASSIGNMENTS_IN_FLIGHT: usize = 256;
 
 /// Send a compact-lane subscriber the parts that it asks for again: each
 /// part that was sent to it already (the cache-fed sender has passed it, or

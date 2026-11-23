@@ -112,6 +112,25 @@ struct Args {
     /// (Phase AM item 11; HTTP requests otherwise wait 5 s).
     #[arg(long, default_value_t = 1_000)]
     assignment_timeout_ms: u64,
+    /// Wave 9 B (time to first audio under loss): ask the entry point for
+    /// the assignment over UDP too (`ASSIGN`, one datagram each way), at
+    /// this port of its address, repeated after --first-retry-ms and then
+    /// twice as long each time; the first answer of UDP or HTTPS is taken.
+    /// Over HTTPS alone a lost SYN waits a second for TCP's retransmission.
+    /// 0: HTTPS alone, as before.
+    #[arg(long, default_value_t = av_mesh::client_udp::DEFAULT_CLIENT_UDP_PORT)]
+    assignment_udp_port: u16,
+    /// Wave 9 B: with the assignment over UDP, the HTTPS request starts
+    /// this long after it (ms) unless UDP has answered (at once when UDP
+    /// fails: no port there, or no assignment).
+    #[arg(long, default_value_t = 50)]
+    assignment_https_after_ms: u64,
+    /// Wave 9 B: an unanswered UDP request (the assignment, the first SUB,
+    /// the SUB with the token) is repeated after this (ms; three round
+    /// trips once one is measured), then twice as long each time up to
+    /// 300 ms. 0: every 300 ms, as before.
+    #[arg(long, default_value_t = av_mesh::client_session::DEFAULT_FIRST_RETRY_MS)]
+    first_retry_ms: u64,
     /// Session id for assignment (CMCD `sid`).
     #[arg(long, default_value = "udp-client")]
     session: String,
@@ -377,13 +396,161 @@ struct Cache {
     failover: bool,
 }
 
+/// The caches and their client UDP port, and how the answer came.
+type AssignmentAnswer = (Vec<Cache>, Option<u16>, &'static str);
+
+/// The assignment of the entry point: over UDP (wave 9 B) and HTTPS, the
+/// first answer of either (HTTPS alone with --assignment-udp-port 0).
 async fn assignment(
     http: &Http,
     entry: &str,
     args: &Args,
     current: Option<&str>,
     skip: &BTreeMap<String, Instant>,
-) -> Result<(Vec<Cache>, Option<u16>)> {
+) -> Result<AssignmentAnswer> {
+    let limit = Duration::from_millis(args.assignment_timeout_ms.max(1));
+    let https_after = Duration::from_millis(args.assignment_https_after_ms);
+    let raced = async {
+        let mut https: Option<std::pin::Pin<Box<dyn std::future::Future<Output = Result<AssignmentAnswer>> + Send + '_>>> = None;
+        let mut udp: Option<std::pin::Pin<Box<dyn std::future::Future<Output = Result<AssignmentAnswer>> + Send + '_>>> = None;
+        if args.assignment_udp_port == 0 {
+            https = Some(Box::pin(https_assignment(http, entry, args, current, skip)));
+        } else {
+            udp = Some(Box::pin(udp_assignment(entry, args, current, skip)));
+        }
+        let start_https = tokio::time::sleep(https_after);
+        tokio::pin!(start_https);
+        let mut https_started = https.is_some();
+        let mut last_error = None;
+        loop {
+            if udp.is_none() && https.is_none() && https_started {
+                return Err(last_error.unwrap_or_else(|| anyhow!("no assignment")));
+            }
+            tokio::select! {
+                answer = async { udp.as_mut().expect("guarded").await }, if udp.is_some() => {
+                    udp = None;
+                    match answer {
+                        Ok(answer) => return Ok(answer),
+                        Err(error) => {
+                            last_error = Some(error);
+                            if !https_started {
+                                https_started = true;
+                                https = Some(Box::pin(https_assignment(http, entry, args, current, skip)));
+                            }
+                        }
+                    }
+                }
+                answer = async { https.as_mut().expect("guarded").await }, if https.is_some() => {
+                    https = None;
+                    match answer {
+                        Ok(answer) => return Ok(answer),
+                        Err(error) => last_error = Some(error),
+                    }
+                }
+                () = &mut start_https, if !https_started => {
+                    https_started = true;
+                    https = Some(Box::pin(https_assignment(http, entry, args, current, skip)));
+                }
+            }
+        }
+    };
+    tokio::time::timeout(limit, raced)
+        .await
+        .map_err(|_| anyhow!("assignment at {entry}: no answer in {} ms", args.assignment_timeout_ms))?
+}
+
+/// Wave 9 B: the assignment over UDP (`ASSIGN` at the entry point's client
+/// UDP port), repeated after --first-retry-ms, then twice as long each time
+/// up to 300 ms, until it is answered.
+async fn udp_assignment(
+    entry: &str,
+    args: &Args,
+    current: Option<&str>,
+    skip: &BTreeMap<String, Instant>,
+) -> Result<AssignmentAnswer> {
+    use av_mesh::client_udp::Control;
+    let entry = Url::parse(entry)?;
+    let (host, _) = entry.host_port();
+    let target = tokio::net::lookup_host((host.as_str(), args.assignment_udp_port))
+        .await?
+        .next()
+        .ok_or_else(|| anyhow!("no address for {host}"))?;
+    let local: SocketAddr = if target.is_ipv4() {
+        "0.0.0.0:0".parse()?
+    } else {
+        "[::]:0".parse()?
+    };
+    let socket = UdpSocket::bind(local).await?;
+    socket.connect(target).await?;
+    let mut nonce = [0_u8; 8];
+    rustls::crypto::ring::default_provider()
+        .secure_random
+        .fill(&mut nonce)
+        .map_err(|_| anyhow!("no random nonce"))?;
+    let nonce = u64::from_be_bytes(nonce);
+    let request = Control::Assign {
+        stream_id: args.stream,
+        nonce,
+        session: args.session.clone(),
+        skip: skip.keys().cloned().collect(),
+        current: current.map(str::to_owned),
+    }
+    .encode();
+    let first = Duration::from_millis(args.first_retry_ms.max(1));
+    let mut wait = if args.first_retry_ms == 0 {
+        av_mesh::client_session::UNANSWERED_REFRESH
+    } else {
+        first
+    };
+    let mut buf = vec![0_u8; 2_048];
+    loop {
+        socket.send(&request).await?;
+        let until = tokio::time::Instant::now() + wait;
+        loop {
+            match tokio::time::timeout_at(until, socket.recv(&mut buf)).await {
+                Err(_) => break,
+                // An ICMP port unreachable: no client UDP port there.
+                Ok(Err(error)) => bail!("ASSIGN to {target}: {error}"),
+                Ok(Ok(len)) => {
+                    if let Some(Control::Assigned {
+                        stream_id,
+                        nonce: answered,
+                        port,
+                        caches,
+                    }) = Control::decode(&buf[..len])
+                    {
+                        if stream_id != args.stream || answered != nonce {
+                            continue;
+                        }
+                        let caches = caches
+                            .into_iter()
+                            .filter_map(|cache| {
+                                Some(Cache {
+                                    node_id: cache.node_id,
+                                    base: Url::parse(&cache.playback_base_url).ok()?,
+                                    failover: cache.failover,
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        if caches.is_empty() {
+                            bail!("no assignment (UDP): the entry point names no cache");
+                        }
+                        return Ok((caches, port, "udp"));
+                    }
+                }
+            }
+        }
+        wait = (wait * 2).min(av_mesh::client_session::UNANSWERED_REFRESH);
+    }
+}
+
+async fn https_assignment(
+    http: &Http,
+    entry: &str,
+    args: &Args,
+    current: Option<&str>,
+    skip: &BTreeMap<String, Instant>,
+) -> Result<AssignmentAnswer> {
     let entry = Url::parse(entry)?;
     let mut path = format!(
         "/api/assignment?stream={}&sid={}",
@@ -397,12 +564,7 @@ async fn assignment(
     if let Some(current) = current {
         path.push_str(&format!("&current={current}"));
     }
-    let (status, body) = tokio::time::timeout(
-        Duration::from_millis(args.assignment_timeout_ms.max(1)),
-        http.get(&entry.authority, &path),
-    )
-    .await
-    .map_err(|_| anyhow!("GET https://{}{path}: no answer in {} ms", entry.authority, args.assignment_timeout_ms))??;
+    let (status, body) = http.get(&entry.authority, &path).await?;
     let json: serde_json::Value = serde_json::from_slice(&body)
         .with_context(|| format!("assignment answer is not JSON ({status})"))?;
     let port = json["client_udp_port"].as_u64().map(|port| port as u16);
@@ -421,7 +583,7 @@ async fn assignment(
     if caches.is_empty() {
         bail!("the assignment names no cache");
     }
-    Ok((caches, port))
+    Ok((caches, port, "https"))
 }
 
 /// The part numbers and extension that a media playlist names.
@@ -485,6 +647,8 @@ fn percentiles(mut values: Vec<f64>) -> Percentiles {
 #[derive(Debug, Default, Serialize)]
 struct Startup {
     assignment_ms: Option<f64>,
+    /// How the first assignment came (wave 9 B): "udp" or "https".
+    assignment_via: Option<&'static str>,
     /// The playlist read (beside the subscription unless --playlist-first).
     playlist_ms: Option<f64>,
     first_request_ms: Option<f64>,
@@ -815,6 +979,7 @@ async fn main() -> Result<()> {
                 rate_cap: args.nack_rate_cap,
             },
             known_parts: 0,
+            first_retry: Duration::from_millis(args.first_retry_ms),
         },
         Instant::now(),
     );
@@ -861,7 +1026,7 @@ async fn main() -> Result<()> {
     // client goes back once it assigns a cache of its own.
     let home = args.entry.clone();
     let mut left_home_at: Option<Instant> = None;
-    let mut home_probe: Option<tokio::task::JoinHandle<Result<(Vec<Cache>, Option<u16>)>>> = None;
+    let mut home_probe: Option<tokio::task::JoinHandle<Result<AssignmentAnswer>>> = None;
     let mut next_home_probe = Instant::now();
     let mut home_returns = 0_u64;
     let mut buf = vec![0_u8; 65_536];
@@ -899,7 +1064,7 @@ async fn main() -> Result<()> {
         } else {
             left_home_at = None;
         }
-        let (caches, port) = match assignment(&http, &entry, &args, current.as_deref(), &skip).await {
+        let (caches, port, via) = match assignment(&http, &entry, &args, current.as_deref(), &skip).await {
             Ok(answer) => {
                 entry_failures = 0;
                 answer
@@ -933,6 +1098,7 @@ async fn main() -> Result<()> {
             }
         }
         startup.assignment_ms.get_or_insert(since_start(started));
+        startup.assignment_via.get_or_insert(via);
         let port = args.udp_port.or(port).ok_or_else(|| {
             anyhow!("no client UDP port: the entry point names none; pass --udp-port")
         })?;
@@ -1121,7 +1287,7 @@ async fn main() -> Result<()> {
                 .is_some_and(|probe| probe.is_finished())
             {
                 let answer = home_probe.take().expect("finished").await;
-                if let Ok(Ok((caches, _))) = answer {
+                if let Ok(Ok((caches, _, _))) = answer {
                     if caches.iter().any(|cache| !cache.failover) {
                         eprintln!("the home region answers: moving back");
                         entry = home.clone();
@@ -1435,6 +1601,102 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use av_mesh::client_udp::{AssignedCache, Control};
+
+    /// Wave 9 B: the assignment over UDP is repeated after 25 ms and then
+    /// twice as long each time until answered; an answer to another request
+    /// (its nonce) is not taken; a node with no client UDP port fails it at
+    /// once (so HTTPS starts without waiting).
+    #[tokio::test]
+    async fn the_udp_assignment_is_repeated_until_answered() {
+        let node = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = node.local_addr().unwrap().port();
+        let args = Args::parse_from([
+            "needletail-udp-client",
+            "--entry",
+            "https://127.0.0.1:19444",
+            "--stream",
+            "3001",
+            "--tls-ca",
+            "/nonexistent",
+            "--session",
+            "s-1",
+            "--assignment-udp-port",
+            &port.to_string(),
+        ]);
+        let server = tokio::spawn(async move {
+            let mut buf = vec![0_u8; 2_048];
+            let mut seen = Vec::new();
+            loop {
+                let (len, peer) = node.recv_from(&mut buf).await.unwrap();
+                seen.push(Instant::now());
+                let Some(Control::Assign { nonce, session, .. }) = Control::decode(&buf[..len])
+                else {
+                    panic!("not an ASSIGN");
+                };
+                assert_eq!(session, "s-1");
+                assert!(len >= av_mesh::client_udp::ASSIGN_REQUEST_BYTES);
+                // The first two are lost; the third is answered, first as
+                // if to another request.
+                if seen.len() < 3 {
+                    continue;
+                }
+                let answer = |nonce| Control::Assigned {
+                    stream_id: 3001,
+                    nonce,
+                    port: Some(19_446),
+                    caches: vec![AssignedCache {
+                        node_id: "lon-edge-2".into(),
+                        playback_base_url: "https://127.0.0.1:19444/live".into(),
+                        failover: false,
+                    }],
+                };
+                node.send_to(&answer(nonce ^ 1).encode(), peer).await.unwrap();
+                node.send_to(&answer(nonce).encode(), peer).await.unwrap();
+                return seen;
+            }
+        });
+        let started = Instant::now();
+        let (caches, udp_port, via) = udp_assignment(&args.entry, &args, None, &BTreeMap::new())
+            .await
+            .unwrap();
+        assert_eq!(via, "udp");
+        assert_eq!(udp_port, Some(19_446));
+        assert_eq!(caches[0].node_id, "lon-edge-2");
+        let seen = server.await.unwrap();
+        let gaps: Vec<u128> = seen
+            .windows(2)
+            .map(|pair| pair[1].duration_since(pair[0]).as_millis())
+            .collect();
+        assert!((24..60).contains(&gaps[0]), "{gaps:?}");
+        assert!((49..100).contains(&gaps[1]), "{gaps:?}");
+        assert!(started.elapsed() < Duration::from_millis(250));
+        // No client UDP port there: an error at once (ICMP port
+        // unreachable), not a wait.
+        let closed = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let closed_port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let args = Args::parse_from([
+            "needletail-udp-client",
+            "--entry",
+            "https://127.0.0.1:19444",
+            "--stream",
+            "3001",
+            "--tls-ca",
+            "/nonexistent",
+            "--assignment-udp-port",
+            &closed_port.to_string(),
+        ]);
+        let started = Instant::now();
+        let failed = tokio::time::timeout(
+            Duration::from_secs(2),
+            udp_assignment(&args.entry, &args, None, &BTreeMap::new()),
+        )
+        .await
+        .expect("an answer, not a wait");
+        assert!(failed.is_err());
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
 
     /// Wave 7 item 8: the playlist is read beside the subscription by
     /// default; --playlist-first true reads it first, as before.
@@ -1460,6 +1722,7 @@ mod tests {
     fn the_report_names_each_step_of_the_start() {
         let startup = Startup {
             assignment_ms: Some(3.0),
+            assignment_via: Some("udp"),
             playlist_ms: None,
             first_request_ms: Some(3.1),
             token_ms: Some(3.6),

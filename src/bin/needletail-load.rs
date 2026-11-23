@@ -217,6 +217,11 @@ struct Args {
     /// 64, and 512 keeps a listener near 200 KB).
     #[arg(long, default_value_t = 512)]
     known_parts: usize,
+    /// Wave 9 B: an unanswered SUB is repeated after this (ms), or three
+    /// round trips once one is measured, then twice as long each time up
+    /// to 300 ms, as needletail-udp-client does (0: every 300 ms, before).
+    #[arg(long, default_value_t = av_mesh::client_session::DEFAULT_FIRST_RETRY_MS)]
+    first_retry_ms: u64,
 }
 
 fn resolve(edge: &str) -> Result<SocketAddr> {
@@ -280,6 +285,7 @@ fn config(args: &Args) -> Result<LoadConfig> {
             rate_cap: args.nack_rate_cap,
         },
         known_parts: args.known_parts,
+        first_retry: Duration::from_millis(args.first_retry_ms),
     };
     let mut config = LoadConfig::new(session, edges, args.listeners);
     if let Some(text) = &args.ramp {

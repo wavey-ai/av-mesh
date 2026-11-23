@@ -2208,6 +2208,20 @@ struct Args {
     )]
     client_udp_prompt_sender: bool,
 
+    /// Wave 9 B (time to first audio under loss): a node with a client UDP
+    /// port answers a client's `ASSIGN` there with the assignment that
+    /// `/api/assignment` gives over HTTPS, in one datagram each way, which
+    /// the client repeats on its own schedule. Over HTTPS a lost SYN waits a
+    /// second for TCP's retransmission (1.2-2.8 s to first audio at 5 %
+    /// loss in wave 8). `false`: `ASSIGN` is not answered, as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_ASSIGN",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    client_udp_assign: bool,
+
     /// Wave 9 (cold start): a forwarder's audio thread sends a lease child
     /// that is new to a stream (an edge taking a new copy) the stream's last
     /// whole one-symbol part, which carries the descriptor of the compact
@@ -4086,6 +4100,7 @@ async fn main() -> Result<()> {
                 drain_spread: Duration::from_millis(args.client_udp_drain_spread_ms),
                 keepalive: Duration::from_millis(args.client_udp_keepalive_ms),
                 prompt_sender: args.client_udp_prompt_sender,
+                assign: args.client_udp_assign,
             },
             Arc::clone(&router.edge_udp_stats),
             edge_cut_through.clone(),
@@ -20371,6 +20386,93 @@ impl AppRouter {
 
     /// The assignment of one reader with the reason for each cache and the
     /// state of every cache of the region. Operators and tests use it.
+    /// A client's assignment: the `assigned` list of `/api/assignment`
+    /// (the assigned cache, the failover order, then the neighbouring
+    /// regions' entry points), shared by the HTTPS answer and the UDP
+    /// `ASSIGN` of wave 9 B.
+    async fn client_assignment(
+        &self,
+        stream_id: u64,
+        pin: Option<&str>,
+        current: Option<&str>,
+        skip: &[String],
+        session_id: Option<&str>,
+        remember: bool,
+    ) -> (
+        Result<Assignment, AssignmentError>,
+        Vec<CacheCandidate>,
+        serde_json::Value,
+    ) {
+        let (assignment, candidates) = self
+            .assign_reader(
+                ReaderRequest {
+                    // A client that names its session asks for its UDP
+                    // assignment (needletail-udp-client, needletail-load).
+                    udp: remember,
+                    skip,
+                    stream_id,
+                    session: session_id,
+                    pin,
+                    current,
+                },
+                remember,
+            )
+            .await;
+        // Phase AM item 11: the neighbouring regions' entry points come
+        // last, as in the HLS steering list: a UDP client that loses this
+        // region asks one of them for its caches. With no cache here that
+        // takes a reader, they are the whole list.
+        let mut assigned = assignment
+            .as_ref()
+            .map(|assignment| serde_json::to_value(&assignment.caches).unwrap_or_default())
+            .unwrap_or(serde_json::Value::Null);
+        if pin.is_none() && !self.failover_entries.is_empty() {
+            let entries = self.failover_entries.iter().map(|(name, url)| {
+                serde_json::json!({
+                    "node_id": name,
+                    "playback_base_url": url,
+                    "failover_entry": true,
+                })
+            });
+            match &mut assigned {
+                serde_json::Value::Array(list) => list.extend(entries),
+                other => *other = serde_json::Value::Array(entries.collect()),
+            }
+        }
+        (assignment, candidates, assigned)
+    }
+
+    /// Wave 9 B: the answer to a UDP `ASSIGN` (`av_mesh::client_udp`), the
+    /// assignment that `/api/assignment?stream=&sid=` gives: the caches in
+    /// order and their client UDP port. The session is remembered and its
+    /// cache charged as for the HTTPS request.
+    pub(crate) async fn udp_assignment(
+        &self,
+        stream_id: u64,
+        session: &str,
+        skip: &[String],
+        current: Option<&str>,
+    ) -> (Option<u16>, Vec<av_mesh::client_udp::AssignedCache>) {
+        let (_, _, assigned) = self
+            .client_assignment(stream_id, None, current, skip, Some(session), true)
+            .await;
+        let caches = assigned
+            .as_array()
+            .map(|list| {
+                list.iter()
+                    .filter_map(|cache| {
+                        Some(av_mesh::client_udp::AssignedCache {
+                            node_id: cache["node_id"].as_str()?.to_owned(),
+                            playback_base_url: cache["playback_base_url"].as_str()?.to_owned(),
+                            failover: cache["failover_entry"].as_bool() == Some(true),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        (self.client_udp_port, caches)
+    }
+
     async fn assignment_api_response(
         &self,
         query: Option<&str>,
@@ -20400,18 +20502,13 @@ impl AppRouter {
         // crowd of moving clients is not all sent to the cache that was free
         // a moment ago. An operator's look (no sid) changes nothing.
         let remember = decoded("sid").is_some();
-        let (assignment, candidates) = self
-            .assign_reader(
-                ReaderRequest {
-                    // A client that names its session asks for its UDP
-                    // assignment (needletail-udp-client, needletail-load).
-                    udp: remember,
-                    skip: &skip,
-                    stream_id,
-                    session: session_id,
-                    pin: pin.as_deref(),
-                    current: current.as_deref(),
-                },
+        let (assignment, candidates, assigned) = self
+            .client_assignment(
+                stream_id,
+                pin.as_deref(),
+                current.as_deref(),
+                &skip,
+                session_id,
                 remember,
             )
             .await;
@@ -20442,27 +20539,6 @@ impl AppRouter {
             }
         };
         let gauges = self.client_udp_gauges().await;
-        // Phase AM item 11: the neighbouring regions' entry points come
-        // last, as in the HLS steering list: a UDP client that loses this
-        // region asks one of them for its caches. With no cache here that
-        // takes a reader, they are the whole list.
-        let mut assigned = assignment
-            .as_ref()
-            .map(|assignment| serde_json::to_value(&assignment.caches).unwrap_or_default())
-            .unwrap_or(serde_json::Value::Null);
-        if pin.is_none() && !self.failover_entries.is_empty() {
-            let entries = self.failover_entries.iter().map(|(name, url)| {
-                serde_json::json!({
-                    "node_id": name,
-                    "playback_base_url": url,
-                    "failover_entry": true,
-                })
-            });
-            match &mut assigned {
-                serde_json::Value::Array(list) => list.extend(entries),
-                other => *other = serde_json::Value::Array(entries.collect()),
-            }
-        }
         let failover_entries: Vec<serde_json::Value> = self
             .failover_entries
             .iter()
@@ -20523,6 +20599,18 @@ impl AppRouter {
         // AM 12, 13: the forwarder's lease children and cache-mesh children.
         body["fast_plane"] = serde_json::to_value(self.fast_plane_gauges()).unwrap_or_default();
         body["cache_mesh"] = serde_json::to_value(self.cache_mesh_gauges()).unwrap_or_default();
+        if let Some(block) = body["client_udp"].as_object_mut() {
+            // Wave 9 B: the UDP ASSIGN requests answered and dropped.
+            let stats = &self.edge_udp_stats;
+            block.insert(
+                "assignments".into(),
+                stats.assignments.load(Ordering::Relaxed).into(),
+            );
+            block.insert(
+                "assignments_dropped".into(),
+                stats.assignments_dropped.load(Ordering::Relaxed).into(),
+            );
+        }
         if let (Some(block), Some(gauges)) = (body["client_udp"].as_object_mut(), gauges) {
             if let Ok(serde_json::Value::Object(gauges)) = serde_json::to_value(gauges) {
                 block.extend(gauges);
@@ -34410,6 +34498,131 @@ mod tests {
         mesh.shutdown();
     }
 
+    /// Wave 9 B: a node's client UDP port answers `ASSIGN` with the
+    /// assignment of `/api/assignment` (the same caches in the same order),
+    /// never with more bytes than the request, and not a short request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_udp_assign_is_answered_with_the_assignment_of_the_https_api() {
+        use av_mesh::client_udp::{Control, ASSIGN_REQUEST_BYTES};
+        let (router, mesh) = entry_point_for_tests(vec![
+            reader_cache_snapshot_for_tests("edge-b", 200, Some(500)),
+            reader_cache_snapshot_for_tests("edge-c", 0, None),
+        ])
+        .await;
+        let router = router.with_client_udp_port(Some(19_446));
+        let start = |assign: bool| {
+            let router = router.clone();
+            async move {
+                let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let port = socket.local_addr().unwrap();
+                let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, 16);
+                config.assign = assign;
+                let (shutdown_tx, shutdown_rx) = watch::channel(());
+                let stats = Arc::clone(&router.edge_udp_stats);
+                tokio::spawn(edge_udp::run_edge_udp(
+                    edge_udp::EdgeSockets::single(socket),
+                    router,
+                    config,
+                    stats,
+                    Vec::new(),
+                    shutdown_rx,
+                ));
+                (port, shutdown_tx)
+            }
+        };
+        let (port, _shutdown) = start(true).await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ask = |session: &str, skip: Vec<String>| {
+            Control::Assign {
+                stream_id: 801,
+                nonce: 0x5eed,
+                session: session.into(),
+                skip,
+                current: None,
+            }
+            .encode()
+        };
+        let mut buf = vec![0_u8; 2_048];
+        let request = ask("reader-u", Vec::new());
+        assert_eq!(request.len(), ASSIGN_REQUEST_BYTES);
+        client.send_to(&request, port).await.unwrap();
+        let (len, _) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+            .await
+            .expect("an answer")
+            .unwrap();
+        assert!(len <= request.len());
+        let Some(Control::Assigned {
+            stream_id,
+            nonce,
+            port: udp_port,
+            caches,
+        }) = Control::decode(&buf[..len])
+        else {
+            panic!("{:?}", String::from_utf8_lossy(&buf[..len]));
+        };
+        assert_eq!((stream_id, nonce, udp_port), (801, 0x5eed, Some(19_446)));
+        // The HTTPS answer for the same session: the same caches in order.
+        let api = get_for_tests(&router, "/api/assignment?stream=801&sid=reader-u").await;
+        let api: serde_json::Value = serde_json::from_str(&body_text(api)).unwrap();
+        let https: Vec<(String, String)> = api["assigned"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|cache| {
+                (
+                    cache["node_id"].as_str().unwrap().to_owned(),
+                    cache["playback_base_url"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        let udp: Vec<(String, String)> = caches
+            .iter()
+            .map(|cache| (cache.node_id.clone(), cache.playback_base_url.clone()))
+            .collect();
+        assert_eq!(udp, https);
+        assert!(udp.len() >= 2, "{udp:?}");
+        assert!(caches.iter().all(|cache| !cache.failover));
+        // A skip set is honoured as over HTTPS.
+        let first = udp[0].0.clone();
+        client
+            .send_to(&ask("reader-v", vec![first.clone()]), port)
+            .await
+            .unwrap();
+        let (len, _) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        match Control::decode(&buf[..len]) {
+            Some(Control::Assigned { caches, .. }) => {
+                assert!(!caches.is_empty() && caches.iter().all(|cache| cache.node_id != first))
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(api["client_udp"]["assignments"], 1, "{api:#}");
+        // A request without its padding is not answered.
+        let short = String::from_utf8(ask("reader-w", Vec::new())).unwrap();
+        let short = short.trim_end_matches('.').to_owned() + ".";
+        client.send_to(short.as_bytes(), port).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), client.recv_from(&mut buf))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            router.edge_udp_stats.assignments_dropped.load(Ordering::Relaxed),
+            1
+        );
+        // --client-udp-assign false: not answered.
+        let (off, _off_shutdown) = start(false).await;
+        client.send_to(&ask("reader-x", Vec::new()), off).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), client.recv_from(&mut buf))
+                .await
+                .is_err()
+        );
+        mesh.shutdown();
+    }
+
     #[tokio::test]
     async fn entry_point_pins_a_reader_to_a_named_cache() {
         let (router, mesh) = entry_point_for_tests(vec![
@@ -36011,6 +36224,16 @@ mod tests {
         assert_eq!(args.client_udp_fanout_nice, 99);
         assert_eq!(args.client_udp_nack_edge_rate, 0);
         assert_eq!(args.relay_class_fallback_nice, 5);
+    }
+
+    #[test]
+    fn the_wave9_udp_assignment_flag_defaults_on_and_can_be_turned_off() {
+        assert!(Args::try_parse_from(["av-mesh"]).unwrap().client_udp_assign);
+        assert!(
+            !Args::try_parse_from(["av-mesh", "--client-udp-assign", "false"])
+                .unwrap()
+                .client_udp_assign
+        );
     }
 
     #[test]

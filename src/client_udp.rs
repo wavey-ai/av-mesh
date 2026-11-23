@@ -24,6 +24,18 @@
 //!   | edge   | `WAIT <stream> <next part>`                                   |
 //!   | edge   | `REFUSED <stream> <reason>`                                   |
 //!   | edge   | `MOVE <stream> <reason>`                                      |
+//!   | client | `ASSIGN <stream> <nonce> <session> <skip,... or -> <current or -> <padding>` |
+//!   | node   | `ASSIGNED <stream> <nonce> <client UDP port or -> [<node>\|<base URL>\|<0 or 1> ...]` |
+//!
+//!   `ASSIGN` (wave 9 B) asks any node's client UDP port for the assignment
+//!   that `/api/assignment` gives over HTTPS: one datagram each way, which a
+//!   client repeats on its own schedule, instead of a TCP and TLS handshake
+//!   whose lost first packet waits a second for TCP's retransmission. The
+//!   request is padded to [`ASSIGN_REQUEST_BYTES`] and the answer is never
+//!   longer than the request (caches past that are left out), so a forged
+//!   source address gets no more bytes than it sent; the nonce ties the
+//!   answer to the request. The caches are the HTTPS answer's `assigned`
+//!   list in its order; `1` marks a failover region's entry point.
 //!
 //!   An edge sends media only to an address that has shown that it receives
 //!   at that address: the first `SUB` of a client is answered with a `TOKEN`,
@@ -109,6 +121,22 @@ pub const TARGET_PART_LOSS: f64 = 1e-7;
 /// An edge answers a request without a token only if it is at least this
 /// long: longer than the answer.
 pub const MIN_FIRST_REQUEST_BYTES: usize = 64;
+/// A client pads an `ASSIGN` to this length; a node answers one at least
+/// [`MIN_ASSIGN_REQUEST_BYTES`] long, with no more bytes than it carried.
+pub const ASSIGN_REQUEST_BYTES: usize = 1_200;
+pub const MIN_ASSIGN_REQUEST_BYTES: usize = 512;
+/// The client UDP port of the deploy and the lab, where a client asks its
+/// entry point for an assignment over UDP unless told another.
+pub const DEFAULT_CLIENT_UDP_PORT: u16 = 19_446;
+
+/// One cache of an `ASSIGNED` answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssignedCache {
+    pub node_id: String,
+    pub playback_base_url: String,
+    /// A failover region's entry point (Phase AM item 11).
+    pub failover: bool,
+}
 
 const OBJECT_MAGIC: &[u8; 4] = b"NTO2";
 const OBJECT_HEADER_LEN: usize = 4 + 1 + 1 + 4 + 4 + 8 + 8 + 8 + 8;
@@ -269,6 +297,22 @@ pub enum Control {
         stream_id: u64,
         reason: String,
     },
+    /// The client asks for its assignment (wave 9 B).
+    Assign {
+        stream_id: u64,
+        nonce: u64,
+        session: String,
+        skip: Vec<String>,
+        current: Option<String>,
+    },
+    /// A node's answer to `ASSIGN`: the caches in assignment order (none
+    /// when it has none to give) and the caches' client UDP port.
+    Assigned {
+        stream_id: u64,
+        nonce: u64,
+        port: Option<u16>,
+        caches: Vec<AssignedCache>,
+    },
 }
 
 impl Control {
@@ -281,7 +325,9 @@ impl Control {
             | Self::Subscribed { stream_id, .. }
             | Self::Waiting { stream_id, .. }
             | Self::Refused { stream_id, .. }
-            | Self::Move { stream_id, .. } => *stream_id,
+            | Self::Move { stream_id, .. }
+            | Self::Assign { stream_id, .. }
+            | Self::Assigned { stream_id, .. } => *stream_id,
         }
     }
 
@@ -344,6 +390,50 @@ impl Control {
             }
             Self::Move { stream_id, reason } => {
                 format!("{CONTROL_PREFIX}MOVE {stream_id} {}", word(reason))
+            }
+            Self::Assign {
+                stream_id,
+                nonce,
+                session,
+                skip,
+                current,
+            } => {
+                let skip = skip
+                    .iter()
+                    .map(|name| word(name).replace(',', "-"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut text = format!(
+                    "{CONTROL_PREFIX}ASSIGN {stream_id} {nonce:016x} {} {} {}",
+                    word(session),
+                    if skip.is_empty() { "-".to_owned() } else { skip },
+                    current.as_deref().map_or_else(|| "-".to_owned(), word),
+                );
+                // Padding: the answer is never longer than the request.
+                let pad = ASSIGN_REQUEST_BYTES.saturating_sub(text.len() + 1).max(1);
+                text.push(' ');
+                text.push_str(&".".repeat(pad));
+                text
+            }
+            Self::Assigned {
+                stream_id,
+                nonce,
+                port,
+                caches,
+            } => {
+                let mut text = format!(
+                    "{CONTROL_PREFIX}ASSIGNED {stream_id} {nonce:016x} {}",
+                    port.map_or_else(|| "-".to_owned(), |port| port.to_string())
+                );
+                for cache in caches {
+                    text.push_str(&format!(
+                        " {}|{}|{}",
+                        word(&cache.node_id).replace('|', "-"),
+                        word(&cache.playback_base_url).replace('|', "-"),
+                        u8::from(cache.failover)
+                    ));
+                }
+                text
             }
         };
         text.into_bytes()
@@ -454,6 +544,64 @@ impl Control {
                 stream_id,
                 reason: words.next().unwrap_or("move").to_owned(),
             },
+            "ASSIGN" => {
+                let nonce = token(words.next()?)?;
+                let session = words.next()?.to_owned();
+                let skip = match words.next()? {
+                    "-" => Vec::new(),
+                    list => list
+                        .split(',')
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
+                };
+                let current = match words.next()? {
+                    "-" => None,
+                    name => Some(name.to_owned()),
+                };
+                if words.clone().next().is_some_and(|pad| pad.bytes().all(|b| b == b'.')) {
+                    words.next();
+                }
+                Self::Assign {
+                    stream_id,
+                    nonce,
+                    session,
+                    skip,
+                    current,
+                }
+            }
+            "ASSIGNED" => {
+                let nonce = token(words.next()?)?;
+                let port = match words.next()? {
+                    "-" => None,
+                    port => Some(port.parse().ok()?),
+                };
+                let mut caches = Vec::new();
+                for cache in words.by_ref() {
+                    let mut fields = cache.split('|');
+                    let node_id = fields.next()?.to_owned();
+                    let playback_base_url = fields.next()?.to_owned();
+                    let failover = match fields.next()? {
+                        "0" => false,
+                        "1" => true,
+                        _ => return None,
+                    };
+                    if fields.next().is_some() {
+                        return None;
+                    }
+                    caches.push(AssignedCache {
+                        node_id,
+                        playback_base_url,
+                        failover,
+                    });
+                }
+                Self::Assigned {
+                    stream_id,
+                    nonce,
+                    port,
+                    caches,
+                }
+            }
             _ => return None,
         };
         if words.next().is_some() {
@@ -1329,6 +1477,61 @@ mod tests {
             Control::decode(b"NTU/1 SUB 5 - 0 1 0 00ff C0.32.1 C0.32.1"),
             None
         );
+    }
+
+    /// Wave 9 B: the assignment over UDP, padded so that the answer is never
+    /// longer than the request.
+    #[test]
+    fn assignment_datagrams_round_trip_and_the_request_is_padded() {
+        let request = Control::Assign {
+            stream_id: 3001,
+            nonce: 0x0123_4567_89ab_cdef,
+            session: "bench-uc-0".into(),
+            skip: vec!["lon-edge-1".into(), "lon-edge-2".into()],
+            current: Some("lon-edge-3".into()),
+        };
+        let bytes = request.encode();
+        assert_eq!(bytes.len(), ASSIGN_REQUEST_BYTES);
+        assert_eq!(Control::decode(&bytes), Some(request));
+        let bare = Control::Assign {
+            stream_id: 1,
+            nonce: 9,
+            session: "s".into(),
+            skip: Vec::new(),
+            current: None,
+        };
+        assert_eq!(Control::decode(&bare.encode()), Some(bare));
+        for answer in [
+            Control::Assigned {
+                stream_id: 3001,
+                nonce: 9,
+                port: Some(19_446),
+                caches: vec![
+                    AssignedCache {
+                        node_id: "lon-edge-1".into(),
+                        playback_base_url: "https://10.90.0.21:19444/live".into(),
+                        failover: false,
+                    },
+                    AssignedCache {
+                        node_id: "new-dist-a".into(),
+                        playback_base_url: "https://10.90.2.11:19444".into(),
+                        failover: true,
+                    },
+                ],
+            },
+            Control::Assigned {
+                stream_id: 3001,
+                nonce: 9,
+                port: None,
+                caches: Vec::new(),
+            },
+        ] {
+            assert!(answer.encode().len() < ASSIGN_REQUEST_BYTES);
+            assert_eq!(Control::decode(&answer.encode()), Some(answer));
+        }
+        assert_eq!(Control::decode(b"NTU/1 ASSIGNED 5 09 - a|b"), None);
+        assert_eq!(Control::decode(b"NTU/1 ASSIGNED 5 09 - a|b|2"), None);
+        assert_eq!(Control::decode(b"NTU/1 ASSIGN 5 09 s -"), None);
     }
 
     #[test]

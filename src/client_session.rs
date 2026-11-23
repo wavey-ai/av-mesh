@@ -35,8 +35,12 @@ use std::time::{Duration, Instant};
 
 /// How often the session measures the loss of its path.
 pub const LOSS_CHECK: Duration = Duration::from_millis(150);
-/// How often a request that the edge has not answered is repeated.
+/// How often a request that the edge has not answered is repeated (at
+/// most, with [`SessionConfig::first_retry`]).
 pub const UNANSWERED_REFRESH: Duration = Duration::from_millis(300);
+/// Wave 9 B: the first repeat of a request that the edge has not answered
+/// (see [`SessionConfig::first_retry`]).
+pub const DEFAULT_FIRST_RETRY_MS: u64 = 25;
 /// An edge that has not answered the compact lane's requests for this long
 /// (and three of them) is asked without it.
 pub const COMPACT_FALLBACK_AFTER: Duration = Duration::from_millis(1_500);
@@ -123,6 +127,13 @@ pub struct SessionConfig {
     /// Parts whose bytes the compact lane keeps for window repair (0: the
     /// receiver's default of 4,096; a load host keeps fewer).
     pub known_parts: usize,
+    /// Wave 9 B (time to first audio under loss): a request that the edge
+    /// has not answered (the first `SUB`, the `SUB` with the token) is
+    /// repeated after this, or three round trips once one is measured, and
+    /// then after twice as long each time, up to [`UNANSWERED_REFRESH`]: a
+    /// lost request or answer costs a few round trips, not 300 ms. Zero:
+    /// every [`UNANSWERED_REFRESH`], as before.
+    pub first_retry: Duration,
 }
 
 /// A move asks for a hole at most this many parts before the newest part
@@ -150,6 +161,7 @@ impl SessionConfig {
             compact_short_header: true,
             nack_timing: NackTiming::default(),
             known_parts: 0,
+            first_retry: Duration::from_millis(DEFAULT_FIRST_RETRY_MS),
         }
     }
 
@@ -240,6 +252,10 @@ pub struct UdpSession {
     asked_at: Instant,
     last_request_at: Instant,
     unanswered: u32,
+    /// Repeats of the request now unanswered (the backoff of
+    /// [`SessionConfig::first_retry`]), and the round trip to the edge.
+    repeats: u32,
+    rtt: Option<Duration>,
     last_datagram: Instant,
     next_refresh: Instant,
     next_loss_check: Instant,
@@ -301,6 +317,8 @@ impl UdpSession {
             asked_at: now,
             last_request_at: now,
             unanswered: 0,
+            repeats: 0,
+            rtt: None,
             last_datagram: now,
             next_refresh: now,
             next_loss_check: now,
@@ -319,6 +337,19 @@ impl UdpSession {
 
     pub fn is_subscribed(&self) -> bool {
         self.subscribed
+    }
+
+    /// How long an unanswered request waits for its answer before it is
+    /// repeated (see [`SessionConfig::first_retry`]).
+    fn unanswered_wait(&self) -> Duration {
+        let first = self.config.first_retry;
+        if first.is_zero() {
+            return UNANSWERED_REFRESH;
+        }
+        let first = first.max(self.rtt.map_or(Duration::ZERO, |rtt| rtt * 3));
+        first
+            .saturating_mul(1 << self.repeats.min(8))
+            .min(UNANSWERED_REFRESH)
     }
 
     fn policy_for_base(&self) -> RepairPolicy {
@@ -401,7 +432,9 @@ impl UdpSession {
         self.unanswered = 1;
         self.last_datagram = now;
         // Until the edge answers, the request is repeated often.
-        self.next_refresh = now + UNANSWERED_REFRESH;
+        self.repeats = 0;
+        self.rtt = None;
+        self.next_refresh = now + self.unanswered_wait();
         self.next_loss_check = now + LOSS_CHECK;
         self.subscribed = false;
     }
@@ -558,7 +591,8 @@ impl UdpSession {
                 + if self.subscribed {
                     REFRESH
                 } else {
-                    UNANSWERED_REFRESH
+                    self.repeats = self.repeats.saturating_add(1);
+                    self.unanswered_wait()
                 };
         }
         None
@@ -618,13 +652,19 @@ impl UdpSession {
                         if self.token.is_none() {
                             // A request and its answer: the round trip that
                             // the NACKs wait for.
-                            self.receiver
-                                .compact
-                                .set_rtt(now.saturating_duration_since(self.last_request_at));
+                            let rtt = now.saturating_duration_since(self.last_request_at);
+                            self.receiver.compact.set_rtt(rtt);
+                            self.rtt = Some(rtt);
                         }
                         self.token = Some(given);
                         send(target, &self.subscribe_datagram(self.from_part));
                         self.last_request_at = now;
+                        // The request with the token is a new request: its
+                        // own repeats, from the first wait.
+                        if !self.subscribed && !self.config.first_retry.is_zero() {
+                            self.repeats = 0;
+                            self.next_refresh = now + self.unanswered_wait();
+                        }
                     }
                     Received::Control
                 }
@@ -717,6 +757,67 @@ mod tests {
 
     fn edge() -> SocketAddr {
         "127.0.0.1:19446".parse().unwrap()
+    }
+
+    /// Wave 9 B: an unanswered request is repeated after 25 ms, then after
+    /// twice as long each time up to 300 ms; the request with the token
+    /// starts its own repeats, after three round trips at least. With
+    /// `first_retry` zero, every 300 ms as before.
+    #[test]
+    fn an_unanswered_request_is_repeated_after_a_few_round_trips() {
+        let now = Instant::now();
+        let mut session = UdpSession::new(SessionConfig::new(4001), now);
+        let mut sent: Vec<(Instant, Vec<u8>)> = Vec::new();
+        session.begin(edge(), None, now, &mut |_, datagram| {
+            sent.push((now, datagram.to_vec()))
+        });
+        let mut at = now;
+        while at < now + Duration::from_millis(1_000) {
+            at = session.next_wake();
+            session.poll(at, &mut |_, datagram| sent.push((at, datagram.to_vec())));
+        }
+        let gaps: Vec<u64> = sent
+            .windows(2)
+            .map(|pair| pair[1].0.duration_since(pair[0].0).as_millis() as u64)
+            .collect();
+        assert_eq!(&gaps[..5], &[25, 50, 100, 200, 300]);
+        // The token comes 4 ms after the last request: the request with
+        // it is repeated 25 ms later (three round trips are 12 ms), then 50.
+        let last = sent.last().unwrap().0;
+        let token = Control::Token { stream_id: 4001, token: 77 }.encode();
+        let answered = last + Duration::from_millis(4);
+        let mut with_token: Vec<Instant> = Vec::new();
+        session.on_datagram(edge(), &token, answered, &mut |_, _| with_token.push(answered));
+        assert_eq!(with_token.len(), 1);
+        while with_token.len() < 3 {
+            let wake = session.next_wake();
+            assert!(wake < answered + Duration::from_millis(200));
+            session.poll(wake, &mut |_, datagram| {
+                assert!(matches!(
+                    Control::decode(datagram),
+                    Some(Control::Subscribe { token: Some(77), .. })
+                ));
+                with_token.push(wake)
+            });
+        }
+        assert_eq!(with_token[1] - with_token[0], Duration::from_millis(25));
+        assert_eq!(with_token[2] - with_token[1], Duration::from_millis(50));
+        // A slower edge: three round trips.
+        let mut session = UdpSession::new(SessionConfig::new(4001), now);
+        session.begin(edge(), None, now, &mut |_, _| {});
+        let answered = now + Duration::from_millis(40);
+        session.on_datagram(edge(), &token, answered, &mut |_, _| {});
+        assert_eq!(session.next_refresh - answered, Duration::from_millis(120));
+        // Before wave 9: every 300 ms.
+        let config = SessionConfig {
+            first_retry: Duration::ZERO,
+            ..SessionConfig::new(4001)
+        };
+        let mut session = UdpSession::new(config, now);
+        session.begin(edge(), None, now, &mut |_, _| {});
+        assert_eq!(session.next_refresh - now, UNANSWERED_REFRESH);
+        session.poll(now + UNANSWERED_REFRESH, &mut |_, _| {});
+        assert_eq!(session.next_refresh - now, UNANSWERED_REFRESH * 2);
     }
 
     #[test]
