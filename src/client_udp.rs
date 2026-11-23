@@ -34,6 +34,11 @@
 //!   datagram. A list that runs to the end (the parts of a `NACK`, the
 //!   caches of an `ASSIGNED`) ends at the first such word. A field is not
 //!   written at its default (`p=1`, `s=0`, an empty `h=` or `o=`, no `r=`).
+//!   A known key whose value is malformed, or that is given twice, refuses
+//!   the datagram, so the values of a key are fixed once a build ships it: a
+//!   new meaning takes a new key. The reason of a `REFUSED` or `MOVE` never
+//!   has the form of a field (`=` is written as `-`), so one there is a
+//!   field of a datagram that gives no reason.
 //!
 //!   A listener may hold a stream on two edges at once, one subscription
 //!   (a leg) at each. `o=` on a `SUB` names the nodes of its other legs
@@ -450,10 +455,13 @@ impl Control {
                 next_part,
             } => format!("{CONTROL_PREFIX}WAIT {stream_id} {next_part}"),
             Self::Refused { stream_id, reason } => {
-                format!("{CONTROL_PREFIX}REFUSED {stream_id} {}", word(reason))
+                format!(
+                    "{CONTROL_PREFIX}REFUSED {stream_id} {}",
+                    reason_word(reason)
+                )
             }
             Self::Move { stream_id, reason } => {
-                format!("{CONTROL_PREFIX}MOVE {stream_id} {}", word(reason))
+                format!("{CONTROL_PREFIX}MOVE {stream_id} {}", reason_word(reason))
             }
             Self::Assign {
                 stream_id,
@@ -640,13 +648,15 @@ impl Control {
                 stream_id,
                 next_part: words.next()?.parse().ok()?,
             },
+            // A reason has no `=`, so a field after the stream is a later
+            // build's field on a datagram that gives no reason.
             "REFUSED" => Self::Refused {
                 stream_id,
-                reason: words.next().unwrap_or("refused").to_owned(),
+                reason: list_word(&mut words).unwrap_or("refused").to_owned(),
             },
             "MOVE" => Self::Move {
                 stream_id,
-                reason: words.next().unwrap_or("move").to_owned(),
+                reason: list_word(&mut words).unwrap_or("move").to_owned(),
             },
             "ASSIGN" => {
                 let nonce = token(words.next()?)?;
@@ -784,6 +794,12 @@ fn list(names: &[String]) -> String {
         .map(|name| word(name).replace(',', "-"))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// A reason as its word, `=` written as `-` so that it never has the form of
+/// a field.
+fn reason_word(reason: &str) -> String {
+    word(reason).replace('=', "-")
 }
 
 fn word(reason: &str) -> String {
@@ -2241,6 +2257,34 @@ mod tests {
         assert_eq!(
             Control::decode(b"NTU/1 ASSIGNED 9 09 - a|b|0 z=1 c|d|0"),
             None
+        );
+        // A datagram that gives no reason: the field is no reason.
+        assert_eq!(
+            Control::decode(b"NTU/1 MOVE 9 z=1"),
+            Some(Control::Move {
+                stream_id: 9,
+                reason: "move".into(),
+            })
+        );
+        assert_eq!(
+            Control::decode(b"NTU/1 REFUSED 9 z=1 y=2"),
+            Some(Control::Refused {
+                stream_id: 9,
+                reason: "refused".into(),
+            })
+        );
+        // A reason with `=` is sent as a reason, never as a field.
+        let odd = Control::Move {
+            stream_id: 9,
+            reason: "a=b".into(),
+        };
+        assert_eq!(text(&odd), "NTU/1 MOVE 9 a-b");
+        assert_eq!(
+            Control::decode(&odd.encode()),
+            Some(Control::Move {
+                stream_id: 9,
+                reason: "a-b".into(),
+            })
         );
         // A field of another verb is one more unknown word.
         assert_eq!(
