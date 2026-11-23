@@ -10,6 +10,7 @@ mod fast_plane;
 mod hop_journal;
 mod memory;
 mod link_telemetry;
+mod node_status;
 
 use anyhow::{anyhow, bail, Context, Result};
 use assignment::{
@@ -504,6 +505,8 @@ const PLAYLIST_WARM_WAIT_MS: u64 = 4_000;
 const ASSIGNMENT_PATH: &str = "/api/assignment";
 /// The hop journal of the node, as NDJSON.
 const HOPS_PATH: &str = "/api/hops";
+/// The node's build, process and readiness (`node_status`).
+const NODE_STATUS_PATH: &str = "/api/node";
 /// Reply events journaled for one part: the first few readers show the
 /// delay of the last hop; a crowd would only fill the ring.
 const HOP_JOURNAL_REPLIES_PER_PART: u32 = 4;
@@ -3856,6 +3859,13 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    // One class thread for each class that has a socket.
+    let class_threads_expected = class_sockets.as_ref().map_or(0, |sockets| {
+        fast_plane::TrafficClass::ALL
+            .iter()
+            .filter(|class| sockets.iter().any(|socket| socket.class == **class))
+            .count() as u64
+    });
     let fec_socket = if class_ingest {
         None
     } else {
@@ -4017,6 +4027,21 @@ async fn main() -> Result<()> {
             }),
     );
     let (audio_epoch_tx, _) = broadcast::channel(AUDIO_EPOCH_BROADCAST_CAPACITY);
+    let node_status_source = NodeStatusSource {
+        threads_expected: class_threads_expected,
+        warm_parts: args.cache_mesh_warm_parts as u64,
+        parents: Arc::new(
+            [
+                (args.relay_primary_peer, &args.relay_primary_id, "primary"),
+                (args.relay_secondary_peer, &args.relay_secondary_id, "secondary"),
+            ]
+            .into_iter()
+            .filter_map(|(peer, id, path)| peer.map(|peer| (peer.ip(), id.clone(), path)))
+            .collect(),
+        ),
+        forwarder: relay_forwarder.clone(),
+        ..NodeStatusSource::default()
+    };
     let relay_ingest_runtime = RelayIngestRuntime {
         dispatch: relay_dispatch,
         secondary_socket: relay_secondary_socket,
@@ -4166,6 +4191,7 @@ async fn main() -> Result<()> {
             .then(|| Duration::from_millis(args.edge_hole_distance_ms)),
     )
     .with_regional_view_ttl(REGIONAL_VIEW_TTL)
+    .with_node_status(node_status_source)
     .with_playlist_demand(playlist_demand)
     .with_client_udp_port(args.client_udp_bind.map(|bind| bind.port()))
     .with_assignment(
@@ -5981,6 +6007,23 @@ enum RelayForwardAttempt {
 }
 
 impl RelayDownstreamForwarder {
+    /// The compiled children, for `GET /api/node`.
+    fn compiled_children(&self) -> Vec<node_status::CompiledChild> {
+        self.paths
+            .iter()
+            .map(|path| node_status::CompiledChild {
+                target: path.target.to_string(),
+                lane: match path.role {
+                    RelayForwardRole::All => "all",
+                    RelayForwardRole::Source => "source",
+                    RelayForwardRole::Repair => "repair",
+                }
+                .to_owned(),
+                promoted: path.promoted.load(Ordering::Relaxed),
+            })
+            .collect()
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     async fn bind(endpoints: &[RelayForwardEndpoint]) -> Result<Option<Arc<Self>>> {
         Self::bind_split(endpoints, None).await
@@ -8450,6 +8493,8 @@ struct LiveTsCache {
     fast_plane: OnceLock<Arc<fast_plane::relay::FastPlaneStats>>,
     /// What each parent delivers on the fast plane (`GET /api/node`).
     parent_feeds: OnceLock<Arc<fast_plane::parent_feeds::ParentFeeds>>,
+    /// When this node started, in Unix µs: its boot id.
+    started_unix_us: u64,
 }
 
 impl LiveTsCache {
@@ -8532,6 +8577,7 @@ impl LiveTsCache {
         chunk_cache.resolve_or_create_stream(stream_id).await;
         let (part_updates, _) = watch::channel(0);
         let mut state = LiveState::new();
+        let started_unix_us = state.process_started_unix_us;
         state.segment_seed_parts = parts_per_segment.max(1) as u64;
         state.nominal_part_us = duration_us(part_target).max(1);
         state.ring_parts = ring_parts;
@@ -8582,6 +8628,7 @@ impl LiveTsCache {
             stream_classes: fast_plane::StreamClasses::default(),
             fast_plane: OnceLock::new(),
             parent_feeds: OnceLock::new(),
+            started_unix_us,
         })
     }
 
@@ -8598,7 +8645,6 @@ impl LiveTsCache {
     }
 
     /// The feed records of the fast plane, when the relay ingest runs on it.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn parent_feeds(&self) -> Option<&Arc<fast_plane::parent_feeds::ParentFeeds>> {
         self.parent_feeds.get()
     }
@@ -10092,6 +10138,34 @@ impl LiveTsCache {
 
     /// Parts in the playlist window of one stream. See
     /// [`LiveState::stream_window_parts`].
+    /// What `GET /api/node` reports of each stream the cache holds or has
+    /// ingested, by stream: its retained parts and its window.
+    async fn stream_holdings(&self) -> Vec<StreamHolding> {
+        let state = self.state.read().await;
+        let mut streams: BTreeSet<u64> = state.stream_parts.keys().copied().collect();
+        streams.extend(state.stream_last_ingest_unix_ms.keys().copied());
+        streams
+            .into_iter()
+            .map(|stream_id| {
+                let parts = state.stream_parts.get(&stream_id);
+                let head = parts.and_then(|parts| parts.iter().next_back());
+                StreamHolding {
+                    stream_id,
+                    ingest_unix_ms: state.stream_last_ingest_unix_ms.get(&stream_id).copied(),
+                    head_part: head.map(|(sequence, _)| *sequence),
+                    head_written_unix_us: head.map(|(_, part)| {
+                        part.committed_unix_us.unwrap_or(part.available_unix_us)
+                    }),
+                    first_part: parts
+                        .and_then(|parts| parts.keys().next())
+                        .copied(),
+                    window_parts: parts.map_or(0, |parts| parts.len() as u64),
+                    window_limit: state.stream_window_parts(stream_id, self.window_parts) as u64,
+                }
+            })
+            .collect()
+    }
+
     async fn window_parts_for(&self, stream_id: u64) -> usize {
         self.state
             .read()
@@ -12266,6 +12340,20 @@ fn object_published_unix_us(object: &MediaObject) -> Option<u64> {
         .filter(|published_us| *published_us > 0)
 }
 
+/// One stream as the cache holds it, for `GET /api/node`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamHolding {
+    stream_id: u64,
+    ingest_unix_ms: Option<u64>,
+    head_part: Option<u64>,
+    /// When the newest part was written here (Unix µs).
+    head_written_unix_us: Option<u64>,
+    first_part: Option<u64>,
+    window_parts: u64,
+    /// The parts the stream's window holds at most.
+    window_limit: u64,
+}
+
 struct LiveState {
     process_started_unix_us: u64,
     current: Vec<u8>,
@@ -13105,6 +13193,10 @@ struct MeshApiSnapshot {
     /// The cache mesh's live gauges (AM 12, 13).
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_mesh: Option<CacheMeshGauges>,
+    /// This node's `GET /api/node`, so that a sampler of this endpoint
+    /// records build and readiness with no second request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<node_status::NodeStatus>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -13384,6 +13476,8 @@ struct MeshFecRuntimeSnapshot {
     warm_starved_ticks: u64,
     warm_capped_ticks: u64,
     parents_released: u64,
+    /// Cache-mesh datagrams from addresses that are not peers.
+    rx_unauthorized_datagrams: u64,
 }
 
 impl From<CacheMeshFecStats> for MeshFecRuntimeSnapshot {
@@ -13421,6 +13515,7 @@ impl From<CacheMeshFecStats> for MeshFecRuntimeSnapshot {
             warm_starved_ticks: stats.warm_starved_ticks,
             warm_capped_ticks: stats.warm_capped_ticks,
             parents_released: stats.parents_released,
+            rx_unauthorized_datagrams: stats.rx_unauthorized_datagrams,
         }
     }
 }
@@ -14343,6 +14438,16 @@ impl EdgeLoad {
 
     fn admission_snapshot(&self) -> EdgeAdmissionSnapshot {
         self.egress.snapshot()
+    }
+
+    /// Moved sessions that made a request here in the last `within_ms`.
+    fn moved_seen_within(&self, within_ms: u64) -> u64 {
+        self.egress.moved_seen_within(within_ms)
+    }
+
+    /// LL-HLS reads in progress.
+    fn requests_in_flight(&self) -> u64 {
+        self.inner.active_readers.load(Ordering::Relaxed)
     }
 
     /// Whether the egress is overloaded now (client UDP lanes included).
@@ -15641,6 +15746,42 @@ impl TelemetryAggregator {
         (snapshots_with_local, telemetry)
     }
 
+    /// What this node, as its region's entry point, knows of the region's
+    /// other nodes: whether any advertised, and how many edges advertise
+    /// within `fresh_ms`, not draining and draining. It reads the held
+    /// advertisements only: no merge, no local snapshot.
+    async fn region_entry(
+        &self,
+        node: &MeshNode,
+        fresh_ms: u64,
+        now_ms: u64,
+    ) -> (bool, node_status::EntryStatus) {
+        let snapshots = self.snapshots.read().await;
+        let mut heard = false;
+        let mut entry = node_status::EntryStatus::default();
+        for snapshot in snapshots.values().filter(|snapshot| {
+            snapshot.node.region == node.region && snapshot.node.node_id != node.node_id
+        }) {
+            heard = true;
+            let Some(edge) = snapshot
+                .edge_service
+                .as_ref()
+                .filter(|edge| edge.cache_mesh_role == "edge")
+            else {
+                continue;
+            };
+            if self.advertisement_age_ms(snapshot, now_ms) > fresh_ms {
+                continue;
+            }
+            if edge.draining || snapshot.node.draining {
+                entry.caches_draining += 1;
+            } else {
+                entry.caches_fresh += 1;
+            }
+        }
+        (heard, entry)
+    }
+
     fn is_stale(&self, snapshot: &MeshSnapshot, now_ms: u64) -> bool {
         self.stale_after_ms > 0
             && now_ms.saturating_sub(snapshot.updated_unix_ms) > self.stale_after_ms
@@ -15934,6 +16075,7 @@ impl MeshApiSnapshot {
             client_udp: None,
             fast_plane: None,
             cache_mesh: None,
+            status: None,
         }
     }
 }
@@ -19153,6 +19295,42 @@ struct AppRouter {
     #[allow(clippy::type_complexity)]
     regional_view: Arc<tokio::sync::Mutex<Option<(Instant, Arc<Vec<MeshSnapshot>>)>>>,
     regional_view_ttl: Duration,
+    /// What `GET /api/node` reads beyond the fields above.
+    node_status: NodeStatusSource,
+}
+
+/// How long one `GET /api/node` object serves.
+const NODE_STATUS_CACHE: Duration = Duration::from_millis(100);
+
+/// What `GET /api/node` reads beyond the router's own fields, and what it
+/// remembers from one request to the next.
+#[derive(Clone, Default)]
+struct NodeStatusSource {
+    /// The class threads this node starts (0 without the fast plane).
+    threads_expected: u64,
+    /// `--cache-mesh-warm-parts`.
+    warm_parts: u64,
+    /// The configured relay parents: address, id and path.
+    parents: Arc<Vec<(std::net::IpAddr, String, &'static str)>>,
+    /// The compiled long-haul children, on a forwarder that has them.
+    forwarder: Option<Arc<RelayDownstreamForwarder>>,
+    memory: Arc<StdMutex<NodeStatusMemory>>,
+}
+
+#[derive(Default)]
+struct NodeStatusMemory {
+    cached: Option<(Instant, Arc<node_status::NodeStatus>)>,
+    /// The warm-up was met (latched), and when the node was first ready.
+    warm: bool,
+    ready_unix_ms: Option<u64>,
+    /// The process's CPU time at the last sample, and the figure of the
+    /// last whole second.
+    cpu_sample: Option<(Instant, u64)>,
+    cpu_permille: u32,
+    /// The lease pairs served at the last look, and when a new one last
+    /// appeared (F5).
+    lease_pairs: HashSet<(SocketAddr, u64)>,
+    lease_opened: Option<Instant>,
 }
 
 /// The candidates without the caches a moving client has just left (Phase
@@ -19335,7 +19513,13 @@ impl AppRouter {
             // A router reads the region afresh for each request unless it is
             // told how long one reading serves.
             regional_view_ttl: Duration::ZERO,
+            node_status: NodeStatusSource::default(),
         }
+    }
+
+    fn with_node_status(mut self, source: NodeStatusSource) -> Self {
+        self.node_status = source;
+        self
     }
 
     fn with_assignment_udp_in_region(mut self, enabled: bool) -> Self {
@@ -19817,6 +20001,7 @@ impl AppRouter {
         snapshot.client_udp = self.client_udp_gauges().await;
         snapshot.fast_plane = self.fast_plane_gauges();
         snapshot.cache_mesh = Some(self.cache_mesh_gauges());
+        snapshot.status = Some((*self.node_status().await).clone());
         snapshot
     }
 
@@ -19870,6 +20055,347 @@ impl AppRouter {
             watermark_stall_max_us: self.cache.watermark_stall_max_us(),
             watermark_stalls_over_250ms: self.cache.watermark_stalls_over(),
         }
+    }
+
+    /// `GET /api/node`: the node's build, process, readiness and the
+    /// figures a tool judges it by. Built from atomics and gauges only (no
+    /// telemetry merge, no replica plan) and kept for 100 ms.
+    async fn node_status(&self) -> Arc<node_status::NodeStatus> {
+        use node_status::{
+            CacheMeshStatus, ClientUdpStatus, DrainReasons, FastPlaneStatus, IngestStatus,
+            LeasePair, LeaseStatus, LeaseStream, NodeStatus, ParentStatus, ParentStreamStatus,
+            ProcessStatus, Readiness, ReadinessInputs, StreamStatus,
+        };
+        let source = &self.node_status;
+        let lock_memory = || {
+            source
+                .memory
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        if let Some((at, status)) = lock_memory().cached.as_ref() {
+            if at.elapsed() < NODE_STATUS_CACHE {
+                return Arc::clone(status);
+            }
+        }
+        let now = Instant::now();
+        let now_us = now_unix_us();
+        let ms_since = |at_us: u64| now_us.saturating_sub(at_us) / 1_000;
+        let uptime_ms = ms_since(self.cache.started_unix_us);
+        let edge = self.cache_mesh_role == CacheMeshRole::Edge;
+        let classes = self.cache.stream_classes();
+        let class_of = |stream_id: u64| classes.class(stream_id).as_str().to_owned();
+
+        // The fast plane, and what each parent delivered on it.
+        let plane = self.cache.relay_ingress_snapshot().fast_plane;
+        let plane_stats = self.cache.fast_plane.get();
+        let feeds = self.cache.parent_feeds();
+        let figures = feeds
+            .map(|feeds| feeds.plane(plane.audio_received + plane.video_received, now_us))
+            .unwrap_or_default();
+        let fast_plane = FastPlaneStatus {
+            threads: plane.threads,
+            threads_expected: source.threads_expected,
+            realtime_threads: plane.realtime_threads,
+            pinned_threads: plane.pinned_threads,
+            received_1s: figures.received_1s,
+            admitted_1s: figures.admitted_1s,
+            not_admitted_1s: figures.not_admitted_1s,
+            received_age_ms: figures.received_age_ms,
+        };
+        let ingest = IngestStatus {
+            audio_deadline_drops: plane_stats.map_or(0, |stats| {
+                stats.deadline_drops[fast_plane::TrafficClass::Audio.index()]
+                    .load(Ordering::Relaxed)
+            }),
+            video_deadline_drops: plane_stats.map_or(0, |stats| {
+                stats.deadline_drops[fast_plane::TrafficClass::Video.index()]
+                    .load(Ordering::Relaxed)
+            }),
+            tee_dropped: plane.tee_dropped,
+        };
+        let rows = feeds.map(|feeds| feeds.snapshot(now_us)).unwrap_or_default();
+        let mut parents: Vec<ParentStatus> = Vec::new();
+        for row in &rows {
+            let class = row.stream_id.map_or_else(|| "audio".to_owned(), class_of);
+            if parents.last().is_none_or(|parent| parent.address != row.address.to_string()) {
+                let (id, path) = source
+                    .parents
+                    .iter()
+                    .find(|(ip, _, _)| *ip == row.address)
+                    .map_or_else(
+                        || (format!("lease-parent-{}", row.address), "lease"),
+                        |(_, id, path)| (id.clone(), *path),
+                    );
+                parents.push(ParentStatus {
+                    address: row.address.to_string(),
+                    id,
+                    path: path.to_owned(),
+                    audio_age_ms: None,
+                    video_age_ms: None,
+                    streams: Vec::new(),
+                });
+            }
+            let parent = parents.last_mut().expect("a parent was pushed");
+            let age = if class == "video" {
+                &mut parent.video_age_ms
+            } else {
+                &mut parent.audio_age_ms
+            };
+            if let Some(source_age) = row.source_age_ms {
+                *age = Some(age.map_or(source_age, |age| age.min(source_age)));
+            }
+            parent.streams.push(ParentStreamStatus {
+                stream_id: row.stream_id,
+                track: row.track.clone(),
+                class,
+                source_age_ms: row.source_age_ms,
+                repair_age_ms: row.repair_age_ms,
+                head_object: row.head_object,
+                window_s: row.window_s,
+                objects_1s: row.objects_1s,
+                objects_10s: row.objects_10s,
+                skipped_10s: row.skipped_10s,
+                resets_10s: row.resets_10s,
+                multi_symbol_10s: row.multi_symbol_10s,
+                slack_mean_us_1s: row.slack_mean_us_1s,
+                slack_mean_us_10s: row.slack_mean_us_10s,
+                slack_min_us_10s: row.slack_min_us_10s,
+            });
+        }
+
+        // The streams: those the parents deliver and those the cache holds.
+        let holdings = self.cache.stream_holdings().await;
+        let mut stream_ids: BTreeSet<u64> = rows.iter().filter_map(|row| row.stream_id).collect();
+        stream_ids.extend(holdings.iter().map(|holding| holding.stream_id));
+        let streams: Vec<StreamStatus> = stream_ids
+            .into_iter()
+            .map(|stream_id| {
+                let holding = holdings
+                    .iter()
+                    .find(|holding| holding.stream_id == stream_id);
+                let ingest_age_ms = holding
+                    .and_then(|holding| holding.ingest_unix_ms)
+                    .map(|at_ms| (now_us / 1_000).saturating_sub(at_ms));
+                let seen_age_ms = rows
+                    .iter()
+                    .filter(|row| row.stream_id == Some(stream_id))
+                    .flat_map(|row| [row.source_age_ms, row.repair_age_ms])
+                    .chain([ingest_age_ms])
+                    .flatten()
+                    .min();
+                let window_limit = holding.map_or(0, |holding| holding.window_limit);
+                StreamStatus {
+                    stream_id,
+                    class: class_of(stream_id),
+                    seen_age_ms,
+                    decoded: holding
+                        .and_then(|holding| holding.head_written_unix_us)
+                        .is_some_and(|at_us| ms_since(at_us) <= node_status::SEEN_WITHIN_MS),
+                    ingest_age_ms,
+                    head_part: holding.and_then(|holding| holding.head_part),
+                    first_part: holding.and_then(|holding| holding.first_part),
+                    window_parts: holding.map_or(0, |holding| holding.window_parts),
+                    warm_parts: if window_limit > 0 {
+                        source.warm_parts.min(window_limit)
+                    } else {
+                        source.warm_parts
+                    },
+                }
+            })
+            .collect();
+
+        // The children: compiled, and the cache-mesh leases the fast plane
+        // feeds.
+        let served = self.mesh.served_subscriptions();
+        let lease = plane_stats
+            .and_then(|stats| stats.lease.get())
+            .map(|lease| {
+                let snapshot = lease.load();
+                let stats = plane.lease_children;
+                let mut streams: BTreeMap<u64, u64> = BTreeMap::new();
+                for pair in &served {
+                    *streams.entry(pair.stream_id).or_default() += 1;
+                }
+                LeaseStatus {
+                    children: stats.children,
+                    pairs: stats.pairs,
+                    refused: stats.refused,
+                    pairs_list: served
+                        .iter()
+                        .map(|pair| LeasePair {
+                            child: pair.child.ip().to_string(),
+                            stream_id: pair.stream_id,
+                            primary: snapshot.feeds(pair.child.ip(), pair.stream_id),
+                            rank: pair.rank,
+                            warm_parts_pending: pair.backfill_parts_pending as u64,
+                        })
+                        .collect(),
+                    streams: streams
+                        .into_iter()
+                        .map(|(stream_id, children)| LeaseStream {
+                            stream_id,
+                            children,
+                            fed_age_ms: Some(snapshot.fed_us(stream_id))
+                                .filter(|at_us| *at_us > 0)
+                                .map(ms_since),
+                        })
+                        .collect(),
+                }
+            });
+        let children = node_status::ChildrenStatus {
+            compiled: source
+                .forwarder
+                .as_ref()
+                .map(|forwarder| forwarder.compiled_children())
+                .unwrap_or_default(),
+            lease,
+        };
+        let parent_heard_age_ms = self
+            .mesh
+            .parents_silent_for()
+            .await
+            .map(|silent| u64::try_from(silent.as_millis()).unwrap_or(u64::MAX));
+        let cache_mesh = CacheMeshStatus {
+            parent_heard_age_ms,
+            children: served
+                .iter()
+                .map(|pair| pair.child)
+                .collect::<HashSet<_>>()
+                .len() as u64,
+            pairs: served.len() as u64,
+            subscribed_playlists: self.mesh.subscribed_streams().len() as u64,
+            warm_parts_pending: served
+                .iter()
+                .map(|pair| pair.backfill_parts_pending as u64)
+                .sum(),
+        };
+
+        let parents_lost = self.parents_are_lost().await;
+        let client_udp = match self.client_udp_port {
+            Some(_) => {
+                let stats = &self.edge_udp_stats;
+                let egress = self.edge_load.admission_snapshot();
+                Some(ClientUdpStatus {
+                    subscribers: stats.live_subscribers(),
+                    hls_sessions: egress.active_sessions,
+                    hls_moved_active: self.edge_load.moved_seen_within(1_000),
+                    hls_requests_in_flight: self.edge_load.requests_in_flight(),
+                    refusals: stats.refusals.load(Ordering::Relaxed),
+                    load_permille: egress.load_permille,
+                    rebalance_moves: stats.rebalance_moves.load(Ordering::Relaxed),
+                    parents_lost,
+                })
+            }
+            None => None,
+        };
+        let (regional_view, entry) = self
+            .telemetry
+            .region_entry(&self.node, self.assignment_fresh_ms, now_us / 1_000)
+            .await;
+        let drain = DrainReasons {
+            operator: self.lifecycle.is_draining().await,
+            ..DrainReasons::default()
+        };
+
+        let mut memory = lock_memory();
+        // F5: a pair served now that was not at the last look opened a
+        // lease.
+        let pairs: HashSet<(SocketAddr, u64)> = served
+            .iter()
+            .map(|pair| (pair.child, pair.stream_id))
+            .collect();
+        if pairs.iter().any(|pair| !memory.lease_pairs.contains(pair)) {
+            memory.lease_opened = Some(now);
+        }
+        memory.lease_pairs = pairs;
+        let inputs = ReadinessInputs {
+            uptime_ms,
+            // This answer is the HTTP server's.
+            http_serving: true,
+            threads: fast_plane.threads,
+            threads_expected: fast_plane.threads_expected,
+            client_udp_running: client_udp.is_none_or(|udp| udp.subscribers.is_some()),
+            parent_heard_age_ms,
+            parents_lost,
+            regional_view,
+            fast_plane,
+            parents: parents.clone(),
+            streams: streams.clone(),
+            lease_renewal_ms: u64::try_from(
+                (self.mesh.subscription_lease() / 3).as_millis(),
+            )
+            .unwrap_or(u64::MAX)
+                + PLAYLIST_DEMAND_SWEEP_MS,
+            lease_opened_age_ms: memory.lease_opened.map(|at| {
+                u64::try_from(now.saturating_duration_since(at).as_millis()).unwrap_or(u64::MAX)
+            }),
+            drain,
+            // E5's warm copies and F7's start demand come with the warm
+            // pass of the lifecycle (CR8), `start`, `stopping` and the
+            // forced start with its start and stop (CR6).
+            warm_copies: Vec::new(),
+            slot_streams: Vec::new(),
+            ready_forced: false,
+        };
+        let readiness = if edge {
+            Readiness::edge(&inputs, memory.warm)
+        } else {
+            Readiness::forwarder(&inputs, memory.warm)
+        };
+        memory.warm = readiness.warm;
+        if readiness.ready() && memory.ready_unix_ms.is_none() {
+            memory.ready_unix_ms = Some(now_us / 1_000);
+        }
+        // The process's CPU over its CPUs, a whole second at a time.
+        let cpus = edge_admission::available_cpus();
+        if let Some(cpu_us) = edge_admission::process_cpu_us() {
+            match memory.cpu_sample {
+                Some((at, before_us)) if now.saturating_duration_since(at) >= Duration::from_secs(1) => {
+                    let wall_us = now.saturating_duration_since(at).as_micros();
+                    memory.cpu_permille = (u128::from(cpu_us.saturating_sub(before_us)) * 1_000
+                        / (wall_us * u128::from(cpus.max(1))).max(1))
+                    .min(u128::from(u32::MAX)) as u32;
+                    memory.cpu_sample = Some((now, cpu_us));
+                }
+                Some(_) => {}
+                None => memory.cpu_sample = Some((now, cpu_us)),
+            }
+        }
+        let status = Arc::new(NodeStatus {
+            schema: node_status::SCHEMA.to_owned(),
+            node_id: self.node.node_id.clone(),
+            region: self.node.region.clone(),
+            role: cache_mesh_role_label(self.cache_mesh_role).to_owned(),
+            build: node_status::BuildStatus::of_this_binary(),
+            process: ProcessStatus {
+                pid: std::process::id(),
+                boot_id: self.cache.started_unix_us,
+                started_unix_ms: self.cache.started_unix_us / 1_000,
+                uptime_ms,
+                args_sha256: node_status::args_sha256().to_owned(),
+                cpus,
+                cpu_permille: memory.cpu_permille,
+            },
+            state: readiness.state,
+            ready: readiness.ready(),
+            warm: readiness.warm,
+            ready_unix_ms: memory.ready_unix_ms,
+            ready_forced: inputs.ready_forced,
+            not_ready: readiness.not_ready,
+            drain_reasons: drain.list(),
+            hello_draining: self.mesh.is_draining(),
+            fast_plane,
+            ingest,
+            parents,
+            streams,
+            children,
+            cache_mesh,
+            client_udp,
+            entry,
+        });
+        memory.cached = Some((now, Arc::clone(&status)));
+        status
     }
 
     /// The client UDP lane's live gauges (Phase AM item 8), when this node
@@ -22448,6 +22974,16 @@ impl Router for AppRouter {
                 Some(Bytes::from_static(b"OK")),
                 Some("text/plain"),
             )),
+            NODE_STATUS_PATH => {
+                let json = serde_json::to_vec(&*self.node_status().await)
+                    .map_err(|err| ServerError::Handler(Box::new(err)))?;
+                Ok(response(
+                    StatusCode::OK,
+                    Some(Bytes::from(json)),
+                    Some("application/json"),
+                )
+                .with_no_store())
+            }
             "/live/stream.m3u8" => {
                 self.request_replica_for_stream(self.cache.stream_id, "playlist-demand", None)
                     .await;
@@ -27829,6 +28365,75 @@ mod tests {
             error.to_string(),
             format!("av-mesh {}\n", av_mesh::build::VERSION)
         );
+    }
+
+    /// CR5: `GET /api/node` answers with the build, the process and the
+    /// readiness, `/api/mesh/local` carries the same object, and an
+    /// operator's drain shows as a reason.
+    #[tokio::test]
+    async fn the_node_status_is_served_and_carried_in_mesh_local() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(250), 4, 32, 64).await;
+        cache
+            .commit_stream_payload(
+                77,
+                encode_test_canonical_fmp4_bundle_with_duration(
+                    77,
+                    0,
+                    Some(b"ftyp-fLaC-moov"),
+                    b"moof-mdat-flac",
+                    Some(250),
+                    false,
+                ),
+            )
+            .await
+            .unwrap();
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh)).with_node_status(
+            NodeStatusSource {
+                warm_parts: 8,
+                ..NodeStatusSource::default()
+            },
+        );
+        let response = get_for_tests(&router, "/api/node").await;
+        assert_eq!(response.status, StatusCode::OK);
+        let status: node_status::NodeStatus =
+            serde_json::from_slice(&response.body.unwrap()).unwrap();
+        assert_eq!(status.schema, node_status::SCHEMA);
+        assert_eq!(status.node_id, router.node.node_id);
+        assert_eq!(status.build.git, av_mesh::build::GIT);
+        assert_eq!(status.build.built_unix, av_mesh::build::UNIX);
+        assert_eq!(status.process.boot_id, cache.started_unix_us);
+        assert_eq!(status.process.pid, std::process::id());
+        assert_eq!(status.process.args_sha256, node_status::args_sha256());
+        assert_eq!(status.drain_reasons, Vec::new());
+        // The part just committed: decoded, and a window of one part of
+        // the eight it needs.
+        let stream = status
+            .streams
+            .iter()
+            .find(|stream| stream.stream_id == 77)
+            .expect("the committed stream is listed");
+        assert!(stream.decoded, "{stream:?}");
+        assert_eq!((stream.head_part, stream.first_part), (Some(0), Some(0)));
+        assert_eq!((stream.window_parts, stream.warm_parts), (1, 8));
+        assert!(stream.seen_age_ms.is_some_and(|age| age < 1_000));
+
+        let local = get_for_tests(&router, "/api/mesh/local").await;
+        let local: serde_json::Value = serde_json::from_slice(&local.body.unwrap()).unwrap();
+        assert_eq!(local["status"]["schema"], node_status::SCHEMA);
+        assert_eq!(local["status"]["process"]["boot_id"], cache.started_unix_us);
+
+        router.lifecycle.set_draining(true).await;
+        tokio::time::sleep(NODE_STATUS_CACHE + Duration::from_millis(20)).await;
+        let response = get_for_tests(&router, "/api/node").await;
+        let drained: serde_json::Value = serde_json::from_slice(&response.body.unwrap()).unwrap();
+        assert_eq!(drained["ready"], false);
+        assert_eq!(drained["drain_reasons"], serde_json::json!(["operator"]));
+        assert!(drained["not_ready"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("draining: operator")));
+        mesh.shutdown();
     }
 
     #[test]

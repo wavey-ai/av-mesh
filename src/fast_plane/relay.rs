@@ -212,6 +212,9 @@ pub struct FastPlaneStats {
     pub not_admitted: AtomicU64,
     pub invalid: AtomicU64,
     pub tee_dropped: AtomicU64,
+    /// Datagrams each class's tee dropped as past their deadline, as its
+    /// dispatch counts them.
+    pub deadline_drops: [AtomicU64; 2],
     pub would_block: AtomicU64,
     pub send_errors: AtomicU64,
     pub truncated: AtomicU64,
@@ -1667,6 +1670,8 @@ impl Tee {
 
     fn publish(&self) {
         let snapshot = self.dispatch.receiver().snapshot();
+        self.stats.deadline_drops[self.class.index()]
+            .store(snapshot.counters.deadline_drops, Ordering::Relaxed);
         let mut merged = {
             let mut snapshots = self
                 .snapshots

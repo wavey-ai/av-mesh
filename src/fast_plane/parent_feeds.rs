@@ -559,7 +559,6 @@ impl ParentFeeds {
 
     /// The plane's figures, with the age of the last received datagram
     /// judged against the count of received datagrams as it is now.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn plane(&self, received: u64, now_us: u64) -> PlaneFigures {
         self.note_received(received, now_us);
         PlaneFigures {
@@ -570,7 +569,6 @@ impl ParentFeeds {
 
     /// Every entry: its ages and head as they are now, and the sampler's
     /// figures. Sorted by address, stream and track.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn snapshot(&self, now_us: u64) -> Vec<ParentFeed> {
         let table = self.table.load_full();
         let mut feeds = table

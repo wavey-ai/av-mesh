@@ -1,0 +1,137 @@
+{
+  "schema": "needletail.node.v1",
+  "node_id": "tok-dist-a",
+  "region": "tokyo",
+  "role": "distributor",
+  "build": {
+    "git": "3f2a9c1d77e0",
+    "git_full": "3f2a9c1d77e0b4c1aa00112233445566778899aa",
+    "dirty": false,
+    "built_unix": 1763900000,
+    "version": "0.1.0"
+  },
+  "process": {
+    "pid": 812,
+    "boot_id": 1763924000123456,
+    "started_unix_ms": 1763924000123,
+    "uptime_ms": 86400,
+    "args_sha256": "9a1f",
+    "cpus": 2,
+    "cpu_permille": 180
+  },
+  "state": "ready",
+  "ready": true,
+  "warm": true,
+  "ready_unix_ms": 1763924006400,
+  "ready_forced": false,
+  "not_ready": [],
+  "drain_reasons": [],
+  "hello_draining": false,
+  "fast_plane": {
+    "threads": 2,
+    "threads_expected": 2,
+    "realtime_threads": 1,
+    "pinned_threads": 2,
+    "received_1s": 4120,
+    "admitted_1s": 4120,
+    "not_admitted_1s": 0,
+    "received_age_ms": 0
+  },
+  "ingest": {
+    "audio_deadline_drops": 0,
+    "video_deadline_drops": 0,
+    "tee_dropped": 0
+  },
+  "parents": [
+    {
+      "address": "172.236.1.10",
+      "id": "lon-dist-a",
+      "path": "primary",
+      "audio_age_ms": 0,
+      "video_age_ms": null,
+      "streams": [
+        {
+          "stream_id": 3001,
+          "track": "opaque-audio",
+          "class": "audio",
+          "source_age_ms": 0,
+          "repair_age_ms": null,
+          "head_object": 5123456,
+          "window_s": 10,
+          "objects_1s": 1000,
+          "objects_10s": 10000,
+          "skipped_10s": 0,
+          "resets_10s": 0,
+          "multi_symbol_10s": 0,
+          "slack_mean_us_1s": 993100,
+          "slack_mean_us_10s": 993000,
+          "slack_min_us_10s": 990800
+        }
+      ]
+    }
+  ],
+  "streams": [
+    {
+      "stream_id": 3001,
+      "class": "audio",
+      "seen_age_ms": 0,
+      "decoded": true,
+      "ingest_age_ms": 1,
+      "head_part": 5123456,
+      "first_part": 5111456,
+      "window_parts": 12001,
+      "warm_parts": 4500
+    }
+  ],
+  "children": {
+    "compiled": [
+      {
+        "target": "139.162.1.5:22200",
+        "lane": "source",
+        "promoted": false
+      }
+    ],
+    "lease": {
+      "children": 3,
+      "pairs": 6,
+      "refused": 0,
+      "pairs_list": [
+        {
+          "child": "10.80.3.21",
+          "stream_id": 3001,
+          "primary": true,
+          "rank": 0,
+          "warm_parts_pending": 0
+        }
+      ],
+      "streams": [
+        {
+          "stream_id": 3001,
+          "children": 3,
+          "fed_age_ms": 0
+        }
+      ]
+    }
+  },
+  "cache_mesh": {
+    "parent_heard_age_ms": 40,
+    "children": 3,
+    "pairs": 6,
+    "subscribed_playlists": 0,
+    "warm_parts_pending": 0
+  },
+  "client_udp": {
+    "subscribers": 120,
+    "hls_sessions": 4,
+    "hls_moved_active": 1,
+    "hls_requests_in_flight": 2,
+    "refusals": 0,
+    "load_permille": 310,
+    "rebalance_moves": 0,
+    "parents_lost": false
+  },
+  "entry": {
+    "caches_fresh": 3,
+    "caches_draining": 0
+  }
+}
