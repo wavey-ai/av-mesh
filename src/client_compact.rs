@@ -1880,6 +1880,11 @@ impl CompactReceiver {
         self.holes.len()
     }
 
+    /// The oldest part this receiver still misses (a hole it NACKs).
+    pub fn lowest_hole(&self) -> Option<u64> {
+        self.holes.keys().next().copied()
+    }
+
     /// Settle the counts of parts and windows older than the settle time:
     /// (datagrams received, datagrams sent) of the originals and copies of
     /// parts and of window repair since the last call. Runs of datagrams

@@ -99,6 +99,13 @@ pub struct SessionConfig {
     /// Drop the short-form parts that come before the edge's `OK`, as
     /// before wave 8 (`false`: kept and read once the `OK` comes).
     pub drop_early_parts: bool,
+    /// Wave 8 local proofs: a move asks the new edge for the oldest part
+    /// still missing here (a hole the old edge never repaired, at most
+    /// MOVE_HOLE_PARTS back), not only for the parts after the newest; the
+    /// new edge serves from the part asked when it holds it (S2). Before
+    /// (`false`) the holes were dropped with the old flow: a killed edge's
+    /// listeners lost the parts it had not repaired (~2 a listener at 1 ms).
+    pub move_from_hole: bool,
     /// Move when the edge does not answer the subscription in this time.
     pub answer: Duration,
     /// Keep the repair that was asked for, whatever the measured loss.
@@ -118,6 +125,10 @@ pub struct SessionConfig {
     pub known_parts: usize,
 }
 
+/// A move asks for a hole at most this many parts before the newest part
+/// (4 s of 1 ms parts; an edge keeps 12 s).
+pub const MOVE_HOLE_PARTS: u64 = 4_096;
+
 impl SessionConfig {
     /// The defaults of `needletail-udp-client` for `stream_id`.
     pub fn new(stream_id: u64) -> Self {
@@ -130,6 +141,7 @@ impl SessionConfig {
             nack_after_drain: true,
             compact_retry: true,
             drop_early_parts: false,
+            move_from_hole: true,
             answer: Duration::from_millis(5_000),
             fixed_repair: false,
             fast_lane: true,
@@ -343,6 +355,18 @@ impl UdpSession {
         now: Instant,
         send: &mut dyn FnMut(SocketAddr, &[u8]),
     ) {
+        // A move: from the oldest hole the old edge left unrepaired.
+        let from_part = match (from_part, self.receiver.compact.lowest_hole()) {
+            (Some(from), Some(hole))
+                if self.config.move_from_hole
+                    && self.target.is_some()
+                    && hole < from
+                    && from - hole <= MOVE_HOLE_PARTS =>
+            {
+                Some(hole)
+            }
+            (from, _) => from,
+        };
         if let Some(old) = self.target {
             if let Some(token) = self.token {
                 send(
@@ -910,6 +934,41 @@ mod tests {
             } else {
                 assert_eq!(got, Some(70_000));
             }
+        }
+    }
+
+    /// Wave 8 local proofs: a listener of a killed edge moves with a hole
+    /// the edge never repaired; the new edge is asked from that hole, not
+    /// from the part after the newest (with the flag off, as before).
+    #[test]
+    fn a_move_asks_the_new_edge_for_the_hole_the_old_edge_left() {
+        for move_from_hole in [true, false] {
+            let now = Instant::now();
+            let config = SessionConfig {
+                move_from_hole,
+                ..SessionConfig::new(3)
+            };
+            let mut session = UdpSession::new(config, now);
+            let mut send = |_: SocketAddr, _: &[u8]| {};
+            session.begin(edge(), None, now, &mut send);
+            let token = Control::Token { stream_id: 3, token: 4 }.encode();
+            session.on_datagram(edge(), &token, now, &mut send);
+            let ok = Control::Subscribed { stream_id: 3, next_part: 100, compact: true }.encode();
+            session.on_datagram(edge(), &ok, now, &mut send);
+            for part in [100_u64, 101, 103, 104] {
+                let long = crate::client_compact::encode_part(part, 0, b"pcm").unwrap();
+                session.on_datagram(edge(), &long, now, &mut send);
+            }
+            while session.next_object().is_some() {}
+            assert_eq!(session.receiver.compact.lowest_hole(), Some(102));
+            let other: SocketAddr = "127.0.0.2:9000".parse().unwrap();
+            session.begin(other, Some(105), now, &mut send);
+            let expected = if move_from_hole { Some(102) } else { Some(105) };
+            assert_eq!(session.from_part, expected, "move_from_hole {move_from_hole}");
+            // A first subscription is not a move: the part asked is kept.
+            let mut fresh = UdpSession::new(SessionConfig::new(3), now);
+            fresh.begin(edge(), Some(105), now, &mut send);
+            assert_eq!(fresh.from_part, Some(105));
         }
     }
 

@@ -197,6 +197,11 @@ struct Args {
     /// as before (`false`: kept, read once the OK comes).
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     drop_early_parts: bool,
+    /// Wave 8 local proofs: a move asks the new edge for the oldest part
+    /// still missing (a hole the old edge never repaired), not only the
+    /// parts after the newest (`false`: as before, those holes are lost).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    move_from_hole: bool,
     #[arg(long)]
     repair_permille: Option<u32>,
     #[arg(long)]
@@ -257,6 +262,7 @@ fn config(args: &Args) -> Result<LoadConfig> {
         nack_after_drain: true,
         compact_retry: args.compact_retry,
         drop_early_parts: args.drop_early_parts,
+        move_from_hole: args.move_from_hole,
         answer: Duration::from_millis(args.answer_ms),
         fixed_repair: args.fixed_repair,
         fast_lane: args.fast_lane,
