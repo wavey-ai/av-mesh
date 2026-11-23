@@ -239,6 +239,10 @@ pub(crate) const DEFAULT_REBALANCE_INTERVAL_MS: u64 = 3_000;
 /// again at once.
 pub(crate) const REBALANCE_MIN_AGE: Duration = Duration::from_secs(10);
 
+/// Wave 9 review: an edge whose rebalance did not lower its load (the load
+/// is not its UDP listeners') plans no round for this long.
+pub(crate) const REBALANCE_PAUSE: Duration = Duration::from_secs(60);
+
 /// Default of `--client-udp-nack-edge-rate`.
 pub(crate) const DEFAULT_NACK_EDGE_RATE: u32 = 20_000;
 
@@ -355,6 +359,9 @@ pub(crate) struct EdgeUdpStats {
     pub rebalance_rounds: AtomicU64,
     pub rebalance_planned: AtomicU64,
     pub rebalance_moves: AtomicU64,
+    /// Wave 9 review: rebalances that did not lower the load (its LL-HLS
+    /// readers' CPU, not its UDP listeners), each followed by a pause.
+    pub rebalance_ineffective: AtomicU64,
 }
 
 /// The subscriber table, for the live gauges.
@@ -3124,6 +3131,9 @@ async fn run_stream_sender(
                 // edge sends some listeners there (a share every tick of
                 // the round). They ask the assignment again without this
                 // edge and resume from their oldest hole at the next.
+                // The share is reserved now, so that the senders of the
+                // edge's other streams do not take it too (wave 9 review);
+                // what this one does not send is handed back.
                 let (due, active) = router.rebalance_due(now).await;
                 if due > 0 {
                     let (leaving, kept) = {
@@ -3149,7 +3159,7 @@ async fn run_stream_sender(
                             None => (Vec::new(), 0),
                         }
                     };
-                    router.rebalance_sent(now, leaving.len());
+                    router.rebalance_sent(now, due, leaving.len());
                     if !leaving.is_empty() {
                         stats
                             .moves
@@ -3474,19 +3484,9 @@ pub(crate) fn rebalance_quota(
     target: u32,
     margin: u32,
 ) -> usize {
-    let mut costs = std::iter::once(own)
-        .chain(others)
-        .filter(|edge| edge.subscribers >= 4 && edge.load_permille > 0)
-        .map(|edge| f64::from(edge.load_permille) / edge.subscribers as f64)
-        .collect::<Vec<_>>();
-    if costs.is_empty() {
+    let Some(k) = rebalance_cost(own, others) else {
         return 0;
-    }
-    costs.sort_by(f64::total_cmp);
-    let k = costs[costs.len() / 2];
-    if k <= 0.0 {
-        return 0;
-    }
+    };
     let target = f64::from(target);
     let margin = f64::from(margin.min(target as u32));
     let own_load = (f64::from(own.load_permille) - recent_shed * k).max(0.0);
@@ -3531,18 +3531,67 @@ pub(crate) fn rebalance_quota(
     share.min(own_excess) as usize
 }
 
+/// What one UDP listener costs an edge (permille), as a rebalance reckons
+/// it: the median of load over subscribers among the edges (this one and
+/// the region's others) with at least 4. `None` without one.
+pub(crate) fn rebalance_cost(own: &RebalanceEdge, others: &[RebalanceEdge]) -> Option<f64> {
+    let mut costs = std::iter::once(own)
+        .chain(others)
+        .filter(|edge| edge.subscribers >= 4 && edge.load_permille > 0)
+        .map(|edge| f64::from(edge.load_permille) / edge.subscribers as f64)
+        .collect::<Vec<_>>();
+    if costs.is_empty() {
+        return None;
+    }
+    costs.sort_by(f64::total_cmp);
+    let k = costs[costs.len() / 2];
+    (k > 0.0).then_some(k)
+}
+
 /// An edge's rebalance rounds (wave 9 C1): when it last planned, the round
-/// in progress (paced as a drain), and what it sent in the last window.
+/// in progress (paced as a drain), what it sent in the last window, and
+/// (wave 9 review) whether its sends lowered its load.
 #[derive(Debug, Default)]
 pub(crate) struct RebalanceState {
     planned_at: Option<Instant>,
     round: Option<DrainPace>,
     shed: VecDeque<(Instant, usize)>,
+    check: Option<RebalanceCheck>,
+    paused_until: Option<Instant>,
+}
+
+/// The load and subscribers when the first round of a rebalance was
+/// planned, what one listener cost then, and what the rounds have sent
+/// since (wave 9 review).
+#[derive(Debug, Clone, Copy)]
+struct RebalanceCheck {
+    load_permille: u32,
+    subscribers: u64,
+    cost: f64,
+    sent: usize,
+    last_sent: Option<Instant>,
+}
+
+/// How a rebalance's sends showed in the edge's load
+/// ([`RebalanceState::judge`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RebalanceVerdict {
+    /// Nothing to judge yet (nothing sent, or the load's window has not
+    /// passed since the last send).
+    Pending,
+    /// The load fell by at least half of what the listeners sent cost.
+    Lowered,
+    /// It did not: the edge's load is not its UDP listeners'. No round is
+    /// planned for [`REBALANCE_PAUSE`].
+    Ineffective,
 }
 
 impl RebalanceState {
     /// Whether a new round is due (and if so, it is now: the caller plans).
     pub(crate) fn take_plan_turn(&mut self, now: Instant, interval: Duration) -> bool {
+        if self.paused_until.is_some_and(|until| now < until) {
+            return false;
+        }
         let due = self
             .planned_at
             .is_none_or(|at| now.saturating_duration_since(at) >= interval);
@@ -3577,14 +3626,84 @@ impl RebalanceState {
             .is_some_and(|round| round.sent < round.initial)
     }
 
-    pub(crate) fn sent(&mut self, now: Instant, count: usize) {
-        if count == 0 {
+    /// Reserve the round's share due now (see [`Self::due`]): another
+    /// stream's sender does not get it too. [`Self::settle`] books what
+    /// was sent and hands back the rest.
+    pub(crate) fn reserve(&mut self, now: Instant, spread: Duration) -> usize {
+        let due = self.due(now, spread);
+        if let Some(round) = self.round.as_mut() {
+            round.sent += due;
+        }
+        due
+    }
+
+    /// `sent` of a reservation of `reserved` went (at `now`).
+    pub(crate) fn settle(&mut self, now: Instant, reserved: usize, sent: usize) {
+        if let Some(round) = self.round.as_mut() {
+            round.sent = round.sent.saturating_sub(reserved.saturating_sub(sent));
+        }
+        if sent == 0 {
             return;
         }
-        if let Some(round) = self.round.as_mut() {
-            round.sent += count;
+        self.shed.push_back((now, sent));
+        if let Some(check) = self.check.as_mut() {
+            check.sent += sent;
+            check.last_sent = Some(now);
         }
-        self.shed.push_back((now, count));
+    }
+
+    /// A round was planned at `load_permille` with `subscribers`, one
+    /// listener costing `cost`: the first since the last judgement starts
+    /// a check of what the sends do to the load.
+    pub(crate) fn begin_check(&mut self, load_permille: u32, subscribers: u64, cost: f64) {
+        if self.check.is_none() {
+            self.check = Some(RebalanceCheck {
+                load_permille,
+                subscribers,
+                cost,
+                sent: 0,
+                last_sent: None,
+            });
+        }
+    }
+
+    /// The load is under the target: no check is open.
+    pub(crate) fn clear_check(&mut self) {
+        self.check = None;
+    }
+
+    /// Whether the sends lowered the load, once the load's `window` has
+    /// passed since the last one: the load expected is the load at the
+    /// check's start plus the change in subscribers (those sent and any
+    /// that came) at the listener's cost; the sends were ineffective if
+    /// the load is more than half their cost above it. Then no round is
+    /// planned for [`REBALANCE_PAUSE`].
+    pub(crate) fn judge(
+        &mut self,
+        now: Instant,
+        window: Duration,
+        load_permille: u32,
+        subscribers: u64,
+    ) -> RebalanceVerdict {
+        let Some(check) = self.check else {
+            return RebalanceVerdict::Pending;
+        };
+        let Some(last) = check.last_sent else {
+            return RebalanceVerdict::Pending;
+        };
+        if check.sent == 0 || now.saturating_duration_since(last) < window {
+            return RebalanceVerdict::Pending;
+        }
+        self.check = None;
+        let expected = f64::from(check.load_permille)
+            + (subscribers as f64 - check.subscribers as f64) * check.cost;
+        if f64::from(load_permille) > expected + check.sent as f64 * check.cost / 2.0 {
+            self.paused_until = Some(now + REBALANCE_PAUSE);
+            self.round = None;
+            RebalanceVerdict::Ineffective
+        } else {
+            RebalanceVerdict::Lowered
+        }
     }
 
     /// What this edge sent away in the last `window`, each weighted by the
@@ -4800,9 +4919,9 @@ mod tests {
         let mut at = start;
         let mut largest = 0;
         while state.active() {
-            let due = state.due(at, spread);
+            let due = state.reserve(at, spread);
             largest = largest.max(due);
-            state.sent(at, due);
+            state.settle(at, due, due);
             sent += due;
             at += DRAIN_TICK;
             assert!(at <= start + spread + DRAIN_TICK, "the round ends with its spread");
@@ -4821,6 +4940,54 @@ mod tests {
         assert!(state.take_plan_turn(start + interval, interval));
         state.start_round(start + interval, 0);
         assert!(!state.active());
+    }
+
+    /// Wave 9 review: two streams' senders cannot take one share (it is
+    /// reserved), what is not sent goes back; and an edge whose sends did
+    /// not lower its load (its load is not its UDP listeners') pauses.
+    #[test]
+    fn a_rebalance_share_is_reserved_and_an_ineffective_one_pauses() {
+        let start = Instant::now();
+        let spread = Duration::from_millis(2_000);
+        let mut state = RebalanceState::default();
+        state.start_round(start, 10);
+        let first = state.reserve(start, spread);
+        assert!(first >= 1);
+        assert_eq!(state.reserve(start, spread), 0, "the other stream's sender");
+        // The first sent one of its share: the rest is due again.
+        state.settle(start, first, 1);
+        assert_eq!(state.reserve(start, spread), first - 1);
+        // A check: 900 permille with 40 listeners at 15 each; 6 sent.
+        let window = Duration::from_secs(10);
+        let mut state = RebalanceState::default();
+        state.begin_check(900, 40, 15.0);
+        state.start_round(start, 6);
+        let due = state.reserve(start + spread, spread);
+        assert_eq!(due, 6);
+        state.settle(start + spread, due, 6);
+        // Before the window has passed: nothing to judge.
+        assert_eq!(
+            state.judge(start + Duration::from_secs(5), window, 900, 34),
+            RebalanceVerdict::Pending
+        );
+        // The load fell by 90 (34 listeners now): lowered.
+        let mut lowered = RebalanceState {
+            check: state.check,
+            ..RebalanceState::default()
+        };
+        assert_eq!(
+            lowered.judge(start + Duration::from_secs(13), window, 812, 34),
+            RebalanceVerdict::Lowered
+        );
+        // It rose to 910 with 3 listeners come since (37): ineffective
+        // (expected 855, more than 45 above it), and no round for a while.
+        assert_eq!(
+            state.judge(start + Duration::from_secs(13), window, 910, 37),
+            RebalanceVerdict::Ineffective
+        );
+        let later = start + Duration::from_secs(14);
+        assert!(!state.take_plan_turn(later, Duration::from_millis(3_000)));
+        assert!(state.take_plan_turn(later + REBALANCE_PAUSE, Duration::from_millis(3_000)));
     }
 
     #[test]

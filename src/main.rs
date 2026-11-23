@@ -14022,6 +14022,8 @@ struct ClientUdpGauges {
     /// over its target and that edge had room (`MOVE rebalance`, wave 9
     /// C1; cumulative).
     rebalance_moves: u64,
+    /// Wave 9 review: rebalances that did not lower the load (paused).
+    rebalance_ineffective: u64,
     /// Measured egress, bits a second, client UDP included.
     egress_observed_bps: u64,
     /// Bytes the client UDP lanes sent, IP and UDP headers included.
@@ -19396,18 +19398,22 @@ impl AppRouter {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .start_round(now, quota);
         }
-        let state = self
+        // The share due now is reserved (wave 9 review): the senders of
+        // the edge's other streams, on other workers, do not get it too.
+        let mut state = self
             .rebalance_state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        (state.due(now, config.spread), state.active())
+        let due = state.reserve(now, config.spread);
+        (due, state.active())
     }
 
-    fn rebalance_sent(&self, now: Instant, count: usize) {
+    /// `sent` listeners of a reserved share of `reserved` were sent away.
+    fn rebalance_sent(&self, now: Instant, reserved: usize, sent: usize) {
         self.rebalance_state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .sent(now, count);
+            .settle(now, reserved, sent);
     }
 
     /// A round's quota from the region as this edge sees it now.
@@ -19419,6 +19425,12 @@ impl AppRouter {
             subscribers: self.edge_udp_stats.live_subscribers().unwrap_or(0),
         };
         if own.subscribers == 0 || own.load_permille <= config.target_permille {
+            // Under the target (or nothing to move): a rebalance's check
+            // is done.
+            self.rebalance_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear_check();
             return 0;
         }
         let snapshots = self.regional_snapshots().await;
@@ -19443,18 +19455,39 @@ impl AppRouter {
             })
             .collect::<Vec<_>>();
         let window = Duration::from_secs(egress.window_seconds.max(1));
-        let recent = self
+        let mut state = self
             .rebalance_state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .recent_shed(now, window);
-        edge_udp::rebalance_quota(
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Wave 9 review: sends that did not lower the load (an edge whose
+        // load is its LL-HLS readers' CPU) are not repeated round after
+        // round until it has no UDP listener left.
+        if state.judge(now, window, own.load_permille, own.subscribers)
+            == edge_udp::RebalanceVerdict::Ineffective
+        {
+            self.edge_udp_stats
+                .rebalance_ineffective
+                .fetch_add(1, Ordering::Relaxed);
+            info!(
+                load_permille = own.load_permille,
+                "edge rebalance did not lower its load: paused"
+            );
+            return 0;
+        }
+        let recent = state.recent_shed(now, window);
+        let quota = edge_udp::rebalance_quota(
             &own,
             recent,
             &others,
             config.target_permille,
             config.margin_permille,
-        )
+        );
+        if quota > 0 {
+            if let Some(cost) = edge_udp::rebalance_cost(&own, &others) {
+                state.begin_check(own.load_permille, own.subscribers, cost);
+            }
+        }
+        quota
     }
 
     fn with_client_udp_port(mut self, port: Option<u16>) -> Self {
@@ -19764,6 +19797,7 @@ impl AppRouter {
             load_permille: egress.load_permille,
             cpu_permille: egress.cpu_permille,
             rebalance_moves: stats.rebalance_moves.load(Ordering::Relaxed),
+            rebalance_ineffective: stats.rebalance_ineffective.load(Ordering::Relaxed),
             egress_observed_bps: egress.observed_bps,
             egress_wire_bytes: stats.egress_wire_bytes(),
             load_refusals: stats.load_refusals.load(Ordering::Relaxed),
