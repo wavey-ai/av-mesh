@@ -1335,24 +1335,27 @@ async fn a_parent_delayed_by_4_ms_shows_4_ms_less_slack() {
     let parts = 120_u64;
     let deadline = now_unix_us() + 20_000_000;
     // What the second parent's copies were really behind by, in all: a
-    // sleep of 4 ms is never shorter and often a little longer.
+    // sleep of 4 ms is never shorter and often a little longer, and the
+    // runtime can hold either send. An object's slack is taken when its
+    // first symbol arrives, so each parent's time is stamped as soon as its
+    // first symbol has left.
     let mut behind_us = 0_u64;
+    async fn send_all(socket: &UdpSocket, to: SocketAddr, symbols: &[Vec<u8>]) -> u64 {
+        let mut first_sent_us = 0;
+        for symbol in symbols {
+            socket.send_to(symbol, to).await.unwrap();
+            if first_sent_us == 0 {
+                first_sent_us = now_unix_us();
+            }
+        }
+        first_sent_us
+    }
     for sequence in 0..parts {
         let symbols = fast_audio_symbols(4001, sequence, deadline);
-        let sent = now_unix_us();
-        for symbol in &symbols {
-            prompt
-                .send_to(symbol, SocketAddr::from((edge_ip, ports[0])))
-                .await
-                .unwrap();
-        }
+        let prompt_us = send_all(&prompt, SocketAddr::from((edge_ip, ports[0])), &symbols).await;
         tokio::time::sleep(Duration::from_millis(4)).await;
-        behind_us += now_unix_us() - sent;
-        for symbol in &symbols {
-            late.send_to(symbol, SocketAddr::from((edge_ip, ports[1])))
-                .await
-                .unwrap();
-        }
+        let late_us = send_all(&late, SocketAddr::from((edge_ip, ports[1])), &symbols).await;
+        behind_us += late_us - prompt_us;
     }
     let behind_us = i64::try_from(behind_us / parts).unwrap();
     assert!(behind_us >= 4_000, "{behind_us}");
