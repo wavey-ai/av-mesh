@@ -19,6 +19,7 @@ pub mod demand;
 pub mod edge_clients;
 pub mod lease;
 pub mod loss_report;
+pub mod parent_feeds;
 pub mod relay;
 pub mod sys;
 pub mod view;

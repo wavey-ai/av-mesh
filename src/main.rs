@@ -8448,6 +8448,8 @@ struct LiveTsCache {
     stream_classes: fast_plane::StreamClasses,
     /// The counters of the fast plane, when the relay ingest runs on it.
     fast_plane: OnceLock<Arc<fast_plane::relay::FastPlaneStats>>,
+    /// What each parent delivers on the fast plane (`GET /api/node`).
+    parent_feeds: OnceLock<Arc<fast_plane::parent_feeds::ParentFeeds>>,
 }
 
 impl LiveTsCache {
@@ -8579,6 +8581,7 @@ impl LiveTsCache {
             hop_journal: OnceLock::new(),
             stream_classes: fast_plane::StreamClasses::default(),
             fast_plane: OnceLock::new(),
+            parent_feeds: OnceLock::new(),
         })
     }
 
@@ -8588,6 +8591,16 @@ impl LiveTsCache {
 
     fn set_fast_plane_stats(&self, stats: Arc<fast_plane::relay::FastPlaneStats>) {
         let _ = self.fast_plane.set(stats);
+    }
+
+    fn set_parent_feeds(&self, feeds: Arc<fast_plane::parent_feeds::ParentFeeds>) {
+        let _ = self.parent_feeds.set(feeds);
+    }
+
+    /// The feed records of the fast plane, when the relay ingest runs on it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn parent_feeds(&self) -> Option<&Arc<fast_plane::parent_feeds::ParentFeeds>> {
+        self.parent_feeds.get()
     }
 
     /// A playlist render reads only the slots written since the last one

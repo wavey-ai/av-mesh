@@ -11,6 +11,7 @@ use super::demand::{NodeDemand, DEMAND_REPORT_INTERVAL};
 use super::edge_clients::{ClientPlan, ClientSender, EdgeFastLane, UpstreamRepair};
 use super::lease::{LeaseChildren, LeaseSnapshot, LeaseSnapshotStats, LeaseTake};
 use super::loss_report::{decode_ledger, LossMeter};
+use super::parent_feeds::ParentFeeds;
 use super::sys::{self, RecvBatch, RECV_BATCH};
 use super::view::RlsView;
 use super::{class_addr, StreamClasses, TrafficClass};
@@ -940,6 +941,8 @@ struct ClassThread {
     demand_peers: Arc<[SocketAddr]>,
     lease_descriptors: bool,
     video_gro: bool,
+    /// What each parent delivers, for `GET /api/node` (see `parent_feeds`).
+    feeds: Arc<ParentFeeds>,
 }
 
 /// Wave 9 (cold start): each stream's last whole one-symbol audio part
@@ -1417,6 +1420,7 @@ impl ClassThread {
                 continue;
             }
             self.failover.observe(path, view.role, now);
+            self.feeds.observe(peer.ip(), &view, rx_us);
             let key = dedup.key(
                 view.tenant,
                 view.stream,
@@ -1973,6 +1977,8 @@ pub async fn run_relay_class_ingest(
         let _ = stats.lease.set(Arc::clone(lease));
     }
     cache.set_fast_plane_stats(Arc::clone(&stats));
+    let feeds = Arc::new(ParentFeeds::default());
+    cache.set_parent_feeds(Arc::clone(&feeds));
     let admissions = Arc::new(dispatch.peer_admissions());
     let mut demand_peers: Vec<SocketAddr> = admissions
         .keys()
@@ -2038,6 +2044,7 @@ pub async fn run_relay_class_ingest(
             demand_peers: Arc::clone(&demand_peers),
             lease_descriptors: config.lease_descriptors,
             video_gro: config.video_gro,
+            feeds: Arc::clone(&feeds),
         };
         match std::thread::Builder::new()
             .name(format!("needletail-fast-{}", class.as_str()))
@@ -2090,6 +2097,11 @@ pub async fn run_relay_class_ingest(
         expire,
         shutdown_rx.clone(),
     ));
+    let sampler = tokio::spawn(crate::fast_control::run_parent_feeds_sampler(
+        feeds,
+        Arc::clone(&stats),
+        shutdown_rx.clone(),
+    ));
     let controller = failover_controller.map(|controller| {
         tokio::spawn(crate::fast_control::run_failover_controller(
             controller,
@@ -2128,6 +2140,7 @@ pub async fn run_relay_class_ingest(
         }
     }
     housekeeping.abort();
+    sampler.abort();
     stop.store(true, Ordering::Relaxed);
     join_threads(threads).await;
     // With the threads gone the tees' channels close and they end.
@@ -2140,6 +2153,7 @@ pub async fn run_relay_class_ingest(
         let _ = controller.await;
     }
     let _ = housekeeping.await;
+    let _ = sampler.await;
     if result.is_ok() {
         cache.rotate_if_due(true).await?;
     }
