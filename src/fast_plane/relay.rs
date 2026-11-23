@@ -1793,8 +1793,6 @@ impl Tee {
         video_kind: bool,
     ) {
         let peer = item.peer;
-        // The upstream repair of the stream's objects, for the fast lane's
-        // top-up.
         // The symbol's header, read again in place, for the fast lane's
         // top-up (the upstream repair of the stream's objects) and the hole
         // trigger.
@@ -1848,8 +1846,13 @@ impl Tee {
                 match commit_relay_object(&self.cache, *object, envelope).await {
                     // Another copy came first (the cache mesh, or the other
                     // form of the part): its clients and the journal have
-                    // it. The parent is live all the same.
+                    // it. The parent is live all the same, and the stream
+                    // commits canonical slots all the same: the fast lane
+                    // serves it even while the cache mesh wins every part.
                     Ok(Committed::AlreadyPresent(_)) => {
+                        if let (Some((lane, stream_id)), true) = (fast_lane, media) {
+                            lane.mark_committed(stream_id, canonical);
+                        }
                         self.failover.stamp(&self.failover.decoded, Instant::now());
                     }
                     // Counted and logged by the cache; the first copy stays.

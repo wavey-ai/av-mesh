@@ -116,7 +116,10 @@ async fn a_conflict_keeps_the_first_copy_and_is_counted() {
             Committed::Refused(CommitRefusal::IdentityConflict)
         );
     }
-    assert_eq!(cache.get_part_for_stream_id(STREAM, 0).await.unwrap().0, stored);
+    assert_eq!(
+        cache.get_part_for_stream_id(STREAM, 0).await.unwrap().0,
+        stored
+    );
     assert_eq!(epoch(&cache), first_epoch);
     let snapshot = cache.relay_ingress_snapshot();
     assert_eq!(snapshot.canonical_conflicts, 10);
@@ -277,4 +280,39 @@ async fn a_warm_source_ages_on_the_local_clock() {
     let snapshot = forwarder.snapshot();
     assert_eq!(snapshot.warm_source_expired_datagrams, 1);
     assert_eq!(snapshot.warm_source_buffered_datagrams, 1);
+}
+
+/// The cache mesh can write a part before the fast plane's copy of it
+/// decodes (a lease's warm-up window, a slower parent). The tee's commit
+/// then finds it present, and the stream is still marked as committing
+/// canonical slots: the edge's fast lane serves it even while the mesh wins
+/// every part.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_part_the_cache_mesh_wrote_first_still_turns_the_fast_lane_on() {
+    let edge = super::fast_lane::LaneEdge::start(super::fast_lease::loopback(11)).await;
+    let part = opaque_part(0, 1, &[7; 120]);
+    assert_eq!(
+        edge.cache
+            .commit_stream_payload(STREAM, part.clone())
+            .await
+            .unwrap(),
+        Committed::Stored(0)
+    );
+    assert!(!edge.lane.is_eligible(STREAM));
+    let symbols = fast_test_symbols(
+        &part,
+        relay_session::MediaPriority::Audio,
+        400,
+        48,
+        0,
+        now_unix_us() + 10_000_000,
+    );
+    edge.send(false, &symbols, false).await;
+    super::fast_lease::wait_until("the tee decodes the part", || {
+        edge.cache.relay_ingress_snapshot().decoded_objects >= 1
+    })
+    .await;
+    assert!(edge.lane.is_eligible(STREAM));
+    assert!(hop_events(&edge.cache, HopStage::RelayDecoded, STREAM).is_empty());
+    edge.stop().await;
 }
