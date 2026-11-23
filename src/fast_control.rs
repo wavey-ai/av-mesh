@@ -254,3 +254,39 @@ pub(crate) async fn run_failover_controller(
         }
     }
 }
+
+/// Read and count whatever arrives on the lease sockets (wave 8 review,
+/// F-I1). They only send; a datagram sent to them (an edge's demand or loss
+/// report to its lease parent) queued in their receive buffers until the
+/// kernel dropped it, counted as UdpRcvbufErrors, which hid any real drop.
+/// One task for each socket of the pair (SO_REUSEPORT spreads what arrives
+/// over both).
+pub(crate) fn spawn_lease_inbound_drain(
+    lease: &Arc<LeaseChildren>,
+    shutdown_rx: watch::Receiver<()>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    lease
+        .inbound_sockets()
+        .into_iter()
+        .filter_map(|socket| tokio::net::UdpSocket::from_std(socket).ok())
+        .map(|socket| {
+            let lease = Arc::clone(lease);
+            let mut shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0_u8; 2_048];
+                loop {
+                    tokio::select! {
+                        _ = shutdown.changed() => return,
+                        received = socket.recv_from(&mut buf) => {
+                            if received.is_ok() {
+                                lease.stats.inbound.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
+                        }
+                    }
+                }
+            })
+        })
+        .collect()
+}

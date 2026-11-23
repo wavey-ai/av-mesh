@@ -307,6 +307,9 @@ pub struct LeaseStats {
     pub promotions: AtomicU64,
     pub demotions: AtomicU64,
     pub commands_rejected: AtomicU64,
+    /// Datagrams read (and dropped) from the lease sockets, which only send
+    /// (`--relay-lease-drain-inbound`, wave 8 review F-I1).
+    pub inbound: AtomicU64,
 }
 
 /// The lease children of a forwarder: their snapshot, their send sockets,
@@ -387,6 +390,20 @@ impl LeaseChildren {
 
     pub fn local_addr(&self) -> SocketAddr {
         self.config.bind
+    }
+
+    /// Copies of the lease sockets for a reader of what arrives on them
+    /// (`crate::fast_control::spawn_lease_inbound_drain`): they only send.
+    pub fn inbound_sockets(&self) -> Vec<std::net::UdpSocket> {
+        self.sockets
+            .iter()
+            .filter_map(|socket| {
+                socket
+                    .try_clone()
+                    .map_err(|error| warn!(error = %error, "lease socket not drained"))
+                    .ok()
+            })
+            .collect()
     }
 
     pub fn fd(&self, class: TrafficClass) -> RawFd {
@@ -634,6 +651,7 @@ pub struct LeaseSnapshotStats {
     pub promotions: u64,
     pub demotions: u64,
     pub commands_rejected: u64,
+    pub inbound: u64,
 }
 
 impl LeaseStats {
@@ -657,6 +675,7 @@ impl LeaseStats {
             promotions: load(&self.promotions),
             demotions: load(&self.demotions),
             commands_rejected: load(&self.commands_rejected),
+            inbound: load(&self.inbound),
         }
     }
 }
@@ -717,6 +736,32 @@ mod tests {
 
     fn lease(max_children: usize, primary: &[&str]) -> Arc<LeaseChildren> {
         lease_with(max_children, primary, true)
+    }
+
+    /// Wave 8 review (F-I1): what arrives at the lease sockets (an edge's
+    /// demand report to its lease parent) is read and counted, not left to
+    /// fill their receive buffers.
+    #[tokio::test]
+    async fn what_arrives_at_the_lease_sockets_is_read_and_counted() {
+        let lease = lease(16, &[]);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let tasks = crate::fast_control::spawn_lease_inbound_drain(&lease, shutdown_rx);
+        assert_eq!(tasks.len(), 2);
+        let child = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        for _ in 0..20 {
+            child.send_to(b"RLD1....", lease.local_addr()).unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while lease.stats.snapshot().inbound < 20 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("every datagram read");
+        let _ = shutdown_tx.send(());
+        for task in tasks {
+            task.await.unwrap();
+        }
     }
 
     #[test]

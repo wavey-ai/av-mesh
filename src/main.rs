@@ -1420,6 +1420,34 @@ struct Args {
     )]
     relay_demand_report: bool,
 
+    /// Wave 8 review (F-I1): an edge, or a forwarder slot
+    /// (--cache-mesh-upstream-demand), sends RLD1 demand reports to its
+    /// relay parents too. Their parents are lease parents, whose
+    /// --relay-lease-bind sockets only send: the reports queued there until
+    /// the kernel dropped them (the referee's UdpRcvbufErrors at every
+    /// dist-a), and a lease parent knows its children's demand from their
+    /// cache-mesh leases anyway. `false` (default): only a node whose relay
+    /// parents are compiled (long-haul) parents reports.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_DEMAND_REPORT_LEASE_PARENTS",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    relay_demand_report_lease_parents: bool,
+
+    /// Wave 8 review (F-I1): a forwarder reads and counts whatever arrives
+    /// on its --relay-lease-bind sockets (fast_plane.lease_children.inbound
+    /// in /api/stats), so that nothing queues there. `false`: nothing reads
+    /// them, as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_LEASE_DRAIN_INBOUND",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_lease_drain_inbound: bool,
+
     /// Datagrams each class's tee holds before the fast plane drops its tee
     /// copy (counted as tee_dropped; forwarding is never held back).
     #[arg(
@@ -1531,12 +1559,17 @@ struct Args {
     /// the first child port), any other rank its secondary. So an edge's
     /// fast-plane parents follow its ranking of the live distributors,
     /// stream by stream, a joining distributor slot included. A lease
-    /// without a rank keeps --relay-lease-primary-children. `false`: the
-    /// fixed list decides, as before.
+    /// without a rank keeps --relay-lease-primary-children. `false`
+    /// (default): the fixed list decides, as before. Off by default (wave 8
+    /// review): an edge's failover controller watches its primary socket,
+    /// not each parent, and promotes its one configured secondary, so with
+    /// the ranked rule a killed rank-0 parent left its streams' video as
+    /// repair alone for 2-3.7 s (another parent's rank-0 streams kept the
+    /// socket busy). Audio goes in full to every lease child either way.
     #[arg(
         long,
         env = "NEEDLETAIL_RELAY_LEASE_RANKED",
-        default_value_t = true,
+        default_value_t = false,
         action = clap::ArgAction::Set
     )]
     relay_lease_ranked: bool,
@@ -1731,11 +1764,15 @@ struct Args {
     /// doubles the primary silence that the next one needs (at most 8 times
     /// --relay-primary-silence-ms); a promotion that waits is counted
     /// (deferred_promotions). The first promotion is as fast as before.
-    /// `false`: every silence promotes, as before.
+    /// `false` (default): every silence promotes, as before. Off by default
+    /// (wave 8 review): S6 turned out not to be a repair storm, the backoff
+    /// was never measured in a lab, and the referee's London pattern (three
+    /// stalls of 568-695 ms in 30 s) would leave the third one, which needs
+    /// 1 s of silence, as a whole video gap.
     #[arg(
         long,
         env = "NEEDLETAIL_RELAY_FAILOVER_PROMOTION_BACKOFF",
-        default_value_t = true,
+        default_value_t = false,
         action = clap::ArgAction::Set
     )]
     relay_failover_promotion_backoff: bool,
@@ -2610,6 +2647,19 @@ struct Args {
     )]
     cache_mesh_avoid_draining_parents: bool,
 
+    /// Wave 8 review: when more live distributors than the two parents
+    /// asked are ranked (a slot joined), a new subscription asks its second
+    /// parent for the warm-up window too: a slot ranked first holds a new
+    /// playlist only from its own subscription on. With two distributors,
+    /// only the first parent, as before. `false`: only the first always.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CACHE_MESH_WARM_SECOND_PARENT",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    cache_mesh_warm_second_parent: bool,
+
     /// Wave 8 stage 5 (AM 13): a cache whose copy of a playlist is more
     /// than this many parts behind the newest copy in the region is
     /// stalled for it and takes no reader of it. Zero (the default) turns
@@ -3276,6 +3326,7 @@ async fn main() -> Result<()> {
         .with_subscribe_rank(args.cache_mesh_subscribe_rank)
         .with_release_unranked_parents(args.cache_mesh_release_unranked_parents)
         .with_avoid_draining_parents(args.cache_mesh_avoid_draining_parents)
+        .with_warm_from_second_parent(args.cache_mesh_warm_second_parent)
         .with_socket_buffer_bytes(if args.cache_mesh_socket_buffer_bytes > 0 {
             args.cache_mesh_socket_buffer_bytes
         } else {
@@ -3617,7 +3668,7 @@ async fn main() -> Result<()> {
     // a first forwarder without groups must still pass its long-haul
     // children's demand to a contributor that has them.
     let mut demand_tasks = Vec::new();
-    let reports_demand = args.relay_demand_report && args.relay_controlled_local;
+    let reports_demand = reports_relay_demand(&args, cache_mesh_role, upstream_demand);
     if let Some(forwarder) = &relay_forwarder {
         if forwarder.demand_groups().is_some() || reports_demand {
             demand_tasks.extend(forwarder.spawn_demand_readers());
@@ -5123,6 +5174,12 @@ async fn start_lease_children(
         Arc::clone(mesh),
         shutdown_rx.clone(),
     ))];
+    if args.relay_lease_drain_inbound {
+        tasks.extend(fast_control::spawn_lease_inbound_drain(
+            &lease,
+            shutdown_rx.clone(),
+        ));
+    }
     if let Some(failover_bind) = args.relay_lease_failover_bind {
         let socket = UdpSocket::bind(failover_bind).await.with_context(|| {
             format!("failed to bind the lease children's failover listener on {failover_bind}")
@@ -15034,6 +15091,17 @@ fn datagram_load_bytes(capacity_bps: u64, datagram_capacity: u64) -> u64 {
         return 0;
     }
     (capacity_bps / 8 / datagram_capacity).max(1)
+}
+
+/// Whether a node sends its relay parents RLD1 demand reports (wave 7 item
+/// 5): with class threads, and, unless --relay-demand-report-lease-parents,
+/// only when its relay parents are compiled ones: an edge's and a forwarder
+/// slot's are lease parents, which never read them (wave 8 review, F-I1).
+fn reports_relay_demand(args: &Args, role: CacheMeshRole, upstream_demand: bool) -> bool {
+    let lease_parents_only = role == CacheMeshRole::Edge || upstream_demand;
+    args.relay_demand_report
+        && args.relay_controlled_local
+        && (args.relay_demand_report_lease_parents || !lease_parents_only)
 }
 
 /// Session ids of the ranked lease parents: after the configured parents'
@@ -31830,16 +31898,16 @@ mod tests {
     }
 
     #[test]
-    fn the_failover_promotion_backoff_defaults_on_and_can_be_turned_off() {
+    fn the_failover_promotion_backoff_defaults_off_and_can_be_turned_on() {
         let args = Args::try_parse_from(["av-mesh"]).unwrap();
-        assert!(args.relay_failover_promotion_backoff);
+        assert!(!args.relay_failover_promotion_backoff);
         let args = Args::try_parse_from([
             "av-mesh",
             "--relay-failover-promotion-backoff",
-            "false",
+            "true",
         ])
         .unwrap();
-        assert!(!args.relay_failover_promotion_backoff);
+        assert!(args.relay_failover_promotion_backoff);
     }
 
     #[tokio::test]
@@ -35851,7 +35919,9 @@ mod tests {
     #[test]
     fn the_stage5_forwarder_flags_default_on_and_can_be_turned_off() {
         let args = Args::try_parse_from(["av-mesh"]).unwrap();
-        assert!(args.relay_lease_ranked);
+        // Off by default (wave 8 review: video failover).
+        assert!(!args.relay_lease_ranked);
+        assert!(args.cache_mesh_warm_second_parent);
         assert!(args.relay_ranked_parents);
         assert!(!args.cache_mesh_upstream_demand);
         assert!(args.cache_mesh_subscribe_rank);
@@ -35865,6 +35935,8 @@ mod tests {
         let args = Args::try_parse_from([
             "av-mesh",
             "--relay-lease-ranked",
+            "true",
+            "--cache-mesh-warm-second-parent",
             "false",
             "--relay-ranked-parents",
             "false",
@@ -35882,7 +35954,8 @@ mod tests {
             "400",
         ])
         .unwrap();
-        assert!(!args.relay_lease_ranked);
+        assert!(args.relay_lease_ranked);
+        assert!(!args.cache_mesh_warm_second_parent);
         assert!(!args.relay_ranked_parents);
         assert!(args.cache_mesh_upstream_demand);
         assert!(!args.cache_mesh_subscribe_rank);
@@ -35910,6 +35983,25 @@ mod tests {
         let args = Args::try_parse_from(["av-mesh", "--client-udp-datagram-capacity", "400000"])
             .unwrap();
         assert_eq!(args.client_udp_datagram_capacity, 400_000);
+    }
+
+    /// Wave 8 review (F-I1): edges and forwarder slots send no RLD1 to
+    /// their lease parents; a distributor with compiled parents does.
+    #[test]
+    fn only_a_node_with_compiled_relay_parents_reports_demand() {
+        let args = |extra: &[&str]| {
+            let mut argv = vec!["av-mesh", "--relay-controlled-local"];
+            argv.extend_from_slice(extra);
+            Args::try_parse_from(argv).unwrap()
+        };
+        let plain = args(&[]);
+        assert!(!reports_relay_demand(&plain, CacheMeshRole::Edge, false));
+        assert!(!reports_relay_demand(&plain, CacheMeshRole::Distributor, true));
+        assert!(reports_relay_demand(&plain, CacheMeshRole::Distributor, false));
+        let before = args(&["--relay-demand-report-lease-parents", "true"]);
+        assert!(reports_relay_demand(&before, CacheMeshRole::Edge, false));
+        let off = args(&["--relay-demand-report", "false"]);
+        assert!(!reports_relay_demand(&off, CacheMeshRole::Distributor, false));
     }
 
     /// AM 12: an edge admits every distributor of its region (its
