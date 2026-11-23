@@ -184,6 +184,10 @@ pub fn bind_class_sockets(
 #[derive(Debug, Default)]
 pub struct FastPlaneStats {
     pub received: [AtomicU64; 2],
+    /// Receive batches (one `recvmmsg` that returned datagrams) per class:
+    /// received / batches is what a wake-up reads, and what a send can join
+    /// (UDP GSO joins a child's symbols of one batch only).
+    pub batches: [AtomicU64; 2],
     pub forwarded: [AtomicU64; 2],
     pub duplicates: AtomicU64,
     pub not_admitted: AtomicU64,
@@ -194,6 +198,10 @@ pub struct FastPlaneStats {
     pub truncated: AtomicU64,
     /// Datagrams the kernel dropped on a full receive queue (SO_RXQ_OVFL).
     pub kernel_dropped: AtomicU64,
+    /// The same by socket: [class][path] (audio, video; primary, secondary),
+    /// so that a full queue names its lane (wave 8: the referee's 4K losses
+    /// were at one socket of each node, the secondary's video).
+    pub kernel_dropped_lanes: [[AtomicU64; 2]; 2],
     pub realtime_threads: AtomicU64,
     pub pinned_threads: AtomicU64,
     pub threads: AtomicU64,
@@ -228,6 +236,8 @@ pub struct FastPlaneSnapshot {
     pub pinned_threads: u64,
     pub audio_received: u64,
     pub video_received: u64,
+    pub audio_batches: u64,
+    pub video_batches: u64,
     pub audio_forwarded: u64,
     pub video_forwarded: u64,
     pub duplicates: u64,
@@ -238,6 +248,10 @@ pub struct FastPlaneSnapshot {
     pub send_errors: u64,
     pub truncated: u64,
     pub kernel_dropped: u64,
+    pub audio_primary_kernel_dropped: u64,
+    pub audio_secondary_kernel_dropped: u64,
+    pub video_primary_kernel_dropped: u64,
+    pub video_secondary_kernel_dropped: u64,
     pub gso_datagrams: u64,
     pub gso_messages: u64,
     pub gso_fallbacks: u64,
@@ -259,6 +273,8 @@ impl FastPlaneStats {
             pinned_threads: load(&self.pinned_threads),
             audio_received: load(&self.received[0]),
             video_received: load(&self.received[1]),
+            audio_batches: load(&self.batches[0]),
+            video_batches: load(&self.batches[1]),
             audio_forwarded: load(&self.forwarded[0]),
             video_forwarded: load(&self.forwarded[1]),
             duplicates: load(&self.duplicates),
@@ -269,6 +285,10 @@ impl FastPlaneStats {
             send_errors: load(&self.send_errors),
             truncated: load(&self.truncated),
             kernel_dropped: load(&self.kernel_dropped),
+            audio_primary_kernel_dropped: load(&self.kernel_dropped_lanes[0][0]),
+            audio_secondary_kernel_dropped: load(&self.kernel_dropped_lanes[0][1]),
+            video_primary_kernel_dropped: load(&self.kernel_dropped_lanes[1][0]),
+            video_secondary_kernel_dropped: load(&self.kernel_dropped_lanes[1][1]),
             gso_datagrams: load(&self.gso_datagrams),
             gso_messages: load(&self.gso_messages),
             gso_fallbacks: load(&self.gso_fallbacks),
@@ -1061,16 +1081,11 @@ impl ClassThread {
             .filter(|(_, snapshot)| !snapshot.streams.is_empty());
         clients.clear();
         self.stats.received[class.index()].fetch_add(batch.len() as u64, Ordering::Relaxed);
+        self.stats.batches[class.index()].fetch_add(1, Ordering::Relaxed);
         for message in 0..batch.len() {
             let received = batch.get(message);
             if let Some(dropped) = received.dropped {
-                if dropped != *kernel_dropped {
-                    self.stats.kernel_dropped.fetch_add(
-                        u64::from(dropped.wrapping_sub(*kernel_dropped)),
-                        Ordering::Relaxed,
-                    );
-                    *kernel_dropped = dropped;
-                }
+                record_kernel_drops(&self.stats, class, path, kernel_dropped, dropped);
             }
             if received.truncated {
                 self.stats.truncated.fetch_add(1, Ordering::Relaxed);
@@ -1228,6 +1243,29 @@ impl ClassThread {
             }
         }
     }
+}
+
+/// Count what a socket's receive queue dropped since `last` (the socket's
+/// SO_RXQ_OVFL counter as its last datagram carried it): in all, and for the
+/// socket's lane.
+fn record_kernel_drops(
+    stats: &FastPlaneStats,
+    class: TrafficClass,
+    path: RelayIngressParentPath,
+    last: &mut u32,
+    dropped: u32,
+) {
+    if dropped == *last {
+        return;
+    }
+    let more = u64::from(dropped.wrapping_sub(*last));
+    stats.kernel_dropped.fetch_add(more, Ordering::Relaxed);
+    let lane = match path {
+        RelayIngressParentPath::Primary => 0,
+        RelayIngressParentPath::Secondary => 1,
+    };
+    stats.kernel_dropped_lanes[class.index()][lane].fetch_add(more, Ordering::Relaxed);
+    *last = dropped;
 }
 
 /// `relay_woken`: when the class thread read the part's first symbol off its
@@ -1827,5 +1865,51 @@ fn tee_ended(ended: Result<(TrafficClass, Result<()>), tokio::task::JoinError>) 
             error.context(format!("the fast-plane {} tee failed", class.as_str()))
         }
         Err(error) => anyhow::anyhow!("a fast-plane tee ended: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_socket_drop_counts_in_all_and_for_its_lane() {
+        let stats = FastPlaneStats::default();
+        let mut video_secondary = 0_u32;
+        let mut audio_primary = 0_u32;
+        // The counter a socket's datagrams carry: 7 dropped, then 7 again
+        // (nothing new), then 10.
+        for dropped in [7, 7, 10] {
+            record_kernel_drops(
+                &stats,
+                TrafficClass::Video,
+                RelayIngressParentPath::Secondary,
+                &mut video_secondary,
+                dropped,
+            );
+        }
+        record_kernel_drops(
+            &stats,
+            TrafficClass::Audio,
+            RelayIngressParentPath::Primary,
+            &mut audio_primary,
+            2,
+        );
+        // The kernel's counter wraps.
+        let mut wrapping = u32::MAX - 1;
+        record_kernel_drops(
+            &stats,
+            TrafficClass::Video,
+            RelayIngressParentPath::Primary,
+            &mut wrapping,
+            1,
+        );
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.video_secondary_kernel_dropped, 10);
+        assert_eq!(snapshot.audio_primary_kernel_dropped, 2);
+        assert_eq!(snapshot.video_primary_kernel_dropped, 3);
+        assert_eq!(snapshot.audio_secondary_kernel_dropped, 0);
+        assert_eq!(snapshot.kernel_dropped, 15);
+        assert_eq!(wrapping, 1);
     }
 }

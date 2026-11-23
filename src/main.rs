@@ -36127,6 +36127,34 @@ mod tests {
         fn stats(&self) -> fast_plane::relay::FastPlaneSnapshot {
             self.cache.relay_ingress_snapshot().fast_plane
         }
+
+        /// The counters once `done` holds of them (or after 3 s): the
+        /// snapshot is the one the tee published last, which may lag the
+        /// class threads' sends that a child already received.
+        async fn settled_stats(
+            &self,
+            done: impl Fn(&fast_plane::relay::FastPlaneSnapshot) -> bool,
+        ) -> fast_plane::relay::FastPlaneSnapshot {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let stats = self.stats();
+                if done(&stats) || Instant::now() >= deadline {
+                    return stats;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    }
+
+    /// The fewest UDP GSO messages that carry `datagrams` to one child when
+    /// they arrive in `batches` receive batches: a child's symbols of one
+    /// batch join in runs of equal size ([`fast_plane::sys::gso_runs`]), so
+    /// each batch adds at most one run to the runs of the whole sequence.
+    fn gso_message_bound(datagrams: &[Vec<u8>], batches: u64) -> u64 {
+        let target: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        fast_plane::sys::gso_runs(datagrams.len(), |index| (datagrams[index].len(), target)).len()
+            as u64
+            + batches
     }
 
     /// Two sockets on ports `offset` apart, for a child that takes both
@@ -36840,11 +36868,18 @@ mod tests {
         );
         assert_eq!(second, sources, "a source child has every source in order");
         wait_for_part(&relay.cache, 1, 0).await;
-        let stats = relay.stats();
-        assert_eq!(
-            stats.video_forwarded,
-            (symbols.len() + sources.len()) as u64
-        );
+        let forwarded = (symbols.len() + sources.len()) as u64;
+        let stats = relay
+            .settled_stats(|stats| stats.video_forwarded >= forwarded)
+            .await;
+        assert_eq!(stats.video_forwarded, forwarded);
+        if stats.gso_messages > 0 {
+            // Each child's symbols of a receive batch in as few messages as
+            // their sizes allow, however the batches fell.
+            let bound = gso_message_bound(&symbols, stats.video_batches)
+                + gso_message_bound(&sources, stats.video_batches);
+            assert!(stats.gso_messages <= bound, "bound {bound}: {stats:?}");
+        }
         relay.stop().await;
         stats
     }
@@ -36855,11 +36890,16 @@ mod tests {
         if with_gso.gso_fallbacks == 0 {
             assert_eq!(with_gso.gso_datagrams, with_gso.video_forwarded);
             // About 64 symbols a message: a handful of passes through the
-            // stack instead of one for each of hundreds of symbols.
-            assert!(
-                with_gso.gso_messages * 8 < with_gso.gso_datagrams,
-                "{with_gso:?}"
-            );
+            // stack instead of one for each of hundreds of symbols, when
+            // the thread's receive batches held many symbols each (a loaded
+            // host wakes it for a few at a time; forward_a_4k_object checks
+            // the per-batch bound then).
+            if with_gso.video_batches * 16 <= with_gso.video_received {
+                assert!(
+                    with_gso.gso_messages * 8 < with_gso.gso_datagrams,
+                    "{with_gso:?}"
+                );
+            }
         } else {
             assert_eq!(with_gso.gso_messages, 0, "the fallback sends every symbol");
         }

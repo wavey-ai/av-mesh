@@ -1145,14 +1145,31 @@ async fn children_of_a_shared_socket_take_4k_as_gso_messages() {
             .collect();
         assert_eq!(&got, datagrams, "every symbol, in order");
     }
-    let stats = relay.stats();
-    assert_eq!(stats.video_forwarded, 2 * datagrams.len() as u64);
+    // The counters are the tee's last snapshot, which may lag the sends
+    // that the children already have.
+    let forwarded = 2 * datagrams.len() as u64;
+    let stats = relay
+        .settled_stats(|stats| stats.video_forwarded >= forwarded)
+        .await;
+    assert_eq!(stats.video_forwarded, forwarded);
     if stats.gso_fallbacks == 0 {
         assert_eq!(stats.gso_datagrams, stats.video_forwarded);
+        // A child's symbols of a receive batch in one message (or as few as
+        // their sizes allow), however many batches a loaded host's wake-ups
+        // cut the part into; taken in turn symbol by symbol, every symbol
+        // would be a message of its own.
+        let bound = 2 * gso_message_bound(datagrams, stats.video_batches);
         assert!(
-            stats.gso_messages * 4 < stats.gso_datagrams,
-            "a child's symbols of a drain in one message: {stats:?}"
+            stats.gso_messages <= bound,
+            "a child's symbols of a batch in one message (bound {bound}): {stats:?}"
         );
+        // The whole part in a few batches (an idle host): a few messages.
+        if stats.video_batches <= 4 {
+            assert!(
+                stats.gso_messages * 4 < stats.gso_datagrams,
+                "a child's symbols of a drain in one message: {stats:?}"
+            );
+        }
     }
     // The counters of the sends, counted per call, add up as per symbol.
     let forwarded = relay.forwarder.as_ref().unwrap().snapshot();
