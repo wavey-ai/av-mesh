@@ -109,6 +109,12 @@ pub struct AssignmentPolicy {
     /// room (wave 9 C1, `--rebalance-target-permille`); a mover goes to a
     /// cache under it first.
     pub rebalance_target_permille: u32,
+    /// The rebalance's margin (`--client-udp-rebalance-margin-permille`):
+    /// a shedding edge counts room only at edges under `target - margin`
+    /// and fills them up to `target - margin / 2`, so a rebalanced
+    /// listener goes only where it keeps the receiver under that (wave 9
+    /// review).
+    pub rebalance_margin_permille: u32,
 }
 
 /// Default of `--rebalance-target-permille`.
@@ -122,7 +128,19 @@ impl Default for AssignmentPolicy {
             max_head_lag_parts: 0,
             move_headroom: true,
             rebalance_target_permille: DEFAULT_REBALANCE_TARGET_PERMILLE,
+            rebalance_margin_permille: DEFAULT_REBALANCE_MARGIN_PERMILLE,
         }
+    }
+}
+
+/// Default of `--client-udp-rebalance-margin-permille`.
+pub const DEFAULT_REBALANCE_MARGIN_PERMILLE: u32 = 150;
+
+impl AssignmentPolicy {
+    /// The load up to which a rebalance fills a receiver.
+    pub fn rebalance_receiver_permille(&self) -> u32 {
+        self.rebalance_target_permille
+            .saturating_sub(self.rebalance_margin_permille / 2)
     }
 }
 
@@ -146,9 +164,14 @@ pub struct AssignmentRequest<'a> {
     /// a mover is apportioned against them.
     pub recent_moves: &'a [(String, u32)],
     /// The mover left an edge that is live, not draining and over the
-    /// rebalance target (`MOVE rebalance`, wave 9 C1): only the caches under
-    /// the target take it while one can.
+    /// rebalance target (`MOVE rebalance`, wave 9 C1): only the caches that
+    /// stay under [`AssignmentPolicy::rebalance_receiver_permille`] with it
+    /// take it while one can.
     pub rebalancing: bool,
+    /// What one UDP listener costs an edge of the region (permille: the
+    /// median of load over UDP subscribers among the edges with a few),
+    /// when known: movers fill the survivors up to a common level.
+    pub listener_permille: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -277,11 +300,14 @@ pub fn assign(
             let load = cache.effective_load_permille();
             let tier = if moving {
                 // Wave 9 C4: by headroom alone; a listener that an edge
-                // over its target sent away goes under the target first
-                // (never to an edge that would shed it again).
+                // over its target sent away goes first where it keeps the
+                // receiver under the level the shedder counted room to
+                // (wave 9 review: under the target alone, a receiver at 780
+                // took a share and passed 900).
                 u8::from(
                     request.rebalancing
-                        && cache.load_permille >= policy.rebalance_target_permille,
+                        && f64::from(load) + request.listener_permille.unwrap_or(0.0)
+                            >= f64::from(policy.rebalance_receiver_permille()),
                 )
             } else if cache.holds_playlist() && load < policy.spread_permille {
                 0_u8
@@ -325,7 +351,21 @@ pub fn assign(
             .filter(|(_, (tier, _, _))| *tier == first_tier)
             .map(|(index, (_, _, cache))| (index, *cache))
             .collect::<Vec<_>>();
-        if let Some(index) = apportion(&pool, request.recent_moves) {
+        // A rebalanced listener fills receivers up to the rebalance's
+        // level; a drained or lost edge's movers fill the survivors up to
+        // the target, or higher if they do not fit under it.
+        let level = if request.rebalancing {
+            Level {
+                at: policy.rebalance_receiver_permille(),
+                listener_permille: None,
+            }
+        } else {
+            Level {
+                at: policy.rebalance_target_permille,
+                listener_permille: request.listener_permille,
+            }
+        };
+        if let Some(index) = apportion(&pool, request.recent_moves, level) {
             let chosen = ranked.remove(index);
             ranked.insert(0, chosen);
         }
@@ -460,13 +500,72 @@ fn assigned(cache: &CacheCandidate, reason: AssignmentReason) -> AssignedCache {
     }
 }
 
+/// The load that movers fill the survivors up to (see [`apportion`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Level {
+    /// Permille: the rebalance target for a drain's or a kill's movers,
+    /// the receivers' level for a rebalance.
+    pub at: u32,
+    /// What one listener costs (permille), when known: the level rises
+    /// above `at` to where the movers fit.
+    pub listener_permille: Option<f64>,
+}
+
+/// The level at which `amount` permille poured over caches at `loads` fills
+/// them evenly: sum(max(level - load, 0)) = amount.
+pub fn fill_level(loads: &[f64], amount: f64) -> f64 {
+    let mut sorted = loads.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let mut below = 0.0;
+    for (index, load) in sorted.iter().enumerate() {
+        below += load;
+        let level = (amount + below) / (index + 1) as f64;
+        if sorted.get(index + 1).is_none_or(|next| level <= *next) {
+            return level;
+        }
+    }
+    amount
+}
+
+/// Each cache's headroom to `level` (see [`apportion`]): its share of the
+/// movers is its headroom over the pool's. The level is `level.at`, raised
+/// to where `movers` listeners at `level.listener_permille` each fill the
+/// caches evenly when they do not fit under it; with no cache under the
+/// level, the headroom to full load (1,000) as before.
+pub fn headroom_to_level(loads: &[f64], movers: f64, level: Level) -> Vec<f64> {
+    let mut at = f64::from(level.at);
+    if let Some(cost) = level.listener_permille.filter(|cost| *cost > 0.0) {
+        at = at.max(fill_level(loads, movers * cost));
+    }
+    let to_level = loads
+        .iter()
+        .map(|load| (at - load).max(0.0))
+        .collect::<Vec<_>>();
+    if to_level.iter().sum::<f64>() >= 1.0 {
+        to_level
+    } else {
+        loads
+            .iter()
+            .map(|load| (f64::from(FULL_LOAD_PERMILLE) - load).max(1.0))
+            .collect()
+    }
+}
+
 /// Wave 9 C4: which of `pool` (index into the ranking, cache; in ranking
 /// order) a mover goes to, so that the movers placed lately
 /// (`recent_moves`: cache, count) and this one follow each cache's share of
 /// the pool's headroom: the cache whose due share less what it took is the
 /// largest. Ties go to the earlier in the ranking (the session's
 /// rendezvous). `None` for an empty pool.
-fn apportion(pool: &[(usize, &CacheCandidate)], recent_moves: &[(String, u32)]) -> Option<usize> {
+///
+/// The headroom is to a level (wave 9 review), not to full load: with the
+/// headroom to 1,000, an edge at 776 permille (its LL-HLS readers' CPU)
+/// took a drain's movers and shed them again as over its target.
+fn apportion(
+    pool: &[(usize, &CacheCandidate)],
+    recent_moves: &[(String, u32)],
+    level: Level,
+) -> Option<usize> {
     let taken = |cache: &CacheCandidate| {
         recent_moves
             .iter()
@@ -474,15 +573,19 @@ fn apportion(pool: &[(usize, &CacheCandidate)], recent_moves: &[(String, u32)]) 
             .map(|(_, count)| f64::from(*count))
             .sum::<f64>()
     };
-    let headroom = |cache: &CacheCandidate| {
-        f64::from(
-            FULL_LOAD_PERMILLE
-                .saturating_sub(cache.load_permille)
-                .max(1),
-        )
-    };
-    let whole: f64 = pool.iter().map(|(_, cache)| headroom(cache)).sum();
     let total: f64 = pool.iter().map(|(_, cache)| taken(cache)).sum::<f64>() + 1.0;
+    let loads = pool
+        .iter()
+        .map(|(_, cache)| f64::from(cache.load_permille))
+        .collect::<Vec<_>>();
+    let rooms = headroom_to_level(&loads, total, level);
+    let room_of = |cache: &CacheCandidate| {
+        pool.iter()
+            .position(|(_, other)| other.node_id == cache.node_id)
+            .map_or(0.0, |at| rooms[at])
+    };
+    let headroom = |cache: &CacheCandidate| room_of(cache);
+    let whole: f64 = rooms.iter().sum();
     let mut best: Option<(f64, usize)> = None;
     for (index, cache) in pool {
         let deficit = headroom(cache) / whole * total - taken(cache);
@@ -607,10 +710,11 @@ mod tests {
                 .into_iter()
                 .collect::<HashMap<String, u32>>()
         };
-        // The wave 9 local F1: headroom 710 / 280 / 480 of 1,470 and 36
-        // movers: 17.4 / 6.9 / 11.8 due; within one of each.
+        // The wave 9 local F1, by headroom to the target (wave 9 review):
+        // 510 / 80 / 280 of 870 and 36 movers: 21.1 / 3.3 / 11.6 due; within
+        // one of each.
         let moved = place(&caches, AssignmentPolicy::default(), 36);
-        for (name, due) in [("edge-2", 17.39), ("edge-3", 6.86), ("edge-4", 11.76)] {
+        for (name, due) in [("edge-2", 21.10), ("edge-3", 3.31), ("edge-4", 11.59)] {
             let got = f64::from(moved.get(name).copied().unwrap_or(0));
             assert!((got - due).abs() <= 1.0, "{name}: {moved:?}");
         }
@@ -622,12 +726,12 @@ mod tests {
         };
         let moved = place(&caches, off, 36);
         assert!(!moved.contains_key("edge-3"), "{moved:?}");
-        // A drain's movers go to a survivor over the rebalance target by
-        // its headroom too (850: 150 of 1,060, 5 of 36)...
+        // A survivor over the target takes none of a drain's movers while
+        // the others have room under it...
         let mut over = caches.clone();
         over[1].load_permille = 850;
         let moved = place(&over, AssignmentPolicy::default(), 36);
-        assert!((4..=6).contains(&moved["edge-3"]), "{moved:?}");
+        assert!(!moved.contains_key("edge-3"), "{moved:?}");
         // ...but a listener that an edge over the target sent away goes
         // only under the target while a cache there has room.
         let mut placed: Vec<(String, u32)> = Vec::new();
@@ -648,6 +752,53 @@ mod tests {
                 None => placed.push((first, 1)),
             }
         }
+        // A rebalanced listener goes only where it keeps the receiver under
+        // the receivers' level (725 with the default margin), counted with
+        // what it costs: edge-3 at 720 is under the target but not a
+        // receiver (wave 9 review), edge-2 at 290 and edge-4 at 520 are.
+        for index in 0..40 {
+            let session = format!("rebalanced-k-{index}");
+            let request = AssignmentRequest {
+                moving: true,
+                rebalancing: true,
+                listener_permille: Some(16.0),
+                ..request(&session)
+            };
+            let first = assign(request, AssignmentPolicy::default(), &caches).unwrap().caches[0]
+                .node_id
+                .clone();
+            assert_ne!(first, "edge-3", "{session}");
+        }
+        // ...unless they do not fit under it: at 40 permille a listener, 36
+        // movers fill the three to 1,033, and edge-3 takes 183 of 1,440 of
+        // the room (4.6).
+        let place_with = |caches: &[CacheCandidate], count: usize, cost: f64| {
+            let mut placed: Vec<(String, u32)> = Vec::new();
+            for index in 0..count {
+                let session = format!("mover-{index}");
+                let moving = AssignmentRequest {
+                    moving: true,
+                    recent_moves: &placed,
+                    listener_permille: Some(cost),
+                    ..request(&session)
+                };
+                let first = assign(moving, AssignmentPolicy::default(), caches)
+                    .unwrap()
+                    .caches[0]
+                    .node_id
+                    .clone();
+                match placed.iter_mut().find(|(node_id, _)| *node_id == first) {
+                    Some(entry) => entry.1 += 1,
+                    None => placed.push((first, 1)),
+                }
+            }
+            placed.into_iter().collect::<HashMap<String, u32>>()
+        };
+        let moved = place_with(&over, 36, 40.0);
+        assert!((3..=6).contains(&moved["edge-3"]), "{moved:?}");
+        // At 10 permille they fit under the target: edge-3 takes none.
+        let moved = place_with(&over, 36, 10.0);
+        assert!(!moved.contains_key("edge-3"), "{moved:?}");
         // Every cache over the target: still assigned, by headroom.
         let all_over = [
             cache("edge-2", 900, Some(900)),
@@ -656,6 +807,31 @@ mod tests {
         let moved = place(&all_over, AssignmentPolicy::default(), 14);
         assert_eq!(moved.get("edge-3"), Some(&9), "{moved:?}");
         assert_eq!(moved.get("edge-2"), Some(&5), "{moved:?}");
+    }
+
+    #[test]
+    fn the_fill_level_spreads_an_amount_evenly_over_the_lowest() {
+        assert!((fill_level(&[394.0, 553.0, 747.0], 658.0) - 784.0).abs() < 1e-9);
+        assert!((fill_level(&[300.0, 700.0], 100.0) - 400.0).abs() < 1e-9);
+        let rooms = headroom_to_level(
+            &[394.0, 553.0, 747.0],
+            47.0,
+            Level {
+                at: 800,
+                listener_permille: Some(14.0),
+            },
+        );
+        assert_eq!(rooms, vec![406.0, 247.0, 53.0]);
+        // Nothing under the level: the headroom to full load.
+        let rooms = headroom_to_level(
+            &[900.0, 820.0],
+            1.0,
+            Level {
+                at: 800,
+                listener_permille: None,
+            },
+        );
+        assert_eq!(rooms, vec![100.0, 180.0]);
     }
 
     /// The readers an entry point sent to a cache since its advertisement
@@ -840,6 +1016,7 @@ mod tests {
             moving: false,
             recent_moves: &[],
             rebalancing: false,
+            listener_permille: None,
         }
     }
 

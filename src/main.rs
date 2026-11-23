@@ -588,6 +588,28 @@ const MAX_RECENT_MOVERS: usize = 4_096;
 /// egress window counts them).
 const PENDING_LOAD_KEEP: Duration = Duration::from_secs(60);
 const MESH_EVENTS_PATH: &str = "/api/mesh/events";
+/// What one UDP listener costs an edge of `region` (permille), as the
+/// rebalance reckons it (wave 9 C1): the median of load over UDP
+/// subscribers among the region's edges with at least 4 subscribers.
+/// `None` when no edge has that many.
+fn region_listener_permille(snapshots: &[MeshSnapshot], region: &str) -> Option<f64> {
+    let mut costs = snapshots
+        .iter()
+        .filter(|snapshot| snapshot.node.region == region)
+        .filter_map(|snapshot| {
+            let edge = snapshot.edge_service.as_ref()?;
+            let subscribers = edge.udp_subscribers.filter(|count| *count >= 4)?;
+            (edge.cache_mesh_role == "edge" && edge.load_permille > 0)
+                .then(|| f64::from(edge.load_permille) / subscribers as f64)
+        })
+        .collect::<Vec<_>>();
+    if costs.is_empty() {
+        return None;
+    }
+    costs.sort_by(f64::total_cmp);
+    Some(costs[costs.len() / 2])
+}
+
 const MESH_WEBSOCKET_PATH: &str = "/ws/mesh";
 const MISSION_CONTROL_DIST_ENV: &str = "NEEDLETAIL_MISSION_CONTROL_DIST";
 const PLAYER_DIST_ENV: &str = "NEEDLETAIL_PLAYER_DIST";
@@ -4149,6 +4171,7 @@ async fn main() -> Result<()> {
             max_head_lag_parts: args.assignment_max_head_lag_parts,
             move_headroom: args.assignment_move_headroom,
             rebalance_target_permille: args.rebalance_target_permille,
+            rebalance_margin_permille: args.client_udp_rebalance_margin_permille,
         },
         args.steering_ttl_seconds.max(1),
         args.telemetry_interval_ms,
@@ -20346,6 +20369,16 @@ impl AppRouter {
             .filter(|entry| now_ms.saturating_sub(entry.1) < REMEMBERED_ASSIGNMENT_MS)
             .map(|entry| entry.0.clone());
         let moving = reader.udp && !reader.skip.is_empty() && reader.current.is_none();
+        // Wave 9 review: a move this entry point has answered already (the
+        // session's remembered cache is not one it has left: a repeat, a
+        // hedge over HTTPS, a confirmation) gets the same cache and is not
+        // charged or logged again.
+        let repeated_move = moving
+            && remembered
+                .as_ref()
+                .is_some_and(|node| !reader.skip.iter().any(|name| name == node));
+        let snapshots = self.regional_snapshots().await;
+        let listener_permille = region_listener_permille(&snapshots, &self.node.region);
         // Wave 9 C1: it left a live edge over its target (a rebalance), not
         // a draining or lost one.
         let rebalancing = moving
@@ -20370,13 +20403,13 @@ impl AppRouter {
             moving,
             recent_moves: &recent_moves,
             rebalancing,
+            listener_permille,
         };
         // A rebalanced listener goes only to a cache heard of lately (one
         // advertisement interval, not the assignment's three): an edge that
         // has just died still looks fresh, and empty, for a few seconds.
         let recent_only;
         let candidates = if rebalancing {
-            let snapshots = self.regional_snapshots().await;
             let heard = self.recent_advert_ms();
             let now = now_unix_ms();
             recent_only = candidates
@@ -20520,6 +20553,7 @@ impl AppRouter {
                 moving: false,
                 recent_moves: &[],
                 rebalancing: false,
+                listener_permille: None,
             },
             policy,
             &candidates,
