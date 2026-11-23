@@ -297,13 +297,19 @@ pub enum Control {
         stream_id: u64,
         reason: String,
     },
-    /// The client asks for its assignment (wave 9 B).
+    /// The client asks for its assignment (wave 9 B). Without a token it
+    /// is padded and answered (`ASSIGNED`, and a `TOKEN` for the client's
+    /// address) but charges no cache: its source is not proven. With the
+    /// node's token (wave 9 review) it is the client's confirmation of the
+    /// answer it took: `current` names the cache, which is charged for the
+    /// session and remembered; it is not padded and not answered.
     Assign {
         stream_id: u64,
         nonce: u64,
         session: String,
         skip: Vec<String>,
         current: Option<String>,
+        token: Option<u64>,
     },
     /// A node's answer to `ASSIGN`: the caches in assignment order (none
     /// when it has none to give) and the caches' client UDP port.
@@ -397,6 +403,7 @@ impl Control {
                 session,
                 skip,
                 current,
+                token,
             } => {
                 let skip = skip
                     .iter()
@@ -409,10 +416,17 @@ impl Control {
                     if skip.is_empty() { "-".to_owned() } else { skip },
                     current.as_deref().map_or_else(|| "-".to_owned(), word),
                 );
-                // Padding: the answer is never longer than the request.
-                let pad = ASSIGN_REQUEST_BYTES.saturating_sub(text.len() + 1).max(1);
-                text.push(' ');
-                text.push_str(&".".repeat(pad));
+                match token {
+                    // A confirmation: not answered, so not padded.
+                    Some(token) => text.push_str(&format!(" t={token:016x}")),
+                    None => {
+                        // Padding: the answer is never longer than the
+                        // request.
+                        let pad = ASSIGN_REQUEST_BYTES.saturating_sub(text.len() + 1).max(1);
+                        text.push(' ');
+                        text.push_str(&".".repeat(pad));
+                    }
+                }
                 text
             }
             Self::Assigned {
@@ -559,6 +573,11 @@ impl Control {
                     "-" => None,
                     name => Some(name.to_owned()),
                 };
+                let mut token_word = None;
+                if let Some(word) = words.clone().next().and_then(|word| word.strip_prefix("t=")) {
+                    token_word = Some(token(word)?);
+                    words.next();
+                }
                 if words.clone().next().is_some_and(|pad| pad.bytes().all(|b| b == b'.')) {
                     words.next();
                 }
@@ -568,6 +587,7 @@ impl Control {
                     session,
                     skip,
                     current,
+                    token: token_word,
                 }
             }
             "ASSIGNED" => {
@@ -1489,6 +1509,7 @@ mod tests {
             session: "bench-uc-0".into(),
             skip: vec!["lon-edge-1".into(), "lon-edge-2".into()],
             current: Some("lon-edge-3".into()),
+            token: None,
         };
         let bytes = request.encode();
         assert_eq!(bytes.len(), ASSIGN_REQUEST_BYTES);
@@ -1499,8 +1520,23 @@ mod tests {
             session: "s".into(),
             skip: Vec::new(),
             current: None,
+            token: None,
         };
         assert_eq!(Control::decode(&bare.encode()), Some(bare));
+        // The confirmation (wave 9 review): the node's token, the cache
+        // taken, no padding.
+        let confirm = Control::Assign {
+            stream_id: 3001,
+            nonce: 9,
+            session: "bench-uc-0".into(),
+            skip: vec!["lon-edge-1".into()],
+            current: Some("lon-edge-3".into()),
+            token: Some(0xfeed_0000_0000_0001),
+        };
+        let bytes = confirm.encode();
+        assert!(bytes.len() < 128, "{}", bytes.len());
+        assert_eq!(Control::decode(&bytes), Some(confirm));
+        assert_eq!(Control::decode(b"NTU/1 ASSIGN 5 09 s - - t=zz"), None);
         for answer in [
             Control::Assigned {
                 stream_id: 3001,

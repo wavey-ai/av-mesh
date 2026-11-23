@@ -19115,8 +19115,9 @@ struct AppRouter {
     /// and its rounds.
     rebalance: Option<RebalanceConfig>,
     rebalance_state: Arc<StdMutex<edge_udp::RebalanceState>>,
-    /// Wave 9 C4: the movers this entry point placed lately (when, where).
-    recent_mover_log: Arc<StdMutex<VecDeque<(Instant, String)>>>,
+    /// Wave 9 C4: the movers this entry point placed lately (when, where,
+    /// the session's key: a session is logged once per cache).
+    recent_mover_log: Arc<StdMutex<VecDeque<(Instant, String, Option<String>)>>>,
     /// Wave 9 C4: readers this entry point sent each cache lately, with
     /// the load each costs it (when, where, permille).
     pending_load: Arc<StdMutex<VecDeque<(Instant, String, u32)>>>,
@@ -19334,18 +19335,45 @@ impl AppRouter {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         while movers
             .front()
-            .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= RECENT_MOVERS_WINDOW)
+            .is_some_and(|(at, _, _)| now.saturating_duration_since(*at) >= RECENT_MOVERS_WINDOW)
         {
             movers.pop_front();
         }
         let mut counts: Vec<(String, u32)> = Vec::new();
-        for (_, node_id) in movers.iter() {
+        for (_, node_id, _) in movers.iter() {
             match counts.iter_mut().find(|(name, _)| name == node_id) {
                 Some(entry) => entry.1 += 1,
                 None => counts.push((node_id.clone(), 1)),
             }
         }
         counts
+    }
+
+    /// Wave 9 C4: log a mover placed at `node_id`. A session is logged
+    /// once in the window (wave 9 review): a repeated request, a hedge or
+    /// the confirmation of an answer already logged is not logged again,
+    /// and one placed elsewhere since moves its entry there.
+    fn log_mover(&self, node_id: &str, key: Option<&str>) {
+        let now = Instant::now();
+        let mut movers = self
+            .recent_mover_log
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if key.is_some() {
+            if let Some(entry) = movers.iter_mut().rev().find(|(at, _, logged)| {
+                logged.as_deref() == key
+                    && now.saturating_duration_since(*at) < RECENT_MOVERS_WINDOW
+            }) {
+                if entry.1 != node_id {
+                    entry.1 = node_id.to_owned();
+                }
+                return;
+            }
+        }
+        movers.push_back((now, node_id.to_owned(), key.map(str::to_owned)));
+        while movers.len() > MAX_RECENT_MOVERS {
+            movers.pop_front();
+        }
     }
 
     /// Wave 9 C4: the load (permille) of the readers this entry point sent
@@ -20442,73 +20470,28 @@ impl AppRouter {
         // A reader that is placed now takes capacity that the cache has not
         // advertised as taken. Count it until the cache advertises again, so
         // that a crowd is not all sent to the cache that was free a moment
-        // ago.
-        if let (true, Ok(assignment)) = (moving, &assignment) {
+        // ago. Only a request whose source is proven (`remember`: HTTPS, or
+        // a UDP confirmation) is charged (wave 9 review: a forged UDP
+        // ASSIGN filled every cache's pending load); an unproven mover is
+        // logged for the apportionment alone, which places a forged one as
+        // it places any, so it skews nothing.
+        if let Ok(assignment) = &assignment {
             if let Some(first) = assignment.caches.first() {
-                let mut movers = self
-                    .recent_mover_log
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                movers.push_back((Instant::now(), first.node_id.clone()));
-                while movers.len() > MAX_RECENT_MOVERS {
-                    movers.pop_front();
+                if moving && !repeated_move && !remember {
+                    self.log_mover(&first.node_id, key.as_deref());
                 }
-            }
-        }
-        // A mover (wave 9 C4) is charged at its new cache too, though the
-        // entry point remembers its old one: the movers of a drained edge
-        // ask within a second of each other.
-        if let (true, true, None, Ok(assignment)) = (
-            remember,
-            remembered.is_none() || request.moving,
-            reader.current,
-            &assignment,
-        ) {
-            if let Some(candidate) = assignment.caches.first().and_then(|first| {
-                candidates
-                    .iter()
-                    .find(|cache| cache.node_id == first.node_id)
-            }) {
-                let charge = candidate.session_charge_bps.or(playlist_bps).unwrap_or(0);
-                let mut pending = self
-                    .pending_assignments
-                    .entry(candidate.node_id.clone())
-                    .or_insert((candidate.updated_unix_ms, 0));
-                if pending.0 != candidate.updated_unix_ms {
-                    *pending = (candidate.updated_unix_ms, 0);
-                }
-                pending.1 = pending.1.saturating_add(charge);
-                drop(pending);
-                // Wave 9 C4: and in its load, at what one listener costs it
-                // (its load over its UDP subscribers), or the charge.
-                let snapshots = self.regional_snapshots().await;
-                let edge = snapshots
-                    .iter()
-                    .find(|snapshot| snapshot.node.node_id == candidate.node_id)
-                    .and_then(|snapshot| snapshot.edge_service.as_ref());
-                let permille = edge
-                    .and_then(|edge| {
-                        let subscribers = edge.udp_subscribers.filter(|count| *count >= 4)?;
-                        (edge.load_permille > 0)
-                            .then(|| (u64::from(edge.load_permille) / subscribers) as u32)
-                    })
-                    .or_else(|| {
-                        let admission = edge?.egress_admission_bps;
-                        (admission > 0).then(|| {
-                            (u128::from(charge) * 1_000 / u128::from(admission))
-                                .min(u128::from(u32::MAX)) as u32
-                        })
-                    })
-                    .unwrap_or(0);
-                if permille > 0 {
-                    let mut log = self
-                        .pending_load
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    log.push_back((Instant::now(), candidate.node_id.clone(), permille));
-                    while log.len() > MAX_RECENT_MOVERS {
-                        log.pop_front();
-                    }
+                if remember
+                    && reader.current.is_none()
+                    && (remembered.is_none() || (moving && !repeated_move))
+                {
+                    self.charge_reader(
+                        &first.node_id,
+                        &candidates,
+                        &snapshots,
+                        playlist_bps,
+                        moving,
+                        key.as_deref(),
+                    );
                 }
             }
         }
@@ -20526,6 +20509,117 @@ impl AppRouter {
             }
         }
         (assignment, candidates)
+    }
+
+    /// Charge cache `node_id` for a reader placed there now: the bytes it
+    /// will take (until the cache advertises again) and its load (fading
+    /// over the cache's egress window, wave 9 C4), and log a mover.
+    fn charge_reader(
+        &self,
+        node_id: &str,
+        candidates: &[CacheCandidate],
+        snapshots: &[MeshSnapshot],
+        playlist_bps: Option<u64>,
+        moving: bool,
+        key: Option<&str>,
+    ) {
+        if moving {
+            self.log_mover(node_id, key);
+        }
+        let Some(candidate) = candidates.iter().find(|cache| cache.node_id == node_id) else {
+            return;
+        };
+        let charge = candidate.session_charge_bps.or(playlist_bps).unwrap_or(0);
+        let mut pending = self
+            .pending_assignments
+            .entry(candidate.node_id.clone())
+            .or_insert((candidate.updated_unix_ms, 0));
+        if pending.0 != candidate.updated_unix_ms {
+            *pending = (candidate.updated_unix_ms, 0);
+        }
+        pending.1 = pending.1.saturating_add(charge);
+        drop(pending);
+        // Wave 9 C4: and in its load, at what one listener costs it (its
+        // load over its UDP subscribers), or at what one costs the region's
+        // edges when it has too few to tell (wave 9 review: a just-joined
+        // slot's charge by bytes alone was 0 at 4 Gbit/s), or the bytes.
+        let edge = snapshots
+            .iter()
+            .find(|snapshot| snapshot.node.node_id == candidate.node_id)
+            .and_then(|snapshot| snapshot.edge_service.as_ref());
+        let own = edge.and_then(|edge| {
+            let subscribers = edge.udp_subscribers.filter(|count| *count >= 4)?;
+            (edge.load_permille > 0).then(|| f64::from(edge.load_permille) / subscribers as f64)
+        });
+        let by_bytes = edge.and_then(|edge| {
+            let admission = edge.egress_admission_bps;
+            (admission > 0).then(|| u128::from(charge) as f64 * 1_000.0 / admission as f64)
+        });
+        let permille = own
+            .or_else(|| region_listener_permille(snapshots, &self.node.region))
+            .or(by_bytes)
+            .unwrap_or(0.0)
+            .round()
+            .clamp(0.0, f64::from(u32::MAX)) as u32;
+        if permille > 0 {
+            let mut log = self
+                .pending_load
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            log.push_back((Instant::now(), candidate.node_id.clone(), permille));
+            while log.len() > MAX_RECENT_MOVERS {
+                log.pop_front();
+            }
+        }
+    }
+
+    /// Wave 9 review: a UDP client's confirmation of the assignment it
+    /// took (an `ASSIGN` with this node's token for its address, so its
+    /// source is proven): cache `cache` is charged for the session and
+    /// remembered, once (a session already remembered there is not charged
+    /// again). Returns whether it charged.
+    pub(crate) async fn confirm_udp_assignment(
+        &self,
+        stream_id: u64,
+        session: &str,
+        skip: &[String],
+        cache: &str,
+    ) -> bool {
+        let candidates = self.cache_candidates(stream_id).await;
+        if !candidates.iter().any(|candidate| {
+            candidate.node_id == cache && candidate.region == self.node.region
+        }) {
+            return false;
+        }
+        let key = format!("{stream_id}/{session}");
+        let now_ms = now_unix_ms();
+        let remembered = self
+            .remembered_assignments
+            .get(&key)
+            .filter(|entry| now_ms.saturating_sub(entry.1) < REMEMBERED_ASSIGNMENT_MS)
+            .map(|entry| entry.0.clone());
+        if remembered.as_deref() == Some(cache) {
+            return false;
+        }
+        let snapshots = self.regional_snapshots().await;
+        let playlist_bps = self.regional_playlist_bps(stream_id).await;
+        self.charge_reader(
+            cache,
+            &candidates,
+            &snapshots,
+            playlist_bps,
+            !skip.is_empty(),
+            Some(&key),
+        );
+        if self.remembered_assignments.len() >= MAX_REMEMBERED_ASSIGNMENTS {
+            self.remembered_assignments
+                .retain(|_, entry| now_ms.saturating_sub(entry.1) < REMEMBERED_ASSIGNMENT_MS);
+        }
+        if self.remembered_assignments.len() < MAX_REMEMBERED_ASSIGNMENTS {
+            self.remembered_assignments
+                .insert(key, (cache.to_owned(), now_ms));
+        }
+        true
     }
 
     /// The same request at the other caches of the region that can take the
@@ -20974,6 +21068,7 @@ impl AppRouter {
         skip: &[String],
         session_id: Option<&str>,
         remember: bool,
+        udp: bool,
     ) -> (
         Result<Assignment, AssignmentError>,
         Vec<CacheCandidate>,
@@ -20984,7 +21079,7 @@ impl AppRouter {
                 ReaderRequest {
                     // A client that names its session asks for its UDP
                     // assignment (needletail-udp-client, needletail-load).
-                    udp: remember,
+                    udp,
                     skip,
                     stream_id,
                     session: session_id,
@@ -21020,8 +21115,10 @@ impl AppRouter {
 
     /// Wave 9 B: the answer to a UDP `ASSIGN` (`av_mesh::client_udp`), the
     /// assignment that `/api/assignment?stream=&sid=` gives: the caches in
-    /// order and their client UDP port. The session is remembered and its
-    /// cache charged as for the HTTPS request.
+    /// order and their client UDP port. Its source is not proven, so no
+    /// cache is charged and the session is not remembered (wave 9 review):
+    /// the client's confirmation does that
+    /// ([`Self::confirm_udp_assignment`]).
     pub(crate) async fn udp_assignment(
         &self,
         stream_id: u64,
@@ -21030,7 +21127,7 @@ impl AppRouter {
         current: Option<&str>,
     ) -> (Option<u16>, Vec<av_mesh::client_udp::AssignedCache>) {
         let (_, _, assigned) = self
-            .client_assignment(stream_id, None, current, skip, Some(session), true)
+            .client_assignment(stream_id, None, current, skip, Some(session), false, true)
             .await;
         let caches = assigned
             .as_array()
@@ -21085,6 +21182,7 @@ impl AppRouter {
                 current.as_deref(),
                 &skip,
                 session_id,
+                remember,
                 remember,
             )
             .await;
@@ -21185,6 +21283,16 @@ impl AppRouter {
             block.insert(
                 "assignments_dropped".into(),
                 stats.assignments_dropped.load(Ordering::Relaxed).into(),
+            );
+            // Wave 9 review: the clients' confirmations that charged a
+            // cache, and those refused.
+            block.insert(
+                "assignment_confirms".into(),
+                stats.assignment_confirms.load(Ordering::Relaxed).into(),
+            );
+            block.insert(
+                "assignment_confirms_refused".into(),
+                stats.assignment_confirms_refused.load(Ordering::Relaxed).into(),
             );
         }
         if let (Some(block), Some(gauges)) = (body["client_udp"].as_object_mut(), gauges) {
@@ -35116,6 +35224,7 @@ mod tests {
                 session: session.into(),
                 skip,
                 current: None,
+                token: None,
             }
             .encode()
         };
@@ -35123,11 +35232,21 @@ mod tests {
         let request = ask("reader-u", Vec::new());
         assert_eq!(request.len(), ASSIGN_REQUEST_BYTES);
         client.send_to(&request, port).await.unwrap();
+        // The token for the client's address, then the answer: no more
+        // bytes in all than the request.
+        let (len, _) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+            .await
+            .expect("a token")
+            .unwrap();
+        let Some(Control::Token { token, .. }) = Control::decode(&buf[..len]) else {
+            panic!("{:?}", String::from_utf8_lossy(&buf[..len]));
+        };
+        let token_len = len;
         let (len, _) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
             .await
             .expect("an answer")
             .unwrap();
-        assert!(len <= request.len());
+        assert!(token_len + len <= request.len());
         let Some(Control::Assigned {
             stream_id,
             nonce,
@@ -35138,6 +35257,56 @@ mod tests {
             panic!("{:?}", String::from_utf8_lossy(&buf[..len]));
         };
         assert_eq!((stream_id, nonce, udp_port), (801, 0x5eed, Some(19_446)));
+        // Wave 9 review: an unproven request charged nothing and is not
+        // remembered; the client's confirmation with the token does both,
+        // once; a confirmation with another token does neither.
+        assert!(router.pending_load.lock().unwrap().is_empty());
+        assert!(router.remembered_assignments.get("801/reader-u").is_none());
+        let confirm = |token: u64, cache: &str| {
+            Control::Assign {
+                stream_id: 801,
+                nonce: 0x5eed,
+                session: "reader-u".into(),
+                skip: Vec::new(),
+                current: Some(cache.into()),
+                token: Some(token),
+            }
+            .encode()
+        };
+        let taken = caches[0].node_id.clone();
+        client
+            .send_to(&confirm(token ^ 1, &taken), port)
+            .await
+            .unwrap();
+        client.send_to(&confirm(token, &taken), port).await.unwrap();
+        client.send_to(&confirm(token, &taken), port).await.unwrap();
+        let stats = Arc::clone(&router.edge_udp_stats);
+        let settled = async {
+            while stats.assignment_confirms.load(Ordering::Relaxed)
+                + stats.assignment_confirms_refused.load(Ordering::Relaxed)
+                < 3
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), settled)
+            .await
+            .expect("the confirmations settle");
+        assert_eq!(stats.assignment_confirms.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.assignment_confirms_refused.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            router
+                .remembered_assignments
+                .get("801/reader-u")
+                .map(|entry| entry.0.clone()),
+            Some(taken.clone())
+        );
+        // Confirmations are not answered.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), client.recv_from(&mut buf))
+                .await
+                .is_err()
+        );
         // The HTTPS answer for the same session: the same caches in order.
         let api = get_for_tests(&router, "/api/assignment?stream=801&sid=reader-u").await;
         let api: serde_json::Value = serde_json::from_str(&body_text(api)).unwrap();
@@ -35165,10 +35334,14 @@ mod tests {
             .send_to(&ask("reader-v", vec![first.clone()]), port)
             .await
             .unwrap();
-        let (len, _) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
-            .await
-            .unwrap()
-            .unwrap();
+        let mut len = 0;
+        for _ in 0..2 {
+            len = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap()
+                .0;
+        }
         match Control::decode(&buf[..len]) {
             Some(Control::Assigned { caches, .. }) => {
                 assert!(!caches.is_empty() && caches.iter().all(|cache| cache.node_id != first))

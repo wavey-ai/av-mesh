@@ -467,6 +467,10 @@ async fn assignment(
         .map_err(|_| anyhow!("assignment at {entry}: no answer in {} ms", args.assignment_timeout_ms))?
 }
 
+/// Wave 9 review: the confirmation of a UDP assignment goes again after
+/// this long.
+const CONFIRM_REPEAT: Duration = Duration::from_millis(30);
+
 /// Wave 9 B: the assignment over UDP (`ASSIGN` at the entry point's client
 /// UDP port), repeated after --first-retry-ms, then twice as long each time
 /// up to 300 ms, until it is answered.
@@ -496,14 +500,19 @@ async fn udp_assignment(
         .fill(&mut nonce)
         .map_err(|_| anyhow!("no random nonce"))?;
     let nonce = u64::from_be_bytes(nonce);
+    let skip: Vec<String> = skip.keys().cloned().collect();
     let request = Control::Assign {
         stream_id: args.stream,
         nonce,
         session: args.session.clone(),
-        skip: skip.keys().cloned().collect(),
+        skip: skip.clone(),
         current: current.map(str::to_owned),
+        token: None,
     }
     .encode();
+    // The node's token for this socket's address, which the confirmation
+    // of the answer carries (wave 9 review).
+    let mut given: Option<u64> = None;
     let first = Duration::from_millis(args.first_retry_ms.max(1));
     let mut wait = if args.first_retry_ms == 0 {
         av_mesh::client_session::UNANSWERED_REFRESH
@@ -520,12 +529,19 @@ async fn udp_assignment(
                 // An ICMP port unreachable: no client UDP port there.
                 Ok(Err(error)) => bail!("ASSIGN to {target}: {error}"),
                 Ok(Ok(len)) => {
+                    let control = Control::decode(&buf[..len]);
+                    if let Some(Control::Token { stream_id, token }) = control {
+                        if stream_id == args.stream {
+                            given = Some(token);
+                        }
+                        continue;
+                    }
                     if let Some(Control::Assigned {
                         stream_id,
                         nonce: answered,
                         port,
                         caches,
-                    }) = Control::decode(&buf[..len])
+                    }) = control
                     {
                         if stream_id != args.stream || answered != nonce {
                             continue;
@@ -542,6 +558,27 @@ async fn udp_assignment(
                             .collect::<Vec<_>>();
                         if caches.is_empty() {
                             bail!("no assignment (UDP): the entry point names no cache");
+                        }
+                        // Confirm the cache taken, so the entry point
+                        // charges it for this session (an unproven request
+                        // charges nothing): off the join's path, sent
+                        // twice against a loss.
+                        if let Some(token) = given {
+                            let confirm = Control::Assign {
+                                stream_id: args.stream,
+                                nonce,
+                                session: args.session.clone(),
+                                skip,
+                                current: Some(caches[0].node_id.clone()),
+                                token: Some(token),
+                            }
+                            .encode();
+                            tokio::spawn(async move {
+                                for _ in 0..2 {
+                                    let _ = socket.send(&confirm).await;
+                                    tokio::time::sleep(CONFIRM_REPEAT).await;
+                                }
+                            });
                         }
                         return Ok((caches, port, "udp"));
                     }
@@ -1771,8 +1808,27 @@ mod tests {
                         failover: false,
                     }],
                 };
+                // The node's token, then the answers.
+                let token = Control::Token {
+                    stream_id: 3001,
+                    token: 0xabc,
+                };
+                node.send_to(&token.encode(), peer).await.unwrap();
                 node.send_to(&answer(nonce ^ 1).encode(), peer).await.unwrap();
                 node.send_to(&answer(nonce).encode(), peer).await.unwrap();
+                // Wave 9 review: the client confirms the cache it took with
+                // the token, unpadded.
+                let (len, _) = node.recv_from(&mut buf).await.unwrap();
+                assert!(len < 200, "{len}");
+                match Control::decode(&buf[..len]) {
+                    Some(Control::Assign {
+                        token, current, ..
+                    }) => {
+                        assert_eq!(token, Some(0xabc));
+                        assert_eq!(current.as_deref(), Some("lon-edge-2"));
+                    }
+                    other => panic!("{other:?}"),
+                }
                 return seen;
             }
         });

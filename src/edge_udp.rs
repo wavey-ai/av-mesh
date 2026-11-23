@@ -302,6 +302,11 @@ pub(crate) struct EdgeUdpStats {
     /// short, too many at once, or the answer would be longer).
     pub assignments: AtomicU64,
     pub assignments_dropped: AtomicU64,
+    /// Wave 9 review: confirmations (`ASSIGN` with the node's token) that
+    /// charged a cache, and those refused (a bad token, over the per-source
+    /// rate, or the session already charged there).
+    pub assignment_confirms: AtomicU64,
+    pub assignment_confirms_refused: AtomicU64,
     /// Parts forwarded cut-through, and their datagrams.
     pub cut_through_parts: AtomicU64,
     pub cut_through_datagrams: AtomicU64,
@@ -1482,6 +1487,7 @@ pub(crate) async fn run_edge_udp(
     let mut nack_budget = EdgeNackBudget::new(config.nack_edge_rate, Instant::now());
     let tokens = Tokens(RandomState::new());
     let assigning: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+    let mut confirms = ConfirmLimit::default();
     let mut audio_buf = vec![0_u8; 2_048];
     let mut video_buf = vec![0_u8; 2_048];
     // The send-only twins' share of the requests, watched for reading only.
@@ -1758,19 +1764,68 @@ pub(crate) async fn run_edge_udp(
                 session,
                 skip,
                 current,
+                token,
             } => {
+                if !config.assign {
+                    stats.assignments_dropped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                // Wave 9 review: the client's confirmation of the answer
+                // it took, with this node's token for its address (so its
+                // source is proven): the cache is charged and the session
+                // remembered, at most CONFIRMS_PER_SOURCE a second from one
+                // address. Not answered.
+                if let Some(token) = token {
+                    let Some(cache) = current.filter(|_| tokens.valid(peer, token)) else {
+                        stats.bad_tokens.fetch_add(1, Ordering::Relaxed);
+                        stats
+                            .assignment_confirms_refused
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    };
+                    if !confirms.allow(peer.ip(), Instant::now())
+                        || assigning.load(Ordering::Relaxed) >= MAX_ASSIGNMENTS_IN_FLIGHT
+                    {
+                        stats
+                            .assignment_confirms_refused
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    assigning.fetch_add(1, Ordering::Relaxed);
+                    let (router, stats, assigning) =
+                        (router.clone(), Arc::clone(&stats), Arc::clone(&assigning));
+                    tokio::spawn(async move {
+                        let counter = if router
+                            .confirm_udp_assignment(stream_id, &session, &skip, &cache)
+                            .await
+                        {
+                            &stats.assignment_confirms
+                        } else {
+                            &stats.assignment_confirms_refused
+                        };
+                        counter.fetch_add(1, Ordering::Relaxed);
+                        assigning.fetch_sub(1, Ordering::Relaxed);
+                    });
+                    continue;
+                }
                 // Wave 9 B: the assignment over UDP. Answered only to a
-                // padded request, never with more bytes than it carried,
-                // and on a task of its own (the assignment reads the
-                // region's adverts), a bounded number at once.
-                if !config.assign
-                    || len < MIN_ASSIGN_REQUEST_BYTES
+                // padded request, never with more bytes than it carried
+                // (the answer and this node's token for the client's
+                // confirmation), and on a task of its own (the assignment
+                // reads the region's adverts), a bounded number at once.
+                if len < MIN_ASSIGN_REQUEST_BYTES
                     || assigning.load(Ordering::Relaxed) >= MAX_ASSIGNMENTS_IN_FLIGHT
                 {
                     stats.assignments_dropped.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
                 assigning.fetch_add(1, Ordering::Relaxed);
+                let given = Control::Token {
+                    stream_id,
+                    token: tokens.current(peer),
+                }
+                .encode();
+                let budget = len.saturating_sub(given.len());
                 let (router, stats, assigning) =
                     (router.clone(), Arc::clone(&stats), Arc::clone(&assigning));
                 tokio::spawn(async move {
@@ -1785,7 +1840,7 @@ pub(crate) async fn run_edge_udp(
                             caches: caches.clone(),
                         }
                         .encode();
-                        if answer.len() <= len || caches.is_empty() {
+                        if answer.len() <= budget || caches.is_empty() {
                             break answer;
                         }
                         // The last cache that fits: the failover order is
@@ -1800,8 +1855,14 @@ pub(crate) async fn run_edge_udp(
                             }
                         }
                     };
-                    if answer.len() <= len {
+                    if answer.len() <= budget {
                         stats.assignments.fetch_add(1, Ordering::Relaxed);
+                        stats.tokens_sent.fetch_add(1, Ordering::Relaxed);
+                        // The token first: the client confirms as soon as
+                        // it has the answer.
+                        if let Err(error) = socket.send_to(&given, peer).await {
+                            debug!(%peer, error = %error, "edge client UDP token send failed");
+                        }
                         if let Err(error) = socket.send_to(&answer, peer).await {
                             debug!(%peer, error = %error, "edge client UDP assignment send failed");
                         }
@@ -1819,6 +1880,41 @@ pub(crate) async fn run_edge_udp(
 /// Wave 9 B: `ASSIGN` requests answered at once at most; more are dropped
 /// (the client repeats its request).
 const MAX_ASSIGNMENTS_IN_FLIGHT: usize = 256;
+
+/// Wave 9 review: assignment confirmations taken from one address a second
+/// at most (a host behind one address may run a few dozen clients; a
+/// proven source that confirms many sessions charges no more).
+const CONFIRMS_PER_SOURCE: u32 = 64;
+/// Addresses the confirmation limit remembers at most (beyond, the window
+/// starts again for all).
+const CONFIRM_SOURCES: usize = 4_096;
+
+/// The per-address limit of assignment confirmations: a count per address
+/// in fixed one-second windows.
+#[derive(Default)]
+struct ConfirmLimit {
+    window: Option<Instant>,
+    counts: HashMap<std::net::IpAddr, u32>,
+}
+
+impl ConfirmLimit {
+    fn allow(&mut self, source: std::net::IpAddr, now: Instant) -> bool {
+        if self
+            .window
+            .is_none_or(|start| now.saturating_duration_since(start) >= Duration::from_secs(1))
+            || (self.counts.len() >= CONFIRM_SOURCES && !self.counts.contains_key(&source))
+        {
+            self.window = Some(now);
+            self.counts.clear();
+        }
+        let count = self.counts.entry(source).or_default();
+        if *count >= CONFIRMS_PER_SOURCE {
+            return false;
+        }
+        *count += 1;
+        true
+    }
+}
 
 /// Send a compact-lane subscriber the parts that it asks for again: each
 /// part that was sent to it already (the cache-fed sender has passed it, or
