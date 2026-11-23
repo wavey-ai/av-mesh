@@ -8,7 +8,9 @@
 //!   lock without a limit (RLIMIT_MEMLOCK infinite, or root): every mapped
 //!   page is faulted in now and every later mapping when it is made, so no
 //!   thread (the real-time class threads included) takes a fault for a page
-//!   of its own. The deploy gives the service `LimitMEMLOCK=infinity`. With
+//!   of its own. Off by default (`--mlock-all`, wave 9 review: its memory
+//!   cost is unmeasured); a deploy that asks for it gives the service
+//!   `LimitMEMLOCK=infinity`. With
 //!   a finite limit (the namespace lab's 8 MB) it is not tried: MCL_FUTURE
 //!   would make allocations past the limit fail.
 //! - `tune_allocator`: a fixed trim threshold and mmap threshold, so that
@@ -132,20 +134,22 @@ pub fn faults(thread: bool) -> (u64, u64) {
     }
 }
 
-/// Write every page of `bytes` bytes at `ptr` once, so that their faults
-/// are taken now. The memory must be owned and writable by the caller; it
-/// is left as it was (each page's first byte is read and written back).
+/// Write a zero to the first byte of every page of `bytes` bytes at `ptr`,
+/// so that their faults are taken now. The memory is the caller's scratch
+/// space: spare capacity not yet initialized (a `Vec`'s), whose bytes it
+/// does not need. Nothing is read (reading uninitialized memory, even with
+/// `read_volatile`, is undefined behaviour; wave 9 review).
 ///
 /// # Safety
-/// `ptr..ptr + bytes` must be valid for reads and writes.
+/// `ptr..ptr + bytes` must be valid for writes, and the caller must not
+/// need the bytes it holds.
 pub unsafe fn prefault(ptr: *mut u8, bytes: usize) {
     const PAGE: usize = 4096;
     let mut offset = 0;
     while offset < bytes {
         // SAFETY: within the range the caller vouches for.
         unsafe {
-            let at = ptr.add(offset);
-            std::ptr::write_volatile(at, std::ptr::read_volatile(at));
+            std::ptr::write_volatile(ptr.add(offset), 0);
         }
         offset += PAGE;
     }

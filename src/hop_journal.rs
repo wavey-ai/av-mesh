@@ -177,22 +177,19 @@ impl HopJournal {
             (VecDeque::new(), Vec::new().into_boxed_slice())
         } else {
             let mut events: Vec<HopEvent> = Vec::with_capacity(capacity);
-            let mut seen = vec![SeenEntry::default(); SEEN_TABLE_SLOTS].into_boxed_slice();
+            // `vec!` writes every entry of the table: its pages are in.
+            let seen = vec![SeenEntry::default(); SEEN_TABLE_SLOTS].into_boxed_slice();
             if PREFAULT.load(std::sync::atomic::Ordering::Relaxed) {
                 // Wave 9 (cold start): the ring's pages are faulted in now,
                 // not one by one under the journal's lock by the threads
                 // that record (the real-time class threads among them)
                 // while the first session fills the ring.
-                // SAFETY: the vector's capacity and the boxed table are
-                // owned and writable.
+                // SAFETY: the vector's spare capacity is owned, writable
+                // and holds nothing yet.
                 unsafe {
                     crate::memory::prefault(
                         events.as_mut_ptr().cast(),
                         capacity * std::mem::size_of::<HopEvent>(),
-                    );
-                    crate::memory::prefault(
-                        seen.as_mut_ptr().cast(),
-                        seen.len() * std::mem::size_of::<SeenEntry>(),
                     );
                 }
             }

@@ -2285,8 +2285,12 @@ struct Args {
     /// later mappings when they are made, so no thread (the real-time class
     /// threads among them) takes a page fault in the first session. With a
     /// finite limit it is not tried (allocations past it would fail).
-    /// `false`: never, as before.
-    #[arg(long, env = "NEEDLETAIL_MLOCK_ALL", default_value_t = true, action = clap::ArgAction::Set)]
+    /// Default `false` (wave 9 review): never measured on a deploy (the lab
+    /// cannot lock: its limit is 8 MB); with it every later mapping, each
+    /// thread's whole stack included, is populated and nothing can be paged
+    /// out, so memory pressure ends in the OOM killer. Turn it on only after
+    /// measuring VmLck, RSS and faults on the deploy's plan.
+    #[arg(long, env = "NEEDLETAIL_MLOCK_ALL", default_value_t = false, action = clap::ArgAction::Set)]
     mlock_all: bool,
 
     /// Wave 9 (cold start): glibc's heap trim threshold fixed at 256 MB and
@@ -36745,7 +36749,13 @@ mod tests {
     fn the_wave9_cold_start_flags_default_on_and_can_be_turned_off() {
         let args = Args::try_parse_from(["av-mesh"]).unwrap();
         assert!(args.client_udp_prompt_sender);
-        assert!(args.mlock_all);
+        // Off until measured on a deploy (wave 9 review); it can be asked.
+        assert!(!args.mlock_all);
+        assert!(
+            Args::try_parse_from(["av-mesh", "--mlock-all", "true"])
+                .unwrap()
+                .mlock_all
+        );
         assert!(args.malloc_tune);
         assert!(args.prefault);
         assert!(args.relay_lease_descriptors);
