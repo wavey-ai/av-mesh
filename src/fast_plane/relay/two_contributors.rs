@@ -183,6 +183,8 @@ struct Ingress {
     children: [StdSocket; 2],
     stats: Arc<FastPlaneStats>,
     epochs: Arc<ValidatedEpochs>,
+    /// What the failover controller reads of the parents' arrivals.
+    failover: Arc<FailoverInputs>,
     tee: mpsc::Receiver<TeeItem>,
     stop: Arc<AtomicBool>,
     thread: Option<ClassThread>,
@@ -241,6 +243,7 @@ impl Ingress {
             .collect();
         let stats = Arc::new(FastPlaneStats::default());
         let epochs = Arc::new(ValidatedEpochs::new(64));
+        let failover = Arc::new(FailoverInputs::new());
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, tee) = mpsc::channel(65_536);
         let thread = ClassThread {
@@ -255,7 +258,7 @@ impl Ingress {
             link_telemetry: None,
             tee: tx,
             stats: Arc::clone(&stats),
-            failover: Arc::new(FailoverInputs::new()),
+            failover: Arc::clone(&failover),
             stop: Arc::clone(&stop),
             cpu: None,
             realtime: false,
@@ -277,6 +280,7 @@ impl Ingress {
             children,
             stats,
             epochs,
+            failover,
             tee,
             stop,
             thread: Some(thread),
@@ -534,8 +538,8 @@ async fn different_object_versions_are_both_forwarded() {
 /// - turn 1: 256 live parts on the primary lane (the stream's clock is
 ///   made; it follows the validated epoch at the next turn), and their
 ///   copies on the secondary;
-/// - turn 2: a live part (the head), then 255 old ones (stale); the
-///   secondary's live parts;
+/// - turn 2: two live parts (the first starts the head, the second
+///   confirms it), then 254 old ones (stale); the secondary's live parts;
 /// - turn 3 on: the marker part (live) behind them, then the rest of the
 ///   burst.
 ///
@@ -557,21 +561,21 @@ async fn a_burst_of_old_datagrams_on_one_lane_is_stale_and_does_not_hold_the_oth
         compact_part(STREAM, object, 1, &payload(object), deadline(object), 0)
     };
     let first_turn: Vec<Vec<u8>> = (20_000..20_256).flat_map(live).collect();
-    let head = live(20_256);
-    let marker = live(20_257);
-    let probes: Vec<Vec<u8>> = (20_258..20_266).flat_map(live).collect();
+    let head: Vec<Vec<u8>> = (20_256..20_258).flat_map(live).collect();
+    let marker = live(20_258);
+    let probes: Vec<Vec<u8>> = (20_259..20_267).flat_map(live).collect();
     let mut primary = first_turn.clone();
     primary.extend(head.iter().cloned());
-    primary.extend((0..255).flat_map(stale));
+    primary.extend((0..254).flat_map(stale));
     primary.extend(marker.iter().cloned());
-    primary.extend((255..BURST).flat_map(stale));
+    primary.extend((254..BURST).flat_map(stale));
     let mut secondary = first_turn.clone();
     secondary.extend(probes.iter().cloned());
     ingress.send(0, &primary);
     ingress.send(1, &secondary);
     ingress.run();
 
-    let received = ingress.receive(0, 256 + 1 + probes.len() + 1);
+    let received = ingress.receive(0, 256 + head.len() + probes.len() + 1);
     let mut other_child = ingress.receive(1, received.len());
     let mut in_order = received.clone();
     other_child.sort();
@@ -598,7 +602,7 @@ async fn a_burst_of_old_datagrams_on_one_lane_is_stale_and_does_not_hold_the_oth
         }
         taken = now;
     }
-    let tail = live(20_266);
+    let tail = live(20_267);
     ingress.send(0, &tail);
     assert_eq!(ingress.receive(0, 1), tail);
     assert_eq!(ingress.receive(1, 1), tail);
@@ -607,12 +611,30 @@ async fn a_burst_of_old_datagrams_on_one_lane_is_stale_and_does_not_hold_the_oth
     };
     let snapshot = ingress.stats.snapshot();
     assert_eq!(judged(&snapshot), BURST, "{:?}", snapshot.media_clock);
-    assert!(snapshot.media_clock.stale_media >= 255);
+    assert!(snapshot.media_clock.stale_media >= 254);
     assert_eq!(snapshot.media_clock.stale_epoch, 0);
     // Nothing stale reached a child or the tee: the tee has the live parts
     // (the secondary's copies of the first turn are duplicates).
     ingress.assert_nothing_more();
-    assert_eq!(ingress.teed(), 256 + 1 + 1 + probes.len() + 1);
+    assert_eq!(ingress.teed(), 256 + head.len() + 1 + probes.len() + 1);
+    // The stale datagrams make their lane look no more live: a burst alone
+    // leaves the primary's last source arrival where the last live part
+    // put it (A 4, "does not stamp the parent feeds").
+    let stamped = ingress.failover.primary_source.load(Ordering::Relaxed);
+    assert_ne!(stamped, 0, "the live parts stamped the primary");
+    std::thread::sleep(Duration::from_millis(5));
+    for index in 0..100 {
+        ingress.send(0, &stale(index));
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while judged(&ingress.stats.snapshot()) < BURST + 100 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let after = ingress.stats.snapshot();
+    assert_eq!(judged(&after), BURST + 100, "{:?}", after.media_clock);
+    assert_eq!(ingress.failover.primary_source.load(Ordering::Relaxed), stamped);
+    ingress.assert_nothing_more();
+    assert_eq!(ingress.teed(), 0);
     // What a live part of the other lane waited at most: one turn of the
     // thread. Printed, not asserted (a loaded host stretches any turn): the
     // order above is the proof that it is one turn and not the burst.

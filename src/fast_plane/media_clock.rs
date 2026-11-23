@@ -20,6 +20,14 @@
 //! budget at most, so a corrupt datagram that passes the UDP checksum
 //! cannot retire a stream.
 //!
+//! A head that starts again (a new clock's first epoch, a new epoch) takes
+//! its first deadline whole, but only provisionally: it judges nothing
+//! until a later deadline within a budget of it confirms it, and a deadline
+//! more than a budget away, either way, takes its place. One wild deadline
+//! in that window (the far future, or the year 1970) costs the next
+//! datagram its judgement and no more; a confirmed head moves by half a
+//! budget a datagram as before.
+//!
 //! The table is allocated once and never grows: a stream's clock is in one
 //! of eight neighbouring slots. A stream that finds none has no clock, is
 //! always fresh, and is counted. A clock that has judged nothing fresh for
@@ -68,6 +76,9 @@ struct Clock {
     epoch: u64,
     /// Zero: the next deadline of the epoch is taken whole.
     head_us: u64,
+    /// The head was taken whole from one deadline and no later deadline
+    /// within a budget of it has confirmed it yet: it judges nothing.
+    provisional: bool,
     /// When the clock last judged a datagram fresh by its own rules.
     fresh_us: u64,
     /// The change of the stream's validated epoch that `follow` took last.
@@ -165,6 +176,7 @@ impl MediaClocks {
         clock.stream_id = key.stream.parse().ok();
         clock.epoch = 0;
         clock.head_us = 0;
+        clock.provisional = false;
         clock.fresh_us = now_us;
         clock.followed = 0;
         self.created += 1;
@@ -173,7 +185,8 @@ impl MediaClocks {
 
     /// Judge a datagram of `epoch` whose deadline is `deadline_us` on its
     /// stream's timeline, and move the stream's head: by half of `budget_us`
-    /// at most, so that one wrong deadline cannot shed the stream.
+    /// at most once the head is confirmed, so that one wrong deadline cannot
+    /// shed the stream.
     pub fn observe(
         &mut self,
         key: ClockKey<'_>,
@@ -202,16 +215,25 @@ impl MediaClocks {
                 Verdict::StaleEpoch
             };
         }
-        if deadline_us.saturating_add(budget_us) <= clock.head_us {
-            return Verdict::StaleMedia;
-        }
-        clock.head_us = if clock.head_us == 0 {
-            deadline_us
+        if clock.head_us == 0
+            || (clock.provisional && deadline_us.abs_diff(clock.head_us) >= budget_us)
+        {
+            // The head starts at this deadline, provisionally: a deadline a
+            // budget or more from it, either way, is the stream's or the
+            // head's was wild, and the next one tells.
+            clock.head_us = deadline_us;
+            clock.provisional = true;
         } else {
-            clock
+            // A confirmed head, or one that this deadline, within a budget
+            // of it, confirms: it judges.
+            clock.provisional = false;
+            if deadline_us.saturating_add(budget_us) <= clock.head_us {
+                return Verdict::StaleMedia;
+            }
+            clock.head_us = clock
                 .head_us
-                .max(deadline_us.min(clock.head_us.saturating_add(budget_us / 2)))
-        };
+                .max(deadline_us.min(clock.head_us.saturating_add(budget_us / 2)));
+        }
         clock.fresh_us = now_us;
         Verdict::Fresh
     }
@@ -238,7 +260,7 @@ impl MediaClocks {
             } else {
                 Verdict::StaleEpoch
             }
-        } else if deadline_us.saturating_add(budget_us) <= clock.head_us {
+        } else if !clock.provisional && deadline_us.saturating_add(budget_us) <= clock.head_us {
             Verdict::StaleMedia
         } else {
             Verdict::Fresh
@@ -258,6 +280,7 @@ impl MediaClocks {
         if epoch > clock.epoch || (idle && epoch != clock.epoch) {
             clock.epoch = epoch;
             clock.head_us = 0;
+            clock.provisional = false;
         }
         clock.fresh_us = now_us;
     }
@@ -278,6 +301,7 @@ impl MediaClocks {
             if epoch != clock.epoch {
                 clock.epoch = epoch;
                 clock.head_us = 0;
+                clock.provisional = false;
             }
         }
     }
@@ -287,13 +311,16 @@ impl MediaClocks {
 /// written where the cache commits and read by the class threads without a
 /// lock (`MediaClocks::follow`).
 ///
-/// The table is allocated once. A stream stays in it for the life of the
-/// process; when every slot is taken, a further stream is not recorded,
-/// its clocks never get an epoch, and they judge nothing stale.
+/// The table is allocated once, and a stream's epoch is in one of eight
+/// neighbouring slots, so that a look costs eight loads at most. A stream
+/// stays in it for the life of the process; a stream that finds none of
+/// its eight slots free is not recorded (counted in `unrecorded`), its
+/// clocks never get an epoch, and they judge nothing stale.
 pub struct ValidatedEpochs {
     slots: Box<[EpochSlot]>,
     mask: usize,
     version: AtomicU64,
+    unrecorded: AtomicU64,
 }
 
 #[derive(Default)]
@@ -314,11 +341,19 @@ impl ValidatedEpochs {
             slots: (0..slots).map(|_| EpochSlot::default()).collect(),
             mask: slots - 1,
             version: AtomicU64::new(0),
+            unrecorded: AtomicU64::new(0),
         }
     }
 
     fn home(stream_id: u64) -> usize {
         (stream_id.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 32) as usize
+    }
+
+    /// The slots that the stream's epoch may be in.
+    fn probe(&self, stream_id: u64) -> impl Iterator<Item = &EpochSlot> {
+        let home = Self::home(stream_id);
+        (0..PROBE.min(self.slots.len()))
+            .map(move |step| &self.slots[home.wrapping_add(step) & self.mask])
     }
 
     /// The cache took up `epoch` for the stream (again, after it forgot the
@@ -327,8 +362,7 @@ impl ValidatedEpochs {
         let Some(tag) = stream_id.checked_add(1) else {
             return;
         };
-        for step in 0..self.slots.len() {
-            let slot = &self.slots[Self::home(stream_id).wrapping_add(step) & self.mask];
+        for slot in self.probe(stream_id) {
             let holder = match slot
                 .stream
                 .compare_exchange(0, tag, Ordering::AcqRel, Ordering::Acquire)
@@ -345,14 +379,14 @@ impl ValidatedEpochs {
                 return;
             }
         }
+        self.unrecorded.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The stream's validated epoch and how many times it was written.
     #[must_use]
     pub fn get(&self, stream_id: u64) -> Option<(u64, u64)> {
         let tag = stream_id.checked_add(1)?;
-        for step in 0..self.slots.len() {
-            let slot = &self.slots[Self::home(stream_id).wrapping_add(step) & self.mask];
+        for slot in self.probe(stream_id) {
             match slot.stream.load(Ordering::Acquire) {
                 0 => return None,
                 holder if holder == tag => {
@@ -374,6 +408,13 @@ impl ValidatedEpochs {
     pub fn version(&self) -> u64 {
         self.version.load(Ordering::Acquire)
     }
+
+    /// Epochs taken up for a stream that found no slot: its clocks judge
+    /// nothing stale.
+    #[must_use]
+    pub fn unrecorded(&self) -> u64 {
+        self.unrecorded.load(Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]
@@ -389,12 +430,16 @@ mod tests {
         MediaClocks::key("needletail", name)
     }
 
-    /// A table whose stream 3001 has a validated epoch and a head at START.
+    /// A table whose stream 3001 has a validated epoch and a confirmed head
+    /// at START.
     fn running() -> MediaClocks {
         let mut clocks = MediaClocks::new(1_024);
         let key = stream("3001");
         assert_eq!(clocks.observe(key, EPOCH, START, BUDGET), Verdict::Fresh);
         clocks.set_epoch(key, EPOCH);
+        // The first deadline of the epoch starts the head, the next one
+        // confirms it.
+        assert_eq!(clocks.observe(key, EPOCH, START, BUDGET), Verdict::Fresh);
         assert_eq!(clocks.observe(key, EPOCH, START, BUDGET), Verdict::Fresh);
         clocks
     }
@@ -581,6 +626,82 @@ mod tests {
         assert_eq!(clocks.observe(key, EPOCH, START + 1_000, BUDGET), Verdict::Fresh);
     }
 
+    /// The review of AM1 (finding 1): where a head starts again, a head
+    /// taken whole from one wild deadline used to shed the rest of the
+    /// epoch (the far future) or disable `StaleMedia` for it (the far past).
+    #[test]
+    fn a_wild_deadline_where_the_head_starts_again_sheds_nothing() {
+        let next = EPOCH + 1;
+        let key = stream("3001");
+        // The head starts again after the cache took up a new session, and
+        // after an object of a higher epoch decoded here.
+        let start_again = |by_decode: bool| {
+            let epochs = ValidatedEpochs::new(64);
+            let mut clocks = running();
+            if by_decode {
+                clocks.set_epoch(key, next);
+            } else {
+                epochs.set(3001, next);
+                clocks.follow(&epochs);
+            }
+            clocks
+        };
+        for wild in [
+            u64::MAX,
+            START + 86_400_000_000,
+            START + BUDGET,
+            START - BUDGET,
+            START - 3_600_000_000,
+            1,
+        ] {
+            for by_decode in [false, true] {
+                let mut clocks = start_again(by_decode);
+                assert_eq!(clocks.observe(key, next, wild, BUDGET), Verdict::Fresh);
+                // A provisional head judges nothing, an assembly held back
+                // either.
+                assert_eq!(clocks.peek(key, next, START - BUDGET, BUDGET), Verdict::Fresh);
+                for part in 1..=2_000_u64 {
+                    assert_eq!(
+                        clocks.observe(key, next, START + part * 1_000, BUDGET),
+                        Verdict::Fresh,
+                        "part {part} after the wild deadline {wild}"
+                    );
+                }
+                // The stream's own head judges again.
+                assert_eq!(
+                    clocks.observe(key, next, START + 2_000_000 - BUDGET, BUDGET),
+                    Verdict::StaleMedia,
+                    "after the wild deadline {wild}"
+                );
+            }
+        }
+        // Both ways at once: the far future, then the far past, then the
+        // live stream. Its second part confirms the head, and a part a
+        // budget behind is stale from the third on.
+        let mut clocks = start_again(false);
+        assert_eq!(clocks.observe(key, next, u64::MAX, BUDGET), Verdict::Fresh);
+        assert_eq!(clocks.observe(key, next, 1, BUDGET), Verdict::Fresh);
+        assert_eq!(clocks.observe(key, next, START + 1_000, BUDGET), Verdict::Fresh);
+        assert_eq!(clocks.observe(key, next, START + 2_000, BUDGET), Verdict::Fresh);
+        assert_eq!(
+            clocks.observe(key, next, START + 2_000 - BUDGET, BUDGET),
+            Verdict::StaleMedia
+        );
+        assert_eq!(
+            clocks.peek(key, next, START + 2_000 - BUDGET, BUDGET),
+            Verdict::StaleMedia
+        );
+        // A frozen sender's burst that comes once the head is confirmed is
+        // stale, as on a running stream.
+        for part in 0..100_u64 {
+            assert_eq!(
+                clocks.observe(key, next, START - 30_000_000 + part * 1_000, BUDGET),
+                Verdict::StaleMedia
+            );
+        }
+        assert_eq!(clocks.observe(key, next, START + 3_000, BUDGET), Verdict::Fresh);
+    }
+
     #[test]
     fn one_corrupt_epoch_retires_nothing() {
         let mut clocks = running();
@@ -623,6 +744,7 @@ mod tests {
         // The head started again: the new session's timeline may be
         // anywhere, behind the old one's too.
         assert_eq!(clocks.observe(key, next, START - 5_000_000, BUDGET), Verdict::Fresh);
+        assert_eq!(clocks.observe(key, next, START - 4_999_000, BUDGET), Verdict::Fresh);
         assert_eq!(
             clocks.observe(key, next, START - 6_000_000, BUDGET),
             Verdict::StaleMedia
@@ -787,6 +909,7 @@ mod tests {
             clocks.observe(key, EPOCH - 1, START, BUDGET),
             Verdict::StaleEpoch
         );
+        assert_eq!(clocks.observe(key, EPOCH, START + 1_000, BUDGET), Verdict::Fresh);
         assert_eq!(
             clocks.observe(key, EPOCH, START - BUDGET, BUDGET),
             Verdict::StaleMedia
@@ -845,9 +968,47 @@ mod tests {
         }
         assert_eq!(epochs.get(5), None);
         assert_eq!(epochs.version(), 4);
+        assert_eq!(epochs.unrecorded(), 1);
         // The last stream id has no tag, and is not recorded.
         epochs.set(u64::MAX, EPOCH);
         assert_eq!(epochs.get(u64::MAX), None);
+    }
+
+    /// The review of AM1 (finding 3): a full table was probed to its end on
+    /// every look, 4,096 loads on the audio thread for each unrecorded
+    /// stream at each `follow`.
+    #[test]
+    fn a_stream_looks_at_eight_slots_and_one_without_room_is_counted() {
+        let epochs = ValidatedEpochs::new(4_096);
+        // Nine streams whose epochs would go in the same slot.
+        let home = ValidatedEpochs::home(1) & epochs.mask;
+        let crowd: Vec<u64> = (1..)
+            .filter(|id| ValidatedEpochs::home(*id) & epochs.mask == home)
+            .take(10)
+            .collect();
+        for (index, stream_id) in crowd.iter().take(9).enumerate() {
+            epochs.set(*stream_id, EPOCH + index as u64);
+        }
+        for (index, stream_id) in crowd.iter().take(8).enumerate() {
+            assert_eq!(epochs.get(*stream_id), Some((EPOCH + index as u64, 1)));
+        }
+        // The ninth found its eight slots taken, though the table has room.
+        assert_eq!(epochs.get(crowd[8]), None);
+        assert_eq!(epochs.unrecorded(), 1);
+        assert_eq!(epochs.version(), 8);
+        // A recorded stream's epoch is written again where it is.
+        epochs.set(crowd[0], EPOCH + 100);
+        assert_eq!(epochs.get(crowd[0]), Some((EPOCH + 100, 2)));
+        assert_eq!(epochs.unrecorded(), 1);
+        // A look for a stream never set stops at its eighth slot.
+        assert_eq!(epochs.get(crowd[9]), None);
+        // Its clocks follow nothing and judge nothing stale.
+        let mut clocks = MediaClocks::new(64);
+        let name = crowd[8].to_string();
+        let key = stream(&name);
+        clocks.observe(key, EPOCH, START, BUDGET);
+        clocks.follow(&epochs);
+        assert_eq!(clocks.observe(key, EPOCH - 1, START, BUDGET), Verdict::Fresh);
     }
 
     #[test]

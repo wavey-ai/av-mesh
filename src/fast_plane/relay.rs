@@ -291,6 +291,9 @@ pub struct FastPlaneStats {
     pub stale_media: AtomicU64,
     /// Datagrams of streams that found no media clock, per class.
     pub media_clock_overflow: [AtomicU64; 2],
+    /// Validated epochs that found no slot in the class threads' table
+    /// (`ValidatedEpochs::unrecorded`): their streams are never stale.
+    pub media_clock_unrecorded: AtomicU64,
 }
 
 /// The counters of one parent lane (one receive socket) of the audio class.
@@ -387,6 +390,9 @@ pub struct MediaClockSnapshot {
     pub stale_epoch: u64,
     pub stale_media: u64,
     pub overflow: u64,
+    /// Epochs the cache took up for a stream that the class threads' table
+    /// of validated epochs had no slot for.
+    pub unrecorded_streams: u64,
 }
 
 /// The thresholds of `FastPlaneStats::loop_busy_over`, in µs.
@@ -624,6 +630,7 @@ impl FastPlaneStats {
                 stale_epoch: load(&self.stale_epoch),
                 stale_media: load(&self.stale_media),
                 overflow: self.media_clock_overflow.iter().map(load).sum(),
+                unrecorded_streams: load(&self.media_clock_unrecorded),
             },
         }
     }
@@ -1233,8 +1240,7 @@ impl LeaseDescriptors {
                 if self.streams.len() >= MAX_DESCRIPTOR_STREAMS {
                     return;
                 }
-                self.streams
-                    .insert(view.stream.into(), LastWhole::default());
+                self.streams.insert(view.stream.into(), LastWhole::default());
             }
             let Some(last) = self.streams.get_mut(view.stream) else {
                 return;
