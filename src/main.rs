@@ -568,6 +568,10 @@ const REMEMBERED_ASSIGNMENT_MS: u64 = 120_000;
 /// many remembered.
 const RECENT_MOVERS_WINDOW: Duration = Duration::from_secs(5);
 const MAX_RECENT_MOVERS: usize = 4_096;
+
+/// Wave 9 C4: pending readers are kept this long at most (longer than any
+/// egress window counts them).
+const PENDING_LOAD_KEEP: Duration = Duration::from_secs(60);
 const MESH_EVENTS_PATH: &str = "/api/mesh/events";
 const MESH_WEBSOCKET_PATH: &str = "/ws/mesh";
 const MISSION_CONTROL_DIST_ENV: &str = "NEEDLETAIL_MISSION_CONTROL_DIST";
@@ -19029,6 +19033,9 @@ struct AppRouter {
     rebalance_state: Arc<StdMutex<edge_udp::RebalanceState>>,
     /// Wave 9 C4: the movers this entry point placed lately (when, where).
     recent_mover_log: Arc<StdMutex<VecDeque<(Instant, String)>>>,
+    /// Wave 9 C4: readers this entry point sent each cache lately, with
+    /// the load each costs it (when, where, permille).
+    pending_load: Arc<StdMutex<VecDeque<(Instant, String, u32)>>>,
     steering_ttl_seconds: u64,
     /// An advertisement older than this does not make a cache assignable.
     assignment_fresh_ms: u64,
@@ -19217,6 +19224,7 @@ impl AppRouter {
             rebalance: None,
             rebalance_state: Arc::default(),
             recent_mover_log: Arc::default(),
+            pending_load: Arc::default(),
             steering_ttl_seconds: 5,
             assignment_fresh_ms: DEFAULT_TELEMETRY_INTERVAL_MS.saturating_mul(3),
             remembered_assignments: Arc::new(DashMap::new()),
@@ -19254,6 +19262,33 @@ impl AppRouter {
             }
         }
         counts
+    }
+
+    /// Wave 9 C4: the load (permille) of the readers this entry point sent
+    /// `node_id` lately, each fading over `window` (the cache's egress
+    /// window, over which its advertised mean takes them in).
+    fn pending_load_permille(&self, node_id: &str, window: Duration) -> u32 {
+        let now = Instant::now();
+        let mut log = self
+            .pending_load
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while log
+            .front()
+            .is_some_and(|(at, _, _)| now.saturating_duration_since(*at) >= PENDING_LOAD_KEEP)
+        {
+            log.pop_front();
+        }
+        let window = window.as_secs_f64().max(1e-3);
+        log.iter()
+            .filter(|(_, node, _)| node == node_id)
+            .map(|(at, _, permille)| {
+                let age = now.saturating_duration_since(*at).as_secs_f64();
+                f64::from(*permille) * (1.0 - age / window).max(0.0)
+            })
+            .sum::<f64>()
+            .round()
+            .min(f64::from(u32::MAX)) as u32
     }
 
     /// Wave 9 C1: an advertisement this recent counts for a rebalance (a
@@ -20075,17 +20110,19 @@ impl AppRouter {
                         }
                     },
                     updated_unix_ms: snapshot.updated_unix_ms,
-                    pending_permille: if is_local || edge.egress_admission_bps == 0 {
+                    // Wave 9 C4: what this entry point sent the cache lately,
+                    // each reader's cost fading over the cache's egress
+                    // window as its advertised mean takes it in (a reset at
+                    // each advertisement forgot readers that the lagging
+                    // mean did not show yet: a burst of 30 new listeners
+                    // put 26 on a just-joined edge, 1,328 permille).
+                    pending_permille: if is_local {
                         0
                     } else {
-                        self.pending_assignments
-                            .get(&snapshot.node.node_id)
-                            .filter(|pending| pending.0 == snapshot.updated_unix_ms)
-                            .map_or(0, |pending| {
-                                (u128::from(pending.1) * 1_000
-                                    / u128::from(edge.egress_admission_bps))
-                                .min(u128::from(u32::MAX)) as u32
-                            })
+                        self.pending_load_permille(
+                            &snapshot.node.node_id,
+                            Duration::from_secs(edge.egress_window_seconds.max(1)),
+                        )
                     },
                 })
             })
@@ -20315,6 +20352,38 @@ impl AppRouter {
                     *pending = (candidate.updated_unix_ms, 0);
                 }
                 pending.1 = pending.1.saturating_add(charge);
+                drop(pending);
+                // Wave 9 C4: and in its load, at what one listener costs it
+                // (its load over its UDP subscribers), or the charge.
+                let snapshots = self.regional_snapshots().await;
+                let edge = snapshots
+                    .iter()
+                    .find(|snapshot| snapshot.node.node_id == candidate.node_id)
+                    .and_then(|snapshot| snapshot.edge_service.as_ref());
+                let permille = edge
+                    .and_then(|edge| {
+                        let subscribers = edge.udp_subscribers.filter(|count| *count >= 4)?;
+                        (edge.load_permille > 0)
+                            .then(|| (u64::from(edge.load_permille) / subscribers) as u32)
+                    })
+                    .or_else(|| {
+                        let admission = edge?.egress_admission_bps;
+                        (admission > 0).then(|| {
+                            (u128::from(charge) * 1_000 / u128::from(admission))
+                                .min(u128::from(u32::MAX)) as u32
+                        })
+                    })
+                    .unwrap_or(0);
+                if permille > 0 {
+                    let mut log = self
+                        .pending_load
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    log.push_back((Instant::now(), candidate.node_id.clone(), permille));
+                    while log.len() > MAX_RECENT_MOVERS {
+                        log.pop_front();
+                    }
+                }
             }
         }
         if let (true, Some(key), Ok(assignment)) = (remember, key, &assignment) {
