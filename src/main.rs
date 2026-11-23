@@ -8010,6 +8010,17 @@ fn journal_relay_decoded(
     );
 }
 
+/// What `LiveTsCache::walk_holes` found.
+struct HoleWalk {
+    /// The newest slot the watermark may move to.
+    ceiling: Option<usize>,
+    /// How long the first hole released held the watermark.
+    held_us: Option<u64>,
+    /// No slot of the walk was stored (and it did not reach the part being
+    /// committed).
+    empty: bool,
+}
+
 /// What a commit did with a canonical object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Committed {
@@ -8473,6 +8484,13 @@ struct LiveTsCache {
     /// The parts of each stream that the watermark passed as holes: the
     /// playlist lists them as gaps while they are missing.
     gap_parts: StdMutex<HashMap<u64, BTreeSet<u64>>>,
+    /// Per stream, the lowest part stored more than
+    /// CANONICAL_GAP_SCAN_LIMIT above the watermark: where the walk of a
+    /// hole wider than its scan resumes (both contributors lost, a source
+    /// that jumped). Ignored once the watermark has passed it.
+    wide_hole_resume: StdMutex<HashMap<u64, u64>>,
+    /// Holes wider than the scan that the repair horizon released.
+    wide_hole_releases: AtomicU64,
     part_updates: watch::Sender<u64>,
     playlist_cache: Vec<StdRwLock<Option<CachedPlaylist>>>,
     /// The scan memo of the playlist in each playlist slot.
@@ -8619,6 +8637,8 @@ impl LiveTsCache {
             canonical_conflicts: AtomicU64::new(0),
             canonical_stale_epoch: AtomicU64::new(0),
             gap_parts: StdMutex::new(HashMap::new()),
+            wide_hole_resume: StdMutex::new(HashMap::new()),
+            wide_hole_releases: AtomicU64::new(0),
             part_updates,
             playlist_cache,
             playlist_scan_memos,
@@ -8863,6 +8883,7 @@ impl LiveTsCache {
         self.relay_availability.apply_to(&mut snapshot);
         snapshot.canonical_conflicts = self.canonical_conflicts.load(Ordering::Relaxed);
         snapshot.canonical_stale_epoch = self.canonical_stale_epoch.load(Ordering::Relaxed);
+        snapshot.wide_hole_releases = self.wide_hole_releases.load(Ordering::Relaxed);
         if let Some(stats) = self.fast_plane.get() {
             snapshot.fast_plane = stats.snapshot();
         }
@@ -9044,6 +9065,44 @@ impl LiveTsCache {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&stream_id);
+        self.wide_hole_resume
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&stream_id);
+    }
+
+    /// Part `slot` was stored: when it is more than the scan limit above
+    /// the watermark, the walk of the hole below it resumes there. The
+    /// lowest such part above the watermark is kept. A part near the
+    /// watermark costs one load and one comparison.
+    fn note_wide_hole(&self, handle: StreamHandle, slot: usize) {
+        let Some(last) = self.chunk_cache.last_for_handle(handle) else {
+            return;
+        };
+        if slot <= last.saturating_add(CANONICAL_GAP_SCAN_LIMIT) {
+            return;
+        }
+        let (last, slot) = (last as u64, slot as u64);
+        self.wide_hole_resume
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(handle.stream_id())
+            .and_modify(|resume| {
+                if *resume <= last || slot < *resume {
+                    *resume = slot;
+                }
+            })
+            .or_insert(slot);
+    }
+
+    /// Where the walk of a stream's wide hole resumes, if above `last`.
+    fn wide_hole_resume_above(&self, stream_id: u64, last: usize) -> Option<usize> {
+        self.wide_hole_resume
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&stream_id)
+            .and_then(|resume| usize::try_from(*resume).ok())
+            .filter(|resume| *resume > last)
     }
 
     /// A part `part` of a stream was stored after a later part: a repair
@@ -9245,38 +9304,79 @@ impl LiveTsCache {
         }
         let now_us = now_unix_us();
         let end = head.min(last.saturating_add(CANONICAL_GAP_SCAN_LIMIT));
-        let mut ceiling = None;
-        let mut in_hole = false;
-        // How long the first hole released held the watermark.
-        let mut held_us = None;
-        for slot in first..=end {
+        let mut walk = self.walk_holes(handle, first..=end, false, committing, now_us, horizon_us);
+        // Nothing stored within the scan: a hole wider than the scan. Its
+        // walk resumes at the lowest part stored above it, as after a
+        // narrow hole.
+        let wide = walk.empty
+            && match self.wide_hole_resume_above(stream_id, last) {
+                Some(resume) if resume <= head => {
+                    let end = head.min(resume.saturating_add(CANONICAL_GAP_SCAN_LIMIT));
+                    walk = self.walk_holes(
+                        handle,
+                        resume..=end,
+                        true,
+                        committing,
+                        now_us,
+                        horizon_us,
+                    );
+                    true
+                }
+                _ => false,
+            };
+        let ceiling = walk.ceiling.filter(|ceiling| *ceiling > last)?;
+        let watermark = self
+            .advance_canonical_watermark(handle, last, ceiling, false)
+            .await?;
+        self.repair_horizon_releases.fetch_add(1, Ordering::Relaxed);
+        if wide {
+            self.wide_hole_releases.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(held_us) = walk.held_us {
+            self.record_watermark_stall(held_us);
+        }
+        Some(watermark)
+    }
+
+    /// The walk of `release_holes_past_horizon` over `slots`, in order,
+    /// stopping at `committing`: the newest stored slot behind which every
+    /// hole is `horizon_us` old (a hole is as old as the first part stored
+    /// after it). `in_hole`: the first slot follows a hole.
+    fn walk_holes(
+        &self,
+        handle: StreamHandle,
+        slots: std::ops::RangeInclusive<usize>,
+        mut in_hole: bool,
+        committing: Option<usize>,
+        now_us: u64,
+        horizon_us: u64,
+    ) -> HoleWalk {
+        let mut walk = HoleWalk {
+            ceiling: None,
+            held_us: None,
+            empty: true,
+        };
+        for slot in slots {
             if committing == Some(slot) {
+                walk.empty = false;
                 break;
             }
             match self.chunk_cache.written_unix_us_for_handle(handle, slot) {
                 None => in_hole = true,
                 Some(written_us) => {
-                    // A hole is as old as the first part stored after it.
+                    walk.empty = false;
                     if in_hole && now_us.saturating_sub(written_us) < horizon_us {
                         break;
                     }
-                    if in_hole && held_us.is_none() {
-                        held_us = Some(now_us.saturating_sub(written_us));
+                    if in_hole && walk.held_us.is_none() {
+                        walk.held_us = Some(now_us.saturating_sub(written_us));
                     }
                     in_hole = false;
-                    ceiling = Some(slot);
+                    walk.ceiling = Some(slot);
                 }
             }
         }
-        let ceiling = ceiling.filter(|ceiling| *ceiling > last)?;
-        let watermark = self
-            .advance_canonical_watermark(handle, last, ceiling, false)
-            .await?;
-        self.repair_horizon_releases.fetch_add(1, Ordering::Relaxed);
-        if let Some(held_us) = held_us {
-            self.record_watermark_stall(held_us);
-        }
-        Some(watermark)
+        walk
     }
 
     /// Release every hole of every stream that the repair horizon has
@@ -9442,9 +9542,13 @@ impl LiveTsCache {
                 .chunk_cache
                 .retained_start(candidate)
                 .max(first_unpublished);
-            let mut skipped_parts = (retained_start - first_unpublished) as u64;
+            // At most the gaps a stream keeps are read, below the new
+            // watermark; the rest of a wider hole is counted unread (a hole
+            // of thousands of parts is one gap to a reader).
+            let read_from = retained_start.max(candidate.saturating_sub(MAX_GAP_PARTS_PER_STREAM));
+            let mut skipped_parts = (read_from - first_unpublished) as u64;
             let mut gaps = Vec::new();
-            for slot in retained_start..candidate {
+            for slot in read_from..candidate {
                 if self
                     .chunk_cache
                     .get_for_handle(handle, slot)
@@ -9476,7 +9580,7 @@ impl LiveTsCache {
             if let Some(journal) = self.hops() {
                 // The stored parts behind the released hole are visible now.
                 let t_us = now_unix_us();
-                for slot in retained_start..=candidate {
+                for slot in read_from..=candidate {
                     if slot == candidate
                         || self
                             .chunk_cache
@@ -9908,6 +10012,7 @@ impl LiveTsCache {
             if write_result == PutIfAbsentResult::Inserted {
                 if let Some(handle) = handle {
                     self.observe_late_part(handle, seq, committed_us);
+                    self.note_wide_hole(handle, slot_id);
                 }
                 if let Some(journal) = self.hops() {
                     journal.record_part(HopStage::Committed, stream_id, seq, committed_us);
@@ -13265,6 +13370,8 @@ struct RelaySessionIngressSnapshot {
     /// epoch below the stream's: the first copy stays.
     canonical_conflicts: u64,
     canonical_stale_epoch: u64,
+    /// Holes wider than the scan limit that the repair horizon released.
+    wide_hole_releases: u64,
     downstream_children: u64,
     forwarded_source_datagrams: u64,
     forwarded_repair_datagrams: u64,
@@ -16621,6 +16728,11 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
             "av_mesh_canonical_stale_epoch_total",
             "Canonical commits refused for an epoch below the stream's.",
             snapshot.relay_session.canonical_stale_epoch,
+        ),
+        (
+            "av_mesh_canonical_wide_hole_releases_total",
+            "Holes wider than the gap scan that the repair horizon released.",
+            snapshot.relay_session.wide_hole_releases,
         ),
     ] {
         push_prometheus_metric_header(&mut output, name, help, "counter");
