@@ -6,11 +6,12 @@
 //! it forwards it.
 
 use super::burst_copy::BurstCopies;
-use super::dedup::{Arrival, FirstArrival};
+use super::dedup::{self, Arrival, FirstArrival};
 use super::demand::{NodeDemand, DEMAND_REPORT_INTERVAL};
 use super::edge_clients::{ClientPlan, ClientSender, EdgeFastLane, UpstreamRepair};
 use super::lease::{LeaseChildren, LeaseSnapshot, LeaseSnapshotStats, LeaseTake};
 use super::loss_report::{decode_ledger, LossMeter};
+use super::media_clock::{MediaClocks, ValidatedEpochs, Verdict};
 use super::sys::{self, RecvBatch, RECV_BATCH};
 use super::view::RlsView;
 use super::{class_addr, StreamClasses, TrafficClass};
@@ -49,6 +50,16 @@ pub const DEFAULT_TEE_CAPACITY: usize = 65_536;
 const DEDUP_CAPACITY: usize = 65_536;
 /// How often an idle class thread looks at the stop flag.
 const STOP_POLL_MS: i32 = 50;
+/// Media clocks per class thread: streams beyond it are never stale.
+const MEDIA_CLOCKS: usize = 1_024;
+/// Streams whose validated epoch the class threads follow.
+const VALIDATED_EPOCH_STREAMS: usize = 4_096;
+/// `--relay-media-deadline-ms` by default, in µs.
+pub const DEFAULT_MEDIA_DEADLINE_US: u64 = 1_000_000;
+/// Receive batches a class thread takes from one socket before it looks at
+/// the next (A 2.7): one parent's burst cannot hold another's live parts
+/// back by more than this many batches.
+const SOCKET_TURN_BATCHES: usize = 4;
 /// SCHED_FIFO priority of the audio thread.
 const AUDIO_FIFO_PRIORITY: i32 = 10;
 /// Nice value of the video thread.
@@ -105,6 +116,11 @@ pub struct RelayClassConfig {
     /// apart in the thread, not one kernel datagram each (see
     /// `sys::enable_gro`).
     pub video_gro: bool,
+    /// `--relay-media-deadline-ms` in µs (A 2.5): a datagram whose deadline
+    /// is this far behind the head of its stream's timeline here is stale,
+    /// and a source held back from a warm child is kept this long from its
+    /// receipt.
+    pub media_deadline_us: u64,
     /// Tests: the tee of this class panics on its first datagram.
     #[cfg(test)]
     pub test_tee_panic: Option<TrafficClass>,
@@ -127,6 +143,7 @@ impl Default for RelayClassConfig {
             ranked_parents: Vec::new(),
             lease_descriptors: true,
             video_gro: true,
+            media_deadline_us: DEFAULT_MEDIA_DEADLINE_US,
             #[cfg(test)]
             test_tee_panic: None,
         }
@@ -264,6 +281,112 @@ pub struct FastPlaneStats {
     pub gro_sockets: AtomicU64,
     pub gro_messages: AtomicU64,
     pub gro_datagrams: AtomicU64,
+    /// The audio class's parent lanes (A 2.7), by [`lane_index`]: what each
+    /// socket received, and how its copies fared in the dedup.
+    pub parent_lanes: [ParentLaneStats; 2],
+    /// Admitted datagrams that the media clocks held stale (A 2.5): of an
+    /// epoch below their stream's validated one, or a budget behind their
+    /// stream's head. Neither forwarded nor teed.
+    pub stale_epoch: AtomicU64,
+    pub stale_media: AtomicU64,
+    /// Datagrams of streams that found no media clock, per class.
+    pub media_clock_overflow: [AtomicU64; 2],
+}
+
+/// The counters of one parent lane (one receive socket) of the audio class.
+#[derive(Debug, Default)]
+pub struct ParentLaneStats {
+    pub received: AtomicU64,
+    pub not_admitted: AtomicU64,
+    /// Symbols whose first copy came on this lane.
+    pub first_arrivals: AtomicU64,
+    /// Further copies that came on this lane, and those whose bytes were
+    /// not the first copy's.
+    pub duplicates: AtomicU64,
+    pub duplicate_mismatch: AtomicU64,
+    /// The largest lag of a duplicate behind its first copy in the second
+    /// under way, and in the last whole second.
+    lag_now_us: AtomicU64,
+    lag_last_us: AtomicU64,
+    /// When the lane's parent last sent its ledger (RLL1), in Unix µs (zero:
+    /// never), and the loss its meter measures.
+    ledger_us: AtomicU64,
+    loss_ppm: AtomicU64,
+    /// The parent whose ledgers arrive on the lane: written when a ledger
+    /// arrives (a few times a second), never per datagram.
+    peer: StdMutex<Option<SocketAddr>>,
+}
+
+impl ParentLaneStats {
+    /// The lane's parent sent its ledger (a few times a second). Its address
+    /// is kept without waiting on a snapshot that holds the lock.
+    fn ledger(&self, peer: SocketAddr, now_us: u64) {
+        self.ledger_us.store(now_us, Ordering::Relaxed);
+        if let Ok(mut kept) = self.peer.try_lock() {
+            *kept = Some(peer);
+        }
+    }
+}
+
+/// The index of a parent lane: primary 0, secondary 1.
+const fn lane_index(path: RelayIngressParentPath) -> usize {
+    match path {
+        RelayIngressParentPath::Primary => 0,
+        RelayIngressParentPath::Secondary => 1,
+    }
+}
+
+/// A lane's name in the snapshot and in log lines.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ParentLane {
+    #[default]
+    Primary,
+    Secondary,
+}
+
+impl ParentLane {
+    const fn of(index: usize) -> Self {
+        if index == 0 {
+            Self::Primary
+        } else {
+            Self::Secondary
+        }
+    }
+}
+
+/// What `/api/mesh/local` reports of a parent lane of the audio class.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ParentLaneSnapshot {
+    pub lane: ParentLane,
+    /// The parent whose ledgers arrive on the lane (a contributor), if any.
+    pub peer: Option<SocketAddr>,
+    pub received: u64,
+    pub first_arrivals: u64,
+    pub duplicates: u64,
+    pub duplicate_mismatch: u64,
+    /// The largest lag of a duplicate in the last whole second or the one
+    /// under way.
+    pub duplicate_lag_max_us: u64,
+    pub not_admitted: u64,
+    pub kernel_dropped: u64,
+    pub ledger_age_ms: Option<u64>,
+    /// `None` once the last ledger is older than [`LEDGER_STALE_MS`]: the
+    /// meter keeps its last estimate until a new parent's ledger.
+    pub loss_ppm: Option<u64>,
+}
+
+/// A lane's loss is not reported once its last ledger is this old.
+pub const LEDGER_STALE_MS: u64 = 3_000;
+
+/// What the media clocks of the class threads held stale.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct MediaClockSnapshot {
+    pub stale_epoch: u64,
+    pub stale_media: u64,
+    pub overflow: u64,
 }
 
 /// The thresholds of `FastPlaneStats::loop_busy_over`, in µs.
@@ -281,6 +404,88 @@ impl FastPlaneStats {
         }
         if let Some(gap_us) = gap_us {
             self.loop_gap_max_us[index].fetch_max(gap_us, Ordering::Relaxed);
+        }
+    }
+
+    /// The counters of the parent lane of `path`: the audio class's only.
+    fn lane(&self, class: TrafficClass, path: RelayIngressParentPath) -> Option<&ParentLaneStats> {
+        (class == TrafficClass::Audio).then(|| &self.parent_lanes[lane_index(path)])
+    }
+
+    /// Book a copy of a symbol already seen, which the thread drops, on the
+    /// lane it came on. A copy whose bytes differ from the first one's is a
+    /// fault of the senders: logged once per power of two a lane.
+    fn record_duplicate(
+        &self,
+        class: TrafficClass,
+        path: RelayIngressParentPath,
+        arrival: Arrival,
+        view: &RlsView<'_>,
+    ) {
+        self.duplicates.fetch_add(1, Ordering::Relaxed);
+        let (
+            Some(lane),
+            Arrival::Duplicate {
+                equal,
+                lag_us,
+                first_lane,
+            },
+        ) = (self.lane(class, path), arrival)
+        else {
+            return;
+        };
+        lane.duplicates.fetch_add(1, Ordering::Relaxed);
+        lane.lag_now_us
+            .fetch_max(u64::from(lag_us), Ordering::Relaxed);
+        if equal {
+            return;
+        }
+        let mismatches = lane.duplicate_mismatch.fetch_add(1, Ordering::Relaxed) + 1;
+        if mismatches.is_power_of_two() {
+            warn!(
+                stream = view.stream,
+                object = view.object,
+                sequence = view.packet_sequence,
+                lane = ?ParentLane::of(lane_index(path)),
+                first_lane = ?ParentLane::of(usize::from(first_lane)),
+                mismatches,
+                "a copy of a symbol differs from its first copy: two senders put other bytes under one key"
+            );
+        }
+    }
+
+    /// A second has passed: its largest lags become the last whole second's.
+    fn roll_duplicate_lag(&self) {
+        for lane in &self.parent_lanes {
+            let lag = lane.lag_now_us.swap(0, Ordering::Relaxed);
+            lane.lag_last_us.store(lag, Ordering::Relaxed);
+        }
+    }
+
+    fn parent_lane_snapshot(&self, index: usize, now_us: u64) -> ParentLaneSnapshot {
+        let load = |value: &AtomicU64| value.load(Ordering::Relaxed);
+        let lane = &self.parent_lanes[index];
+        let ledger_age_ms = match load(&lane.ledger_us) {
+            0 => None,
+            at => Some(now_us.saturating_sub(at) / 1_000),
+        };
+        ParentLaneSnapshot {
+            lane: ParentLane::of(index),
+            peer: *lane
+                .peer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            received: load(&lane.received),
+            first_arrivals: load(&lane.first_arrivals),
+            duplicates: load(&lane.duplicates),
+            duplicate_mismatch: load(&lane.duplicate_mismatch),
+            duplicate_lag_max_us: load(&lane.lag_now_us).max(load(&lane.lag_last_us)),
+            not_admitted: load(&lane.not_admitted),
+            kernel_dropped: load(&self.kernel_dropped_lanes[TrafficClass::Audio.index()][index]),
+            ledger_age_ms,
+            loss_ppm: ledger_age_ms
+                .filter(|age| *age < LEDGER_STALE_MS)
+                .map(|_| load(&lane.loss_ppm)),
         }
     }
 }
@@ -345,6 +550,9 @@ pub struct FastPlaneSnapshot {
     pub gro_sockets: u64,
     pub gro_messages: u64,
     pub gro_datagrams: u64,
+    /// The audio class's parent lanes (A 2.7).
+    pub parent_lanes: [ParentLaneSnapshot; 2],
+    pub media_clock: MediaClockSnapshot,
 }
 
 impl FastPlaneStats {
@@ -408,6 +616,15 @@ impl FastPlaneStats {
             gro_sockets: load(&self.gro_sockets),
             gro_messages: load(&self.gro_messages),
             gro_datagrams: load(&self.gro_datagrams),
+            parent_lanes: {
+                let now_us = now_unix_us();
+                [0, 1].map(|index| self.parent_lane_snapshot(index, now_us))
+            },
+            media_clock: MediaClockSnapshot {
+                stale_epoch: load(&self.stale_epoch),
+                stale_media: load(&self.stale_media),
+                overflow: self.media_clock_overflow.iter().map(load).sum(),
+            },
         }
     }
 }
@@ -498,7 +715,9 @@ struct PlannedWarm {
     message: u16,
     path: u16,
     object: u64,
-    expires_at_us: u64,
+    /// How long it is kept from its receipt, on this node's clock: its wire
+    /// deadline is a point on its stream's timeline and says nothing here.
+    hold_us: u64,
 }
 
 /// A send to a lease child: `child` indexes the snapshot's children.
@@ -548,7 +767,9 @@ impl ForwardPlan {
 }
 
 /// Plan the sends of one admitted symbol to the lease children of its
-/// stream, by the lane rule.
+/// stream, by the lane rule. A video source held back from a repair-only
+/// child is kept for `hold_us`.
+#[allow(clippy::too_many_arguments)]
 fn plan_lease(
     snapshot: &LeaseSnapshot,
     class: TrafficClass,
@@ -556,6 +777,7 @@ fn plan_lease(
     view: &RlsView<'_>,
     plan: &mut ForwardPlan,
     now_us: u64,
+    hold_us: u64,
 ) {
     let mut object = None;
     let Some((children, fed_us)) = snapshot.children_and_clock_of(view.stream) else {
@@ -575,7 +797,7 @@ fn plan_lease(
                 message: message as u16,
                 path: child,
                 object: *object.get_or_insert_with(|| view_object_id(view)),
-                expires_at_us: view.deadline_us,
+                hold_us,
             }),
         }
     }
@@ -686,7 +908,7 @@ fn send_lease_plan(
         lease.buffer_warm(
             &snapshot.children[usize::from(warm.path)],
             warm.object,
-            warm.expires_at_us,
+            now_us.saturating_add(warm.hold_us),
             batch.data(usize::from(warm.message)),
             now_us,
         );
@@ -711,8 +933,16 @@ impl RelayDownstreamForwarder {
     /// Plan the sends of one admitted symbol: every path whose lane takes
     /// its role, in compiled order. A source symbol held back from a warm
     /// repair-only child is noted, and kept for a later promotion only once
-    /// the batch is sent (`buffer_fast_warm`), as `forward` keeps it.
-    fn plan_fast(&self, message: usize, view: &RlsView<'_>, plan: &mut ForwardPlan, now: Instant) {
+    /// the batch is sent (`buffer_fast_warm`), as `forward` keeps it, for
+    /// `hold_us` from its receipt.
+    fn plan_fast(
+        &self,
+        message: usize,
+        view: &RlsView<'_>,
+        plan: &mut ForwardPlan,
+        now: Instant,
+        hold_us: u64,
+    ) {
         let role = view.role;
         let mut object = None;
         // Renditions that a child's subtree does not read stay off its lane
@@ -757,7 +987,7 @@ impl RelayDownstreamForwarder {
                     message: message as u16,
                     path: index as u16,
                     object: *object.get_or_insert_with(|| view_object_id(view)),
-                    expires_at_us: view.deadline_us,
+                    hold_us,
                 });
             }
             self.filtered_datagrams.fetch_add(1, Ordering::Relaxed);
@@ -778,7 +1008,7 @@ impl RelayDownstreamForwarder {
                 &self.paths[usize::from(warm.path)],
                 class,
                 warm.object,
-                warm.expires_at_us,
+                now_us.saturating_add(warm.hold_us),
                 batch.data(usize::from(warm.message)),
                 now_us,
             );
@@ -940,6 +1170,11 @@ struct ClassThread {
     demand_peers: Arc<[SocketAddr]>,
     lease_descriptors: bool,
     video_gro: bool,
+    /// The media budget (A 2.5), in µs.
+    media_deadline_us: u64,
+    /// The epoch that the cache validated for each stream, which the
+    /// thread's media clocks follow.
+    epochs: Arc<ValidatedEpochs>,
 }
 
 /// Wave 9 (cold start): each stream's last whole one-symbol audio part
@@ -958,12 +1193,16 @@ struct LeaseDescriptors {
 #[derive(Default)]
 struct LastWhole {
     datagram: Vec<u8>,
-    deadline_us: u64,
+    /// When it arrived, on this node's clock.
+    kept_us: u64,
     had: Vec<SocketAddr>,
 }
 
 /// Streams whose last whole part the audio thread keeps, at most.
 const MAX_DESCRIPTOR_STREAMS: usize = 1_024;
+/// How long a stream's last whole part is sent to a new child, from its
+/// receipt.
+const DESCRIPTOR_HOLD_US: u64 = 1_000_000;
 
 impl LeaseDescriptors {
     /// Look at one admitted audio datagram that goes to the stream's lease
@@ -994,14 +1233,15 @@ impl LeaseDescriptors {
                 if self.streams.len() >= MAX_DESCRIPTOR_STREAMS {
                     return;
                 }
-                self.streams.insert(view.stream.into(), LastWhole::default());
+                self.streams
+                    .insert(view.stream.into(), LastWhole::default());
             }
             let Some(last) = self.streams.get_mut(view.stream) else {
                 return;
             };
             last.datagram.clear();
             last.datagram.extend_from_slice(datagram);
-            last.deadline_us = view.deadline_us;
+            last.kept_us = now_us;
             // Every child of the stream gets this one now.
             last.had.clear();
             last.had.extend(children.iter().map(target));
@@ -1013,7 +1253,7 @@ impl LeaseDescriptors {
         let Some(last) = self.streams.get_mut(view.stream) else {
             return;
         };
-        if last.datagram.is_empty() || (last.deadline_us != 0 && last.deadline_us <= now_us) {
+        if last.datagram.is_empty() || now_us.saturating_sub(last.kept_us) >= DESCRIPTOR_HOLD_US {
             return;
         }
         for child in children {
@@ -1115,6 +1355,11 @@ impl ClassThread {
             RecvBatch::new()
         };
         let mut dedup = FirstArrival::new(DEDUP_CAPACITY);
+        let mut clocks = MediaClocks::new(MEDIA_CLOCKS);
+        // The validated epochs' version and the clocks made when the clocks
+        // last followed them.
+        let mut followed = None;
+        let mut lag_second = 0;
         let mut plan = self.forwarder.as_ref().map_or_else(
             || ForwardPlan::new(0, 0),
             |forwarder| ForwardPlan::new(forwarder.socket_groups.len(), forwarder.warm_paths()),
@@ -1164,6 +1409,12 @@ impl ClassThread {
                 }
             };
             let woke = Instant::now();
+            let woke_us = now_unix_us();
+            self.turn_clocks(&mut clocks, &mut followed, woke_us);
+            if self.class == TrafficClass::Audio && woke_us / 1_000_000 != lag_second {
+                lag_second = woke_us / 1_000_000;
+                self.stats.roll_duplicate_lag();
+            }
             // A wait that timed out is idle time, not lag: the next gap
             // starts after it.
             let gap_us = if ready == 0 {
@@ -1178,7 +1429,9 @@ impl ClassThread {
                 if ready & (1 << index) == 0 {
                     continue;
                 }
-                loop {
+                // A few batches, then the next socket: what is left is
+                // still readable at the next wait.
+                for _ in 0..SOCKET_TURN_BATCHES {
                     let received = match batch.recv(socket) {
                         Ok(received) => received,
                         Err(error) => {
@@ -1196,6 +1449,7 @@ impl ClassThread {
                             *path,
                             &mut kernel_dropped[index],
                             &mut dedup,
+                            &mut clocks,
                             &mut plan,
                             &mut pending,
                             &mut clients,
@@ -1252,6 +1506,27 @@ impl ClassThread {
         }
     }
 
+    /// The media clocks at the start of a turn: the local time, by which a
+    /// clock goes idle, and the epochs the cache validated since they last
+    /// looked (or for a stream whose clock is new).
+    fn turn_clocks(
+        &self,
+        clocks: &mut MediaClocks,
+        followed: &mut Option<(u64, u64)>,
+        now_us: u64,
+    ) {
+        clocks.tick(now_us);
+        // The version before the epochs: a write after this read is seen
+        // at the next turn.
+        let seen = (self.epochs.version(), clocks.created());
+        if *followed != Some(seen) {
+            clocks.follow(&self.epochs);
+            *followed = Some(seen);
+        }
+        self.stats.media_clock_overflow[self.class.index()]
+            .store(clocks.overflow(), Ordering::Relaxed);
+    }
+
     /// Send every relay parent this node's demand, from each audio socket:
     /// a parent knows its child by the address its symbols go to, and
     /// ignores a report from any other (a promoted secondary parent sends
@@ -1284,6 +1559,10 @@ impl ClassThread {
                 }
             }
             worst = worst.max(meter.loss_ppm());
+            if let Some(lane) = self.stats.lane(self.class, self.sockets[index].0) {
+                lane.loss_ppm
+                    .store(u64::from(meter.loss_ppm()), Ordering::Relaxed);
+            }
         }
         self.stats
             .parent_loss_ppm
@@ -1322,6 +1601,7 @@ impl ClassThread {
         path: RelayIngressParentPath,
         kernel_dropped: &mut u32,
         dedup: &mut FirstArrival,
+        clocks: &mut MediaClocks,
         plan: &mut ForwardPlan,
         pending: &mut Vec<Pending>,
         clients: &mut ClientPlan,
@@ -1355,6 +1635,12 @@ impl ClassThread {
         clients.clear();
         self.stats.received[class.index()].fetch_add(batch.len() as u64, Ordering::Relaxed);
         self.stats.batches[class.index()].fetch_add(1, Ordering::Relaxed);
+        let parent_lane = self.stats.lane(class, path);
+        if let Some(parent_lane) = parent_lane {
+            parent_lane
+                .received
+                .fetch_add(batch.len() as u64, Ordering::Relaxed);
+        }
         for message in 0..batch.len() {
             let received = batch.get(message);
             if let Some(dropped) = received.dropped {
@@ -1390,6 +1676,9 @@ impl ClassThread {
                 if let Some(meter) = meter.as_deref_mut() {
                     if let Some(sent) = decode_ledger(received.data) {
                         meter.ledger(peer, sent, *kernel_dropped, now);
+                        if let Some(parent_lane) = parent_lane {
+                            parent_lane.ledger(peer, now_us);
+                        }
                         continue;
                     }
                 }
@@ -1414,7 +1703,30 @@ impl ClassThread {
             });
             if !admitted {
                 self.stats.not_admitted.fetch_add(1, Ordering::Relaxed);
+                if let Some(parent_lane) = parent_lane {
+                    parent_lane.not_admitted.fetch_add(1, Ordering::Relaxed);
+                }
                 continue;
+            }
+            // On its stream's own timeline (A 2.5): a datagram of an ended
+            // session, or a budget behind its stream's head (a sender that
+            // was frozen and resumes), is neither forwarded nor teed, and
+            // makes no parent look live.
+            match clocks.observe(
+                MediaClocks::key(view.tenant, view.stream),
+                view.epoch,
+                view.deadline_us,
+                self.media_deadline_us,
+            ) {
+                Verdict::Fresh => {}
+                Verdict::StaleEpoch => {
+                    self.stats.stale_epoch.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                Verdict::StaleMedia => {
+                    self.stats.stale_media.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
             }
             self.failover.observe(path, view.role, now);
             let key = dedup.key(
@@ -1428,12 +1740,25 @@ impl ClassThread {
                 view.object,
                 view.packet_sequence,
             );
-            if dedup.first(key, 0, rx_us, 0) != Arrival::First {
-                self.stats.duplicates.fetch_add(1, Ordering::Relaxed);
-                continue;
+            // The audio class compares the bytes of every copy (A 2.7).
+            let digest = if class == TrafficClass::Audio {
+                dedup::digest(received.data)
+            } else {
+                0
+            };
+            match dedup.first(key, digest, rx_us, lane_index(path) as u8) {
+                Arrival::First => {
+                    if let Some(parent_lane) = parent_lane {
+                        parent_lane.first_arrivals.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                duplicate @ Arrival::Duplicate { .. } => {
+                    self.stats.record_duplicate(class, path, duplicate, &view);
+                    continue;
+                }
             }
             if let Some(forwarder) = &self.forwarder {
-                forwarder.plan_fast(message, &view, plan, now);
+                forwarder.plan_fast(message, &view, plan, now, self.media_deadline_us);
             }
             if let (Some(descriptors), Some((children, snapshot))) =
                 (descriptors.as_deref_mut(), &descriptor_lease)
@@ -1449,7 +1774,15 @@ impl ClassThread {
                 );
             }
             if let Some((_, snapshot)) = &lease {
-                plan_lease(snapshot, class, message, &view, plan, now_us);
+                plan_lease(
+                    snapshot,
+                    class,
+                    message,
+                    &view,
+                    plan,
+                    now_us,
+                    self.media_deadline_us,
+                );
             }
             if let Some((lane, snapshot)) = &edge_clients {
                 clients.plan(lane, snapshot, message, &view);
@@ -1546,11 +1879,7 @@ fn record_kernel_drops(
     }
     let more = u64::from(dropped.wrapping_sub(*last));
     stats.kernel_dropped.fetch_add(more, Ordering::Relaxed);
-    let lane = match path {
-        RelayIngressParentPath::Primary => 0,
-        RelayIngressParentPath::Secondary => 1,
-    };
-    stats.kernel_dropped_lanes[class.index()][lane].fetch_add(more, Ordering::Relaxed);
+    stats.kernel_dropped_lanes[class.index()][lane_index(path)].fetch_add(more, Ordering::Relaxed);
     *last = dropped;
 }
 
@@ -1991,6 +2320,16 @@ pub async fn run_relay_class_ingest(
     ]));
     cache.update_relay_ingress(dispatch.receiver().snapshot());
     let failover = Arc::new(FailoverInputs::new());
+    // The epochs that the cache takes up, for the threads' media clocks.
+    let epochs = Arc::new(ValidatedEpochs::new(VALIDATED_EPOCH_STREAMS));
+    {
+        let epochs = Arc::clone(&epochs);
+        cache
+            .on_source_epoch(Arc::new(move |stream_id, epoch| {
+                epochs.set(stream_id, epoch)
+            }))
+            .await;
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let reply_socket = match sockets.iter().find(|socket| {
         socket.class == TrafficClass::Audio && socket.path == RelayIngressParentPath::Primary
@@ -2038,6 +2377,8 @@ pub async fn run_relay_class_ingest(
             demand_peers: Arc::clone(&demand_peers),
             lease_descriptors: config.lease_descriptors,
             video_gro: config.video_gro,
+            media_deadline_us: config.media_deadline_us,
+            epochs: Arc::clone(&epochs),
         };
         match std::thread::Builder::new()
             .name(format!("needletail-fast-{}", class.as_str()))
@@ -2166,8 +2507,62 @@ fn tee_ended(ended: Result<(TrafficClass, Result<()>), tokio::task::JoinError>) 
 }
 
 #[cfg(test)]
+mod two_contributors;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lane_reports_its_loss_only_while_its_ledgers_are_fresh() {
+        let stats = FastPlaneStats::default();
+        let lane = stats
+            .lane(TrafficClass::Audio, RelayIngressParentPath::Secondary)
+            .unwrap();
+        assert!(stats
+            .lane(TrafficClass::Video, RelayIngressParentPath::Secondary)
+            .is_none());
+        let peer: SocketAddr = "10.77.1.7:22301".parse().unwrap();
+        let now_us = 1_763_924_000_000_000;
+        // No ledger yet: nothing measured.
+        let snapshot = stats.parent_lane_snapshot(1, now_us);
+        assert_eq!(snapshot.lane, ParentLane::Secondary);
+        assert_eq!((snapshot.ledger_age_ms, snapshot.loss_ppm), (None, None));
+        lane.ledger(peer, now_us);
+        lane.loss_ppm.store(5_000, Ordering::Relaxed);
+        let snapshot = stats.parent_lane_snapshot(1, now_us + 400_000);
+        assert_eq!(snapshot.peer, Some(peer));
+        assert_eq!(
+            (snapshot.ledger_age_ms, snapshot.loss_ppm),
+            (Some(400), Some(5_000))
+        );
+        // The parent stopped sending ledgers: its last estimate is not loss.
+        let snapshot = stats.parent_lane_snapshot(1, now_us + 3_000_000);
+        assert_eq!(
+            (snapshot.ledger_age_ms, snapshot.loss_ppm),
+            (Some(3_000), None)
+        );
+        let json = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(json["lane"], "secondary");
+        assert_eq!(json["peer"], "10.77.1.7:22301");
+        assert!(json["loss_ppm"].is_null());
+    }
+
+    #[test]
+    fn a_lanes_lag_is_the_largest_of_the_last_whole_second_or_the_one_under_way() {
+        let stats = FastPlaneStats::default();
+        let lane = &stats.parent_lanes[0];
+        lane.lag_now_us.fetch_max(310, Ordering::Relaxed);
+        lane.lag_now_us.fetch_max(40, Ordering::Relaxed);
+        assert_eq!(stats.parent_lane_snapshot(0, 0).duplicate_lag_max_us, 310);
+        stats.roll_duplicate_lag();
+        lane.lag_now_us.fetch_max(20, Ordering::Relaxed);
+        assert_eq!(stats.parent_lane_snapshot(0, 0).duplicate_lag_max_us, 310);
+        stats.roll_duplicate_lag();
+        assert_eq!(stats.parent_lane_snapshot(0, 0).duplicate_lag_max_us, 20);
+        stats.roll_duplicate_lag();
+        assert_eq!(stats.parent_lane_snapshot(0, 0).duplicate_lag_max_us, 0);
+    }
 
     #[test]
     fn a_socket_drop_counts_in_all_and_for_its_lane() {
