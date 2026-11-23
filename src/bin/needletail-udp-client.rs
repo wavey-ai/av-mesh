@@ -1658,7 +1658,7 @@ async fn main() -> Result<()> {
             .map(|interval| interval.as_secs_f64() * 1_000.0),
         nack_rtt_ms: receiver
             .compact
-            .rtt()
+            .leg_rtt(av_mesh::client_compact::LegId::FIRST)
             .map(|rtt| rtt.as_secs_f64() * 1_000.0),
         compact_confirmed: session.compact_confirmed,
         final_compact_plan: compact_asked.then(|| plan.word()),

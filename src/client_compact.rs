@@ -964,6 +964,67 @@ pub const MIN_KNOWN_PARTS: usize = 2 * MAX_WINDOW as usize;
 /// this long to arrive.
 const SETTLE: Duration = Duration::from_millis(150);
 
+/// The most legs of one receiver: a listener's subscriptions at different
+/// edges, two wanted and a replacement or a hedge each.
+pub const MAX_LEGS: usize = 4;
+/// A leg whose `OK` names a part this far behind the newest part delivered
+/// is stale: its edge handed out an old head (after its admission wait).
+pub const STALE_PARTS: u64 = 4_096;
+/// Delivered parts whose arrivals are kept, for each leg's lag.
+const ARRIVALS: usize = 64;
+/// The last delivered parts over which a leg is judged steady or level.
+pub const JUDGED_PARTS: usize = 32;
+/// A leg that brought at least this many of the judged parts is steady.
+pub const STEADY_PARTS: usize = 28;
+/// A leg that brought fewer of the judged parts than this has no lag to
+/// be compared with: a leg beside it is level once it is steady.
+pub const COMPARED_PARTS: usize = 16;
+/// A leg is level with another when its median lag is at most this much
+/// more than the other's.
+pub const LEVEL_MARGIN: Duration = Duration::from_micros(250);
+
+/// One leg of a receiver: the parts that one edge sends one listener.
+/// Rows, loss and numbering are the leg's own; delivery is shared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LegId(u8);
+
+impl LegId {
+    /// The first leg that a receiver opens.
+    pub const FIRST: Self = Self(0);
+
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// What a leg's `OK` means for the session (see
+/// [`CompactReceiver::leg_expect`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegStart {
+    /// The leg starts at the part its `OK` names.
+    Started,
+    /// The part its `OK` names is more than [`STALE_PARTS`] behind the
+    /// newest part delivered: the leg is failed, nothing of it delivered.
+    Stale,
+    /// The parts delivered so far all came from this other leg, which the
+    /// new leg shows to be more than [`STALE_PARTS`] behind: that leg is
+    /// failed, and the session starts again at the new leg's first part.
+    Displaces(LegId),
+}
+
+/// Counters of one leg.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LegStats {
+    /// Compact datagrams from this leg.
+    pub datagrams: u64,
+    /// Parts that this leg delivered first.
+    pub parts_first: u64,
+    /// Datagrams of parts delivered already (by this leg or another).
+    pub duplicates: u64,
+    /// Datagrams of parts below the session's first part: dropped.
+    pub before_start: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Hole {
     since: Instant,
@@ -989,6 +1050,9 @@ struct WindowState {
     t: usize,
     rows: Vec<(u8, Vec<u8>)>,
     seen_at: Instant,
+    /// A part recovered from it failed its length, CRC or number: the
+    /// window is kept, and counted once.
+    failed: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -996,6 +1060,62 @@ struct Count {
     received: u8,
     sent: u8,
     at: Instant,
+}
+
+/// The canonical bytes of a part, and the leg they came from.
+#[derive(Debug)]
+struct Known {
+    leg: LegId,
+    bytes: Vec<u8>,
+}
+
+/// When a delivered part first arrived, and when each leg brought it (an
+/// original or a copy).
+#[derive(Debug, Clone, Copy)]
+struct Arrival {
+    part: u64,
+    first: Option<Instant>,
+    legs: [Option<Instant>; MAX_LEGS],
+}
+
+const NO_ARRIVAL: Arrival = Arrival {
+    part: u64::MAX,
+    first: None,
+    legs: [None; MAX_LEGS],
+};
+
+/// Whether a part delivered came as an original or a copy from some leg
+/// (else it needed a row or a NACK), for the joint loss.
+#[derive(Debug, Clone, Copy)]
+struct Joint {
+    came: bool,
+    at: Instant,
+}
+
+/// What the receiver keeps of one leg.
+#[derive(Debug, Default)]
+struct LegRx {
+    open: bool,
+    /// The part its `OK` named: the reference of its part numbers until a
+    /// part of it comes (kept across a new source generation, as the
+    /// reference of before).
+    reference: Option<u64>,
+    /// The edge's first part for this subscriber (it answers NACKs from
+    /// it on): set by the `OK`, cleared by a new source generation.
+    first_part: Option<u64>,
+    /// The highest part of this leg's own datagrams.
+    highest: Option<u64>,
+    /// Short-form parts of this leg that came before its `OK`.
+    early: Vec<Vec<u8>>,
+    windows: BTreeMap<u64, WindowState>,
+    counts: BTreeMap<u64, Count>,
+    window_counts: HashMap<u64, Count>,
+    last_copies: u8,
+    run: u64,
+    burst_sum: u64,
+    burst_runs: u64,
+    rtt: Option<Duration>,
+    stats: LegStats,
 }
 
 /// Counters of a compact receiver.
@@ -1019,35 +1139,42 @@ pub struct CompactStats {
     /// of an older generation dropped.
     pub generation_changes: u64,
     pub stale_generation: u64,
+    /// Datagrams of parts below the session's first part, dropped.
+    pub before_start: u64,
+    /// Windows whose recovery failed its check on bytes that another leg
+    /// brought: two edges' bytes of a part differ (L1's byte identity).
+    pub cross_leg_mismatch: u64,
 }
 
-/// The receiving side of the compact lane.
+/// The receiving side of the compact lane, for one listener with one leg
+/// or several. The first arrival of a part number is delivered; a part's
+/// canonical bytes, the holes and the part interval are shared; each leg
+/// has its own part numbering, loss, burst and window repair, so that rows
+/// from two edges never meet in one decode.
 #[derive(Debug, Default)]
 pub struct CompactReceiver {
     /// The edge sends this client the compact lane: holes are tracked for
-    /// NACK and counted as loss (see [`Self::expect_from`]).
+    /// NACK and counted as loss (see [`Self::leg_expect`]).
     active: bool,
-    reference: Option<u64>,
-    known: HashMap<u64, Vec<u8>>,
+    legs: [LegRx; MAX_LEGS],
+    known: HashMap<u64, Known>,
     known_order: VecDeque<u64>,
     delivered: HashSet<u64>,
     delivered_order: VecDeque<u64>,
-    windows: BTreeMap<u64, WindowState>,
+    /// The newest part delivered.
     highest: Option<u64>,
+    /// The session's first part (the first delivered, or the part that
+    /// its leg's `OK` named before it) and the leg that set it: another
+    /// leg's parts below it are dropped (see [`Self::below_floor`]).
+    floor: Option<u64>,
+    floor_leg: Option<LegId>,
+    /// The leg whose bytes of a part replace another leg's (the repair
+    /// leg): its rows are coded over its edge's bytes.
+    prefer_leg: Option<LegId>,
     holes: BTreeMap<u64, Hole>,
-    counts: BTreeMap<u64, Count>,
-    window_counts: HashMap<u64, Count>,
-    last_copies: u8,
-    run: u64,
-    burst_sum: u64,
-    burst_runs: u64,
-    window_received: u64,
-    window_sent: u64,
     /// Parts delivered as gaps: the part itself, if it comes, is delivered
     /// after its gap.
     gapped: BTreeSet<u64>,
-    /// The round trip of the client's path to its edge, if measured.
-    rtt: Option<Duration>,
     /// When the highest part last advanced, and the interval between
     /// parts (an average of the originals' arrivals).
     highest_at: Option<Instant>,
@@ -1072,14 +1199,11 @@ pub struct CompactReceiver {
     nack_tokens_at: Option<Instant>,
     /// NACKs of parts held back by the rate cap.
     pub nacks_capped: u64,
-    /// Short-form parts that came before the edge's `OK` (no reference for
-    /// their 16 bits yet): kept, and read once the `OK` names the first part
-    /// (wave 8: a subscribe spike delays the `OK` behind the fast lane's
-    /// first parts; they were dropped, and not asked for again).
-    early: Vec<Vec<u8>>,
-    /// Drop such parts, as before wave 8.
+    /// Drop short-form parts that come before their leg's `OK`, as before
+    /// wave 8 (wave 8: a subscribe spike delays the `OK` behind the fast
+    /// lane's first parts; they were dropped, and not asked for again).
     pub drop_early: bool,
-    /// Parts kept that way.
+    /// Short-form parts kept until their leg's `OK`.
     pub early_kept: u64,
     /// The source generation of the parts, once a datagram named one, and
     /// the generations before it (their late datagrams are dropped).
@@ -1091,6 +1215,15 @@ pub struct CompactReceiver {
     time_anchor: Option<(u64, Instant)>,
     /// Parts whose bytes are kept for window repair (0: [`MEMORY`]).
     known_parts: usize,
+    /// The arrivals of the last [`ARRIVALS`] parts delivered, by part
+    /// number modulo [`ARRIVALS`] (sized on first use).
+    arrivals: Vec<Arrival>,
+    /// Parts delivered or missed, until they settle, for the joint loss;
+    /// and the runs of parts that no leg brought.
+    joint: BTreeMap<u64, Joint>,
+    joint_run: u64,
+    joint_run_sum: u64,
+    joint_runs: u64,
     pub stats: CompactStats,
 }
 
@@ -1114,27 +1247,120 @@ impl CompactReceiver {
         }
     }
 
-    /// The part that the edge will send first (its `OK`): the reference
-    /// for the 32-bit part numbers until a part arrives.
-    pub fn expect_from(&mut self, part: u64, compact: bool) {
-        self.reference = Some(part);
-        self.active |= compact;
-        // Parts that came before this OK (an earlier OK was lost and the
-        // subscription asked again): the ones from the part it names up to
-        // the highest that came are holes, to ask for (wave 7 gate: under
-        // bursts a client whose OK was lost dropped the short parts that
-        // came first, and never asked for them again).
-        if let Some(highest) = self.highest {
-            self.note_holes(part, highest, Instant::now());
+    /// A new leg, if fewer than [`MAX_LEGS`] are open.
+    pub fn open_leg(&mut self) -> Option<LegId> {
+        let index = self.legs.iter().position(|leg| !leg.open)?;
+        self.legs[index] = LegRx {
+            open: true,
+            ..LegRx::default()
+        };
+        Some(LegId(index as u8))
+    }
+
+    /// Forget a leg: its windows, counts and early parts. What it
+    /// delivered stays delivered.
+    pub fn close_leg(&mut self, leg: LegId) {
+        self.legs[leg.index()] = LegRx::default();
+        if self.prefer_leg == Some(leg) {
+            self.prefer_leg = None;
+        }
+        if self.floor_leg == Some(leg) {
+            self.floor_leg = None;
         }
     }
 
-    /// Parts `from..to` that have not come are holes (none if the run is
-    /// longer than [`MAX_HOLE_RUN`], or the lane is not compact).
+    pub fn is_open(&self, leg: LegId) -> bool {
+        self.legs[leg.index()].open
+    }
+
+    /// The leg whose bytes of a part are kept over another leg's (the
+    /// repair leg, whose edge codes its rows over its own bytes).
+    pub fn set_prefer_leg(&mut self, leg: Option<LegId>) {
+        self.prefer_leg = leg;
+    }
+
+    pub fn leg_stats(&self, leg: LegId) -> LegStats {
+        self.legs[leg.index()].stats
+    }
+
+    /// The highest part of a leg's own datagrams.
+    pub fn leg_highest(&self, leg: LegId) -> Option<u64> {
+        self.legs[leg.index()].highest
+    }
+
+    /// The part that a leg's `OK` named (the edge's first part for it).
+    pub fn leg_first_part(&self, leg: LegId) -> Option<u64> {
+        self.legs[leg.index()].first_part
+    }
+
+    /// The newest part delivered, and the session's first part.
+    pub fn newest(&self) -> Option<u64> {
+        self.highest
+    }
+
+    pub fn floor(&self) -> Option<u64> {
+        self.floor
+    }
+
+    /// A leg's `OK`: the part that its edge sends it first (the reference
+    /// for its 32-bit part numbers until a part of it arrives), and whether
+    /// it sends the compact lane (holes are then asked for with NACK).
+    pub fn leg_expect(&mut self, leg: LegId, part: u64, compact: bool) -> LegStart {
+        if let Some(newest) = self.highest {
+            if part.saturating_add(STALE_PARTS) < newest {
+                return LegStart::Stale;
+            }
+            if part > newest.saturating_add(STALE_PARTS) {
+                let mut first = self
+                    .legs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, other)| other.open && other.stats.parts_first > 0);
+                if let (Some((only, _)), None) = (first.next(), first.next()) {
+                    let only = LegId(only as u8);
+                    if only != leg {
+                        self.reset_delivery();
+                        let rx = &mut self.legs[leg.index()];
+                        rx.reference = Some(part);
+                        rx.first_part = Some(part);
+                        self.active |= compact;
+                        return LegStart::Displaces(only);
+                    }
+                }
+            }
+        }
+        let rx = &mut self.legs[leg.index()];
+        rx.reference = Some(part);
+        rx.first_part = Some(part);
+        self.active |= compact;
+        // Parts of this leg that came before this OK (an earlier OK was
+        // lost and the subscription asked again): the ones from the part
+        // it names up to the highest that came are holes, to ask for (wave
+        // 7 gate: under bursts a client whose OK was lost dropped the short
+        // parts that came first, and never asked for them again).
+        if let Some(highest) = rx.highest {
+            let now = Instant::now();
+            self.leg_losses(leg, part, highest, now);
+            if self.floor_leg == Some(leg)
+                && self
+                    .floor
+                    .is_some_and(|floor| part < floor && floor - part <= STALE_PARTS)
+            {
+                self.floor = Some(part);
+            }
+            self.note_holes(part, highest, now);
+        }
+        LegStart::Started
+    }
+
+    /// Parts `from..to` that have not been delivered are holes (none if
+    /// the run is longer than [`MAX_HOLE_RUN`], or the lane is not
+    /// compact, or below the session's first part).
     fn note_holes(&mut self, from: u64, to: u64, now: Instant) {
         if !self.active || to <= from || to - from > MAX_HOLE_RUN {
             return;
         }
+        let from = self.floor.map_or(from, |floor| from.max(floor));
         let delay = self.nack_timing().delay;
         for hole in from..to {
             if self.delivered.contains(&hole) {
@@ -1149,51 +1375,116 @@ impl CompactReceiver {
                 silence_nacks: 0,
                 capped: false,
             });
-            self.counts.entry(hole).or_insert(Count {
-                received: 0,
-                sent: 1 + self.last_copies,
+            self.joint.entry(hole).or_insert(Joint {
+                came: false,
                 at: now,
             });
         }
     }
 
-    /// The short-form parts kept until the `OK` (see `early`), to push now.
-    pub fn take_early(&mut self) -> Vec<Vec<u8>> {
-        std::mem::take(&mut self.early)
+    /// Parts `from..to` that a leg has not brought count as its losses
+    /// once they settle (none if the run is longer than [`MAX_HOLE_RUN`],
+    /// or the lane is not compact).
+    fn leg_losses(&mut self, leg: LegId, from: u64, to: u64, now: Instant) {
+        if !self.active || to <= from || to - from > MAX_HOLE_RUN {
+            return;
+        }
+        let rx = &mut self.legs[leg.index()];
+        let sent = 1 + rx.last_copies;
+        for part in from..to {
+            rx.counts.entry(part).or_insert(Count {
+                received: 0,
+                sent,
+                at: now,
+            });
+        }
     }
 
-    /// Forget everything of the last edge (or of the last source epoch,
-    /// whose part numbers the new one counts again).
-    pub fn new_flow(&mut self) {
+    /// A leg brought `part` (an original, a copy or a RaptorQ object): its
+    /// highest part moves, and the parts it skipped are its losses.
+    fn leg_reached(&mut self, leg: LegId, part: u64, now: Instant) {
+        let rx = &self.legs[leg.index()];
+        match (rx.highest, rx.first_part) {
+            (Some(highest), _) if part > highest => {
+                self.leg_losses(leg, highest + 1, part, now);
+                self.legs[leg.index()].highest = Some(part);
+            }
+            (Some(_), _) => {}
+            (None, first) => {
+                // Its first part: the parts from the one its OK named up
+                // to it were lost on the way.
+                if let Some(first) = first {
+                    self.leg_losses(leg, first, part, now);
+                }
+                self.legs[leg.index()].highest = Some(part);
+            }
+        }
+    }
+
+    /// The short-form parts of a leg kept until its `OK` (see `early`), to
+    /// push now.
+    pub fn take_early(&mut self, leg: LegId) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.legs[leg.index()].early)
+    }
+
+    /// Forget every part delivered: the session starts again (a stale leg
+    /// displaced, or a new source epoch).
+    fn reset_delivery(&mut self) {
         self.known.clear();
         self.known_order.clear();
         self.delivered.clear();
         self.delivered_order.clear();
-        self.windows.clear();
         self.highest = None;
         self.highest_at = None;
+        self.floor = None;
+        self.floor_leg = None;
         self.silence_noted = None;
         self.silence_spent = 0;
-        self.early.clear();
         self.holes.clear();
-        self.counts.clear();
-        self.window_counts.clear();
         self.gapped.clear();
-        self.run = 0;
+        self.arrivals.clear();
+        self.joint.clear();
+        self.joint_run = 0;
+    }
+
+    /// Forget everything of the last source epoch, whose part numbers the
+    /// new one counts again: the parts delivered and every leg's windows,
+    /// counts and early parts. The legs stay open, with their round trips.
+    pub fn new_flow(&mut self) {
+        self.reset_delivery();
+        for rx in self.legs.iter_mut().filter(|rx| rx.open) {
+            *rx = LegRx {
+                open: true,
+                reference: rx.reference,
+                rtt: rx.rtt,
+                stats: rx.stats,
+                ..LegRx::default()
+            };
+        }
         self.time_anchor = None;
     }
 
-    /// A round trip of the client's path to its edge (a request and its
+    /// A round trip of a leg's path to its edge (a request and its
     /// answer): NACKs are not repeated sooner than an answer can come.
-    pub fn set_rtt(&mut self, sample: Duration) {
-        self.rtt = Some(match self.rtt {
+    pub fn set_leg_rtt(&mut self, leg: LegId, sample: Duration) {
+        let rx = &mut self.legs[leg.index()];
+        rx.rtt = Some(match rx.rtt {
             Some(rtt) => (rtt * 7 + sample) / 8,
             None => sample,
         });
     }
 
-    pub fn rtt(&self) -> Option<Duration> {
-        self.rtt
+    pub fn leg_rtt(&self, leg: LegId) -> Option<Duration> {
+        self.legs[leg.index()].rtt
+    }
+
+    /// The shortest round trip of an open leg.
+    fn shortest_rtt(&self) -> Option<Duration> {
+        self.legs
+            .iter()
+            .filter(|rx| rx.open)
+            .filter_map(|rx| rx.rtt)
+            .min()
     }
 
     /// The NACK timing (see [`NackTiming`]; the default is wave 6's).
@@ -1306,10 +1597,11 @@ impl CompactReceiver {
     }
 
     /// The wait between the first two NACKs of a hole: [`NACK_RETRY`], or
-    /// one and a half round trips if that is longer.
+    /// one and a half round trips of the nearest leg if that is longer.
     pub fn nack_retry(&self) -> Duration {
         let floor = self.nack_timing().retry_floor;
-        self.rtt.map_or(floor, |rtt| floor.max(rtt * 3 / 2))
+        self.shortest_rtt()
+            .map_or(floor, |rtt| floor.max(rtt * 3 / 2))
     }
 
     /// A part came as a gap: remember it, and ask for the part again a
@@ -1365,29 +1657,81 @@ impl CompactReceiver {
         }
     }
 
-    /// A part came on a RaptorQ lane: it is delivered, and it is no compact
-    /// part whose loss counts. `false` if it had been delivered.
-    pub fn delivered_elsewhere(&mut self, part: u64, now: Instant) -> bool {
-        let first = self.mark_delivered(part, now);
-        if first {
-            self.counts.remove(&part);
+    /// A part came on a RaptorQ lane of `leg`: it is delivered (unless it
+    /// is below the session's first part), and it is no compact part whose
+    /// loss counts. `false` if it had been delivered or is dropped.
+    pub fn delivered_elsewhere(&mut self, leg: LegId, part: u64, now: Instant) -> bool {
+        self.leg_reached(leg, part, now);
+        self.legs[leg.index()].counts.remove(&part);
+        if self.below_floor(leg, part) {
+            return false;
         }
+        self.record_leg_arrival(leg, part, now);
+        let first = self.mark_delivered(leg, part, now);
+        self.joint
+            .entry(part)
+            .or_insert(Joint { came: true, at: now })
+            .came = true;
         first
     }
 
-    fn part_number(&self, low: u32) -> u64 {
-        extend_u32(self.highest.or(self.reference).unwrap_or(0), low)
+    /// A part number from its low 32 bits, extended around the leg's own
+    /// last part, else the part its `OK` named, else the newest part
+    /// delivered.
+    fn part_number(&self, leg: LegId, low: u32) -> u64 {
+        let rx = &self.legs[leg.index()];
+        extend_u32(
+            rx.highest.or(rx.reference).or(self.highest).unwrap_or(0),
+            low,
+        )
     }
 
-    fn remember(&mut self, part: u64, datagram: Vec<u8>) {
-        if self.known.insert(part, datagram).is_none() {
-            self.known_order.push_back(part);
-            if self.known_order.len() > self.known_limit() {
-                if let Some(old) = self.known_order.pop_front() {
-                    self.known.remove(&old);
+    /// Whether `part` of `leg` is below the session's first part, and so
+    /// dropped (counted on the session and on the leg). The leg that set
+    /// the first part brings older parts of its own (a resume from a hole,
+    /// whose backfill comes after the fast lane's live parts): they lower
+    /// the first part, unless they are [`STALE_PARTS`] below it.
+    fn below_floor(&mut self, leg: LegId, part: u64) -> bool {
+        let Some(floor) = self.floor.filter(|floor| part < *floor) else {
+            return false;
+        };
+        if self.floor_leg == Some(leg) && floor - part <= STALE_PARTS {
+            self.floor = Some(part);
+            return false;
+        }
+        self.stats.before_start += 1;
+        self.legs[leg.index()].stats.before_start += 1;
+        true
+    }
+
+    /// Keep a part's canonical bytes for window repair. The bytes of the
+    /// preferred leg replace another leg's; no other bytes replace any.
+    /// `true` when they replaced different bytes.
+    fn remember(&mut self, leg: LegId, part: u64, datagram: Vec<u8>) -> bool {
+        if let Some(known) = self.known.get_mut(&part) {
+            if known.leg != leg && self.prefer_leg == Some(leg) {
+                known.leg = leg;
+                if known.bytes != datagram {
+                    known.bytes = datagram;
+                    return true;
                 }
             }
+            return false;
         }
+        self.known.insert(
+            part,
+            Known {
+                leg,
+                bytes: datagram,
+            },
+        );
+        self.known_order.push_back(part);
+        if self.known_order.len() > self.known_limit() {
+            if let Some(old) = self.known_order.pop_front() {
+                self.known.remove(&old);
+            }
+        }
+        false
     }
 
     /// Whether `part` has been delivered (by any lane).
@@ -1395,9 +1739,34 @@ impl CompactReceiver {
         self.delivered.contains(&part)
     }
 
-    /// A part was delivered, by this lane or another: holes before it are
-    /// noted, and it is no longer one. `false` if it had been delivered.
-    pub fn mark_delivered(&mut self, part: u64, now: Instant) -> bool {
+    /// The arrival record of `part`, made anew when the part is newer
+    /// than the one in its place; `None` for a part older than that.
+    fn arrival(&mut self, part: u64) -> Option<&mut Arrival> {
+        if self.arrivals.is_empty() {
+            self.arrivals = vec![NO_ARRIVAL; ARRIVALS];
+        }
+        let slot = &mut self.arrivals[(part % ARRIVALS as u64) as usize];
+        if slot.part == u64::MAX || slot.part < part {
+            *slot = Arrival {
+                part,
+                ..NO_ARRIVAL
+            };
+        }
+        (slot.part == part).then_some(slot)
+    }
+
+    /// A leg brought `part` (an original or a copy): its arrival, for the
+    /// leg's lag.
+    fn record_leg_arrival(&mut self, leg: LegId, part: u64, now: Instant) {
+        if let Some(arrival) = self.arrival(part) {
+            arrival.legs[leg.index()].get_or_insert(now);
+        }
+    }
+
+    /// A part was delivered, by `leg` on this lane or another: holes
+    /// before it are noted, and it is no longer one. `false` if it had been
+    /// delivered.
+    pub fn mark_delivered(&mut self, leg: LegId, part: u64, now: Instant) -> bool {
         if !self.delivered.insert(part) {
             return false;
         }
@@ -1408,6 +1777,20 @@ impl CompactReceiver {
             }
         }
         self.holes.remove(&part);
+        if let Some(arrival) = self.arrival(part) {
+            arrival.first.get_or_insert(now);
+        }
+        self.legs[leg.index()].stats.parts_first += 1;
+        if self.floor.is_none() {
+            // The session's first part: this one, or the part its leg's OK
+            // named when that is before it (those between were lost on the
+            // way, or come after it).
+            let first = self.legs[leg.index()]
+                .first_part
+                .filter(|first| *first <= part && part - *first <= STALE_PARTS);
+            self.floor = Some(first.unwrap_or(part));
+            self.floor_leg = Some(leg);
+        }
         let delay = self.nack_timing().delay;
         let timing = self.nack_timing();
         let retry = self.nack_retry();
@@ -1456,9 +1839,8 @@ impl CompactReceiver {
                                     entry.next_nack.min(at)
                                 };
                             }
-                            self.counts.entry(hole).or_insert(Count {
-                                received: 0,
-                                sent: 1 + self.last_copies,
+                            self.joint.entry(hole).or_insert(Joint {
+                                came: false,
                                 at: now,
                             });
                         }
@@ -1472,26 +1854,34 @@ impl CompactReceiver {
                 self.highest_at = Some(now);
                 // The first part after the OK: the parts from the one the OK
                 // named up to it were lost on the way.
-                if let Some(reference) = self.reference {
-                    self.note_holes(reference, part, now);
+                if let Some(first) = self.legs[leg.index()].first_part {
+                    self.note_holes(first, part, now);
                 }
             }
         }
         true
     }
 
-    /// Push one compact datagram; returns the parts it delivered (itself,
-    /// and any that a window's repair recovered with it).
-    pub fn push(&mut self, datagram: &[u8], now: Instant, now_unix_us: u64) -> Vec<CompactPart> {
+    /// Push one compact datagram of `leg`; returns the parts it delivered
+    /// (itself, and any that a window's repair recovered with it).
+    pub fn push(
+        &mut self,
+        leg: LegId,
+        datagram: &[u8],
+        now: Instant,
+        now_unix_us: u64,
+    ) -> Vec<CompactPart> {
         // A part in the short form is read in its long form, which is what
         // the window repair covers.
         let long;
+        let mut anchored = true;
         let datagram = if is_short(datagram) {
-            // Its 16 bits of part number need a reference: the edge's OK
-            // or a part. Before either, it is dropped (and asked again).
-            let Some(reference) = self.highest.or(self.reference) else {
-                if !self.drop_early && self.early.len() < MAX_EARLY {
-                    self.early.push(datagram.to_vec());
+            // Its 16 bits of part number need a reference of its own leg:
+            // the leg's OK or a part. Before either, it waits for the OK.
+            let rx = &mut self.legs[leg.index()];
+            let Some(reference) = rx.highest.or(rx.reference) else {
+                if !self.drop_early && rx.early.len() < MAX_EARLY {
+                    rx.early.push(datagram.to_vec());
                     self.early_kept += 1;
                     return Vec::new();
                 }
@@ -1500,10 +1890,20 @@ impl CompactReceiver {
                 return Vec::new();
             };
             // Its 24 bits of time are extended around the edge's clock as
-            // the last long-form part gave it, not the client's own.
-            let reference_us = self.time_anchor.map_or(now_unix_us, |(published, at)| {
-                published + now.saturating_duration_since(at).as_micros() as u64
-            });
+            // the last long-form part gave it. Before any, around the
+            // client's own clock, which may be more than 8 s off the
+            // source's: its long form may then be wrong, and is not kept
+            // for window repair (a wrong part there would also read as a
+            // cross-leg mismatch).
+            let reference_us = match self.time_anchor {
+                Some((published, at)) => {
+                    published + now.saturating_duration_since(at).as_micros() as u64
+                }
+                None => {
+                    anchored = false;
+                    now_unix_us
+                }
+            };
             match lengthen(datagram, reference, reference_us) {
                 Some(datagram) => {
                     long = datagram;
@@ -1525,6 +1925,7 @@ impl CompactReceiver {
             datagram
         };
         self.stats.datagrams += 1;
+        self.legs[leg.index()].stats.datagrams += 1;
         let Some(view) = parse(datagram) else {
             self.stats.errors += 1;
             return Vec::new();
@@ -1534,7 +1935,7 @@ impl CompactReceiver {
             return Vec::new();
         }
         self.active = true;
-        let part = self.part_number(view.part_low);
+        let part = self.part_number(leg, view.part_low);
         let mut out = Vec::new();
         match view.kind {
             Kind::Repair => {
@@ -1544,17 +1945,19 @@ impl CompactReceiver {
                     self.stats.errors += 1;
                     return out;
                 }
-                let count = self.window_counts.entry(part).or_insert(Count {
+                let rx = &mut self.legs[leg.index()];
+                let count = rx.window_counts.entry(part).or_insert(Count {
                     received: 0,
                     sent: rows,
                     at: now,
                 });
                 count.received = count.received.saturating_add(1);
-                let window = self.windows.entry(part).or_insert(WindowState {
+                let window = rx.windows.entry(part).or_insert(WindowState {
                     k,
                     t: view.payload.len(),
                     rows: Vec::new(),
                     seen_at: now,
+                    failed: false,
                 });
                 if window.k == k
                     && window.t == view.payload.len()
@@ -1562,12 +1965,13 @@ impl CompactReceiver {
                 {
                     window.rows.push((row, view.payload.to_vec()));
                 }
-                self.try_window(part, now, now_unix_us, &mut out);
+                self.try_window(leg, part, now, now_unix_us, &mut out);
             }
             Kind::Part | Kind::Gap => {
                 if view.retransmit {
                     self.stats.retransmits += 1;
-                    // The answer to the only NACK of a hole: a round trip.
+                    // The answer to the only NACK of a hole: a round trip
+                    // of the leg it came from.
                     if let Some(Hole {
                         nacks: 1,
                         last_nack: Some(at),
@@ -1576,7 +1980,7 @@ impl CompactReceiver {
                     }) = self.holes.get(&part)
                     {
                         let sample = now.saturating_duration_since(*at);
-                        self.set_rtt(sample);
+                        self.set_leg_rtt(leg, sample);
                     }
                 } else {
                     // The interval between parts, from the originals that
@@ -1600,8 +2004,11 @@ impl CompactReceiver {
                             self.interval_samples = self.interval_samples.saturating_add(1);
                         }
                     }
-                    self.last_copies = view.copies;
-                    let count = self.counts.entry(part).or_insert(Count {
+                    // The leg's own loss: its parts and their copies.
+                    self.leg_reached(leg, part, now);
+                    let rx = &mut self.legs[leg.index()];
+                    rx.last_copies = view.copies;
+                    let count = rx.counts.entry(part).or_insert(Count {
                         received: 0,
                         sent: 1 + view.copies,
                         at: now,
@@ -1609,25 +2016,58 @@ impl CompactReceiver {
                     count.received = count.received.saturating_add(1);
                     count.sent = 1 + view.copies;
                 }
+                if self.below_floor(leg, part) {
+                    return out;
+                }
+                if !view.retransmit {
+                    self.record_leg_arrival(leg, part, now);
+                    if let Some(joint) = self.joint.get_mut(&part) {
+                        joint.came = true;
+                    }
+                }
                 let canonical = canonical(&datagram[..HEADER_LEN + view.payload.len()]);
                 // The part after its gap: the edge got it late. It is
                 // delivered (once), and replaces the gap's bytes.
                 if view.kind == Kind::Part && self.gapped.remove(&part) {
                     self.holes.remove(&part);
-                    self.known.insert(part, canonical);
+                    if anchored {
+                        self.known.insert(
+                            part,
+                            Known {
+                                leg,
+                                bytes: canonical,
+                            },
+                        );
+                    } else {
+                        self.known.remove(&part);
+                    }
                     out.push(self.part_of(part, &view, now_unix_us, false));
                     self.try_windows_with(part, now, now_unix_us, &mut out);
                     return out;
                 }
                 if view.kind == Kind::Gap && self.delivered.contains(&part) {
                     self.stats.duplicates += 1;
+                    self.legs[leg.index()].stats.duplicates += 1;
                     return out;
                 }
-                self.remember(part, canonical);
-                if !self.mark_delivered(part, now) {
+                let replaced = anchored && self.remember(leg, part, canonical);
+                if !self.mark_delivered(leg, part, now) {
                     self.stats.duplicates += 1;
+                    self.legs[leg.index()].stats.duplicates += 1;
+                    if replaced {
+                        // The preferred leg's bytes: a window kept after a
+                        // failed check may now recover.
+                        self.try_windows_with(part, now, now_unix_us, &mut out);
+                    }
                     return out;
                 }
+                self.joint
+                    .entry(part)
+                    .or_insert(Joint {
+                        came: false,
+                        at: now,
+                    })
+                    .came |= !view.retransmit;
                 if view.kind == Kind::Gap {
                     self.note_gap(part, now);
                 }
@@ -1674,7 +2114,7 @@ impl CompactReceiver {
         }
     }
 
-    /// Try the windows that hold `part`.
+    /// Try the windows of every leg that hold `part`.
     fn try_windows_with(
         &mut self,
         part: u64,
@@ -1682,39 +2122,45 @@ impl CompactReceiver {
         now_unix_us: u64,
         out: &mut Vec<CompactPart>,
     ) {
-        let firsts: Vec<u64> = self
-            .windows
-            .range(part.saturating_sub(u64::from(MAX_WINDOW))..=part)
-            .filter(|(first, window)| part < **first + u64::from(window.k))
-            .map(|(first, _)| *first)
-            .collect();
-        for first in firsts {
-            self.try_window(first, now, now_unix_us, out);
+        let mut firsts = Vec::new();
+        for (index, rx) in self.legs.iter().enumerate() {
+            firsts.extend(
+                rx.windows
+                    .range(part.saturating_sub(u64::from(MAX_WINDOW))..=part)
+                    .filter(|(first, window)| part < **first + u64::from(window.k))
+                    .map(|(first, _)| (LegId(index as u8), *first)),
+            );
+        }
+        for (leg, first) in firsts {
+            self.try_window(leg, first, now, now_unix_us, out);
         }
     }
 
     /// Recover what a window's repair can, and then what the recovered parts
-    /// make recoverable in the other windows.
+    /// make recoverable in the other windows (of any leg). A window whose
+    /// recovered part fails its check is kept, to be tried again when other
+    /// bytes or a NACK's answer come.
     fn try_window(
         &mut self,
+        leg: LegId,
         first: u64,
         now: Instant,
         now_unix_us: u64,
         out: &mut Vec<CompactPart>,
     ) {
-        let mut queue = vec![first];
-        while let Some(first) = queue.pop() {
-            let Some(window) = self.windows.get(&first) else {
+        let mut queue = vec![(leg, first)];
+        while let Some((leg, first)) = queue.pop() {
+            let Some(window) = self.legs[leg.index()].windows.get(&first) else {
                 continue;
             };
-            let parts: Vec<u64> = (first..first + u64::from(window.k)).collect();
-            if parts.iter().all(|part| self.delivered.contains(part)) {
-                self.windows.remove(&first);
+            let parts = first..first + u64::from(window.k);
+            if parts.clone().all(|part| self.delivered.contains(&part)) {
+                self.legs[leg.index()].windows.remove(&first);
                 continue;
             }
             let known: Vec<Option<&[u8]>> = parts
-                .iter()
-                .map(|part| self.known.get(part).map(Vec::as_slice))
+                .clone()
+                .map(|part| self.known.get(&part).map(|known| known.bytes.as_slice()))
                 .collect();
             let rows: Vec<(u8, &[u8])> = window
                 .rows
@@ -1724,35 +2170,59 @@ impl CompactReceiver {
             let Some(recovered) = recover_window(&known, window.t, &rows) else {
                 continue;
             };
-            self.windows.remove(&first);
+            let mut checked = true;
             for (index, padded) in recovered {
                 let part = first + index as u64;
+                // The edge's bytes of a part differ from the ones the
+                // client has: the window is kept, and NACK fetches the part.
                 let Some(view) = parse(&padded) else {
-                    // The edge's bytes of a part differ from the ones the
-                    // client has: NACK will fetch it.
-                    self.stats.errors += 1;
+                    checked = false;
                     continue;
                 };
-                if self.part_number(view.part_low) != part {
-                    self.stats.errors += 1;
+                if self.part_number(leg, view.part_low) != part {
+                    checked = false;
                     continue;
                 }
                 let datagram = padded[..HEADER_LEN + view.payload.len()].to_vec();
-                self.remember(part, datagram);
-                if self.mark_delivered(part, now) {
+                self.remember(leg, part, datagram);
+                if self.mark_delivered(leg, part, now) {
+                    self.joint.entry(part).or_insert(Joint {
+                        came: false,
+                        at: now,
+                    });
                     if view.kind == Kind::Gap {
                         self.note_gap(part, now);
                     }
                     out.push(self.part_of(part, &view, now_unix_us, true));
                     // Other windows that held it may now be complete enough.
-                    queue.extend(
-                        self.windows
-                            .range(part.saturating_sub(u64::from(MAX_WINDOW))..=part)
-                            .filter(|(other, window)| {
-                                **other != first && part < **other + u64::from(window.k)
-                            })
-                            .map(|(other, _)| *other),
-                    );
+                    for (index, rx) in self.legs.iter().enumerate() {
+                        queue.extend(
+                            rx.windows
+                                .range(part.saturating_sub(u64::from(MAX_WINDOW))..=part)
+                                .filter(|(other, window)| {
+                                    (index != leg.index() || **other != first)
+                                        && part < **other + u64::from(window.k)
+                                })
+                                .map(|(other, _)| (LegId(index as u8), *other)),
+                        );
+                    }
+                }
+            }
+            if checked {
+                self.legs[leg.index()].windows.remove(&first);
+                continue;
+            }
+            let foreign = (first..first + u64::from(self.legs[leg.index()].windows[&first].k))
+                .any(|part| self.known.get(&part).is_some_and(|known| known.leg != leg));
+            let window = self.legs[leg.index()]
+                .windows
+                .get_mut(&first)
+                .expect("the window tried");
+            if !window.failed {
+                window.failed = true;
+                self.stats.errors += 1;
+                if foreign {
+                    self.stats.cross_leg_mismatch += 1;
                 }
             }
         }
@@ -1895,15 +2365,16 @@ impl CompactReceiver {
         self.holes.keys().next().copied()
     }
 
-    /// Settle the counts of parts and windows older than the settle time:
-    /// (datagrams received, datagrams sent) of the originals and copies of
-    /// parts and of window repair since the last call. Runs of datagrams
-    /// lost in a row are counted as bursts: all the datagrams of a part
-    /// lost whole, and the lost ones of a part that came (which end the
-    /// run). A copy lost with its part is part of the burst, so a burst
-    /// that copies cannot beat reads as one.
-    pub fn take_counts(&mut self, now: Instant) -> (u64, u64) {
-        let settled: Vec<u64> = self
+    /// Settle a leg's counts of parts and windows older than the settle
+    /// time: (datagrams received, datagrams sent) of the originals and
+    /// copies of its parts and of its window repair since the last call.
+    /// Runs of datagrams lost in a row are counted as bursts: all the
+    /// datagrams of a part lost whole, and the lost ones of a part that
+    /// came (which end the run). A copy lost with its part is part of the
+    /// burst, so a burst that copies cannot beat reads as one.
+    pub fn take_counts(&mut self, leg: LegId, now: Instant) -> (u64, u64) {
+        let rx = &mut self.legs[leg.index()];
+        let settled: Vec<u64> = rx
             .counts
             .iter()
             .take_while(|(_, count)| now.duration_since(count.at) >= SETTLE)
@@ -1911,46 +2382,156 @@ impl CompactReceiver {
             .collect();
         let (mut received, mut sent) = (0_u64, 0_u64);
         for part in settled {
-            let count = self.counts.remove(&part).unwrap();
+            let count = rx.counts.remove(&part).unwrap();
             let came = count.received.min(count.sent);
             received += u64::from(came);
             sent += u64::from(count.sent);
-            self.run += u64::from(count.sent - came);
-            if came > 0 && self.run > 0 {
-                self.burst_sum += self.run;
-                self.burst_runs += 1;
-                self.run = 0;
+            rx.run += u64::from(count.sent - came);
+            if came > 0 && rx.run > 0 {
+                rx.burst_sum += rx.run;
+                rx.burst_runs += 1;
+                rx.run = 0;
             }
         }
-        let windows: Vec<u64> = self
+        let windows: Vec<u64> = rx
             .window_counts
             .iter()
             .filter(|(_, count)| now.duration_since(count.at) >= SETTLE)
             .map(|(first, _)| *first)
             .collect();
         for first in windows {
-            let count = self.window_counts.remove(&first).unwrap();
+            let count = rx.window_counts.remove(&first).unwrap();
             received += u64::from(count.received.min(count.sent));
             sent += u64::from(count.sent);
         }
         // Windows whose parts all came, or that are too old to help.
-        self.windows
+        rx.windows
             .retain(|_, window| now.duration_since(window.seen_at) < HOLE_GIVE_UP);
-        self.window_received += received;
-        self.window_sent += sent;
         (received, sent)
     }
 
-    /// The mean length of the runs of compact datagrams lost in a row since
-    /// the last call, if any run ended.
-    pub fn take_burst(&mut self) -> Option<f64> {
-        if self.burst_runs == 0 {
+    /// The mean length of the runs of a leg's compact datagrams lost in a
+    /// row since the last call, if any run ended.
+    pub fn take_burst(&mut self, leg: LegId) -> Option<f64> {
+        let rx = &mut self.legs[leg.index()];
+        if rx.burst_runs == 0 {
             return None;
         }
-        let mean = self.burst_sum as f64 / self.burst_runs as f64;
-        self.burst_sum = 0;
-        self.burst_runs = 0;
+        let mean = rx.burst_sum as f64 / rx.burst_runs as f64;
+        rx.burst_sum = 0;
+        rx.burst_runs = 0;
         Some(mean)
+    }
+
+    /// The joint loss since the last call, of the parts settled: the share
+    /// of parts that no leg brought as an original or a copy (they needed a
+    /// row or a NACK, or never came), and the mean run of such parts if a
+    /// run ended. `None` when no part settled.
+    pub fn take_joint(&mut self, now: Instant) -> Option<(f64, Option<f64>)> {
+        let (mut parts, mut missed) = (0_u64, 0_u64);
+        while let Some(entry) = self.joint.first_entry() {
+            if now.duration_since(entry.get().at) < SETTLE {
+                break;
+            }
+            let joint = entry.remove();
+            parts += 1;
+            if joint.came {
+                if self.joint_run > 0 {
+                    self.joint_run_sum += self.joint_run;
+                    self.joint_runs += 1;
+                    self.joint_run = 0;
+                }
+            } else {
+                missed += 1;
+                self.joint_run += 1;
+            }
+        }
+        if parts == 0 {
+            return None;
+        }
+        let burst = (self.joint_runs > 0).then(|| self.joint_run_sum as f64 / self.joint_runs as f64);
+        self.joint_run_sum = 0;
+        self.joint_runs = 0;
+        Some((missed as f64 / parts as f64, burst))
+    }
+
+    /// The indices in `arrivals` of the last [`JUDGED_PARTS`] parts
+    /// delivered, and how many there are.
+    fn judged(&self) -> ([usize; JUDGED_PARTS], usize) {
+        let mut indices = [0_usize; JUDGED_PARTS];
+        let Some(newest) = self.highest else {
+            return (indices, 0);
+        };
+        let mut candidates = [(0_u64, 0_usize); ARRIVALS];
+        let mut count = 0;
+        for (index, arrival) in self.arrivals.iter().enumerate() {
+            if arrival.first.is_some()
+                && arrival.part <= newest
+                && arrival.part + ARRIVALS as u64 > newest
+            {
+                candidates[count] = (arrival.part, index);
+                count += 1;
+            }
+        }
+        let candidates = &mut candidates[..count];
+        candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        let judged = count.min(JUDGED_PARTS);
+        for (slot, (_, index)) in indices.iter_mut().zip(candidates.iter()).take(judged) {
+            *slot = *index;
+        }
+        (indices, judged)
+    }
+
+    /// How many of the last [`JUDGED_PARTS`] parts delivered a leg brought,
+    /// and its median lag behind their first arrival.
+    fn brought(&self, leg: LegId) -> (usize, Option<Duration>) {
+        let (indices, judged) = self.judged();
+        let mut lags = [Duration::ZERO; JUDGED_PARTS];
+        let mut brought = 0;
+        for index in &indices[..judged] {
+            let arrival = &self.arrivals[*index];
+            if let (Some(first), Some(at)) = (arrival.first, arrival.legs[leg.index()]) {
+                lags[brought] = at.saturating_duration_since(first);
+                brought += 1;
+            }
+        }
+        if brought == 0 {
+            return (0, None);
+        }
+        let lags = &mut lags[..brought];
+        lags.sort_unstable();
+        (brought, Some(lags[brought / 2]))
+    }
+
+    /// A leg's median lag behind the first arrival over the last
+    /// [`JUDGED_PARTS`] parts delivered that it brought (0 on a part it
+    /// brought first).
+    pub fn leg_lag(&self, leg: LegId) -> Option<Duration> {
+        self.brought(leg).1
+    }
+
+    /// A leg brought at least [`STEADY_PARTS`] of the last
+    /// [`JUDGED_PARTS`] parts delivered.
+    pub fn steady(&self, leg: LegId) -> bool {
+        self.brought(leg).0 >= STEADY_PARTS
+    }
+
+    /// Leg `new` is level with leg `old`: it is steady, and its median lag
+    /// is at most [`LEVEL_MARGIN`] more than `old`'s (or `old` brought
+    /// fewer than [`COMPARED_PARTS`] of the parts judged).
+    pub fn level(&self, new: LegId, old: LegId) -> bool {
+        let (brought, lag) = self.brought(new);
+        if brought < STEADY_PARTS {
+            return false;
+        }
+        let (old_brought, old_lag) = self.brought(old);
+        if old_brought < COMPARED_PARTS {
+            return true;
+        }
+        match (lag, old_lag) {
+            (Some(lag), Some(old_lag)) => lag <= old_lag + LEVEL_MARGIN,
+            _ => false,
+        }
     }
 }
 
@@ -1958,15 +2539,24 @@ impl CompactReceiver {
 mod tests {
     use super::*;
 
-    fn before() -> CompactReceiver {
+    const L: LegId = LegId::FIRST;
+
+    /// A receiver with its first leg open.
+    fn rx() -> CompactReceiver {
         let mut receiver = CompactReceiver::new();
+        assert_eq!(receiver.open_leg(), Some(L));
+        receiver
+    }
+
+    fn before() -> CompactReceiver {
+        let mut receiver = rx();
         receiver.set_nack_timing(NackTiming::BEFORE);
         receiver
     }
 
     /// Wave 6 and 7's timing: silence NACKs without wave 8's bounds.
     fn wave6() -> CompactReceiver {
-        let mut receiver = CompactReceiver::new();
+        let mut receiver = rx();
         receiver.set_nack_timing(NackTiming::WAVE6);
         receiver
     }
@@ -1980,18 +2570,18 @@ mod tests {
         start: Instant,
         interval: Duration,
     ) -> Instant {
-        receiver.expect_from(first, true);
+        receiver.leg_expect(L, first, true);
         let mut at = start;
         for part in first..first + parts {
             at = start + interval * (part - first) as u32;
-            receiver.push(&encode_part(part, 0, &payload(part, 10)).unwrap(), at, 0);
+            receiver.push(L, &encode_part(part, 0, &payload(part, 10)).unwrap(), at, 0);
         }
         at
     }
 
     #[test]
     fn a_hole_is_asked_for_a_quarter_millisecond_after_a_later_part_shows_it() {
-        let mut receiver = CompactReceiver::new();
+        let mut receiver = rx();
         assert_eq!(receiver.nack_timing(), NackTiming::default());
         let start = Instant::now();
         let ms = Duration::from_millis(1);
@@ -1999,7 +2589,7 @@ mod tests {
         assert_eq!(receiver.part_interval(), Some(ms));
         // Part 20 is lost; 21 shows it.
         let at = last + ms * 2;
-        receiver.push(&encode_part(21, 0, &payload(21, 10)).unwrap(), at, 0);
+        receiver.push(L, &encode_part(21, 0, &payload(21, 10)).unwrap(), at, 0);
         assert!(receiver.nacks_due(at, 64).is_empty());
         assert_eq!(receiver.nacks_due(at + FAST_NACK_DELAY, 64), vec![20]);
         // Repeated after the 2 ms floor (no round trip measured), not before.
@@ -2031,7 +2621,7 @@ mod tests {
         // The burst ends: 123 comes; 120-122 are holes now, asked for
         // again after the delay of a new hole.
         let end = last + ms * 4 + Duration::from_micros(300);
-        receiver.push(&encode_part(123, 0, &payload(123, 10)).unwrap(), end, 0);
+        receiver.push(L, &encode_part(123, 0, &payload(123, 10)).unwrap(), end, 0);
         assert_eq!(receiver.holes(), 3);
         assert!(receiver.nacks_due(end, 64).is_empty());
         assert_eq!(
@@ -2041,7 +2631,7 @@ mod tests {
         for part in [120_u64, 121, 122] {
             let mut again = encode_part(part, 0, &payload(part, 10)).unwrap();
             set_flags(&mut again, 0, true);
-            assert_eq!(receiver.push(&again, end, 0).len(), 1);
+            assert_eq!(receiver.push(L, &again, end, 0).len(), 1);
         }
         assert_eq!(receiver.holes(), 0);
         // A silence-asked part that no part shows lost is not abandoned
@@ -2088,14 +2678,14 @@ mod tests {
     #[test]
     fn a_jittery_path_waits_longer_before_it_asks_for_a_silence() {
         let mut receiver = wave6();
-        receiver.expect_from(0, true);
+        receiver.leg_expect(L, 0, true);
         let start = Instant::now();
         // 1 ms parts that arrive 0.9 ms early or late in turn.
         let mut at = start;
         for part in 0..200_u64 {
             let offset = if part % 2 == 0 { 0 } else { 900 };
             at = start + Duration::from_micros(part * 1_000 + offset);
-            receiver.push(&encode_part(part, 0, &payload(part, 10)).unwrap(), at, 0);
+            receiver.push(L, &encode_part(part, 0, &payload(part, 10)).unwrap(), at, 0);
         }
         let silence = receiver.next_nack_at().unwrap() - at;
         assert!(
@@ -2109,7 +2699,7 @@ mod tests {
     /// next part's due time.
     #[test]
     fn a_silence_is_asked_for_only_past_the_wider_margin() {
-        let mut receiver = CompactReceiver::new();
+        let mut receiver = rx();
         let start = Instant::now();
         let ms = Duration::from_millis(1);
         let last = fed(&mut receiver, 100, 20, start, ms);
@@ -2117,7 +2707,7 @@ mod tests {
         assert!(receiver.nacks_due(last + ms * 3, 64).is_empty());
         // The next part comes 3.5 ms late: nothing was asked for.
         let late = last + Duration::from_micros(3_500);
-        receiver.push(&encode_part(120, 0, &payload(120, 10)).unwrap(), late, 0);
+        receiver.push(L, &encode_part(120, 0, &payload(120, 10)).unwrap(), late, 0);
         assert_eq!(receiver.stats.nacked, 0);
         // Wave 6 asked for it after 2 ms.
         let mut old = wave6();
@@ -2129,17 +2719,17 @@ mod tests {
     /// margin after it is that of the stream's interval.
     #[test]
     fn a_stall_is_no_sample_of_the_interval() {
-        let mut receiver = CompactReceiver::new();
+        let mut receiver = rx();
         let start = Instant::now();
         let ms = Duration::from_millis(1);
         let last = fed(&mut receiver, 0, 50, start, ms);
         // 300 ms of nothing, then the stream goes on.
         let resumed = last + ms * 300;
-        receiver.push(&encode_part(50, 0, &payload(50, 10)).unwrap(), resumed, 0);
+        receiver.push(L, &encode_part(50, 0, &payload(50, 10)).unwrap(), resumed, 0);
         assert_eq!(receiver.part_interval(), Some(ms));
         let mut old = wave6();
         let last = fed(&mut old, 0, 50, start, ms);
-        old.push(&encode_part(50, 0, &payload(50, 10)).unwrap(), last + ms * 300, 0);
+        old.push(L, &encode_part(50, 0, &payload(50, 10)).unwrap(), last + ms * 300, 0);
         assert!(old.part_interval().unwrap() > ms * 10);
     }
 
@@ -2151,15 +2741,15 @@ mod tests {
     fn a_short_seed_or_a_burst_does_not_hold_the_interval_down() {
         let ms = Duration::from_millis(1);
         let start = Instant::now();
-        let mut receiver = CompactReceiver::new();
-        receiver.expect_from(0, true);
-        receiver.push(&encode_part(0, 0, &payload(0, 10)).unwrap(), start, 0);
+        let mut receiver = rx();
+        receiver.leg_expect(L, 0, true);
+        receiver.push(L, &encode_part(0, 0, &payload(0, 10)).unwrap(), start, 0);
         let mut at = start + Duration::from_micros(100);
-        receiver.push(&encode_part(1, 0, &payload(1, 10)).unwrap(), at, 0);
+        receiver.push(L, &encode_part(1, 0, &payload(1, 10)).unwrap(), at, 0);
         assert_eq!(receiver.part_interval(), Some(Duration::from_micros(100)));
         for part in 2..40 {
             at += ms;
-            receiver.push(&encode_part(part, 0, &payload(part, 10)).unwrap(), at, 0);
+            receiver.push(L, &encode_part(part, 0, &payload(part, 10)).unwrap(), at, 0);
             assert!(receiver.nacks_due(at, 64).is_empty());
         }
         let interval = receiver.part_interval().unwrap();
@@ -2170,14 +2760,14 @@ mod tests {
         // A burst of 30 parts 80 us apart, then the stream goes on.
         for part in 40..70 {
             at += Duration::from_micros(80);
-            receiver.push(&encode_part(part, 0, &payload(part, 10)).unwrap(), at, 0);
+            receiver.push(L, &encode_part(part, 0, &payload(part, 10)).unwrap(), at, 0);
         }
         let interval = receiver.part_interval().unwrap();
         assert!(interval > Duration::from_micros(900), "{interval:?}");
         let mut asked = 0;
         for part in 70..200 {
             at += ms;
-            receiver.push(&encode_part(part, 0, &payload(part, 10)).unwrap(), at, 0);
+            receiver.push(L, &encode_part(part, 0, &payload(part, 10)).unwrap(), at, 0);
             asked += receiver.nacks_due(at, 64).len();
             asked += receiver.nacks_due(at + Duration::from_micros(990), 64).len();
         }
@@ -2189,12 +2779,12 @@ mod tests {
     /// counted once a wait, not once a poll.
     #[test]
     fn a_capped_hole_is_counted_once_a_wait() {
-        let mut receiver = CompactReceiver::new();
+        let mut receiver = rx();
         let start = Instant::now();
-        receiver.expect_from(0, true);
-        receiver.push(&encode_part(0, 0, &payload(0, 10)).unwrap(), start, 0);
+        receiver.leg_expect(L, 0, true);
+        receiver.push(L, &encode_part(0, 0, &payload(0, 10)).unwrap(), start, 0);
         // 100 parts lost at once.
-        receiver.push(&encode_part(101, 0, &payload(101, 10)).unwrap(), start, 0);
+        receiver.push(L, &encode_part(101, 0, &payload(101, 10)).unwrap(), start, 0);
         let at = start + FAST_NACK_DELAY;
         let first = receiver.nacks_due(at, 256).len();
         assert_eq!(first, DEFAULT_NACK_RATE_CAP as usize / 4);
@@ -2210,8 +2800,8 @@ mod tests {
     /// ordinary schedule.
     #[test]
     fn a_silence_spends_its_budget_and_waits_for_a_datagram() {
-        let mut receiver = CompactReceiver::new();
-        receiver.set_rtt(Duration::from_millis(1));
+        let mut receiver = rx();
+        receiver.set_leg_rtt(L, Duration::from_millis(1));
         let start = Instant::now();
         let ms = Duration::from_millis(1);
         let last = fed(&mut receiver, 0, 50, start, ms);
@@ -2252,7 +2842,7 @@ mod tests {
     /// the retry after its last NACK.
     #[test]
     fn a_backlog_after_a_stall_is_not_nacked_between_its_datagrams() {
-        let mut receiver = CompactReceiver::new();
+        let mut receiver = rx();
         // (The rate cap apart: its own test.)
         receiver.set_nack_timing(NackTiming {
             rate_cap: 0,
@@ -2272,8 +2862,8 @@ mod tests {
         }
         assert!(asked.contains_key(&50));
         // The backlog: 51 and 52 come (50 is lost), then the reads go on.
-        receiver.push(&encode_part(51, 0, &payload(51, 10)).unwrap(), at, 0);
-        receiver.push(&encode_part(52, 0, &payload(52, 10)).unwrap(), at, 0);
+        receiver.push(L, &encode_part(51, 0, &payload(51, 10)).unwrap(), at, 0);
+        receiver.push(L, &encode_part(52, 0, &payload(52, 10)).unwrap(), at, 0);
         // 50, which the silence asked for, waits the retry after its last
         // NACK (2 ms floor), not the 250 us of a new hole; holes past 52
         // that the silence asked for wait for the next silence: none is
@@ -2295,17 +2885,17 @@ mod tests {
     /// it waits for tokens.
     #[test]
     fn the_nacks_are_capped_at_the_rate_and_do_not_spin() {
-        let mut receiver = CompactReceiver::new();
+        let mut receiver = rx();
         let start = Instant::now();
         let ms = Duration::from_millis(1);
-        receiver.expect_from(0, true);
+        receiver.leg_expect(L, 0, true);
         // Every other part lost for a second: 500 holes.
         let mut at = start;
         let mut asked = 0;
         let mut wakes = 0;
         for part in (0..1_000_u64).step_by(2) {
             at = start + ms * part as u32;
-            receiver.push(&encode_part(part, 0, &payload(part, 10)).unwrap(), at, 0);
+            receiver.push(L, &encode_part(part, 0, &payload(part, 10)).unwrap(), at, 0);
             let mut now = at;
             while let Some(next) = receiver.next_nack_at().filter(|next| *next <= at + ms) {
                 now = next.max(now);
@@ -2317,16 +2907,16 @@ mod tests {
         let cap = DEFAULT_NACK_RATE_CAP as usize;
         assert!(asked <= cap + cap / 4 + 1, "{asked} parts asked for in a second");
         assert!(receiver.nacks_capped > 0);
-        let mut free = CompactReceiver::new();
+        let mut free = rx();
         free.set_nack_timing(NackTiming {
             rate_cap: 0,
             ..NackTiming::default()
         });
-        free.expect_from(0, true);
+        free.leg_expect(L, 0, true);
         let mut all = 0;
         for part in (0..1_000_u64).step_by(2) {
             let at = start + ms * part as u32;
-            free.push(&encode_part(part, 0, &payload(part, 10)).unwrap(), at, 0);
+            free.push(L, &encode_part(part, 0, &payload(part, 10)).unwrap(), at, 0);
             all += free.nacks_due(at + ms, 64).len();
         }
         assert!(all > cap, "{all} without the cap");
@@ -2345,14 +2935,14 @@ mod tests {
     #[test]
     fn a_receiver_keeps_the_bytes_of_as_many_parts_as_it_is_told() {
         let now = Instant::now();
-        let mut default = CompactReceiver::new();
-        let mut small = CompactReceiver::new();
+        let mut default = rx();
+        let mut small = rx();
         small.set_known_parts(200);
         for receiver in [&mut default, &mut small] {
-            receiver.expect_from(0, true);
+            receiver.leg_expect(L, 0, true);
             for part in 0..5_000_u64 {
                 let datagram = encode_part(part, 1, &payload(part, 300)).unwrap();
-                assert_eq!(receiver.push(&datagram, now, 1).len(), 1);
+                assert_eq!(receiver.push(L, &datagram, now, 1).len(), 1);
             }
         }
         assert_eq!(default.known.len(), MEMORY);
@@ -2385,15 +2975,15 @@ mod tests {
         // The receiver says which parts came marked; a part recovered from
         // window repair is not marked.
         let now = Instant::now();
-        let mut receiver = CompactReceiver::new();
-        receiver.expect_from(5, true);
+        let mut receiver = rx();
+        receiver.leg_expect(L, 5, true);
         let mut marked = encode_part(5, 1_700_000_000_000_500, &bytes).unwrap();
         set_fast_lane(&mut marked);
-        let parts = receiver.push(&marked, now, 1_700_000_000_001_000);
+        let parts = receiver.push(L, &marked, now, 1_700_000_000_001_000);
         assert_eq!(parts.len(), 1);
         assert!(parts[0].fast_lane);
         let unmarked = encode_part(6, 1_700_000_000_001_500, &payload(6, 40)).unwrap();
-        assert!(!receiver.push(&unmarked, now, 1_700_000_000_002_000)[0].fast_lane);
+        assert!(!receiver.push(L, &unmarked, now, 1_700_000_000_002_000)[0].fast_lane);
     }
 
     /// The short form (wave 7 item 9): 7 bytes of header, the flags kept,
@@ -2456,17 +3046,28 @@ mod tests {
         }
         // A short part before any reference is dropped; after the OK it is
         // a part.
-        let mut receiver = CompactReceiver::new();
+        let mut receiver = rx();
         let long = encode_part(70_000, 1_700_000_000_000_000, &bytes).unwrap();
         let short = shorten(&long).unwrap();
         let now = Instant::now();
-        assert!(receiver.push(&short, now, 1_700_000_000_001_000).is_empty());
-        receiver.expect_from(69_999, true);
-        let parts = receiver.push(&short, now, 1_700_000_000_001_000);
+        assert!(receiver.push(L, &short, now, 1_700_000_000_001_000).is_empty());
+        receiver.leg_expect(L, 69_999, true);
+        let parts = receiver.push(L, &short, now, 1_700_000_000_001_000);
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].part, 70_000);
         assert_eq!(parts[0].payload, bytes);
+        // No long-form part has given the edge's clock yet: the time is
+        // read around the client's, and the long form, which may be wrong,
+        // is not kept (B X2, seam A).
         assert_eq!(parts[0].published_unix_us, 1_700_000_000_000_000);
+        assert!(!receiver.known.contains_key(&70_000));
+        // After one, the short form's time is read.
+        let anchor = encode_part(70_144, 1_700_000_000_144_000, &bytes).unwrap();
+        assert_eq!(receiver.push(L, &anchor, now, 1_700_000_000_145_000).len(), 1);
+        let next = shorten(&encode_part(70_145, 1_700_000_000_145_000, &bytes).unwrap()).unwrap();
+        let parts = receiver.push(L, &next, now, 1_700_000_000_146_000);
+        assert_eq!(parts[0].published_unix_us, 1_700_000_000_145_000);
+        assert!(receiver.known.contains_key(&70_145));
     }
 
     /// Wave 7 gate: the first parts that a client misses are asked for
@@ -2479,19 +3080,19 @@ mod tests {
         let start = Instant::now();
         let delay = Duration::from_millis(5);
         // The OK names 700; 700..=702 are lost and 703 comes first.
-        let mut receiver = CompactReceiver::new();
-        receiver.expect_from(700, true);
+        let mut receiver = rx();
+        receiver.leg_expect(L, 700, true);
         let first = encode_part(703, 1_700_000_000_000_000, &bytes).unwrap();
-        assert_eq!(receiver.push(&first, start, 1_700_000_000_001_000).len(), 1);
+        assert_eq!(receiver.push(L, &first, start, 1_700_000_000_001_000).len(), 1);
         assert_eq!(receiver.nacks_due(start + delay, 64), vec![700, 701, 702]);
         // A part (long, as every 256th is) came before the OK, which names
         // an older part: the parts between are asked for.
-        let mut receiver = CompactReceiver::new();
+        let mut receiver = rx();
         let anchor = encode_part(768, 1_700_000_000_000_000, &bytes).unwrap();
         assert!(shorten(&anchor).is_none());
         receiver.active = true;
-        assert_eq!(receiver.push(&anchor, start, 1_700_000_000_001_000).len(), 1);
-        receiver.expect_from(760, true);
+        assert_eq!(receiver.push(L, &anchor, start, 1_700_000_000_001_000).len(), 1);
+        receiver.leg_expect(L, 760, true);
         assert_eq!(
             receiver.nacks_due(start + delay, 64),
             (760..768).collect::<Vec<_>>()
@@ -2506,12 +3107,12 @@ mod tests {
         let bytes = payload(4, 56);
         let edge_us = 1_763_812_345_678_901_u64;
         let client_off_us = 60_000_000;
-        let mut receiver = CompactReceiver::new();
-        receiver.expect_from(511, true);
+        let mut receiver = rx();
+        receiver.leg_expect(L, 511, true);
         let start = Instant::now();
         let anchor = encode_part(512, edge_us, &bytes).unwrap();
         assert!(shorten(&anchor).is_none(), "part 512 keeps the long form");
-        let parts = receiver.push(&anchor, start, edge_us + client_off_us);
+        let parts = receiver.push(L, &anchor, start, edge_us + client_off_us);
         assert_eq!(parts.len(), 1);
         for index in 1..300_u64 {
             let part = 512 + index;
@@ -2519,7 +3120,7 @@ mod tests {
             let long = encode_part(part, published, &bytes).unwrap();
             let datagram = shorten(&long).unwrap_or(long.clone());
             let at = start + Duration::from_millis(index);
-            let parts = receiver.push(&datagram, at, published + client_off_us + 500);
+            let parts = receiver.push(L, &datagram, at, published + client_off_us + 500);
             assert_eq!(parts.len(), 1, "part {part}");
             // The long form it keeps (for window repair) is the edge's.
             assert_eq!(
@@ -2527,7 +3128,7 @@ mod tests {
                 long
             );
             assert_eq!(
-                u32::from_be_bytes(receiver.known[&part][7..11].try_into().unwrap())
+                u32::from_be_bytes(receiver.known[&part].bytes[7..11].try_into().unwrap())
                     as u64,
                 published & 0xffff_ffff,
                 "part {part}"
@@ -2678,27 +3279,27 @@ mod tests {
             set_generation(&mut datagram, generation);
             datagram
         };
-        let mut receiver = CompactReceiver::new();
-        receiver.expect_from(1_000, true);
+        let mut receiver = rx();
+        receiver.leg_expect(L, 1_000, true);
         for part in 1_000..1_010 {
-            assert_eq!(receiver.push(&stamped(part, old), start, 0).len(), 1);
+            assert_eq!(receiver.push(L, &stamped(part, old), start, 0).len(), 1);
         }
         // The new epoch counts from 0: its parts are delivered, not taken
         // for old ones, and its holes are NACKed.
-        assert_eq!(receiver.push(&stamped(0, new), start, 0).len(), 1);
+        assert_eq!(receiver.push(L, &stamped(0, new), start, 0).len(), 1);
         assert_eq!(receiver.stats.generation_changes, 1);
-        assert_eq!(receiver.push(&stamped(2, new), start, 0).len(), 1);
+        assert_eq!(receiver.push(L, &stamped(2, new), start, 0).len(), 1);
         assert_eq!(receiver.holes(), 1);
         let later = start + Duration::from_millis(5);
         assert_eq!(receiver.nacks_due(later, 16), vec![1]);
         // A late datagram of the old epoch is dropped, and does not switch
         // back.
-        assert!(receiver.push(&stamped(1_010, old), later, 0).is_empty());
+        assert!(receiver.push(L, &stamped(1_010, old), later, 0).is_empty());
         assert_eq!(receiver.stats.stale_generation, 1);
-        assert_eq!(receiver.push(&stamped(1, new), later, 0).len(), 1);
+        assert_eq!(receiver.push(L, &stamped(1, new), later, 0).len(), 1);
         assert_eq!(receiver.stats.generation_changes, 1);
         // Generation 0 (not known) is taken in any flow.
-        assert_eq!(receiver.push(&stamped(3, 0), later, 0).len(), 1);
+        assert_eq!(receiver.push(L, &stamped(3, 0), later, 0).len(), 1);
     }
 
     /// Any `r` lost parts of a window are recovered from `r` rows, for every
@@ -2761,8 +3362,8 @@ mod tests {
 
     #[test]
     fn a_receiver_delivers_each_part_once_and_recovers_a_window() {
-        let mut receiver = CompactReceiver::new();
-        receiver.expect_from(1_000, true);
+        let mut receiver = rx();
+        receiver.leg_expect(L, 1_000, true);
         let now = Instant::now();
         let datagrams: Vec<Vec<u8>> = (1_000..1_016_u64)
             .map(|part| encode_part(part, 1_000 + part, &payload(part, 80)).unwrap())
@@ -2774,17 +3375,17 @@ mod tests {
             if index == 3 || index == 9 {
                 continue;
             }
-            delivered.extend(receiver.push(datagram, now, 0));
+            delivered.extend(receiver.push(L, datagram, now, 0));
         }
         assert_eq!(receiver.holes(), 2);
         // A copy is a duplicate.
         let mut copy = datagrams[0].clone();
         set_flags(&mut copy, 1, false);
-        assert!(receiver.push(&copy, now, 0).is_empty());
+        assert!(receiver.push(L, &copy, now, 0).is_empty());
         assert_eq!(receiver.stats.duplicates, 1);
-        delivered.extend(receiver.push(&repair[0], now, 0));
+        delivered.extend(receiver.push(L, &repair[0], now, 0));
         assert_eq!(delivered.len(), 14, "one row is not enough for two holes");
-        delivered.extend(receiver.push(&repair[1], now, 0));
+        delivered.extend(receiver.push(L, &repair[1], now, 0));
         assert_eq!(delivered.len(), 16);
         let recovered: Vec<u64> = delivered
             .iter()
@@ -2805,10 +3406,10 @@ mod tests {
         // The timing of before wave 6 (needletail-udp-client --silence-nack
         // false --nack-delay-us 1000 --nack-retry-floor-us 5000).
         let mut receiver = before();
-        receiver.expect_from(10, true);
+        receiver.leg_expect(L, 10, true);
         let start = Instant::now();
         for part in [10_u64, 11, 14] {
-            receiver.push(&encode_part(part, 0, &payload(part, 10)).unwrap(), start, 0);
+            receiver.push(L, &encode_part(part, 0, &payload(part, 10)).unwrap(), start, 0);
         }
         assert!(
             receiver.nacks_due(start, 64).is_empty(),
@@ -2835,7 +3436,7 @@ mod tests {
         // A retransmission fills one hole.
         let mut again = encode_part(13, 0, &payload(13, 10)).unwrap();
         set_flags(&mut again, 0, true);
-        let parts = receiver.push(&again, start, 0);
+        let parts = receiver.push(L, &again, start, 0);
         assert_eq!(parts.len(), 1);
         assert!(parts[0].retransmit);
         assert_eq!(receiver.holes(), 1);
@@ -2843,7 +3444,7 @@ mod tests {
         assert_eq!(receiver.holes(), 0);
         assert_eq!(receiver.stats.abandoned, 1);
         // A jump far ahead is a resume, not holes.
-        receiver.push(&encode_part(10_000, 0, &[]).unwrap(), start, 0);
+        receiver.push(L, &encode_part(10_000, 0, &[]).unwrap(), start, 0);
         assert_eq!(receiver.holes(), 0);
     }
 
@@ -2852,11 +3453,11 @@ mod tests {
         // The timing of before wave 6 (needletail-udp-client --silence-nack
         // false --nack-delay-us 1000 --nack-retry-floor-us 5000).
         let mut receiver = before();
-        receiver.expect_from(20, true);
+        receiver.leg_expect(L, 20, true);
         let start = Instant::now();
-        receiver.push(&encode_part(20, 0, &payload(20, 10)).unwrap(), start, 0);
+        receiver.push(L, &encode_part(20, 0, &payload(20, 10)).unwrap(), start, 0);
         // The edge gave part 21 up (its hole outlived the repair horizon).
-        let parts = receiver.push(&encode_gap(21), start, 0);
+        let parts = receiver.push(L, &encode_gap(21), start, 0);
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].kind, Kind::Gap);
         // The gap is asked for again a round trip later, in case the edge's
@@ -2866,17 +3467,17 @@ mod tests {
         // It had: the part comes, and is delivered after its gap, once.
         let mut late = encode_part(21, 0, &payload(21, 10)).unwrap();
         set_flags(&mut late, 0, true);
-        let parts = receiver.push(&late, start + NACK_RETRY * 2, 0);
+        let parts = receiver.push(L, &late, start + NACK_RETRY * 2, 0);
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].kind, Kind::Part);
         assert_eq!(parts[0].payload, payload(21, 10));
-        assert!(receiver.push(&late, start + NACK_RETRY * 2, 0).is_empty());
+        assert!(receiver.push(L, &late, start + NACK_RETRY * 2, 0).is_empty());
         assert_eq!(receiver.holes(), 0);
         // A gap again for a part delivered is a duplicate.
-        assert!(receiver.push(&encode_gap(20), start, 0).is_empty());
+        assert!(receiver.push(L, &encode_gap(20), start, 0).is_empty());
         // A gap whose part never comes is not counted as abandoned (it was
         // delivered, as a gap).
-        receiver.push(&encode_gap(22), start, 0);
+        receiver.push(L, &encode_gap(22), start, 0);
         receiver.nacks_due(start + HOLE_GIVE_UP, 64);
         assert_eq!(receiver.holes(), 0);
         assert_eq!(receiver.stats.abandoned, 0);
@@ -2887,12 +3488,12 @@ mod tests {
         // The timing of before wave 6 (needletail-udp-client --silence-nack
         // false --nack-delay-us 1000 --nack-retry-floor-us 5000).
         let mut receiver = before();
-        receiver.expect_from(10, true);
-        receiver.set_rtt(Duration::from_millis(30));
+        receiver.leg_expect(L, 10, true);
+        receiver.set_leg_rtt(L, Duration::from_millis(30));
         assert_eq!(receiver.nack_retry(), Duration::from_millis(45));
         let start = Instant::now();
         for part in [10_u64, 12] {
-            receiver.push(&encode_part(part, 0, &payload(part, 10)).unwrap(), start, 0);
+            receiver.push(L, &encode_part(part, 0, &payload(part, 10)).unwrap(), start, 0);
         }
         assert_eq!(receiver.nacks_due(start + NACK_DELAY, 64), vec![11]);
         // Not at 5 ms or 15 ms after it: a retransmission takes 30 ms.
@@ -2907,32 +3508,32 @@ mod tests {
         );
         // A short path keeps the 5 ms floor.
         let mut near = before();
-        near.set_rtt(Duration::from_micros(200));
+        near.set_leg_rtt(L, Duration::from_micros(200));
         assert_eq!(near.nack_retry(), NACK_RETRY);
         // Wave 6's floor is 2 ms.
-        let mut fast = CompactReceiver::new();
-        fast.set_rtt(Duration::from_micros(200));
+        let mut fast = rx();
+        fast.set_leg_rtt(L, Duration::from_micros(200));
         assert_eq!(fast.nack_retry(), FAST_NACK_RETRY);
-        let mut far = CompactReceiver::new();
-        far.set_rtt(Duration::from_millis(30));
+        let mut far = rx();
+        far.set_leg_rtt(L, Duration::from_millis(30));
         assert_eq!(far.nack_retry(), Duration::from_millis(45));
         // The answer to a hole's only NACK measures the round trip.
         let mut measured = before();
-        measured.expect_from(0, true);
+        measured.leg_expect(L, 0, true);
         for part in [0_u64, 2] {
-            measured.push(&encode_part(part, 0, &payload(part, 10)).unwrap(), start, 0);
+            measured.push(L, &encode_part(part, 0, &payload(part, 10)).unwrap(), start, 0);
         }
         assert_eq!(measured.nacks_due(start + NACK_DELAY, 64), vec![1]);
         let mut again = encode_part(1, 0, &payload(1, 10)).unwrap();
         set_flags(&mut again, 0, true);
-        measured.push(&again, start + NACK_DELAY + Duration::from_millis(20), 0);
-        assert_eq!(measured.rtt(), Some(Duration::from_millis(20)));
+        measured.push(L, &again, start + NACK_DELAY + Duration::from_millis(20), 0);
+        assert_eq!(measured.leg_rtt(L), Some(Duration::from_millis(20)));
     }
 
     #[test]
     fn loss_is_counted_on_originals_and_copies_and_bursts_are_measured() {
-        let mut receiver = CompactReceiver::new();
-        receiver.expect_from(0, true);
+        let mut receiver = rx();
+        receiver.leg_expect(L, 0, true);
         let start = Instant::now();
         // Parts 0..100 with one copy each; parts 10..13 lost whole with
         // their copies (a burst of six datagrams), part 50's copy lost (a
@@ -2943,16 +3544,16 @@ mod tests {
             if (10..13).contains(&part) {
                 continue;
             }
-            receiver.push(&datagram, start, 0);
+            receiver.push(L, &datagram, start, 0);
             if part != 50 {
-                receiver.push(&datagram, start, 0);
+                receiver.push(L, &datagram, start, 0);
             }
         }
-        let (received, sent) = receiver.take_counts(start + SETTLE);
+        let (received, sent) = receiver.take_counts(L, start + SETTLE);
         assert_eq!(sent, 200);
         assert_eq!(received, 200 - 6 - 1);
-        assert_eq!(receiver.take_burst(), Some(3.5));
-        assert_eq!(receiver.take_burst(), None);
+        assert_eq!(receiver.take_burst(L), Some(3.5));
+        assert_eq!(receiver.take_burst(L), None);
     }
 
     /// With back-to-back copies, a burst that takes one part takes its
@@ -2961,8 +3562,8 @@ mod tests {
     /// no copies but window rows for the burst.
     #[test]
     fn a_burst_that_takes_a_part_and_its_copy_reads_as_a_burst() {
-        let mut receiver = CompactReceiver::new();
-        receiver.expect_from(0, true);
+        let mut receiver = rx();
+        receiver.leg_expect(L, 0, true);
         let start = Instant::now();
         // A burst of four datagrams (parts 10 and 11 and their copies), one
         // of one (part 30's copy: a part that came ends a run) and one of
@@ -2977,12 +3578,12 @@ mod tests {
             set_flags(&mut datagram, 1, false);
             for copy in [false, true] {
                 if !lost(part, copy) {
-                    receiver.push(&datagram, start, 0);
+                    receiver.push(L, &datagram, start, 0);
                 }
             }
         }
-        receiver.take_counts(start + SETTLE);
-        let burst = receiver.take_burst().unwrap();
+        receiver.take_counts(L, start + SETTLE);
+        let burst = receiver.take_burst(L).unwrap();
         assert!((burst - 7.0 / 3.0).abs() < 1e-9, "{burst}");
         let plan = CompactPlan::for_measured(0.048, burst);
         assert_eq!(plan.copies, 0, "{plan:?}");
@@ -2993,5 +3594,351 @@ mod tests {
         // The plan of before, for the A/B: one copy and two more rows.
         let before = CompactPlan::for_measured_with(0.048, burst, false);
         assert_eq!((before.copies, before.window_repair), (1, 4), "{before:?}");
+    }
+
+    /// Two legs, both open at `first`.
+    fn two_legs(first: u64) -> (CompactReceiver, LegId) {
+        let mut receiver = rx();
+        let other = receiver.open_leg().unwrap();
+        assert_eq!(receiver.leg_expect(L, first, true), LegStart::Started);
+        assert_eq!(receiver.leg_expect(other, first, true), LegStart::Started);
+        (receiver, other)
+    }
+
+    /// B X2: the first arrival of a part number is delivered, the other
+    /// leg's is that leg's duplicate; a gap from one edge and the part from
+    /// the other is delivered as the part; each leg counts its own
+    /// datagrams.
+    #[test]
+    fn a_part_from_two_legs_is_delivered_once_and_counted_on_each() {
+        let (mut receiver, b) = two_legs(100);
+        let start = Instant::now();
+        let ms = Duration::from_millis(1);
+        for part in 100..110_u64 {
+            let datagram = encode_part(part, 0, &payload(part, 20)).unwrap();
+            let at = start + ms * (part - 100) as u32;
+            assert_eq!(receiver.push(L, &datagram, at, 0).len(), 1);
+            assert!(receiver
+                .push(b, &datagram, at + Duration::from_micros(200), 0)
+                .is_empty());
+        }
+        assert_eq!(receiver.leg_stats(L).parts_first, 10);
+        assert_eq!(receiver.leg_stats(L).duplicates, 0);
+        assert_eq!(receiver.leg_stats(b).parts_first, 0);
+        assert_eq!(receiver.leg_stats(b).duplicates, 10);
+        assert_eq!(receiver.stats.parts, 10);
+        assert_eq!(receiver.stats.duplicates, 10);
+        // A gap from one edge, the part from the other: the part.
+        let gap = receiver.push(L, &encode_gap(110), start + ms * 10, 0);
+        assert_eq!(gap[0].kind, Kind::Gap);
+        let part = receiver.push(
+            b,
+            &encode_part(110, 0, &payload(110, 20)).unwrap(),
+            start + ms * 10,
+            0,
+        );
+        assert_eq!(part.len(), 1);
+        assert_eq!(part[0].kind, Kind::Part);
+        assert_eq!(receiver.holes(), 0);
+        let settled = start + Duration::from_secs(1);
+        assert_eq!(receiver.take_counts(L, settled), (11, 11));
+        assert_eq!(receiver.take_counts(b, settled), (11, 11));
+    }
+
+    /// B X2: the session's first part is the first delivered by any leg;
+    /// a slower leg's older parts are counted and dropped, never holes.
+    #[test]
+    fn a_second_leg_that_starts_lower_delivers_nothing_below_the_first_part() {
+        let mut receiver = rx();
+        let b = receiver.open_leg().unwrap();
+        receiver.leg_expect(L, 1_000, true);
+        receiver.leg_expect(b, 998, true);
+        let now = Instant::now();
+        let part = |part: u64| encode_part(part, 0, &payload(part, 20)).unwrap();
+        assert_eq!(receiver.push(L, &part(1_000), now, 0).len(), 1);
+        assert_eq!(receiver.floor(), Some(1_000));
+        assert!(receiver.push(b, &part(998), now, 0).is_empty());
+        assert!(receiver.push(b, &part(999), now, 0).is_empty());
+        assert!(receiver.push(b, &part(1_000), now, 0).is_empty());
+        assert_eq!(receiver.stats.before_start, 2);
+        assert_eq!(receiver.leg_stats(b).before_start, 2);
+        assert_eq!(receiver.leg_stats(b).duplicates, 1);
+        assert_eq!(receiver.holes(), 0);
+        assert_eq!(receiver.push(b, &part(1_001), now, 0).len(), 1);
+        assert_eq!(receiver.leg_stats(b).parts_first, 1);
+        assert_eq!(receiver.floor(), Some(1_000));
+        assert_eq!(receiver.holes(), 0);
+        // The leg that set the first part resumes from an older part (its
+        // backfill comes after its live parts): delivered, and the first
+        // part moves down to it.
+        assert_eq!(receiver.push(L, &part(995), now, 0).len(), 1);
+        assert_eq!(receiver.floor(), Some(995));
+        assert!(receiver.push(b, &part(994), now, 0).is_empty());
+        assert_eq!(receiver.leg_stats(b).before_start, 3);
+    }
+
+    /// B X2: a leg whose OK names a part 4,096 behind the newest is stale
+    /// and the newest does not move; a leg that shows the only leg that
+    /// delivered to be that far behind displaces it.
+    #[test]
+    fn a_stale_first_part_fails_its_leg_and_does_not_move_the_newest() {
+        let mut receiver = rx();
+        receiver.leg_expect(L, 10_000, true);
+        let now = Instant::now();
+        for part in 10_000..10_010_u64 {
+            receiver.push(L, &encode_part(part, 0, &payload(part, 10)).unwrap(), now, 0);
+        }
+        let stale = receiver.open_leg().unwrap();
+        assert_eq!(receiver.leg_expect(stale, 5_000, true), LegStart::Stale);
+        assert_eq!(receiver.newest(), Some(10_009));
+        assert_eq!(receiver.leg_first_part(stale), None);
+        receiver.close_leg(stale);
+        // A head 4,096 ahead of the only leg that delivered.
+        let ahead = receiver.open_leg().unwrap();
+        assert_eq!(receiver.leg_expect(ahead, 20_000, true), LegStart::Displaces(L));
+        assert_eq!(receiver.newest(), None);
+        assert_eq!(receiver.floor(), None);
+        receiver.close_leg(L);
+        let parts = receiver.push(ahead, &encode_part(20_000, 0, &payload(1, 10)).unwrap(), now, 0);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(receiver.floor(), Some(20_000));
+        assert_eq!(receiver.newest(), Some(20_000));
+        // With two legs delivering, a far head displaces nobody.
+        let (mut receiver, b) = two_legs(100);
+        for part in 100..104_u64 {
+            let datagram = encode_part(part, 0, &payload(part, 10)).unwrap();
+            let leg = if part % 2 == 0 { L } else { b };
+            receiver.push(leg, &datagram, now, 0);
+        }
+        let far = receiver.open_leg().unwrap();
+        assert_eq!(receiver.leg_expect(far, 50_000, true), LegStart::Started);
+        assert_eq!(receiver.newest(), Some(103));
+    }
+
+    /// B X2: the 16 bits of a short-form part are extended around its own
+    /// leg's last part or `OK`, never another leg's: before its `OK` a
+    /// short part waits. Before any long-form part its long form is not
+    /// kept for window repair.
+    #[test]
+    fn short_parts_are_numbered_from_their_own_leg() {
+        let bytes = payload(7, 56);
+        let us = 1_700_000_000_000_000_u64;
+        let short = |part: u64| {
+            shorten(&encode_part(part, us + part * 1_000, &bytes).unwrap()).unwrap()
+        };
+        let now = Instant::now();
+        let mut receiver = rx();
+        receiver.leg_expect(L, 70_142, true);
+        let unanchored = receiver.push(L, &short(70_142), now, us + 70_142_500);
+        assert_eq!(unanchored[0].part, 70_142);
+        assert_eq!(unanchored[0].published_unix_us, us + 70_142_000);
+        assert!(!receiver.known.contains_key(&70_142));
+        let anchor = encode_part(70_144, us + 70_144_000, &bytes).unwrap();
+        assert_eq!(receiver.push(L, &anchor, now, us + 70_144_500).len(), 1);
+        let parts = receiver.push(L, &short(70_145), now, us);
+        assert_eq!(parts[0].part, 70_145);
+        assert_eq!(parts[0].published_unix_us, us + 70_145_000);
+        // A second leg's short part before its OK waits for it, though the
+        // session has a newest part.
+        let b = receiver.open_leg().unwrap();
+        assert!(receiver.push(b, &short(70_146), now, us).is_empty());
+        assert_eq!(receiver.early_kept, 1);
+        let early = receiver.take_early(b);
+        assert_eq!(early.len(), 1);
+        receiver.leg_expect(b, 70_146, true);
+        let parts = receiver.push(b, &early[0], now, us);
+        assert_eq!(parts[0].part, 70_146);
+        let parts = receiver.push(b, &short(70_147), now, us);
+        assert_eq!(parts[0].part, 70_147);
+        assert_eq!(receiver.leg_highest(b), Some(70_147));
+        assert_eq!(receiver.leg_highest(L), Some(70_145));
+        assert_eq!(receiver.stats.errors, 0);
+    }
+
+    /// B X2: each leg's loss is its own datagrams; the joint loss is the
+    /// share of parts that no leg brought.
+    #[test]
+    fn each_leg_measures_its_own_loss_and_the_joint_loss_is_what_no_leg_brought() {
+        let (mut receiver, b) = two_legs(0);
+        let start = Instant::now();
+        for part in 0..100_u64 {
+            let datagram = encode_part(part, 0, &payload(part, 20)).unwrap();
+            if part % 10 != 3 {
+                receiver.push(L, &datagram, start, 0);
+            }
+            let b_loses = (part % 10 == 3 && part < 50) || part % 10 == 7;
+            if !b_loses {
+                receiver.push(b, &datagram, start, 0);
+            }
+        }
+        let settled = start + SETTLE;
+        assert_eq!(receiver.take_counts(L, settled), (90, 100));
+        assert_eq!(receiver.take_counts(b, settled), (85, 100));
+        let (joint, burst) = receiver.take_joint(settled).expect("parts settled");
+        assert!((joint - 0.05).abs() < 1e-9, "{joint}");
+        assert_eq!(burst, Some(1.0));
+        assert_eq!(receiver.take_joint(settled), None);
+    }
+
+    /// B X2: a repair row enters only the windows of the leg it came from:
+    /// one row from each of two edges does not recover two holes.
+    #[test]
+    fn rows_of_one_leg_never_enter_another_legs_window() {
+        let (mut receiver, b) = two_legs(1_000);
+        let now = Instant::now();
+        let datagrams: Vec<Vec<u8>> = (1_000..1_016_u64)
+            .map(|part| encode_part(part, 0, &payload(part, 80)).unwrap())
+            .collect();
+        let refs: Vec<&[u8]> = datagrams.iter().map(Vec::as_slice).collect();
+        let repair = encode_window_repair(1_000, &refs, 2);
+        let mut delivered = 0;
+        for (index, datagram) in datagrams.iter().enumerate() {
+            if index != 3 && index != 9 {
+                delivered += receiver.push(L, datagram, now, 0).len();
+            }
+        }
+        delivered += receiver.push(L, &repair[0], now, 0).len();
+        delivered += receiver.push(b, &repair[1], now, 0).len();
+        assert_eq!(delivered, 14, "rows of two legs met in one decode");
+        assert_eq!(receiver.holes(), 2);
+        delivered += receiver.push(L, &repair[1], now, 0).len();
+        assert_eq!(delivered, 16);
+        assert_eq!(receiver.stats.recovered, 2);
+    }
+
+    /// B X2: the repair leg's bytes of a part replace another leg's, never
+    /// the reverse; a recovery that fails its check on another leg's bytes
+    /// counts a cross-leg mismatch, keeps the window, and recovers once the
+    /// repair leg's own bytes come.
+    #[test]
+    fn the_repair_legs_bytes_are_kept_and_a_mismatch_keeps_the_window() {
+        let (mut receiver, b) = two_legs(0);
+        receiver.set_prefer_leg(Some(L));
+        let now = Instant::now();
+        let ours: Vec<Vec<u8>> = (0..4_u64)
+            .map(|part| encode_part(part, 0, &payload(part, 30)).unwrap())
+            .collect();
+        let mut theirs = ours[1].clone();
+        theirs[HEADER_LEN + 2] ^= 0x55;
+        let refs: Vec<&[u8]> = ours.iter().map(Vec::as_slice).collect();
+        let rows = encode_window_repair(0, &refs, 1);
+        assert_eq!(receiver.push(L, &ours[0], now, 0).len(), 1);
+        assert_eq!(receiver.push(b, &theirs, now, 0).len(), 1);
+        assert_eq!(receiver.push(L, &ours[3], now, 0).len(), 1);
+        assert!(receiver.push(L, &rows[0], now, 0).is_empty());
+        assert_eq!(receiver.stats.cross_leg_mismatch, 1);
+        assert_eq!(receiver.lowest_hole(), Some(2));
+        assert!(receiver.legs[L.index()].windows.contains_key(&0));
+        // The row again changes nothing and counts nothing again.
+        assert!(receiver.push(L, &rows[0], now, 0).is_empty());
+        assert_eq!(receiver.stats.cross_leg_mismatch, 1);
+        // The repair leg's own bytes of part 1: they replace the other
+        // leg's, and the window recovers part 2.
+        let recovered = receiver.push(L, &ours[1], now, 0);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].part, 2);
+        assert!(recovered[0].recovered);
+        assert_eq!(receiver.known[&1].bytes, ours[1]);
+        // Another leg's bytes never replace the repair leg's.
+        let mut other = ours[3].clone();
+        other[HEADER_LEN] ^= 0x01;
+        assert!(receiver.push(b, &other, now, 0).is_empty());
+        assert_eq!(receiver.known[&3].bytes, ours[3]);
+        assert_eq!(receiver.holes(), 0);
+    }
+
+    /// B X2: a leg is steady when it brought 28 of the last 32 parts, and
+    /// level with another when its median lag is at most 250 us more
+    /// (steady is enough beside a leg that brought fewer than 16).
+    #[test]
+    fn a_leg_is_steady_then_level() {
+        let (mut receiver, b) = two_legs(0);
+        let start = Instant::now();
+        let ms = Duration::from_millis(1);
+        let us = Duration::from_micros(1);
+        let feed = |receiver: &mut CompactReceiver,
+                        parts: std::ops::Range<u64>,
+                        lag: Duration,
+                        a: bool,
+                        b_brings: &dyn Fn(u64) -> bool| {
+            for part in parts {
+                let datagram = encode_part(part, 0, &payload(part, 10)).unwrap();
+                let at = start + ms * part as u32;
+                if a {
+                    receiver.push(L, &datagram, at, 0);
+                }
+                if b_brings(part) {
+                    receiver.push(b, &datagram, at + lag, 0);
+                }
+            }
+        };
+        feed(&mut receiver, 0..20, us * 100, true, &|_| true);
+        assert!(!receiver.steady(b), "20 parts are not 28");
+        feed(&mut receiver, 20..40, us * 100, true, &|_| true);
+        assert!(receiver.steady(b) && receiver.steady(L));
+        assert_eq!(receiver.leg_lag(b), Some(us * 100));
+        assert_eq!(receiver.leg_lag(L), Some(Duration::ZERO));
+        assert!(receiver.level(b, L));
+        // Slower by 400 us: steady, not level; the faster leg is level.
+        feed(&mut receiver, 40..80, us * 400, true, &|_| true);
+        assert!(receiver.steady(b));
+        assert!(!receiver.level(b, L));
+        assert!(receiver.level(L, b));
+        // Five of the last 32 missing: not steady.
+        feed(&mut receiver, 80..100, us * 100, true, &|part| part % 4 != 0);
+        assert!(!receiver.steady(b));
+        assert!(!receiver.level(b, L));
+        // The other leg silent: steady is enough.
+        feed(&mut receiver, 100..140, us * 100, false, &|_| true);
+        assert!(receiver.level(b, L));
+        assert!(!receiver.steady(L));
+    }
+
+    /// B X2: a new source generation resets every leg's windows, counts and
+    /// numbering, and the session's first part.
+    #[test]
+    fn a_new_generation_resets_every_leg() {
+        let (mut receiver, b) = two_legs(1_000);
+        let start = Instant::now();
+        let old = generation_of_epoch(1_700_000_000_000_000);
+        let new = generation_of_epoch(1_700_000_100_000_000);
+        let stamped = |part: u64, generation: u8| {
+            let mut datagram = encode_part(part, 0, &payload(part, 10)).unwrap();
+            set_generation(&mut datagram, generation);
+            datagram
+        };
+        let originals: Vec<Vec<u8>> = (1_000..1_004).map(|part| stamped(part, old)).collect();
+        let refs: Vec<&[u8]> = originals.iter().map(Vec::as_slice).collect();
+        let rows = encode_window_repair(1_000, &refs, 2);
+        for part in 1_000..1_010_u64 {
+            if part == 1_002 || part == 1_003 {
+                continue;
+            }
+            receiver.push(L, &stamped(part, old), start, 0);
+            if part != 1_005 {
+                receiver.push(b, &stamped(part, old), start, 0);
+            }
+        }
+        receiver.push(b, &rows[0], start, 0);
+        assert!(!receiver.legs[b.index()].windows.is_empty());
+        assert!(!receiver.legs[b.index()].counts.is_empty());
+        assert_eq!(receiver.push(L, &stamped(0, new), start, 0).len(), 1);
+        assert_eq!(receiver.stats.generation_changes, 1);
+        for leg in [L, b] {
+            let rx = &receiver.legs[leg.index()];
+            assert!(rx.windows.is_empty() && rx.window_counts.is_empty());
+            assert_eq!(rx.first_part, None);
+            assert!(rx.open);
+        }
+        assert!(receiver.legs[b.index()].counts.is_empty());
+        assert_eq!(receiver.leg_highest(b), None);
+        assert_eq!(receiver.floor(), Some(0));
+        // The other leg's part of the new generation is a duplicate, not
+        // before the start; its old generation's late datagram is dropped.
+        assert!(receiver.push(b, &stamped(0, new), start, 0).is_empty());
+        assert_eq!(receiver.leg_stats(b).before_start, 0);
+        assert!(receiver.push(b, &stamped(1_009, old), start, 0).is_empty());
+        assert_eq!(receiver.stats.stale_generation, 1);
+        assert_eq!(receiver.push(b, &stamped(1, new), start, 0).len(), 1);
     }
 }

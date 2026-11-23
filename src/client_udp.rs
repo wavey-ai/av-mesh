@@ -103,7 +103,7 @@
 //! two edges encode one part into different symbols.
 
 pub use crate::client_compact::CompactPlan;
-use crate::client_compact::{self as compact, CompactReceiver};
+use crate::client_compact::{self as compact, CompactReceiver, LegId};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use raptorq_datagram_fec::{DatagramFecDecoder, DatagramFecEncoder, DatagramFecHeader};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1142,10 +1142,12 @@ const SETTLED_MEMORY: usize = 8_192;
 
 impl ObjectReceiver {
     pub fn new() -> Self {
-        Self {
+        let mut receiver = Self {
             flows: 1,
             ..Self::default()
-        }
+        };
+        receiver.compact.open_leg();
+        receiver
     }
 
     /// Start receiving from another edge: its symbols of a part differ from
@@ -1164,11 +1166,11 @@ impl ObjectReceiver {
     /// sends the compact lane (holes are then asked for with NACK).
     pub fn expect(&mut self, stream_id: u64, next_part: u64, compact: bool) {
         self.stream_id = stream_id;
-        self.compact.expect_from(next_part, compact);
+        self.compact.leg_expect(LegId::FIRST, next_part, compact);
         // The short-form parts that came before the OK, read now (their
         // objects wait in `ready`, in the order they came: `push_compact`
         // returns the oldest object ready, which goes back to the front).
-        for datagram in self.compact.take_early() {
+        for datagram in self.compact.take_early(LegId::FIRST) {
             if let Some(object) = self.push_compact(&datagram) {
                 self.ready.push_front(object);
             }
@@ -1205,7 +1207,9 @@ impl ObjectReceiver {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_micros() as u64);
         let before = self.compact.stats;
-        let parts = self.compact.push(datagram, Instant::now(), now_unix_us);
+        let parts = self
+            .compact
+            .push(LegId::FIRST, datagram, Instant::now(), now_unix_us);
         let after = self.compact.stats;
         self.errors += after.errors - before.errors;
         self.duplicate_parts += after.duplicates - before.duplicates;
@@ -1318,7 +1322,7 @@ impl ObjectReceiver {
                     if matches!(object.kind, ObjectKind::Part | ObjectKind::Gap)
                         && !self
                             .compact
-                            .delivered_elsewhere(object.part, Instant::now())
+                            .delivered_elsewhere(LegId::FIRST, object.part, Instant::now())
                     {
                         // A part that the compact lane (or another block)
                         // delivered already.
@@ -1403,7 +1407,7 @@ impl ObjectReceiver {
             self.lost_datagrams += u64::from(sent - received);
         }
         // The compact lane's parts and window repair.
-        let (received, sent) = self.compact.take_counts(now);
+        let (received, sent) = self.compact.take_counts(LegId::FIRST, now);
         self.window_received += received;
         self.window_sent += sent;
         self.sent_datagrams += sent;

@@ -26,7 +26,7 @@
 //! unanswered requests and 1.5 s ([`falls_back_from_compact`]), and
 //! [`UdpSession::hold`] for the end-of-run drain.
 
-use crate::client_compact::{smoothed_loss, CompactPlan, NackTiming};
+use crate::client_compact::{smoothed_loss, CompactPlan, LegId, NackTiming};
 use crate::client_udp::{
     Control, ObjectReceiver, PartObject, RepairPolicy, REFRESH, UNMEASURED_LOSS,
 };
@@ -496,7 +496,7 @@ impl UdpSession {
                 // what a short rise of the loss leaves.
                 let smooth = smoothed_loss(self.compact_estimate, loss);
                 self.compact_estimate = Some(smooth);
-                if let Some(burst) = self.receiver.compact.take_burst() {
+                if let Some(burst) = self.receiver.compact.take_burst(LegId::FIRST) {
                     self.burst_max = Some(self.burst_max.map_or(burst, |max| max.max(burst)));
                     self.burst_estimate = Some(match self.burst_estimate {
                         Some(previous) => previous * 0.7 + burst * 0.3,
@@ -666,7 +666,7 @@ impl UdpSession {
                         // of the round trip (wave 9 review).
                         if self.token.is_none() && self.repeats == 0 {
                             let rtt = now.saturating_duration_since(self.last_request_at);
-                            self.receiver.compact.set_rtt(rtt);
+                            self.receiver.compact.set_leg_rtt(LegId::FIRST, rtt);
                             self.rtt = Some(rtt);
                         }
                         self.token = Some(given);
