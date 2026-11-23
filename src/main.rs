@@ -356,6 +356,12 @@ const CACHE_MESH_ANNOUNCE_MS: u64 = 100;
 /// round trip: 400 ms tripped while parents were alive but slow to decode,
 /// and moved UDP clients between edges every few milliseconds.
 const EDGE_PARENTS_SILENT_MS: u64 = 1_500;
+/// Default of --client-udp-region-hold-ms (Phase AM item 11).
+const DEFAULT_CLIENT_UDP_REGION_HOLD_MS: u64 = 2_000;
+/// How long an answer of a failover region is reused (Phase AM item 11).
+const FAILOVER_PROBE_CACHE: Duration = Duration::from_secs(1);
+/// How long a failover region has to answer.
+const FAILOVER_PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 /// Default of --edge-liveness-cache-us: far below the parents' silence that
 /// counts, and long enough that a thousand requests a second ask the mesh
 /// a few hundred times.
@@ -2128,6 +2134,21 @@ struct Args {
     )]
     client_udp_drain_spread_ms: u64,
 
+    /// Phase AM item 11: when the parents' silence is region-wide (the
+    /// edge holds its UDP clients, --edge-region-silence-holds) for this
+    /// many ms and a --failover-entry region answers with a fresh copy of
+    /// the stream, the edge sends its clients `MOVE region-lost` (they go
+    /// to the failover region, the last entry of their assignment). The
+    /// neighbour is asked over HTTPS, trusting the certificates of --cert
+    /// for the name --telemetry-dns-name. 0: held for as long as the
+    /// silence lasts, as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_REGION_HOLD_MS",
+        default_value_t = DEFAULT_CLIENT_UDP_REGION_HOLD_MS
+    )]
+    client_udp_region_hold_ms: u64,
+
     /// An edge that has heard none of its cache-mesh parents for this long
     /// has lost them: it answers 503 for a part or a playlist reload that it
     /// would otherwise hold, and moves its UDP clients. Keep it above the
@@ -3596,6 +3617,10 @@ async fn main() -> Result<()> {
             .max(REGION_SILENCE_MIN_FRESH_MS),
     )
     .with_liveness_cache(args.edge_liveness_cache_us)
+    .with_region_failover(
+        Duration::from_millis(args.client_udp_region_hold_ms),
+        failover_probe(&args),
+    )
     .with_part_wait_due(args.edge_part_wait_due)
     .with_hole_distance(
         hole_trigger
@@ -4608,6 +4633,165 @@ async fn resolve_socket_addr_args(kind: &str, values: &[String]) -> Result<Vec<S
     resolved.sort();
     resolved.dedup();
     Ok(resolved)
+}
+
+/// Phase AM item 11: asks the entry point of a failover region whether it
+/// holds a fresh copy of a stream (its `/api/assignment`: a fresh cache
+/// that serves readers, holds the playlist and is not draining), over
+/// HTTPS/2, trusting the certificates of this node's own chain (the
+/// regions of one deployment share their CA). Answers are reused for
+/// FAILOVER_PROBE_CACHE; a region that does not answer within
+/// FAILOVER_PROBE_TIMEOUT is not fresh.
+struct FailoverProbe {
+    connector: tokio_rustls::TlsConnector,
+    server_name: String,
+    answers: tokio::sync::Mutex<HashMap<(String, u64), (Instant, bool)>>,
+}
+
+impl FailoverProbe {
+    fn from_pem(pem: &[u8], server_name: String) -> Result<Self> {
+        let mut roots = rustls::RootCertStore::empty();
+        for certificate in rustls_pemfile::certs(&mut &pem[..]) {
+            // A leaf or an intermediate as a root is harmless here: the
+            // chain's CA is among them.
+            let _ = roots.add(certificate?);
+        }
+        if roots.is_empty() {
+            bail!("no certificate to trust for the failover regions");
+        }
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        Ok(Self {
+            connector: tokio_rustls::TlsConnector::from(Arc::new(config)),
+            server_name,
+            answers: tokio::sync::Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Whether the failover region at `base_url` holds a fresh copy of
+    /// `stream_id`.
+    async fn fresh(&self, base_url: &str, stream_id: u64) -> bool {
+        let key = (base_url.to_owned(), stream_id);
+        if let Some((at, fresh)) = self.answers.lock().await.get(&key) {
+            if *at > Instant::now() {
+                return *fresh;
+            }
+        }
+        let fresh = tokio::time::timeout(FAILOVER_PROBE_TIMEOUT, self.ask(base_url, stream_id))
+            .await
+            .ok()
+            .and_then(|answer| {
+                answer
+                    .map_err(|error| debug!(base_url, error = %error, "failover region did not answer"))
+                    .ok()
+            })
+            .unwrap_or(false);
+        self.answers
+            .lock()
+            .await
+            .insert(key, (Instant::now() + FAILOVER_PROBE_CACHE, fresh));
+        fresh
+    }
+
+    async fn ask(&self, base_url: &str, stream_id: u64) -> Result<bool> {
+        use http_body_util::BodyExt;
+        let authority = base_url
+            .strip_prefix("https://")
+            .ok_or_else(|| anyhow!("a failover entry is asked over HTTPS"))?
+            .split('/')
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        let tcp = tokio::net::TcpStream::connect(authority.as_str()).await?;
+        tcp.set_nodelay(true)?;
+        let name = rustls::pki_types::ServerName::try_from(self.server_name.clone())
+            .map_err(|error| anyhow!("invalid TLS server name: {error}"))?;
+        let tls = self.connector.connect(name, tcp).await?;
+        let (mut sender, connection) = hyper::client::conn::http2::handshake(
+            hyper_util::rt::TokioExecutor::new(),
+            TokioIo::new(tls),
+        )
+        .await?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(format!(
+                "https://{authority}/api/assignment?stream={stream_id}"
+            ))
+            .body(http_body_util::Empty::<Bytes>::new())?;
+        let response = sender.send_request(request).await?;
+        let body = response.into_body().collect().await?.to_bytes();
+        let answer: serde_json::Value = serde_json::from_slice(&body)?;
+        Ok(failover_answer_is_fresh(&answer))
+    }
+
+    /// A probe that trusts nothing: its answers are set by the test.
+    #[cfg(test)]
+    fn for_tests() -> Self {
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+        Self {
+            connector: tokio_rustls::TlsConnector::from(Arc::new(config)),
+            server_name: "local.wavey.ai".into(),
+            answers: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Fix the answer for a region (tests).
+    #[cfg(test)]
+    async fn set_answer(&self, base_url: &str, stream_id: u64, fresh: bool) {
+        self.answers.lock().await.insert(
+            (base_url.to_owned(), stream_id),
+            (Instant::now() + Duration::from_secs(3_600), fresh),
+        );
+    }
+}
+
+/// Whether an `/api/assignment` answer of a failover region names a cache
+/// that can take a reader of the stream now.
+fn failover_answer_is_fresh(answer: &serde_json::Value) -> bool {
+    answer["caches"].as_array().is_some_and(|caches| {
+        caches.iter().any(|cache| {
+            cache["fresh"].as_bool() == Some(true)
+                && cache["serves_readers"].as_bool() == Some(true)
+                && cache["draining"].as_bool() != Some(true)
+                && cache["head_part"].is_u64()
+        })
+    })
+}
+
+/// The failover probe of a node with --failover-entry and
+/// --client-udp-region-hold-ms, trusting its --cert chain.
+fn failover_probe(args: &Args) -> Option<Arc<FailoverProbe>> {
+    if args.failover_entries.is_empty() || args.client_udp_region_hold_ms == 0 {
+        return None;
+    }
+    let Some(path) = args.cert.as_ref() else {
+        warn!("--client-udp-region-hold-ms needs --cert to trust the failover regions: UDP clients are held");
+        return None;
+    };
+    match std::fs::read(path)
+        .map_err(anyhow::Error::from)
+        .and_then(|pem| FailoverProbe::from_pem(&pem, args.telemetry_dns_name.clone()))
+    {
+        Ok(probe) => Some(Arc::new(probe)),
+        Err(error) => {
+            warn!(error = %error, "no failover probe: UDP clients are held through a region-wide silence");
+            None
+        }
+    }
 }
 
 fn load_tls(args: &Args) -> Result<(String, String)> {
@@ -13138,6 +13322,8 @@ struct ClientUdpGauges {
     egress_wire_bytes: u64,
     /// New subscriptions refused because the egress was overloaded.
     load_refusals: u64,
+    /// Clients sent to a failover region (`region-lost`, Phase AM item 11).
+    region_lost_moves: u64,
 }
 
 /// One playlist that a cache holds. This is what a cache advertises to the
@@ -17889,6 +18075,13 @@ struct AppRouter {
     /// the last this many milliseconds says the same (see
     /// `region_wide_silence`).
     region_silence_fresh_ms: Option<u64>,
+    /// Phase AM item 11: a region-wide silence this long moves the UDP
+    /// clients to a failover region that is fresh (`None`: held, as
+    /// before), the silence's start, and how the failover regions are
+    /// asked.
+    region_hold: Option<Duration>,
+    region_silence_since: Arc<StdMutex<Option<Instant>>>,
+    failover_probe: Option<Arc<FailoverProbe>>,
     /// Whether the parents are lost, as last asked, and when (see
     /// --edge-liveness-cache-us).
     liveness: Arc<LivenessCache>,
@@ -18037,6 +18230,9 @@ impl AppRouter {
             parents_silent_after: None,
             region_silence_fresh_ms: None,
             liveness: Arc::new(LivenessCache::new(DEFAULT_EDGE_LIVENESS_CACHE_US)),
+            region_hold: None,
+            region_silence_since: Arc::default(),
+            failover_probe: None,
             part_wait_due: true,
             hole_distance: None,
             failover_entries: Arc::new(Vec::new()),
@@ -18104,6 +18300,15 @@ impl AppRouter {
         self.region_silence_fresh_ms = holds.then_some(fresh_ms);
         // A router with other rules does not share the answers of this one.
         self.liveness = Arc::new(LivenessCache::new(self.liveness.ttl_us));
+        self
+    }
+
+    /// Phase AM item 11: move the UDP clients to a fresh failover region
+    /// after a region-wide silence of `hold` (zero: hold them), asking the
+    /// failover entries with `probe`.
+    fn with_region_failover(mut self, hold: Duration, probe: Option<Arc<FailoverProbe>>) -> Self {
+        self.region_hold = (!hold.is_zero()).then_some(hold);
+        self.failover_probe = probe;
         self
     }
 
@@ -18301,6 +18506,7 @@ impl AppRouter {
             egress_observed_bps: egress.observed_bps,
             egress_wire_bytes: stats.egress_wire_bytes(),
             load_refusals: stats.load_refusals.load(Ordering::Relaxed),
+            region_lost_moves: stats.region_lost_moves.load(Ordering::Relaxed),
         })
     }
 
@@ -19338,13 +19544,39 @@ impl AppRouter {
             }
         };
         let gauges = self.client_udp_gauges().await;
+        // Phase AM item 11: the neighbouring regions' entry points come
+        // last, as in the HLS steering list: a UDP client that loses this
+        // region asks one of them for its caches. With no cache here that
+        // takes a reader, they are the whole list.
+        let mut assigned = assignment
+            .as_ref()
+            .map(|assignment| serde_json::to_value(&assignment.caches).unwrap_or_default())
+            .unwrap_or(serde_json::Value::Null);
+        if pin.is_none() && !self.failover_entries.is_empty() {
+            let entries = self.failover_entries.iter().map(|(name, url)| {
+                serde_json::json!({
+                    "node_id": name,
+                    "playback_base_url": url,
+                    "failover_entry": true,
+                })
+            });
+            match &mut assigned {
+                serde_json::Value::Array(list) => list.extend(entries),
+                other => *other = serde_json::Value::Array(entries.collect()),
+            }
+        }
+        let failover_entries: Vec<serde_json::Value> = self
+            .failover_entries
+            .iter()
+            .map(|(name, url)| serde_json::json!({"name": name, "url": url}))
+            .collect();
         let body = serde_json::json!({
             "entry_point": self.node.node_id,
             "region": self.node.region,
             "stream_id": stream_id,
             "session": session_id,
             "pinned": assignment.as_ref().is_some_and(|assignment| assignment.pinned),
-            "assigned": assignment.as_ref().map(|assignment| &assignment.caches),
+            "assigned": assigned,
             "error": error.map(|error| error.to_string()),
             "policy": {
                 "spread_permille": self.assignment_policy.spread_permille,
@@ -19389,6 +19621,7 @@ impl AppRouter {
         });
         // Phase AM item 8: the live gauges beside the counters.
         let mut body = body;
+        body["failover_entries"] = serde_json::Value::Array(failover_entries);
         if let (Some(block), Some(gauges)) = (body["client_udp"].as_object_mut(), gauges) {
             if let Ok(serde_json::Value::Object(gauges)) = serde_json::to_value(gauges) {
                 block.extend(gauges);
@@ -19923,6 +20156,7 @@ impl AppRouter {
                 .await
                 .is_some_and(|silent| silent >= limit)
         {
+            self.note_region_silence(false);
             return false;
         }
         let Some(fresh_ms) = self.region_silence_fresh_ms else {
@@ -19940,9 +20174,65 @@ impl AppRouter {
             self.edge_udp_stats
                 .region_silence_held
                 .fetch_add(1, Ordering::Relaxed);
+            self.note_region_silence(true);
             return false;
         }
+        self.note_region_silence(false);
         true
+    }
+
+    /// Phase AM item 11: keep when the region-wide silence began.
+    fn note_region_silence(&self, silent: bool) {
+        let mut since = self
+            .region_silence_since
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match (silent, since.is_some()) {
+            (true, false) => *since = Some(Instant::now()),
+            (false, true) => *since = None,
+            _ => {}
+        }
+    }
+
+    /// Phase AM item 11: whether this edge's region has lost stream
+    /// `stream_id`: its parents' silence has been region-wide for
+    /// --client-udp-region-hold-ms and a failover region answers with a
+    /// fresh copy. The UDP clients are then sent there (`region-lost`).
+    async fn region_is_lost(&self, stream_id: u64) -> bool {
+        let (Some(hold), Some(probe)) = (self.region_hold, self.failover_probe.as_ref()) else {
+            return false;
+        };
+        if self.failover_entries.is_empty() || !self.region_wide_silence_now().await {
+            return false;
+        }
+        let held_for = self
+            .region_silence_since
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .map(|since| since.elapsed());
+        if !held_for.is_some_and(|held| held >= hold) {
+            return false;
+        }
+        for (name, url) in self.failover_entries.iter() {
+            if probe.fresh(url, stream_id).await {
+                self.edge_udp_stats
+                    .region_lost_checks
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(failover = %name, stream_id, "the region is silent and the failover region is fresh");
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Asks whether the parents are lost (which notes a region-wide
+    /// silence): true when they are silent, whether or not the edge holds.
+    async fn region_wide_silence_now(&self) -> bool {
+        let _ = self.parents_are_lost().await;
+        self.region_silence_since
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
     }
 
     /// `Err` when the part is not here and this edge has lost its parents.
@@ -24509,6 +24799,136 @@ mod tests {
             .and_then(|edge| edge.parents_silent_ms)
             .is_some_and(|silent| silent >= 200));
         edge_mesh.shutdown();
+    }
+
+    /// Phase AM item 11: a region-wide silence (the edge holds its UDP
+    /// clients) that lasts --client-udp-region-hold-ms, with a failover
+    /// region that answers fresh, is a lost region: the clients are sent
+    /// there (`region-lost`). Not before the hold, not when the failover
+    /// region is not fresh, not with the hold at 0.
+    #[tokio::test]
+    async fn a_region_wide_silence_held_long_enough_sends_udp_clients_to_a_fresh_failover_region(
+    ) {
+        use playlists::mesh::{CacheMesh, CacheMeshConfig};
+
+        let parent_addr = unused_loopback_addr();
+        let edge_addr = unused_loopback_addr();
+        let edge_cache = canonical_gap_test_cache().await;
+        let parent_mesh = CacheMesh::new(
+            Arc::clone(&canonical_gap_test_cache().await.chunk_cache),
+            CacheMeshConfig::new("region-parent", "uk", parent_addr)
+                .with_peer(edge_addr)
+                .with_announce_interval(Duration::from_millis(40)),
+        )
+        .start()
+        .await
+        .unwrap();
+        let edge_mesh = Arc::new(
+            CacheMesh::new(
+                Arc::clone(&edge_cache.chunk_cache),
+                CacheMeshConfig::new("region-edge", "uk", edge_addr)
+                    .with_peer(parent_addr)
+                    .with_announce_interval(Duration::from_millis(40)),
+            )
+            .start()
+            .await
+            .unwrap(),
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        parent_mesh.shutdown();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let telemetry = TelemetryAggregator::default();
+        let mut other = telemetry_snapshot_for_tests(
+            "edge-b",
+            "test-region",
+            "test-continent",
+            51.6,
+            -0.2,
+            Vec::new(),
+            77,
+        );
+        let mut edge =
+            EdgeServiceSnapshot::from_node(&other.node, None, "edge", EdgeLoadSnapshot::default());
+        edge.parents_silent_ms = Some(5_000);
+        other.edge_service = Some(edge);
+        telemetry.ingest_snapshot(other).await;
+        let failover = "https://127.0.0.1:9";
+        let probe = Arc::new(FailoverProbe::for_tests());
+        probe.set_answer(failover, 77, true).await;
+        let router = app_router_for_tests_with_telemetry(
+            Arc::clone(&edge_cache),
+            Arc::clone(&edge_mesh),
+            telemetry,
+        )
+        .with_parents_silent_after(Some(Duration::from_millis(200)))
+        .with_region_silence_holds(true, 3_000)
+        .with_liveness_cache(0)
+        .with_failover_entries(&[format!("us-east={failover}")]);
+        let lost = router
+            .clone()
+            .with_region_failover(Duration::from_millis(300), Some(Arc::clone(&probe)));
+        // Held: the silence is region-wide, and not yet for the hold.
+        assert!(!lost.parents_are_lost().await);
+        assert!(!lost.region_is_lost(77).await);
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert!(lost.region_is_lost(77).await, "held past the hold, failover fresh");
+        assert!(
+            lost.edge_udp_stats
+                .region_lost_checks
+                .load(Ordering::Relaxed)
+                >= 1
+        );
+        // Another stream that the failover region does not hold fresh.
+        probe.set_answer(failover, 78, false).await;
+        assert!(!lost.region_is_lost(78).await);
+        // With the hold at 0 (before): held for as long as it lasts.
+        let held = router
+            .clone()
+            .with_region_failover(Duration::ZERO, Some(Arc::clone(&probe)));
+        assert!(!held.parents_are_lost().await);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!held.region_is_lost(77).await);
+        // The UDP assignment lists the failover region last.
+        let api: serde_json::Value = serde_json::from_slice(
+            get_for_tests(&lost, "/api/assignment?stream=77")
+                .await
+                .body
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        let assigned = api["assigned"].as_array().expect("a list");
+        let last = assigned.last().unwrap();
+        assert_eq!(last["node_id"], "us-east", "{api:#}");
+        assert_eq!(last["playback_base_url"], failover);
+        assert_eq!(last["failover_entry"], true);
+        assert_eq!(api["failover_entries"][0]["name"], "us-east");
+        // Pinned: the named cache alone.
+        let pinned = get_for_tests(&lost, "/api/assignment?stream=77&cache=nowhere").await;
+        let pinned: serde_json::Value =
+            serde_json::from_slice(pinned.body.as_ref().unwrap()).unwrap();
+        assert!(pinned["assigned"].is_null(), "{pinned:#}");
+        edge_mesh.shutdown();
+    }
+
+    #[test]
+    fn a_failover_region_is_fresh_when_a_cache_can_take_a_reader() {
+        let answer = |cache: serde_json::Value| serde_json::json!({ "caches": [cache] });
+        let good = serde_json::json!({
+            "fresh": true, "serves_readers": true, "draining": false, "head_part": 12
+        });
+        assert!(failover_answer_is_fresh(&answer(good.clone())));
+        for (key, value) in [
+            ("fresh", serde_json::json!(false)),
+            ("serves_readers", serde_json::json!(false)),
+            ("draining", serde_json::json!(true)),
+            ("head_part", serde_json::Value::Null),
+        ] {
+            let mut cache = good.clone();
+            cache[key] = value;
+            assert!(!failover_answer_is_fresh(&answer(cache)), "{key}");
+        }
+        assert!(!failover_answer_is_fresh(&serde_json::json!({"error": "x"})));
     }
 
     #[tokio::test]
@@ -34618,6 +35038,7 @@ mod tests {
         assert!(args.client_udp_egress_load);
         assert!(args.client_udp_admit_by_load);
         assert_eq!(args.client_udp_drain_spread_ms, 2_000);
+        assert_eq!(args.client_udp_region_hold_ms, 2_000);
         let args = Args::try_parse_from([
             "av-mesh",
             "--client-udp-egress-load",
@@ -34626,11 +35047,14 @@ mod tests {
             "false",
             "--client-udp-drain-spread-ms",
             "0",
+            "--client-udp-region-hold-ms",
+            "0",
         ])
         .unwrap();
         assert!(!args.client_udp_egress_load);
         assert!(!args.client_udp_admit_by_load);
         assert_eq!(args.client_udp_drain_spread_ms, 0);
+        assert_eq!(args.client_udp_region_hold_ms, 0);
     }
 
     #[test]

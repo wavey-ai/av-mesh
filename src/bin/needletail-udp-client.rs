@@ -352,14 +352,18 @@ fn tls_connector(args: &Args) -> Result<TlsConnector> {
 struct Cache {
     node_id: String,
     base: Url,
+    /// The entry point of a neighbouring region (Phase AM item 11): it is
+    /// asked for its own caches when this region's are lost.
+    failover: bool,
 }
 
 async fn assignment(
     http: &Http,
+    entry: &str,
     args: &Args,
     current: Option<&str>,
 ) -> Result<(Vec<Cache>, Option<u16>)> {
-    let entry = Url::parse(&args.entry)?;
+    let entry = Url::parse(entry)?;
     let mut path = format!(
         "/api/assignment?stream={}&sid={}",
         args.stream, args.session
@@ -379,6 +383,7 @@ async fn assignment(
             Some(Cache {
                 node_id: cache["node_id"].as_str()?.to_owned(),
                 base: Url::parse(cache["playback_base_url"].as_str()?).ok()?,
+                failover: cache["failover_entry"].as_bool() == Some(true),
             })
         })
         .collect::<Vec<_>>();
@@ -808,6 +813,12 @@ async fn main() -> Result<()> {
     let mut current: Option<String> = None;
     let mut skip: BTreeSet<String> = BTreeSet::new();
     let mut move_reason = String::from("start");
+    // Phase AM item 11: the entry point asked (the region's, or a failover
+    // region's once this one is lost), the failover entries of the last
+    // answer, and the assignment failures in a row.
+    let mut entry = args.entry.clone();
+    let mut failover_entries: Vec<Cache> = Vec::new();
+    let mut entry_failures = 0_u32;
     let mut buf = vec![0_u8; 65_536];
     let mut first_published_us: Option<u64> = None;
     let mut last_published_us: Option<u64> = None;
@@ -826,14 +837,38 @@ async fn main() -> Result<()> {
     }
 
     'caches: while Instant::now() < deadline {
-        let (caches, port) = match assignment(&http, &args, current.as_deref()).await {
-            Ok(answer) => answer,
+        let (caches, port) = match assignment(&http, &entry, &args, current.as_deref()).await {
+            Ok(answer) => {
+                entry_failures = 0;
+                answer
+            }
             Err(error) => {
                 eprintln!("assignment failed: {error:#}");
+                entry_failures += 1;
+                // The region's entry point does not answer (the region is
+                // lost): ask a failover region's that an earlier answer
+                // named.
+                if entry_failures >= 2 {
+                    if let Some(next) = failover_entries.first() {
+                        eprintln!("asking the failover region {} instead", next.node_id);
+                        entry = format!("https://{}", next.base.authority);
+                        failover_entries.clear();
+                        entry_failures = 0;
+                        skip.clear();
+                        continue;
+                    }
+                }
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 continue;
             }
         };
+        failover_entries = caches.iter().filter(|cache| cache.failover).cloned().collect();
+        // A lost region (MOVE region-lost): none of its caches.
+        if move_reason == "region-lost" {
+            for cache in caches.iter().filter(|cache| !cache.failover) {
+                skip.insert(cache.node_id.clone());
+            }
+        }
         startup.assignment_ms.get_or_insert(since_start(started));
         let port = args.udp_port.or(port).ok_or_else(|| {
             anyhow!("no client UDP port: the entry point names none; pass --udp-port")
@@ -847,6 +882,16 @@ async fn main() -> Result<()> {
             .clone();
         if skip.len() >= caches.len() {
             skip.clear();
+        }
+        // A failover region's entry point: ask it for its caches.
+        if cache.failover {
+            eprintln!("moving to the failover region {}", cache.node_id);
+            entry = format!("https://{}", cache.base.authority);
+            skip.clear();
+            if move_reason == "region-lost" {
+                move_reason = format!("region-lost via {}", cache.node_id);
+            }
+            continue;
         }
         let next_part = received
             .keys()

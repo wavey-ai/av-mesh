@@ -295,6 +295,11 @@ pub(crate) struct EdgeUdpStats {
     /// New subscriptions refused because the edge's egress was overloaded
     /// (`--client-udp-admit-by-load`, Phase AM item 8).
     pub load_refusals: AtomicU64,
+    /// Times that the region was found lost (its silence held past
+    /// --client-udp-region-hold-ms and a failover region fresh), and the
+    /// clients moved for it (Phase AM item 11).
+    pub region_lost_checks: AtomicU64,
+    pub region_lost_moves: AtomicU64,
 }
 
 /// The subscriber table, for the live gauges.
@@ -1865,13 +1870,18 @@ async fn send_control(socket: &UdpSocket, peer: SocketAddr, control: &Control) {
     }
 }
 
-/// Why this edge sends its clients elsewhere, if it does.
-async fn move_reason(router: &AppRouter) -> Option<&'static str> {
+/// Why this edge sends the clients of `stream_id` elsewhere, if it does.
+async fn move_reason(router: &AppRouter, stream_id: u64) -> Option<&'static str> {
     if router.lifecycle.is_draining().await {
         return Some("draining");
     }
     if router.parents_are_lost().await {
         return Some("parents-lost");
+    }
+    // Phase AM item 11: a region-wide silence held long enough, with a
+    // failover region fresh.
+    if router.region_is_lost(stream_id).await {
+        return Some("region-lost");
     }
     None
 }
@@ -2028,7 +2038,7 @@ async fn admit(
     compact: Option<CompactPlan>,
 ) {
     let admitted_in = Instant::now();
-    let reason = match move_reason(&router).await {
+    let reason = match move_reason(&router, stream_id).await {
         // A client sent away for lost parents that comes back at once has
         // found no better edge: it is taken, not sent away again.
         Some("parents-lost")
@@ -2829,7 +2839,7 @@ async fn run_stream_sender(
         if now >= housekeeping_at {
             housekeeping_at = now + HOUSEKEEPING;
             held_while_lost = false;
-            let reason = move_reason(&router).await;
+            let reason = move_reason(&router, stream_id).await;
             let paced = reason == Some("draining") && !config.drain_spread.is_zero();
             if !paced {
                 drain = None;
@@ -2883,6 +2893,11 @@ async fn run_stream_sender(
                     stats
                         .moves
                         .fetch_add(leaving.len() as u64, Ordering::Relaxed);
+                    if reason == "region-lost" {
+                        stats
+                            .region_lost_moves
+                            .fetch_add(leaving.len() as u64, Ordering::Relaxed);
+                    }
                     info!(
                         stream_id,
                         reason,
