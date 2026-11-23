@@ -14,6 +14,10 @@ pub const RECV_BATCH: usize = 64;
 /// Bytes per receive slot: a RelaySession datagram is at most 1,472 bytes;
 /// a legacy or AEP1 datagram larger than a slot is counted as truncated.
 pub const RECV_SLOT_BYTES: usize = 16 * 1024;
+/// Bytes per receive slot with UDP GRO (wave 9 D): one message is a run of
+/// datagrams of one sender that the kernel kept together (a sender's UDP GSO
+/// message on a virtual link, or what the NIC's GRO joined), at most 64 KiB.
+pub const GRO_SLOT_BYTES: usize = 64 * 1024;
 /// Messages one send call takes.
 pub const SEND_BATCH: usize = 32;
 /// SO_PRIORITY of audio sockets: band 0 of the default prio qdisc priomap
@@ -123,6 +127,41 @@ pub fn enable_receive_metadata(socket: &impl AsRawFd) -> io::Result<()> {
     }
 }
 
+/// Ask the kernel to keep a sender's run of equal datagrams together on
+/// this socket (UDP_GRO): one receive message carries up to 64 of them, cut
+/// apart by [`RecvBatch`] with the segment size the kernel gives. A UDP GSO
+/// burst on a virtual link then reaches the socket as one buffer instead of
+/// one per datagram (no segmentation, one queue entry), and a NIC's GRO
+/// joins a flow's datagrams of one interrupt the same way.
+pub fn enable_gro(socket: &impl AsRawFd) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        setsockopt_int(socket.as_raw_fd(), libc::SOL_UDP, libc::UDP_GRO, 1)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = socket;
+        Err(io::Error::new(io::ErrorKind::Unsupported, "UDP GRO is Linux only"))
+    }
+}
+
+/// The metadata of one message of a GRO receive, shared by its datagrams.
+#[derive(Debug, Clone, Copy, Default)]
+struct MessageMeta {
+    peer: Option<SocketAddr>,
+    kernel_us: Option<u64>,
+    dropped: Option<u32>,
+    truncated: bool,
+}
+
+/// One datagram of a GRO receive: its message and its place in the slot.
+#[derive(Debug, Clone, Copy)]
+struct Segment {
+    message: u16,
+    offset: u32,
+    len: u32,
+}
+
 /// One received message of a [`RecvBatch`].
 #[derive(Debug, Clone, Copy)]
 pub struct Received<'a> {
@@ -137,8 +176,15 @@ pub struct Received<'a> {
 }
 
 /// Preallocated buffers for `recvmmsg`.
+///
+/// With UDP GRO ([`RecvBatch::with_gro`]) a message can carry many datagrams;
+/// the batch then shows them as windows of at most [`RECV_BATCH`] datagrams
+/// ([`RecvBatch::next_window`]), each read with `len`/`get`/`data` as the
+/// messages of a plain receive are, so a reader of the batch does not see
+/// the difference.
 pub struct RecvBatch {
     data: Vec<u8>,
+    slot_bytes: usize,
     #[cfg(target_os = "linux")]
     addresses: Vec<libc::sockaddr_storage>,
     #[cfg(target_os = "linux")]
@@ -147,6 +193,16 @@ pub struct RecvBatch {
     headers: Vec<libc::mmsghdr>,
     control: Vec<[u64; 16]>,
     count: usize,
+    gro: bool,
+    /// GRO: each message's metadata and the datagrams of the last receive,
+    /// and the window shown now (start, length).
+    metas: Vec<MessageMeta>,
+    segments: Vec<Segment>,
+    window: (usize, usize),
+    /// GRO: messages that carried more than one datagram, and the datagrams
+    /// they carried, since the batch was made.
+    pub gro_messages: u64,
+    pub gro_datagrams: u64,
 }
 
 // SAFETY: the raw pointers in the headers point only into the batch's own
@@ -161,8 +217,20 @@ impl Default for RecvBatch {
 
 impl RecvBatch {
     pub fn new() -> Self {
+        Self::with_slots(RECV_SLOT_BYTES, false)
+    }
+
+    /// A batch for sockets with UDP GRO on ([`enable_gro`]): slots of
+    /// [`GRO_SLOT_BYTES`], and each message cut into its datagrams. A
+    /// message without the GRO control (one datagram) is read as one.
+    pub fn with_gro() -> Self {
+        Self::with_slots(GRO_SLOT_BYTES, true)
+    }
+
+    fn with_slots(slot_bytes: usize, gro: bool) -> Self {
         Self {
-            data: vec![0_u8; RECV_BATCH * RECV_SLOT_BYTES],
+            data: vec![0_u8; RECV_BATCH * slot_bytes],
+            slot_bytes,
             #[cfg(target_os = "linux")]
             // SAFETY: all-zero sockaddr_storage, iovec and mmsghdr are valid.
             addresses: vec![unsafe { std::mem::zeroed() }; RECV_BATCH],
@@ -172,7 +240,35 @@ impl RecvBatch {
             headers: vec![unsafe { std::mem::zeroed() }; RECV_BATCH],
             control: vec![[0_u64; 16]; RECV_BATCH],
             count: 0,
+            gro,
+            metas: if gro { vec![MessageMeta::default(); RECV_BATCH] } else { Vec::new() },
+            segments: if gro {
+                Vec::with_capacity(RECV_BATCH * 64)
+            } else {
+                Vec::new()
+            },
+            window: (0, 0),
+            gro_messages: 0,
+            gro_datagrams: 0,
         }
+    }
+
+    pub const fn is_gro(&self) -> bool {
+        self.gro
+    }
+
+    /// GRO: show the next [`RECV_BATCH`] datagrams of the last receive;
+    /// false when the last window was the last. A plain batch has one.
+    pub fn next_window(&mut self) -> bool {
+        if !self.gro {
+            return false;
+        }
+        let next = self.window.0 + self.window.1;
+        if next >= self.segments.len() {
+            return false;
+        }
+        self.window = (next, (self.segments.len() - next).min(RECV_BATCH));
+        true
     }
 
     /// Take what the socket has queued, up to [`RECV_BATCH`] messages,
@@ -181,10 +277,11 @@ impl RecvBatch {
         self.count = 0;
         #[cfg(target_os = "linux")]
         {
+            let slot_bytes = self.slot_bytes;
             for index in 0..RECV_BATCH {
                 self.iovecs[index] = libc::iovec {
-                    iov_base: self.data[index * RECV_SLOT_BYTES..].as_mut_ptr().cast(),
-                    iov_len: RECV_SLOT_BYTES,
+                    iov_base: self.data[index * slot_bytes..].as_mut_ptr().cast(),
+                    iov_len: slot_bytes,
                 };
                 let header = &mut self.headers[index].msg_hdr;
                 header.msg_name = std::ptr::from_mut(&mut self.addresses[index]).cast();
@@ -217,6 +314,9 @@ impl RecvBatch {
                 };
             }
             self.count = result as usize;
+            if self.gro {
+                self.cut_segments();
+            }
             Ok(self.count)
         }
         #[cfg(not(target_os = "linux"))]
@@ -229,8 +329,99 @@ impl RecvBatch {
         }
     }
 
+    /// GRO: read each message's metadata once and cut it into datagrams of
+    /// the segment size the kernel gave (the last may be shorter); show the
+    /// first window.
+    #[cfg(target_os = "linux")]
+    fn cut_segments(&mut self) {
+        self.segments.clear();
+        for message in 0..self.count {
+            let (meta, segment_size) = self.parse_message(message);
+            self.metas[message] = meta;
+            let len = (self.headers[message].msg_len as usize).min(self.slot_bytes);
+            let step = match segment_size {
+                Some(size) if size > 0 && size < len => size,
+                _ => len.max(1),
+            };
+            let mut offset = 0;
+            let mut pieces = 0_u64;
+            loop {
+                let take = step.min(len - offset);
+                self.segments.push(Segment {
+                    message: message as u16,
+                    offset: offset as u32,
+                    len: take as u32,
+                });
+                pieces += 1;
+                offset += take;
+                if offset >= len {
+                    break;
+                }
+            }
+            if pieces > 1 {
+                self.gro_messages += 1;
+                self.gro_datagrams += pieces;
+            }
+        }
+        self.window = (0, self.segments.len().min(RECV_BATCH));
+    }
+
+    /// The metadata of message `index` of the last receive (its peer, kernel
+    /// time, the socket's drop count, truncation) and its GRO segment size.
+    #[cfg(target_os = "linux")]
+    fn parse_message(&self, index: usize) -> (MessageMeta, Option<usize>) {
+        let header = &self.headers[index];
+        let peer = sockaddr_to_std(&self.addresses[index], header.msg_hdr.msg_namelen);
+        let mut kernel_us = None;
+        let mut dropped = None;
+        let mut segment = None;
+        // SAFETY: the kernel filled msg_control up to msg_controllen with
+        // well-formed cmsg headers; CMSG_* only walk inside it.
+        unsafe {
+            let msg = &header.msg_hdr;
+            let mut cmsg = libc::CMSG_FIRSTHDR(msg);
+            while !cmsg.is_null() {
+                let level = (*cmsg).cmsg_level;
+                let kind = (*cmsg).cmsg_type;
+                if level == libc::SOL_SOCKET && kind == libc::SCM_TIMESTAMPNS {
+                    let time = std::ptr::read_unaligned(
+                        libc::CMSG_DATA(cmsg).cast::<libc::timespec>(),
+                    );
+                    kernel_us = Some(
+                        (time.tv_sec as u64)
+                            .saturating_mul(1_000_000)
+                            .saturating_add(time.tv_nsec as u64 / 1_000),
+                    );
+                } else if level == libc::SOL_SOCKET && kind == libc::SO_RXQ_OVFL {
+                    dropped = Some(std::ptr::read_unaligned(
+                        libc::CMSG_DATA(cmsg).cast::<u32>(),
+                    ));
+                } else if level == libc::SOL_UDP && kind == libc::UDP_GRO {
+                    let size = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::c_int>());
+                    segment = usize::try_from(size).ok();
+                }
+                cmsg = libc::CMSG_NXTHDR(msg, cmsg);
+            }
+        }
+        (
+            MessageMeta {
+                peer,
+                kernel_us,
+                dropped,
+                truncated: header.msg_hdr.msg_flags & libc::MSG_TRUNC != 0,
+            },
+            segment,
+        )
+    }
+
+    /// The datagrams shown now: the messages of a plain receive, or the
+    /// window of a GRO receive.
     pub const fn len(&self) -> usize {
-        self.count
+        if self.gro {
+            self.window.1
+        } else {
+            self.count
+        }
     }
 
     /// The bytes of message `index` of the last receive, without its
@@ -238,6 +429,11 @@ impl RecvBatch {
     pub fn data(&self, index: usize) -> &[u8] {
         #[cfg(target_os = "linux")]
         {
+            if self.gro {
+                let segment = self.segments[self.window.0 + index];
+                let start = usize::from(segment.message) * self.slot_bytes + segment.offset as usize;
+                return &self.data[start..start + segment.len as usize];
+            }
             let len = (self.headers[index].msg_len as usize).min(RECV_SLOT_BYTES);
             &self.data[index * RECV_SLOT_BYTES..index * RECV_SLOT_BYTES + len]
         }
@@ -252,6 +448,18 @@ impl RecvBatch {
     pub fn get(&self, index: usize) -> Received<'_> {
         #[cfg(target_os = "linux")]
         {
+            if self.gro {
+                debug_assert!(index < self.window.1);
+                let segment = self.segments[self.window.0 + index];
+                let meta = self.metas[usize::from(segment.message)];
+                return Received {
+                    data: self.data(index),
+                    peer: meta.peer,
+                    kernel_us: meta.kernel_us,
+                    dropped: meta.dropped,
+                    truncated: meta.truncated,
+                };
+            }
             debug_assert!(index < self.count);
             let header = &self.headers[index];
             let len = (header.msg_len as usize).min(RECV_SLOT_BYTES);
@@ -1348,5 +1556,83 @@ mod tests {
             assert_eq!(got.len(), payloads.len());
             assert_eq!(got, payloads);
         }
+    }
+
+    /// Wave 9 D: a receiver with UDP GRO takes a GSO burst as a few messages
+    /// and the batch shows the same datagrams, in order, in windows of at
+    /// most RECV_BATCH, each with the sender, a kernel time and the drop
+    /// count; a plain datagram among them is read as one.
+    #[test]
+    fn a_gro_batch_shows_a_gso_burst_as_the_same_datagrams_in_windows() {
+        let receiver = bind_plain("127.0.0.1:0".parse().unwrap()).unwrap();
+        socket2::SockRef::from(&receiver)
+            .set_recv_buffer_size(4 << 20)
+            .unwrap();
+        enable_receive_metadata(&receiver).unwrap();
+        if let Err(error) = enable_gro(&receiver) {
+            eprintln!("UDP GRO is not available here: {error}");
+            return;
+        }
+        let target = receiver.local_addr().unwrap();
+        let sender = bind_plain("127.0.0.1:0".parse().unwrap()).unwrap();
+        let payloads: Vec<Vec<u8>> = (0..301_u32)
+            .map(|index| {
+                let size = if index == 300 { 333 } else { 1_316 };
+                (0..size)
+                    .map(|byte| (index as usize * 7 + byte) as u8)
+                    .collect()
+            })
+            .collect();
+        let plan: Vec<_> = payloads.iter().map(|payload| (&payload[..], target)).collect();
+        match send_gso_batch(sender.as_raw_fd(), plan.len(), |index| plan[index]) {
+            Ok(sent) => assert_eq!(sent.datagrams, plan.len()),
+            Err(error) if gso_unsupported(&error) => {
+                eprintln!("UDP GSO is not available here: {error}");
+                return;
+            }
+            Err(error) => panic!("GSO send failed: {error}"),
+        }
+        // One plain datagram after the burst.
+        let single = vec![9_u8; 700];
+        assert_eq!(send_batch(sender.as_raw_fd(), 1, |_| (&single[..], target)).unwrap(), 1);
+        let mut batch = RecvBatch::with_gro();
+        let mut got = Vec::new();
+        let mut messages = 0;
+        for _ in 0..200 {
+            let _ = wait_readable(&[receiver.as_raw_fd()], 100);
+            let n = batch.recv(&receiver).unwrap_or(0);
+            messages += n;
+            if n == 0 {
+                continue;
+            }
+            loop {
+                assert!(batch.len() <= RECV_BATCH);
+                for index in 0..batch.len() {
+                    let message = batch.get(index);
+                    assert_eq!(message.peer, Some(sender.local_addr().unwrap()));
+                    assert!(message.kernel_us.is_some());
+                    // The kernel sends the drop count only once it is above 0.
+                    assert!(matches!(message.dropped, None | Some(0)));
+                    assert!(!message.truncated);
+                    assert_eq!(message.data, batch.data(index));
+                    got.push(message.data.to_vec());
+                }
+                if !batch.next_window() {
+                    break;
+                }
+            }
+            if got.len() == payloads.len() + 1 {
+                break;
+            }
+        }
+        let mut expected = payloads.clone();
+        expected.push(single);
+        assert_eq!(got.len(), expected.len());
+        assert_eq!(got, expected);
+        // 302 datagrams in a handful of messages (runs of up to 49 symbols
+        // of 1,316 bytes), not 302.
+        assert!(messages <= 12, "{messages} messages");
+        assert!(batch.gro_messages >= 6, "{}", batch.gro_messages);
+        assert_eq!(batch.gro_datagrams, 301);
     }
 }

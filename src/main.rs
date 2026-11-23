@@ -1341,6 +1341,21 @@ struct Args {
     )]
     relay_video_gso: bool,
 
+    /// Wave 9 D: the video fast-plane sockets take UDP GRO. A parent's GSO
+    /// burst (a 4K part's symbols, up to 64 in one message) reaches the
+    /// socket as one receive message that the thread cuts into its symbols,
+    /// instead of one queue entry, one segmentation and one copy per symbol;
+    /// on a NIC, its GRO joins a flow's symbols of one interrupt the same way.
+    /// A host that refuses it is logged once per socket and reads one symbol
+    /// per message. `false`: one datagram per message, as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_VIDEO_GRO",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_video_gro: bool,
+
     /// Burst copies on the long-haul lanes (wave 5, W2): the audio
     /// fast-plane thread sends every audio source symbol that it forwards
     /// to a compiled child (--relay-forward: the long-haul forwarders, a
@@ -3963,6 +3978,7 @@ async fn main() -> Result<()> {
         realtime: args.relay_class_realtime,
         tee_capacity: args.relay_class_tee_capacity,
         video_gso: args.relay_video_gso,
+        video_gro: args.relay_video_gro,
         burst_copy_ms: args.relay_burst_copy_ms,
         loss_report: args.relay_loss_report,
         demand: node_demand,
@@ -40150,6 +40166,15 @@ mod tests {
         assert!(!args.relay_video_gso);
     }
 
+    #[test]
+    fn the_wave9_4k_flags_default_on_and_can_be_turned_off() {
+        let args = Args::try_parse_from(["av-mesh"]).unwrap();
+        assert!(args.relay_video_gro);
+        assert!(fast_plane::relay::RelayClassConfig::default().video_gro);
+        let args = Args::try_parse_from(["av-mesh", "--relay-video-gro", "false"]).unwrap();
+        assert!(!args.relay_video_gro);
+    }
+
     #[tokio::test]
     async fn fast_plane_forwards_everything_when_its_tee_is_full() {
         let (child, _) = bind_class_pair(1_000).await;
@@ -40643,6 +40668,7 @@ mod tests {
                 demand: None,
                 ranked_parents: Vec::new(),
                 lease_descriptors: true,
+                video_gro: true,
                 test_tee_panic: Some(fast_plane::TrafficClass::Audio),
             },
         )

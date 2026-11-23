@@ -100,6 +100,11 @@ pub struct RelayClassConfig {
     /// one-symbol part (RLS1, which carries the descriptor of the compact
     /// RLC1 parts) before its first compact part (see `LeaseDescriptors`).
     pub lease_descriptors: bool,
+    /// `--relay-video-gro` (wave 9 D): the video sockets take UDP GRO, so a
+    /// parent's GSO burst (or what the NIC joined) is one receive message cut
+    /// apart in the thread, not one kernel datagram each (see
+    /// `sys::enable_gro`).
+    pub video_gro: bool,
     /// Tests: the tee of this class panics on its first datagram.
     #[cfg(test)]
     pub test_tee_panic: Option<TrafficClass>,
@@ -121,6 +126,7 @@ impl Default for RelayClassConfig {
             demand: None,
             ranked_parents: Vec::new(),
             lease_descriptors: true,
+            video_gro: true,
             #[cfg(test)]
             test_tee_panic: None,
         }
@@ -253,6 +259,11 @@ pub struct FastPlaneStats {
     /// Whole audio parts sent to lease children new to their stream, for
     /// the descriptor of the compact parts (wave 9, `LeaseDescriptors`).
     pub lease_descriptors: AtomicU64,
+    /// Video sockets with UDP GRO on, receive messages that carried more
+    /// than one datagram and the datagrams they carried (wave 9 D).
+    pub gro_sockets: AtomicU64,
+    pub gro_messages: AtomicU64,
+    pub gro_datagrams: AtomicU64,
 }
 
 /// The thresholds of `FastPlaneStats::loop_busy_over`, in µs.
@@ -331,6 +342,9 @@ pub struct FastPlaneSnapshot {
     pub memory_locked: bool,
     pub allocator_tuned: bool,
     pub lease_descriptors: u64,
+    pub gro_sockets: u64,
+    pub gro_messages: u64,
+    pub gro_datagrams: u64,
 }
 
 impl FastPlaneStats {
@@ -391,6 +405,9 @@ impl FastPlaneStats {
             memory_locked: crate::memory::locked(),
             allocator_tuned: crate::memory::tuned(),
             lease_descriptors: load(&self.lease_descriptors),
+            gro_sockets: load(&self.gro_sockets),
+            gro_messages: load(&self.gro_messages),
+            gro_datagrams: load(&self.gro_datagrams),
         }
     }
 }
@@ -922,6 +939,7 @@ struct ClassThread {
     /// ranked lease parents.
     demand_peers: Arc<[SocketAddr]>,
     lease_descriptors: bool,
+    video_gro: bool,
 }
 
 /// Wave 9 (cold start): each stream's last whole one-symbol audio part
@@ -1072,7 +1090,30 @@ impl ClassThread {
             .iter()
             .map(|(_, socket)| socket.as_raw_fd())
             .collect();
-        let mut batch = RecvBatch::new();
+        // UDP GRO on the video sockets (wave 9 D); a socket that refuses it
+        // still reads one datagram per message through the same batch.
+        let gro_sockets = if self.video_gro && self.class == TrafficClass::Video {
+            self.sockets
+                .iter()
+                .filter(|(_, socket)| match sys::enable_gro(socket) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        info!(error = %error, "UDP GRO refused on a video socket");
+                        false
+                    }
+                })
+                .count()
+        } else {
+            0
+        };
+        self.stats
+            .gro_sockets
+            .fetch_add(gro_sockets as u64, Ordering::Relaxed);
+        let mut batch = if gro_sockets > 0 {
+            RecvBatch::with_gro()
+        } else {
+            RecvBatch::new()
+        };
         let mut dedup = FirstArrival::new(DEDUP_CAPACITY);
         let mut plan = self.forwarder.as_ref().map_or_else(
             || ForwardPlan::new(0, 0),
@@ -1148,20 +1189,26 @@ impl ClassThread {
                     if received == 0 {
                         break;
                     }
-                    self.drain(
-                        &batch,
-                        *path,
-                        &mut kernel_dropped[index],
-                        &mut dedup,
-                        &mut plan,
-                        &mut pending,
-                        &mut clients,
-                        &mut client_sender,
-                        &mut gso,
-                        copies.as_mut(),
-                        meters.get_mut(index),
-                        descriptors.as_mut(),
-                    );
+                    // A GRO receive shows its datagrams RECV_BATCH at a time.
+                    loop {
+                        self.drain(
+                            &batch,
+                            *path,
+                            &mut kernel_dropped[index],
+                            &mut dedup,
+                            &mut plan,
+                            &mut pending,
+                            &mut clients,
+                            &mut client_sender,
+                            &mut gso,
+                            copies.as_mut(),
+                            meters.get_mut(index),
+                            descriptors.as_mut(),
+                        );
+                        if !batch.next_window() {
+                            break;
+                        }
+                    }
                     if received < RECV_BATCH {
                         break;
                     }
@@ -1179,6 +1226,14 @@ impl ClassThread {
             {
                 last_demand_report = Some(Instant::now());
                 self.report_demand(&fds);
+            }
+            if batch.is_gro() {
+                self.stats
+                    .gro_messages
+                    .store(batch.gro_messages, Ordering::Relaxed);
+                self.stats
+                    .gro_datagrams
+                    .store(batch.gro_datagrams, Ordering::Relaxed);
             }
             if ready != 0 {
                 self.stats.record_loop(
@@ -1982,6 +2037,7 @@ pub async fn run_relay_class_ingest(
                 .flatten(),
             demand_peers: Arc::clone(&demand_peers),
             lease_descriptors: config.lease_descriptors,
+            video_gro: config.video_gro,
         };
         match std::thread::Builder::new()
             .name(format!("needletail-fast-{}", class.as_str()))
@@ -2047,6 +2103,7 @@ pub async fn run_relay_class_ingest(
         threads = threads.len(),
         port_offset = config.port_offset,
         video_gso = config.video_gso,
+        video_gro = config.video_gro,
         children = forwarder
             .as_ref()
             .map_or(0, |forwarder| forwarder.paths.len()),
