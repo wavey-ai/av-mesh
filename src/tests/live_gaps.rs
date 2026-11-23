@@ -59,7 +59,7 @@ async fn commit(cache: &LiveTsCache, sequence: u64) {
             )
             .await
             .unwrap(),
-        sequence
+        Committed::Stored(sequence)
     );
 }
 

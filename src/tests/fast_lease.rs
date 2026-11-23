@@ -59,6 +59,7 @@ fn lease_children(ports: [u16; 2], primary: &[Ipv4Addr]) -> Arc<LeaseChildren> {
             primary_children: primary.iter().map(|ip| IpAddr::V4(*ip)).collect(),
             max_children: 16,
             ranked: true,
+            warm_hold_us: 1_000_000,
         },
         4 << 20,
     )
@@ -570,6 +571,7 @@ async fn lease_children_above_the_cap_are_refused() {
             primary_children: ips.iter().map(|ip| IpAddr::V4(*ip)).collect(),
             max_children: 1,
             ranked: true,
+            warm_hold_us: 1_000_000,
         },
         4 << 20,
     )

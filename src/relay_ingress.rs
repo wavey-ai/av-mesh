@@ -419,6 +419,11 @@ macro_rules! rejection_kinds {
             pub fn add(&mut self, other: &Self) {
                 $(self.$field = self.$field.saturating_add(other.$field);)+
             }
+
+            /// Each kind's name and count, for the metrics.
+            pub fn named(&self) -> impl Iterator<Item = (&'static str, u64)> {
+                [$((stringify!($field), self.$field)),+].into_iter()
+            }
         }
     };
 }
