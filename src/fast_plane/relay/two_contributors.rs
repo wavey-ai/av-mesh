@@ -763,3 +763,87 @@ async fn the_epoch_that_the_cache_takes_up_reaches_the_class_threads() {
     let _ = shutdown_tx.send(());
     task.await.unwrap().unwrap();
 }
+
+/// A stream's last whole part, kept for a lease child that is new to the
+/// stream (`LeaseDescriptors`), ages on this node's clock from its receipt
+/// (A 2.5, "local holds age on the local clock"): its wire deadline is a
+/// point on the stream's timeline, and here it is long past.
+#[test]
+fn a_kept_whole_part_ages_from_its_receipt_not_its_wire_deadline() {
+    use crate::fast_plane::lease::LeaseChildConfig;
+    use playlists::mesh::ServedSubscription;
+    use std::os::fd::AsRawFd;
+    const STREAM: u64 = 3010;
+    const RECEIPT_US: u64 = 1_763_924_000_000_000;
+    // Two lease children on one port of two loopback addresses.
+    let ips = [Ipv4Addr::new(127, 0, 0, 2), Ipv4Addr::new(127, 0, 0, 3)];
+    let (port, children) = (0..128)
+        .find_map(|_| {
+            let first = StdSocket::bind((ips[0], 0)).ok()?;
+            let port = first.local_addr().ok()?.port();
+            port.checked_add(1_000)?;
+            let second = StdSocket::bind((ips[1], port)).ok()?;
+            Some((port, [first, second]))
+        })
+        .expect("a port free on both addresses");
+    for child in &children {
+        child
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+    }
+    let lease = LeaseChildren::bind(
+        LeaseChildConfig {
+            bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            child_ports: [port, port ^ 1],
+            class_port_offset: 1_000,
+            primary_children: ips.iter().map(|ip| (*ip).into()).collect(),
+            max_children: 16,
+            ranked: false,
+        },
+        1 << 20,
+    )
+    .unwrap();
+    let served = |ip: Ipv4Addr| ServedSubscription {
+        child: SocketAddr::from((ip, 9_101)),
+        stream_id: STREAM,
+        backfill_parts_pending: 0,
+        rank: None,
+    };
+    let sender = StdSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let stats = FastPlaneStats::default();
+    let mut descriptors = LeaseDescriptors::default();
+    let mut observe = |datagram: &[u8], now_us: u64| {
+        let view = RlsView::parse(datagram, RelayLimits::default()).unwrap();
+        descriptors.observe(
+            sender.as_raw_fd(),
+            &lease.load(),
+            TrafficClass::Audio,
+            &view,
+            datagram,
+            now_us,
+            &stats,
+        );
+    };
+    // A whole one-symbol part whose wire deadline passed long ago (a source
+    // clock behind this node's), kept before the stream has a child.
+    let past = 1;
+    let whole = rls1_part(&envelope(STREAM, 0, 1, &payload(0)), past).remove(0);
+    let view = RlsView::parse(&whole, RelayLimits::default()).unwrap();
+    assert!(view.slim.is_none() && view.source_symbols == 1);
+    observe(&whole, RECEIPT_US);
+    let compact_of = |object: u64| compact_part(STREAM, object, 1, &payload(object), past, 0).remove(0);
+    // A child that comes 900 ms after the receipt gets it before the next
+    // compact part.
+    lease.rebuild(&[served(ips[0])]);
+    observe(&compact_of(1), RECEIPT_US + 900_000);
+    let mut buf = [0_u8; 2_048];
+    let (len, _) = children[0].recv_from(&mut buf).expect("the kept part");
+    assert_eq!(&buf[..len], whole.as_slice());
+    assert_eq!(stats.lease_descriptors.load(Ordering::Relaxed), 1);
+    // One that comes a second after it does not.
+    lease.rebuild(&[served(ips[0]), served(ips[1])]);
+    observe(&compact_of(2), RECEIPT_US + DESCRIPTOR_HOLD_US);
+    assert!(children[1].recv_from(&mut buf).is_err(), "a part held past its second");
+    assert!(children[0].recv_from(&mut buf).is_err(), "the first child had it");
+    assert_eq!(stats.lease_descriptors.load(Ordering::Relaxed), 1);
+}
