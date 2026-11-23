@@ -6,7 +6,7 @@
 //! it forwards it.
 
 use super::burst_copy::BurstCopies;
-use super::dedup::FirstArrival;
+use super::dedup::{Arrival, FirstArrival};
 use super::demand::{NodeDemand, DEMAND_REPORT_INTERVAL};
 use super::edge_clients::{ClientPlan, ClientSender, EdgeFastLane, UpstreamRepair};
 use super::lease::{LeaseChildren, LeaseSnapshot, LeaseSnapshotStats, LeaseTake};
@@ -1428,7 +1428,7 @@ impl ClassThread {
                 view.object,
                 view.packet_sequence,
             );
-            if !dedup.first(key) {
+            if dedup.first(key, 0, rx_us, 0) != Arrival::First {
                 self.stats.duplicates.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
