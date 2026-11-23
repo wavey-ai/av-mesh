@@ -18131,6 +18131,11 @@ struct ReaderRequest<'a> {
     session: Option<&'a str>,
     pin: Option<&'a str>,
     current: Option<&'a str>,
+    /// Caches the reader has just left (a moving UDP client's skip set,
+    /// Phase AM item 10): not assigned, so that the readers of a lost cache
+    /// spread by the region's ranking instead of all taking the shared
+    /// first alternate.
+    skip: &'a [String],
 }
 
 impl AppRouter {
@@ -18677,6 +18682,7 @@ impl AppRouter {
             draining,
         });
         let reader = ReaderRequest {
+            skip: &[],
             stream_id: stream_id.unwrap_or(self.cache.stream_id),
             session: session_id,
             pin: None,
@@ -19007,7 +19013,10 @@ impl AppRouter {
         reader: ReaderRequest<'_>,
         remember: bool,
     ) -> (Result<Assignment, AssignmentError>, Vec<CacheCandidate>) {
-        let candidates = self.cache_candidates(reader.stream_id).await;
+        let mut candidates = self.cache_candidates(reader.stream_id).await;
+        if !reader.skip.is_empty() {
+            candidates.retain(|cache| !reader.skip.iter().any(|skip| *skip == cache.node_id));
+        }
         let playlist_bps = self.regional_playlist_bps(reader.stream_id).await;
         let now_ms = now_unix_ms();
         let key = reader
@@ -19154,6 +19163,7 @@ impl AppRouter {
             .and_then(percent_decode_query_value)
             .filter(|pin| !pin.is_empty());
         let reader = ReaderRequest {
+            skip: &[],
             stream_id,
             session: session_id,
             pin: pin.as_deref(),
@@ -19354,6 +19364,7 @@ impl AppRouter {
         let (assignment, _) = self
             .assign_reader(
                 ReaderRequest {
+                    skip: &[],
                     stream_id,
                     session: session.as_deref(),
                     pin: None,
@@ -19404,6 +19415,7 @@ impl AppRouter {
         let (assignment, _) = self
             .assign_reader(
                 ReaderRequest {
+                    skip: &[],
                     stream_id,
                     session: session_id,
                     pin: pin.as_deref(),
@@ -19506,15 +19518,32 @@ impl AppRouter {
         };
         let pin = decoded("cache");
         let current = decoded("current");
+        // Phase AM item 10: the caches a moving client has just left.
+        let skip: Vec<String> = decoded("skip")
+            .map(|list| {
+                list.split(',')
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        // A client that names its session (a UDP client: this answer is its
+        // assignment) is counted against the cache it is sent to until the
+        // cache advertises again, as a reader of the steering list is, so a
+        // crowd of moving clients is not all sent to the cache that was free
+        // a moment ago. An operator's look (no sid) changes nothing.
+        let remember = decoded("sid").is_some();
         let (assignment, candidates) = self
             .assign_reader(
                 ReaderRequest {
+                    skip: &skip,
                     stream_id,
                     session: session_id,
                     pin: pin.as_deref(),
                     current: current.as_deref(),
                 },
-                false,
+                remember,
             )
             .await;
         let caches = candidates
@@ -21120,6 +21149,7 @@ impl Router for AppRouter {
                             Ok(part) => part,
                             Err(ParentsLost) => {
                                 let reader = ReaderRequest {
+                                    skip: &[],
                                     stream_id,
                                     session: session_id.as_deref(),
                                     pin: None,
@@ -33429,6 +33459,17 @@ mod tests {
         assert_eq!(api["assigned"][0]["node_id"], "edge-c");
         assert_eq!(api["assigned"][0]["reason"], "holds_playlist");
         assert_eq!(api["caches"].as_array().unwrap().len(), 3);
+        // Phase AM item 10: a moving client's skip set is not assigned,
+        // first or alternate.
+        let api = get_for_tests(&router, "/api/assignment?stream=801&sid=reader-7&skip=edge-c").await;
+        let api: serde_json::Value = serde_json::from_str(&body_text(api)).unwrap();
+        let assigned: Vec<&str> = api["assigned"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|cache| cache["node_id"].as_str().unwrap())
+            .collect();
+        assert!(!assigned.is_empty() && !assigned.contains(&"edge-c"), "{api:#}");
         mesh.shutdown();
     }
 

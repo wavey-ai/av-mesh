@@ -1087,6 +1087,7 @@ impl Placing<'_> {
                 generation: listener.generation,
                 sid: listener.sid.clone(),
                 entry: listener.entry.clone(),
+                skip: listener.skip.iter().map(|(node, _)| node.clone()).collect(),
             });
             listener.scheduled = deadline;
             return;

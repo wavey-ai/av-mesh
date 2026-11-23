@@ -69,7 +69,7 @@ struct Args {
     /// answer (ms) before the next is asked.
     #[arg(long, default_value_t = 256)]
     assign_in_flight: usize,
-    #[arg(long, default_value_t = 2_000)]
+    #[arg(long, default_value_t = 500)]
     assign_timeout_ms: u64,
     /// A moving listener does not go back to an edge it left within this.
     #[arg(long, default_value_t = 30_000)]

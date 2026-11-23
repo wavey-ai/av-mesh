@@ -62,6 +62,9 @@ pub struct ResolveRequest {
     pub sid: String,
     /// Ask this entry point, not the region's (a failover region).
     pub entry: Option<String>,
+    /// The caches the listener has just left: the entry point assigns
+    /// none of them (`skip=`), so a lost cache's listeners spread.
+    pub skip: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -108,6 +111,7 @@ impl Resolver {
                         server_name: config.server_name.clone(),
                         connections: tokio::sync::Mutex::new(HashMap::new()),
                         addresses: tokio::sync::Mutex::new(HashMap::new()),
+                        failed: std::sync::Mutex::new(HashMap::new()),
                     });
                     let config = Arc::new(config);
                     let limit = Arc::new(tokio::sync::Semaphore::new(config.in_flight.max(1)));
@@ -176,7 +180,7 @@ async fn resolve(
     config: &AssignConfig,
     request: &ResolveRequest,
 ) -> (Result<Vec<AssignedCache>>, Option<String>) {
-    let entries: Vec<&str> = match &request.entry {
+    let mut entries: Vec<&str> = match &request.entry {
         Some(entry) => vec![entry.as_str()],
         None => {
             let first = entry_for(&config.entries, &request.sid);
@@ -185,20 +189,50 @@ async fn resolve(
                 .collect()
         }
     };
+    // An entry point that failed lately is asked last: a stopped node
+    // (its kernel still takes the connection) costs one timeout, once.
+    {
+        let now = Instant::now();
+        let failed = http.failed.lock().unwrap();
+        entries.sort_by_key(|entry| failed.get(*entry).is_some_and(|until| *until > now));
+    }
+    let skip = request.skip.join(",");
     let mut last = anyhow!("no entry point");
     for entry in entries {
-        match tokio::time::timeout(config.timeout, ask(http, config, entry, &request.sid)).await {
-            Ok(Ok(caches)) => return (Ok(caches), Some(entry.to_owned())),
+        match tokio::time::timeout(config.timeout, ask(http, config, entry, &request.sid, &skip))
+            .await
+        {
+            Ok(Ok(caches)) => {
+                http.failed.lock().unwrap().remove(entry);
+                return (Ok(caches), Some(entry.to_owned()));
+            }
             Ok(Err(error)) => last = error.context(entry.to_owned()),
             Err(_) => last = anyhow!("{entry}: no answer in {:?}", config.timeout),
         }
+        http.failed
+            .lock()
+            .unwrap()
+            .insert(entry.to_owned(), Instant::now() + ENTRY_FAILED_FOR);
     }
     (Err(last), None)
 }
 
-async fn ask(http: &Http, config: &AssignConfig, entry: &str, sid: &str) -> Result<Vec<AssignedCache>> {
+/// How long an entry point that failed is asked last.
+const ENTRY_FAILED_FOR: Duration = Duration::from_secs(10);
+
+async fn ask(
+    http: &Http,
+    config: &AssignConfig,
+    entry: &str,
+    sid: &str,
+    skip: &str,
+) -> Result<Vec<AssignedCache>> {
     let authority = authority_of(entry)?;
-    let path = format!("/api/assignment?stream={}&sid={sid}", config.stream_id);
+    let mut path = format!("/api/assignment?stream={}&sid={sid}", config.stream_id);
+    if !skip.is_empty() {
+        path.push_str("&skip=");
+        path.push_str(skip);
+    }
     let body = http.get(&authority, &path, sid).await?;
     let answer: serde_json::Value =
         serde_json::from_slice(&body).context("the assignment answer is not JSON")?;
@@ -287,6 +321,8 @@ struct Http {
     server_name: Option<String>,
     connections: tokio::sync::Mutex<HashMap<String, SendRequest<Empty<Bytes>>>>,
     addresses: tokio::sync::Mutex<HashMap<(String, u16), SocketAddr>>,
+    /// Entry points that failed, until when they are asked last.
+    failed: std::sync::Mutex<HashMap<String, Instant>>,
 }
 
 impl Http {

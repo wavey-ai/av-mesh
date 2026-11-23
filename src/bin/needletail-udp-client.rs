@@ -97,6 +97,11 @@ struct Args {
     /// Fetch every received part over HTTP from the same cache and compare.
     #[arg(long)]
     verify_http: bool,
+    /// How long an entry point has to answer an assignment (ms); one that
+    /// does not, with a failover region known, sends the client there
+    /// (Phase AM item 11; HTTP requests otherwise wait 5 s).
+    #[arg(long, default_value_t = 1_000)]
+    assignment_timeout_ms: u64,
     /// Session id for assignment (CMCD `sid`).
     #[arg(long, default_value = "udp-client")]
     session: String,
@@ -362,16 +367,27 @@ async fn assignment(
     entry: &str,
     args: &Args,
     current: Option<&str>,
+    skip: &BTreeSet<String>,
 ) -> Result<(Vec<Cache>, Option<u16>)> {
     let entry = Url::parse(entry)?;
     let mut path = format!(
         "/api/assignment?stream={}&sid={}",
         args.stream, args.session
     );
+    // Phase AM item 10: the caches it has just left are not assigned.
+    if !skip.is_empty() {
+        path.push_str("&skip=");
+        path.push_str(&skip.iter().cloned().collect::<Vec<_>>().join(","));
+    }
     if let Some(current) = current {
         path.push_str(&format!("&current={current}"));
     }
-    let (status, body) = http.get(&entry.authority, &path).await?;
+    let (status, body) = tokio::time::timeout(
+        Duration::from_millis(args.assignment_timeout_ms.max(1)),
+        http.get(&entry.authority, &path),
+    )
+    .await
+    .map_err(|_| anyhow!("GET https://{}{path}: no answer in {} ms", entry.authority, args.assignment_timeout_ms))??;
     let json: serde_json::Value = serde_json::from_slice(&body)
         .with_context(|| format!("assignment answer is not JSON ({status})"))?;
     let port = json["client_udp_port"].as_u64().map(|port| port as u16);
@@ -837,7 +853,18 @@ async fn main() -> Result<()> {
     }
 
     'caches: while Instant::now() < deadline {
-        let (caches, port) = match assignment(&http, &entry, &args, current.as_deref()).await {
+        // MOVE region-lost: straight to a failover region that an earlier
+        // answer named (this region's entry point may be silent too).
+        if move_reason == "region-lost" {
+            if let Some(next) = failover_entries.first().cloned() {
+                eprintln!("region lost: asking the failover region {}", next.node_id);
+                entry = format!("https://{}", next.base.authority);
+                failover_entries.clear();
+                skip.clear();
+                move_reason = format!("region-lost via {}", next.node_id);
+            }
+        }
+        let (caches, port) = match assignment(&http, &entry, &args, current.as_deref(), &skip).await {
             Ok(answer) => {
                 entry_failures = 0;
                 answer
@@ -848,7 +875,7 @@ async fn main() -> Result<()> {
                 // The region's entry point does not answer (the region is
                 // lost): ask a failover region's that an earlier answer
                 // named.
-                if entry_failures >= 2 {
+                if entry_failures >= 1 {
                     if let Some(next) = failover_entries.first() {
                         eprintln!("asking the failover region {} instead", next.node_id);
                         entry = format!("https://{}", next.base.authority);
