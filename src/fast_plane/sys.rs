@@ -869,6 +869,65 @@ pub fn set_fifo(priority: i32) -> Result<(), String> {
     }
 }
 
+/// `--relay-class-fallback-nice` (wave 8): when the audio class thread is
+/// refused SCHED_FIFO (no CAP_SYS_NICE, as in the local lab), every other
+/// thread of the process is made this much nicer, so that the ingest thread
+/// still wins the CPU over the fan-out, the runtime and the repair, as it
+/// does at real-time priority on a deployed node. 0: off.
+static FALLBACK_NICE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+pub fn set_fallback_nice(nice: i32) {
+    FALLBACK_NICE.store(nice.clamp(0, 19), std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn fallback_nice() -> i32 {
+    FALLBACK_NICE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The audio class thread was refused SCHED_FIFO: make every other thread
+/// of the process [`fallback_nice`] nicer than the process (the class
+/// threads, named `needletail-fast-*`, excepted). Threads started later
+/// inherit the nice value of the thread that starts them. Returns the
+/// threads niced.
+pub fn nice_other_threads() -> usize {
+    let step = fallback_nice();
+    if step == 0 {
+        return 0;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: gettid has no preconditions.
+        let me = unsafe { libc::syscall(libc::SYS_gettid) } as i64;
+        let nice = (process_nice() + step).min(19);
+        let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+            return 0;
+        };
+        let mut niced = 0;
+        for task in tasks.flatten() {
+            let Some(tid) = task.file_name().to_str().and_then(|tid| tid.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            if tid == me {
+                continue;
+            }
+            let name = std::fs::read_to_string(task.path().join("comm")).unwrap_or_default();
+            if name.starts_with("needletail-fast") {
+                continue;
+            }
+            // SAFETY: setpriority on a thread of this process.
+            if unsafe { libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, nice) } == 0 {
+                niced += 1;
+            }
+        }
+        niced
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
 /// Run the calling thread as an ordinary one: SCHED_OTHER on the CPUs of
 /// the process's main thread, at the process's nice value. A thread
 /// inherits the policy, the priority and the CPUs of the thread that
@@ -882,6 +941,15 @@ pub fn set_fifo(priority: i32) -> Result<(), String> {
 /// value asked for is the process's own, which raising never needs a
 /// privilege for.
 pub fn set_ordinary() -> Result<(), String> {
+    set_ordinary_at(None)
+}
+
+/// [`set_ordinary`], at the nice value `nice` if given (wave 8: the fan-out
+/// threads, above the runtime's threads): where the kernel refuses it (no
+/// CAP_SYS_NICE for a value below the thread's), the thread keeps the nice
+/// value it inherited from the class thread that started it, which is
+/// still above the threads that `--relay-class-fallback-nice` made nicer.
+pub fn set_ordinary_at(nice: Option<i32>) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         // SAFETY: a zeroed cpu_set_t is valid; sched_getaffinity writes at
@@ -900,13 +968,15 @@ pub fn set_ordinary() -> Result<(), String> {
         if unsafe { libc::sched_setscheduler(0, libc::SCHED_OTHER, &param) } != 0 {
             return Err(format!("SCHED_OTHER: {}", io::Error::last_os_error()));
         }
-        if let Err(error) = set_nice(process_nice()) {
+        let wanted = nice.unwrap_or_else(process_nice);
+        if let Err(error) = set_nice(wanted) {
             tracing::debug!(error, "an ordinary thread keeps its nice value");
         }
         Ok(())
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = nice;
         Ok(())
     }
 }

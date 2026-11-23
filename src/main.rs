@@ -1281,6 +1281,14 @@ struct Args {
     )]
     relay_class_realtime: bool,
 
+    /// Wave 8: when the audio class thread is refused SCHED_FIFO (no
+    /// CAP_SYS_NICE, as in the local namespace lab), every other thread of
+    /// the process is made this much nicer, so that the ingest still comes
+    /// first, as at real-time priority on a deployed node. 0: off (all at
+    /// the process's nice value, as before).
+    #[arg(long, env = "NEEDLETAIL_RELAY_CLASS_FALLBACK_NICE", default_value_t = 5)]
+    relay_class_fallback_nice: i32,
+
     /// SO_BUSY_POLL, in µs, on the audio fast-plane thread's receive
     /// sockets (forwarders and edges): with the host's net.core.busy_poll
     /// above zero, the thread's poll() polls the device queue for that long
@@ -1909,6 +1917,32 @@ struct Args {
     )]
     client_udp_fanout_inline_sends: usize,
 
+    /// Wave 8 (B4): with fan-out threads, the audio class thread sends one
+    /// shard of each handed-off batch itself (the batch splits threads + 1
+    /// ways): those clients wait for no hand-off, and a batch wakes one
+    /// thread fewer. `false`: every shard to the threads, as in wave 7.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_FANOUT_INLINE_SHARD",
+        default_value_t = fast_plane::edge_clients::DEFAULT_FANOUT_INLINE_SHARD,
+        action = clap::ArgAction::Set
+    )]
+    client_udp_fanout_inline_shard: bool,
+
+    /// Wave 8: the nice value of the audio fan-out threads, above the
+    /// runtime's threads (HTTP, SUB admission, NACK answers, the cache-fed
+    /// lane) and below the real-time class thread. Where the kernel refuses
+    /// it (no CAP_SYS_NICE), they keep the class thread's nice value, above
+    /// the threads --relay-class-fallback-nice made nicer. 99: the process's
+    /// own nice value, as in wave 7.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_FANOUT_NICE",
+        default_value_t = fast_plane::edge_clients::DEFAULT_FANOUT_NICE,
+        allow_negative_numbers = true
+    )]
+    client_udp_fanout_nice: i32,
+
     /// The fast lane sends from send-only twins of the client sockets (the
     /// same address, in their SO_REUSEPORT group) that the runtime watches
     /// for reading only (wave 7 item 10). A socket that the runtime watches
@@ -1963,6 +1997,61 @@ struct Args {
         default_value_t = edge_udp::DEFAULT_FRESH_HEAD_MS
     )]
     client_udp_fresh_head_ms: u64,
+
+    /// Wave 8 S1: the audio class thread (real time) takes no lock that
+    /// ordinary tasks hold. Its batches' window repair, which takes the
+    /// subscriber table's lock, goes to a repair thread, and the NACK answers
+    /// are collected under that lock and sent after it is released, so SUB
+    /// admission, NACK storms and the cache-fed lane never hold the lock
+    /// across sends while the class thread waits. `false`: the class thread
+    /// runs its window repair itself and NACK answers are sent under the
+    /// lock, as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_REPAIR_THREAD",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    client_udp_repair_thread: bool,
+
+    /// Wave 8 S3: a burst of new UDP subscriptions (the start of a step, a
+    /// region's clients moving at once) rebuilds the fast lane's client
+    /// snapshot once a batch, not once a subscriber under the subscriber
+    /// table's lock (each rebuild reads every subscriber), and admission
+    /// does not log each subscription. `false`: one rebuild and log line
+    /// per subscription, as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_BATCHED_ADMISSION",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    client_udp_batched_admission: bool,
+
+    /// Wave 8 S2: a client that moves here from another edge resumes at the
+    /// part that it names while this edge's cache holds it, even if it is
+    /// older than the playout deadline (--client-udp-playout-ms): the parts
+    /// it lost to the old edge's stall come late, not missing. `false`:
+    /// such a client resumes at the oldest part within the deadline, as
+    /// before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_RESUME_FROM_REQUEST",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    client_udp_resume_from_request: bool,
+
+    /// Wave 8: the NACKed parts a second that an edge answers at most, all
+    /// its clients together (each client also has its own budget). A NACK
+    /// storm from the clients of an overloaded edge (parts late or shed)
+    /// must not take the CPU that its sends need. 0: no cap, as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_NACK_EDGE_RATE",
+        default_value_t = edge_udp::DEFAULT_NACK_EDGE_RATE
+    )]
+    client_udp_nack_edge_rate: u32,
 
     /// An edge that has heard none of its cache-mesh parents for this long
     /// has lost them: it answers 503 for a part or a playlist reload that it
@@ -2952,6 +3041,9 @@ async fn main() -> Result<()> {
         lane.set_compact_fast_parse(args.client_udp_compact_fast_parse);
         lane.set_compact_top_up(args.client_udp_compact_top_up);
         lane.set_compact_mark(args.client_udp_compact_mark_fast_lane);
+        lane.set_repair_thread(args.client_udp_repair_thread);
+        lane.set_fanout_inline_shard(args.client_udp_fanout_inline_shard);
+        lane.set_fanout_nice(args.client_udp_fanout_nice);
         lane.set_fanout(
             args.client_udp_fanout_threads,
             args.client_udp_fanout_inline_sends,
@@ -3312,6 +3404,7 @@ async fn main() -> Result<()> {
     if let Some(lease) = &lease_children {
         let _ = lease_push_slot.set(Arc::clone(lease));
     }
+    fast_plane::sys::set_fallback_nice(args.relay_class_fallback_nice);
     // `..Default::default()` fills the fields that exist only in tests.
     #[allow(clippy::needless_update)]
     let relay_class_config = fast_plane::relay::RelayClassConfig {
@@ -3533,6 +3626,10 @@ async fn main() -> Result<()> {
                 admit_on_first_part: args.client_udp_admit_on_first_part,
                 first_part_at_once: args.client_udp_first_part_at_once,
                 fresh_head: Duration::from_millis(args.client_udp_fresh_head_ms),
+                nack_send_unlocked: args.client_udp_repair_thread,
+                batched_admission: args.client_udp_batched_admission,
+                resume_from_request: args.client_udp_resume_from_request,
+                nack_edge_rate: args.client_udp_nack_edge_rate,
             },
             Arc::clone(&router.edge_udp_stats),
             edge_cut_through.clone(),
@@ -19065,6 +19162,7 @@ impl AppRouter {
                     "nack_parts": stats.nack_parts.load(Ordering::Relaxed),
                     "nack_resent": stats.nack_resent.load(Ordering::Relaxed),
                     "nack_refused": stats.nack_refused.load(Ordering::Relaxed),
+                    "nack_edge_capped": stats.nack_edge_capped.load(Ordering::Relaxed),
                     "fast_lane": stats.fast_lane.get().map(|lane| lane.snapshot_stats()),
                 })
             }),
@@ -33735,7 +33833,7 @@ mod tests {
         use av_mesh::client_udp::{Control, RepairPolicy};
         use tokio::time::timeout;
 
-        async fn first_part(playout_ms: u64) -> (u64, u64) {
+        async fn first_part(playout_ms: u64, resume_from_request: bool) -> (u64, u64) {
             let cache = LiveTsCache::new(1, Duration::from_millis(250), 4, 32, 64).await;
             for sequence in 0..10_u64 {
                 cache
@@ -33761,6 +33859,7 @@ mod tests {
             let stats = Arc::new(edge_udp::EdgeUdpStats::default());
             let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, 16);
             config.playout = Duration::from_millis(playout_ms);
+            config.resume_from_request = resume_from_request;
             let task = tokio::spawn(edge_udp::run_edge_udp(
                 edge_udp::EdgeSockets::single(socket),
                 router.clone(),
@@ -33806,9 +33905,50 @@ mod tests {
             mesh.shutdown();
             (next, stats.playout_skipped_parts.load(Ordering::Relaxed))
         }
-        // Parts of 250 ms, the head at 9: 500 ms is the two parts behind it.
-        assert_eq!(first_part(500).await, (7, 6));
-        assert_eq!(first_part(0).await, (1, 0));
+        // Parts of 250 ms, the head at 9: 500 ms is the two parts behind it
+        // (--client-udp-resume-from-request false, before wave 8).
+        assert_eq!(first_part(500, false).await, (7, 6));
+        assert_eq!(first_part(0, false).await, (1, 0));
+        // Wave 8 S2: a client that moved here resumes at the part it names
+        // while the cache holds it, late rather than missing.
+        assert_eq!(first_part(500, true).await, (1, 0));
+    }
+
+    #[test]
+    fn the_wave8_edge_flags_default_on_and_can_be_turned_off() {
+        let args = Args::try_parse_from(["av-mesh"]).unwrap();
+        assert!(args.client_udp_repair_thread);
+        assert!(args.client_udp_batched_admission);
+        assert!(args.client_udp_resume_from_request);
+        assert!(!args.client_udp_fanout_inline_shard);
+        assert_eq!(args.client_udp_fanout_nice, -5);
+        assert_eq!(args.client_udp_nack_edge_rate, 20_000);
+        assert_eq!(args.relay_class_fallback_nice, 5);
+        let args = Args::try_parse_from([
+            "av-mesh",
+            "--client-udp-repair-thread",
+            "false",
+            "--client-udp-batched-admission",
+            "false",
+            "--client-udp-resume-from-request",
+            "false",
+            "--client-udp-fanout-inline-shard",
+            "true",
+            "--client-udp-fanout-nice",
+            "99",
+            "--client-udp-nack-edge-rate",
+            "0",
+            "--relay-class-fallback-nice",
+            "0",
+        ])
+        .unwrap();
+        assert!(!args.client_udp_repair_thread);
+        assert!(!args.client_udp_batched_admission);
+        assert!(!args.client_udp_resume_from_request);
+        assert!(args.client_udp_fanout_inline_shard);
+        assert_eq!(args.client_udp_fanout_nice, 99);
+        assert_eq!(args.client_udp_nack_edge_rate, 0);
+        assert_eq!(args.relay_class_fallback_nice, 0);
     }
 
     #[test]

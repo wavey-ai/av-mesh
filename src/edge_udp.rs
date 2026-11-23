@@ -141,6 +141,23 @@ pub(crate) struct EdgeUdpConfig {
     /// stale one only at the end of its wait (`--client-udp-fresh-head-ms`,
     /// wave 7 review; zero: any part, as before).
     pub fresh_head: Duration,
+    /// NACK answers are collected under the subscriber table's lock and
+    /// sent after it is released (`--client-udp-repair-thread`, wave 8 S1;
+    /// `false`: sent under the lock, as before).
+    pub nack_send_unlocked: bool,
+    /// New subscriptions rebuild the fast lane's snapshot once a batch
+    /// (`--client-udp-batched-admission`, wave 8 S3; `false`: once each,
+    /// under the table's lock, as before).
+    pub batched_admission: bool,
+    /// A moved client resumes at the part it names while the cache holds
+    /// it, past the playout deadline (`--client-udp-resume-from-request`,
+    /// wave 8 S2; `false`: at the playout floor, as before).
+    pub resume_from_request: bool,
+    /// The NACKed parts a second that the edge answers at most, all its
+    /// clients together (`--client-udp-nack-edge-rate`, wave 8; 0: no cap,
+    /// only each subscriber's budget, as before): a NACK storm from an
+    /// overloaded edge's clients does not take the CPU its sends need.
+    pub nack_edge_rate: u32,
 }
 
 impl EdgeUdpConfig {
@@ -161,7 +178,46 @@ impl EdgeUdpConfig {
             admit_on_first_part: true,
             first_part_at_once: true,
             fresh_head: Duration::from_millis(DEFAULT_FRESH_HEAD_MS),
+            nack_send_unlocked: true,
+            batched_admission: true,
+            resume_from_request: true,
+            nack_edge_rate: DEFAULT_NACK_EDGE_RATE,
         }
+    }
+}
+
+/// Default of `--client-udp-nack-edge-rate`.
+pub(crate) const DEFAULT_NACK_EDGE_RATE: u32 = 20_000;
+
+/// The edge's budget of NACKed parts (see `EdgeUdpConfig::nack_edge_rate`):
+/// a token bucket of a tenth of a second's worth, kept by the control loop.
+pub(crate) struct EdgeNackBudget {
+    rate: f64,
+    tokens: f64,
+    at: Instant,
+}
+
+impl EdgeNackBudget {
+    pub(crate) fn new(rate: u32, now: Instant) -> Self {
+        Self {
+            rate: f64::from(rate),
+            tokens: f64::from(rate) / 10.0,
+            at: now,
+        }
+    }
+
+    /// Of `parts` asked for, how many may be answered now (all, with no
+    /// cap); takes them from the bucket.
+    pub(crate) fn grant(&mut self, parts: usize, now: Instant) -> usize {
+        if self.rate <= 0.0 {
+            return parts;
+        }
+        let since = now.saturating_duration_since(self.at).as_secs_f64();
+        self.tokens = (self.tokens + since * self.rate).min(self.rate / 10.0);
+        self.at = now;
+        let granted = (self.tokens.floor() as usize).min(parts);
+        self.tokens -= granted as f64;
+        granted
     }
 }
 
@@ -215,6 +271,8 @@ pub(crate) struct EdgeUdpStats {
     pub nack_parts: AtomicU64,
     pub nack_resent: AtomicU64,
     pub nack_refused: AtomicU64,
+    /// NACKed parts refused for the edge's budget (wave 8).
+    pub nack_edge_capped: AtomicU64,
 }
 
 /// The compact datagrams of each stream's recent parts, in their canonical
@@ -1160,6 +1218,46 @@ fn fast_lane_changed(sockets: &EdgeSockets, table: &HashMap<u64, StreamEntry>) {
         lane.rebuild_locked(table);
     }
 }
+
+/// Rebuilds of the fast lane's snapshot asked for and made, so that a burst
+/// of table changes (a step's subscribe spike, a region's clients moving)
+/// costs a few rebuilds, not one each (`--client-udp-batched-admission`,
+/// wave 8 S3). A rebuild reads every subscriber under the table's lock.
+#[derive(Default)]
+pub(crate) struct Rebuilds {
+    asked: AtomicU64,
+    made: AtomicU64,
+    /// One rebuild at a time; those who wait behind it find their change
+    /// taken by the next.
+    turn: tokio::sync::Mutex<()>,
+    /// Rebuilds made, and changes they covered (for the stats).
+    pub(crate) rebuilds: AtomicU64,
+}
+
+impl Rebuilds {
+    /// The snapshot includes the caller's change to the table (made
+    /// before this call) when this returns: a rebuild that began after the
+    /// change was asked for has run.
+    pub(crate) async fn after_change(&self, sockets: &EdgeSockets, table: &Table) {
+        if sockets.fast_lane().is_none() {
+            return;
+        }
+        let mine = self.asked.fetch_add(1, Ordering::SeqCst) + 1;
+        let _turn = self.turn.lock().await;
+        if self.made.load(Ordering::SeqCst) >= mine {
+            return;
+        }
+        // Every change asked for up to here was made in the table before it
+        // was asked for: this rebuild covers them all.
+        let covers = self.asked.load(Ordering::SeqCst);
+        {
+            let table = table.lock().unwrap();
+            fast_lane_changed(sockets, &table);
+        }
+        self.rebuilds.fetch_add(1, Ordering::Relaxed);
+        self.made.store(covers, Ordering::SeqCst);
+    }
+}
 /// Clients that this edge sent away because it had lost its parents, and
 /// when: one that comes back within the move hold-down is taken.
 type MovedAway = Arc<Mutex<HashMap<(SocketAddr, u64), Instant>>>;
@@ -1239,6 +1337,8 @@ pub(crate) async fn run_edge_udp(
         );
     }
     let admitting: Admitting = Arc::default();
+    let rebuilds: Arc<Rebuilds> = Arc::default();
+    let mut nack_budget = EdgeNackBudget::new(config.nack_edge_rate, Instant::now());
     let tokens = Tokens(RandomState::new());
     let mut audio_buf = vec![0_u8; 2_048];
     let mut video_buf = vec![0_u8; 2_048];
@@ -1352,8 +1452,8 @@ pub(crate) async fn run_edge_udp(
                 let window = router.cache.window_parts_for(stream_id).await as u64;
                 let head = head_part(&router, stream_id).await;
                 let refreshed = {
-                    let mut table = table.lock().unwrap();
-                    let refreshed = match table
+                    let mut guard = table.lock().unwrap();
+                    let refreshed = match guard
                         .get_mut(&stream_id)
                         .and_then(|entry| entry.subscribers.get_mut(&peer))
                     {
@@ -1378,7 +1478,15 @@ pub(crate) async fn run_edge_udp(
                         None => None,
                     };
                     if refreshed.is_some_and(|(_, regroup)| regroup) {
-                        fast_lane_changed(&sockets, &table);
+                        if config.batched_admission {
+                            let (sockets, table, rebuilds) =
+                                (sockets.clone(), Arc::clone(&table), Arc::clone(&rebuilds));
+                            tokio::spawn(async move {
+                                rebuilds.after_change(&sockets, &table).await;
+                            });
+                        } else {
+                            fast_lane_changed(&sockets, &guard);
+                        }
                     }
                     refreshed.map(|(next_part, _)| next_part)
                 };
@@ -1421,6 +1529,7 @@ pub(crate) async fn run_edge_udp(
                     Arc::clone(&moved),
                     config,
                     Arc::clone(&stats),
+                    Arc::clone(&rebuilds),
                     peer,
                     stream_id,
                     from_part,
@@ -1439,12 +1548,21 @@ pub(crate) async fn run_edge_udp(
                     stats.bad_tokens.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
-                let mut table = table.lock().unwrap();
-                let removed = table
+                let mut guard = table.lock().unwrap();
+                let removed = guard
                     .get_mut(&stream_id)
                     .and_then(|entry| entry.subscribers.remove(&peer));
                 if removed.is_some_and(|subscriber| subscriber.fast.is_some()) {
-                    fast_lane_changed(&sockets, &table);
+                    if config.batched_admission {
+                        drop(guard);
+                        let (sockets, table, rebuilds) =
+                            (sockets.clone(), Arc::clone(&table), Arc::clone(&rebuilds));
+                        tokio::spawn(async move {
+                            rebuilds.after_change(&sockets, &table).await;
+                        });
+                    } else {
+                        fast_lane_changed(&sockets, &guard);
+                    }
                 }
             }
             Control::Nack {
@@ -1462,7 +1580,16 @@ pub(crate) async fn run_edge_udp(
                 // lossy listener's NACKs do not hold up the other clients'
                 // SUBs, refreshes and NACKs.
                 if let Some((misses, repair)) =
-                    answer_nack(&sockets, &table, &stats, peer, stream_id, &parts)
+                    answer_nack(
+                        &sockets,
+                        &table,
+                        &stats,
+                        peer,
+                        stream_id,
+                        &parts,
+                        config.nack_send_unlocked,
+                        &mut nack_budget,
+                    )
                 {
                     let sockets = sockets.clone();
                     let router = router.clone();
@@ -1488,6 +1615,12 @@ pub(crate) async fn run_edge_udp(
 /// within its NACK budget (parts and bytes), from the compact ring. Returns
 /// the granted parts that the ring does not hold, with the subscriber's
 /// repair, for [`answer_nack_from_cache`]; it never waits.
+///
+/// With `unlocked` (wave 8 S1) the datagrams are collected under the
+/// subscriber table's lock and sent after it is released: a NACK storm does
+/// not hold the lock across a send each (which the real-time class thread
+/// and every SUB would wait behind); without, each is sent under the lock,
+/// as before.
 pub(crate) fn answer_nack(
     sockets: &EdgeSockets,
     table: &Table,
@@ -1495,13 +1628,28 @@ pub(crate) fn answer_nack(
     peer: SocketAddr,
     stream_id: u64,
     parts: &[u64],
+    unlocked: bool,
+    budget: &mut EdgeNackBudget,
 ) -> Option<(Vec<u64>, RepairPolicy)> {
     stats
         .nack_parts
         .fetch_add(parts.len() as u64, Ordering::Relaxed);
+    // The edge's own budget first (wave 8): what is past it is refused
+    // without a look at the table.
+    let granted = budget.grant(parts.len(), Instant::now());
+    if granted < parts.len() {
+        let capped = (parts.len() - granted) as u64;
+        stats.nack_edge_capped.fetch_add(capped, Ordering::Relaxed);
+        stats.nack_refused.fetch_add(capped, Ordering::Relaxed);
+    }
+    if granted == 0 {
+        return None;
+    }
+    let parts = &parts[..granted];
     let out = sockets.out_for_stream(stream_id);
     let mut answered = 0_usize;
     let mut misses = Vec::new();
+    let mut later: Vec<Vec<u8>> = Vec::new();
     let repair = {
         let mut table = table.lock().unwrap();
         let Some(subscriber) = table
@@ -1553,6 +1701,10 @@ pub(crate) fn answer_nack(
             answered += 1;
             let short = subscriber.compact.is_some_and(|plan| plan.short_header);
             let datagram = compact_marked(&kept, 0, true, short);
+            if unlocked {
+                later.push(datagram);
+                continue;
+            }
             if matches!(
                 out.send(stats, &datagram, peer),
                 SendOutcome::Sent | SendOutcome::Queued
@@ -1562,6 +1714,17 @@ pub(crate) fn answer_nack(
         }
         subscriber.repair
     };
+    if !later.is_empty() {
+        // One sendmmsg for the answer's parts.
+        let list: Vec<(&[u8], SocketAddr)> = later
+            .iter()
+            .map(|datagram| (datagram.as_slice(), peer))
+            .collect();
+        let (delivered, _) = out.send_many(stats, true, false, &list);
+        stats
+            .nack_resent
+            .fetch_add(delivered as u64, Ordering::Relaxed);
+    }
     stats
         .nack_refused
         .fetch_add((parts.len() - answered) as u64, Ordering::Relaxed);
@@ -1798,6 +1961,7 @@ async fn admit(
     moved: MovedAway,
     config: EdgeUdpConfig,
     stats: Arc<EdgeUdpStats>,
+    rebuilds: Arc<Rebuilds>,
     peer: SocketAddr,
     stream_id: u64,
     from_part: Option<u64>,
@@ -1892,6 +2056,9 @@ async fn admit(
         from_part.unwrap_or(head).min(head),
     )
     .await;
+    // Wave 8 S2: a client moving here resumes where it asks while the
+    // cache holds the part, late rather than missing.
+    let floor = floor.filter(|_| !(config.resume_from_request && from_part.is_some()));
     let first_part = first_part_for(from_part, head, window, floor);
     if let Some(part) = from_part.filter(|part| head.saturating_sub(*part) < window) {
         if first_part > part {
@@ -1928,12 +2095,16 @@ async fn admit(
             },
         );
         let start = !std::mem::replace(&mut entry.running, true);
-        // In the threads' snapshot before the client hears OK.
-        if fast.is_some() {
+        // In the threads' snapshot before the client hears OK (batched: by
+        // the next rebuild, waited for below).
+        if fast.is_some() && !config.batched_admission {
             fast_lane_changed(&sockets, &table);
         }
         start
     };
+    if fast.is_some() && config.batched_admission {
+        rebuilds.after_change(&sockets, &table).await;
+    }
     stats.subscriptions.fetch_add(1, Ordering::Relaxed);
     send_control(
         &socket,
@@ -1968,16 +2139,29 @@ async fn admit(
             .await;
         }
     }
-    info!(
-        %peer,
-        stream_id,
-        first_part,
-        head,
-        fast_lane = fast.is_some(),
-        compact = compact.map(|plan| plan.word()),
-        admit_ms = admitted_in.elapsed().as_secs_f64() * 1_000.0,
-        "edge client UDP subscription"
-    );
+    if config.batched_admission {
+        debug!(
+            %peer,
+            stream_id,
+            first_part,
+            head,
+            fast_lane = fast.is_some(),
+            compact = compact.map(|plan| plan.word()),
+            admit_ms = admitted_in.elapsed().as_secs_f64() * 1_000.0,
+            "edge client UDP subscription"
+        );
+    } else {
+        info!(
+            %peer,
+            stream_id,
+            first_part,
+            head,
+            fast_lane = fast.is_some(),
+            compact = compact.map(|plan| plan.word()),
+            admit_ms = admitted_in.elapsed().as_secs_f64() * 1_000.0,
+            "edge client UDP subscription"
+        );
+    }
     if start_sender {
         tokio::spawn(run_stream_sender(
             sockets, router, table, moved, config, stats, stream_id,
@@ -2541,6 +2725,9 @@ async fn run_stream_sender(
                 for subscriber in entry.subscribers.values_mut() {
                     if head.saturating_sub(subscriber.next_part) >= window {
                         subscriber.next_part = head;
+                    } else if config.resume_from_request && subscriber.moved_in {
+                        // Wave 8 S2: a client that moved here catches up
+                        // from the part it asked for.
                     } else if let Some(floor) = playout {
                         if subscriber.next_part < floor {
                             stats

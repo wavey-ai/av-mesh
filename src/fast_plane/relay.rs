@@ -851,6 +851,16 @@ impl ClassThread {
                 reasons = ?normal,
                 "fast-plane thread runs with normal scheduling"
             );
+            // Wave 8: without real-time priority, the audio thread still
+            // comes first: the process's other threads are made nicer.
+            if self.class == TrafficClass::Audio && self.realtime && sys::fallback_nice() > 0 {
+                let niced = sys::nice_other_threads();
+                info!(
+                    niced,
+                    step = sys::fallback_nice(),
+                    "the other threads of the process are nicer than the audio thread"
+                );
+            }
         }
     }
 

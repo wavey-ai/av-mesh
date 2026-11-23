@@ -373,6 +373,25 @@ pub struct FastLaneStats {
     pub fanout_shed: AtomicU64,
     /// Batches whose fan-out thread waited for room in a full socket.
     pub fanout_waited: AtomicU64,
+    /// Window repair of the class thread's batches (wave 8 S1): jobs handed
+    /// to the repair thread, jobs it dropped because its queue was full,
+    /// and the window repair that the class thread ran itself
+    /// (`--client-udp-repair-thread false`): calls, the longest (µs; it
+    /// takes the subscriber table's lock) and those over a millisecond.
+    pub repair_handoffs: AtomicU64,
+    pub repair_dropped: AtomicU64,
+    pub class_repairs: AtomicU64,
+    pub class_repair_max_us: AtomicU64,
+    pub class_repair_over_1ms: AtomicU64,
+    /// The repair thread's longest window repair (µs).
+    pub repair_thread_max_us: AtomicU64,
+    /// Fan-out (wave 8 B4): the longest wait of a batch for its thread
+    /// (from the hand-off to the thread's first send, µs), batches that
+    /// waited over a millisecond, and the sends that the class thread made
+    /// itself for its own shard (`--client-udp-fanout-inline-shard`).
+    pub fanout_lag_max_us: AtomicU64,
+    pub fanout_lag_over_1ms: AtomicU64,
+    pub fanout_inline_sends: AtomicU64,
 }
 
 /// What `/api/mesh` reports of the fast client lane.
@@ -406,6 +425,24 @@ pub struct FastLaneSnapshot {
     pub fanout_shed: u64,
     #[serde(default)]
     pub fanout_waited: u64,
+    #[serde(default)]
+    pub repair_handoffs: u64,
+    #[serde(default)]
+    pub repair_dropped: u64,
+    #[serde(default)]
+    pub class_repairs: u64,
+    #[serde(default)]
+    pub class_repair_max_us: u64,
+    #[serde(default)]
+    pub class_repair_over_1ms: u64,
+    #[serde(default)]
+    pub repair_thread_max_us: u64,
+    #[serde(default)]
+    pub fanout_lag_max_us: u64,
+    #[serde(default)]
+    pub fanout_lag_over_1ms: u64,
+    #[serde(default)]
+    pub fanout_inline_sends: u64,
 }
 
 struct Armed {
@@ -451,8 +488,38 @@ pub struct EdgeFastLane {
     /// itself.
     fanout_threads: AtomicU32,
     fanout_inline_sends: AtomicU32,
+    /// With fan-out threads, the class thread sends one shard of each batch
+    /// itself (`--client-udp-fanout-inline-shard`, wave 8 B4): its clients
+    /// wait for no hand-off, and a batch wakes one thread fewer.
+    fanout_inline_shard: AtomicBool,
+    /// The nice value of the fan-out threads (`--client-udp-fanout-nice`,
+    /// wave 8; [`FANOUT_NICE_PROCESS`]: the process's, as in wave 7).
+    fanout_nice: std::sync::atomic::AtomicI32,
+    /// The class thread hands its batches' window repair to a repair
+    /// thread (`--client-udp-repair-thread`, wave 8 S1): window repair
+    /// takes the subscriber table's lock, which ordinary tasks hold (SUB
+    /// admission, NACK answers, the cache-fed lane), so the real-time
+    /// thread would wait behind them.
+    repair_thread: AtomicBool,
+    repair_jobs: OnceLock<std::sync::mpsc::SyncSender<RepairJob>>,
     pub stats: FastLaneStats,
 }
+
+/// The window repair of one part, for the repair thread.
+#[derive(Debug, Clone, Copy)]
+struct RepairJob {
+    stream_id: u64,
+    part: u64,
+    windows: [u8; REPAIR_JOB_WINDOWS],
+    count: u8,
+}
+
+/// The plans' windows a job carries (distinct windows of one part: the
+/// plans in use have one or two).
+const REPAIR_JOB_WINDOWS: usize = 8;
+/// Jobs that wait for the repair thread, at most: a window completes once
+/// in 8-64 parts of a stream, so this is seconds of jobs.
+const REPAIR_QUEUE: usize = 4_096;
 
 const TXTIME_UNSET: u8 = 0;
 const TXTIME_ON: u8 = 1;
@@ -486,8 +553,131 @@ impl EdgeFastLane {
             txtime: AtomicU8::new(TXTIME_UNSET),
             fanout_threads: AtomicU32::new(DEFAULT_FANOUT_THREADS as u32),
             fanout_inline_sends: AtomicU32::new(DEFAULT_FANOUT_INLINE_SENDS as u32),
+            repair_thread: AtomicBool::new(true),
+            repair_jobs: OnceLock::new(),
+            fanout_inline_shard: AtomicBool::new(DEFAULT_FANOUT_INLINE_SHARD),
+            fanout_nice: std::sync::atomic::AtomicI32::new(DEFAULT_FANOUT_NICE),
             stats: FastLaneStats::default(),
         })
+    }
+
+    /// Tests: the subscriber table the lane was armed with.
+    #[cfg(test)]
+    pub fn table_for_test(&self) -> Option<Table> {
+        self.armed.get().map(|armed| Arc::clone(&armed.table))
+    }
+
+    /// The class thread hands its window repair to a repair thread (`true`,
+    /// the default), or runs it itself, taking the subscriber table's lock
+    /// (`false`, as before wave 8).
+    pub fn set_repair_thread(&self, on: bool) {
+        self.repair_thread.store(on, Ordering::Relaxed);
+    }
+
+    /// The window repair of `part` for the plans' `windows`, from the class
+    /// thread: handed to the repair thread (started when first needed), or,
+    /// with `--client-udp-repair-thread false`, run here. Never waits on a
+    /// lock when handed off; a full queue drops the job (counted): the
+    /// part's clients then have NACK.
+    fn class_window_repair(self: &EdgeFastLane, stream_id: u64, part: u64, windows: &[u8]) {
+        let Some(armed) = self.armed.get() else {
+            return;
+        };
+        if !self.repair_thread.load(Ordering::Relaxed) {
+            let started = Instant::now();
+            crate::edge_udp::window_repair_now(
+                &armed.sockets,
+                &armed.table,
+                true,
+                &armed.stats,
+                stream_id,
+                part,
+                Some(windows),
+            );
+            let took = started.elapsed().as_micros() as u64;
+            self.stats.class_repairs.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .class_repair_max_us
+                .fetch_max(took, Ordering::Relaxed);
+            if took > 1_000 {
+                self.stats
+                    .class_repair_over_1ms
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
+        let Some(jobs) = self.repair_jobs() else {
+            return;
+        };
+        let mut job = RepairJob {
+            stream_id,
+            part,
+            windows: [0; REPAIR_JOB_WINDOWS],
+            count: 0,
+        };
+        for window in windows {
+            if usize::from(job.count) == REPAIR_JOB_WINDOWS {
+                break;
+            }
+            if !job.windows[..usize::from(job.count)].contains(window) {
+                job.windows[usize::from(job.count)] = *window;
+                job.count += 1;
+            }
+        }
+        match jobs.try_send(job) {
+            Ok(()) => self.stats.repair_handoffs.fetch_add(1, Ordering::Relaxed),
+            Err(_) => self.stats.repair_dropped.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+
+    /// The repair thread's queue, the thread started on first use (at
+    /// ordinary priority, on any of the process's CPUs).
+    fn repair_jobs(&self) -> Option<&std::sync::mpsc::SyncSender<RepairJob>> {
+        if let Some(jobs) = self.repair_jobs.get() {
+            return Some(jobs);
+        }
+        let armed = self.armed.get()?;
+        let (tx, rx) = std::sync::mpsc::sync_channel::<RepairJob>(REPAIR_QUEUE);
+        let sockets = armed.sockets.clone();
+        let table = Arc::clone(&armed.table);
+        let stats = Arc::clone(&armed.stats);
+        // At the fan-out threads' nice value: the repair of the audio's
+        // windows, above the runtime's threads.
+        let nice = self.fanout_nice.load(Ordering::Relaxed);
+        let nice = (nice != FANOUT_NICE_PROCESS).then_some(nice);
+        let spawned = std::thread::Builder::new()
+            .name("nt-window-repair".into())
+            .spawn(move || {
+                if let Err(error) = sys::set_ordinary_at(nice) {
+                    tracing::warn!(error, "the repair thread keeps the class thread's scheduling");
+                }
+                while let Ok(job) = rx.recv() {
+                    let started = Instant::now();
+                    crate::edge_udp::window_repair_now(
+                        &sockets,
+                        &table,
+                        true,
+                        &stats,
+                        job.stream_id,
+                        job.part,
+                        Some(&job.windows[..usize::from(job.count)]),
+                    );
+                    if let Some(lane) = stats.fast_lane.get() {
+                        lane.stats
+                            .repair_thread_max_us
+                            .fetch_max(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(error = %error, "the repair thread did not start: window repair runs on the class thread");
+            self.repair_thread.store(false, Ordering::Relaxed);
+            return None;
+        }
+        // Another thread may have set it first: its sender is used, and
+        // this thread's ends with its channel.
+        let _ = self.repair_jobs.set(tx);
+        self.repair_jobs.get()
     }
 
     /// The audio class thread hands batches of more than `inline_sends`
@@ -500,6 +690,19 @@ impl EdgeFastLane {
             inline_sends.min(u32::MAX as usize) as u32,
             Ordering::Relaxed,
         );
+    }
+
+    /// The class thread sends one shard of each handed-off batch itself
+    /// (`true`), or hands every shard to the fan-out threads (`false`, as in
+    /// wave 7). Read when the threads start.
+    pub fn set_fanout_inline_shard(&self, inline: bool) {
+        self.fanout_inline_shard.store(inline, Ordering::Relaxed);
+    }
+
+    /// The fan-out threads' nice value ([`FANOUT_NICE_PROCESS`]: the
+    /// process's, as in wave 7). Read when the threads start.
+    pub fn set_fanout_nice(&self, nice: i32) {
+        self.fanout_nice.store(nice, Ordering::Relaxed);
     }
 
     fn fanout(&self) -> (usize, usize) {
@@ -696,6 +899,15 @@ impl EdgeFastLane {
             fanout_sends: load(&self.stats.fanout_sends),
             fanout_shed: load(&self.stats.fanout_shed),
             fanout_waited: load(&self.stats.fanout_waited),
+            repair_handoffs: load(&self.stats.repair_handoffs),
+            repair_dropped: load(&self.stats.repair_dropped),
+            class_repairs: load(&self.stats.class_repairs),
+            class_repair_max_us: load(&self.stats.class_repair_max_us),
+            class_repair_over_1ms: load(&self.stats.class_repair_over_1ms),
+            repair_thread_max_us: load(&self.stats.repair_thread_max_us),
+            fanout_lag_max_us: load(&self.stats.fanout_lag_max_us),
+            fanout_lag_over_1ms: load(&self.stats.fanout_lag_over_1ms),
+            fanout_inline_sends: load(&self.stats.fanout_inline_sends),
         }
     }
 
@@ -1055,6 +1267,8 @@ pub struct ClientPlan {
     /// part, window): after the sends, the window repair of each window
     /// that one of them completes goes from here.
     compact_sent: Vec<(u64, u64, u8)>,
+    /// When the class thread handed this plan to a fan-out thread.
+    dispatched_at: Option<Instant>,
 }
 
 const REPAIR_MEMO: usize = 64;
@@ -1112,6 +1326,7 @@ impl ClientPlan {
             first_sent: [None; sys::RECV_BATCH],
             sent_us: 0,
             compact_sent: Vec::with_capacity(sys::RECV_BATCH),
+            dispatched_at: None,
         }
     }
 
@@ -1418,6 +1633,7 @@ impl ClientPlan {
     /// client. A host that refuses GSO is sent to without it from then on.
     pub fn send(&mut self, lane: &EdgeFastLane, class: TrafficClass) {
         self.send_with_patience(lane, class, None);
+        self.class_window_repair(lane);
     }
 
     /// [`Self::send`], waiting up to `patience` for room in a full socket
@@ -1580,7 +1796,6 @@ impl ClientPlan {
         self.sent_us = crate::now_unix_us();
         self.sends.clear();
         self.clients.clear();
-        self.window_repair(lane);
     }
 
     /// The sends planned for the batch so far.
@@ -1656,7 +1871,7 @@ impl ClientPlan {
         self.sends.clear();
         self.clients.clear();
         if repair_kept {
-            self.window_repair(lane);
+            self.class_window_repair(lane);
         }
         self.compact_sent.clear();
     }
@@ -1674,6 +1889,33 @@ impl ClientPlan {
                 );
             }
         }
+    }
+
+    /// [`Self::window_repair`] from the class thread: each part's job goes
+    /// to the lane's repair thread (wave 8 S1), so the real-time thread
+    /// takes no lock that ordinary tasks hold.
+    fn class_window_repair(&mut self, lane: &EdgeFastLane) {
+        if self.compact_sent.is_empty() {
+            return;
+        }
+        let mut windows: Vec<u8> = Vec::new();
+        for (index, (stream_id, part, _)) in self.compact_sent.iter().enumerate() {
+            if self.compact_sent[..index]
+                .iter()
+                .any(|(other, at, _)| other == stream_id && at == part)
+            {
+                continue;
+            }
+            windows.clear();
+            windows.extend(
+                self.compact_sent
+                    .iter()
+                    .filter(|(other, at, _)| other == stream_id && at == part)
+                    .map(|(_, _, window)| *window),
+            );
+            lane.class_window_repair(*stream_id, *part, &windows);
+        }
+        self.compact_sent.clear();
     }
 
     /// The window repair of the windows that the batch's compact parts
@@ -1727,6 +1969,15 @@ pub const DEFAULT_FANOUT_INLINE_SENDS: usize = 32;
 /// sheds its clients' sends of a batch rather than wait: a few parts of
 /// 1 ms.
 pub const FANOUT_DEPTH: usize = 8;
+/// Default of `--client-udp-fanout-nice` (wave 8): the audio's fan-out
+/// above the runtime's threads (HTTP, SUB admission, NACK answers, the
+/// cache-fed lane), below the real-time class thread.
+pub const DEFAULT_FANOUT_NICE: i32 = -5;
+/// `--client-udp-fanout-nice` of the process's own nice value (wave 7).
+pub const FANOUT_NICE_PROCESS: i32 = 99;
+/// Default of `--client-udp-fanout-inline-shard` (decided by the wave 8
+/// lab A/B).
+pub const DEFAULT_FANOUT_INLINE_SHARD: bool = false;
 
 /// The fan-out shard of a client: fixed by its address, so that all its
 /// sends go from the same thread, in order.
@@ -1757,6 +2008,9 @@ struct FanoutShard {
 /// The fan-out threads of a class thread.
 struct Fanout {
     shards: Vec<FanoutShard>,
+    /// The class thread's own shard (the last of `shards.len() + 1`), when
+    /// it sends one itself.
+    inline: Option<Box<ClientPlan>>,
 }
 
 impl Fanout {
@@ -1780,8 +2034,11 @@ impl Fanout {
                 std::thread::Builder::new()
                     .name(format!("nt-fanout-{}{index}", class.as_str()))
                     .spawn(move || {
-                        // Not the class thread's real-time priority or CPU.
-                        if let Err(error) = sys::set_ordinary() {
+                        // Not the class thread's real-time priority or CPU;
+                        // above the runtime's threads (wave 8).
+                        let nice = lane.fanout_nice.load(Ordering::Relaxed);
+                        let nice = (nice != FANOUT_NICE_PROCESS).then_some(nice);
+                        if let Err(error) = sys::set_ordinary_at(nice) {
                             tracing::warn!(
                                 error,
                                 "a fan-out thread keeps the class thread's scheduling"
@@ -1798,12 +2055,17 @@ impl Fanout {
                 thread: Some(thread),
             });
         }
+        let inline = lane
+            .fanout_inline_shard
+            .load(Ordering::Relaxed)
+            .then(|| Box::new(ClientPlan::new()));
         tracing::info!(
             class = class.as_str(),
             threads,
+            inline_shard = inline.is_some(),
             "edge client UDP: the fan-out to clients runs off the ingest thread"
         );
-        Ok(Self { shards })
+        Ok(Self { shards, inline })
     }
 
     /// Whether a fan-out thread still has batches in hand.
@@ -1816,7 +2078,9 @@ impl Fanout {
     /// Hand each shard's sends of the batch to its thread, or shed them if
     /// the thread has [`FANOUT_DEPTH`] batches in hand. Never waits.
     fn dispatch(&mut self, plan: &mut ClientPlan, lane: &EdgeFastLane) {
-        let shards = self.shards.len();
+        // With an inline shard, the batch splits one way more: the last is
+        // the class thread's, sent after the threads have theirs.
+        let shards = self.shards.len() + usize::from(self.inline.is_some());
         // The batch's window repair goes with the first shard that takes it.
         let mut repair_kept = !plan.compact_sent.is_empty();
         for (index, shard) in self.shards.iter_mut().enumerate() {
@@ -1831,6 +2095,7 @@ impl Fanout {
             }
             let sends = next.sends.len() as u64;
             let with_repair = !next.compact_sent.is_empty();
+            next.dispatched_at = Some(Instant::now());
             shard.in_hand.fetch_add(1, Ordering::AcqRel);
             match shard.work.as_ref().map(|work| work.try_send(next)) {
                 Some(Ok(())) => {
@@ -1849,6 +2114,16 @@ impl Fanout {
                 None => {
                     shard.in_hand.fetch_sub(1, Ordering::AcqRel);
                 }
+            }
+        }
+        if let Some(inline) = self.inline.as_mut() {
+            plan.split_into(shards - 1, shards, inline, false);
+            if !inline.sends.is_empty() {
+                lane.stats
+                    .fanout_inline_sends
+                    .fetch_add(inline.sends.len() as u64, Ordering::Relaxed);
+                inline.send_with_patience(lane, TrafficClass::Audio, None);
+                inline.journal_sent(lane);
             }
         }
         plan.handed_off(lane, repair_kept);
@@ -1880,7 +2155,19 @@ fn run_fanout(
     in_hand: &AtomicU32,
 ) {
     while let Ok(mut plan) = work.recv() {
+        if let Some(at) = plan.dispatched_at.take() {
+            let lag = at.elapsed().as_micros() as u64;
+            lane.stats.fanout_lag_max_us.fetch_max(lag, Ordering::Relaxed);
+            if lag > 1_000 {
+                lane.stats
+                    .fanout_lag_over_1ms
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
         plan.send_with_patience(lane, class, Some(FANOUT_SEND_PATIENCE));
+        // A fan-out thread is an ordinary thread: it runs its share of the
+        // window repair itself.
+        plan.window_repair(lane);
         plan.journal_sent(lane);
         in_hand.fetch_sub(1, Ordering::AcqRel);
         if free.try_send(plan).is_err() {
@@ -2098,7 +2385,10 @@ mod tests {
             // them at once (gives its plans back).
             receivers.push((work_rx, free_tx));
         }
-        let mut fanout = Fanout { shards };
+        let mut fanout = Fanout {
+            shards,
+            inline: None,
+        };
         let mut handed = 0;
         for batch in 0..=FANOUT_DEPTH {
             let (mut plan, clients) = audio_plan(1, 40);

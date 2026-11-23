@@ -1440,6 +1440,104 @@ async fn window_repair_does_not_wait_for_the_cache_fed_lane() {
     edge.stop().await;
 }
 
+/// Wave 8 S1: the class thread takes no lock that ordinary tasks hold. A
+/// task that holds the subscriber table's lock (a SUB, a NACK storm, the
+/// cache-fed lane) for 60 ms does not stop the fast lane: windows complete
+/// meanwhile and their repair waits on the repair thread, not on the class
+/// thread. With --client-udp-repair-thread false the class thread runs the
+/// repair itself and stops at the first window that completes. Returns the
+/// parts that the fast lane sent while the lock was held.
+async fn the_fast_lane_goes_on_while_the_table_is_locked(repair_thread: bool, ip: u8) -> u64 {
+    let stream_id = 4005;
+    let payload = Payload::Opus1;
+    let (edge, first) = AnyEdge::start(Feed::Fast, payload, stream_id, ip).await;
+    let AnyEdge::Fast(lane_edge) = &edge else {
+        unreachable!("a fast edge")
+    };
+    lane_edge.lane.set_repair_thread(repair_thread);
+    let lane = Arc::clone(&lane_edge.lane);
+    let shared = Shared::new();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let listener = tokio::spawn(listen(
+        edge.client_port(),
+        stream_id,
+        Mode::Compact,
+        true,
+        PathLoss::Clean,
+        17,
+        Arc::clone(&shared),
+        tx,
+    ));
+    let from = timeout(Duration::from_secs(5), rx).await.unwrap().unwrap();
+    let table = lane.table_for_test().expect("armed");
+    let window = u64::from(CompactPlan::CLEAN.window);
+    // A few windows before the lock, then 60 ms of parts with the table
+    // locked by another thread, then the rest.
+    let parts = from + 6 * window;
+    let lock_at = from + 2 * window;
+    let lock_for = Duration::from_millis(60);
+    let start = Instant::now();
+    let mut during = 0_u64;
+    // The lane's compact parts while the lock is still held (read by the
+    // holder, before it lets go).
+    let mut holder: Option<std::thread::JoinHandle<u64>> = None;
+    let mut before = 0;
+    for sequence in first..parts {
+        let due = start + Duration::from_micros(payload.part_us() * (sequence - first));
+        tokio::time::sleep_until(due.into()).await;
+        if sequence == lock_at {
+            before = lane.stats.compact_parts.load(Ordering::Relaxed);
+            let table = Arc::clone(&table);
+            let lane = Arc::clone(&lane);
+            let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+            holder = Some(std::thread::spawn(move || {
+                let _guard = table.lock().unwrap();
+                locked_tx.send(()).unwrap();
+                std::thread::sleep(lock_for);
+                lane.stats.compact_parts.load(Ordering::Relaxed)
+            }));
+            locked_rx.recv().unwrap();
+        }
+        edge.publish(payload, stream_id, sequence).await;
+        if holder.as_ref().is_some_and(|thread| thread.is_finished()) {
+            during = holder.take().unwrap().join().unwrap() - before;
+        }
+    }
+    if let Some(thread) = holder.take() {
+        during = thread.join().unwrap() - before;
+    }
+    shared.last.store(parts - 1, Ordering::Relaxed);
+    let run = listener.await.unwrap();
+    assert!(run.compact_confirmed);
+    if repair_thread {
+        assert_eq!(lane.stats.class_repairs.load(Ordering::Relaxed), 0);
+        assert!(lane.stats.repair_handoffs.load(Ordering::Relaxed) >= 4);
+    } else {
+        assert!(lane.stats.class_repairs.load(Ordering::Relaxed) >= 1);
+    }
+    edge.stop().await;
+    eprintln!("repair thread {repair_thread}: {during} parts on the fast lane in the 60 ms lock");
+    during
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_class_thread_does_not_wait_for_the_subscriber_table() {
+    // About 60 parts of 1 ms go while the table is locked.
+    let during = the_fast_lane_goes_on_while_the_table_is_locked(true, 51).await;
+    assert!(during >= 40, "{during} parts went on the fast lane while the table was locked");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_the_repair_thread_the_class_thread_waits_for_the_table() {
+    // The first window that completes under the lock stops the thread: a
+    // window's parts go at most.
+    let during = the_fast_lane_goes_on_while_the_table_is_locked(false, 52).await;
+    assert!(
+        during <= u64::from(CompactPlan::CLEAN.window) + 2,
+        "{during} parts went on the fast lane while the table was locked"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_part_filled_after_its_gap_reaches_a_cache_fed_listener() {
     a_part_filled_after_its_gap_reaches_the_listener(false, 24).await;
