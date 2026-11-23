@@ -38532,46 +38532,57 @@ mod tests {
 
     #[tokio::test]
     async fn stalls_endpoint_filters_by_since_us() {
-        // The process's journal: other tests' fast-plane threads may record
-        // into it when the machine stalls under them, and the fast plane's
-        // own test records events of an hour and more into it. This test
-        // knows its events by durations of half an hour that no real event
-        // has, of kinds and threads that test does not use, so that the
-        // two never merge.
+        // The process's journal: other tests' fast-plane threads record
+        // into it when the machine stalls under them, and an event merges
+        // with one of its kind and thread that ended less than 10 ms before
+        // it began, or that begins less than 10 ms after it. This test's
+        // events are short, of durations a real event is unlikely to have,
+        // and are recorded again (at most five times, 30 ms apart) until
+        // neither has merged with another.
         let journal = stall_journal::install(Arc::new(StallJournal::new("stalls-test", 4_096)));
-        const MARK: u64 = 1_800_000_000;
+        const PASS_US: u64 = 2_347;
+        const RX_US: u64 = 2_351;
+        let video = stall_journal::StallThread::Video;
+        let ours = |kind: stall_journal::StallKind, dur_us: u64| {
+            journal
+                .query(None)
+                .events
+                .iter()
+                .rev()
+                .map(|line| line.event)
+                .find(|event| event.kind == kind && event.thread == video && event.dur_us == dur_us)
+        };
+        // As another test's stalled fast plane would: a pass of the video
+        // thread just before, with page faults of its own. The first try
+        // merges with it.
+        journal.record(stall_journal::StallKind::ClassPass, video, 3_000, 647, 0);
+        let mut first_t_us = None;
+        for _ in 0..5 {
+            journal.record(stall_journal::StallKind::ClassPass, video, PASS_US, 3, 0);
+            journal.record(stall_journal::StallKind::RxLate, video, RX_US, 0, 0);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let pass = ours(stall_journal::StallKind::ClassPass, PASS_US);
+            let rx = ours(stall_journal::StallKind::RxLate, RX_US);
+            if let (Some(pass), Some(rx)) = (pass, rx) {
+                if pass.n == 1 && rx.n == 1 {
+                    first_t_us = Some(pass.t_us);
+                    break;
+                }
+            }
+        }
+        let first_t_us = first_t_us.expect("the test's events stand apart from real ones");
         let marked = |body: &str| -> Vec<serde_json::Value> {
             body.lines()
                 .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
                 .filter(|line| {
-                    line["dur_us"]
-                        .as_u64()
-                        .is_some_and(|dur| (MARK..MARK + 100).contains(&dur))
+                    line["thread"] == "video"
+                        && line["t_us"].as_u64().is_some_and(|t_us| t_us >= first_t_us)
+                        && line["dur_us"]
+                            .as_u64()
+                            .is_some_and(|dur| dur == PASS_US || dur == RX_US)
                 })
                 .collect()
         };
-        journal.record(
-            stall_journal::StallKind::ClassPass,
-            stall_journal::StallThread::Video,
-            MARK + 11,
-            3,
-            0,
-        );
-        let first_t_us = journal
-            .query(None)
-            .events
-            .iter()
-            .find(|line| line.event.dur_us == MARK + 11)
-            .unwrap()
-            .event
-            .t_us;
-        journal.record(
-            stall_journal::StallKind::RxLate,
-            stall_journal::StallThread::Video,
-            MARK + 12,
-            0,
-            0,
-        );
         let cache = LiveTsCache::new(1, Duration::from_millis(5), 2, 64, 64).await;
         let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
         let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
