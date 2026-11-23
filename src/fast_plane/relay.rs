@@ -95,6 +95,11 @@ pub struct RelayClassConfig {
     /// parents. They are lease parents, which read no demand report: none
     /// is sent to them.
     pub ranked_parents: Vec<SocketAddr>,
+    /// `--relay-lease-descriptors` (wave 9, cold start): the audio thread
+    /// sends a lease child that is new to a stream the stream's last whole
+    /// one-symbol part (RLS1, which carries the descriptor of the compact
+    /// RLC1 parts) before its first compact part (see `LeaseDescriptors`).
+    pub lease_descriptors: bool,
     /// Tests: the tee of this class panics on its first datagram.
     #[cfg(test)]
     pub test_tee_panic: Option<TrafficClass>,
@@ -115,6 +120,7 @@ impl Default for RelayClassConfig {
             loss_report: false,
             demand: None,
             ranked_parents: Vec::new(),
+            lease_descriptors: true,
             #[cfg(test)]
             test_tee_panic: None,
         }
@@ -244,6 +250,9 @@ pub struct FastPlaneStats {
     /// thread itself about once a second (wave 9: a first session's faults
     /// against a later one's).
     pub thread_faults: [[AtomicU64; 2]; 2],
+    /// Whole audio parts sent to lease children new to their stream, for
+    /// the descriptor of the compact parts (wave 9, `LeaseDescriptors`).
+    pub lease_descriptors: AtomicU64,
 }
 
 /// The thresholds of `FastPlaneStats::loop_busy_over`, in µs.
@@ -321,6 +330,7 @@ pub struct FastPlaneSnapshot {
     pub process_majflt: u64,
     pub memory_locked: bool,
     pub allocator_tuned: bool,
+    pub lease_descriptors: u64,
 }
 
 impl FastPlaneStats {
@@ -380,6 +390,7 @@ impl FastPlaneStats {
             process_majflt: crate::memory::faults(false).1,
             memory_locked: crate::memory::locked(),
             allocator_tuned: crate::memory::tuned(),
+            lease_descriptors: load(&self.lease_descriptors),
         }
     }
 }
@@ -910,6 +921,94 @@ struct ClassThread {
     /// The parents that demand reports go to: every admitted peer but the
     /// ranked lease parents.
     demand_peers: Arc<[SocketAddr]>,
+    lease_descriptors: bool,
+}
+
+/// Wave 9 (cold start): each stream's last whole one-symbol audio part
+/// (RLS1: it carries the descriptor that the compact RLC1 parts are read
+/// against) and the lease children that had a whole part of the stream
+/// since. A child new to the stream (an edge taking a new copy) gets that
+/// part before its first compact part. Without it the child dropped every
+/// compact part ("unknown descriptor") until the contributor's next whole
+/// part, up to --relay-compact-whole-ms (100 ms) later, and served its new
+/// listeners from the cache mesh meanwhile, 7-18 ms late (wave 9 trace).
+#[derive(Default)]
+struct LeaseDescriptors {
+    streams: HashMap<Box<str>, LastWhole>,
+}
+
+#[derive(Default)]
+struct LastWhole {
+    datagram: Vec<u8>,
+    deadline_us: u64,
+    had: Vec<SocketAddr>,
+}
+
+/// Streams whose last whole part the audio thread keeps, at most.
+const MAX_DESCRIPTOR_STREAMS: usize = 1_024;
+
+impl LeaseDescriptors {
+    /// Look at one admitted audio datagram that goes to the stream's lease
+    /// children: keep a whole one-symbol source part, or send the kept one
+    /// to each child that has not had it before this compact part goes.
+    #[allow(clippy::too_many_arguments)]
+    fn observe(
+        &mut self,
+        fd: std::os::fd::RawFd,
+        snapshot: &LeaseSnapshot,
+        class: TrafficClass,
+        view: &RlsView<'_>,
+        datagram: &[u8],
+        now_us: u64,
+        stats: &FastPlaneStats,
+    ) {
+        let children = snapshot
+            .children_and_clock_of(view.stream)
+            .map_or(&[][..], |(children, _)| children);
+        let target = |child: &u16| snapshot.children[usize::from(*child)].targets[class.index()];
+        if view.slim.is_none() {
+            // Kept whether or not the stream has lease children yet: the
+            // first child comes between two whole parts.
+            if view.source_symbols != 1 || !matches!(view.role, MediaDatagramRole::Source) {
+                return;
+            }
+            if !self.streams.contains_key(view.stream) {
+                if self.streams.len() >= MAX_DESCRIPTOR_STREAMS {
+                    return;
+                }
+                self.streams.insert(view.stream.into(), LastWhole::default());
+            }
+            let Some(last) = self.streams.get_mut(view.stream) else {
+                return;
+            };
+            last.datagram.clear();
+            last.datagram.extend_from_slice(datagram);
+            last.deadline_us = view.deadline_us;
+            // Every child of the stream gets this one now.
+            last.had.clear();
+            last.had.extend(children.iter().map(target));
+            return;
+        }
+        if children.is_empty() {
+            return;
+        }
+        let Some(last) = self.streams.get_mut(view.stream) else {
+            return;
+        };
+        if last.datagram.is_empty() || (last.deadline_us != 0 && last.deadline_us <= now_us) {
+            return;
+        }
+        for child in children {
+            let peer = target(child);
+            if last.had.contains(&peer) {
+                continue;
+            }
+            last.had.push(peer);
+            if sys::send_batch(fd, 1, |_| (last.datagram.as_slice(), peer)).unwrap_or(0) == 1 {
+                stats.lease_descriptors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 /// How often the audio thread looks at its loss meters.
@@ -1000,6 +1099,10 @@ impl ClassThread {
         } else {
             Vec::new()
         };
+        let mut descriptors = (self.lease_descriptors
+            && self.class == TrafficClass::Audio
+            && self.lease.is_some())
+        .then(LeaseDescriptors::default);
         let mut last_loss_poll = Instant::now();
         let mut last_demand_report: Option<Instant> = None;
         // Loop lag (wave 9): the last wait's return that brought datagrams.
@@ -1057,6 +1160,7 @@ impl ClassThread {
                         &mut gso,
                         copies.as_mut(),
                         meters.get_mut(index),
+                        descriptors.as_mut(),
                     );
                     if received < RECV_BATCH {
                         break;
@@ -1170,6 +1274,7 @@ impl ClassThread {
         gso: &mut bool,
         copies: Option<&mut BurstCopies>,
         mut meter: Option<&mut LossMeter>,
+        mut descriptors: Option<&mut LeaseDescriptors>,
     ) {
         let now_us = now_unix_us();
         let now = Instant::now();
@@ -1177,11 +1282,15 @@ impl ClassThread {
         plan.clear();
         let class = self.class;
         // The lease children as they are now, without a lock.
-        let lease = self
-            .lease
-            .as_deref()
-            .map(|lease| (lease, lease.load()))
-            .filter(|(_, snapshot)| !snapshot.is_empty());
+        let lease_now = self.lease.as_deref().map(|lease| (lease, lease.load()));
+        // The whole parts are kept for children to come (wave 9), so the
+        // descriptors look at every batch; the lease plan only when there
+        // are children.
+        let descriptor_lease = lease_now
+            .as_ref()
+            .filter(|_| descriptors.is_some())
+            .map(|(lease, snapshot)| (*lease, Arc::clone(&**snapshot)));
+        let lease = lease_now.filter(|(_, snapshot)| !snapshot.is_empty());
         // The edge's fast-lane clients as they are now, without a lock.
         let edge_clients = self
             .edge_clients
@@ -1270,6 +1379,19 @@ impl ClassThread {
             }
             if let Some(forwarder) = &self.forwarder {
                 forwarder.plan_fast(message, &view, plan, now);
+            }
+            if let (Some(descriptors), Some((children, snapshot))) =
+                (descriptors.as_deref_mut(), &descriptor_lease)
+            {
+                descriptors.observe(
+                    children.fd(class),
+                    snapshot,
+                    class,
+                    &view,
+                    received.data,
+                    now_us,
+                    &self.stats,
+                );
             }
             if let Some((_, snapshot)) = &lease {
                 plan_lease(snapshot, class, message, &view, plan, now_us);
@@ -1859,6 +1981,7 @@ pub async fn run_relay_class_ingest(
                 .then(|| config.demand.clone())
                 .flatten(),
             demand_peers: Arc::clone(&demand_peers),
+            lease_descriptors: config.lease_descriptors,
         };
         match std::thread::Builder::new()
             .name(format!("needletail-fast-{}", class.as_str()))

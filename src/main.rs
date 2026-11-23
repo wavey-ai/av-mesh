@@ -2208,6 +2208,22 @@ struct Args {
     )]
     client_udp_prompt_sender: bool,
 
+    /// Wave 9 (cold start): a forwarder's audio thread sends a lease child
+    /// that is new to a stream (an edge taking a new copy) the stream's last
+    /// whole one-symbol part, which carries the descriptor of the compact
+    /// parts (RLC1), before its first compact part. Without it the child
+    /// drops every compact part ("unknown descriptor") until the
+    /// contributor's next whole part (--relay-compact-whole-ms, 100 ms) and
+    /// serves its new listeners from the cache mesh meanwhile. `false`: as
+    /// before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_LEASE_DESCRIPTORS",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_lease_descriptors: bool,
+
     /// Wave 9 (cold start): lock the process's memory (mlockall
     /// MCL_CURRENT | MCL_FUTURE) once the node is set up, where it may lock
     /// without a limit (RLIMIT_MEMLOCK infinite: the deploy's unit has
@@ -3836,6 +3852,7 @@ async fn main() -> Result<()> {
         lease: lease_children,
         edge_clients: fast_lane.clone(),
         holes: hole_trigger.clone(),
+        lease_descriptors: args.relay_lease_descriptors,
         ..Default::default()
     };
     let fec_ingest_task = match (fec_socket, class_sockets) {
@@ -36003,6 +36020,12 @@ mod tests {
         assert!(args.mlock_all);
         assert!(args.malloc_tune);
         assert!(args.prefault);
+        assert!(args.relay_lease_descriptors);
+        assert!(
+            !Args::try_parse_from(["av-mesh", "--relay-lease-descriptors", "false"])
+                .unwrap()
+                .relay_lease_descriptors
+        );
         let args = Args::try_parse_from([
             "av-mesh",
             "--client-udp-prompt-sender",
@@ -39913,6 +39936,7 @@ mod tests {
                 loss_report: false,
                 demand: None,
                 ranked_parents: Vec::new(),
+                lease_descriptors: true,
                 test_tee_panic: Some(fast_plane::TrafficClass::Audio),
             },
         )

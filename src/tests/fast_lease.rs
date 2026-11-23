@@ -252,6 +252,140 @@ async fn a_served_lease_makes_its_child_a_fast_plane_child_of_its_stream() {
     relay.stop().await;
 }
 
+/// Wave 9 (cold start): a lease child that is new to a stream whose audio
+/// parts come compact (RLC1) gets the stream's last whole part (RLS1, the
+/// descriptor) before its first compact part, so that it can read the
+/// compact parts at once; with --relay-lease-descriptors false it gets the
+/// compact part alone and drops it until the next whole part.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_lease_child_gets_the_descriptor_before_its_first_compact_part() {
+    use crate::tests::compact_lane::Payload;
+    for (descriptors, ip) in [(true, 41_u8), (false, 42)] {
+        let edge_ip = loopback(ip);
+        let (ports, mut children) = bind_lease_children(&[edge_ip]).await;
+        let [child_audio, _child_video, _child_secondary, _] = children.pop().unwrap();
+        let lease = lease_children(ports, &[edge_ip]);
+        let mut config = lease_config(&lease);
+        config.lease_descriptors = descriptors;
+        let relay = start_fast_relay_with(ParentPath::Secondary, &[], config).await;
+
+        let distributor_addr = unused_loopback_addr();
+        let edge_addr = SocketAddr::from((edge_ip, unused_loopback_addr().port()));
+        let sync = Duration::from_millis(10);
+        let mut distributor_config = CacheMeshConfig::new("forwarder", "uk", distributor_addr)
+            .with_peer(edge_addr)
+            .with_same_region_only(true)
+            .with_role(MeshRole::Distributor)
+            .with_replication(ReplicationMode::Demand)
+            .with_subscription_lease(Duration::from_millis(2_000));
+        distributor_config.sync_interval = sync;
+        distributor_config.announce_interval = Duration::from_millis(50);
+        let distributor_mesh = Arc::new(
+            CacheMesh::new(Arc::clone(&relay.cache.chunk_cache), distributor_config)
+                .start()
+                .await
+                .unwrap(),
+        );
+        let edge_cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let mut edge_config = CacheMeshConfig::new("edge", "uk", edge_addr)
+            .with_peer(distributor_addr)
+            .with_same_region_only(true)
+            .with_role(MeshRole::Edge)
+            .with_replication(ReplicationMode::Demand)
+            .with_subscription_lease(Duration::from_millis(2_000));
+        edge_config.sync_interval = sync;
+        edge_config.announce_interval = Duration::from_millis(50);
+        let edge_mesh = CacheMesh::new(Arc::clone(&edge_cache.chunk_cache), edge_config)
+            .start()
+            .await
+            .unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        tokio::spawn(fast_control::run_lease_children(
+            Arc::clone(&lease),
+            Arc::clone(&distributor_mesh),
+            shutdown_rx,
+        ));
+        timeout(Duration::from_secs(3), async {
+            while edge_mesh.parents_for(4001).await.is_empty()
+                || distributor_mesh.peers().await.is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the edge knows its parent");
+
+        // The stream's first part goes whole (it carries the descriptor),
+        // before any child.
+        let payload = Payload::Opus1;
+        let deadline = now_unix_us() + 30_000_000;
+        let mut sender = playlists::compact_object::CompactSender::new(3_600_000_000);
+        let (envelope, _) = payload.envelope(4001, 0);
+        assert!(crate::tests::fast_test_compact(&envelope, &mut sender, 0, deadline, 0).is_none());
+        let (sources, _) = payload.symbols(&envelope);
+        assert_eq!(sources.len(), 1, "a one-symbol audio part");
+        let whole = sources[0].clone();
+        relay
+            .primary_sender
+            .send_to(&whole, relay.primary_audio)
+            .await
+            .unwrap();
+        wait_for_part(&relay.cache, 4001, 0).await;
+
+        // Then the child comes, and the next part is compact.
+        edge_mesh.subscribe(4001, 0, 0).await.unwrap();
+        wait_until("the lease makes a child", || {
+            lease.stats.snapshot().pairs == 1
+        })
+        .await;
+        let (envelope, _) = payload.envelope(4001, 1);
+        let (compact, _) = crate::tests::fast_test_compact(&envelope, &mut sender, 1_000, deadline, 0)
+            .expect("the second part goes compact");
+        relay
+            .primary_sender
+            .send_to(&compact[0], relay.primary_audio)
+            .await
+            .unwrap();
+        let from = SocketAddr::from((Ipv4Addr::LOCALHOST, lease.local_addr().port()));
+        let expected = if descriptors {
+            vec![whole.clone(), compact[0].clone()]
+        } else {
+            vec![compact[0].clone()]
+        };
+        let received: Vec<Vec<u8>> = receive_all(&child_audio, expected.len())
+            .await
+            .into_iter()
+            .map(|(bytes, source)| {
+                assert_eq!(source, from, "from the lease socket");
+                bytes
+            })
+            .collect();
+        assert_eq!(received, expected, "descriptors {descriptors}: in this order");
+        assert_nothing_more(&child_audio).await;
+        assert_eq!(
+            relay.stats().lease_descriptors,
+            u64::from(descriptors),
+            "one descriptor for the one new child"
+        );
+        // A third part, compact too: the child has the descriptor now.
+        let (envelope, _) = payload.envelope(4001, 2);
+        let (compact, _) = crate::tests::fast_test_compact(&envelope, &mut sender, 2_000, deadline, 0)
+            .expect("the third part goes compact");
+        relay
+            .primary_sender
+            .send_to(&compact[0], relay.primary_audio)
+            .await
+            .unwrap();
+        assert_eq!(receive_all(&child_audio, 1).await[0].0, compact[0]);
+        assert_eq!(relay.stats().lease_descriptors, u64::from(descriptors));
+
+        let _ = shutdown_tx.send(());
+        distributor_mesh.shutdown();
+        edge_mesh.shutdown();
+        relay.stop().await;
+    }
+}
+
 /// B5, the lane rule: a video stream goes in full to the child this
 /// forwarder is primary for and as repair to the other, which keeps the
 /// sources warm; the other's failover controller promotes the forwarder
