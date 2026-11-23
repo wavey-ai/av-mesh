@@ -7768,9 +7768,7 @@ async fn process_udp_fec_ingest_datagram_inner(
         Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Buffered { key, role, .. })) => {
             journal_relay_symbol(cache, &key, peer, received_us);
             if let Some(forwarder) = relay_forwarder {
-                forwarder
-                    .forward(datagram, role, Some(&key))
-                    .await;
+                forwarder.forward(datagram, role, Some(&key)).await;
             }
             debug!(
                 peer = %peer,
@@ -7795,9 +7793,7 @@ async fn process_udp_fec_ingest_datagram_inner(
             let decoded_us = now_unix_us();
             journal_relay_symbol(cache, object.key(), peer, received_us);
             if let Some(forwarder) = relay_forwarder {
-                forwarder
-                    .forward(datagram, role, Some(object.key()))
-                    .await;
+                forwarder.forward(datagram, role, Some(object.key())).await;
             }
             let stream = object.key().stream().to_owned();
             let sequence = object.key().object();
@@ -7836,9 +7832,7 @@ async fn process_udp_fec_ingest_datagram_inner(
         }
         Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Duplicate { key, role, .. })) => {
             if let Some(forwarder) = relay_forwarder {
-                forwarder
-                    .forward(datagram, role, Some(&key))
-                    .await;
+                forwarder.forward(datagram, role, Some(&key)).await;
             }
             debug!(
                 peer = %peer,
@@ -7862,12 +7856,7 @@ async fn process_udp_fec_ingest_datagram_inner(
             return Ok(None);
         }
         Err(error) => {
-            warn!(
-                peer = %peer,
-                datagram_bytes = datagram.len(),
-                error = %error,
-                "RelaySession datagram rejected at configured dispatch seam"
-            );
+            warn_relay_rejection(relay_dispatch, peer, None, datagram.len(), &error);
             return Ok(None);
         }
     }
@@ -7942,9 +7931,6 @@ async fn process_udp_fec_ingest_datagram_inner(
     Ok(None)
 }
 
-/// Journal the arrival of a RelaySession symbol: `relay_first` for the
-/// first symbol of an object, and `relay_decoded` when the symbol completed
-/// it.
 /// `--fast-busy-poll-us` on the audio class receive sockets; a refusal is
 /// said once and leaves them without it.
 fn apply_fast_busy_poll(sockets: &[fast_plane::relay::ClassSocket], micros: u32) {
@@ -7975,6 +7961,35 @@ fn apply_fast_busy_poll(sockets: &[fast_plane::relay::ClassSocket], micros: u32)
     );
 }
 
+/// A RelaySession datagram was rejected. The receiver counts it by kind
+/// (`relay_session.rejected_by_kind`); one line is logged a kind, at counts
+/// 1, 2, 4, 8... with the total, so that a parent that sends what this node
+/// refuses cannot flood the log. `class` is the fast-plane class whose tee
+/// rejected it; the single loop has none.
+fn warn_relay_rejection(
+    dispatch: &RelayUdpDispatch,
+    peer: SocketAddr,
+    class: Option<&str>,
+    datagram_bytes: usize,
+    error: &RelayIngressError,
+) {
+    let kind = error.kind();
+    let total = dispatch.receiver().counters().rejected_by_kind.get(kind);
+    if total.is_power_of_two() {
+        warn!(
+            %peer,
+            class,
+            kind = kind.as_str(),
+            total,
+            datagram_bytes,
+            error = %error,
+            "RelaySession datagram rejected at configured dispatch seam"
+        );
+    }
+}
+
+/// Journal the arrival of a RelaySession symbol: `relay_first` for the
+/// first symbol of an object (`relay_decoded` is `journal_relay_decoded`'s).
 fn journal_relay_symbol(
     cache: &LiveTsCache,
     key: &media_object::ObjectKey,

@@ -16,11 +16,11 @@ use super::view::RlsView;
 use super::{class_addr, StreamClasses, TrafficClass};
 use crate::link_telemetry::LinkTelemetry;
 use crate::{
-    commit_relay_object, configure_udp_socket_buffers, journal_relay_decoded,
-    journal_relay_symbol, now_unix_ms, now_unix_us, process_relay_audio_epoch_datagram,
-    process_udp_fec_ingest_datagram_inner, relay_publication_clock, AudioEpochDatagram, Committed,
-    LiveTsCache, NativeAudioRelay, RelayDownstreamForwarder, RelayForwardRole, RelayIngestRuntime,
-    RelayIngressParentPath, CANONICAL_STREAM_IDLE_RETENTION,
+    commit_relay_object, configure_udp_socket_buffers, journal_relay_decoded, journal_relay_symbol,
+    now_unix_ms, now_unix_us, process_relay_audio_epoch_datagram,
+    process_udp_fec_ingest_datagram_inner, relay_publication_clock, warn_relay_rejection,
+    AudioEpochDatagram, Committed, LiveTsCache, NativeAudioRelay, RelayDownstreamForwarder,
+    RelayForwardRole, RelayIngestRuntime, RelayIngressParentPath, CANONICAL_STREAM_IDLE_RETENTION,
 };
 use anyhow::{Context, Result};
 use av_mesh::relay_ingress::{
@@ -1906,26 +1906,13 @@ impl Tee {
             }
             Ok(RelayUdpDispatchOutcome::Legacy) => {}
             Err(error) => {
-                // Every rejection is counted by kind in the receiver; one line
-                // a kind at counts 1, 2, 4, 8..., with the total.
-                let kind = error.kind();
-                let total = self
-                    .dispatch
-                    .receiver()
-                    .counters()
-                    .rejected_by_kind
-                    .get(kind);
-                if total.is_power_of_two() {
-                    warn!(
-                        %peer,
-                        class = self.class.as_str(),
-                        kind = kind.as_str(),
-                        total,
-                        datagram_bytes = item.bytes.len(),
-                        error = %error,
-                        "RelaySession datagram rejected at configured dispatch seam"
-                    );
-                }
+                warn_relay_rejection(
+                    &self.dispatch,
+                    peer,
+                    Some(self.class.as_str()),
+                    item.bytes.len(),
+                    &error,
+                );
             }
         }
         // The fast lane's send of the symbol to its clients (udp_sent).

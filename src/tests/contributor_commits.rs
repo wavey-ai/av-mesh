@@ -60,8 +60,18 @@ impl std::io::Write for CapturedLog {
     }
 }
 
+/// A second dispatcher that lives as long as the test binary. With one
+/// dispatcher registered, tracing works out a callsite's interest from the
+/// default of the thread that first reaches it: a callsite that another
+/// test's thread reaches first (with no subscriber) would stay off for the
+/// subscriber of the test that reads the log. With two or more, every live
+/// subscriber is asked.
+static SECOND_DISPATCH: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+
 impl CapturedLog {
     fn capture(&self) -> tracing::subscriber::DefaultGuard {
+        SECOND_DISPATCH
+            .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
         let writer = self.clone();
         tracing::subscriber::set_default(
             tracing_subscriber::fmt()
@@ -280,6 +290,133 @@ async fn a_warm_source_ages_on_the_local_clock() {
     let snapshot = forwarder.snapshot();
     assert_eq!(snapshot.warm_source_expired_datagrams, 1);
     assert_eq!(snapshot.warm_source_buffered_datagrams, 1);
+}
+
+/// The log lines of the dispatch seam's limiter for rejections of `kind`:
+/// the total each line gives.
+fn rejection_totals(log: &CapturedLog, kind: &str) -> Vec<u64> {
+    String::from_utf8_lossy(
+        &log.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+    .lines()
+    .filter(|line| line.contains("RelaySession datagram rejected") && line.contains(kind))
+    .map(|line| {
+        let total = line
+            .split(" total=")
+            .nth(1)
+            .expect("the line gives the total");
+        total
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    })
+    .collect()
+}
+
+/// The symbols of one part of 16 or so symbols, and the same symbols with a
+/// deadline 100 ms later (an announcement that conflicts with the first,
+/// fresh on any media clock); and the symbols of other bytes under the
+/// part's number (an object identity conflict).
+fn conflicting_symbols() -> [Vec<Vec<u8>>; 3] {
+    let deadline_us = now_unix_us() + 10_000_000;
+    let symbols = |payload: &[u8], deadline_us| {
+        fast_test_symbols(
+            &opaque_part(0, 1, payload),
+            relay_session::MediaPriority::Audio,
+            400,
+            48,
+            0,
+            deadline_us,
+        )
+        .0
+    };
+    let first = symbols(&[3; 6_000], deadline_us);
+    assert!(first.len() >= 12);
+    [
+        symbols(&[3; 6_000], deadline_us + 100_000),
+        symbols(&[4; 6_000], deadline_us),
+        first,
+    ]
+}
+
+fn rejected(cache: &LiveTsCache, kind: av_mesh::relay_ingress::RejectionKind) -> u64 {
+    cache.relay_ingress_snapshot().rejected_by_kind.get(kind)
+}
+
+/// The tee counts every rejection by kind and logs one line a kind at
+/// counts 1, 2, 4, 8..., with the total (one 4K edge wrote 17,984 lines,
+/// one a datagram).
+#[tokio::test]
+async fn the_tee_logs_each_rejection_kind_at_counts_one_two_four_eight() {
+    use av_mesh::relay_ingress::RejectionKind;
+    let log = CapturedLog::default();
+    let _guard = log.capture();
+    let relay = start_fast_relay(0, ParentPath::PromotedSecondary, &[], 1_024).await;
+    let [later, other, first] = conflicting_symbols();
+    for symbol in std::iter::once(&first[0]).chain(&later[1..=10]) {
+        relay
+            .primary_sender
+            .send_to(symbol, relay.primary_audio)
+            .await
+            .unwrap();
+    }
+    super::fast_lease::wait_until("ten conflicts", || {
+        rejected(&relay.cache, RejectionKind::AnnouncementConflict) == 10
+    })
+    .await;
+    relay
+        .primary_sender
+        .send_to(&other[11], relay.primary_audio)
+        .await
+        .unwrap();
+    super::fast_lease::wait_until("an identity conflict", || {
+        rejected(&relay.cache, RejectionKind::ObjectIdentityConflict) == 1
+    })
+    .await;
+    assert_eq!(
+        rejection_totals(&log, "announcement_conflict"),
+        [1, 2, 4, 8]
+    );
+    assert_eq!(rejection_totals(&log, "object_identity_conflict"), [1]);
+    assert_eq!(relay.cache.relay_ingress_snapshot().datagrams_rejected, 11);
+    relay.stop().await;
+}
+
+/// The single loop (`--relay-class-threads false`) logs its rejections as
+/// the tee does.
+#[tokio::test]
+async fn the_single_loop_logs_each_rejection_kind_at_counts_one_two_four_eight() {
+    use av_mesh::relay_ingress::RejectionKind;
+    let log = CapturedLog::default();
+    let _guard = log.capture();
+    let cache = journaled_cache().await;
+    let peer: SocketAddr = "127.0.0.1:41001".parse().unwrap();
+    let mut dispatch = fast_test_dispatch(
+        peer,
+        "127.0.0.1:41002".parse().unwrap(),
+        ParentPath::PromotedSecondary,
+    );
+    let mut receiver = UdpFecReceiver::new();
+    let [later, other, first] = conflicting_symbols();
+    for symbol in std::iter::once(&first[0])
+        .chain(&later[1..=10])
+        .chain(std::iter::once(&other[11]))
+    {
+        process_udp_fec_ingest_datagram(peer, symbol, &cache, &mut receiver, &mut dispatch, None)
+            .await
+            .unwrap();
+    }
+    assert_eq!(rejected(&cache, RejectionKind::AnnouncementConflict), 10);
+    assert_eq!(rejected(&cache, RejectionKind::ObjectIdentityConflict), 1);
+    assert_eq!(
+        rejection_totals(&log, "announcement_conflict"),
+        [1, 2, 4, 8]
+    );
+    assert_eq!(rejection_totals(&log, "object_identity_conflict"), [1]);
 }
 
 /// The cache mesh can write a part before the fast plane's copy of it
