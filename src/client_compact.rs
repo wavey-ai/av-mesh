@@ -902,6 +902,12 @@ const MAX_EARLY: usize = 256;
 const MIN_CAPPED_WAIT: Duration = Duration::from_micros(100);
 /// See [`NackTiming::interval_cap`].
 pub const DEFAULT_INTERVAL_CAP: u32 = 4;
+/// With `interval_cap`: samples shorter than the interval divided by the
+/// cap are rejected only after this many were taken.
+const INTERVAL_WARMUP_SAMPLES: u32 = 8;
+/// With `interval_cap`: this many samples in a row longer than the cap
+/// allows seed the interval again (a stall is one such sample).
+const INTERVAL_RESEED_AFTER: u32 = 4;
 /// See [`NackTiming::margin_intervals`].
 pub const DEFAULT_SILENCE_MARGIN_INTERVALS: u32 = 3;
 
@@ -962,6 +968,9 @@ struct Hole {
     /// NACKs of it sent during a silence (not counted against
     /// [`MAX_NACKS_PER_HOLE`]; at most [`SILENCE_NACKS_PER_HOLE`]).
     silence_nacks: u16,
+    /// It is waiting for the rate cap's tokens, and has been counted in
+    /// `nacks_capped` for that wait (once a wait, not once a poll).
+    capped: bool,
 }
 
 #[derive(Debug)]
@@ -1033,6 +1042,11 @@ pub struct CompactReceiver {
     /// parts (an average of the originals' arrivals).
     highest_at: Option<Instant>,
     interval: Option<Duration>,
+    /// Samples taken into `interval` since it was last seeded, and the
+    /// samples in a row rejected as longer than `interval_cap` intervals
+    /// (see [`Self::interval_sample_taken`]).
+    interval_samples: u32,
+    interval_long_rejects: u32,
     /// The mean deviation of the originals' spacing from the interval (as
     /// RFC 3550's jitter): the silence's margin covers four of it.
     jitter: Duration,
@@ -1123,6 +1137,7 @@ impl CompactReceiver {
                 last_nack: None,
                 gap: false,
                 silence_nacks: 0,
+                capped: false,
             });
             self.counts.entry(hole).or_insert(Count {
                 received: 0,
@@ -1185,6 +1200,36 @@ impl CompactReceiver {
         self.interval
     }
 
+    /// Whether `sample` (the spacing of two originals' arrivals, per part)
+    /// is a sample of the interval, with wave 8's `interval_cap` (R6-5): a
+    /// gap longer than `interval_cap` intervals (a stall) is not, nor,
+    /// once [`INTERVAL_WARMUP_SAMPLES`] samples are in, one shorter than
+    /// the interval divided by the cap (a burst, such as the backlog after
+    /// a stall or a resume's catch-up). The estimate is seeded by the first
+    /// sample, which may be short (the first part comes with the `OK`, the
+    /// next any time after): [`INTERVAL_RESEED_AFTER`] long samples in a
+    /// row seed it again, so a short seed does not reject every later
+    /// sample for good (wave 8 review: the estimate could only fall).
+    fn interval_sample_taken(&mut self, sample: Duration) -> bool {
+        let cap = self.nack_timing().interval_cap;
+        let Some(interval) = self.interval.filter(|_| cap != 0) else {
+            return true;
+        };
+        if sample > interval * cap {
+            self.interval_long_rejects += 1;
+            if self.interval_long_rejects >= INTERVAL_RESEED_AFTER {
+                self.interval = None;
+                self.jitter = Duration::ZERO;
+                self.interval_samples = 0;
+                self.interval_long_rejects = 0;
+                return true;
+            }
+            return false;
+        }
+        self.interval_long_rejects = 0;
+        !(self.interval_samples >= INTERVAL_WARMUP_SAMPLES && sample * cap < interval)
+    }
+
     /// The silence after the highest part past which the next parts are
     /// NACKed: one interval for the next part, and a margin.
     fn silence_after(&self) -> Option<Duration> {
@@ -1228,6 +1273,7 @@ impl CompactReceiver {
                 last_nack: None,
                 gap: false,
                 silence_nacks: 0,
+                capped: false,
             });
         }
     }
@@ -1274,6 +1320,7 @@ impl CompactReceiver {
                     last_nack: None,
                     gap: true,
                     silence_nacks: 0,
+                    capped: false,
                 },
             );
         }
@@ -1380,6 +1427,7 @@ impl CompactReceiver {
                                 last_nack: None,
                                 gap: false,
                                 silence_nacks: 0,
+                                capped: false,
                             });
                             // Asked for during the silence that this part
                             // ends: the answers went into the burst, so it
@@ -1524,16 +1572,12 @@ impl CompactReceiver {
                     // The interval between parts, from the originals that
                     // advance the highest part.
                     if let (Some(highest), Some(at)) = (self.highest, self.highest_at) {
-                        let cap = self.nack_timing().interval_cap;
                         let sample = (part > highest && part - highest <= MAX_HOLE_RUN)
                             .then(|| now.saturating_duration_since(at) / (part - highest) as u32)
                             // Parts read together say nothing of the interval.
                             .filter(|sample| *sample >= MIN_INTERVAL_SAMPLE)
-                            // Nor does a stall (wave 8, R6-5).
-                            .filter(|sample| {
-                                cap == 0
-                                    || self.interval.is_none_or(|interval| *sample <= interval * cap)
-                            });
+                            // Nor does a stall, or a burst (wave 8, R6-5).
+                            .filter(|sample| self.interval_sample_taken(*sample));
                         if let Some(sample) = sample {
                             if let Some(interval) = self.interval {
                                 let deviation = sample.abs_diff(interval);
@@ -1543,6 +1587,7 @@ impl CompactReceiver {
                                 Some(interval) => (interval * 7 + sample) / 8,
                                 None => sample,
                             });
+                            self.interval_samples = self.interval_samples.saturating_add(1);
                         }
                     }
                     self.last_copies = view.copies;
@@ -1708,6 +1753,7 @@ impl CompactReceiver {
     pub fn nacks_due(&mut self, now: Instant, limit: usize) -> Vec<u64> {
         // The rate cap (wave 8): at most the bucket's tokens of parts.
         let cap = self.nack_timing().rate_cap;
+        let asked_limit = limit;
         let limit = if cap == 0 {
             limit
         } else {
@@ -1718,14 +1764,10 @@ impl CompactReceiver {
             self.nack_tokens = (self.nack_tokens + since).min(burst);
             self.nack_tokens_at = Some(now);
             let allowed = (self.nack_tokens + 1e-6).floor() as usize;
-            if allowed < limit {
-                // Holes past what is allowed wait (counted when they would
-                // have gone).
-                let waiting = self.holes.values().filter(|hole| hole.next_nack <= now).count();
-                self.nacks_capped += waiting.saturating_sub(allowed) as u64;
-            }
             limit.min(allowed)
         };
+        let capping = limit < asked_limit;
+        let mut capped = 0_u64;
         self.note_silence(now);
         let silent = self.silent(now);
         let mut due = Vec::new();
@@ -1757,7 +1799,17 @@ impl CompactReceiver {
                 hole.silence_nacks = hole.silence_nacks.max(1);
                 continue;
             }
+            if capping && hole.next_nack <= now && due.len() >= limit {
+                // Past what the rate cap allows: it waits (counted once a
+                // wait).
+                if !hole.capped {
+                    hole.capped = true;
+                    capped += 1;
+                }
+                continue;
+            }
             if hole.next_nack <= now && due.len() < limit {
+                hole.capped = false;
                 if silent.is_some() && budget > 0 {
                     spent = spent.saturating_add(1);
                 }
@@ -1792,6 +1844,7 @@ impl CompactReceiver {
             }
         }
         self.silence_spent = spent;
+        self.nacks_capped += capped;
         if cap > 0 {
             self.nack_tokens -= due.len() as f64;
         }
@@ -2073,6 +2126,67 @@ mod tests {
         let last = fed(&mut old, 0, 50, start, ms);
         old.push(&encode_part(50, 0, &payload(50, 10)).unwrap(), last + ms * 300, 0);
         assert!(old.part_interval().unwrap() > ms * 10);
+    }
+
+    /// Wave 8 review: a short first sample (the second part came 100 us
+    /// after the first, which came with the OK) does not hold the estimate
+    /// down for good, and a burst of parts (a catch-up after a stall) does
+    /// not pull it down; a clean 1 ms stream then asks for nothing.
+    #[test]
+    fn a_short_seed_or_a_burst_does_not_hold_the_interval_down() {
+        let ms = Duration::from_millis(1);
+        let start = Instant::now();
+        let mut receiver = CompactReceiver::new();
+        receiver.expect_from(0, true);
+        receiver.push(&encode_part(0, 0, &payload(0, 10)).unwrap(), start, 0);
+        let mut at = start + Duration::from_micros(100);
+        receiver.push(&encode_part(1, 0, &payload(1, 10)).unwrap(), at, 0);
+        assert_eq!(receiver.part_interval(), Some(Duration::from_micros(100)));
+        for part in 2..40 {
+            at += ms;
+            receiver.push(&encode_part(part, 0, &payload(part, 10)).unwrap(), at, 0);
+            assert!(receiver.nacks_due(at, 64).is_empty());
+        }
+        let interval = receiver.part_interval().unwrap();
+        assert!(
+            interval > Duration::from_micros(900) && interval < Duration::from_micros(1_100),
+            "{interval:?}"
+        );
+        // A burst of 30 parts 80 us apart, then the stream goes on.
+        for part in 40..70 {
+            at += Duration::from_micros(80);
+            receiver.push(&encode_part(part, 0, &payload(part, 10)).unwrap(), at, 0);
+        }
+        let interval = receiver.part_interval().unwrap();
+        assert!(interval > Duration::from_micros(900), "{interval:?}");
+        let mut asked = 0;
+        for part in 70..200 {
+            at += ms;
+            receiver.push(&encode_part(part, 0, &payload(part, 10)).unwrap(), at, 0);
+            asked += receiver.nacks_due(at, 64).len();
+            asked += receiver.nacks_due(at + Duration::from_micros(990), 64).len();
+        }
+        assert_eq!(asked, 0);
+        assert_eq!(receiver.stats.nacked, 0);
+    }
+
+    /// Wave 8 review: a hole that waits for the rate cap's tokens is
+    /// counted once a wait, not once a poll.
+    #[test]
+    fn a_capped_hole_is_counted_once_a_wait() {
+        let mut receiver = CompactReceiver::new();
+        let start = Instant::now();
+        receiver.expect_from(0, true);
+        receiver.push(&encode_part(0, 0, &payload(0, 10)).unwrap(), start, 0);
+        // 100 parts lost at once.
+        receiver.push(&encode_part(101, 0, &payload(101, 10)).unwrap(), start, 0);
+        let at = start + FAST_NACK_DELAY;
+        let first = receiver.nacks_due(at, 256).len();
+        assert_eq!(first, DEFAULT_NACK_RATE_CAP as usize / 4);
+        for _ in 0..10 {
+            assert!(receiver.nacks_due(at, 256).is_empty());
+        }
+        assert_eq!(receiver.nacks_capped, 100 - first as u64);
     }
 
     /// Wave 8 (R6-3): a dead path is not asked for 500 parts a second: one

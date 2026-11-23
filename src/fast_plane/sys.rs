@@ -876,8 +876,15 @@ pub fn set_fifo(priority: i32) -> Result<(), String> {
 /// does at real-time priority on a deployed node. 0: off.
 static FALLBACK_NICE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
+/// The process's nice value when [`set_fallback_nice`] was called (before
+/// any thread was made nicer): the base of [`nice_other_threads`], so that
+/// a second class thread refused SCHED_FIFO does not add the step again on
+/// top of the main thread's new value.
+static BASE_NICE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(i32::MIN);
+
 pub fn set_fallback_nice(nice: i32) {
     FALLBACK_NICE.store(nice.clamp(0, 19), std::sync::atomic::Ordering::Relaxed);
+    BASE_NICE.store(process_nice(), std::sync::atomic::Ordering::Relaxed);
 }
 
 pub fn fallback_nice() -> i32 {
@@ -898,7 +905,11 @@ pub fn nice_other_threads() -> usize {
     {
         // SAFETY: gettid has no preconditions.
         let me = unsafe { libc::syscall(libc::SYS_gettid) } as i64;
-        let nice = (process_nice() + step).min(19);
+        let base = match BASE_NICE.load(std::sync::atomic::Ordering::Relaxed) {
+            i32::MIN => process_nice(),
+            base => base,
+        };
+        let nice = (base + step).min(19);
         let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
             return 0;
         };

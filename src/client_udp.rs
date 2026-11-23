@@ -827,12 +827,18 @@ impl ObjectReceiver {
         self.stream_id = stream_id;
         self.compact.expect_from(next_part, compact);
         // The short-form parts that came before the OK, read now (their
-        // objects wait in `ready`).
+        // objects wait in `ready`, in the order they came: `push_compact`
+        // returns the oldest object ready, which goes back to the front).
         for datagram in self.compact.take_early() {
             if let Some(object) = self.push_compact(&datagram) {
-                self.ready.push_back(object);
+                self.ready.push_front(object);
             }
         }
+    }
+
+    /// Whether objects wait in `ready` (see [`Self::next_ready`]).
+    pub fn has_ready(&self) -> bool {
+        !self.ready.is_empty()
     }
 
     /// The next object that the last `push` delivered besides the one it

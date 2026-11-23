@@ -1296,9 +1296,12 @@ struct Args {
     /// Wave 8: when the audio class thread is refused SCHED_FIFO (no
     /// CAP_SYS_NICE, as in the local namespace lab), every other thread of
     /// the process is made this much nicer, so that the ingest still comes
-    /// first, as at real-time priority on a deployed node. 0: off (all at
-    /// the process's nice value, as before).
-    #[arg(long, env = "NEEDLETAIL_RELAY_CLASS_FALLBACK_NICE", default_value_t = 5)]
+    /// first, as at real-time priority on a deployed node. 0 (default):
+    /// off, all at the process's nice value, as before (wave 8 review:
+    /// under overload it cost parts, 9.4 k missing against 2.0 k, and a
+    /// deployed node at real-time priority never takes this path, so a
+    /// lab A/B with it measures a setup no node runs).
+    #[arg(long, env = "NEEDLETAIL_RELAY_CLASS_FALLBACK_NICE", default_value_t = 0)]
     relay_class_fallback_nice: i32,
 
     /// SO_BUSY_POLL, in µs, on the audio fast-plane thread's receive
@@ -2187,6 +2190,18 @@ struct Args {
         default_value_t = edge_udp::DEFAULT_DRAIN_SPREAD_MS
     )]
     client_udp_drain_spread_ms: u64,
+
+    /// Wave 8 review: while a stream has no new part, an edge sends its UDP
+    /// subscribers `WAIT` this often, under the clients' 200 ms move
+    /// silence, so that a quiet stream (a contributor gap, a failover
+    /// promotion) does not move every listener of every edge at once. 0:
+    /// every 300 ms, as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_KEEPALIVE_MS",
+        default_value_t = edge_udp::DEFAULT_KEEPALIVE_MS
+    )]
+    client_udp_keepalive_ms: u64,
 
     /// Phase AM item 11: when the parents' silence is region-wide (the
     /// edge holds its UDP clients, --edge-region-silence-holds) for this
@@ -3893,6 +3908,7 @@ async fn main() -> Result<()> {
                 nack_edge_rate: args.client_udp_nack_edge_rate,
                 admit_by_load: args.client_udp_admit_by_load,
                 drain_spread: Duration::from_millis(args.client_udp_drain_spread_ms),
+                keepalive: Duration::from_millis(args.client_udp_keepalive_ms),
             },
             Arc::clone(&router.edge_udp_stats),
             edge_cut_through.clone(),
@@ -35645,7 +35661,9 @@ mod tests {
         assert!(!args.client_udp_fanout_inline_shard);
         assert_eq!(args.client_udp_fanout_nice, -5);
         assert_eq!(args.client_udp_nack_edge_rate, 20_000);
-        assert_eq!(args.relay_class_fallback_nice, 5);
+        // Off by default (wave 8 review: it cost parts under overload, and
+        // a deployed node with SCHED_FIFO never takes it).
+        assert_eq!(args.relay_class_fallback_nice, 0);
         let args = Args::try_parse_from([
             "av-mesh",
             "--client-udp-repair-thread",
@@ -35661,7 +35679,7 @@ mod tests {
             "--client-udp-nack-edge-rate",
             "0",
             "--relay-class-fallback-nice",
-            "0",
+            "5",
         ])
         .unwrap();
         assert!(!args.client_udp_repair_thread);
@@ -35670,7 +35688,7 @@ mod tests {
         assert!(args.client_udp_fanout_inline_shard);
         assert_eq!(args.client_udp_fanout_nice, 99);
         assert_eq!(args.client_udp_nack_edge_rate, 0);
-        assert_eq!(args.relay_class_fallback_nice, 0);
+        assert_eq!(args.relay_class_fallback_nice, 5);
     }
 
     #[test]
@@ -35925,6 +35943,101 @@ mod tests {
         parent.shutdown();
         slot.shutdown();
         edge.shutdown();
+    }
+
+    /// Wave 8 review: a quiet stream sends WAIT under the client's 200 ms
+    /// move silence (every 80 ms by default), not every 300 ms, so that a
+    /// contributor gap does not move every listener at once.
+    #[tokio::test]
+    async fn a_quiet_stream_sends_wait_under_the_clients_move_silence() {
+        use av_mesh::client_udp::{Control, RepairPolicy};
+        use tokio::time::timeout;
+
+        async fn longest_wait_gap(keepalive_ms: u64) -> Duration {
+            let cache = LiveTsCache::new(1, Duration::from_millis(250), 4, 32, 64).await;
+            for sequence in 0..4_u64 {
+                cache
+                    .commit_stream_payload(
+                        78,
+                        encode_test_canonical_fmp4_bundle_with_duration(
+                            78,
+                            sequence,
+                            (sequence == 0).then_some(b"ftyp-fLaC-moov".as_slice()),
+                            &[sequence as u8; 200],
+                            Some(250),
+                            true,
+                        ),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+            let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let edge = socket.local_addr().unwrap();
+            let (shutdown_tx, shutdown_rx) = watch::channel(());
+            let stats = Arc::new(edge_udp::EdgeUdpStats::default());
+            let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, 16);
+            config.keepalive = Duration::from_millis(keepalive_ms);
+            let task = tokio::spawn(edge_udp::run_edge_udp(
+                edge_udp::EdgeSockets::single(socket),
+                router.clone(),
+                config,
+                Arc::clone(&stats),
+                Vec::new(),
+                shutdown_rx,
+            ));
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let subscribe = |token| {
+                Control::Subscribe {
+                    stream_id: 78,
+                    from_part: None,
+                    repair: RepairPolicy {
+                        permille: 0,
+                        min_symbols: 0,
+                        loss_ppm: 0,
+                    },
+                    token,
+                    fast_lane: false,
+                    compact: None,
+                }
+                .encode()
+            };
+            let mut buf = vec![0_u8; 65_536];
+            client.send_to(&subscribe(None), edge).await.unwrap();
+            let mut waits = Vec::new();
+            let _ = timeout(Duration::from_millis(1_200), async {
+                loop {
+                    let (len, _) = client.recv_from(&mut buf).await.unwrap();
+                    match Control::decode(&buf[..len]) {
+                        Some(Control::Token { token, .. }) => {
+                            client.send_to(&subscribe(Some(token)), edge).await.unwrap();
+                        }
+                        Some(Control::Waiting { .. }) => waits.push(Instant::now()),
+                        _ => {}
+                    }
+                }
+            })
+            .await;
+            let _ = shutdown_tx.send(());
+            task.await.unwrap().unwrap();
+            mesh.shutdown();
+            assert!(waits.len() >= 2, "{} WAITs", waits.len());
+            waits
+                .windows(2)
+                .map(|pair| pair[1] - pair[0])
+                .max()
+                .unwrap()
+        }
+        let gap = longest_wait_gap(edge_udp::DEFAULT_KEEPALIVE_MS).await;
+        assert!(gap < Duration::from_millis(150), "WAIT every {gap:?}");
+        // 0: every 300 ms, as before.
+        let gap = longest_wait_gap(0).await;
+        assert!(gap >= Duration::from_millis(250), "WAIT every {gap:?}");
+        assert!(
+            edge_udp::DEFAULT_KEEPALIVE_MS * 2 <= av_mesh::client_session::DEFAULT_SILENCE_MS,
+            "a lost WAIT must not move a client"
+        );
     }
 
     #[test]

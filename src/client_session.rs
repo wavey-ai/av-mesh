@@ -202,10 +202,21 @@ pub struct UdpSession {
     /// Set by the caller before [`Self::poll`]: datagrams are queued on its
     /// socket (NACKs wait for them, with `nack_after_drain`).
     pub queued: bool,
+    /// Since when [`Self::queued`] has been set without a break: NACKs wait
+    /// for a queue at most one NACK retry (see [`Self::poll`]).
+    queued_since: Option<Instant>,
     /// The compact lane asked for again after a fall-back (see
     /// [`SessionConfig::compact_retry`]), over the run and at this edge.
     pub compact_retries: u64,
     compact_retries_here: u32,
+    /// When the compact lane was asked for again while subscribed, until an
+    /// `OK` with it comes: an edge that drops compact requests (one older
+    /// than the lane) never answers, and the client asks without it again
+    /// after [`COMPACT_FALLBACK_AFTER`] (wave 8 review: the retry undid the
+    /// fall-back, every refresh was dropped and the subscription expired).
+    compact_retry_at: Option<Instant>,
+    /// Retries given up that way.
+    pub compact_retries_unanswered: u64,
     /// The last move was for silence and the edge in use has sent nothing
     /// since: the longer silence applies.
     moved_for_silence: bool,
@@ -265,8 +276,11 @@ impl UdpSession {
             first_subscribed_at: None,
             hold: false,
             queued: false,
+            queued_since: None,
             compact_retries: 0,
             compact_retries_here: 0,
+            compact_retry_at: None,
+            compact_retries_unanswered: 0,
             moved_for_silence: false,
             target: None,
             from_part: None,
@@ -344,6 +358,7 @@ impl UdpSession {
         }
         self.edges += 1;
         self.compact_retries_here = 0;
+        self.compact_retry_at = None;
         self.target = Some(target);
         self.from_part = from_part;
         self.token = None;
@@ -443,8 +458,19 @@ impl UdpSession {
                 }
             }
         }
-        // NACKs wait while datagrams are queued (they fill most holes).
-        let drained = !(self.queued && self.config.nack_after_drain);
+        // NACKs wait while datagrams are queued (they fill most holes), but
+        // no longer than one NACK retry (2 ms, or 1.5 round trips): a
+        // stream that keeps the socket busy (4K at 25k datagrams a second)
+        // never empties it, and its holes would wait until they were given
+        // up (wave 8 review).
+        let queued = self.queued && self.config.nack_after_drain;
+        let drained = if queued {
+            let since = *self.queued_since.get_or_insert(now);
+            now.saturating_duration_since(since) >= self.receiver.compact.nack_retry()
+        } else {
+            self.queued_since = None;
+            true
+        };
         if self.compact_confirmed && drained {
             if let Some(token) = self.token {
                 let parts = self.receiver.nacks_due(now);
@@ -461,6 +487,20 @@ impl UdpSession {
                     );
                 }
             }
+        }
+        if self
+            .compact_retry_at
+            .is_some_and(|at| now.saturating_duration_since(at) >= COMPACT_FALLBACK_AFTER)
+        {
+            // The retry went unanswered while the subscription without the
+            // lane stood: asked without it again, and not retried here.
+            self.compact_retry_at = None;
+            self.compact_retries_unanswered += 1;
+            self.compact_retries_here = COMPACT_RETRIES;
+            self.compact_asked = false;
+            self.base_repair = self.config.base_for(false);
+            self.repair = self.policy_for_base();
+            self.next_refresh = now;
         }
         if now >= self.next_refresh {
             // An edge that has not answered two requests for the compact
@@ -587,6 +627,9 @@ impl UdpSession {
                             .expect(self.config.stream_id, next_part, compact);
                     }
                     self.compact_confirmed = compact;
+                    if compact {
+                        self.compact_retry_at = None;
+                    }
                     self.subscribed = true;
                     self.next_refresh = now + REFRESH;
                     // An edge that does not serve the compact lane (OK
@@ -609,6 +652,7 @@ impl UdpSession {
                     {
                         self.compact_retries_here += 1;
                         self.compact_retries += 1;
+                        self.compact_retry_at = Some(now);
                         self.compact_asked = true;
                         self.base_repair = self.config.base_for(true);
                         self.repair = self.policy_for_base();
@@ -631,6 +675,13 @@ impl UdpSession {
     /// The objects that the last media datagram delivered, one at a time.
     pub fn next_object(&mut self) -> Option<PartObject> {
         self.pending.take().or_else(|| self.receiver.next_ready())
+    }
+
+    /// Whether [`Self::next_object`] has objects now: after an `OK`, the
+    /// parts that came before it (take them at once, not after the next
+    /// media datagram).
+    pub fn has_objects(&self) -> bool {
+        self.pending.is_some() || self.receiver.has_ready()
     }
 }
 
@@ -862,6 +913,39 @@ mod tests {
         }
     }
 
+    /// Wave 8 review: several parts before the OK come out in the order
+    /// they came, at the OK (not after the next media datagram).
+    #[test]
+    fn parts_before_the_ok_come_out_in_order_at_the_ok() {
+        let now = Instant::now();
+        let mut session = UdpSession::new(SessionConfig::new(3), now);
+        let mut send = |_: SocketAddr, _: &[u8]| {};
+        session.begin(edge(), None, now, &mut send);
+        let token = Control::Token { stream_id: 3, token: 4 }.encode();
+        session.on_datagram(edge(), &token, now, &mut send);
+        for part in 70_000..70_004_u64 {
+            let long = crate::client_compact::encode_part(part, 0, b"pcm").unwrap();
+            let short = crate::client_compact::shorten(&long).expect("short form");
+            session.on_datagram(edge(), &short, now, &mut send);
+        }
+        assert!(!session.has_objects());
+        let ok = Control::Subscribed { stream_id: 3, next_part: 70_000, compact: true }.encode();
+        assert!(matches!(
+            session.on_datagram(edge(), &ok, now, &mut send),
+            Received::Subscribed { first: true, .. }
+        ));
+        assert!(session.has_objects());
+        let mut parts = Vec::new();
+        while let Some(object) = session.next_object() {
+            parts.push(object.part);
+        }
+        assert_eq!(parts, vec![70_000, 70_001, 70_002, 70_003]);
+        // The next part follows them.
+        let next = crate::client_compact::encode_part(70_004, 0, b"pcm").unwrap();
+        session.on_datagram(edge(), &next, now, &mut send);
+        assert_eq!(session.next_object().map(|object| object.part), Some(70_004));
+    }
+
     /// Wave 8 R6-2: no NACK while the caller says datagrams are queued.
     #[test]
     fn nacks_wait_while_datagrams_are_queued() {
@@ -885,14 +969,62 @@ mod tests {
         assert_eq!(sent, 1);
     }
 
+    /// Wave 8 review: a socket that never empties (a 4K stream) holds the
+    /// NACKs back for one NACK retry at most, not until the holes are
+    /// given up.
+    #[test]
+    fn a_socket_that_stays_busy_holds_nacks_back_for_a_retry_at_most() {
+        let now = Instant::now();
+        let mut session = subscribed(SessionConfig::new(1), now);
+        let sent = std::cell::Cell::new(0);
+        let mut send = |_: SocketAddr, datagram: &[u8]| {
+            if matches!(Control::decode(datagram), Some(Control::Nack { .. })) {
+                sent.set(sent.get() + 1);
+            }
+        };
+        let part = crate::client_compact::encode_part(12, 0, b"pcm").unwrap();
+        session.on_datagram(edge(), &part, now, &mut send);
+        let mut at = now;
+        let mut first = None;
+        while at < now + Duration::from_millis(20) {
+            at += Duration::from_micros(100);
+            session.queued = true;
+            session.poll(at, &mut send);
+            if first.is_none() && sent.get() > 0 {
+                first = Some(at);
+            }
+        }
+        let first = first.expect("a NACK while the socket stayed busy");
+        assert!(
+            first <= now + Duration::from_micros(2_400),
+            "first NACK {:?} after the hole",
+            first - now
+        );
+        // A queue that empties now and then: the wait starts again.
+        let mut session = subscribed(SessionConfig::new(1), now);
+        let mut nacks = 0;
+        let mut send = |_: SocketAddr, datagram: &[u8]| {
+            if matches!(Control::decode(datagram), Some(Control::Nack { .. })) {
+                nacks += 1;
+            }
+        };
+        session.on_datagram(edge(), &part, now, &mut send);
+        session.queued = true;
+        session.poll(now + Duration::from_millis(1), &mut send);
+        session.queued = false;
+        session.poll(now + Duration::from_millis(1), &mut send);
+        drop(send);
+        assert_eq!(nacks, 1);
+    }
+
     /// Wave 8: a client that gave up the compact lane for want of an answer
     /// asks for it again once the edge answers (twice at most).
     #[test]
     fn the_compact_lane_is_asked_for_again_when_the_edge_answers() {
         let now = Instant::now();
         let mut session = UdpSession::new(SessionConfig::new(1), now);
-        let mut sent: Vec<Vec<u8>> = Vec::new();
-        let mut send = |_: SocketAddr, datagram: &[u8]| sent.push(datagram.to_vec());
+        let sent: std::cell::RefCell<Vec<Vec<u8>>> = Default::default();
+        let mut send = |_: SocketAddr, datagram: &[u8]| sent.borrow_mut().push(datagram.to_vec());
         session.begin(edge(), None, now, &mut send);
         let mut at = now;
         while session.compact_asked {
@@ -908,11 +1040,29 @@ mod tests {
         assert!(session.compact_asked);
         assert_eq!(session.compact_retries, 1);
         session.poll(at, &mut send);
-        drop(send);
-        match Control::decode(sent.last().unwrap()) {
+        match Control::decode(sent.borrow().last().unwrap()) {
             Some(Control::Subscribe { compact, .. }) => assert!(compact.is_some()),
             other => panic!("{other:?}"),
         }
+        // An edge that drops compact requests never answers the retry: the
+        // client asks without the lane again within 1.5 s, before its
+        // subscription could expire, and does not retry at this edge.
+        let mut later = at;
+        let wait = Control::Waiting { stream_id: 1, next_part: 10 }.encode();
+        while session.compact_asked {
+            later += Duration::from_millis(100);
+            session.on_datagram(edge(), &wait, later, &mut send);
+            assert!(session.poll(later, &mut send).is_none());
+            assert!(later < at + COMPACT_FALLBACK_AFTER + Duration::from_millis(200));
+        }
+        assert_eq!(session.compact_retries_unanswered, 1);
+        match Control::decode(sent.borrow().last().unwrap()) {
+            Some(Control::Subscribe { compact, .. }) => assert!(compact.is_none()),
+            other => panic!("{other:?}"),
+        }
+        session.on_datagram(edge(), &ok, later, &mut send);
+        assert!(!session.compact_asked);
+        assert_eq!(session.compact_retries, 1);
         // Without the retry, the RaptorQ lane stays.
         let config = SessionConfig {
             compact_retry: false,

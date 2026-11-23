@@ -1372,7 +1372,10 @@ fn handle_datagram(
                         .saturating_sub(lag_us),
                 );
             }
-            return None;
+            // The parts that came before the OK are taken now.
+            if !session.has_objects() {
+                return None;
+            }
         }
         Received::Move(reason) => return Some(reason),
         Received::Control | Received::Ignored => return None,

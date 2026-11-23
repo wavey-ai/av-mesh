@@ -169,6 +169,12 @@ pub(crate) struct EdgeUdpConfig {
     /// (`--client-udp-drain-spread-ms`, Phase AM item 9; zero: all at the
     /// first housekeeping tick, as before).
     pub drain_spread: Duration,
+    /// While a stream has no new part, `WAIT` goes to its subscribers this
+    /// often (`--client-udp-keepalive-ms`, wave 8 review; 300 ms before):
+    /// under a client's 200 ms move silence (S2), so that a quiet stream
+    /// (a contributor gap, a failover promotion) is not taken for a dead
+    /// edge by every listener at once.
+    pub keepalive: Duration,
 }
 
 impl EdgeUdpConfig {
@@ -195,9 +201,15 @@ impl EdgeUdpConfig {
             nack_edge_rate: DEFAULT_NACK_EDGE_RATE,
             admit_by_load: true,
             drain_spread: Duration::from_millis(DEFAULT_DRAIN_SPREAD_MS),
+            keepalive: Duration::from_millis(DEFAULT_KEEPALIVE_MS),
         }
     }
 }
+
+/// Default of `--client-udp-keepalive-ms`: under half the client's move
+/// silence (`client_session::DEFAULT_SILENCE_MS`, 200 ms), so that a lost
+/// `WAIT` is not a move either.
+pub(crate) const DEFAULT_KEEPALIVE_MS: u64 = 80;
 
 /// Default of `--client-udp-drain-spread-ms`.
 pub(crate) const DEFAULT_DRAIN_SPREAD_MS: u64 = 2_000;
@@ -222,18 +234,26 @@ impl EdgeNackBudget {
         }
     }
 
-    /// Of `parts` asked for, how many may be answered now (all, with no
-    /// cap); takes them from the bucket.
-    pub(crate) fn grant(&mut self, parts: usize, now: Instant) -> usize {
-        if self.rate <= 0.0 {
-            return parts;
-        }
+    fn fill(&mut self, now: Instant) {
         let since = now.saturating_duration_since(self.at).as_secs_f64();
         self.tokens = (self.tokens + since * self.rate).min(self.rate / 10.0);
         self.at = now;
-        let granted = (self.tokens.floor() as usize).min(parts);
-        self.tokens -= granted as f64;
-        granted
+    }
+
+    /// Whether one more part may be answered now (always, with no cap);
+    /// [`Self::spend`] takes it once it is.
+    pub(crate) fn has_part(&mut self, now: Instant) -> bool {
+        if self.rate <= 0.0 {
+            return true;
+        }
+        self.fill(now);
+        self.tokens >= 1.0
+    }
+
+    pub(crate) fn spend(&mut self) {
+        if self.rate > 0.0 {
+            self.tokens -= 1.0;
+        }
     }
 }
 
@@ -1163,6 +1183,13 @@ pub(crate) struct Subscriber {
     /// It came by a move from another edge (it named the part that it needs
     /// next): only such a client is held within the move hold-down.
     moved_in: bool,
+    /// It came by a move and has not yet caught up to the playout floor:
+    /// only then does it skip the floor (wave 8 S2, resume from request).
+    /// Cleared once it reaches the floor, so that a later stall of this
+    /// edge skips it forward like any other (wave 8 review: the exemption
+    /// lasted the whole session, and one exempt client made the stream's
+    /// sender walk the whole stale backlog).
+    catching_up: bool,
     /// It has been counted in `moves_held_down` once already.
     held_down_counted: bool,
     /// Its place on the fast lane, if it asked for it (`F1`) and the edge
@@ -1429,7 +1456,13 @@ pub(crate) async fn run_edge_udp(
         let [twin_audio_buf, twin_video_buf] = &mut twin_bufs;
         // Which socket: 0 audio, 1 video, 2 and 3 their send-only twins.
         let (len, peer, source) = tokio::select! {
-            _ = shutdown_rx.changed() => return Ok(()),
+            _ = shutdown_rx.changed() => {
+                // The streams' senders end with their subscribers: a stopped
+                // edge sends no more WAIT (which, every 80 ms, would hold
+                // its clients on it until their subscriptions expired).
+                table.lock().unwrap().clear();
+                return Ok(());
+            }
             received = sockets.audio.recv_from(&mut audio_buf) => match received {
                 Ok((len, peer)) => (len, peer, 0),
                 Err(error) => {
@@ -1697,18 +1730,10 @@ pub(crate) fn answer_nack(
     stats
         .nack_parts
         .fetch_add(parts.len() as u64, Ordering::Relaxed);
-    // The edge's own budget first (wave 8): what is past it is refused
-    // without a look at the table.
-    let granted = budget.grant(parts.len(), Instant::now());
-    if granted < parts.len() {
-        let capped = (parts.len() - granted) as u64;
-        stats.nack_edge_capped.fetch_add(capped, Ordering::Relaxed);
-        stats.nack_refused.fetch_add(capped, Ordering::Relaxed);
-    }
-    if granted == 0 {
-        return None;
-    }
-    let parts = &parts[..granted];
+    // The edge's own budget (wave 8) is charged only for the parts that are
+    // answered: a NACK from a stranger, or for parts not sent yet or past
+    // the subscriber's own budget, takes nothing from the other clients
+    // (wave 8 review).
     let out = sockets.out_for_stream(stream_id);
     let mut answered = 0_usize;
     let mut misses = Vec::new();
@@ -1731,7 +1756,7 @@ pub(crate) fn answer_nack(
             return None;
         }
         let now = Instant::now();
-        for part in parts {
+        for (index, part) in parts.iter().enumerate() {
             let sent = *part < subscriber.next_part
                 || subscriber.cut_slots.contains(part)
                 || subscriber
@@ -1740,6 +1765,12 @@ pub(crate) fn answer_nack(
                     .is_some_and(|fast| fast.has_fast(*part));
             if !sent || *part < subscriber.first_part {
                 continue;
+            }
+            if !budget.has_part(now) {
+                stats
+                    .nack_edge_capped
+                    .fetch_add((parts.len() - index) as u64, Ordering::Relaxed);
+                break;
             }
             if !subscriber.nack_interval.grant_part(now) {
                 break;
@@ -1751,6 +1782,7 @@ pub(crate) fn answer_nack(
                 .get(stream_id, *part)
                 .filter(|kept| !compact::is_gap(kept))
             else {
+                budget.spend();
                 misses.push(*part);
                 answered += 1;
                 continue;
@@ -1761,6 +1793,7 @@ pub(crate) fn answer_nack(
             {
                 break;
             }
+            budget.spend();
             answered += 1;
             let short = subscriber.compact.is_some_and(|plan| plan.short_header);
             let datagram = compact_marked(&kept, 0, true, short);
@@ -2170,6 +2203,7 @@ async fn admit(
                 cut_slots: BTreeSet::new(),
                 admitted_at: Instant::now(),
                 moved_in: from_part.is_some(),
+                catching_up: from_part.is_some(),
                 held_down_counted: false,
                 fast: fast.clone(),
                 compact,
@@ -2810,18 +2844,17 @@ async fn run_stream_sender(
             };
             if let Some(head) = head {
                 for subscriber in entry.subscribers.values_mut() {
-                    if head.saturating_sub(subscriber.next_part) >= window {
-                        subscriber.next_part = head;
-                    } else if config.resume_from_request && subscriber.moved_in {
-                        // Wave 8 S2: a client that moved here catches up
-                        // from the part it asked for.
-                    } else if let Some(floor) = playout {
-                        if subscriber.next_part < floor {
-                            stats
-                                .playout_skipped_parts
-                                .fetch_add(floor - subscriber.next_part, Ordering::Relaxed);
-                            subscriber.next_part = floor;
-                        }
+                    let skipped = hold_to_playout(
+                        subscriber,
+                        head,
+                        window,
+                        playout,
+                        config.resume_from_request,
+                    );
+                    if skipped > 0 {
+                        stats
+                            .playout_skipped_parts
+                            .fetch_add(skipped, Ordering::Relaxed);
                     }
                 }
             }
@@ -3012,11 +3045,18 @@ async fn run_stream_sender(
         }
 
         // The newest part: wait for it as an LL-HLS part request does, for a
-        // short while at a time.
+        // short while at a time (no longer than the keepalive, whose WAIT
+        // goes when a wait ends with nothing).
+        let keepalive = if config.keepalive.is_zero() {
+            KEEPALIVE
+        } else {
+            config.keepalive
+        };
+        let live_wait = LIVE_WAIT.min(keepalive);
         let waited = if held_while_lost {
             Ok(Ok(router
                 .cache
-                .get_part_until_for_stream_id(stream_id, part, Instant::now() + LIVE_WAIT)
+                .get_part_until_for_stream_id(stream_id, part, Instant::now() + live_wait)
                 .await))
         } else {
             // With a repair horizon, the newest part may be a hole that the
@@ -3026,8 +3066,8 @@ async fn run_stream_sender(
             let mut slice = router
                 .cache
                 .repair_horizon_us()
-                .map_or(LIVE_WAIT, |horizon_us| {
-                    LIVE_WAIT.min(Duration::from_micros(horizon_us).max(Duration::from_millis(1)))
+                .map_or(live_wait, |horizon_us| {
+                    live_wait.min(Duration::from_micros(horizon_us).max(Duration::from_millis(1)))
                 });
             if drain.is_some() {
                 // A paced drain's next share is due at its tick.
@@ -3071,7 +3111,7 @@ async fn run_stream_sender(
                 housekeeping_at = Instant::now();
             }
             Ok(Ok(None)) | Err(_) => {
-                if last_sent.elapsed() >= KEEPALIVE {
+                if last_sent.elapsed() >= keepalive {
                     // A quiet stream is not a dead edge.
                     for peer in &peers {
                         send_control(
@@ -3089,6 +3129,38 @@ async fn run_stream_sender(
             }
         }
     }
+}
+
+/// A subscriber's next part against the stream's `head`: a part the window
+/// no longer holds jumps to the head, and one older than the playout
+/// `floor` to the floor, except for a client that moved here and is still
+/// catching up from the part it named (wave 8 S2, with
+/// `resume_from_request`). Returns the parts skipped for the floor.
+fn hold_to_playout(
+    subscriber: &mut Subscriber,
+    head: u64,
+    window: u64,
+    floor: Option<u64>,
+    resume_from_request: bool,
+) -> u64 {
+    if head.saturating_sub(subscriber.next_part) >= window {
+        subscriber.next_part = head;
+        subscriber.catching_up = false;
+        return 0;
+    }
+    let Some(floor) = floor else {
+        return 0;
+    };
+    if subscriber.next_part >= floor {
+        subscriber.catching_up = false;
+        return 0;
+    }
+    if resume_from_request && subscriber.catching_up {
+        return 0;
+    }
+    let skipped = floor - subscriber.next_part;
+    subscriber.next_part = floor;
+    skipped
 }
 
 /// Subscribers of `stream_id` that no client stands behind (a test of a
@@ -3118,6 +3190,7 @@ pub(crate) fn insert_test_subscribers(
                 cut_slots: BTreeSet::new(),
                 admitted_at: now,
                 moved_in: false,
+                catching_up: false,
                 held_down_counted: false,
                 fast: None,
                 compact: None,
@@ -4155,6 +4228,7 @@ mod tests {
             cut_slots: BTreeSet::new(),
             admitted_at,
             moved_in,
+            catching_up: moved_in,
             held_down_counted: false,
             fast: None,
             compact: None,
@@ -4162,6 +4236,36 @@ mod tests {
             nack_interval: NackInterval::new(admitted_at),
             windows_repaired: VecDeque::new(),
         }
+    }
+
+    /// Wave 8 review: a client that moved here skips the playout floor only
+    /// until it has caught up to it; a later stall of this edge skips it
+    /// forward like every other subscriber.
+    #[test]
+    fn a_mover_skips_the_playout_floor_only_until_it_has_caught_up() {
+        let now = Instant::now();
+        let mut mover = moved_subscriber(now, true);
+        mover.next_part = 100;
+        // Head 1,000, floor 500: the mover resumes at its part.
+        assert_eq!(hold_to_playout(&mut mover, 1_000, 12_000, Some(500), true), 0);
+        assert_eq!(mover.next_part, 100);
+        assert!(mover.catching_up);
+        // Caught up.
+        mover.next_part = 600;
+        assert_eq!(hold_to_playout(&mut mover, 1_100, 12_000, Some(600), true), 0);
+        assert!(!mover.catching_up);
+        // The edge stalls: the mover is skipped forward as others are.
+        assert_eq!(hold_to_playout(&mut mover, 2_000, 12_000, Some(1_500), true), 900);
+        assert_eq!(mover.next_part, 1_500);
+        // Without resume from request every subscriber goes to the floor.
+        let mut mover = moved_subscriber(now, true);
+        mover.next_part = 100;
+        assert_eq!(hold_to_playout(&mut mover, 1_000, 12_000, Some(500), false), 400);
+        // Past the window: to the head.
+        let mut other = moved_subscriber(now, false);
+        other.next_part = 100;
+        assert_eq!(hold_to_playout(&mut other, 20_000, 12_000, Some(19_500), true), 0);
+        assert_eq!(other.next_part, 20_000);
     }
 
     #[test]
@@ -4322,6 +4426,43 @@ mod tests {
     /// A part's datagrams to several clients leave in one batch, with or
     /// without GSO, with or without a send queue: each client receives its
     /// own, whole and in order, and each counts once.
+    /// Wave 8 review: the edge's NACK budget is charged only for parts it
+    /// answers; a stranger's NACK, or parts not sent yet, take nothing from
+    /// the other clients.
+    #[tokio::test]
+    async fn the_edge_nack_budget_pays_only_for_answered_parts() {
+        let sockets = EdgeSockets::single(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let table: Table = Arc::default();
+        let stats = EdgeUdpStats::default();
+        let now = Instant::now();
+        let client: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let stranger: SocketAddr = "127.0.0.1:1001".parse().unwrap();
+        let mut subscriber = moved_subscriber(now, false);
+        subscriber.compact = Some(CompactPlan::CLEAN);
+        subscriber.first_part = 0;
+        subscriber.next_part = 100;
+        table
+            .lock()
+            .unwrap()
+            .entry(5)
+            .or_default()
+            .subscribers
+            .insert(client, subscriber);
+        // Ten parts' worth (a tenth of a second at 100 a second).
+        let mut budget = EdgeNackBudget::new(100, now);
+        let many: Vec<u64> = (0..50).collect();
+        assert!(answer_nack(&sockets, &table, &stats, stranger, 5, &many, true, &mut budget).is_none());
+        let unsent: Vec<u64> = (100..150).collect();
+        assert!(answer_nack(&sockets, &table, &stats, client, 5, &unsent, true, &mut budget).is_none());
+        assert_eq!(stats.nack_edge_capped.load(Ordering::Relaxed), 0);
+        // Sent parts (not in the ring: asked of the cache): ten answered.
+        let sent: Vec<u64> = (0..20).collect();
+        let (misses, _) =
+            answer_nack(&sockets, &table, &stats, client, 5, &sent, true, &mut budget).unwrap();
+        assert_eq!(misses, (0..10).collect::<Vec<u64>>());
+        assert_eq!(stats.nack_edge_capped.load(Ordering::Relaxed), 10);
+    }
+
     #[tokio::test]
     async fn a_batch_reaches_each_client_whole_and_in_order() {
         for (queue, gso) in [(true, true), (true, false), (false, true), (false, false)] {
