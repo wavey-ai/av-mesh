@@ -18301,6 +18301,25 @@ enum ControlKind {
     ReplicaRequest,
 }
 
+impl ControlKind {
+    /// Drain, close and resume act on one node, named by its `node_id`.
+    const fn targets_one_node(self) -> bool {
+        matches!(self, Self::CloseNode | Self::DrainNode | Self::ResumeNode)
+    }
+
+    /// The last part of the kind's `/api/control/` path.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProvisionNode => "provision-node",
+            Self::CloseNode => "close-node",
+            Self::DrainNode => "drain-node",
+            Self::ResumeNode => "resume-node",
+            Self::WarmStream => "warm-stream",
+            Self::ReplicaRequest => "replica-request",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ControlCommand {
     id: u64,
@@ -22044,7 +22063,11 @@ impl AppRouter {
         if envelope.origin_node_id == self.node.node_id {
             return Ok(false);
         }
-        if !self.control_targets_local(&envelope.request, &envelope.target_node_ids) {
+        if !self.control_targets_local(
+            envelope.kind,
+            &envelope.request,
+            &envelope.target_node_ids,
+        ) {
             return Ok(false);
         }
 
@@ -22129,8 +22152,12 @@ impl AppRouter {
         control_id: u64,
         target_node_ids: &[String],
     ) -> String {
+        if kind.targets_one_node() && request.node_id.is_none() {
+            // A region-wide drain, published by a node of an older build.
+            return "local skipped: no node id".into();
+        }
         if kind != ControlKind::ProvisionNode
-            && !self.control_targets_local(request, target_node_ids)
+            && !self.control_targets_local(kind, request, target_node_ids)
         {
             return "local skipped: target does not match".into();
         }
@@ -22144,6 +22171,16 @@ impl AppRouter {
                     .chunk_cache
                     .resolve_or_create_stream(stream_id)
                     .await;
+                // A node that replicates on demand holds a copy while it has
+                // demand: open it, as a reader would.
+                if self.playlist_demand.config.enabled {
+                    return if self.open_playlist_demand(stream_id).await {
+                        "local warm requested: demand opened".into()
+                    } else {
+                        "local warm refused: every playlist slot holds a playlist with readers"
+                            .into()
+                    };
+                }
                 self.request_replica_for_stream(
                     stream_id,
                     "warm-stream",
@@ -22178,7 +22215,18 @@ impl AppRouter {
         }
     }
 
-    fn control_targets_local(&self, request: &ControlRequest, target_node_ids: &[String]) -> bool {
+    /// Whether a control applies to this node. A node's drain, close or
+    /// resume applies only where its `node_id` is this node's, whatever
+    /// the targets say.
+    fn control_targets_local(
+        &self,
+        kind: ControlKind,
+        request: &ControlRequest,
+        target_node_ids: &[String],
+    ) -> bool {
+        if kind.targets_one_node() {
+            return request.node_id.as_deref() == Some(self.node.node_id.as_str());
+        }
         if !target_node_ids.is_empty() {
             return target_node_ids
                 .iter()
@@ -22203,6 +22251,10 @@ impl AppRouter {
         }
         if let Some(node_id) = &request.node_id {
             return vec![node_id.clone()];
+        }
+        // A region alone never selects the nodes to drain, close or resume.
+        if kind.targets_one_node() {
+            return Vec::new();
         }
         let Some(region) = &request.region else {
             return Vec::new();
@@ -23562,6 +23614,21 @@ impl Router for AppRouter {
             let Some(kind) = control_kind_from_path(&path) else {
                 return Ok(response(StatusCode::NOT_FOUND, None, None));
             };
+            // A node's drain, close or resume names the node: a stray POST
+            // without one would drain every node that hears it. Nothing is
+            // recorded, applied or published.
+            if kind.targets_one_node() && request.node_id.is_none() {
+                let json = serde_json::to_vec(&serde_json::json!({
+                    "error": format!("node_id is required for {}", kind.as_str()),
+                }))
+                .map_err(|err| ServerError::Handler(Box::new(err)))?;
+                return Ok(response(
+                    StatusCode::BAD_REQUEST,
+                    Some(Bytes::from(json)),
+                    Some("application/json"),
+                )
+                .with_no_store());
+            }
             let command = self.execute_control(kind, request).await;
             let json =
                 serde_json::to_vec(&command).map_err(|err| ServerError::Handler(Box::new(err)))?;
@@ -25309,6 +25376,8 @@ async fn read_body_bytes(body: &mut BodyStream) -> HandlerResult<Bytes> {
     Ok(bytes.freeze())
 }
 
+/// The body of a control POST. An empty body is a request without a
+/// target, and an empty `node_id` or `region` is none.
 async fn read_control_request(body: &mut BodyStream) -> HandlerResult<ControlRequest> {
     let bytes = read_body_bytes(body).await?;
     if bytes.is_empty() {
@@ -25318,7 +25387,12 @@ async fn read_control_request(body: &mut BodyStream) -> HandlerResult<ControlReq
             stream_id: None,
         });
     }
-    serde_json::from_slice(&bytes).map_err(|err| ServerError::Handler(Box::new(err)))
+    let mut request: ControlRequest =
+        serde_json::from_slice(&bytes).map_err(|err| ServerError::Handler(Box::new(err)))?;
+    let named = |value: Option<String>| value.filter(|value| !value.trim().is_empty());
+    request.node_id = named(request.node_id);
+    request.region = named(request.region);
+    Ok(request)
 }
 
 fn deserialize_optional_u64_from_any<'de, D>(
@@ -31447,6 +31521,168 @@ mod tests {
 
         assert!(command.status.contains("draining"));
         assert!(router.mesh_api_snapshot().await.node.draining);
+
+        // A resume that names another node leaves this one drained.
+        let command = router
+            .execute_control(
+                ControlKind::ResumeNode,
+                ControlRequest {
+                    node_id: Some("other-node".into()),
+                    region: Some("test-region".into()),
+                    stream_id: None,
+                },
+            )
+            .await;
+        assert!(command.status.contains("local skipped: target does not match"));
+        assert!(router.mesh_api_snapshot().await.node.draining);
+        mesh.shutdown();
+    }
+
+    /// CR7: a drain, close or resume without a node id is refused with 400:
+    /// nothing is recorded, applied or published.
+    #[tokio::test]
+    async fn a_drain_without_a_node_id_is_refused_and_not_published() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
+        let (tx, mut rx) = mpsc::channel(4);
+        router.dispatch.set_sender(tx).await;
+        for (path, body) in [
+            ("/api/control/drain-node", &b""[..]),
+            ("/api/control/drain-node", br#"{"region":"test-region"}"#),
+            ("/api/control/close-node", br#"{"node_id":""}"#),
+            ("/api/control/resume-node", br#"{"node_id":"  ","region":"test-region"}"#),
+        ] {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .body(())
+                .unwrap();
+            let body: BodyStream =
+                Box::pin(futures_util::stream::iter(vec![Ok(Bytes::copy_from_slice(body))]));
+            let response = router.route_body(req, body).await.unwrap();
+            assert_eq!(response.status, StatusCode::BAD_REQUEST, "{path}");
+            let error: serde_json::Value =
+                serde_json::from_slice(&response.body.unwrap()).unwrap();
+            let kind = path.trim_start_matches("/api/control/");
+            assert_eq!(
+                error,
+                serde_json::json!({"error": format!("node_id is required for {kind}")})
+            );
+        }
+        assert!(router.control.recent().await.is_empty());
+        assert!(!router.lifecycle.is_draining().await);
+        assert!(!mesh.is_draining());
+        assert!(rx.try_recv().is_err(), "nothing was published");
+
+        // With its node id the drain is taken, and published to that node.
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/control/drain-node")
+            .body(())
+            .unwrap();
+        let body: BodyStream = Box::pin(futures_util::stream::iter(vec![Ok(
+            Bytes::from_static(br#"{"node_id":"test-node"}"#),
+        )]));
+        let response = router.route_body(req, body).await.unwrap();
+        assert_eq!(response.status, StatusCode::ACCEPTED);
+        assert!(router.lifecycle.is_draining().await);
+        let message = rx.recv().await.unwrap();
+        let envelope: ControlEnvelope = serde_json::from_slice(&message.data()[0]).unwrap();
+        assert_eq!(envelope.target_node_ids, vec!["test-node"]);
+        mesh.shutdown();
+    }
+
+    /// CR7: a region-wide drain published by a node of an older build names
+    /// this node among its targets but not in its request: ignored.
+    #[tokio::test]
+    async fn a_region_wide_drain_from_another_node_is_ignored() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
+        let envelope = |kind: ControlKind, node_id: Option<&str>| ControlEnvelope {
+            id: 21,
+            origin_node_id: "older-node".into(),
+            kind,
+            request: ControlRequest {
+                node_id: node_id.map(str::to_owned),
+                region: Some("test-region".into()),
+                stream_id: None,
+            },
+            target_node_ids: vec!["older-node".into(), "test-node".into()],
+        };
+        let deliver = |envelope: ControlEnvelope| TcpChangesPayload {
+            tag: CONTROL_TAG,
+            val: Bytes::from(serde_json::to_vec(&envelope).unwrap()),
+        };
+        for kind in [ControlKind::DrainNode, ControlKind::CloseNode] {
+            assert!(!router
+                .ingest_tcp_changes_payload(deliver(envelope(kind, None)))
+                .await
+                .unwrap());
+            assert!(!router
+                .ingest_tcp_changes_payload(deliver(envelope(kind, Some("older-node"))))
+                .await
+                .unwrap());
+        }
+        assert!(!router.lifecycle.is_draining().await);
+        assert!(router.control.recent().await.is_empty());
+        // Named, it is taken.
+        assert!(router
+            .ingest_tcp_changes_payload(deliver(envelope(ControlKind::DrainNode, Some("test-node"))))
+            .await
+            .unwrap());
+        assert!(router.lifecycle.is_draining().await);
+        // Applied directly without a node id, it says why it did nothing.
+        assert_eq!(
+            router
+                .apply_control_locally(
+                    ControlKind::ResumeNode,
+                    &ControlRequest {
+                        node_id: None,
+                        region: Some("test-region".into()),
+                        stream_id: None,
+                    },
+                    false,
+                    22,
+                    &["test-node".to_owned()],
+                )
+                .await,
+            "local skipped: no node id"
+        );
+        assert!(router.lifecycle.is_draining().await);
+        mesh.shutdown();
+    }
+
+    /// CR7: on an edge that holds playlists on demand, warm-stream opens
+    /// demand for the stream, as a reader would.
+    #[tokio::test]
+    async fn warm_stream_opens_a_copy_on_a_demand_edge() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh))
+            .with_playlist_demand(PlaylistDemand::new(PlaylistDemandConfig {
+                enabled: true,
+                lease: Duration::from_millis(900),
+                idle: Duration::from_millis(1_200),
+                warm_parts: 16,
+                max_playlists: 4,
+            }));
+        assert!(mesh.subscribed_streams().is_empty());
+        let command = router
+            .execute_control(
+                ControlKind::WarmStream,
+                ControlRequest {
+                    node_id: Some("test-node".into()),
+                    region: None,
+                    stream_id: Some(94),
+                },
+            )
+            .await;
+        assert!(command.status.contains("demand opened"), "{}", command.status);
+        assert_eq!(mesh.subscribed_streams(), vec![94]);
+        assert!(router.playlist_demand.streams.contains_key(&94));
+        assert!(cache.chunk_cache.resolve_stream(94).is_some());
         mesh.shutdown();
     }
 
@@ -36167,6 +36403,12 @@ mod tests {
             .unwrap();
         assert_ne!(part.status, StatusCode::TEMPORARY_REDIRECT);
         assert_ne!(part.status, StatusCode::TOO_MANY_REQUESTS);
+        // The moved reader still fetches here: the drained proof waits for
+        // it, though the session gauge no longer counts it. (The part is
+        // not here, so its request waited for it: the request was seen at
+        // its start, seconds ago.)
+        assert_eq!(router.edge_load.admission_snapshot().active_sessions, 0);
+        assert_eq!(router.edge_load.moved_seen_within(10_000), 1);
 
         // A new reader is rejected and told where to go.
         let rejected = router.route(request(playlist, "reader-2")).await.unwrap();
@@ -36179,6 +36421,19 @@ mod tests {
         assert!(!master.lines().any(|line| line == "stream.m3u8"));
         assert!(master.contains("https://edge-b.example/live/801/stream.m3u8"));
 
+        // A region's resume does not resume it: only its own node id does.
+        let command = router
+            .execute_control(
+                ControlKind::ResumeNode,
+                ControlRequest {
+                    node_id: None,
+                    region: Some("test-region".into()),
+                    stream_id: None,
+                },
+            )
+            .await;
+        assert!(command.status.contains("local skipped: no node id"));
+        assert!(router.local_mesh_snapshot().await.node.draining);
         router
             .execute_control(
                 ControlKind::ResumeNode,
