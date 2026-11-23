@@ -10,7 +10,7 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::net::SocketAddr;
 
-use media_object::{MediaObject, ObjectKey, ObjectKind, PayloadHash};
+use media_object::{MediaObject, ObjectKey, ObjectKind, PayloadHash, Stage};
 use playlists::compact_object::{self, CompactTemplates};
 use raptorq_datagram_fec::{
     DatagramFecHeader, MediaDatagramRole, MediaDeadline, MediaObjectKind, MediaPathIntent,
@@ -19,17 +19,24 @@ use relay_session::{
     decode_datagram, CarrierIdentity, CarrierKind, ObjectAnnouncement, ObjectAssembler, ParentPath,
     RelayLimits, SubscriptionId, TopologyGeneration, TrustMode,
 };
+use serde::{Deserialize, Serialize};
+
+use crate::media_clock::{MediaClocks, Verdict};
 
 /// Wire prefix used by `RelaySession`'s RLS1 envelope.
 pub const RELAY_SESSION_DATAGRAM_MAGIC: [u8; 4] = *b"RLS1";
 
 const HARD_MAX_PARENT_SESSIONS: usize = 65_536;
 const HARD_MAX_ACTIVE_OBJECTS: usize = 65_536;
-const HARD_MAX_PARENTS_PER_OBJECT: usize = 2;
+/// Primary, secondary and the ranked parents of an edge, with room: every
+/// promoted session may bring symbols of one object.
+const HARD_MAX_PARENTS_PER_OBJECT: usize = 8;
 const HARD_MAX_DATAGRAMS_PER_OBJECT: usize = 65_536;
 const HARD_MAX_BUFFERED_DATAGRAMS: usize = 262_144;
 const HARD_MAX_BUFFERED_OBJECT_BYTES: usize = 512 * 1024 * 1024;
 const HARD_MAX_COMPLETED_OBJECTS: usize = 65_536;
+/// Streams whose media clock a receiver keeps.
+const MEDIA_CLOCK_STREAMS: usize = 4_096;
 
 /// Operational receive ceilings. Every value is checked before allocation or
 /// decoder admission.
@@ -45,6 +52,9 @@ pub struct RelayObjectReceiverConfig {
     pub max_completed_objects: usize,
     pub object_inactivity_timeout_us: u64,
     pub expiry_scan_interval_us: u64,
+    /// `--relay-media-deadline-ms`: how far behind the head of its stream,
+    /// in the stream's own time, a part may be and still be taken.
+    pub media_deadline_us: u64,
 }
 
 impl Default for RelayObjectReceiverConfig {
@@ -53,13 +63,14 @@ impl Default for RelayObjectReceiverConfig {
             relay_limits: RelayLimits::default(),
             max_parent_sessions: 4_096,
             max_active_objects: 4_096,
-            max_parents_per_object: 2,
+            max_parents_per_object: 4,
             max_datagrams_per_object: 32_768,
             max_buffered_datagrams: 131_072,
             max_buffered_object_bytes: 128 * 1024 * 1024,
             max_completed_objects: 4_096,
             object_inactivity_timeout_us: 10_000_000,
             expiry_scan_interval_us: 250_000,
+            media_deadline_us: 1_000_000,
         }
     }
 }
@@ -113,6 +124,12 @@ impl RelayObjectReceiverConfig {
         if self.expiry_scan_interval_us == 0 {
             return Err(RelayIngressError::InvalidConfig {
                 field: "expiry_scan_interval_us",
+                reason: "bound must be positive",
+            });
+        }
+        if self.media_deadline_us == 0 {
+            return Err(RelayIngressError::InvalidConfig {
+                field: "media_deadline_us",
                 reason: "bound must be positive",
             });
         }
@@ -346,6 +363,84 @@ pub struct RelayIngressCounters {
     pub compact_unknown_descriptor: u64,
     /// Whole audio objects whose descriptor was learnt (or seen again).
     pub compact_descriptors_learned: u64,
+    /// Media objects decoded more than the media budget after their
+    /// Published time by this node's wall clock, and the longest any decoded
+    /// object was behind its Published time (µs). Nothing acts on either:
+    /// they say what a wall-clock deadline would have shed.
+    pub wall_late_parts: u64,
+    pub wall_late_max_us: u64,
+    /// Every rejection, by the kind of its error.
+    pub rejected_by_kind: RejectedByKind,
+}
+
+/// The kinds of rejection and their counters, from one list: the name of a
+/// kind in a log line is the name of its counter in the status JSON.
+macro_rules! rejection_kinds {
+    ($($variant:ident => $field:ident),+ $(,)?) => {
+        /// What kind of error rejected a datagram or an announcement.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub enum RejectionKind {
+            $($variant),+
+        }
+
+        impl RejectionKind {
+            #[must_use]
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => stringify!($field)),+
+                }
+            }
+        }
+
+        /// Rejections counted by [`RejectionKind`].
+        #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+        #[serde(default)]
+        pub struct RejectedByKind {
+            $(pub $field: u64),+
+        }
+
+        impl RejectedByKind {
+            #[must_use]
+            pub const fn get(&self, kind: RejectionKind) -> u64 {
+                match kind {
+                    $(RejectionKind::$variant => self.$field),+
+                }
+            }
+
+            fn count(&mut self, kind: RejectionKind) {
+                let counter = match kind {
+                    $(RejectionKind::$variant => &mut self.$field),+
+                };
+                *counter = counter.saturating_add(1);
+            }
+
+            /// Add another receiver's counts (the audio and the video tee
+            /// each have a receiver).
+            pub fn add(&mut self, other: &Self) {
+                $(self.$field = self.$field.saturating_add(other.$field);)+
+            }
+        }
+    };
+}
+
+rejection_kinds! {
+    Invalid => invalid,
+    LimitExceeded => limit_exceeded,
+    Authentication => authentication,
+    ParentSessionConflict => parent_session_conflict,
+    AnnouncementRequired => announcement_required,
+    AnnouncementConflict => announcement_conflict,
+    ObjectIdentityConflict => object_identity_conflict,
+    ParentLimitExceeded => parent_limit_exceeded,
+    ParentRoleConflict => parent_role_conflict,
+    UnauthorizedParent => unauthorized_parent,
+    StaleMedia => stale_media,
+    StaleEpoch => stale_epoch,
+    DatagramLimitExceeded => datagram_limit_exceeded,
+    BufferedDatagramLimitExceeded => buffered_datagram_limit_exceeded,
+    SymbolReplayConflict => symbol_replay_conflict,
+    CodingProfileConflict => coding_profile_conflict,
+    Malformed => malformed,
 }
 
 /// Receiver state and counters exported to the executable observability layer.
@@ -395,7 +490,11 @@ pub enum RelayIngressError {
     ParentLimitExceeded,
     ParentRoleConflict,
     UnauthorizedParent,
+    /// The head of the object's stream has passed its deadline by more than
+    /// the media budget.
     DeadlineExpired,
+    /// The object belongs to an epoch that its stream has left.
+    StaleEpoch,
     DatagramLimitExceeded,
     BufferedDatagramLimitExceeded,
     SymbolReplayConflict,
@@ -447,7 +546,11 @@ impl fmt::Display for RelayIngressError {
             Self::UnauthorizedParent => {
                 formatter.write_str("relay parent session is unauthorized for this object or path")
             }
-            Self::DeadlineExpired => formatter.write_str("media object deadline has expired"),
+            Self::DeadlineExpired => formatter
+                .write_str("media object deadline is more than the budget behind its stream"),
+            Self::StaleEpoch => {
+                formatter.write_str("media object belongs to an epoch its stream has left")
+            }
             Self::DatagramLimitExceeded => {
                 formatter.write_str("media object datagram admission limit reached")
             }
@@ -459,6 +562,43 @@ impl fmt::Display for RelayIngressError {
             }
             Self::RelaySession(error) => write!(formatter, "relay-session error: {error}"),
             Self::Compact(reason) => write!(formatter, "compact relay datagram: {reason}"),
+        }
+    }
+}
+
+impl RelayIngressError {
+    /// The kind this rejection is counted and logged under.
+    #[must_use]
+    pub const fn kind(&self) -> RejectionKind {
+        match self {
+            Self::InvalidConfig { .. } | Self::InvalidSessionId | Self::InvalidCarrierIdentity(_) => {
+                RejectionKind::Invalid
+            }
+            Self::LimitExceeded { .. } => RejectionKind::LimitExceeded,
+            Self::AuthenticationRequired | Self::ParentSessionMissing(_) => {
+                RejectionKind::Authentication
+            }
+            Self::ParentSessionConflict(_) | Self::UdpPeerConflict(_) => {
+                RejectionKind::ParentSessionConflict
+            }
+            Self::AnnouncementRequired => RejectionKind::AnnouncementRequired,
+            Self::AnnouncementConflict => RejectionKind::AnnouncementConflict,
+            Self::ObjectIdentityConflict
+            | Self::RelaySession(relay_session::Error::ObjectIdentityConflict) => {
+                RejectionKind::ObjectIdentityConflict
+            }
+            Self::ParentLimitExceeded => RejectionKind::ParentLimitExceeded,
+            Self::ParentRoleConflict => RejectionKind::ParentRoleConflict,
+            Self::UnauthorizedParent => RejectionKind::UnauthorizedParent,
+            Self::DeadlineExpired => RejectionKind::StaleMedia,
+            Self::StaleEpoch => RejectionKind::StaleEpoch,
+            Self::DatagramLimitExceeded => RejectionKind::DatagramLimitExceeded,
+            Self::BufferedDatagramLimitExceeded => RejectionKind::BufferedDatagramLimitExceeded,
+            Self::SymbolReplayConflict => RejectionKind::SymbolReplayConflict,
+            Self::RelaySession(relay_session::Error::CodingProfileConflict) => {
+                RejectionKind::CodingProfileConflict
+            }
+            Self::RelaySession(_) | Self::Compact(_) => RejectionKind::Malformed,
         }
     }
 }
@@ -559,6 +699,18 @@ impl CompactIdentity {
             version,
         }
     }
+
+    fn of(key: &ObjectKey) -> Self {
+        Self::new(
+            key.tenant(),
+            key.stream(),
+            key.track(),
+            key.epoch(),
+            key.group(),
+            key.object(),
+            key.version(),
+        )
+    }
 }
 
 /// The relay tags of a compact datagram, as the RLS1 types.
@@ -586,7 +738,6 @@ fn compact_tags(
 const COMPACT_TEMPLATE_MAX_ENVELOPE: usize = 2_048;
 
 /// Bounded cross-parent object receiver.
-#[derive(Debug)]
 pub struct RelayObjectReceiver {
     config: RelayObjectReceiverConfig,
     sessions: HashMap<u64, AuthenticatedRelayParentSession>,
@@ -603,6 +754,25 @@ pub struct RelayObjectReceiver {
     /// Compact objects decoded, for the duplicates of their other copies.
     compact_completed: HashMap<CompactIdentity, ObjectKey>,
     compact_order: VecDeque<CompactIdentity>,
+    /// The objects in `completed`, as a compact datagram names one: a part
+    /// that came whole is not rebuilt from its compact copy.
+    whole_done: HashSet<CompactIdentity>,
+    /// Each stream's place on its own timeline: what a deadline is measured
+    /// against (never this node's wall clock).
+    clocks: MediaClocks,
+}
+
+impl fmt::Debug for RelayObjectReceiver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RelayObjectReceiver")
+            .field("config", &self.config)
+            .field("sessions", &self.sessions.len())
+            .field("active_objects", &self.objects.len())
+            .field("completed_objects", &self.completed.len())
+            .field("counters", &self.counters)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RelayObjectReceiver {
@@ -628,6 +798,8 @@ impl RelayObjectReceiver {
             templates: CompactTemplates::new(),
             compact_completed: HashMap::with_capacity(config.max_completed_objects),
             compact_order: VecDeque::with_capacity(config.max_completed_objects),
+            whole_done: HashSet::with_capacity(config.max_completed_objects),
+            clocks: MediaClocks::new(MEDIA_CLOCK_STREAMS),
         })
     }
 
@@ -680,6 +852,12 @@ impl RelayObjectReceiver {
             buffered_datagrams: self.buffered_datagrams,
             counters: self.counters,
         }
+    }
+
+    /// The cumulative counters alone (the snapshot also walks the sessions).
+    #[must_use]
+    pub const fn counters(&self) -> &RelayIngressCounters {
+        &self.counters
     }
 
     /// Register a caller-authenticated carrier session. Replaying an identical
@@ -778,9 +956,8 @@ impl RelayObjectReceiver {
             )?;
             return Ok(RelayAnnouncementOutcome::AlreadyComplete);
         }
-
-        if announcement.deadline.is_expired_at(now_us) {
-            return Err(RelayIngressError::DeadlineExpired);
+        if self.completed_compact(&announcement.key)? {
+            return Ok(RelayAnnouncementOutcome::AlreadyComplete);
         }
 
         if let Some(active) = self.objects.get_mut(&announcement.key) {
@@ -796,6 +973,16 @@ impl RelayObjectReceiver {
             active.last_activity_us = now_us;
             return Ok(RelayAnnouncementOutcome::Joined);
         }
+
+        // No assembly is opened for an object that its stream has left
+        // behind. An announcement moves no clock: the head of a stream
+        // follows the datagrams that arrive.
+        verdict_result(self.clocks.peek(
+            MediaClocks::key(announcement.key.tenant(), announcement.key.stream()),
+            announcement.key.epoch(),
+            announcement.deadline.expires_at_us,
+            self.config.media_deadline_us,
+        ))?;
 
         if self.objects.len() >= self.config.max_active_objects {
             return Err(RelayIngressError::LimitExceeded {
@@ -872,7 +1059,9 @@ impl RelayObjectReceiver {
     }
 
     /// Decode and admit one RLS1 datagram from a registered authenticated
-    /// parent. `now_us` uses the same clock domain as the announced deadline.
+    /// parent. `now_us` is this node's clock: it bounds an assembly's
+    /// inactivity and nothing else (a deadline is measured on its stream's
+    /// own timeline).
     pub fn push_wire_datagram(
         &mut self,
         session_id: u64,
@@ -908,8 +1097,17 @@ impl RelayObjectReceiver {
             return Err(RelayIngressError::ObjectIdentityConflict);
         }
 
-        if let Some(completed) = self.completed.get(&symbol.object_key) {
+        // A whole copy of a part that was rebuilt from its compact one is
+        // not assembled or decoded again.
+        let duplicate = if self.completed_compact(&symbol.object_key)? {
+            true
+        } else if let Some(completed) = self.completed.get(&symbol.object_key) {
             validate_completed_symbol(completed, &session, &symbol)?;
+            true
+        } else {
+            false
+        };
+        if duplicate {
             self.counters.duplicate_datagrams = self.counters.duplicate_datagrams.saturating_add(1);
             match symbol.role {
                 MediaDatagramRole::Source => {
@@ -928,13 +1126,23 @@ impl RelayObjectReceiver {
             });
         }
 
-        // Deadline admission happens before any decoder mutation. Completed
-        // objects above remain tombstones, so an authenticated symbol that
-        // races decode completion is classified as a duplicate instead of a
-        // deadline or authentication failure.
-        if symbol.deadline.is_expired_at(now_us) {
-            self.expire(now_us);
-            return Err(RelayIngressError::DeadlineExpired);
+        // Deadline admission happens before any decoder mutation, on the
+        // stream's own timeline. Completed objects above remain tombstones,
+        // so an authenticated symbol that races decode completion is
+        // classified as a duplicate instead of a deadline or authentication
+        // failure. A symbol the stream has left behind ends its object's
+        // assembly with it.
+        let verdict = self.clocks.observe(
+            MediaClocks::key(symbol.object_key.tenant(), symbol.object_key.stream()),
+            symbol.object_key.epoch(),
+            symbol.deadline.expires_at_us,
+            self.config.media_deadline_us,
+        );
+        if let Err(error) = verdict_result(verdict) {
+            if self.remove_active_object(&symbol.object_key, true).is_some() {
+                self.counters.expired_objects = self.counters.expired_objects.saturating_add(1);
+            }
+            return Err(error);
         }
 
         let state = self
@@ -1019,6 +1227,7 @@ impl RelayObjectReceiver {
             self.counters.compact_descriptors_learned =
                 self.counters.compact_descriptors_learned.saturating_add(1);
         }
+        self.note_decoded(&object, now_us);
         let key = object.key().clone();
         let active = self
             .remove_active_object(&key, false)
@@ -1066,8 +1275,9 @@ impl RelayObjectReceiver {
     ///
     /// # Errors
     ///
-    /// An unknown session, a session that does not admit the datagram, an
-    /// expired deadline, or a datagram that does not read or rebuild.
+    /// An unknown session, a session that does not admit the datagram, a
+    /// deadline that its stream has left behind, or a datagram that does
+    /// not read or rebuild.
     pub fn push_compact_datagram(
         &mut self,
         session_id: u64,
@@ -1117,8 +1327,29 @@ impl RelayObjectReceiver {
                 counters.repair_datagrams = counters.repair_datagrams.saturating_add(1);
             }
         };
-        if let Some(key) = self.compact_completed.get(&identity) {
-            let key = key.clone();
+        // A compact datagram carries no payload hash: where its object is
+        // not at hand, its key has none.
+        let unhashed_key = || {
+            ObjectKey::new(
+                header.tenant,
+                header.stream,
+                header.track,
+                header.epoch,
+                header.group,
+                header.object,
+                header.version,
+                PayloadHash::from_bytes([0; 32]),
+            )
+            .map_err(|_| RelayIngressError::Compact("object key"))
+        };
+        // Another copy of a part rebuilt already, or the compact copy of a
+        // part that came whole: not rebuilt or committed again.
+        let completed = match self.compact_completed.get(&identity) {
+            Some(key) => Some(key.clone()),
+            None if self.whole_done.contains(&identity) => Some(unhashed_key()?),
+            None => None,
+        };
+        if let Some(key) = completed {
             self.counters.duplicate_datagrams = self.counters.duplicate_datagrams.saturating_add(1);
             count_role(&mut self.counters);
             return Ok(RelayIngressOutcome::Duplicate {
@@ -1127,28 +1358,20 @@ impl RelayObjectReceiver {
                 deadline,
             });
         }
-        if deadline.is_expired_at(now_us) {
-            return Err(RelayIngressError::DeadlineExpired);
-        }
+        verdict_result(self.clocks.observe(
+            MediaClocks::key(header.tenant, header.stream),
+            header.epoch,
+            header.deadline_us,
+            self.config.media_deadline_us,
+        ))?;
         let object = match self.templates.expand(header.stream, slim) {
             Ok(object) => object,
             Err(error) if error.0 == "unknown descriptor" => {
                 self.counters.compact_unknown_descriptor =
                     self.counters.compact_unknown_descriptor.saturating_add(1);
                 count_role(&mut self.counters);
-                let key = ObjectKey::new(
-                    header.tenant,
-                    header.stream,
-                    header.track,
-                    header.epoch,
-                    header.group,
-                    header.object,
-                    header.version,
-                    PayloadHash::from_bytes([0; 32]),
-                )
-                .map_err(|_| RelayIngressError::Compact("object key"))?;
                 return Ok(RelayIngressOutcome::Buffered {
-                    key,
+                    key: unhashed_key()?,
                     role,
                     deadline,
                 });
@@ -1169,6 +1392,7 @@ impl RelayObjectReceiver {
         validate_object_kind(&object, kind)?;
         let envelope =
             media_object::encode(&object).map_err(|_| RelayIngressError::Compact("envelope"))?;
+        self.note_decoded(&object, now_us);
         if self.compact_completed.len() >= self.config.max_completed_objects {
             if let Some(evicted) = self.compact_order.pop_front() {
                 self.compact_completed.remove(&evicted);
@@ -1190,16 +1414,25 @@ impl RelayObjectReceiver {
         })
     }
 
-    /// Remove deadline-expired and inactive object assemblies.
+    /// Remove the object assemblies that their stream has left behind (its
+    /// head has passed their deadline by the media budget, or it has moved
+    /// to a later epoch) and those with no symbol for the inactivity bound
+    /// of `now_us`, this node's clock.
     pub fn expire(&mut self, now_us: u64) -> RelayObjectExpiry {
+        self.clocks.tick(now_us);
         let expired = self
             .objects
             .iter()
             .filter_map(|(key, state)| {
-                let deadline_expired = state.announcement.deadline.is_expired_at(now_us);
+                let left_behind = self.clocks.peek(
+                    MediaClocks::key(key.tenant(), key.stream()),
+                    key.epoch(),
+                    state.announcement.deadline.expires_at_us,
+                    self.config.media_deadline_us,
+                ) != Verdict::Fresh;
                 let inactive = now_us.saturating_sub(state.last_activity_us)
                     >= self.config.object_inactivity_timeout_us;
-                (deadline_expired || inactive).then(|| key.clone())
+                (left_behind || inactive).then(|| key.clone())
             })
             .collect::<Vec<_>>();
         let mut result = RelayObjectExpiry::default();
@@ -1223,6 +1456,9 @@ impl RelayObjectReceiver {
     }
 
     fn expire_if_due(&mut self, now_us: u64) {
+        // The clocks age on this node's time (an idle clock's slot may be
+        // reused): every datagram and announcement passes here first.
+        self.clocks.tick(now_us);
         let due = match self.next_expiry_scan_us {
             Some(next_scan) => now_us >= next_scan,
             None => true,
@@ -1236,6 +1472,7 @@ impl RelayObjectReceiver {
         if datagram {
             self.counters.datagrams_rejected = self.counters.datagrams_rejected.saturating_add(1);
         }
+        self.counters.rejected_by_kind.count(error.kind());
         match error {
             RelayIngressError::AuthenticationRequired
             | RelayIngressError::ParentSessionMissing(_)
@@ -1255,6 +1492,48 @@ impl RelayObjectReceiver {
             }
             _ => {}
         }
+    }
+
+    /// Whether the object was rebuilt from a compact datagram already. A
+    /// whole object of the same names and number with another payload is a
+    /// conflict, as it is against a whole one.
+    fn completed_compact(&self, key: &ObjectKey) -> Result<bool, RelayIngressError> {
+        // No table to look in on a receiver that sees no compact datagrams
+        // (video): its symbols pay nothing for this.
+        if self.compact_completed.is_empty() {
+            return Ok(false);
+        }
+        match self.compact_completed.get(&CompactIdentity::of(key)) {
+            Some(completed) if completed == key => Ok(true),
+            Some(_) => Err(RelayIngressError::ObjectIdentityConflict),
+            None => Ok(false),
+        }
+    }
+
+    /// An object decoded: its epoch is validated, so its stream's clock may
+    /// take it up; and how late the object is by this node's wall clock is
+    /// counted, for the record alone.
+    fn note_decoded(&mut self, object: &MediaObject, now_us: u64) {
+        let key = object.key();
+        self.clocks
+            .set_epoch(MediaClocks::key(key.tenant(), key.stream()), key.epoch());
+        if object.kind() != ObjectKind::Media {
+            return;
+        }
+        let Some(published_us) = object
+            .stage_timestamps()
+            .iter()
+            .find(|timestamp| timestamp.stage() == Stage::Published)
+            .and_then(|timestamp| u64::try_from(timestamp.timestamp().unix_time_ns()).ok())
+            .map(|published_ns| published_ns / 1_000)
+        else {
+            return;
+        };
+        let late_us = now_us.saturating_sub(published_us);
+        if late_us > self.config.media_deadline_us {
+            self.counters.wall_late_parts = self.counters.wall_late_parts.saturating_add(1);
+        }
+        self.counters.wall_late_max_us = self.counters.wall_late_max_us.max(late_us);
     }
 
     fn session(
@@ -1290,8 +1569,10 @@ impl RelayObjectReceiver {
             if self.completed.remove(&evicted).is_some() {
                 self.logical_keys
                     .remove(&LogicalObjectIdentity::from(&evicted));
+                self.whole_done.remove(&CompactIdentity::of(&evicted));
             }
         }
+        self.whole_done.insert(CompactIdentity::of(&key));
         self.completed_order.push_back(key.clone());
         self.completed.insert(key, completed);
     }
@@ -1320,12 +1601,27 @@ fn add_parent_to_set(
                 candidate.session_id,
             ));
         }
-        if existing.parent_path == candidate.parent_path {
+        // Two sessions on the primary path, or two on the repair path, are
+        // a miscompiled plan. Promoted sessions each carry sources and
+        // repair, and any number of them may bring symbols of one object:
+        // two contributors at a first forwarder, every parent at an edge.
+        if existing.parent_path == candidate.parent_path
+            && candidate.parent_path != ParentPath::PromotedSecondary
+        {
             return Err(RelayIngressError::ParentRoleConflict);
         }
     }
     parent_sessions.insert(candidate.session_id);
     Ok(())
+}
+
+/// The media clock's verdict as the receiver's result.
+fn verdict_result(verdict: Verdict) -> Result<(), RelayIngressError> {
+    match verdict {
+        Verdict::Fresh => Ok(()),
+        Verdict::StaleEpoch => Err(RelayIngressError::StaleEpoch),
+        Verdict::StaleMedia => Err(RelayIngressError::DeadlineExpired),
+    }
 }
 
 fn validate_session_announcement(
@@ -1668,6 +1964,10 @@ mod tests {
     }
 
     fn fmp4_object(sequence: u64, payload_len: usize) -> MediaObject {
+        fmp4_object_of_epoch(1, sequence, payload_len)
+    }
+
+    fn fmp4_object_of_epoch(epoch: u64, sequence: u64, payload_len: usize) -> MediaObject {
         let media = (0..payload_len)
             .map(|index| ((index * 31 + 17) % 251) as u8)
             .collect::<Vec<_>>();
@@ -1677,8 +1977,9 @@ mod tests {
         slot.extend_from_slice(&(media.len() as u32).to_be_bytes());
         slot.extend_from_slice(b"ftyp-moov");
         slot.extend_from_slice(&media);
-        let key = ObjectKey::for_payload("tenant", "77", "muxed-fmp4", 1, 3, sequence, 1, &slot)
-            .expect("key");
+        let key =
+            ObjectKey::for_payload("tenant", "77", "muxed-fmp4", epoch, 3, sequence, 1, &slot)
+                .expect("key");
         MediaObject::builder(key, ObjectKind::Media, slot)
             .with_keyframe(true)
             .with_metadata("container", b"fmp4".to_vec())
@@ -2045,7 +2346,7 @@ mod tests {
     }
 
     #[test]
-    fn receive_time_deadline_and_inactivity_expiry_release_all_state() {
+    fn inactivity_expiry_releases_all_state() {
         let object = fmp4_object(42, 4_000);
         let mut encoder = encoder();
         let encoded = encoder
@@ -2070,24 +2371,21 @@ mod tests {
             .expect("announcement");
         let wire = encode_datagram(&encoded.source_symbols[0], RelayLimits::default())
             .expect("source wire");
+        // This node's clock is long past the deadline: no reason to refuse
+        // the symbol.
         assert!(matches!(
-            receiver.push_wire_datagram(1, &wire, 100),
-            Err(RelayIngressError::DeadlineExpired)
+            receiver.push_wire_datagram(1, &wire, 100_000),
+            Ok(RelayIngressOutcome::Buffered { .. })
         ));
-        assert_eq!(receiver.snapshot().counters.datagrams_rejected, 1);
-        assert_eq!(receiver.snapshot().counters.deadline_drops, 1);
-        assert_eq!(receiver.state().active_objects, 0);
-        assert_eq!(receiver.state().buffered_object_bytes, 0);
-
-        let mut later = encoded.announcement.clone();
-        later.deadline = MediaDeadline::from_micros(1_000);
-        receiver
-            .announce_object(1, later, 200)
-            .expect("fresh announcement");
-        let expiry = receiver.expire(210);
+        assert_eq!(receiver.expire(100_009).objects, 0);
+        let expiry = receiver.expire(100_010);
         assert_eq!(expiry.objects, 1);
         assert!(expiry.released_object_bytes > 0);
+        assert_eq!(expiry.released_datagrams, 1);
         assert_eq!(receiver.state().active_objects, 0);
+        assert_eq!(receiver.state().buffered_object_bytes, 0);
+        assert_eq!(receiver.snapshot().counters.deadline_drops, 0);
+        assert_eq!(receiver.snapshot().counters.expired_objects, 1);
     }
 
     #[test]
@@ -2339,5 +2637,511 @@ mod tests {
         assert_eq!(counters.compact_descriptors_learned, 1);
         assert_eq!(counters.duplicate_datagrams, 4);
         assert_eq!(counters.authentication_drops, 1);
+    }
+
+    /// A dispatch whose controlled sessions 1.. have `paths`, each at a peer
+    /// address of its own.
+    fn dispatch_with(paths: &[ParentPath]) -> (RelayUdpDispatch, Vec<SocketAddr>) {
+        let receiver =
+            RelayObjectReceiver::new(RelayObjectReceiverConfig::default()).expect("receiver");
+        let mut dispatch = RelayUdpDispatch::new(receiver);
+        let mut peers = Vec::new();
+        for (index, path) in paths.iter().enumerate() {
+            let peer: SocketAddr = format!("127.0.0.1:{}", 41_100 + index)
+                .parse()
+                .expect("peer");
+            dispatch
+                .bind_controlled_peer(
+                    peer,
+                    controlled_parent(index as u64 + 1, &format!("parent-{index}"), *path),
+                )
+                .expect("binding");
+            peers.push(peer);
+        }
+        (dispatch, peers)
+    }
+
+    /// The RLS1 wire symbols of an object, sources then repair: an audio
+    /// part in one symbol, as the contributor sends it, anything else in
+    /// symbols of 400 bytes.
+    fn wire_symbols(
+        object: &MediaObject,
+        deadline_us: u64,
+        priority: MediaPriority,
+        repair: u32,
+    ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let policy = AdaptiveFecPolicy {
+            min_repair_symbols: repair,
+            max_repair_symbols: repair,
+            min_repair_ratio: 0.0,
+            max_repair_ratio: 0.0,
+            symbol_size: if matches!(priority, MediaPriority::Audio) {
+                1_200
+            } else {
+                400
+            },
+            ..AdaptiveFecPolicy::default()
+        };
+        let encoded = RaptorQObjectEncoder::new(
+            AdaptiveFecController::new(policy, CongestionConfig::default()),
+            RelayLimits::default(),
+        )
+        .expect("encoder")
+        .encode_object(
+            object,
+            generation(),
+            subscription(),
+            MediaDeadline::from_micros(deadline_us),
+            priority,
+        )
+        .expect("symbols");
+        let wire = |symbols: &[relay_session::RelayDatagram]| {
+            symbols
+                .iter()
+                .map(|symbol| encode_datagram(symbol, RelayLimits::default()).expect("wire"))
+                .collect::<Vec<_>>()
+        };
+        (wire(&encoded.source_symbols), wire(&encoded.repair_symbols))
+    }
+
+    fn decoded(outcome: Result<RelayUdpDispatchOutcome, RelayIngressError>) -> bool {
+        match outcome.expect("admitted") {
+            RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Decoded { .. }) => true,
+            RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Buffered { .. }) => false,
+            outcome => panic!("unexpected outcome: {outcome:?}"),
+        }
+    }
+
+    fn is_duplicate(outcome: Result<RelayUdpDispatchOutcome, RelayIngressError>) -> bool {
+        matches!(
+            outcome,
+            Ok(RelayUdpDispatchOutcome::Relay(
+                RelayIngressOutcome::Duplicate { .. }
+            ))
+        )
+    }
+
+    const FAR_DEADLINE_US: u64 = 4_000_000_000_000_000;
+
+    /// Two contributors at a first forwarder (and the two parents of an
+    /// edge) are both promoted sessions: the symbols of one object may come
+    /// first from either.
+    #[test]
+    fn two_promoted_sessions_assemble_one_object() {
+        let (mut dispatch, peers) = dispatch_with(&[ParentPath::PromotedSecondary; 2]);
+        let object = fmp4_object(42, 12_000);
+        let (sources, _) = wire_symbols(&object, FAR_DEADLINE_US, MediaPriority::VideoKey, 1);
+        assert!(sources.len() > 20);
+        let mut complete = false;
+        for (index, symbol) in sources.iter().enumerate() {
+            assert!(!complete);
+            complete = match dispatch
+                .push(peers[index % 2], symbol, 1_000)
+                .expect("a symbol of either session")
+            {
+                RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Decoded {
+                    object: received,
+                    parent_count,
+                    accepted_datagrams,
+                    ..
+                }) => {
+                    assert_eq!(*received, object);
+                    assert_eq!(parent_count, 2);
+                    assert_eq!(accepted_datagrams, sources.len());
+                    true
+                }
+                RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Buffered { .. }) => false,
+                outcome => panic!("unexpected outcome: {outcome:?}"),
+            };
+        }
+        assert!(complete);
+        // The same symbol from the other session is a duplicate, before and
+        // after the object completes.
+        assert!(is_duplicate(dispatch.push(peers[1], &sources[0], 1_000)));
+        let counters = dispatch.receiver().snapshot().counters;
+        assert_eq!(counters.datagrams_rejected, 0);
+        assert_eq!(counters.rejected_by_kind, RejectedByKind::default());
+    }
+
+    #[test]
+    fn the_copy_of_a_whole_part_may_come_from_the_other_session() {
+        let (mut dispatch, peers) = dispatch_with(&[ParentPath::PromotedSecondary; 2]);
+        let part = opaque_audio(42);
+        let (sources, copies) = wire_symbols(&part, FAR_DEADLINE_US, MediaPriority::Audio, 2);
+        assert_eq!(sources.len(), 1, "a one-symbol part");
+        assert!(decoded(dispatch.push(peers[0], &sources[0], 1_000)));
+        // The other contributor's source, and its copies of the part.
+        assert!(is_duplicate(dispatch.push(peers[1], &sources[0], 1_000)));
+        for copy in &copies {
+            assert!(is_duplicate(dispatch.push(peers[1], copy, 1_000)));
+        }
+        let counters = dispatch.receiver().snapshot().counters;
+        assert_eq!(counters.decoded_objects, 1);
+        assert_eq!(counters.duplicate_datagrams, 3);
+        assert_eq!(counters.datagrams_rejected, 0);
+    }
+
+    /// An edge's two lease parents are both promoted. The primary sends a
+    /// video object in full and one source symbol is lost; the secondary
+    /// sends repair. The edge's tee rebuilds the object from both (it used
+    /// to reject every symbol of the second parent).
+    #[test]
+    fn an_edge_decodes_a_video_object_from_its_second_parents_repair() {
+        let (mut dispatch, peers) = dispatch_with(&[ParentPath::PromotedSecondary; 2]);
+        let object = fmp4_object(7, 12_000);
+        let (sources, repair) = wire_symbols(&object, FAR_DEADLINE_US, MediaPriority::VideoKey, 4);
+        for (index, symbol) in sources.iter().enumerate() {
+            if index == 3 {
+                continue;
+            }
+            assert!(!decoded(dispatch.push(peers[0], symbol, 1_000)));
+        }
+        let mut complete = false;
+        for symbol in &repair {
+            if complete {
+                assert!(is_duplicate(dispatch.push(peers[1], symbol, 1_100)));
+            } else {
+                complete = decoded(dispatch.push(peers[1], symbol, 1_100));
+            }
+        }
+        assert!(complete, "the second parent's repair completes the object");
+        let counters = dispatch.receiver().snapshot().counters;
+        assert_eq!(counters.fec_recovered_objects, 1);
+        assert_eq!(counters.fec_recovered_source_symbols, 1);
+        assert_eq!(counters.repair_assisted_objects, 1);
+        assert_eq!(counters.datagrams_rejected, 0);
+        assert_eq!(counters.rejected_by_kind, RejectedByKind::default());
+    }
+
+    /// A ranked parent is a third promoted session; four parents may bring
+    /// symbols of one object, and a fifth is refused and counted by kind.
+    #[test]
+    fn a_third_promoted_parent_joins() {
+        let (mut dispatch, peers) = dispatch_with(&[ParentPath::PromotedSecondary; 5]);
+        let object = fmp4_object(9, 12_000);
+        let (sources, _) = wire_symbols(&object, FAR_DEADLINE_US, MediaPriority::VideoKey, 1);
+        for (index, symbol) in sources.iter().take(4).enumerate() {
+            assert!(!decoded(dispatch.push(peers[index], symbol, 1_000)));
+        }
+        assert!(matches!(
+            dispatch.push(peers[4], &sources[4], 1_000),
+            Err(RelayIngressError::ParentLimitExceeded)
+        ));
+        let mut parents = 0;
+        for (index, symbol) in sources.iter().enumerate().skip(4) {
+            if let RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Decoded {
+                parent_count,
+                ..
+            }) = dispatch
+                .push(peers[index % 3], symbol, 1_000)
+                .expect("a symbol of an admitted parent")
+            {
+                parents = parent_count;
+            }
+        }
+        assert_eq!(parents, 4);
+        let counters = dispatch.receiver().snapshot().counters;
+        assert_eq!(counters.datagrams_rejected, 1);
+        assert_eq!(
+            counters
+                .rejected_by_kind
+                .get(RejectionKind::ParentLimitExceeded),
+            1
+        );
+        assert_eq!(RejectionKind::ParentLimitExceeded.as_str(), "parent_limit_exceeded");
+    }
+
+    #[test]
+    fn two_primaries_still_conflict() {
+        let object = fmp4_object(11, 4_000);
+        let (sources, repair) = wire_symbols(&object, FAR_DEADLINE_US, MediaPriority::VideoKey, 2);
+        // Two sessions on the primary path.
+        let (mut dispatch, peers) = dispatch_with(&[ParentPath::Primary; 2]);
+        assert!(!decoded(dispatch.push(peers[0], &sources[0], 1_000)));
+        assert!(matches!(
+            dispatch.push(peers[1], &sources[1], 1_000),
+            Err(RelayIngressError::ParentRoleConflict)
+        ));
+        // Two on the repair path.
+        let (mut dispatch, peers) = dispatch_with(&[
+            ParentPath::Primary,
+            ParentPath::Secondary,
+            ParentPath::Secondary,
+        ]);
+        assert!(!decoded(dispatch.push(peers[0], &sources[0], 1_000)));
+        assert!(!decoded(dispatch.push(peers[1], &repair[0], 1_000)));
+        assert!(matches!(
+            dispatch.push(peers[2], &repair[1], 1_000),
+            Err(RelayIngressError::ParentRoleConflict)
+        ));
+        let counters = dispatch.receiver().snapshot().counters;
+        assert_eq!(
+            counters
+                .rejected_by_kind
+                .get(RejectionKind::ParentRoleConflict),
+            1
+        );
+        // A promoted session beside a primary is no conflict.
+        let (mut dispatch, peers) =
+            dispatch_with(&[ParentPath::Primary, ParentPath::PromotedSecondary]);
+        assert!(!decoded(dispatch.push(peers[0], &sources[0], 1_000)));
+        assert!(!decoded(dispatch.push(peers[1], &sources[1], 1_000)));
+    }
+
+    #[test]
+    fn a_part_seen_whole_is_not_decoded_again_compact() {
+        let (mut dispatch, peers) = dispatch_with(&[ParentPath::PromotedSecondary; 2]);
+        let part = opaque_audio(42);
+        let (sources, _) = wire_symbols(&part, FAR_DEADLINE_US, MediaPriority::Audio, 0);
+        let mut complete = false;
+        for symbol in &sources {
+            complete = decoded(dispatch.push(peers[0], symbol, 1_000));
+        }
+        assert!(complete);
+        // The other contributor sent the same part compact.
+        for (role, sequence) in [(0, 1), (1, 2)] {
+            let compact = compact_wire(&part, role, subscription().get(), sequence);
+            let Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Duplicate {
+                key, ..
+            })) = dispatch.push(peers[1], &compact, 1_000)
+            else {
+                panic!("the compact copy of a whole part is a duplicate");
+            };
+            assert_eq!((key.stream(), key.object()), ("3001", 42));
+        }
+        let counters = dispatch.receiver().snapshot().counters;
+        assert_eq!(counters.decoded_objects, 1);
+        assert_eq!(counters.compact_decoded_objects, 0);
+        assert_eq!(counters.duplicate_datagrams, 2);
+        assert_eq!(counters.datagrams_rejected, 0);
+    }
+
+    #[test]
+    fn a_part_seen_compact_is_not_decoded_again_whole() {
+        let (mut dispatch, peers) = dispatch_with(&[ParentPath::PromotedSecondary; 2]);
+        // A whole part teaches the descriptor.
+        for symbol in &wire_symbols(&opaque_audio(41), FAR_DEADLINE_US, MediaPriority::Audio, 0).0 {
+            dispatch.push(peers[0], symbol, 1_000).expect("whole part");
+        }
+        let part = opaque_audio(42);
+        let compact = compact_wire(&part, 0, subscription().get(), 1);
+        assert!(decoded(dispatch.push(peers[0], &compact, 1_000)));
+        // The other contributor sent part 42 whole (its first part after a
+        // restart): every symbol and copy is a duplicate, and no assembly
+        // is opened for it.
+        let (sources, copies) = wire_symbols(&part, FAR_DEADLINE_US, MediaPriority::Audio, 2);
+        for symbol in sources.iter().chain(&copies) {
+            assert!(is_duplicate(dispatch.push(peers[1], symbol, 1_000)));
+        }
+        assert_eq!(dispatch.receiver().state().active_objects, 0);
+        let counters = dispatch.receiver().snapshot().counters;
+        assert_eq!(counters.decoded_objects, 2);
+        assert_eq!(counters.compact_decoded_objects, 1);
+        assert_eq!(counters.datagrams_rejected, 0);
+        // Other bytes under the number of a part that came compact are a
+        // conflict, as they are against a whole part.
+        let mut other = opaque_audio(43);
+        let compact = compact_wire(&other, 0, subscription().get(), 5);
+        assert!(decoded(dispatch.push(peers[0], &compact, 1_000)));
+        other = MediaObject::builder(
+            ObjectKey::for_payload(
+                "default",
+                "3001",
+                "opaque-audio",
+                other.key().epoch(),
+                0,
+                43,
+                1,
+                b"other bytes",
+            )
+            .expect("key"),
+            ObjectKind::Media,
+            b"other bytes".to_vec(),
+        )
+        .build()
+        .expect("object");
+        let (conflicting, _) = wire_symbols(&other, FAR_DEADLINE_US, MediaPriority::Audio, 0);
+        assert!(matches!(
+            dispatch.push(peers[1], &conflicting[0], 1_000),
+            Err(RelayIngressError::ObjectIdentityConflict)
+        ));
+    }
+
+    /// The published time of `opaque_audio(sequence)`, in µs.
+    fn opaque_published_us(sequence: u64) -> u64 {
+        1_763_812_345_000_000 + sequence * 1_000
+    }
+
+    /// A stream that arrives late as a whole (a source clock behind this
+    /// node's, a paused DAW, a slow path) is taken, not shed: a deadline is
+    /// a point on the stream's timeline.
+    #[test]
+    fn a_stream_behind_the_wall_clock_is_not_expired() {
+        let (mut dispatch, peers) = dispatch_with(&[ParentPath::PromotedSecondary; 2]);
+        let hour_us = 3_600_000_000;
+        for sequence in 0..50 {
+            let part = opaque_audio(sequence);
+            let published_us = opaque_published_us(sequence);
+            let now_us = published_us + hour_us;
+            let (sources, _) =
+                wire_symbols(&part, published_us + 1_000_000, MediaPriority::Audio, 0);
+            let mut complete = false;
+            for symbol in &sources {
+                complete = decoded(dispatch.push(peers[0], symbol, now_us));
+            }
+            assert!(complete, "part {sequence} is an hour late and is taken");
+        }
+        let counters = dispatch.receiver().snapshot().counters;
+        assert_eq!(counters.decoded_objects, 50);
+        assert_eq!(counters.deadline_drops, 0);
+        assert_eq!(counters.datagrams_rejected, 0);
+        // What a wall-clock deadline would have shed is counted.
+        assert_eq!(counters.wall_late_parts, 50);
+        assert_eq!(counters.wall_late_max_us, hour_us);
+    }
+
+    #[test]
+    fn a_part_a_budget_behind_the_head_is_dropped() {
+        let (mut dispatch, peers) = dispatch_with(&[ParentPath::PromotedSecondary; 2]);
+        let budget_us = dispatch.receiver().config().media_deadline_us;
+        assert_eq!(budget_us, 1_000_000);
+        let push = |dispatch: &mut RelayUdpDispatch, sequence: u64, peer: usize| {
+            let published_us = opaque_published_us(sequence);
+            let (sources, _) = wire_symbols(
+                &opaque_audio(sequence),
+                published_us + budget_us,
+                MediaPriority::Audio,
+                0,
+            );
+            // This node's clock is in step with the stream: nothing is
+            // late by the wall clock.
+            dispatch.push(peers[peer], &sources[0], published_us + 2_000)
+        };
+        // The first part that decodes starts the stream's clock; the next
+        // parts move its head.
+        assert!(decoded(push(&mut dispatch, 0, 0)));
+        assert!(decoded(push(&mut dispatch, 1, 0)));
+        // 400 ms of parts lost, then the stream goes on: the head follows
+        // in steps of half a budget at most.
+        for sequence in [400, 800, 1_200, 1_600, 2_000, 2_400, 2_800, 3_000] {
+            assert!(decoded(push(&mut dispatch, sequence, 0)), "part {sequence}");
+        }
+        // Half a second behind the head: taken (a repair, the other
+        // contributor). A budget behind, or more: dropped, from either
+        // session.
+        assert!(decoded(push(&mut dispatch, 2_500, 1)));
+        assert!(decoded(push(&mut dispatch, 2_001, 1)));
+        for (sequence, peer) in [(2_000 - 1, 0), (1_500, 1), (2, 1)] {
+            assert!(
+                matches!(
+                    push(&mut dispatch, sequence, peer),
+                    Err(RelayIngressError::DeadlineExpired)
+                ),
+                "part {sequence}"
+            );
+        }
+        let counters = dispatch.receiver().snapshot().counters;
+        assert_eq!(counters.deadline_drops, 3);
+        assert_eq!(counters.datagrams_rejected, 3);
+        assert_eq!(counters.rejected_by_kind.get(RejectionKind::StaleMedia), 3);
+        assert_eq!(counters.wall_late_parts, 0);
+        assert_eq!(dispatch.receiver().state().active_objects, 0);
+    }
+
+    /// An assembly that waits for symbols ends when its stream's head has
+    /// passed it by the budget, whatever this node's clock says.
+    #[test]
+    fn an_open_assembly_ends_when_the_head_passes_it() {
+        let (mut dispatch, peers) = dispatch_with(&[ParentPath::PromotedSecondary; 2]);
+        let base_us = 1_000_000_000;
+        let (first, _) = wire_symbols(&fmp4_object(0, 4_000), base_us, MediaPriority::VideoKey, 0);
+        let mut complete = false;
+        for symbol in &first {
+            complete = decoded(dispatch.push(peers[0], symbol, 5));
+        }
+        assert!(complete);
+        // One symbol of the next object comes; the rest is lost.
+        let (held, _) =
+            wire_symbols(&fmp4_object(1, 4_000), base_us + 40_000, MediaPriority::VideoKey, 0);
+        assert!(!decoded(dispatch.push(peers[0], &held[0], 6)));
+        assert_eq!(dispatch.receiver().state().active_objects, 1);
+        // The stream goes on for 900 ms: the assembly still waits.
+        let (later, _) =
+            wire_symbols(&fmp4_object(2, 4_000), base_us + 940_000, MediaPriority::VideoKey, 0);
+        for symbol in &later {
+            dispatch.push(peers[0], symbol, 7).expect("later object");
+        }
+        assert_eq!(dispatch.receiver_mut().expire(8).objects, 0);
+        assert!(!decoded(dispatch.push(peers[1], &held[1], 9)));
+        // A budget past its deadline it ends, and its late symbols are
+        // dropped.
+        let (latest, _) =
+            wire_symbols(&fmp4_object(3, 4_000), base_us + 1_040_000, MediaPriority::VideoKey, 0);
+        for symbol in &latest {
+            dispatch.push(peers[0], symbol, 10).expect("latest object");
+        }
+        let expiry = dispatch.receiver_mut().expire(11);
+        assert_eq!(expiry.objects, 1);
+        assert_eq!(expiry.released_datagrams, 2);
+        assert_eq!(dispatch.receiver().state().active_objects, 0);
+        assert!(matches!(
+            dispatch.push(peers[1], &held[2], 12),
+            Err(RelayIngressError::DeadlineExpired)
+        ));
+        assert_eq!(dispatch.receiver().state().active_objects, 0);
+        let counters = dispatch.receiver().snapshot().counters;
+        assert_eq!(counters.expired_objects, 1);
+        assert_eq!(counters.deadline_drops, 1);
+    }
+
+    /// Only an object that decodes moves a stream to a later epoch; what
+    /// then comes of the epoch before is refused and counted, and nothing
+    /// of the new epoch is dropped for it.
+    #[test]
+    fn a_datagram_of_an_epoch_its_stream_left_is_refused() {
+        let (mut dispatch, peers) = dispatch_with(&[ParentPath::PromotedSecondary; 2]);
+        let symbols = |epoch: u64, sequence: u64, deadline_us: u64| {
+            wire_symbols(
+                &fmp4_object_of_epoch(epoch, sequence, 1_500),
+                deadline_us,
+                MediaPriority::VideoKey,
+                0,
+            )
+            .0
+        };
+        let old = symbols(41, 0, 9_000_000_000);
+        for symbol in &old {
+            dispatch.push(peers[0], symbol, 1).expect("the first epoch");
+        }
+        // A symbol that claims a later epoch does not retire the running
+        // one: an object of the running epoch still decodes.
+        let new = symbols(42, 0, 1_000_000);
+        assert!(!decoded(dispatch.push(peers[1], &new[0], 2)));
+        let mut complete = false;
+        for symbol in &symbols(41, 1, 9_000_040_000) {
+            complete = decoded(dispatch.push(peers[0], symbol, 3));
+        }
+        assert!(complete);
+        // The new epoch's object decodes (its deadlines start lower: a new
+        // session of the source). The stream has left epoch 41.
+        for symbol in &new[1..] {
+            complete = decoded(dispatch.push(peers[1], symbol, 4));
+        }
+        assert!(complete);
+        let stale = symbols(41, 2, 9_000_080_000);
+        assert!(matches!(
+            dispatch.push(peers[0], &stale[0], 5),
+            Err(RelayIngressError::StaleEpoch)
+        ));
+        let mut complete = false;
+        for symbol in &symbols(42, 1, 1_040_000) {
+            complete = decoded(dispatch.push(peers[1], symbol, 6));
+        }
+        assert!(complete);
+        let counters = dispatch.receiver().snapshot().counters;
+        assert_eq!(counters.rejected_by_kind.get(RejectionKind::StaleEpoch), 1);
+        assert_eq!(counters.deadline_drops, 0);
+        assert_eq!(counters.datagrams_rejected, 1);
+        assert_eq!(dispatch.receiver().state().active_objects, 0);
     }
 }

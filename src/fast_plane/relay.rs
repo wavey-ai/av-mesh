@@ -1909,7 +1909,8 @@ impl Tee {
             Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Duplicate { key, .. })) => {
                 journal_forward(&key);
             }
-            Ok(RelayUdpDispatchOutcome::Legacy) | Err(RelayIngressError::DeadlineExpired) => {}
+            Ok(RelayUdpDispatchOutcome::Legacy)
+            | Err(RelayIngressError::DeadlineExpired | RelayIngressError::StaleEpoch) => {}
             Err(error) => {
                 warn!(
                     %peer,

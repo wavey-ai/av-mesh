@@ -7844,9 +7844,10 @@ async fn process_udp_fec_ingest_datagram_inner(
                 decoded: false,
             }));
         }
-        Err(RelayIngressError::DeadlineExpired) => {
-            // This is an expected overload/late-arrival outcome and is already
-            // counted in RelayIngressCounters::deadline_drops. Logging every
+        Err(RelayIngressError::DeadlineExpired | RelayIngressError::StaleEpoch) => {
+            // This is an expected outcome (a sender that was frozen, the tail
+            // of a session that has ended) and is already counted in
+            // RelayIngressCounters (deadline_drops, rejected_by_kind). Logging every
             // expired symbol here would add synchronous work to the UDP receive
             // loop precisely when ingress is behind; the receive loop reports
             // one aggregate warning per expiry tick instead.
@@ -40248,8 +40249,11 @@ mod tests {
         relay.stop().await;
     }
 
+    /// A deadline is a point on the stream's timeline: a stream whose
+    /// deadlines are behind this node's wall clock (a source clock that is
+    /// behind, a paused DAW, a slow path) is forwarded and committed.
     #[tokio::test]
-    async fn fast_plane_forwards_a_symbol_past_its_deadline() {
+    async fn fast_plane_forwards_and_commits_a_stream_behind_the_wall_clock() {
         let (child, _) = bind_class_pair(1_000).await;
         let relay = start_fast_relay(
             1_000,
@@ -40268,14 +40272,8 @@ mod tests {
         }
         let received = receive_all(&child, symbols.len()).await;
         assert_eq!(received.len(), symbols.len());
-        // The tee still bounds its receive state by the deadline.
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while relay.cache.relay_ingress_snapshot().deadline_drops == 0 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
+        wait_for_part(&relay.cache, 4001, 3).await;
+        assert_eq!(relay.cache.relay_ingress_snapshot().deadline_drops, 0);
         relay.stop().await;
     }
 
