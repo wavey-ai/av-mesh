@@ -2105,7 +2105,12 @@ async fn playout_floor(
 /// another edge names the part that it needs next: it resumes there if the
 /// part is still in the window, and otherwise at the newest part. A part
 /// past the playout deadline is not worth sending: it resumes at the oldest
-/// part within it (`playout_floor`).
+/// part within it (`playout_floor`). A mover whose part is ahead of this
+/// edge's copy (a copy that lags, or one taken again after a drain) starts
+/// at its part, which the copy will bring, never at an older one that it
+/// has played (wave 9 C1: a resumed edge sent a rebalanced listener its
+/// stale head, 30 s old); one further ahead than the window is refused
+/// before this (`mover_ahead_of_copy`).
 fn first_part_for(
     from_part: Option<u64>,
     head: u64,
@@ -2116,8 +2121,16 @@ fn first_part_for(
         Some(part) if part <= head.saturating_add(1) && head.saturating_sub(part) < window => {
             playout_floor.map_or(part, |floor| part.max(floor))
         }
+        Some(part) if part > head && part - head <= window => part,
         _ => head,
     }
+}
+
+/// A client moving here names a part further ahead of this edge's copy
+/// than its window: the copy is stale (an edge resumed after a drain whose
+/// copy is not back yet). It is refused (`stale-copy`) and asks another.
+fn mover_ahead_of_copy(from_part: Option<u64>, head: u64, window: u64) -> bool {
+    from_part.is_some_and(|part| part > head.saturating_add(window.max(1)))
 }
 
 /// How far a hole at `part` lies behind the head, in time: from the parts'
@@ -2273,6 +2286,19 @@ async fn admit(
         return;
     };
     let window = router.cache.window_parts_for(stream_id).await as u64;
+    if mover_ahead_of_copy(from_part, head, window) {
+        stats.refusals.fetch_add(1, Ordering::Relaxed);
+        send_control(
+            &socket,
+            peer,
+            &Control::Refused {
+                stream_id,
+                reason: "stale-copy".into(),
+            },
+        )
+        .await;
+        return;
+    }
     let floor = playout_floor(
         &router,
         config,
@@ -4548,6 +4574,14 @@ mod tests {
         assert_eq!(first_part_for(None, 1_500, 2_400, floor), 1_500);
         // Out of the window: the newest part, as before.
         assert_eq!(first_part_for(Some(10), 5_000, 2_400, floor), 5_000);
+        // Wave 9 C1: a mover ahead of a lagging copy starts at its part,
+        // never at the older head; one further ahead than the window (a
+        // stale copy) is refused.
+        assert_eq!(first_part_for(Some(1_600), 1_500, 2_400, floor), 1_600);
+        assert!(!mover_ahead_of_copy(Some(1_600), 1_500, 2_400));
+        assert!(mover_ahead_of_copy(Some(66_000), 36_000, 2_400));
+        assert!(!mover_ahead_of_copy(None, 36_000, 2_400));
+        assert!(!mover_ahead_of_copy(Some(1_000), 1_500, 2_400));
     }
 
     /// With no send queue a part is never completed inline, whatever its

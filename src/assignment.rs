@@ -145,6 +145,10 @@ pub struct AssignmentRequest<'a> {
     /// Movers that this entry point placed lately, per cache (wave 9 C4):
     /// a mover is apportioned against them.
     pub recent_moves: &'a [(String, u32)],
+    /// The mover left an edge that is live, not draining and over the
+    /// rebalance target (`MOVE rebalance`, wave 9 C1): only the caches under
+    /// the target take it while one can.
+    pub rebalancing: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -272,9 +276,13 @@ pub fn assign(
         .map(|cache| {
             let load = cache.effective_load_permille();
             let tier = if moving {
-                // Wave 9 C4: by headroom alone, under the rebalance target
-                // first (a mover never goes to an edge that would shed it).
-                u8::from(cache.load_permille >= policy.rebalance_target_permille)
+                // Wave 9 C4: by headroom alone; a listener that an edge
+                // over its target sent away goes under the target first
+                // (never to an edge that would shed it again).
+                u8::from(
+                    request.rebalancing
+                        && cache.load_permille >= policy.rebalance_target_permille,
+                )
             } else if cache.holds_playlist() && load < policy.spread_permille {
                 0_u8
             } else if !cache.holds_playlist() && load < policy.spread_permille {
@@ -568,8 +576,8 @@ mod tests {
     /// Wave 9 C4: the movers of a drained edge spread over the survivors
     /// in proportion to their headroom (the spread tiers sent them all to
     /// the survivors under 60 %), apportioned against the movers placed
-    /// before them, and a survivor over the rebalance target takes none
-    /// while one under it has room.
+    /// before them; a rebalanced listener goes to none over the rebalance
+    /// target while one under it has room.
     #[test]
     fn movers_spread_over_the_survivors_by_headroom() {
         let caches = [
@@ -614,11 +622,32 @@ mod tests {
         };
         let moved = place(&caches, off, 36);
         assert!(!moved.contains_key("edge-3"), "{moved:?}");
-        // Over the rebalance target: none while a cache under it has room.
+        // A drain's movers go to a survivor over the rebalance target by
+        // its headroom too (850: 150 of 1,060, 5 of 36)...
         let mut over = caches.clone();
         over[1].load_permille = 850;
         let moved = place(&over, AssignmentPolicy::default(), 36);
-        assert!(!moved.contains_key("edge-3"), "{moved:?}");
+        assert!((4..=6).contains(&moved["edge-3"]), "{moved:?}");
+        // ...but a listener that an edge over the target sent away goes
+        // only under the target while a cache there has room.
+        let mut placed: Vec<(String, u32)> = Vec::new();
+        for index in 0..36 {
+            let session = format!("rebalanced-{index}");
+            let request = AssignmentRequest {
+                moving: true,
+                rebalancing: true,
+                recent_moves: &placed,
+                ..request(&session)
+            };
+            let first = assign(request, AssignmentPolicy::default(), &over).unwrap().caches[0]
+                .node_id
+                .clone();
+            assert_ne!(first, "edge-3");
+            match placed.iter_mut().find(|(node_id, _)| *node_id == first) {
+                Some(entry) => entry.1 += 1,
+                None => placed.push((first, 1)),
+            }
+        }
         // Every cache over the target: still assigned, by headroom.
         let all_over = [
             cache("edge-2", 900, Some(900)),
@@ -810,6 +839,7 @@ mod tests {
             playlist_bps: None,
             moving: false,
             recent_moves: &[],
+            rebalancing: false,
         }
     }
 

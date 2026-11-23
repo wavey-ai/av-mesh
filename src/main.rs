@@ -19256,6 +19256,13 @@ impl AppRouter {
         counts
     }
 
+    /// Wave 9 C1: an advertisement this recent counts for a rebalance (a
+    /// receiver, a rebalanced listener's cache): one interval, where the
+    /// assignment allows three.
+    fn recent_advert_ms(&self) -> u64 {
+        (self.assignment_fresh_ms / 3).max(1_000)
+    }
+
     /// Wave 9 C1: rebalance this edge's UDP listeners (`None`: never).
     fn with_rebalance(mut self, rebalance: Option<RebalanceConfig>) -> Self {
         self.rebalance = rebalance;
@@ -19329,7 +19336,7 @@ impl AppRouter {
                     && snapshot.node.region == self.node.region
                     && !snapshot.node.draining
                     && self.telemetry.advertisement_age_ms(snapshot, now_ms)
-                        <= self.assignment_fresh_ms
+                        <= self.recent_advert_ms()
             })
             .filter_map(|snapshot| {
                 let edge = snapshot.edge_service.as_ref()?;
@@ -20189,6 +20196,11 @@ impl AppRouter {
         remember: bool,
     ) -> (Result<Assignment, AssignmentError>, Vec<CacheCandidate>) {
         let mut candidates = self.cache_candidates(reader.stream_id).await;
+        let candidates_all = if reader.skip.is_empty() {
+            Vec::new()
+        } else {
+            candidates.clone()
+        };
         if !reader.skip.is_empty() {
             candidates = without_skipped(candidates, reader.skip, &self.node.region);
         }
@@ -20204,6 +20216,15 @@ impl AppRouter {
             .filter(|entry| now_ms.saturating_sub(entry.1) < REMEMBERED_ASSIGNMENT_MS)
             .map(|entry| entry.0.clone());
         let moving = reader.udp && !reader.skip.is_empty() && reader.current.is_none();
+        // Wave 9 C1: it left a live edge over its target (a rebalance), not
+        // a draining or lost one.
+        let rebalancing = moving
+            && candidates_all.iter().any(|cache| {
+                reader.skip.iter().any(|name| *name == cache.node_id)
+                    && cache.fresh
+                    && !cache.draining
+                    && cache.load_permille >= self.assignment_policy.rebalance_target_permille
+            });
         // Wave 9 C4: the movers this entry point placed lately, per cache.
         let recent_moves = if moving {
             self.recent_movers(Instant::now())
@@ -20218,6 +20239,34 @@ impl AppRouter {
             playlist_bps,
             moving,
             recent_moves: &recent_moves,
+            rebalancing,
+        };
+        // A rebalanced listener goes only to a cache heard of lately (one
+        // advertisement interval, not the assignment's three): an edge that
+        // has just died still looks fresh, and empty, for a few seconds.
+        let recent_only;
+        let candidates = if rebalancing {
+            let snapshots = self.regional_snapshots().await;
+            let heard = self.recent_advert_ms();
+            let now = now_unix_ms();
+            recent_only = candidates
+                .iter()
+                .filter(|cache| {
+                    cache.node_id == self.node.node_id
+                        || snapshots.iter().any(|snapshot| {
+                            snapshot.node.node_id == cache.node_id
+                                && self.telemetry.advertisement_age_ms(snapshot, now) <= heard
+                        })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if recent_only.is_empty() {
+                candidates
+            } else {
+                recent_only
+            }
+        } else {
+            candidates
         };
         let assignment = match assign(request, self.assignment_policy, &candidates) {
             Err(AssignmentError::NoCacheAvailable)
@@ -20308,6 +20357,7 @@ impl AppRouter {
                 playlist_bps,
                 moving: false,
                 recent_moves: &[],
+                rebalancing: false,
             },
             policy,
             &candidates,
