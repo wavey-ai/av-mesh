@@ -117,9 +117,7 @@ pub struct RelayClassConfig {
     /// `sys::enable_gro`).
     pub video_gro: bool,
     /// `--relay-media-deadline-ms` in µs (A 2.5): a datagram whose deadline
-    /// is this far behind the head of its stream's timeline here is stale,
-    /// and a source held back from a warm child is kept this long from its
-    /// receipt.
+    /// is this far behind the head of its stream's timeline here is stale.
     pub media_deadline_us: u64,
     /// Tests: the tee of this class panics on its first datagram.
     #[cfg(test)]
@@ -722,9 +720,7 @@ struct PlannedWarm {
     message: u16,
     path: u16,
     object: u64,
-    /// How long it is kept from its receipt, on this node's clock: its wire
-    /// deadline is a point on its stream's timeline and says nothing here.
-    hold_us: u64,
+    expires_at_us: u64,
 }
 
 /// A send to a lease child: `child` indexes the snapshot's children.
@@ -774,9 +770,7 @@ impl ForwardPlan {
 }
 
 /// Plan the sends of one admitted symbol to the lease children of its
-/// stream, by the lane rule. A video source held back from a repair-only
-/// child is kept for `hold_us`.
-#[allow(clippy::too_many_arguments)]
+/// stream, by the lane rule.
 fn plan_lease(
     snapshot: &LeaseSnapshot,
     class: TrafficClass,
@@ -784,7 +778,6 @@ fn plan_lease(
     view: &RlsView<'_>,
     plan: &mut ForwardPlan,
     now_us: u64,
-    hold_us: u64,
 ) {
     let mut object = None;
     let Some((children, fed_us)) = snapshot.children_and_clock_of(view.stream) else {
@@ -804,7 +797,7 @@ fn plan_lease(
                 message: message as u16,
                 path: child,
                 object: *object.get_or_insert_with(|| view_object_id(view)),
-                hold_us,
+                expires_at_us: view.deadline_us,
             }),
         }
     }
@@ -915,7 +908,7 @@ fn send_lease_plan(
         lease.buffer_warm(
             &snapshot.children[usize::from(warm.path)],
             warm.object,
-            now_us.saturating_add(warm.hold_us),
+            warm.expires_at_us,
             batch.data(usize::from(warm.message)),
             now_us,
         );
@@ -940,16 +933,8 @@ impl RelayDownstreamForwarder {
     /// Plan the sends of one admitted symbol: every path whose lane takes
     /// its role, in compiled order. A source symbol held back from a warm
     /// repair-only child is noted, and kept for a later promotion only once
-    /// the batch is sent (`buffer_fast_warm`), as `forward` keeps it, for
-    /// `hold_us` from its receipt.
-    fn plan_fast(
-        &self,
-        message: usize,
-        view: &RlsView<'_>,
-        plan: &mut ForwardPlan,
-        now: Instant,
-        hold_us: u64,
-    ) {
+    /// the batch is sent (`buffer_fast_warm`), as `forward` keeps it.
+    fn plan_fast(&self, message: usize, view: &RlsView<'_>, plan: &mut ForwardPlan, now: Instant) {
         let role = view.role;
         let mut object = None;
         // Renditions that a child's subtree does not read stay off its lane
@@ -994,7 +979,7 @@ impl RelayDownstreamForwarder {
                     message: message as u16,
                     path: index as u16,
                     object: *object.get_or_insert_with(|| view_object_id(view)),
-                    hold_us,
+                    expires_at_us: view.deadline_us,
                 });
             }
             self.filtered_datagrams.fetch_add(1, Ordering::Relaxed);
@@ -1015,7 +1000,7 @@ impl RelayDownstreamForwarder {
                 &self.paths[usize::from(warm.path)],
                 class,
                 warm.object,
-                now_us.saturating_add(warm.hold_us),
+                warm.expires_at_us,
                 batch.data(usize::from(warm.message)),
                 now_us,
             );
@@ -1531,6 +1516,9 @@ impl ClassThread {
         }
         self.stats.media_clock_overflow[self.class.index()]
             .store(clocks.overflow(), Ordering::Relaxed);
+        self.stats
+            .media_clock_unrecorded
+            .store(self.epochs.unrecorded(), Ordering::Relaxed);
     }
 
     /// Send every relay parent this node's demand, from each audio socket:
@@ -1764,7 +1752,7 @@ impl ClassThread {
                 }
             }
             if let Some(forwarder) = &self.forwarder {
-                forwarder.plan_fast(message, &view, plan, now, self.media_deadline_us);
+                forwarder.plan_fast(message, &view, plan, now);
             }
             if let (Some(descriptors), Some((children, snapshot))) =
                 (descriptors.as_deref_mut(), &descriptor_lease)
@@ -1780,15 +1768,7 @@ impl ClassThread {
                 );
             }
             if let Some((_, snapshot)) = &lease {
-                plan_lease(
-                    snapshot,
-                    class,
-                    message,
-                    &view,
-                    plan,
-                    now_us,
-                    self.media_deadline_us,
-                );
+                plan_lease(snapshot, class, message, &view, plan, now_us);
             }
             if let Some((lane, snapshot)) = &edge_clients {
                 clients.plan(lane, snapshot, message, &view);
