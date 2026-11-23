@@ -164,6 +164,11 @@ pub(crate) struct EdgeUdpConfig {
     /// (`--client-udp-admit-by-load`, Phase AM item 8; `false`: only
     /// `--client-udp-max-subscribers` refuses, as before).
     pub admit_by_load: bool,
+    /// A draining edge sends its subscribers `MOVE draining` spread over
+    /// this long, a share at each tick, not all of them at once
+    /// (`--client-udp-drain-spread-ms`, Phase AM item 9; zero: all at the
+    /// first housekeeping tick, as before).
+    pub drain_spread: Duration,
 }
 
 impl EdgeUdpConfig {
@@ -189,9 +194,13 @@ impl EdgeUdpConfig {
             resume_from_request: true,
             nack_edge_rate: DEFAULT_NACK_EDGE_RATE,
             admit_by_load: true,
+            drain_spread: Duration::from_millis(DEFAULT_DRAIN_SPREAD_MS),
         }
     }
 }
+
+/// Default of `--client-udp-drain-spread-ms`.
+pub(crate) const DEFAULT_DRAIN_SPREAD_MS: u64 = 2_000;
 
 /// Default of `--client-udp-nack-edge-rate`.
 pub(crate) const DEFAULT_NACK_EDGE_RATE: u32 = 20_000;
@@ -2732,6 +2741,9 @@ async fn run_stream_sender(
     // The edge has lost its parents but keeps subscribers within the move
     // hold-down: it serves them from its cache alone, without repair.
     let mut held_while_lost = false;
+    // Phase AM item 9: the drain in progress (its start, the subscribers
+    // there were, those sent away so far).
+    let mut drain: Option<DrainPace> = None;
     loop {
         let now = Instant::now();
         // The stream's class can become known after it started.
@@ -2817,11 +2829,17 @@ async fn run_stream_sender(
         if now >= housekeeping_at {
             housekeeping_at = now + HOUSEKEEPING;
             held_while_lost = false;
-            if let Some(reason) = move_reason(&router).await {
+            let reason = move_reason(&router).await;
+            let paced = reason == Some("draining") && !config.drain_spread.is_zero();
+            if !paced {
+                drain = None;
+            }
+            if let Some(reason) = reason {
                 // Lost parents do not move a subscriber that came by a
                 // move within the hold-down: it may have just come from an
                 // edge that lost its parents too. A subscriber that did not
-                // move here goes at once, and draining moves every one.
+                // move here goes at once, and draining moves every one
+                // (spread over --client-udp-drain-spread-ms).
                 let hold_down = if reason == "parents-lost" {
                     config.move_hold_down
                 } else {
@@ -2831,7 +2849,18 @@ async fn run_stream_sender(
                     let mut guard = table.lock().unwrap();
                     match guard.get_mut(&stream_id) {
                         Some(entry) => {
-                            let leaving = take_movable(entry, hold_down, now);
+                            let limit = paced.then(|| {
+                                let pace = drain.get_or_insert_with(|| DrainPace {
+                                    started: now,
+                                    initial: entry.subscribers.len(),
+                                    sent: 0,
+                                });
+                                pace.due(now, config.drain_spread)
+                            });
+                            let leaving = take_movable(entry, hold_down, now, limit);
+                            if let Some(pace) = drain.as_mut() {
+                                pace.sent += leaving.len();
+                            }
                             let kept = entry.subscribers.len();
                             let newly_held = count_held_down(entry);
                             if kept == 0 {
@@ -2882,14 +2911,21 @@ async fn run_stream_sender(
                 if kept == 0 {
                     return;
                 }
-                held_while_lost = true;
-                continue;
+                if paced {
+                    // The next share soon; those not yet sent away are
+                    // served as before (their parts, repaired).
+                    housekeeping_at = Instant::now() + DRAIN_TICK;
+                } else {
+                    held_while_lost = true;
+                    continue;
+                }
+            } else {
+                // Keep the playlist held, as a reader's playlist reloads do.
+                router.ensure_playlist_copy(stream_id).await;
+                router
+                    .request_replica_for_stream(stream_id, "udp-client-demand", None)
+                    .await;
             }
-            // Keep the playlist held, as a reader's playlist reloads do.
-            router.ensure_playlist_copy(stream_id).await;
-            router
-                .request_replica_for_stream(stream_id, "udp-client-demand", None)
-                .await;
         }
 
         let part = oldest_next;
@@ -2972,12 +3008,20 @@ async fn run_stream_sender(
             // cache releases as a gap within the horizon: the wait is that
             // long at a time, so that the parts behind the hole are not held
             // for LIVE_WAIT (the wait does not wake for a release).
-            let slice = router
+            let mut slice = router
                 .cache
                 .repair_horizon_us()
                 .map_or(LIVE_WAIT, |horizon_us| {
                     LIVE_WAIT.min(Duration::from_micros(horizon_us).max(Duration::from_millis(1)))
                 });
+            if drain.is_some() {
+                // A paced drain's next share is due at its tick.
+                slice = slice.min(
+                    housekeeping_at
+                        .saturating_duration_since(Instant::now())
+                        .max(Duration::from_millis(1)),
+                );
+            }
             tokio::time::timeout(slice, router.get_part_repairing_holes(stream_id, part)).await
         };
         match waited {
@@ -3032,9 +3076,81 @@ async fn run_stream_sender(
     }
 }
 
+/// Subscribers of `stream_id` that no client stands behind (a test of a
+/// crowd larger than its sockets): each asks for `next_part` on.
+#[cfg(test)]
+pub(crate) fn insert_test_subscribers(
+    table: &Table,
+    stream_id: u64,
+    peers: &[SocketAddr],
+    next_part: u64,
+) {
+    let now = Instant::now();
+    let mut guard = table.lock().unwrap();
+    let entry = guard.entry(stream_id).or_default();
+    for peer in peers {
+        entry.subscribers.insert(
+            *peer,
+            Subscriber {
+                repair: RepairPolicy {
+                    permille: 0,
+                    min_symbols: 0,
+                    loss_ppm: 0,
+                },
+                expires_at: now + SUBSCRIPTION_TTL,
+                next_part,
+                init: None,
+                cut_slots: BTreeSet::new(),
+                admitted_at: now,
+                moved_in: false,
+                held_down_counted: false,
+                fast: None,
+                compact: None,
+                first_part: next_part,
+                nack_interval: NackInterval::new(now),
+                windows_repaired: VecDeque::new(),
+            },
+        );
+    }
+}
+
+/// How often a paced drain sends its next share (Phase AM item 9).
+const DRAIN_TICK: Duration = Duration::from_millis(50);
+
+/// A paced drain of one stream's subscribers (Phase AM item 9): by
+/// `started + spread` every subscriber that was there at the start has
+/// been sent away, a share at each tick, the first at once.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DrainPace {
+    pub(crate) started: Instant,
+    pub(crate) initial: usize,
+    pub(crate) sent: usize,
+}
+
+impl DrainPace {
+    /// How many to send away now: the share due by the next tick, less
+    /// those sent; everyone at the end of the spread (and any who came
+    /// since the start).
+    pub(crate) fn due(&self, now: Instant, spread: Duration) -> usize {
+        let elapsed = now.saturating_duration_since(self.started) + DRAIN_TICK;
+        if spread.is_zero() || elapsed >= spread {
+            return usize::MAX;
+        }
+        let share = (self.initial as u128 * elapsed.as_micros())
+            .div_ceil(spread.as_micros().max(1)) as usize;
+        share.max(1).saturating_sub(self.sent)
+    }
+}
+
 /// Take the subscribers that may be moved: all of them, or with a
-/// hold-down all but those that came by a move less than that long ago.
-fn take_movable(entry: &mut StreamEntry, hold_down: Duration, now: Instant) -> Vec<SocketAddr> {
+/// hold-down all but those that came by a move less than that long ago;
+/// at most `limit` of them, if given (a paced drain).
+fn take_movable(
+    entry: &mut StreamEntry,
+    hold_down: Duration,
+    now: Instant,
+    limit: Option<usize>,
+) -> Vec<SocketAddr> {
     let leaving: Vec<SocketAddr> = entry
         .subscribers
         .iter()
@@ -3042,6 +3158,7 @@ fn take_movable(entry: &mut StreamEntry, hold_down: Duration, now: Instant) -> V
             !subscriber.moved_in || now.duration_since(subscriber.admitted_at) >= hold_down
         })
         .map(|(peer, _)| *peer)
+        .take(limit.unwrap_or(usize::MAX))
         .collect();
     for peer in &leaving {
         entry.subscribers.remove(peer);
@@ -4045,12 +4162,12 @@ mod tests {
             .subscribers
             .insert(new, subscriber(now - Duration::from_millis(500)));
         assert_eq!(
-            take_movable(&mut entry, Duration::from_secs(3), now),
+            take_movable(&mut entry, Duration::from_secs(3), now, None),
             vec![old]
         );
         assert_eq!(entry.subscribers.len(), 1);
         // Without a hold-down (or draining) every subscriber goes.
-        assert_eq!(take_movable(&mut entry, Duration::ZERO, now), vec![new]);
+        assert_eq!(take_movable(&mut entry, Duration::ZERO, now, None), vec![new]);
         assert!(entry.subscribers.is_empty());
     }
 
@@ -4073,21 +4190,70 @@ mod tests {
             moved_subscriber(now - Duration::from_millis(200), true),
         );
         assert_eq!(
-            take_movable(&mut entry, Duration::from_secs(3), now),
+            take_movable(&mut entry, Duration::from_secs(3), now, None),
             vec![fresh]
         );
         assert_eq!(count_held_down(&mut entry), 1);
         // A later round holds it again but does not count it again.
-        assert!(take_movable(&mut entry, Duration::from_secs(3), now).is_empty());
+        assert!(take_movable(&mut entry, Duration::from_secs(3), now, None).is_empty());
         assert_eq!(count_held_down(&mut entry), 0);
         assert_eq!(
             take_movable(
                 &mut entry,
                 Duration::from_secs(3),
-                now + Duration::from_secs(3)
+                now + Duration::from_secs(3),
+                None
             ),
             vec![moved]
         );
+    }
+
+    /// Phase AM item 9: a paced drain of 1,000 subscribers over 2 s sends
+    /// a share at each 50 ms tick, the first at once, and the last at the
+    /// end of the spread: they leave across more than 1.5 s, at most a
+    /// tick's share (~25) at once.
+    #[test]
+    fn a_paced_drain_spreads_a_thousand_moves_over_its_spread() {
+        let start = Instant::now();
+        let spread = Duration::from_millis(2_000);
+        let mut pace = DrainPace {
+            started: start,
+            initial: 1_000,
+            sent: 0,
+        };
+        let mut left = 1_000_usize;
+        let (mut first, mut last, mut largest) = (None, None, 0);
+        let mut at = start;
+        while left > 0 {
+            let due = pace.due(at, spread).min(left);
+            if due > 0 {
+                first.get_or_insert(at);
+                last = Some(at);
+                largest = largest.max(due);
+            }
+            pace.sent += due;
+            left -= due;
+            at += DRAIN_TICK;
+        }
+        let across = last.unwrap() - first.unwrap();
+        assert_eq!(first, Some(start), "the first share goes at once");
+        assert!(across >= Duration::from_millis(1_500), "{across:?}");
+        assert!(across <= spread, "{across:?}");
+        assert!(largest <= 26, "{largest}");
+        // Newcomers since the start and those left at the end go at once.
+        let pace = DrainPace {
+            started: start,
+            initial: 10,
+            sent: 10,
+        };
+        assert_eq!(pace.due(start + spread, spread), usize::MAX);
+        // One subscriber goes at once.
+        let pace = DrainPace {
+            started: start,
+            initial: 1,
+            sent: 0,
+        };
+        assert_eq!(pace.due(start, spread), 1);
     }
 
     #[test]

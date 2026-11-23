@@ -2117,6 +2117,17 @@ struct Args {
     )]
     client_udp_admit_by_load: bool,
 
+    /// Phase AM item 9: a draining edge sends its UDP subscribers `MOVE
+    /// draining` spread over this many ms (a share every 50 ms), so that
+    /// the edges they move to are not all asked at once. 0: all at once at
+    /// the next housekeeping tick, as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_DRAIN_SPREAD_MS",
+        default_value_t = edge_udp::DEFAULT_DRAIN_SPREAD_MS
+    )]
+    client_udp_drain_spread_ms: u64,
+
     /// An edge that has heard none of its cache-mesh parents for this long
     /// has lost them: it answers 503 for a part or a playlist reload that it
     /// would otherwise hold, and moves its UDP clients. Keep it above the
@@ -3708,6 +3719,7 @@ async fn main() -> Result<()> {
                 resume_from_request: args.client_udp_resume_from_request,
                 nack_edge_rate: args.client_udp_nack_edge_rate,
                 admit_by_load: args.client_udp_admit_by_load,
+                drain_spread: Duration::from_millis(args.client_udp_drain_spread_ms),
             },
             Arc::clone(&router.edge_udp_stats),
             edge_cut_through.clone(),
@@ -34307,6 +34319,110 @@ mod tests {
         mesh.shutdown();
     }
 
+    /// Phase AM item 9: a draining edge with 1,000 UDP subscribers sends
+    /// them away spread over --client-udp-drain-spread-ms (2 s): the live
+    /// gauge falls across at least 1.5 s, never by more than a few ticks'
+    /// share at once; with the spread at 0 they all go at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_draining_edge_sends_its_udp_clients_away_spread_over_two_seconds() {
+        use av_mesh::client_udp::Control;
+
+        async fn drain(spread_ms: u64) -> (Duration, u64, String) {
+            let cache = LiveTsCache::new(1, Duration::from_millis(250), 4, 32, 64).await;
+            for sequence in 0..4_u64 {
+                cache
+                    .commit_stream_payload(
+                        77,
+                        encode_test_canonical_fmp4_bundle_with_duration(
+                            77,
+                            sequence,
+                            (sequence == 0).then_some(b"ftyp-fLaC-moov".as_slice()),
+                            &[sequence as u8; 400],
+                            Some(250),
+                            true,
+                        ),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+            let mut router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let edge = socket.local_addr().unwrap();
+            router.client_udp_port = Some(edge.port());
+            let (shutdown_tx, shutdown_rx) = watch::channel(());
+            let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, 2_000);
+            config.playout = Duration::ZERO;
+            config.drain_spread = Duration::from_millis(spread_ms);
+            let stats = Arc::clone(&router.edge_udp_stats);
+            let task = tokio::spawn(edge_udp::run_edge_udp(
+                edge_udp::EdgeSockets::single(socket),
+                router.clone(),
+                config,
+                Arc::clone(&stats),
+                Vec::new(),
+                shutdown_rx,
+            ));
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let answer = subscribe_udp_for_tests(&client, edge, Some(0)).await;
+            assert!(matches!(answer, Control::Subscribed { .. }), "{answer:?}");
+            // 999 more, with no client behind them (ports nobody reads).
+            let crowd: Vec<SocketAddr> = (0..999_u16)
+                .map(|index| SocketAddr::from(([127, 0, 0, 3], 40_000 + index)))
+                .collect();
+            edge_udp::insert_test_subscribers(&stats.table.get().unwrap().0, 77, &crowd, 4);
+            assert_eq!(stats.live_subscribers(), Some(1_000));
+            let moves_before = stats.moves.load(Ordering::Relaxed);
+            router.lifecycle.set_draining(true).await;
+            let started = Instant::now();
+            let (mut first, mut largest_drop, mut last_count) = (None, 0_u64, 1_000_u64);
+            let mut samples: Vec<(Duration, u64)> = Vec::new();
+            loop {
+                let count = stats.live_subscribers().unwrap_or(0);
+                if count < last_count {
+                    first.get_or_insert(started.elapsed());
+                    largest_drop = largest_drop.max(last_count - count);
+                    last_count = count;
+                }
+                samples.push((started.elapsed(), count));
+                if count == 0 || started.elapsed() > Duration::from_secs(8) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let across = started.elapsed() - first.unwrap_or_default();
+            assert_eq!(last_count, 0, "every subscriber left: {samples:?}");
+            assert_eq!(stats.moves.load(Ordering::Relaxed) - moves_before, 1_000);
+            // The real client was told why.
+            let mut buf = vec![0_u8; 65_536];
+            let reason = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let (len, _) = client.recv_from(&mut buf).await.unwrap();
+                    if let Some(Control::Move { reason, .. }) = Control::decode(&buf[..len]) {
+                        break reason;
+                    }
+                }
+            })
+            .await
+            .expect("the client is moved");
+            let _ = shutdown_tx.send(());
+            task.await.unwrap().unwrap();
+            mesh.shutdown();
+            (across, largest_drop, reason)
+        }
+
+        let (across, largest, reason) = drain(2_000).await;
+        assert_eq!(reason, "draining");
+        assert!(across >= Duration::from_millis(1_500), "{across:?}");
+        assert!(across <= Duration::from_millis(3_000), "{across:?}");
+        // A 50 ms tick sends ~25; the samples may see two or three at once.
+        assert!(largest <= 100, "largest drop {largest}");
+        // Before (spread 0): all of them in one housekeeping round.
+        let (across, largest, _) = drain(0).await;
+        assert!(across < Duration::from_millis(500), "{across:?}");
+        assert!(largest >= 900, "largest drop {largest}");
+    }
+
     /// Without the counter (--client-udp-egress-load false) and with
     /// --client-udp-admit-by-load false, the edge is as before: no load
     /// from UDP and every new subscription taken.
@@ -34501,16 +34617,20 @@ mod tests {
         let args = Args::try_parse_from(["av-mesh"]).unwrap();
         assert!(args.client_udp_egress_load);
         assert!(args.client_udp_admit_by_load);
+        assert_eq!(args.client_udp_drain_spread_ms, 2_000);
         let args = Args::try_parse_from([
             "av-mesh",
             "--client-udp-egress-load",
             "false",
             "--client-udp-admit-by-load",
             "false",
+            "--client-udp-drain-spread-ms",
+            "0",
         ])
         .unwrap();
         assert!(!args.client_udp_egress_load);
         assert!(!args.client_udp_admit_by_load);
+        assert_eq!(args.client_udp_drain_spread_ms, 0);
     }
 
     #[test]
