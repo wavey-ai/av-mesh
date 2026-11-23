@@ -125,13 +125,41 @@ struct Args {
     nack_retry_floor_us: u64,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     silence_nack: bool,
+    /// Wave 8 (R6-3): the parts that one silence asks for, at most (0: no
+    /// bound, before wave 8).
+    #[arg(long, default_value_t = av_mesh::client_compact::DEFAULT_SILENCE_NACK_BUDGET)]
+    silence_nack_budget: u16,
+    /// Wave 8 (R6-4): a silence's NACKs one and a half round trips apart.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    silence_nack_rtt_floor: bool,
+    /// Wave 8 (R6-5): gaps longer than this many intervals are no sample
+    /// of the interval (0: every gap is).
+    #[arg(long, default_value_t = av_mesh::client_compact::DEFAULT_INTERVAL_CAP)]
+    interval_cap: u32,
+    /// Wave 8 (S4): the silence margin in part intervals (1 before).
+    #[arg(long, default_value_t = av_mesh::client_compact::DEFAULT_SILENCE_MARGIN_INTERVALS)]
+    silence_margin_intervals: u32,
+    /// Wave 8: the parts a second that the client asks for at most (0: no
+    /// cap): an overloaded edge is not asked for thousands a second.
+    #[arg(long, default_value_t = av_mesh::client_compact::DEFAULT_NACK_RATE_CAP)]
+    nack_rate_cap: u32,
+    /// Wave 8 (S2): the silence that moves again after a move for silence.
+    #[arg(long, default_value_t = av_mesh::client_session::DEFAULT_SILENCE_REPEAT_MS)]
+    silence_repeat_ms: u64,
+    /// Wave 8: ask for the compact lane again after a fall-back.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    compact_retry: bool,
+    /// Wave 8: drop the short-form parts that come before the edge's OK,
+    /// as before (`false`: kept, read once the OK comes).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    drop_early_parts: bool,
     #[arg(long)]
     repair_permille: Option<u32>,
     #[arg(long)]
     min_repair: Option<u32>,
     #[arg(long)]
     fixed_repair: bool,
-    #[arg(long, default_value_t = 1_000)]
+    #[arg(long, default_value_t = av_mesh::client_session::DEFAULT_SILENCE_MS)]
     silence_ms: u64,
     #[arg(long, default_value_t = 5_000)]
     answer_ms: u64,
@@ -170,6 +198,10 @@ fn config(args: &Args) -> Result<LoadConfig> {
         repair_permille: args.repair_permille,
         min_repair: args.min_repair,
         silence: Duration::from_millis(args.silence_ms),
+        silence_repeat: Duration::from_millis(args.silence_repeat_ms),
+        nack_after_drain: true,
+        compact_retry: args.compact_retry,
+        drop_early_parts: args.drop_early_parts,
         answer: Duration::from_millis(args.answer_ms),
         fixed_repair: args.fixed_repair,
         fast_lane: args.fast_lane,
@@ -180,6 +212,11 @@ fn config(args: &Args) -> Result<LoadConfig> {
             delay: Duration::from_micros(args.nack_delay_us),
             retry_floor: Duration::from_micros(args.nack_retry_floor_us),
             silence: args.silence_nack,
+            silence_budget: args.silence_nack_budget,
+            rtt_floor: args.silence_nack_rtt_floor,
+            interval_cap: args.interval_cap,
+            margin_intervals: args.silence_margin_intervals,
+            rate_cap: args.nack_rate_cap,
         },
         known_parts: args.known_parts,
     };
@@ -273,6 +310,12 @@ mod tests {
         // The wave 6/7 client: short form and the fast NACK timing.
         assert!(config.session.compact_short_header);
         assert_eq!(config.session.nack_timing, NackTiming::default());
+        // Wave 8: the 200 ms move, the repeat silence, the compact retry,
+        // and the start-up parts kept.
+        assert_eq!(config.session.silence, Duration::from_millis(200));
+        assert_eq!(config.session.silence_repeat, Duration::from_millis(1_000));
+        assert!(config.session.compact_retry);
+        assert!(!config.session.drop_early_parts);
         assert!(config.kernel_timestamps);
         assert_eq!(config.session.stream_id, 4001);
         assert_eq!(config.out_dir, Some(PathBuf::from("x")));
@@ -289,6 +332,39 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(config_ramp(&args), vec![(Duration::ZERO, 7)]);
+    }
+
+    #[test]
+    fn the_wave8_client_flags_turn_back_to_wave_6() {
+        let args = Args::try_parse_from([
+            "needletail-load",
+            "--edges",
+            "127.0.0.1:19446",
+            "--stream",
+            "1",
+            "--silence-nack-budget",
+            "0",
+            "--silence-nack-rtt-floor",
+            "false",
+            "--interval-cap",
+            "0",
+            "--silence-margin-intervals",
+            "1",
+            "--nack-rate-cap",
+            "0",
+            "--silence-ms",
+            "1000",
+            "--compact-retry",
+            "false",
+            "--drop-early-parts",
+            "true",
+        ])
+        .unwrap();
+        let config = config(&args).unwrap();
+        assert_eq!(config.session.nack_timing, NackTiming::WAVE6);
+        assert_eq!(config.session.silence, Duration::from_millis(1_000));
+        assert!(!config.session.compact_retry);
+        assert!(config.session.drop_early_parts);
     }
 
     fn config_ramp(args: &Args) -> Vec<(Duration, usize)> {

@@ -826,6 +826,13 @@ impl ObjectReceiver {
     pub fn expect(&mut self, stream_id: u64, next_part: u64, compact: bool) {
         self.stream_id = stream_id;
         self.compact.expect_from(next_part, compact);
+        // The short-form parts that came before the OK, read now (their
+        // objects wait in `ready`).
+        for datagram in self.compact.take_early() {
+            if let Some(object) = self.push_compact(&datagram) {
+                self.ready.push_back(object);
+            }
+        }
     }
 
     /// The next object that the last `push` delivered besides the one it

@@ -63,6 +63,14 @@ pub fn drops_short_header(compact: bool, compact_asked: bool, plan: CompactPlan)
     !compact && compact_asked && plan.short_header
 }
 
+/// The silence after which a client moves (wave 8 S2; 1,000 before).
+pub const DEFAULT_SILENCE_MS: u64 = 200;
+/// See [`SessionConfig::silence_repeat`].
+pub const DEFAULT_SILENCE_REPEAT_MS: u64 = 1_000;
+/// Times a client asks an edge for the compact lane again after falling
+/// back from it (see [`SessionConfig::compact_retry`]).
+pub const COMPACT_RETRIES: u32 = 2;
+
 /// What a client asks for, as `needletail-udp-client`'s flags say.
 #[derive(Debug, Clone, Copy)]
 pub struct SessionConfig {
@@ -71,8 +79,26 @@ pub struct SessionConfig {
     /// (by default the lane's).
     pub repair_permille: Option<u32>,
     pub min_repair: Option<u32>,
-    /// Move after this long without a datagram from a subscribed edge.
+    /// Move after this long without a datagram from a subscribed edge
+    /// (wave 8 S2: 200 ms; 1 s before).
     pub silence: Duration,
+    /// After a move for silence, until the new edge sends a datagram, the
+    /// silence that moves again (at least `silence`): a stall of the stream
+    /// itself (every edge silent) moves a client once a second, not five
+    /// times.
+    pub silence_repeat: Duration,
+    /// NACKs wait while the caller says datagrams are queued on its socket
+    /// ([`UdpSession::queued`], wave 8 R6-2): the backlog after a stall
+    /// fills most holes.
+    pub nack_after_drain: bool,
+    /// An edge that answers a request asked without the compact lane (the
+    /// client fell back after its compact requests went unanswered) is
+    /// asked for the lane again, twice at most (wave 8: a lost answer
+    /// otherwise kept the client on the RaptorQ lane for good).
+    pub compact_retry: bool,
+    /// Drop the short-form parts that come before the edge's `OK`, as
+    /// before wave 8 (`false`: kept and read once the `OK` comes).
+    pub drop_early_parts: bool,
     /// Move when the edge does not answer the subscription in this time.
     pub answer: Duration,
     /// Keep the repair that was asked for, whatever the measured loss.
@@ -99,7 +125,11 @@ impl SessionConfig {
             stream_id,
             repair_permille: None,
             min_repair: None,
-            silence: Duration::from_millis(1_000),
+            silence: Duration::from_millis(DEFAULT_SILENCE_MS),
+            silence_repeat: Duration::from_millis(DEFAULT_SILENCE_REPEAT_MS),
+            nack_after_drain: true,
+            compact_retry: true,
+            drop_early_parts: false,
             answer: Duration::from_millis(5_000),
             fixed_repair: false,
             fast_lane: true,
@@ -169,6 +199,16 @@ pub struct UdpSession {
     /// While set, the session reports no failure (no answer, silence) and
     /// keeps the edge: the end-of-run drain, which waits for NACK answers.
     pub hold: bool,
+    /// Set by the caller before [`Self::poll`]: datagrams are queued on its
+    /// socket (NACKs wait for them, with `nack_after_drain`).
+    pub queued: bool,
+    /// The compact lane asked for again after a fall-back (see
+    /// [`SessionConfig::compact_retry`]), over the run and at this edge.
+    pub compact_retries: u64,
+    compact_retries_here: u32,
+    /// The last move was for silence and the edge in use has sent nothing
+    /// since: the longer silence applies.
+    moved_for_silence: bool,
     // The edge in use.
     target: Option<SocketAddr>,
     from_part: Option<u64>,
@@ -197,6 +237,7 @@ impl UdpSession {
             receiver.compact.set_known_parts(config.known_parts);
         }
         receiver.compact.set_nack_timing(config.nack_timing);
+        receiver.compact.drop_early = config.drop_early_parts;
         Self {
             config,
             receiver,
@@ -223,6 +264,10 @@ impl UdpSession {
             first_token_at: None,
             first_subscribed_at: None,
             hold: false,
+            queued: false,
+            compact_retries: 0,
+            compact_retries_here: 0,
+            moved_for_silence: false,
             target: None,
             from_part: None,
             token: None,
@@ -298,6 +343,7 @@ impl UdpSession {
             self.receiver.new_flow();
         }
         self.edges += 1;
+        self.compact_retries_here = 0;
         self.target = Some(target);
         self.from_part = from_part;
         self.token = None;
@@ -350,11 +396,10 @@ impl UdpSession {
         {
             return Some(format!("no-answer-{}ms", self.config.answer.as_millis()));
         }
-        if !self.hold
-            && self.subscribed
-            && now.duration_since(self.last_datagram) > self.config.silence
-        {
-            return Some(format!("silence-{}ms", self.config.silence.as_millis()));
+        let silence = self.silence();
+        if !self.hold && self.subscribed && now.duration_since(self.last_datagram) > silence {
+            self.moved_for_silence = true;
+            return Some(format!("silence-{}ms", silence.as_millis()));
         }
         if now >= self.next_loss_check {
             self.next_loss_check = now + LOSS_CHECK;
@@ -398,7 +443,9 @@ impl UdpSession {
                 }
             }
         }
-        if self.compact_confirmed {
+        // NACKs wait while datagrams are queued (they fill most holes).
+        let drained = !(self.queued && self.config.nack_after_drain);
+        if self.compact_confirmed && drained {
             if let Some(token) = self.token {
                 let parts = self.receiver.nacks_due(now);
                 if !parts.is_empty() {
@@ -453,10 +500,20 @@ impl UdpSession {
         None
     }
 
+    /// The silence that moves the client now (see
+    /// [`SessionConfig::silence_repeat`]).
+    fn silence(&self) -> Duration {
+        if self.moved_for_silence {
+            self.config.silence.max(self.config.silence_repeat)
+        } else {
+            self.config.silence
+        }
+    }
+
     /// When [`Self::poll`] wants to run next.
     pub fn next_wake(&self) -> Instant {
         let silence_at = if self.subscribed {
-            self.last_datagram + self.config.silence
+            self.last_datagram + self.silence()
         } else {
             self.asked_at + self.config.answer
         };
@@ -540,6 +597,23 @@ impl UdpSession {
                         self.repair = self.policy_for_base();
                         self.next_refresh = now;
                     }
+                    // Answered without the lane that the client gave up for
+                    // want of an answer: the edge hears it, so the lane is
+                    // asked for again (at most COMPACT_RETRIES times here).
+                    if !compact
+                        && !self.compact_asked
+                        && self.config.compact
+                        && self.config.compact_retry
+                        && self.compact_fallbacks > 0
+                        && self.compact_retries_here < COMPACT_RETRIES
+                    {
+                        self.compact_retries_here += 1;
+                        self.compact_retries += 1;
+                        self.compact_asked = true;
+                        self.base_repair = self.config.base_for(true);
+                        self.repair = self.policy_for_base();
+                        self.next_refresh = now;
+                    }
                     Received::Subscribed { next_part, first }
                 }
                 Control::Move { reason, .. } | Control::Refused { reason, .. } => {
@@ -548,6 +622,7 @@ impl UdpSession {
                 _ => Received::Control,
             }
         } else {
+            self.moved_for_silence = false;
             self.pending = self.receiver.push(datagram);
             Received::Media
         }
@@ -680,6 +755,180 @@ mod tests {
             )));
         assert_eq!(session.edges, 3);
         assert_eq!(session.receiver.flows, 3);
+    }
+
+    /// A session subscribed at `edge()` with a part received at `at`.
+    fn subscribed(config: SessionConfig, at: Instant) -> UdpSession {
+        let mut session = UdpSession::new(config, at);
+        let mut send = |_: SocketAddr, _: &[u8]| {};
+        session.begin(edge(), None, at, &mut send);
+        let token = Control::Token {
+            stream_id: config.stream_id,
+            token: 5,
+        }
+        .encode();
+        session.on_datagram(edge(), &token, at, &mut send);
+        let ok = Control::Subscribed {
+            stream_id: config.stream_id,
+            next_part: 10,
+            compact: true,
+        }
+        .encode();
+        session.on_datagram(edge(), &ok, at, &mut send);
+        let part = crate::client_compact::encode_part(10, 0, b"pcm").unwrap();
+        session.on_datagram(edge(), &part, at, &mut send);
+        session
+    }
+
+    /// Wave 8 S2: a client moves after 200 ms of silence; an edge it moved
+    /// to that is silent too (the stream itself stalls) moves it again only
+    /// after the second's silence, until a datagram comes.
+    #[test]
+    fn a_client_moves_on_a_short_silence_and_then_on_the_long_one() {
+        let now = Instant::now();
+        let config = SessionConfig::new(1);
+        assert_eq!(config.silence, Duration::from_millis(200));
+        let mut session = subscribed(config, now);
+        let mut send = |_: SocketAddr, _: &[u8]| {};
+        assert!(session.poll(now + Duration::from_millis(150), &mut send).is_none());
+        let reason = session
+            .poll(now + Duration::from_millis(201), &mut send)
+            .expect("move");
+        assert_eq!(reason, "silence-200ms");
+        // The next edge answers but sends nothing.
+        let moved_at = now + Duration::from_millis(201);
+        let next: SocketAddr = "127.0.0.3:19446".parse().unwrap();
+        session.begin(next, Some(11), moved_at, &mut send);
+        let token = Control::Token { stream_id: 1, token: 6 }.encode();
+        session.on_datagram(next, &token, moved_at, &mut send);
+        let ok = Control::Subscribed { stream_id: 1, next_part: 11, compact: true }.encode();
+        session.on_datagram(next, &ok, moved_at, &mut send);
+        assert!(session
+            .poll(moved_at + Duration::from_millis(500), &mut send)
+            .is_none());
+        assert_eq!(
+            session
+                .poll(moved_at + Duration::from_millis(1_001), &mut send)
+                .as_deref(),
+            Some("silence-1000ms")
+        );
+        // A datagram from the edge in use brings the short silence back.
+        let mut session = subscribed(config, now);
+        session.poll(now + Duration::from_millis(201), &mut send);
+        session.begin(next, Some(11), moved_at, &mut send);
+        session.on_datagram(next, &token, moved_at, &mut send);
+        session.on_datagram(next, &ok, moved_at, &mut send);
+        let part = crate::client_compact::encode_part(11, 0, b"pcm").unwrap();
+        session.on_datagram(next, &part, moved_at, &mut send);
+        assert_eq!(
+            session
+                .poll(moved_at + Duration::from_millis(201), &mut send)
+                .as_deref(),
+            Some("silence-200ms")
+        );
+    }
+
+    /// Wave 8: short-form parts that come before the OK (a subscribe spike
+    /// delays the OK behind the fast lane's first parts) are kept and read
+    /// once the OK names the first part, not dropped.
+    #[test]
+    fn parts_before_the_ok_are_kept_until_it_comes() {
+        for drop_early_parts in [false, true] {
+            let now = Instant::now();
+            let config = SessionConfig {
+                drop_early_parts,
+                ..SessionConfig::new(3)
+            };
+            let mut session = UdpSession::new(config, now);
+            let mut send = |_: SocketAddr, _: &[u8]| {};
+            session.begin(edge(), None, now, &mut send);
+            let token = Control::Token { stream_id: 3, token: 4 }.encode();
+            session.on_datagram(edge(), &token, now, &mut send);
+            let long = crate::client_compact::encode_part(70_000, 0, b"pcm").unwrap();
+            let short = crate::client_compact::shorten(&long).expect("short form");
+            assert_eq!(
+                session.on_datagram(edge(), &short, now, &mut send),
+                Received::Media
+            );
+            assert!(session.next_object().is_none());
+            let ok = Control::Subscribed { stream_id: 3, next_part: 70_000, compact: true }.encode();
+            session.on_datagram(edge(), &ok, now, &mut send);
+            let got = session.next_object().map(|object| object.part);
+            if drop_early_parts {
+                assert_eq!(got, None);
+            } else {
+                assert_eq!(got, Some(70_000));
+            }
+        }
+    }
+
+    /// Wave 8 R6-2: no NACK while the caller says datagrams are queued.
+    #[test]
+    fn nacks_wait_while_datagrams_are_queued() {
+        let now = Instant::now();
+        let mut session = subscribed(SessionConfig::new(1), now);
+        let mut sent = 0;
+        let mut send = |_: SocketAddr, datagram: &[u8]| {
+            if matches!(Control::decode(datagram), Some(Control::Nack { .. })) {
+                sent += 1;
+            }
+        };
+        // Part 12 shows 11 lost.
+        let part = crate::client_compact::encode_part(12, 0, b"pcm").unwrap();
+        session.on_datagram(edge(), &part, now, &mut send);
+        let at = now + Duration::from_millis(1);
+        session.queued = true;
+        session.poll(at, &mut send);
+        session.queued = false;
+        session.poll(at, &mut send);
+        drop(send);
+        assert_eq!(sent, 1);
+    }
+
+    /// Wave 8: a client that gave up the compact lane for want of an answer
+    /// asks for it again once the edge answers (twice at most).
+    #[test]
+    fn the_compact_lane_is_asked_for_again_when_the_edge_answers() {
+        let now = Instant::now();
+        let mut session = UdpSession::new(SessionConfig::new(1), now);
+        let mut sent: Vec<Vec<u8>> = Vec::new();
+        let mut send = |_: SocketAddr, datagram: &[u8]| sent.push(datagram.to_vec());
+        session.begin(edge(), None, now, &mut send);
+        let mut at = now;
+        while session.compact_asked {
+            at += UNANSWERED_REFRESH;
+            session.poll(at, &mut send);
+        }
+        assert_eq!(session.compact_fallbacks, 1);
+        // The edge answers the request without the lane.
+        let token = Control::Token { stream_id: 1, token: 8 }.encode();
+        session.on_datagram(edge(), &token, at, &mut send);
+        let ok = Control::Subscribed { stream_id: 1, next_part: 10, compact: false }.encode();
+        session.on_datagram(edge(), &ok, at, &mut send);
+        assert!(session.compact_asked);
+        assert_eq!(session.compact_retries, 1);
+        session.poll(at, &mut send);
+        drop(send);
+        match Control::decode(sent.last().unwrap()) {
+            Some(Control::Subscribe { compact, .. }) => assert!(compact.is_some()),
+            other => panic!("{other:?}"),
+        }
+        // Without the retry, the RaptorQ lane stays.
+        let config = SessionConfig {
+            compact_retry: false,
+            ..SessionConfig::new(1)
+        };
+        let mut session = UdpSession::new(config, now);
+        let mut send = |_: SocketAddr, _: &[u8]| {};
+        session.begin(edge(), None, now, &mut send);
+        let mut at = now;
+        while session.compact_asked {
+            at += UNANSWERED_REFRESH;
+            session.poll(at, &mut send);
+        }
+        session.on_datagram(edge(), &token, at, &mut send);
+        session.on_datagram(edge(), &ok, at, &mut send);
+        assert!(!session.compact_asked);
     }
 
     #[test]
@@ -831,8 +1080,8 @@ mod tests {
         assert!(session.next_wake() > late);
         session.hold = false;
         assert_eq!(
-            session.poll(late, &mut send).as_deref(),
-            Some("silence-1000ms")
+            session.poll(late, &mut send),
+            Some(format!("silence-{DEFAULT_SILENCE_MS}ms"))
         );
     }
 

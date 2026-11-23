@@ -83,8 +83,9 @@ struct Args {
     /// the compact lane, 3 on the RaptorQ lane alone.
     #[arg(long)]
     min_repair: Option<u32>,
-    /// Move to the next cache after this long without a datagram.
-    #[arg(long, default_value_t = 1_000)]
+    /// Move to the next cache after this long without a datagram (wave 8
+    /// S2: 200; 1,000 before).
+    #[arg(long, default_value_t = av_mesh::client_session::DEFAULT_SILENCE_MS)]
     silence_ms: u64,
     /// Move to the next cache when a subscription is not answered in this
     /// time (a new playlist copy at an edge takes up to a second).
@@ -147,6 +148,48 @@ struct Args {
     /// a hole is asked for only once a later part shows it, as before.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     silence_nack: bool,
+    /// Wave 8 (R6-3): the parts that one silence asks for, at most; its
+    /// holes then wait for a datagram. 0: no bound, and a silence's holes go
+    /// on in the ordinary schedule after its first 50 ms (before wave 8).
+    #[arg(long, default_value_t = av_mesh::client_compact::DEFAULT_SILENCE_NACK_BUDGET)]
+    silence_nack_budget: u16,
+    /// Wave 8 (R6-4): a silence's NACKs of a hole are one and a half round
+    /// trips apart at least, and asked again no sooner when it ends.
+    /// `false`: every interval, and 250 µs after the silence (before).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    silence_nack_rtt_floor: bool,
+    /// Wave 8 (R6-5): a gap between arrivals longer than this many part
+    /// intervals is no sample of the interval or jitter (0: every gap is).
+    #[arg(long, default_value_t = av_mesh::client_compact::DEFAULT_INTERVAL_CAP)]
+    interval_cap: u32,
+    /// Wave 8 (S4): a silence is NACKed this many part intervals past the
+    /// next part's due time (and at least 0.5 ms and four times the jitter);
+    /// 1 before wave 8.
+    #[arg(long, default_value_t = av_mesh::client_compact::DEFAULT_SILENCE_MARGIN_INTERVALS)]
+    silence_margin_intervals: u32,
+    /// Wave 8: the parts a second that the client asks for at most (0: no
+    /// cap): an overloaded edge is not asked for thousands a second.
+    #[arg(long, default_value_t = av_mesh::client_compact::DEFAULT_NACK_RATE_CAP)]
+    nack_rate_cap: u32,
+    /// Wave 8 (S2): after a move for silence, until the new edge sends a
+    /// datagram, the silence (ms) that moves again (a stall of the stream
+    /// itself moves a client once a second, not every --silence-ms).
+    #[arg(long, default_value_t = av_mesh::client_session::DEFAULT_SILENCE_REPEAT_MS)]
+    silence_repeat_ms: u64,
+    /// Wave 8: an edge that answers after the client gave up the compact
+    /// lane for want of an answer is asked for it again (twice at most).
+    /// `false`: the RaptorQ lane for the rest of the run at that edge.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    compact_retry: bool,
+    /// Wave 8: drop the short-form parts that come before the edge's OK,
+    /// as before (`false`: kept, read once the OK comes).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    drop_early_parts: bool,
+    /// Wave 8 (R6-2): no NACK while datagrams are queued on the socket
+    /// (after a stall the backlog fills most holes). `false`: NACKs between
+    /// the datagrams of a backlog, as before.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    nack_after_drain: bool,
     /// At the end of the run, keep receiving for up to this long (ms) to
     /// fill the holes among the parts received so far, by NACK, so that a
     /// part lost just before the end is not counted missing; parts past the
@@ -565,6 +608,15 @@ fn enable_kernel_timestamps(socket: &UdpSocket) {
 
 /// Receive one datagram, with its sender and the kernel's receive time
 /// (Unix µs) when the socket gives one.
+/// Whether a datagram waits on the socket (FIONREAD).
+fn datagrams_queued(socket: &UdpSocket) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut queued: libc::c_int = 0;
+    // SAFETY: FIONREAD writes one int to the pointer given.
+    let result = unsafe { libc::ioctl(socket.as_raw_fd(), libc::FIONREAD, &mut queued) };
+    result == 0 && queued > 0
+}
+
 async fn recv_timestamped(
     socket: &UdpSocket,
     buf: &mut [u8],
@@ -703,6 +755,10 @@ async fn main() -> Result<()> {
             repair_permille: args.repair_permille,
             min_repair: args.min_repair,
             silence: Duration::from_millis(args.silence_ms),
+            silence_repeat: Duration::from_millis(args.silence_repeat_ms),
+            nack_after_drain: args.nack_after_drain,
+            compact_retry: args.compact_retry,
+            drop_early_parts: args.drop_early_parts,
             answer: Duration::from_millis(args.answer_ms),
             fixed_repair: args.fixed_repair,
             fast_lane: args.fast_lane,
@@ -713,6 +769,11 @@ async fn main() -> Result<()> {
                 delay: Duration::from_micros(args.nack_delay_us),
                 retry_floor: Duration::from_micros(args.nack_retry_floor_us),
                 silence: args.silence_nack,
+                silence_budget: args.silence_nack_budget,
+                rtt_floor: args.silence_nack_rtt_floor,
+                interval_cap: args.interval_cap,
+                margin_intervals: args.silence_margin_intervals,
+                rate_cap: args.nack_rate_cap,
             },
             known_parts: 0,
         },
@@ -922,6 +983,7 @@ async fn main() -> Result<()> {
                 }
             }
             let fallbacks = session.compact_fallbacks;
+            session.queued = args.nack_after_drain && datagrams_queued(&socket);
             let failed = session.poll(now, &mut |to, datagram| {
                 outbox.push((to, datagram.to_vec()))
             });
