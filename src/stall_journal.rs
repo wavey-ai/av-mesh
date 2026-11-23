@@ -330,6 +330,16 @@ pub struct StallReport {
     pub secs: Vec<SecLine>,
 }
 
+impl StallReport {
+    /// The latest `t_us` of the report: a reader that comes back with
+    /// `since_us` one after it misses nothing.
+    pub fn last_t_us(&self) -> Option<u64> {
+        let events = self.events.last().map(|line| line.event.t_us);
+        let secs = self.secs.last().map(|line| line.t_us);
+        events.max(secs)
+    }
+}
+
 /// What `/api/mesh/local` reports of the journal. The tick counters are
 /// since start, and count every tick whether or not the ring took its event.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -694,7 +704,12 @@ impl StallJournal {
     /// [`Self::query`] as NDJSON, one line an event or a CPU's second,
     /// oldest first.
     pub fn render_ndjson(&self, since_us: Option<u64>) -> String {
-        let report = self.query(since_us);
+        self.render_report(&self.query(since_us))
+    }
+
+    /// A report of [`Self::query`] as NDJSON: events and `sec` lines in
+    /// one order of time.
+    pub fn render_report(&self, report: &StallReport) -> String {
         let node = serde_json::to_string(&self.node).unwrap_or_else(|_| "\"\"".to_owned());
         let mut body = String::with_capacity((report.events.len() + report.secs.len()) * 192);
         let mut secs = report.secs.iter().peekable();
@@ -939,6 +954,21 @@ fn note_event(kind: StallKind, thread: StallThread, dur_us: u64, faults: Option<
         )
     });
     journal.record(kind, thread, dur_us, minflt, majflt);
+}
+
+/// The CPUs that the calling thread may run on, in order.
+pub fn allowed_cpus() -> Vec<u16> {
+    os::allowed_cpus()
+}
+
+/// Pin the calling thread to one CPU; false where the host refuses.
+pub fn pin_current_thread(cpu: u16) -> bool {
+    os::pin(cpu)
+}
+
+/// Sleep to an absolute CLOCK_MONOTONIC time in nanoseconds.
+pub fn sleep_until(due_ns: u64) {
+    os::sleep_until(due_ns)
 }
 
 /// CLOCK_REALTIME in microseconds.
