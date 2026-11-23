@@ -576,9 +576,9 @@ impl RelayIngressError {
     #[must_use]
     pub const fn kind(&self) -> RejectionKind {
         match self {
-            Self::InvalidConfig { .. } | Self::InvalidSessionId | Self::InvalidCarrierIdentity(_) => {
-                RejectionKind::Invalid
-            }
+            Self::InvalidConfig { .. }
+            | Self::InvalidSessionId
+            | Self::InvalidCarrierIdentity(_) => RejectionKind::Invalid,
             Self::LimitExceeded { .. } => RejectionKind::LimitExceeded,
             Self::AuthenticationRequired | Self::ParentSessionMissing(_) => {
                 RejectionKind::Authentication
@@ -1135,16 +1135,31 @@ impl RelayObjectReceiver {
         // stream's own timeline. Completed objects above remain tombstones,
         // so an authenticated symbol that races decode completion is
         // classified as a duplicate instead of a deadline or authentication
-        // failure. A symbol the stream has left behind ends its object's
-        // assembly with it.
+        // failure. A symbol the stream has left behind is dropped; its
+        // object's assembly ends with it only when the stream has left the
+        // assembly's own announced deadline behind (a symbol's deadline is
+        // its own claim, and one corrupt symbol must not cost the object).
+        let clock = MediaClocks::key(symbol.object_key.tenant(), symbol.object_key.stream());
         let verdict = self.clocks.observe(
-            MediaClocks::key(symbol.object_key.tenant(), symbol.object_key.stream()),
+            clock,
             symbol.object_key.epoch(),
             symbol.deadline.expires_at_us,
             self.config.media_deadline_us,
         );
         if let Err(error) = verdict_result(verdict) {
-            if self.remove_active_object(&symbol.object_key, true).is_some() {
+            let left_behind = self.objects.get(&symbol.object_key).is_some_and(|state| {
+                self.clocks.peek(
+                    clock,
+                    symbol.object_key.epoch(),
+                    state.announcement.deadline.expires_at_us,
+                    self.config.media_deadline_us,
+                ) != Verdict::Fresh
+            });
+            if left_behind
+                && self
+                    .remove_active_object(&symbol.object_key, true)
+                    .is_some()
+            {
                 self.counters.expired_objects = self.counters.expired_objects.saturating_add(1);
             }
             return Err(error);
@@ -2853,7 +2868,10 @@ mod tests {
                 .get(RejectionKind::ParentLimitExceeded),
             1
         );
-        assert_eq!(RejectionKind::ParentLimitExceeded.as_str(), "parent_limit_exceeded");
+        assert_eq!(
+            RejectionKind::ParentLimitExceeded.as_str(),
+            "parent_limit_exceeded"
+        );
     }
 
     #[test]
@@ -2906,9 +2924,8 @@ mod tests {
         // The other contributor sent the same part compact.
         for (role, sequence) in [(0, 1), (1, 2)] {
             let compact = compact_wire(&part, role, subscription().get(), sequence);
-            let Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Duplicate {
-                key, ..
-            })) = dispatch.push(peers[1], &compact, 1_000)
+            let Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Duplicate { key, .. })) =
+                dispatch.push(peers[1], &compact, 1_000)
             else {
                 panic!("the compact copy of a whole part is a duplicate");
             };
@@ -3066,13 +3083,21 @@ mod tests {
         }
         assert!(complete);
         // One symbol of the next object comes; the rest is lost.
-        let (held, _) =
-            wire_symbols(&fmp4_object(1, 4_000), base_us + 40_000, MediaPriority::VideoKey, 0);
+        let (held, _) = wire_symbols(
+            &fmp4_object(1, 4_000),
+            base_us + 40_000,
+            MediaPriority::VideoKey,
+            0,
+        );
         assert!(!decoded(dispatch.push(peers[0], &held[0], 6)));
         assert_eq!(dispatch.receiver().state().active_objects, 1);
         // The stream goes on for 900 ms: the assembly still waits.
-        let (later, _) =
-            wire_symbols(&fmp4_object(2, 4_000), base_us + 940_000, MediaPriority::VideoKey, 0);
+        let (later, _) = wire_symbols(
+            &fmp4_object(2, 4_000),
+            base_us + 940_000,
+            MediaPriority::VideoKey,
+            0,
+        );
         for symbol in &later {
             dispatch.push(peers[0], symbol, 7).expect("later object");
         }
@@ -3080,8 +3105,12 @@ mod tests {
         assert!(!decoded(dispatch.push(peers[1], &held[1], 9)));
         // A budget past its deadline it ends, and its late symbols are
         // dropped.
-        let (latest, _) =
-            wire_symbols(&fmp4_object(3, 4_000), base_us + 1_040_000, MediaPriority::VideoKey, 0);
+        let (latest, _) = wire_symbols(
+            &fmp4_object(3, 4_000),
+            base_us + 1_040_000,
+            MediaPriority::VideoKey,
+            0,
+        );
         for symbol in &latest {
             dispatch.push(peers[0], symbol, 10).expect("latest object");
         }
@@ -3096,6 +3125,77 @@ mod tests {
         assert_eq!(dispatch.receiver().state().active_objects, 0);
         let counters = dispatch.receiver().snapshot().counters;
         assert_eq!(counters.expired_objects, 1);
+        assert_eq!(counters.deadline_drops, 1);
+    }
+
+    /// A symbol's deadline is its own claim. One that its stream has left
+    /// behind is dropped, and the object it names goes on assembling until
+    /// the stream leaves the object's announced deadline behind: a corrupt
+    /// deadline that passed the UDP checksum costs the datagram, not the
+    /// object.
+    #[test]
+    fn a_stale_symbol_does_not_end_an_assembly_its_announcement_keeps_fresh() {
+        let mut receiver =
+            RelayObjectReceiver::new(RelayObjectReceiverConfig::default()).expect("receiver");
+        receiver
+            .register_parent_session(parent(1, "primary-amsterdam", ParentPath::Primary))
+            .expect("primary");
+        let mut encoder = encoder();
+        let mut encode = |sequence: u64| {
+            encoder
+                .encode_object(
+                    &fmp4_object(sequence, 4_000),
+                    generation(),
+                    subscription(),
+                    MediaDeadline::from_micros(1_000_000_000 + sequence * 40_000),
+                    MediaPriority::VideoKey,
+                )
+                .expect("relay symbols")
+        };
+        let wire = |symbol: &relay_session::RelayDatagram| {
+            encode_datagram(symbol, RelayLimits::default()).expect("wire")
+        };
+        // Two objects decode: the stream's clock has its epoch and its head.
+        for sequence in 0..2 {
+            let encoded = encode(sequence);
+            receiver
+                .announce_object(1, encoded.announcement, 1_000)
+                .expect("announcement");
+            let mut complete = false;
+            for symbol in &encoded.source_symbols {
+                complete = matches!(
+                    receiver.push_wire_datagram(1, &wire(symbol), 1_100),
+                    Ok(RelayIngressOutcome::Decoded { .. })
+                );
+            }
+            assert!(complete, "object {sequence}");
+        }
+        let encoded = encode(2);
+        assert!(encoded.source_symbols.len() >= 3);
+        receiver
+            .announce_object(1, encoded.announcement.clone(), 1_200)
+            .expect("announcement");
+        assert!(matches!(
+            receiver.push_wire_datagram(1, &wire(&encoded.source_symbols[0]), 1_200),
+            Ok(RelayIngressOutcome::Buffered { .. })
+        ));
+        let mut corrupt = encoded.source_symbols[1].clone();
+        corrupt.deadline = MediaDeadline::from_micros(1);
+        assert!(matches!(
+            receiver.push_wire_datagram(1, &wire(&corrupt), 1_300),
+            Err(RelayIngressError::DeadlineExpired)
+        ));
+        assert_eq!(receiver.state().active_objects, 1);
+        let mut complete = false;
+        for symbol in &encoded.source_symbols[1..] {
+            complete = matches!(
+                receiver.push_wire_datagram(1, &wire(symbol), 1_400),
+                Ok(RelayIngressOutcome::Decoded { .. })
+            );
+        }
+        assert!(complete, "the object decodes");
+        let counters = receiver.snapshot().counters;
+        assert_eq!(counters.expired_objects, 0);
         assert_eq!(counters.deadline_drops, 1);
     }
 
