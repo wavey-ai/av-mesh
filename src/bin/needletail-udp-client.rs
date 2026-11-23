@@ -137,6 +137,14 @@ struct Args {
     /// UDP receive buffer in bytes.
     #[arg(long, default_value_t = 16 * 1024 * 1024)]
     receive_buffer_bytes: usize,
+    /// Wave 9 D: UDP GRO on the client's socket: an edge's GSO run of a 4K
+    /// part's symbols (or what the NIC's GRO joined) is one receive of up to
+    /// 64 KiB, cut into its datagrams here, instead of one receive and one
+    /// queue entry per symbol (at 300 Mbit/s a clip's loop point, 15 MB in
+    /// a quarter of a second, overflowed the client's 8 MB queue). `false`:
+    /// one datagram per receive, as before.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    gro: bool,
     /// Local address for the UDP socket.
     #[arg(long)]
     bind: Option<SocketAddr>,
@@ -808,8 +816,26 @@ fn enable_kernel_timestamps(socket: &UdpSocket) {
     };
 }
 
-/// Receive one datagram, with its sender and the kernel's receive time
-/// (Unix µs) when the socket gives one.
+/// Ask the kernel to keep a sender's run of equal datagrams together
+/// (UDP_GRO); a receive then says the size of each (see `recv_timestamped`).
+fn enable_gro(socket: &UdpSocket) {
+    use std::os::fd::AsRawFd;
+    let on: libc::c_int = 1;
+    // SAFETY: a valid fd and an int option of its size.
+    let _ = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_UDP,
+            libc::UDP_GRO,
+            (&on as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+}
+
+/// Receive one message, with its sender, the kernel's receive time (Unix
+/// µs) when the socket gives one, and with UDP GRO the size of each of the
+/// datagrams it carries (all but the last; None: one datagram).
 /// Whether a datagram waits on the socket (FIONREAD).
 fn datagrams_queued(socket: &UdpSocket) -> bool {
     use std::os::fd::AsRawFd;
@@ -822,12 +848,12 @@ fn datagrams_queued(socket: &UdpSocket) -> bool {
 async fn recv_timestamped(
     socket: &UdpSocket,
     buf: &mut [u8],
-) -> std::io::Result<(usize, SocketAddr, Option<u64>)> {
+) -> std::io::Result<(usize, SocketAddr, Option<u64>, Option<usize>)> {
     use std::os::fd::AsRawFd;
     socket
         .async_io(tokio::io::Interest::READABLE, || {
             let mut address: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-            let mut control = [0_u64; 8];
+            let mut control = [0_u64; 16];
             let mut iov = libc::iovec {
                 iov_base: buf.as_mut_ptr().cast(),
                 iov_len: buf.len(),
@@ -846,6 +872,7 @@ async fn recv_timestamped(
                 return Err(std::io::Error::last_os_error());
             }
             let mut kernel_us = None;
+            let mut segment = None;
             // SAFETY: the kernel filled msg_control with well-formed cmsg
             // headers up to msg_controllen; CMSG_* walk only inside it.
             unsafe {
@@ -862,6 +889,12 @@ async fn recv_timestamped(
                                 .saturating_mul(1_000_000)
                                 .saturating_add(time.tv_nsec as u64 / 1_000),
                         );
+                    } else if (*cmsg).cmsg_level == libc::SOL_UDP
+                        && (*cmsg).cmsg_type == libc::UDP_GRO
+                    {
+                        let size =
+                            std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::c_int>());
+                        segment = usize::try_from(size).ok();
                     }
                     cmsg = libc::CMSG_NXTHDR(&message, cmsg);
                 }
@@ -881,7 +914,7 @@ async fn recv_timestamped(
             .1
             .as_socket()
             .ok_or_else(|| std::io::Error::other("a datagram from no IP address"))?;
-            Ok((len as usize, peer, kernel_us))
+            Ok((len as usize, peer, kernel_us, segment))
         })
         .await
 }
@@ -900,6 +933,9 @@ async fn main() -> Result<()> {
     let socket = UdpSocket::bind(args.bind.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap())).await?;
     set_receive_buffer(&socket, args.receive_buffer_bytes);
     enable_kernel_timestamps(&socket);
+    if args.gro {
+        enable_gro(&socket);
+    }
 
     // Verification runs beside reception, with bounded concurrency.
     let (verify_tx, mut verify_rx) = mpsc::unbounded_channel::<VerifyJob>();
@@ -1217,6 +1253,9 @@ async fn main() -> Result<()> {
         flush(&socket, &mut outbox).await;
         startup.first_request_ms.get_or_insert(since_start(started));
 
+        // The datagrams of a GRO receive still to read: (next, end, size,
+        // sender, kernel time) in `buf`.
+        let mut pending: Option<(usize, usize, usize, SocketAddr, Option<u64>)> = None;
         loop {
             let now = Instant::now();
             if now >= deadline
@@ -1301,7 +1340,8 @@ async fn main() -> Result<()> {
                 }
             }
             let fallbacks = session.compact_fallbacks;
-            session.queued = args.nack_after_drain && datagrams_queued(&socket);
+            session.queued =
+                args.nack_after_drain && (pending.is_some() || datagrams_queued(&socket));
             let failed = session.poll(now, &mut |to, datagram| {
                 outbox.push((to, datagram.to_vec()))
             });
@@ -1320,15 +1360,28 @@ async fn main() -> Result<()> {
             let end = if draining { deadline + drain } else { deadline };
             let wake = end.min(session.next_wake());
             let wait = wake.saturating_duration_since(now);
-            let (len, peer, kernel_us) =
+            let (start, len, peer, kernel_us) = if let Some((next, end, size, peer, kernel)) =
+                pending.take()
+            {
+                let len = size.min(end - next);
+                if next + len < end {
+                    pending = Some((next + len, end, size, peer, kernel));
+                }
+                (next, len, peer, kernel)
+            } else {
                 match tokio::time::timeout(wait, recv_timestamped(&socket, &mut buf)).await {
-                    Ok(Ok(received)) => received,
+                    Ok(Ok((len, peer, kernel_us, Some(size)))) if size > 0 && size < len => {
+                        pending = Some((size, len, size, peer, kernel_us));
+                        (0, size, peer, kernel_us)
+                    }
+                    Ok(Ok((len, peer, kernel_us, _))) => (0, len, peer, kernel_us),
                     Ok(Err(_)) => continue,
                     Err(_) => continue,
-                };
+                }
+            };
             let dropped = session.short_header_dropped;
             let outcome =
-                session.on_datagram(peer, &buf[..len], Instant::now(), &mut |to, datagram| {
+                session.on_datagram(peer, &buf[start..start + len], Instant::now(), &mut |to, datagram| {
                     outbox.push((to, datagram.to_vec()))
                 });
             flush(&socket, &mut outbox).await;
@@ -1602,6 +1655,73 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use av_mesh::client_udp::{AssignedCache, Control};
+
+    /// Wave 9 D: with UDP GRO a sender's GSO run comes as one receive that
+    /// names its datagrams' size; without it, one datagram per receive. GRO
+    /// is on by default.
+    #[tokio::test]
+    async fn a_gro_receive_names_the_size_of_its_datagrams() {
+        use std::os::fd::AsRawFd;
+        let args = Args::parse_from([
+            "needletail-udp-client",
+            "--entry",
+            "https://127.0.0.1:19444",
+            "--stream",
+            "1",
+            "--tls-ca",
+            "/nonexistent",
+        ]);
+        assert!(args.gro);
+        for gro in [true, false] {
+            let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            enable_kernel_timestamps(&receiver);
+            if gro {
+                enable_gro(&receiver);
+            }
+            let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let size: libc::c_int = 1_316;
+            // SAFETY: a valid fd and an int option of its size.
+            let set = unsafe {
+                libc::setsockopt(
+                    sender.as_raw_fd(),
+                    libc::SOL_UDP,
+                    libc::UDP_SEGMENT,
+                    (&size as *const libc::c_int).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            if set != 0 {
+                eprintln!("UDP GSO is not available here");
+                return;
+            }
+            // Ten datagrams of 1,316 bytes and a last one of 500.
+            let payload: Vec<u8> = (0..13_660_u32).map(|byte| byte as u8).collect();
+            sender
+                .send_to(&payload, receiver.local_addr().unwrap())
+                .unwrap();
+            let mut buf = vec![0_u8; 65_536];
+            let mut got = Vec::new();
+            while got.len() < payload.len() {
+                let (len, peer, kernel_us, segment) = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    recv_timestamped(&receiver, &mut buf),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(peer, sender.local_addr().unwrap());
+                assert!(kernel_us.is_some());
+                if gro {
+                    assert_eq!((len, segment), (13_660, Some(1_316)));
+                } else {
+                    assert!(len == 1_316 || len == 500, "{len}");
+                    assert_eq!(segment, None);
+                }
+                got.extend_from_slice(&buf[..len]);
+            }
+            assert_eq!(got, payload);
+        }
+    }
 
     /// Wave 9 B: the assignment over UDP is repeated after 25 ms and then
     /// twice as long each time until answered; an answer to another request
