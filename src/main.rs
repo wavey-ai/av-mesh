@@ -18791,8 +18791,8 @@ struct AppRouter {
 }
 
 /// The candidates without the caches a moving client has just left (Phase
-/// AM item 10), unless that leaves none of the region's caches that serve
-/// readers: then the skip set is ignored, so that a client that has left
+/// AM item 10), unless that leaves none of the region's live caches that
+/// serve readers (fresh, not draining): then the skip set is ignored, so that a client that has left
 /// every edge of its region once (a region-wide stall) is assigned in its
 /// region again, not refused for good or sent out of it (wave 8 review).
 fn without_skipped(
@@ -18801,9 +18801,13 @@ fn without_skipped(
     region: &str,
 ) -> Vec<CacheCandidate> {
     let skipped = |cache: &CacheCandidate| skip.iter().any(|name| *name == cache.node_id);
-    let regional_left = candidates
-        .iter()
-        .any(|cache| cache.region == region && cache.serves_readers && !skipped(cache));
+    let regional_left = candidates.iter().any(|cache| {
+        cache.region == region
+            && cache.serves_readers
+            && cache.fresh
+            && !cache.draining
+            && !skipped(cache)
+    });
     if !regional_left {
         return candidates;
     }
