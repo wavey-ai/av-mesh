@@ -27,6 +27,7 @@ use av_mesh::relay_ingress::{
     is_relay_datagram, PeerAdmission, RelayIngressError, RelayIngressOutcome, RelayIngressSnapshot,
     RelayUdpDispatch, RelayUdpDispatchOutcome,
 };
+use av_mesh::stall_journal::{self, StallKind, StallThread};
 use av_mesh::udp_fec::UdpFecReceiver;
 use bytes::Bytes;
 use media_object::ObjectKey;
@@ -283,6 +284,58 @@ impl FastPlaneStats {
             self.loop_gap_max_us[index].fetch_max(gap_us, Ordering::Relaxed);
         }
     }
+}
+
+/// The fast plane's lines of the stall journal (D1). Each is given a
+/// duration that its caller has measured anyway; under the kind's threshold
+/// it is that comparison and nothing else, and at the threshold an event
+/// (`stall_journal::note`). A class thread's events carry its page faults
+/// since its once-a-second reading (`FastPlaneStats::thread_faults`).
+#[inline]
+fn stall_line(stats: &FastPlaneStats, kind: StallKind, class: TrafficClass, dur_us: u64) {
+    let thread = match class {
+        TrafficClass::Audio => StallThread::Audio,
+        TrafficClass::Video => StallThread::Video,
+    };
+    let faults = &stats.thread_faults[class.index()];
+    stall_journal::note(kind, thread, dur_us, Some(faults));
+}
+
+/// `class_pass`: a pass of a class thread's loop.
+#[inline]
+fn stall_pass(stats: &FastPlaneStats, class: TrafficClass, busy_us: u64) {
+    stall_line(stats, StallKind::ClassPass, class, busy_us);
+}
+
+/// `class_gap`: the time between two data-bearing wakes.
+#[inline]
+fn stall_gap(stats: &FastPlaneStats, class: TrafficClass, gap_us: Option<u64>) {
+    stall_line(stats, StallKind::ClassGap, class, gap_us.unwrap_or(0));
+}
+
+/// `rx_late`: how long the oldest datagram of a batch (its first) waited
+/// between its kernel stamp and the drain.
+#[inline]
+fn stall_rx(stats: &FastPlaneStats, class: TrafficClass, message: usize, waited_us: u64) {
+    if message == 0 {
+        stall_line(stats, StallKind::RxLate, class, waited_us);
+    }
+}
+
+/// `send_slow`: one `sendmmsg` of a class thread.
+#[inline]
+fn stall_send(stats: &FastPlaneStats, class: TrafficClass, took_us: u64) {
+    stall_line(stats, StallKind::SendSlow, class, took_us);
+}
+
+/// `tee_lag`: how long after its batch's wake an item reached the tee.
+#[inline]
+fn stall_tee(class: TrafficClass, lag_us: u64) {
+    let thread = match class {
+        TrafficClass::Audio => StallThread::TeeAudio,
+        TrafficClass::Video => StallThread::TeeVideo,
+    };
+    stall_journal::note(StallKind::TeeLag, thread, lag_us, None);
 }
 
 /// What `/api/mesh` reports of the fast plane.
@@ -616,6 +669,7 @@ fn send_lease_plan(
             let send = &sends[index];
             (batch.data(usize::from(send.message)), target(send))
         };
+        let started = Instant::now();
         let mut sent = None;
         if use_gso {
             match sys::send_gso_batch(fd, sends.len(), message) {
@@ -643,6 +697,7 @@ fn send_lease_plan(
             Some(sent) => sent,
             None => sys::send_batch(fd, sends.len(), message).unwrap_or(0),
         };
+        stall_send(stats, class, started.elapsed().as_micros() as u64);
         let sent_us = now_unix_us();
         for send in &sends[..sent] {
             first[usize::from(send.message)].get_or_insert((target(send), sent_us));
@@ -876,6 +931,7 @@ impl RelayDownstreamForwarder {
             };
             let sent_us = now_unix_us();
             let elapsed = started.elapsed();
+            stall_send(stats, class, elapsed.as_micros() as u64);
             let (mut sources, mut repairs, mut bytes) = (0_u64, 0_u64, 0_u64);
             for send in &sends[..sent] {
                 bytes += batch.data(usize::from(send.message)).len() as u64;
@@ -1241,6 +1297,8 @@ impl ClassThread {
                     woke.elapsed().as_micros() as u64,
                     gap_us,
                 );
+                stall_pass(&self.stats, self.class, woke.elapsed().as_micros() as u64);
+                stall_gap(&self.stats, self.class, gap_us);
             }
             if faults_read_at.elapsed() >= Duration::from_secs(1) {
                 faults_read_at = Instant::now();
@@ -1378,6 +1436,7 @@ impl ClassThread {
                 }
             }
             let rx_us = received.kernel_us.unwrap_or(now_us);
+            stall_rx(&self.stats, class, message, now_us.saturating_sub(rx_us));
             let unchecked = Pending {
                 message,
                 peer,
@@ -1743,6 +1802,7 @@ impl Tee {
         #[cfg(test)]
         assert!(!self.panic_on_item, "test: the tee panics");
         let started = Instant::now();
+        stall_tee(self.class, now_unix_us().saturating_sub(item.woken_us));
         match item.kind {
             TeeKind::Admitted {
                 forwarded,
@@ -2234,5 +2294,91 @@ mod loop_lag_tests {
         assert_eq!(snapshot.audio_loop_gap_max_us, 9_000);
         assert_eq!(snapshot.video_loop_busy_over_50ms, 1);
         assert_eq!(snapshot.video_loop_gap_max_us, 70_000);
+    }
+}
+
+#[cfg(test)]
+mod stall_tests {
+    use super::*;
+    use av_mesh::stall_journal::{StallEvent, StallJournal};
+
+    /// The journal of the test process. Other tests' fast-plane threads
+    /// record into it too when the machine stalls under them.
+    fn journal() -> &'static Arc<StallJournal> {
+        stall_journal::install(Arc::new(StallJournal::new("fast-plane-tests", 4_096)))
+    }
+
+    #[test]
+    fn the_fast_plane_s_lines_reach_the_stall_journal_at_their_thresholds() {
+        let journal = journal();
+        let stats = FastPlaneStats::default();
+        // Durations that no real event has: an hour and more.
+        const MARK: u64 = 3_600_000_000;
+        stall_pass(&stats, TrafficClass::Audio, MARK + 1);
+        stall_gap(&stats, TrafficClass::Video, Some(MARK + 2));
+        stall_rx(&stats, TrafficClass::Audio, 0, MARK + 3);
+        // Not the oldest datagram of its batch.
+        stall_rx(&stats, TrafficClass::Audio, 1, MARK + 4);
+        stall_send(&stats, TrafficClass::Video, MARK + 5);
+        stall_tee(TrafficClass::Video, MARK + 6);
+        stall_tee(TrafficClass::Audio, MARK + 7);
+        // Under their thresholds, and a pass with no gap before it.
+        stall_pass(&stats, TrafficClass::Audio, stall_journal::CLASS_PASS_US - 1);
+        stall_gap(&stats, TrafficClass::Audio, None);
+        let events: Vec<StallEvent> = journal
+            .query(None)
+            .events
+            .iter()
+            .map(|line| line.event)
+            .filter(|event| event.dur_us > MARK)
+            .collect();
+        let mut marked: Vec<(u64, StallKind, StallThread)> = events
+            .iter()
+            .map(|event| (event.dur_us - MARK, event.kind, event.thread))
+            .collect();
+        marked.sort_unstable_by_key(|(mark, _, _)| *mark);
+        assert_eq!(
+            marked,
+            vec![
+                (1, StallKind::ClassPass, StallThread::Audio),
+                (2, StallKind::ClassGap, StallThread::Video),
+                (3, StallKind::RxLate, StallThread::Audio),
+                (5, StallKind::SendSlow, StallThread::Video),
+                (6, StallKind::TeeLag, StallThread::TeeVideo),
+                (7, StallKind::TeeLag, StallThread::TeeAudio),
+            ]
+        );
+        assert!(journal.snapshot().rx_late_max_us >= MARK + 3);
+    }
+
+    /// What the journal's lines cost a class thread while nothing stalls:
+    /// the lines of one pass that drained a batch of eight datagrams and
+    /// sent it to compiled and lease children, as `run`, `drain`,
+    /// `send_fast_plan` and `send_lease_plan` hold them.
+    #[test]
+    fn a_quiet_pass_pays_the_journal_three_clock_readings() {
+        journal();
+        let stats = FastPlaneStats::default();
+        let class = TrafficClass::Audio;
+        const PASSES: u32 = 100_000;
+        let mut best_ns = f64::MAX;
+        for _ in 0..30 {
+            let began = Instant::now();
+            for _ in 0..PASSES {
+                let woke = std::hint::black_box(began);
+                for message in 0..8 {
+                    stall_rx(&stats, class, message, std::hint::black_box(150));
+                }
+                stall_send(&stats, class, std::hint::black_box(30));
+                let started = Instant::now();
+                stall_send(&stats, class, started.elapsed().as_micros() as u64);
+                stall_pass(&stats, class, woke.elapsed().as_micros() as u64 % 1_000);
+                stall_gap(&stats, class, std::hint::black_box(Some(1_000)));
+            }
+            best_ns = best_ns.min(began.elapsed().as_nanos() as f64 / f64::from(PASSES));
+        }
+        eprintln!("the stall journal's lines of a quiet pass of 8 datagrams: {best_ns:.1} ns");
+        let bound_ns = if cfg!(debug_assertions) { 5_000.0 } else { 500.0 };
+        assert!(best_ns < bound_ns, "{best_ns:.1} ns a pass");
     }
 }

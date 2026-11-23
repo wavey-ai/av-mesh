@@ -6,6 +6,7 @@ pub mod load;
 pub mod load_assign;
 pub mod relay_ingress;
 pub mod replication;
+pub mod stall_journal;
 pub mod subscribe_authorization;
 pub mod synchronized_stem_subscribe;
 pub mod talkback_lane;
