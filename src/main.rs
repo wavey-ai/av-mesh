@@ -33397,6 +33397,12 @@ mod tests {
                     shutdown_rx,
                 ));
                 let client = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                // A client's receive buffer, as needletail-udp-client asks
+                // for: this one never NACKs, and with the default 208 KB
+                // (under two 70 KB 4K parts of symbols) a loaded host's
+                // stall of its task lost parts that the edge had sent
+                // (every datagram, cut through: wave 8 stage 3).
+                let _ = SockRef::from(&*client).set_recv_buffer_size(4 << 20);
                 let subscribe = |token| {
                     Control::Subscribe {
                         stream_id,
@@ -33482,9 +33488,27 @@ mod tests {
                     .unwrap_or(-1.0);
                 let mut latencies: Vec<f64> = Vec::new();
                 for part in 1..=parts {
-                    let (at, payload) = arrived
-                        .get(&part)
-                        .unwrap_or_else(|| panic!("{name}: part {part} did not arrive"));
+                    let (at, payload) = arrived.get(&part).unwrap_or_else(|| {
+                        let load = |value: &AtomicU64| value.load(Ordering::Relaxed);
+                        panic!(
+                            "{name}: part {part} did not arrive ({} of {parts} did; edge: parts {} \
+                             datagrams {} cut-through parts {} datagrams {} fallbacks {} queue drops {} \
+                             would_block {} send queue drops {} playout skipped {} holes past playout {} \
+                             gaps {})",
+                            arrived.len(),
+                            load(&stats.parts),
+                            load(&stats.datagrams),
+                            load(&stats.cut_through_parts),
+                            load(&stats.cut_through_datagrams),
+                            load(&stats.cut_through_fallbacks),
+                            load(&stats.cut_through_queue_drops),
+                            load(&stats.would_block),
+                            load(&stats.send_queue_drops),
+                            load(&stats.playout_skipped_parts),
+                            load(&stats.holes_past_playout),
+                            load(&stats.gaps),
+                        )
+                    });
                     assert_eq!(
                         payload.as_ref(),
                         media(part).as_slice(),
