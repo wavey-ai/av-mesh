@@ -1202,7 +1202,9 @@ struct CpuSecond {
 }
 
 /// Start one tick thread for each CPU that the calling thread may run on,
-/// named `needletail-tick-<cpu>` and pinned to it where the host allows.
+/// named `nt-tick-<cpu>` (a kernel thread name holds 15 bytes, so a longer
+/// prefix would give every tick thread one name) and pinned to it where the
+/// host allows.
 /// None with a zero period, a journal that keeps nothing, or off Linux.
 pub fn spawn_ticks(journal: &Arc<StallJournal>, config: TickConfig) -> TickThreads {
     let stop = Arc::new(AtomicBool::new(false));
@@ -1228,7 +1230,7 @@ pub fn spawn_ticks(journal: &Arc<StallJournal>, config: TickConfig) -> TickThrea
         // A thread that cannot start leaves its CPU without a tick thread:
         // the count of threads says so.
         if let Ok(handle) = std::thread::Builder::new()
-            .name(format!("needletail-tick-{cpu}"))
+            .name(format!("nt-tick-{cpu}"))
             .spawn(move || tick.run(started))
         {
             handles.push(handle);
@@ -2825,6 +2827,13 @@ mod tests {
                         ..TickConfig::every(1_000)
                     },
                 );
+                // Each thread's kernel name says its CPU (`ps -L`, `top -H`).
+                for thread in ticks.threads() {
+                    let comm =
+                        std::fs::read_to_string(format!("/proc/self/task/{}/comm", thread.tid))
+                            .unwrap();
+                    assert_eq!(comm.trim_end(), format!("nt-tick-{}", thread.cpu));
+                }
                 std::thread::sleep(Duration::from_millis(2_400));
                 ticks.stop();
                 let report = journal.query(None);
