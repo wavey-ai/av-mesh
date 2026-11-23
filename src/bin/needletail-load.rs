@@ -24,6 +24,7 @@ use anyhow::{bail, Context, Result};
 use av_mesh::client_compact::NackTiming;
 use av_mesh::client_session::SessionConfig;
 use av_mesh::load::{parse_ramp, run, LoadConfig};
+use av_mesh::load_assign::AssignConfig;
 use clap::Parser;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
@@ -37,11 +38,54 @@ use std::time::Duration;
     about = "Simulated UDP listeners of a Needletail stream, thousands per host"
 )]
 struct Args {
-    /// The edges' client UDP ports, `host:port,...`: listener i starts at
-    /// edge i mod n, and moves to the next edge when its edge says `MOVE`
-    /// or `REFUSED`, does not answer, or goes silent.
-    #[arg(long, value_delimiter = ',', required = true)]
+    /// The edges' client UDP ports, `host:port,...`. Without --entry,
+    /// listener i starts at edge i mod n; a listener that must move (its
+    /// edge says `MOVE` or `REFUSED`, does not answer, or goes silent) goes
+    /// to the edge that rendezvous of its session picks among those it has
+    /// not left in the last --skip-ms (--move-rule next: the next edge of
+    /// the list, as before). With --entry, the fallback when no entry point
+    /// answers.
+    #[arg(long, value_delimiter = ',')]
     edges: Vec<String>,
+    /// Phase AM item 10: entry points of the region, `https://host:port`,
+    /// any node of it (comma list): each listener asks one
+    /// (`/api/assignment`, its own session id) where to subscribe when it
+    /// starts and each time it moves, as needletail-udp-client does, and
+    /// takes the first cache of the answer that it has not left in the
+    /// last --skip-ms (a failover region's entry point, Phase AM item 11,
+    /// once its region is lost).
+    #[arg(long, value_delimiter = ',')]
+    entry: Vec<String>,
+    /// PEM file of the nodes' certificate authority (with --entry).
+    #[arg(long)]
+    tls_ca: Option<PathBuf>,
+    /// TLS server name of the nodes, when it is not their address.
+    #[arg(long)]
+    server_name: Option<String>,
+    /// Client UDP port of the caches when the entry point names none.
+    #[arg(long)]
+    udp_port: Option<u16>,
+    /// Assignment requests in flight at most, and an entry point's time to
+    /// answer (ms) before the next is asked.
+    #[arg(long, default_value_t = 256)]
+    assign_in_flight: usize,
+    #[arg(long, default_value_t = 2_000)]
+    assign_timeout_ms: u64,
+    /// A moving listener does not go back to an edge it left within this.
+    #[arg(long, default_value_t = 30_000)]
+    skip_ms: u64,
+    /// A listener with no part for this long counts as stranded.
+    #[arg(long, default_value_t = 5_000)]
+    stranded_ms: u64,
+    /// Where a listener moves without an assignment: `rendezvous` (of its
+    /// session over the edges not left) or `next` (the next edge of
+    /// --edges, as before).
+    #[arg(long, default_value = "rendezvous")]
+    move_rule: String,
+    /// Session ids are `<prefix>-<listener>` (by default the label, or
+    /// `load-<pid>`).
+    #[arg(long)]
+    sid_prefix: Option<String>,
     #[arg(long)]
     stream: u64,
     /// Listeners for the whole run (when --ramp is not given).
@@ -184,9 +228,20 @@ fn config(args: &Args) -> Result<LoadConfig> {
         .filter(|edge| !edge.trim().is_empty())
         .map(|edge| resolve(edge.trim()))
         .collect::<Result<Vec<_>>>()?;
-    if edges.is_empty() {
-        bail!("--edges names no edge");
+    let entries: Vec<String> = args
+        .entry
+        .iter()
+        .map(|entry| entry.trim().trim_end_matches('/').to_owned())
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    if edges.is_empty() && entries.is_empty() {
+        bail!("--edges or --entry must name the edges or an entry point");
     }
+    let rendezvous_moves = match args.move_rule.as_str() {
+        "rendezvous" => true,
+        "next" => false,
+        other => bail!("--move-rule {other:?}: rendezvous or next"),
+    };
     if args.settle_parts == 0 || args.settle_parts >= 4_096 {
         bail!("--settle-parts must be 1 to 4095");
     }
@@ -241,6 +296,28 @@ fn config(args: &Args) -> Result<LoadConfig> {
     config.progress = !args.quiet;
     config.label = args.label.clone();
     config.coalesce = Duration::from_micros(args.coalesce_us);
+    config.skip_for = Duration::from_millis(args.skip_ms);
+    config.stranded_after = Duration::from_millis(args.stranded_ms);
+    config.rendezvous_moves = rendezvous_moves;
+    config.sid_prefix = args.sid_prefix.clone().unwrap_or_else(|| {
+        args.label
+            .clone()
+            .unwrap_or_else(|| format!("load-{}", std::process::id()))
+    });
+    if !entries.is_empty() {
+        let Some(tls_ca) = args.tls_ca.clone() else {
+            bail!("--entry needs --tls-ca");
+        };
+        config.assign = Some(AssignConfig {
+            entries,
+            stream_id: args.stream,
+            tls_ca,
+            server_name: args.server_name.clone(),
+            udp_port: args.udp_port,
+            in_flight: args.assign_in_flight.max(1),
+            timeout: Duration::from_millis(args.assign_timeout_ms.max(1)),
+        });
+    }
     Ok(config)
 }
 
@@ -365,6 +442,55 @@ mod tests {
         assert_eq!(config.session.silence, Duration::from_millis(1_000));
         assert!(!config.session.compact_retry);
         assert!(config.session.drop_early_parts);
+    }
+
+    #[test]
+    fn the_phase_am_flags_ask_the_entry_points_and_move_by_rendezvous() {
+        let args = Args::try_parse_from([
+            "needletail-load",
+            "--stream",
+            "4001",
+            "--entry",
+            "https://10.80.1.1:19444/,https://10.80.1.2:19444",
+            "--tls-ca",
+            "ca.crt",
+            "--server-name",
+            "local.wavey.ai",
+            "--label",
+            "lon-1",
+        ])
+        .unwrap();
+        let config = config(&args).unwrap();
+        let assign = config.assign.as_ref().expect("assignment");
+        assert_eq!(
+            assign.entries,
+            vec!["https://10.80.1.1:19444", "https://10.80.1.2:19444"]
+        );
+        assert_eq!(assign.server_name.as_deref(), Some("local.wavey.ai"));
+        assert!(config.edges.is_empty());
+        assert!(config.rendezvous_moves);
+        assert_eq!(config.skip_for, Duration::from_secs(30));
+        assert_eq!(config.stranded_after, Duration::from_secs(5));
+        assert_eq!(config.sid_prefix, "lon-1");
+        // --entry needs the CA; neither edges nor an entry is an error.
+        assert!(config_of(&["needletail-load", "--stream", "1", "--entry", "https://a:1"]).is_err());
+        assert!(config_of(&["needletail-load", "--stream", "1"]).is_err());
+        // The rule of before: the next edge of the list.
+        let config = config_of(&[
+            "needletail-load",
+            "--stream",
+            "1",
+            "--edges",
+            "127.0.0.1:1",
+            "--move-rule",
+            "next",
+        ])
+        .unwrap();
+        assert!(!config.rendezvous_moves && config.assign.is_none());
+    }
+
+    fn config_of(argv: &[&str]) -> Result<LoadConfig> {
+        config(&Args::try_parse_from(argv).unwrap())
     }
 
     fn config_ramp(args: &Args) -> Vec<(Duration, usize)> {

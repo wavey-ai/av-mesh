@@ -25,9 +25,11 @@
 
 use crate::client_session::{Received, SessionConfig, UdpSession};
 use crate::client_udp::ObjectKind;
+use crate::load_assign::{rendezvous, AssignConfig, AssignedCache, ResolveAnswer, ResolveRequest, Resolver};
 use serde_json::{json, Map, Value};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::{BTreeMap, BinaryHeap, VecDeque};
+use std::sync::Mutex;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::os::fd::AsRawFd;
@@ -232,6 +234,30 @@ pub struct Counters {
     pub ttok: Histogram,
     /// Kernel receive timestamp to processing, µs: the load host's own lag.
     pub recv_lag: Histogram,
+    /// Phase AM item 10. Moves away from this edge (`moves` counts those
+    /// that came to it), by reason; the time from a moving listener's last
+    /// part on its old edge to its first part on the new one (µs, booked
+    /// on the new edge); the parts lost in moves (missing between the two)
+    /// and every missing part of a listener that has moved, both booked on
+    /// the edge the listener is on when the part settles.
+    pub moves_out: u64,
+    pub moves_by_reason: BTreeMap<String, u64>,
+    pub time_to_move: Histogram,
+    pub move_lost: u64,
+    pub missing_moved: u64,
+    /// Gauges: listeners with no part for `stranded_after` (5 s), and moved
+    /// listeners still waiting for their first part on their new edge. At
+    /// the end, `never_resumed`: moved listeners that never had one.
+    pub stranded: u64,
+    pub resuming: u64,
+    pub never_resumed: u64,
+    /// Assignment (`/api/assignment`, Phase AM item 10): answers, their
+    /// time (µs), failures (no entry point answered), and listeners placed
+    /// by rendezvous over the known edges for want of an answer.
+    pub assignments: u64,
+    pub assignment_errors: u64,
+    pub assignment_time: Histogram,
+    pub fallbacks: u64,
 }
 
 impl Counters {
@@ -264,6 +290,20 @@ impl Counters {
         self.ttfp.merge(&other.ttfp);
         self.ttok.merge(&other.ttok);
         self.recv_lag.merge(&other.recv_lag);
+        self.moves_out += other.moves_out;
+        for (reason, count) in &other.moves_by_reason {
+            *self.moves_by_reason.entry(reason.clone()).or_default() += count;
+        }
+        self.time_to_move.merge(&other.time_to_move);
+        self.move_lost += other.move_lost;
+        self.missing_moved += other.missing_moved;
+        self.stranded += other.stranded;
+        self.resuming += other.resuming;
+        self.never_resumed += other.never_resumed;
+        self.assignments += other.assignments;
+        self.assignment_errors += other.assignment_errors;
+        self.assignment_time.merge(&other.assignment_time);
+        self.fallbacks += other.fallbacks;
     }
 
     /// Missing over all the parts that were due (received, missing, gaps).
@@ -303,11 +343,29 @@ impl Counters {
             "ttok_ms": self.ttok.summary_ms(),
             "recv_lag_ms": self.recv_lag.summary_ms(),
         });
+        self.am10_json(&mut value);
         if gauges {
             value["active"] = json!(self.active);
             value["up"] = json!(self.up);
+            value["stranded"] = json!(self.stranded);
+            value["resuming"] = json!(self.resuming);
         }
         value
+    }
+
+    /// The Phase AM item 10 counters, into `value`. The time to move has
+    /// its buckets, so that a window of intervals merges.
+    fn am10_json(&self, value: &mut Value) {
+        value["moves_out"] = json!(self.moves_out);
+        value["moves_by_reason"] = json!(self.moves_by_reason);
+        value["time_to_move_ms"] = self.time_to_move.summary_with_buckets();
+        value["move_lost"] = json!(self.move_lost);
+        value["missing_moved"] = json!(self.missing_moved);
+        value["never_resumed"] = json!(self.never_resumed);
+        value["assignments"] = json!(self.assignments);
+        value["assignment_errors"] = json!(self.assignment_errors);
+        value["assignment_ms"] = self.assignment_time.summary_ms();
+        value["fallbacks"] = json!(self.fallbacks);
     }
 }
 
@@ -340,7 +398,16 @@ struct PartTrack {
     /// The last far part (and whether it was a gap), until the next part
     /// confirms the jump or a near part shows it was a stray.
     jump: Option<(u64, bool)>,
+    /// Phase AM item 10: the part from which the listener had moved (its
+    /// missing parts are a moved listener's), and the parts of its recent
+    /// moves (from the part after its last on the old edge to its first on
+    /// the new one; open until that comes).
+    moved_from: Option<u64>,
+    windows: VecDeque<(u64, u64)>,
 }
+
+/// Moves whose parts a listener keeps track of.
+const MOVE_WINDOWS: usize = 8;
 
 impl PartTrack {
     fn new() -> Box<Self> {
@@ -351,7 +418,27 @@ impl PartTrack {
             got: [0; TRACK_WORDS],
             gap: [0; TRACK_WORDS],
             jump: None,
+            moved_from: None,
+            windows: VecDeque::new(),
         })
+    }
+
+    /// The listener leaves its edge: the parts from the next one on are a
+    /// moved listener's, and those until it resumes are the move's.
+    fn move_begins(&mut self) {
+        let from = self.highest.map_or(self.next_settle, |highest| highest + 1);
+        self.moved_from.get_or_insert(from);
+        if self.windows.len() == MOVE_WINDOWS {
+            self.windows.pop_front();
+        }
+        self.windows.push_back((from, u64::MAX));
+    }
+
+    /// The first part on the new edge closes the open moves.
+    fn move_ends(&mut self, part: u64) {
+        for window in self.windows.iter_mut().filter(|window| window.1 == u64::MAX) {
+            window.1 = part.max(window.0);
+        }
     }
 
     fn set(&mut self, part: u64, gap: bool) {
@@ -377,6 +464,10 @@ impl PartTrack {
         self.start = Some(first);
         self.next_settle = first;
         self.highest = None;
+        self.windows.clear();
+        if self.moved_from.is_some() {
+            self.moved_from = Some(first);
+        }
     }
 
     fn settle(&mut self, upto: u64, counters: &mut Counters) {
@@ -388,12 +479,24 @@ impl PartTrack {
                     counters.gaps += 1;
                 } else {
                     counters.missing += 1;
+                    if self.moved_from.is_some_and(|from| part >= from) {
+                        counters.missing_moved += 1;
+                    }
+                    if self
+                        .windows
+                        .iter()
+                        .any(|(from, to)| *from <= part && part < *to)
+                    {
+                        counters.move_lost += 1;
+                    }
                 }
             }
             self.got[word] &= !bit;
             self.gap[word] &= !bit;
             self.next_settle += 1;
         }
+        let settled = self.next_settle;
+        self.windows.retain(|(_, to)| *to > settled);
     }
 
     fn mark(&mut self, part: u64, gap: bool, settle_parts: u64, counters: &mut Counters) -> Mark {
@@ -495,6 +598,21 @@ pub struct LoadConfig {
     /// at once). With kernel timestamps the latency measured is the same;
     /// timers (NACKs, refreshes) run up to this late.
     pub coalesce: Duration,
+    /// Phase AM item 10: ask these entry points (`/api/assignment`) where
+    /// each listener subscribes, at its start and at each move, as
+    /// needletail-udp-client does; `edges` (may be empty) are the fallback.
+    /// `None`: the static `edges` alone, as before.
+    pub assign: Option<AssignConfig>,
+    /// A moving listener does not go back to an edge it left within this.
+    pub skip_for: Duration,
+    /// A listener with no part for this long is stranded.
+    pub stranded_after: Duration,
+    /// Without assignment, or when no entry point answers: rendezvous of
+    /// the listener's session over the known edges not skipped (`true`),
+    /// or the next edge of the list (`false`, as before).
+    pub rendezvous_moves: bool,
+    /// Session ids, `<prefix>-<listener>` (the CMCD `sid` of assignment).
+    pub sid_prefix: String,
 }
 
 impl LoadConfig {
@@ -525,6 +643,11 @@ impl LoadConfig {
             progress: false,
             stop: None,
             coalesce: Duration::ZERO,
+            assign: None,
+            skip_for: Duration::from_secs(30),
+            stranded_after: Duration::from_secs(5),
+            rendezvous_moves: true,
+            sid_prefix: "load".into(),
         }
     }
 
@@ -756,7 +879,26 @@ struct Seen {
 
 struct Listener {
     index: usize,
+    /// The edge in the book that its counters go to.
     edge: usize,
+    /// Phase AM item 10: its session id, its edge's node, the edges it
+    /// left (not taken again until the time), where it is being sent (an
+    /// assignment asked), its last part, the last part before a move that
+    /// has not resumed yet, whether it ever moved, the caches of its
+    /// region (the last answer) and a failover entry to ask.
+    sid: String,
+    node: Option<String>,
+    skip: Vec<(String, Instant)>,
+    resolving: Option<Resolving>,
+    generation: u32,
+    last_part_at: Option<Instant>,
+    move_from: Option<Instant>,
+    region: Vec<String>,
+    failover: Option<String>,
+    entry: Option<String>,
+    /// When it last asked where to go: a listener that every edge
+    /// refuses asks at most every ROUTE_GAP, not at the round trip's pace.
+    routed_at: Option<Instant>,
     socket: UdpSocket,
     session: UdpSession,
     started: Instant,
@@ -768,6 +910,358 @@ struct Listener {
     overflows: u32,
     highest_at_end: Option<u64>,
     arrivals: Option<BTreeMap<u64, (u64, usize, u64, u64)>>,
+}
+
+/// An assignment asked for a listener, or a retry of one due.
+struct Resolving {
+    reason: String,
+    deadline: Instant,
+    retry_at: Option<Instant>,
+}
+
+/// Every edge that the listeners use, by index (the counters' order): the
+/// static ones first ("unassigned" before them with assignment), then the
+/// ones that answers name, as they come.
+pub(crate) struct EdgeBook {
+    edges: Mutex<Vec<BookEdge>>,
+    unassigned: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BookEdge {
+    addr: Option<SocketAddr>,
+    node: Option<String>,
+}
+
+impl BookEdge {
+    /// The name of its counters: its address, as the static list gives it.
+    fn name(&self) -> String {
+        self.addr
+            .map_or_else(|| "unassigned".to_owned(), |addr| addr.to_string())
+    }
+}
+
+impl EdgeBook {
+    fn new(edges: &[SocketAddr], unassigned: bool) -> Self {
+        let mut list = Vec::new();
+        if unassigned {
+            list.push(BookEdge {
+                addr: None,
+                node: None,
+            });
+        }
+        list.extend(edges.iter().map(|addr| BookEdge {
+            addr: Some(*addr),
+            node: None,
+        }));
+        Self {
+            edges: Mutex::new(list),
+            unassigned: unassigned.then_some(0),
+        }
+    }
+
+    /// The index of the edge at `addr` (added if new), naming its node.
+    fn index(&self, addr: SocketAddr, node: &str) -> usize {
+        let mut edges = self.edges.lock().unwrap();
+        if let Some(index) = edges.iter().position(|edge| edge.addr == Some(addr)) {
+            edges[index].node.get_or_insert_with(|| node.to_owned());
+            return index;
+        }
+        edges.push(BookEdge {
+            addr: Some(addr),
+            node: Some(node.to_owned()),
+        });
+        edges.len() - 1
+    }
+
+    fn snapshot(&self) -> Vec<BookEdge> {
+        self.edges.lock().unwrap().clone()
+    }
+}
+
+/// `counters` long enough for edge `index`.
+fn ensure(counters: &mut Vec<Counters>, index: usize) {
+    if counters.len() <= index {
+        counters.resize_with(index + 1, Counters::default);
+    }
+}
+
+/// Add `from` into `into`, edge by edge.
+fn merge_edges(into: &mut Vec<Counters>, from: &[Counters]) {
+    if into.len() < from.len() {
+        into.resize_with(from.len(), Counters::default);
+    }
+    for (sum, counters) in into.iter_mut().zip(from) {
+        sum.merge(counters);
+    }
+}
+
+/// How long a listener waits for an assignment before it falls back.
+const ASSIGN_WAIT_EXTRA: Duration = Duration::from_secs(1);
+/// After a failed assignment with no edge to fall back to, the next try.
+const ASSIGN_RETRY: Duration = Duration::from_millis(500);
+/// A listener asks where to go at most this often.
+const ROUTE_GAP: Duration = Duration::from_millis(100);
+
+/// What a worker needs to place its listeners (Phase AM item 10).
+struct Placing<'a> {
+    config: &'a LoadConfig,
+    book: &'a EdgeBook,
+    resolver: Option<&'a Resolver>,
+    worker: usize,
+    next_generation: &'a mut u32,
+}
+
+impl Placing<'_> {
+    /// Listener `slot` must leave its edge for `reason`: count it, keep
+    /// away from the edge (and from the whole region for `region-lost`),
+    /// and send it on.
+    fn begin_move(
+        &mut self,
+        listener: &mut Listener,
+        slot: usize,
+        counters: &mut Vec<Counters>,
+        reason: &str,
+        now: Instant,
+    ) {
+        if listener.resolving.is_some() {
+            return;
+        }
+        ensure(counters, listener.edge);
+        let edge = &mut counters[listener.edge];
+        edge.moves_out += 1;
+        *edge.moves_by_reason.entry(reason.to_owned()).or_default() += 1;
+        let until = now + self.config.skip_for;
+        if let Some(node) = listener.node.clone() {
+            listener.skip.push((node, until));
+        }
+        if reason.starts_with("region-lost") {
+            let region = std::mem::take(&mut listener.region);
+            listener.skip.extend(region.into_iter().map(|node| (node, until)));
+            if listener.entry.is_none() {
+                listener.entry = listener.failover.clone();
+            }
+        }
+        if listener.move_from.is_none() {
+            listener.move_from = Some(listener.last_part_at.unwrap_or(listener.started));
+        }
+        listener.track.move_begins();
+        self.route(listener, slot, counters, reason, now);
+    }
+
+    /// Send listener `slot` on: ask for an assignment, or choose from the
+    /// known edges (no assignment configured).
+    fn route(
+        &mut self,
+        listener: &mut Listener,
+        slot: usize,
+        counters: &mut Vec<Counters>,
+        reason: &str,
+        now: Instant,
+    ) {
+        listener.skip.retain(|(_, until)| *until > now);
+        if let Some(at) = listener.routed_at.filter(|at| now < *at + ROUTE_GAP) {
+            // Again so soon (every edge refuses it): a little later.
+            let retry = at + ROUTE_GAP;
+            listener.resolving = Some(Resolving {
+                reason: reason.to_owned(),
+                deadline: retry + Duration::from_secs(1),
+                retry_at: Some(retry),
+            });
+            listener.scheduled = retry;
+            return;
+        }
+        listener.routed_at = Some(now);
+        if let (Some(resolver), Some(assign)) = (self.resolver, self.config.assign.as_ref()) {
+            *self.next_generation = self.next_generation.wrapping_add(1);
+            listener.generation = *self.next_generation;
+            let deadline = now + assign.timeout + ASSIGN_WAIT_EXTRA;
+            listener.resolving = Some(Resolving {
+                reason: reason.to_owned(),
+                deadline,
+                retry_at: None,
+            });
+            resolver.request(ResolveRequest {
+                worker: self.worker,
+                slot,
+                generation: listener.generation,
+                sid: listener.sid.clone(),
+                entry: listener.entry.clone(),
+            });
+            listener.scheduled = deadline;
+            return;
+        }
+        self.fall_back(listener, counters, now, false);
+    }
+
+    /// No answer: rendezvous over the known edges (or the next edge of the
+    /// list, as before). With none, try the assignment again soon.
+    fn fall_back(
+        &mut self,
+        listener: &mut Listener,
+        counters: &mut Vec<Counters>,
+        now: Instant,
+        counted: bool,
+    ) {
+        let edges = self.book.snapshot();
+        let usable: Vec<(usize, &BookEdge)> = edges
+            .iter()
+            .enumerate()
+            .filter(|(_, edge)| edge.addr.is_some())
+            .collect();
+        if usable.is_empty() {
+            if let Some(resolving) = listener.resolving.as_mut() {
+                resolving.retry_at = Some(now + ASSIGN_RETRY);
+                listener.scheduled = now + ASSIGN_RETRY;
+            }
+            return;
+        }
+        let skipped = |edge: &BookEdge| {
+            let names = [edge.node.clone(), Some(edge.name())];
+            listener
+                .skip
+                .iter()
+                .any(|(node, _)| names.iter().flatten().any(|name| name == node))
+        };
+        let index = if self.config.rendezvous_moves {
+            let free: Vec<usize> = usable
+                .iter()
+                .filter(|(index, edge)| *index != listener.edge && !skipped(edge))
+                .map(|(index, _)| *index)
+                .collect();
+            let names: Vec<(usize, String)> = free
+                .iter()
+                .map(|index| (*index, edges[*index].name()))
+                .collect();
+            rendezvous(&listener.sid, names.iter().map(|(_, name)| name))
+                .and_then(|name| names.iter().find(|(_, other)| other == name))
+                .map(|(index, _)| *index)
+                .or_else(|| {
+                    usable
+                        .iter()
+                        .find(|(index, _)| *index != listener.edge)
+                        .map(|(index, _)| *index)
+                })
+                .unwrap_or(usable[0].0)
+        } else {
+            // The next edge of the list, as before wave 8 stage 4.
+            let position = usable
+                .iter()
+                .position(|(index, _)| *index == listener.edge)
+                .map_or(0, |position| (position + 1) % usable.len());
+            usable[position].0
+        };
+        if counted {
+            ensure(counters, listener.edge);
+            counters[listener.edge].fallbacks += 1;
+        }
+        let edge = &edges[index];
+        let node = edge.node.clone().unwrap_or_else(|| edge.name());
+        subscribe_at(listener, counters, index, edge.addr.unwrap(), node, now);
+    }
+
+    /// An assignment came for listener `slot`.
+    fn answered(
+        &mut self,
+        listener: &mut Listener,
+        slot: usize,
+        counters: &mut Vec<Counters>,
+        answer: ResolveAnswer,
+        now: Instant,
+    ) {
+        if listener.generation != answer.generation || listener.resolving.is_none() {
+            return;
+        }
+        ensure(counters, listener.edge);
+        let edge = &mut counters[listener.edge];
+        edge.assignments += 1;
+        edge.assignment_time
+            .record(answer.took.as_micros().min(u128::from(u64::MAX)) as u64);
+        let caches = match answer.caches {
+            Ok(caches) => caches,
+            Err(_) => {
+                counters[listener.edge].assignment_errors += 1;
+                // The region does not answer: a failover region that an
+                // earlier answer named, once.
+                if listener.entry.is_none() && listener.failover.is_some() {
+                    listener.entry = listener.failover.clone();
+                    let reason = listener
+                        .resolving
+                        .take()
+                        .map_or_else(String::new, |resolving| resolving.reason);
+                    self.route(listener, slot, counters, &reason, now);
+                    return;
+                }
+                self.fall_back(listener, counters, now, true);
+                return;
+            }
+        };
+        let regional: Vec<&AssignedCache> =
+            caches.iter().filter(|cache| cache.addr.is_some()).collect();
+        if let Some(failover) = caches.iter().find_map(|cache| cache.failover_url.clone()) {
+            listener.failover = Some(failover);
+        }
+        listener.region = regional.iter().map(|cache| cache.node_id.clone()).collect();
+        let skipped = |node: &str| listener.skip.iter().any(|(skip, _)| skip == node);
+        let choice = regional
+            .iter()
+            .find(|cache| !skipped(&cache.node_id))
+            .map(|cache| (*cache).clone());
+        if let Some(cache) = choice {
+            let index = self.book.index(cache.addr.unwrap(), &cache.node_id);
+            subscribe_at(listener, counters, index, cache.addr.unwrap(), cache.node_id, now);
+            return;
+        }
+        // Every cache of the region was left: a failover region's entry
+        // point, if the answer names one not asked yet.
+        if let Some(url) = caches
+            .iter()
+            .find_map(|cache| cache.failover_url.clone())
+            .filter(|url| listener.entry.as_deref() != Some(url.as_str()))
+        {
+            listener.entry = Some(url);
+            listener.skip.clear();
+            let reason = listener
+                .resolving
+                .take()
+                .map_or_else(String::new, |resolving| resolving.reason);
+            self.route(listener, slot, counters, &reason, now);
+            return;
+        }
+        match regional.first() {
+            Some(cache) => {
+                let cache = (*cache).clone();
+                let index = self.book.index(cache.addr.unwrap(), &cache.node_id);
+                subscribe_at(listener, counters, index, cache.addr.unwrap(), cache.node_id, now);
+            }
+            None => self.fall_back(listener, counters, now, true),
+        }
+    }
+}
+
+/// Subscribe `listener` at edge `index` (`addr`, node `node`), from the
+/// part after its newest; a move is counted on the edge it comes to.
+fn subscribe_at(
+    listener: &mut Listener,
+    counters: &mut Vec<Counters>,
+    index: usize,
+    addr: SocketAddr,
+    node: String,
+    now: Instant,
+) {
+    ensure(counters, index);
+    if listener.node.is_some() {
+        counters[index].moves += 1;
+    }
+    listener.edge = index;
+    listener.node = Some(node);
+    listener.resolving = None;
+    let from = listener.track.highest.map(|part| part + 1);
+    let socket = &listener.socket;
+    listener.session.begin(addr, from, now, &mut |to, bytes| {
+        let _ = socket.send_to(bytes, to);
+    });
+    listener.scheduled = listener.session.next_wake();
 }
 
 enum Report {
@@ -846,6 +1340,8 @@ fn handle_datagram(
     let session = &mut listener.session;
     let track = &mut listener.track;
     let edge = &mut counters[listener.edge];
+    let last_part_at = &mut listener.last_part_at;
+    let move_from = &mut listener.move_from;
     if let Some(overflows) = datagram.overflows {
         edge.socket_drops += u64::from(overflows.wrapping_sub(listener.overflows));
         listener.overflows = overflows;
@@ -898,6 +1394,15 @@ fn handle_datagram(
             ObjectKind::Part => match track.mark(object.part, false, config.settle_parts, edge) {
                 Mark::New => {
                     edge.parts += 1;
+                    // Phase AM item 10: the first part after a move ends it.
+                    *last_part_at = Some(now);
+                    if let Some(before) = move_from.take() {
+                        edge.time_to_move.record(
+                            now.saturating_duration_since(before).as_micros().min(u128::from(u64::MAX))
+                                as u64,
+                        );
+                        track.move_ends(object.part);
+                    }
                     if object.published_unix_us > 0 {
                         edge.latency
                             .record(arrival_us.saturating_sub(object.published_unix_us));
@@ -930,36 +1435,39 @@ fn handle_datagram(
     None
 }
 
-/// Move `listener` to the next edge.
-fn move_listener(listener: &mut Listener, config: &LoadConfig, counters: &mut [Counters], now: Instant) {
-    if config.edges.len() > 1 {
-        listener.edge = (listener.edge + 1) % config.edges.len();
-    }
-    counters[listener.edge].moves += 1;
-    let from = listener.track.highest.map(|part| part + 1);
-    let socket = &listener.socket;
-    listener
-        .session
-        .begin(config.edges[listener.edge], from, now, &mut |to, bytes| {
-            let _ = socket.send_to(bytes, to);
-        });
-}
-
-fn collect_deltas(listeners: &mut [Listener], counters: &mut [Counters]) {
+fn collect_deltas(
+    listeners: &mut [Listener],
+    counters: &mut Vec<Counters>,
+    now: Instant,
+    stranded_after: Duration,
+) {
     for listener in listeners {
-        collect_one(listener, counters, true);
+        collect_one(listener, counters, Some((now, stranded_after)));
     }
 }
 
 /// A listener's counters since the last interval into its edge's, with
-/// the gauges (`active`, `up`) when `gauges` (not for one that stops).
-fn collect_one(listener: &mut Listener, counters: &mut [Counters], gauges: bool) {
+/// the gauges (`active`, `up`, `stranded`, `resuming`) when `gauges` (not
+/// for one that stops).
+fn collect_one(
+    listener: &mut Listener,
+    counters: &mut Vec<Counters>,
+    gauges: Option<(Instant, Duration)>,
+) {
+    ensure(counters, listener.edge);
     {
         let edge = &mut counters[listener.edge];
-        if gauges {
+        if let Some((now, stranded_after)) = gauges {
             edge.active += 1;
-            if listener.session.is_subscribed() {
+            if listener.session.is_subscribed() && listener.resolving.is_none() {
                 edge.up += 1;
+            }
+            let quiet_since = listener.last_part_at.unwrap_or(listener.started);
+            if now.saturating_duration_since(quiet_since) >= stranded_after {
+                edge.stranded += 1;
+            }
+            if listener.move_from.is_some() {
+                edge.resuming += 1;
             }
         }
         let receiver = &listener.session.receiver;
@@ -992,9 +1500,18 @@ fn collect_one(listener: &mut Listener, counters: &mut [Counters], gauges: bool)
     }
 }
 
-fn worker(worker: usize, config: Arc<LoadConfig>, shared: Arc<Shared>, tx: mpsc::Sender<Report>) {
+fn worker(
+    worker: usize,
+    config: Arc<LoadConfig>,
+    shared: Arc<Shared>,
+    tx: mpsc::Sender<Report>,
+    book: Arc<EdgeBook>,
+    assign: Option<(Arc<Resolver>, mpsc::Receiver<ResolveAnswer>)>,
+) {
     let threads = config.threads;
-    let edges = config.edges.len();
+    let edges = book.snapshot().len();
+    let mut next_generation = 0_u32;
+    let stranded_after = config.stranded_after;
     let epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     assert!(epoll >= 0, "epoll_create1");
     let mut events: Vec<libc::epoll_event> = vec![libc::epoll_event { events: 0, u64: 0 }; 1_024];
@@ -1025,12 +1542,13 @@ fn worker(worker: usize, config: Arc<LoadConfig>, shared: Arc<Shared>, tx: mpsc:
         let loop_start = Instant::now();
         let now = loop_start;
         if now >= next_flush {
-            collect_deltas(&mut listeners, &mut counters);
+            collect_deltas(&mut listeners, &mut counters, now, stranded_after);
             let cpu = thread_cpu_ns();
+            let width = counters.len();
             let _ = tx.send(Report::Interval {
                 worker,
                 interval: interval_index,
-                edges: std::mem::replace(&mut counters, vec![Counters::default(); edges]),
+                edges: std::mem::replace(&mut counters, vec![Counters::default(); width]),
                 cpu_ns: cpu.saturating_sub(cpu_before),
                 busy_ns: std::mem::take(&mut busy_ns),
                 lateness: std::mem::take(&mut lateness),
@@ -1058,10 +1576,17 @@ fn worker(worker: usize, config: Arc<LoadConfig>, shared: Arc<Shared>, tx: mpsc:
             while listeners.len() < wanted && budget >= 1.0 && now >= start_retry_at {
                 budget -= 1.0;
                 let index = worker + listeners.len() * threads;
+                // Without assignment, listener i starts at static edge i mod n;
+                // with it, "unassigned" until its answer comes.
+                let edge = match book.unassigned {
+                    Some(unassigned) if assign.is_some() => unassigned,
+                    _ => index % edges,
+                };
                 let socket = match listener_socket(&config, index) {
                     Ok(socket) => socket,
                     Err(_) => {
-                        counters[index % edges].start_errors += 1;
+                        ensure(&mut counters, edge);
+                        counters[edge].start_errors += 1;
                         start_retry_at = now + START_RETRY;
                         break;
                     }
@@ -1074,29 +1599,51 @@ fn worker(worker: usize, config: Arc<LoadConfig>, shared: Arc<Shared>, tx: mpsc:
                 unsafe {
                     libc::epoll_ctl(epoll, libc::EPOLL_CTL_ADD, socket.as_raw_fd(), &mut event);
                 }
-                let edge = index % edges;
-                let mut session = UdpSession::new(config.session, now);
-                session.begin(config.edges[edge], None, now, &mut |to, bytes| {
-                    let _ = socket.send_to(bytes, to);
-                });
-                let scheduled = session.next_wake();
-                heap.push(Reverse((scheduled, slot)));
+                let session = UdpSession::new(config.session, now);
+                ensure(&mut counters, edge);
                 counters[edge].started += 1;
                 listeners.push(Listener {
                     index,
                     edge,
+                    sid: format!("{}-{index}", config.sid_prefix),
+                    node: None,
+                    skip: Vec::new(),
+                    resolving: None,
+                    generation: 0,
+                    last_part_at: None,
+                    move_from: None,
+                    region: Vec::new(),
+                    failover: None,
+                    entry: None,
+                    routed_at: None,
                     socket,
                     session,
                     started: now,
                     first_part: false,
                     subscribed_once: false,
                     track: PartTrack::new(),
-                    scheduled,
+                    scheduled: now,
                     seen: Seen::default(),
                     overflows: 0,
                     highest_at_end: None,
                     arrivals: (index < config.sample).then(BTreeMap::new),
                 });
+                let listener = listeners.last_mut().unwrap();
+                let mut placing = Placing {
+                    config: &config,
+                    book: &book,
+                    resolver: assign.as_ref().map(|(resolver, _)| resolver.as_ref()),
+                    worker,
+                    next_generation: &mut next_generation,
+                };
+                if placing.resolver.is_some() {
+                    placing.route(listener, slot, &mut counters, "start", now);
+                } else {
+                    let addr = config.edges[index % config.edges.len()];
+                    let static_index = book.index(addr, &addr.to_string());
+                    subscribe_at(listener, &mut counters, static_index, addr, addr.to_string(), now);
+                }
+                heap.push(Reverse((listener.scheduled, slot)));
             }
             while listeners.len() > wanted {
                 let mut listener = listeners.pop().unwrap();
@@ -1113,12 +1660,33 @@ fn worker(worker: usize, config: Arc<LoadConfig>, shared: Arc<Shared>, tx: mpsc:
                     );
                 }
                 // What it received since the last interval counts too.
-                collect_one(&mut listener, &mut counters, false);
+                collect_one(&mut listener, &mut counters, None);
                 let edge = listener.edge;
                 if let Some(highest) = listener.track.highest {
                     listener.track.settle(highest + 1, &mut counters[edge]);
                 }
                 counters[edge].stopped += 1;
+            }
+        }
+        // Phase AM item 10: the assignments that came.
+        if let Some((resolver, answers)) = &assign {
+            let mut placing = Placing {
+                config: &config,
+                book: &book,
+                resolver: Some(resolver.as_ref()),
+                worker,
+                next_generation: &mut next_generation,
+            };
+            while let Ok(answer) = answers.try_recv() {
+                let slot = answer.slot;
+                let Some(listener) = listeners.get_mut(slot) else {
+                    continue;
+                };
+                if draining {
+                    continue;
+                }
+                placing.answered(listener, slot, &mut counters, answer, now);
+                heap.push(Reverse((listener.scheduled.max(now), slot)));
             }
         }
         // The timers that are due.
@@ -1135,19 +1703,48 @@ fn worker(worker: usize, config: Arc<LoadConfig>, shared: Arc<Shared>, tx: mpsc:
             }
             lateness.record(now.saturating_duration_since(at).as_micros() as u64);
             work.polls += 1;
+            let mut placing = Placing {
+                config: &config,
+                book: &book,
+                resolver: assign.as_ref().map(|(resolver, _)| resolver.as_ref()),
+                worker,
+                next_generation: &mut next_generation,
+            };
+            // Waiting for an assignment: a retry due, or no answer in time.
+            if let Some(resolving) = &listener.resolving {
+                if draining {
+                    listener.scheduled = drain_until;
+                } else if resolving.retry_at.is_some_and(|retry| now >= retry) {
+                    let reason = resolving.reason.clone();
+                    listener.resolving = None;
+                    placing.route(listener, slot, &mut counters, &reason, now);
+                } else if now >= resolving.deadline {
+                    ensure(&mut counters, listener.edge);
+                    counters[listener.edge].assignment_errors += 1;
+                    placing.fall_back(listener, &mut counters, now, true);
+                } else {
+                    listener.scheduled = resolving
+                        .retry_at
+                        .unwrap_or(resolving.deadline)
+                        .min(resolving.deadline);
+                }
+                listener.scheduled = listener.scheduled.max(now + Duration::from_micros(50));
+                heap.push(Reverse((listener.scheduled, slot)));
+                continue;
+            }
             let socket = &listener.socket;
             let failed = listener.session.poll(now, &mut |to, bytes| {
                 let _ = socket.send_to(bytes, to);
             });
             let mut wake = listener.session.next_wake();
-            if failed.is_some() {
+            if let Some(reason) = failed {
                 if draining {
                     // It stays failed until the run ends: polling it again
                     // would find the same (at every turn of the loop).
                     wake = drain_until;
                 } else {
-                    move_listener(listener, &config, &mut counters, now);
-                    wake = listener.session.next_wake();
+                    placing.begin_move(listener, slot, &mut counters, &reason, now);
+                    wake = listener.scheduled;
                 }
             }
             listener.scheduled = wake.max(now + Duration::from_micros(50));
@@ -1195,11 +1792,20 @@ fn worker(worker: usize, config: Arc<LoadConfig>, shared: Arc<Shared>, tx: mpsc:
                 let now_us = now_unix_us();
                 for index in 0..received {
                     let datagram = bufs.get(index);
-                    if let Some(_reason) =
+                    ensure(&mut counters, listener.edge);
+                    if let Some(reason) =
                         handle_datagram(listener, &mut counters, &config, &datagram, now, now_us)
                     {
                         if !draining {
-                            move_listener(listener, &config, &mut counters, now);
+                            let mut placing = Placing {
+                                config: &config,
+                                book: &book,
+                                resolver: assign.as_ref().map(|(resolver, _)| resolver.as_ref()),
+                                worker,
+                                next_generation: &mut next_generation,
+                            };
+                            placing.begin_move(listener, slot, &mut counters, &reason, now);
+                            heap.push(Reverse((listener.scheduled.max(now), slot)));
                         }
                     }
                 }
@@ -1209,7 +1815,7 @@ fn worker(worker: usize, config: Arc<LoadConfig>, shared: Arc<Shared>, tx: mpsc:
             }
             // A datagram can bring a NACK forward.
             let wake = listener.session.next_wake();
-            if wake < listener.scheduled {
+            if listener.resolving.is_none() && wake < listener.scheduled {
                 listener.scheduled = wake;
                 heap.push(Reverse((wake, slot)));
             }
@@ -1223,6 +1829,10 @@ fn worker(worker: usize, config: Arc<LoadConfig>, shared: Arc<Shared>, tx: mpsc:
     let mut samples = Vec::new();
     for listener in &mut listeners {
         let edge = listener.edge;
+        ensure(&mut counters, edge);
+        if listener.move_from.is_some() {
+            counters[edge].never_resumed += 1;
+        }
         if let Some(highest) = listener.highest_at_end {
             listener.track.settle(highest + 1, &mut counters[edge]);
         }
@@ -1248,17 +1858,14 @@ fn worker(worker: usize, config: Arc<LoadConfig>, shared: Arc<Shared>, tx: mpsc:
             }
             samples.push(json!({
                 "listener": listener.index,
-                "edge": config.edges[edge].to_string(),
+                "edge": listener.node.clone(),
                 "parts": arrivals.len(),
                 "file": file.map(|path| path.display().to_string()),
             }));
         }
     }
-    collect_deltas(&mut listeners, &mut counters);
-    for counters in &mut counters {
-        // Not gauges at the end: the listeners left.
-        counters.active = 0;
-        counters.up = 0;
+    for listener in &mut listeners {
+        collect_one(listener, &mut counters, None);
     }
     unsafe {
         libc::close(epoll);
@@ -1471,8 +2078,8 @@ fn saturation(host: &HostInterval, lag_limit_us: u64) -> Vec<&'static str> {
 /// line (also written to `intervals.jsonl` in the output directory). Returns
 /// the summary (also written to `summary.json`).
 pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::Result<Value> {
-    if config.edges.is_empty() {
-        return Err(std::io::Error::other("no edge"));
+    if config.edges.is_empty() && config.assign.is_none() {
+        return Err(std::io::Error::other("no edge and no entry point"));
     }
     if config.threads == 0 || config.bind_ips.is_empty() {
         return Err(std::io::Error::other("no worker thread or no bind address"));
@@ -1494,28 +2101,55 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
         stop: AtomicBool::new(false),
     });
     let started_unix_us = now_unix_us();
+    let book = Arc::new(EdgeBook::new(&config.edges, config.assign.is_some()));
+    // Phase AM item 10: the assignment thread, one answer channel a worker.
+    let (resolver, mut answer_rxs) = match &config.assign {
+        Some(assign) => {
+            let (resolver, rxs) = Resolver::start(assign.clone(), config.threads)
+                .map_err(|error| std::io::Error::other(format!("{error:#}")))?;
+            (Some(Arc::new(resolver)), rxs.into_iter().map(Some).collect())
+        }
+        None => (None, Vec::new()),
+    };
     let (tx, rx) = mpsc::channel();
     let mut handles = Vec::new();
     for index in 0..config.threads {
-        let (config, shared, tx) = (Arc::clone(&config), Arc::clone(&shared), tx.clone());
+        let (config, shared, tx, book) = (
+            Arc::clone(&config),
+            Arc::clone(&shared),
+            tx.clone(),
+            Arc::clone(&book),
+        );
+        let assign = match (&resolver, answer_rxs.get_mut(index).and_then(Option::take)) {
+            (Some(resolver), Some(answers)) => Some((Arc::clone(resolver), answers)),
+            _ => None,
+        };
         handles.push(
             std::thread::Builder::new()
                 .name(format!("{}{index}", config.thread_name))
-                .spawn(move || worker(index, config, shared, tx))?,
+                .spawn(move || worker(index, config, shared, tx, book, assign))?,
         );
     }
     drop(tx);
-    let edge_names: Vec<String> = config.edges.iter().map(ToString::to_string).collect();
+    let edge_json = |book: &EdgeBook, by_edge: &[Counters], seconds: f64, gauges: bool| {
+        let mut per_edge = Map::new();
+        for (edge, counters) in book.snapshot().iter().zip(by_edge) {
+            let mut value = counters.to_json(seconds, gauges);
+            value["node"] = json!(edge.node);
+            per_edge.insert(edge.name(), value);
+        }
+        per_edge
+    };
     let ticks = clock_ticks();
     let interval_s = config.interval.as_secs_f64();
     let mut host_before = host_sample();
     let mut host_at = Instant::now();
     let mut pending: BTreeMap<u64, Vec<Report>> = BTreeMap::new();
     let mut reported = vec![None::<u64>; config.threads];
-    let mut total_by_edge = vec![Counters::default(); config.edges.len()];
+    let mut total_by_edge: Vec<Counters> = Vec::new();
     // What the workers counted after their last interval (the drain, and
     // the parts settled at the end): the final line.
-    let mut final_by_edge = vec![Counters::default(); config.edges.len()];
+    let mut final_by_edge: Vec<Counters> = Vec::new();
     let mut done = 0;
     let mut never_first = 0;
     let mut samples = Vec::new();
@@ -1564,12 +2198,8 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
                 samples: mine,
             }) => {
                 reported[worker] = Some(u64::MAX);
-                for (total, counters) in total_by_edge.iter_mut().zip(&edges) {
-                    total.merge(counters);
-                }
-                for (last, counters) in final_by_edge.iter_mut().zip(&edges) {
-                    last.merge(counters);
-                }
+                merge_edges(&mut total_by_edge, &edges);
+                merge_edges(&mut final_by_edge, &edges);
                 never_first += none;
                 samples.extend(mine);
                 done += 1;
@@ -1587,7 +2217,7 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
                 break;
             }
             let reports = pending.remove(&interval).unwrap();
-            let mut by_edge = vec![Counters::default(); config.edges.len()];
+            let mut by_edge: Vec<Counters> = Vec::new();
             let mut worker_busy = Vec::new();
             let mut worker_cpu = Vec::new();
             let mut lateness = Histogram::new();
@@ -1602,9 +2232,7 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
                     ..
                 } = report
                 {
-                    for (sum, counters) in by_edge.iter_mut().zip(edges) {
-                        sum.merge(counters);
-                    }
+                    merge_edges(&mut by_edge, edges);
                     worker_busy.push(*busy_ns as f64 / 1e9 / interval_s);
                     worker_cpu.push(*cpu_ns as f64 / 1e9 / interval_s);
                     lateness.merge(late);
@@ -1637,9 +2265,7 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
             for counters in &by_edge {
                 total.merge(counters);
             }
-            for (sum, counters) in total_by_edge.iter_mut().zip(&by_edge) {
-                sum.merge(counters);
-            }
+            merge_edges(&mut total_by_edge, &by_edge);
             peak_up = peak_up.max(total.up);
             peak_active = peak_active.max(total.active);
             cpu_cores.record((process_cores * 1_000.0) as u64);
@@ -1660,10 +2286,7 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
                 lag_limit_us,
             );
             let t = (interval + 1) as f64 * interval_s;
-            let mut per_edge = Map::new();
-            for (name, counters) in edge_names.iter().zip(&by_edge) {
-                per_edge.insert(name.clone(), counters.to_json(interval_s, true));
-            }
+            let per_edge = edge_json(&book, &by_edge, interval_s, true);
             let rss_mb = rss_mb();
             rss_mb_max = rss_mb_max.max(rss_mb);
             let line = json!({
@@ -1737,11 +2360,10 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
     }
     {
         let mut last = Counters::default();
-        let mut per_edge = Map::new();
-        for (name, counters) in edge_names.iter().zip(&final_by_edge) {
+        for counters in &final_by_edge {
             last.merge(counters);
-            per_edge.insert(name.clone(), counters.to_json(0.0, false));
         }
+        let per_edge = edge_json(&book, &final_by_edge, 0.0, false);
         let line = json!({
             "schema": "needletail.load.interval.v1",
             "label": config.label,
@@ -1764,7 +2386,7 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
         total.merge(counters);
     }
     let edge_summary = |counters: &Counters| {
-        json!({
+        let mut summary = json!({
             "listeners_started": counters.started,
             "start_errors": counters.start_errors,
             "parts": counters.parts,
@@ -1792,12 +2414,18 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
             "ttfp_ms": counters.ttfp.summary_with_buckets(),
             "ttok_ms": counters.ttok.summary_with_buckets(),
             "recv_lag_ms": counters.recv_lag.summary_with_buckets(),
-        })
+        });
+        counters.am10_json(&mut summary);
+        summary
     };
     let mut per_edge = Map::new();
-    for (name, counters) in edge_names.iter().zip(&total_by_edge) {
-        per_edge.insert(name.clone(), edge_summary(counters));
+    let edges_now = book.snapshot();
+    for (edge, counters) in edges_now.iter().zip(&total_by_edge) {
+        let mut summary = edge_summary(counters);
+        summary["node"] = json!(edge.node);
+        per_edge.insert(edge.name(), summary);
     }
+    let edge_names: Vec<String> = edges_now.iter().map(BookEdge::name).collect();
     samples.sort_by_key(|sample| sample["listener"].as_u64());
     let summary = json!({
         "schema": "needletail.load.v1",
@@ -1813,6 +2441,12 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
         "peak_listeners": peak_active,
         "peak_subscribed": peak_up,
         "listeners_without_parts": never_first,
+        "never_resumed": total.never_resumed,
+        "assignment": config.assign.as_ref().map(|assign| json!({
+            "entries": assign.entries,
+            "skip_s": config.skip_for.as_secs_f64(),
+        })),
+        "move_rule": if config.rendezvous_moves { "rendezvous" } else { "next" },
         "lanes": {
             "fast_lane": config.session.fast_lane,
             "compact": config.session.compact,
@@ -1907,6 +2541,31 @@ mod tests {
         assert!((p99 - 9_900.0).abs() / 9_900.0 < 0.02, "{p99}");
         assert_eq!(merged.quantile(1.0), Some(10_005));
         assert_eq!(empty.quantile(0.5), None);
+    }
+
+    #[test]
+    fn the_parts_lost_in_a_move_are_counted_as_the_move_s() {
+        let mut track = PartTrack::new();
+        let mut counters = Counters::default();
+        track.begin(0);
+        // Before any move: a missing part is no moved listener's.
+        for part in (0..10).filter(|part| *part != 3) {
+            track.mark(part, false, 1_000, &mut counters);
+        }
+        // Leaves after part 9; resumes at 14 (10..13 never come), then
+        // loses 20 later on its new edge.
+        track.move_begins();
+        assert_eq!(track.windows.front(), Some(&(10, u64::MAX)));
+        track.mark(14, false, 1_000, &mut counters);
+        track.move_ends(14);
+        for part in (15..30).filter(|part| *part != 20) {
+            track.mark(part, false, 1_000, &mut counters);
+        }
+        track.settle(30, &mut counters);
+        assert_eq!(counters.missing, 1 + 4 + 1);
+        assert_eq!(counters.move_lost, 4, "10..13: the move's");
+        assert_eq!(counters.missing_moved, 5, "every part lost after the move");
+        assert!(track.windows.is_empty(), "settled moves are forgotten");
     }
 
     #[test]

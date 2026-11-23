@@ -778,3 +778,284 @@ fn load_mode_cost_against_a_synthetic_edge() {
     std::fs::write(dir.join("bench.json"), serde_json::to_vec_pretty(&line).unwrap()).unwrap();
     println!("{}", serde_json::to_string_pretty(&line).unwrap());
 }
+
+// ------------------------------------------------------- moves (Phase AM 10)
+
+/// An entry point for the load's assignment (`/api/assignment` over
+/// HTTPS/2): it lists the edges that are alive, ranked for each session by
+/// rendezvous, as a region's entry point ranks its caches. The CA file is
+/// its own self-signed certificate (for `localhost`).
+struct FakeEntry {
+    url: String,
+    ca: PathBuf,
+    alive: Arc<std::sync::Mutex<Vec<(String, SocketAddr)>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+async fn fake_entry(name: &str, alive: Vec<(String, SocketAddr)>) -> FakeEntry {
+    use std::hash::{Hash, Hasher};
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let ca = out_dir(name).with_extension("ca.pem");
+    std::fs::create_dir_all(ca.parent().unwrap()).unwrap();
+    std::fs::write(&ca, certified.cert.pem()).unwrap();
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()),
+    );
+    let mut server = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(vec![certified.cert.der().clone()], key)
+    .unwrap();
+    server.alpn_protocols = vec![b"h2".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("https://{}", listener.local_addr().unwrap());
+    let alive = Arc::new(std::sync::Mutex::new(alive));
+    let shared = Arc::clone(&alive);
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            let (acceptor, alive) = (acceptor.clone(), Arc::clone(&shared));
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let service = hyper::service::service_fn(
+                    move |request: http::Request<hyper::body::Incoming>| {
+                        let alive = Arc::clone(&alive);
+                        async move {
+                            let sid = request
+                                .uri()
+                                .query()
+                                .unwrap_or("")
+                                .split('&')
+                                .find_map(|pair| pair.strip_prefix("sid="))
+                                .unwrap_or("")
+                                .to_owned();
+                            let mut caches = alive.lock().unwrap().clone();
+                            caches.sort_by_key(|(node, _)| {
+                                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                                sid.hash(&mut hasher);
+                                node.hash(&mut hasher);
+                                std::cmp::Reverse(hasher.finish())
+                            });
+                            let assigned: Vec<Value> = caches
+                                .iter()
+                                .map(|(node, addr)| {
+                                    serde_json::json!({
+                                        "node_id": node,
+                                        "playback_base_url": format!("https://{}:443", addr.ip()),
+                                        "client_udp_port": addr.port(),
+                                    })
+                                })
+                                .collect();
+                            let body = serde_json::json!({ "assigned": assigned }).to_string();
+                            Ok::<_, std::convert::Infallible>(http::Response::new(
+                                http_body_util::Full::new(Bytes::from(body)),
+                            ))
+                        }
+                    },
+                );
+                let _ = hyper::server::conn::http2::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                )
+                .serve_connection(hyper_util::rt::TokioIo::new(tls), service)
+                .await;
+            });
+        }
+    });
+    FakeEntry {
+        url,
+        ca,
+        alive,
+        task,
+    }
+}
+
+/// Four edges of 2.5 ms Opus, 500 listeners spread over them; 4 s in, the
+/// first edge is killed. Returns the load's summary, its interval lines and
+/// the killed edge's address.
+fn kill_one_edge(name: &str, assigned: bool, rendezvous: bool, ip: u8) -> (Value, Vec<Value>, String) {
+    let edge_rt = runtime("kill-edge-rt", 4);
+    let pub_rt = runtime("kill-pub-rt", 2);
+    let payload = Payload::Opus;
+    let stream_id = 4001;
+    let seconds = 9;
+    let mut edges = Vec::new();
+    for index in 0..4_u8 {
+        let edge = edge_rt
+            .block_on(async move {
+                tokio::spawn(async move {
+                    let edge = LaneEdge::start_with_capacity(
+                        loopback(ip + index),
+                        Duration::ZERO,
+                        1_024,
+                        true,
+                    )
+                    .await;
+                    // The stream is in the cache before anyone subscribes.
+                    let (envelope, _) = payload.envelope(stream_id, 0);
+                    edge.send(false, &payload.symbols(&envelope), false).await;
+                    wait_for_part(&edge.cache, stream_id, 0).await;
+                    AnyEdge::Fast(edge)
+                })
+                .await
+            })
+            .unwrap();
+        edges.push((Arc::new(edge), 1));
+    }
+    let last = 1 + (seconds + 6) * 1_000_000 / payload.part_us();
+    let publishers: Vec<_> = edges
+        .iter()
+        .map(|(edge, first)| {
+            let (edge, first) = (Arc::clone(edge), *first);
+            pub_rt.spawn(async move { publish_paced(&edge, payload, stream_id, first, last).await })
+        })
+        .collect();
+    let ports: Vec<SocketAddr> = edges.iter().map(|(edge, _)| edge.client_port()).collect();
+    let alive: Vec<(String, SocketAddr)> = ports
+        .iter()
+        .enumerate()
+        .map(|(index, port)| (format!("edge-{index}"), *port))
+        .collect();
+    let entry = edge_rt.block_on(async { fake_entry(name, alive).await });
+    std::thread::sleep(Duration::from_millis(300));
+
+    let dir = out_dir(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    let session = SessionConfig::new(stream_id);
+    let static_edges = if assigned { Vec::new() } else { ports.clone() };
+    let mut config = LoadConfig::new(session, static_edges, 500);
+    config.duration = Duration::from_secs(seconds);
+    config.threads = 2;
+    config.start_rate = 4_000.0;
+    config.out_dir = Some(dir.clone());
+    config.thread_name = "kill-load-w".into();
+    config.rendezvous_moves = rendezvous;
+    config.sid_prefix = name.into();
+    if assigned {
+        config.assign = Some(av_mesh::load_assign::AssignConfig {
+            entries: vec![entry.url.clone()],
+            stream_id,
+            tls_ca: entry.ca.clone(),
+            server_name: Some("localhost".into()),
+            udp_port: None,
+            in_flight: 64,
+            timeout: Duration::from_secs(2),
+        });
+    }
+    let load = std::thread::spawn(move || run(config, &mut |_| {}).unwrap());
+    std::thread::sleep(Duration::from_secs(4));
+    // Kill edge 0: the region no longer lists it, its stream stops, it
+    // answers nothing.
+    entry.alive.lock().unwrap().retain(|(node, _)| node != "edge-0");
+    let mut publishers = publishers.into_iter();
+    let first = publishers.next().unwrap();
+    first.abort();
+    let _ = pub_rt.block_on(first);
+    let (killed, _) = edges.remove(0);
+    let killed = Arc::try_unwrap(killed).ok().expect("the killed edge is not shared");
+    edge_rt.block_on(killed.stop());
+    let summary = load.join().unwrap();
+    for publisher in publishers {
+        publisher.abort();
+        let _ = pub_rt.block_on(publisher);
+    }
+    entry.task.abort();
+    for (edge, _) in edges {
+        let edge = Arc::try_unwrap(edge).ok().expect("not shared");
+        edge_rt.block_on(edge.stop());
+    }
+    let lines = std::fs::read_to_string(dir.join("intervals.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    (summary, lines, ports[0].to_string())
+}
+
+/// The moves of a killed edge's listeners: into each edge left, their
+/// spread (max/mean), and the killed edge's moves out.
+fn move_spread(summary: &Value, killed: &str) -> (Vec<u64>, f64, u64) {
+    let per_edge = summary["per_edge"].as_object().unwrap();
+    let into: Vec<u64> = per_edge
+        .iter()
+        .filter(|(name, _)| name.as_str() != killed && name.as_str() != "unassigned")
+        .map(|(_, edge)| edge["moves"].as_u64().unwrap_or(0))
+        .collect();
+    let mean = into.iter().sum::<u64>() as f64 / into.len().max(1) as f64;
+    let max = into.iter().copied().max().unwrap_or(0) as f64;
+    let out = per_edge[killed]["moves_out"].as_u64().unwrap_or(0);
+    (into, if mean > 0.0 { max / mean } else { 0.0 }, out)
+}
+
+/// Phase AM item 10: 500 listeners that subscribe through `/api/assignment`
+/// over four edges; one edge is killed. Its listeners move by assignment
+/// (the edges left, ranked for each session), spread over the three
+/// others (max/mean of the moves at most 1.5), none stranded, every one
+/// resumed; each move's reason and time from the last part on the old
+/// edge to the first on the new one are counted. With the static list and
+/// the rule of before (the next edge), they all pile onto one edge.
+#[test]
+fn load_mode_moves_spread_over_the_edges_left_when_one_is_killed() {
+    let (summary, lines, killed) = kill_one_edge("kill-assigned", true, true, 71);
+    let total = &summary["total"];
+    let (into, spread, out) = move_spread(&summary, &killed);
+    let started = total["listeners_started"].as_u64().unwrap();
+    assert_eq!(started, 500, "{summary:#}");
+    assert_eq!(summary["listeners_without_parts"], 0, "{summary:#}");
+    assert_eq!(summary["never_resumed"], 0, "{summary:#}");
+    assert!(total["assignments"].as_u64().unwrap() >= 500, "{summary:#}");
+    assert_eq!(total["fallbacks"], 0, "{summary:#}");
+    // About a quarter of them were on the killed edge.
+    assert!((80..=200).contains(&out), "moves out {out}: {summary:#}");
+    assert_eq!(into.len(), 3, "{into:?}");
+    assert_eq!(into.iter().sum::<u64>(), out, "every move landed: {into:?}");
+    assert!(into.iter().all(|moves| *moves > 0), "{into:?}");
+    assert!(spread <= 1.5, "spread {spread:.2}: {into:?}");
+    let stranded = lines
+        .iter()
+        .filter(|line| line["phase"] == "run")
+        .filter_map(|line| line["total"]["stranded"].as_u64())
+        .max()
+        .unwrap_or(0);
+    assert_eq!(stranded, 0, "no listener without a part for 5 s");
+    let moved = &total["time_to_move_ms"];
+    assert_eq!(moved["count"].as_u64(), Some(out), "{summary:#}");
+    let p99 = moved["p99"].as_f64().unwrap();
+    assert!(p99 <= 1_500.0, "time to move p99 {p99} ms");
+    let reasons = summary["per_edge"][&killed]["moves_by_reason"].clone();
+    assert!(
+        reasons.as_object().unwrap().keys().all(|reason| reason.starts_with("silence")
+            || reason.starts_with("no-answer")),
+        "{reasons}"
+    );
+
+    // Before: the static list and the next edge.
+    let (before, _, killed_before) = kill_one_edge("kill-next", false, false, 75);
+    let (into_before, spread_before, out_before) = move_spread(&before, &killed_before);
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "assigned": {
+                "moves_out": out, "into": into, "spread": spread,
+                "time_to_move_ms": moved, "missing": total["missing"],
+                "move_lost": total["move_lost"], "missing_moved": total["missing_moved"],
+                "assignment_ms": total["assignment_ms"], "ttfp_ms": total["ttfp_ms"],
+            },
+            "static_next": {
+                "moves_out": out_before, "into": into_before, "spread": spread_before,
+                "time_to_move_ms": before["total"]["time_to_move_ms"],
+                "missing": before["total"]["missing"],
+                "move_lost": before["total"]["move_lost"],
+            },
+        })
+    );
+    assert!(out_before >= 80, "{before:#}");
+    assert!(spread_before >= 2.5, "all onto one edge: {into_before:?}");
+}

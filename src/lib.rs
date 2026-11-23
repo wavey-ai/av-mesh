@@ -3,6 +3,7 @@ pub mod client_compact;
 pub mod client_session;
 pub mod client_udp;
 pub mod load;
+pub mod load_assign;
 pub mod relay_ingress;
 pub mod replication;
 pub mod subscribe_authorization;
