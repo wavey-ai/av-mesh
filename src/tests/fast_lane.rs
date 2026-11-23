@@ -499,6 +499,8 @@ async fn lane_client(
             token,
             fast_lane: true,
             compact: None,
+            others: Vec::new(),
+            resume: false,
         }
         .encode()
     };

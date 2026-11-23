@@ -407,6 +407,8 @@ pub(super) async fn listen(
             token,
             fast_lane,
             compact: compact.then_some(plan),
+            others: Vec::new(),
+            resume: false,
         }
         .encode()
     };

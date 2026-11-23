@@ -391,6 +391,8 @@ fn run_bench(bench: &Bench) -> Measured {
                         token,
                         fast_lane: false,
                         compact: None,
+                        others: Vec::new(),
+                        resume: false,
                     }
                     .encode()
                 };

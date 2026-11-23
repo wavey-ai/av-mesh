@@ -97,6 +97,8 @@ async fn subscribe(
             token,
             fast_lane: true,
             compact: Some(CompactPlan::CLEAN),
+            others: Vec::new(),
+            resume: false,
         }
         .encode()
     };

@@ -170,6 +170,8 @@ impl Listener {
             token: self.token,
             fast_lane: true,
             compact: Some(CompactPlan::CLEAN),
+            others: Vec::new(),
+            resume: false,
         }
         .encode();
         let _ = self.socket.send_to(&request, edge);

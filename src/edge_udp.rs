@@ -1578,6 +1578,7 @@ pub(crate) async fn run_edge_udp(
                 token,
                 fast_lane,
                 compact,
+                ..
             } => {
                 let compact = compact.filter(|_| config.compact).map(|plan| {
                     plan.with_short_header(plan.short_header && config.compact_short_header)
@@ -1765,6 +1766,7 @@ pub(crate) async fn run_edge_udp(
                 skip,
                 current,
                 token,
+                ..
             } => {
                 if !config.assign {
                     stats.assignments_dropped.fetch_add(1, Ordering::Relaxed);
@@ -1776,7 +1778,11 @@ pub(crate) async fn run_edge_udp(
                 // remembered, at most CONFIRMS_PER_SOURCE a second from one
                 // address. Not answered.
                 if let Some(token) = token {
-                    let Some(cache) = current.filter(|_| tokens.valid(peer, token)) else {
+                    let Some(cache) = current
+                        .into_iter()
+                        .next()
+                        .filter(|_| tokens.valid(peer, token))
+                    else {
                         stats.bad_tokens.fetch_add(1, Ordering::Relaxed);
                         stats
                             .assignment_confirms_refused
@@ -1830,7 +1836,12 @@ pub(crate) async fn run_edge_udp(
                     (router.clone(), Arc::clone(&stats), Arc::clone(&assigning));
                 tokio::spawn(async move {
                     let (port, mut caches) = router
-                        .udp_assignment(stream_id, &session, &skip, current.as_deref())
+                        .udp_assignment(
+                            stream_id,
+                            &session,
+                            &skip,
+                            current.first().map(String::as_str),
+                        )
                         .await;
                     let answer = loop {
                         let answer = Control::Assigned {
@@ -1838,6 +1849,8 @@ pub(crate) async fn run_edge_udp(
                             nonce,
                             port,
                             caches: caches.clone(),
+                            paths: 1,
+                            spare: false,
                         }
                         .encode();
                         if answer.len() <= budget || caches.is_empty() {
