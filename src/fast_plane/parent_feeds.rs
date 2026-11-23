@@ -457,18 +457,28 @@ impl ParentFeeds {
     /// Book one admitted datagram from the parent at `ip`, received at
     /// `rx_us` (Unix µs). Called by the class thread of the datagram's
     /// stream for every admitted datagram, before the first-arrival test:
-    /// no lock, and no allocation once the entry exists.
+    /// no lock, and no allocation once the entry exists or while the table
+    /// is full.
     pub fn observe(&self, ip: IpAddr, view: &RlsView<'_>, rx_us: u64) {
         let hash = self.hash(ip, view.stream, view.track);
         let table = self.table.load();
-        match table.find(hash, ip, view.stream, view.track) {
+        if let Some(feed) = table.find(hash, ip, view.stream, view.track) {
+            feed.record(view, rx_us);
+            return;
+        }
+        // A full table takes no new key: count it before anything is made,
+        // so an untracked stream costs no allocation per datagram. `insert`
+        // tests again for a table that filled since this load.
+        let inserted = if table.len >= MAX_FEEDS {
+            None
+        } else {
+            self.insert(hash, ip, view.stream, view.track)
+        };
+        match inserted {
             Some(feed) => feed.record(view, rx_us),
-            None => match self.insert(hash, ip, view.stream, view.track) {
-                Some(feed) => feed.record(view, rx_us),
-                None => {
-                    self.untracked.fetch_add(1, Ordering::Relaxed);
-                }
-            },
+            None => {
+                self.untracked.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -628,6 +638,44 @@ mod tests {
     use super::*;
     use raptorq_datagram_fec::{MediaObjectKind, MediaPathIntent};
     use std::net::{Ipv4Addr, SocketAddr};
+
+    /// Counts the allocations made by the current thread, so that a test
+    /// can show that a path of the class thread allocates nothing. The
+    /// test binary's allocator is the system's, as the node's is.
+    struct CountingAllocator;
+
+    thread_local! {
+        static ALLOCATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    // SAFETY: every call is passed on to the system allocator unchanged.
+    unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            let _ = ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            unsafe { std::alloc::System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(
+            &self,
+            ptr: *mut u8,
+            layout: std::alloc::Layout,
+            new_size: usize,
+        ) -> *mut u8 {
+            let _ = ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+            unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    fn allocations() -> u64 {
+        ALLOCATIONS.with(std::cell::Cell::get)
+    }
 
     static NO_HASH: [u8; 32] = [0; 32];
     /// A time well into a Unix second, so that a few µs either way stay in
@@ -900,5 +948,17 @@ mod tests {
         }
         assert_eq!(feeds.snapshot(T0).len(), MAX_FEEDS);
         assert_eq!(feeds.untracked(), 3);
+
+        // On the class thread, neither a tracked key nor an untracked one
+        // allocates once the table is full.
+        let tracked = IpAddr::V4(Ipv4Addr::from(0x0a00_0000));
+        let untracked = IpAddr::V4(Ipv4Addr::from(0x0b00_0000));
+        let before = allocations();
+        for object in 1..=100 {
+            feeds.observe(tracked, &source(object, T0 + SECOND), T0);
+            feeds.observe(untracked, &source(object, T0 + SECOND), T0);
+        }
+        assert_eq!(allocations() - before, 0, "allocations on the class thread");
+        assert_eq!(feeds.untracked(), 103);
     }
 }
