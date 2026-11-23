@@ -292,6 +292,104 @@ async fn a_warm_source_ages_on_the_local_clock() {
     assert_eq!(snapshot.warm_source_buffered_datagrams, 1);
 }
 
+/// A Soundkit v2 bundle of one 2.5 ms Opus epoch in `channels` channels, as
+/// the object of part `sequence`: two builds that box a part differently
+/// give it other bytes and another initialization.
+fn bundle_part(sequence: u64, channels: u8) -> Bytes {
+    use frame_header::{EncodingFlag, Endianness};
+    // A CELT fullband 2.5 ms frame (config 28), code 0, mono or stereo.
+    let packet = vec![
+        (28 << 3) | if channels == 2 { 0x04 } else { 0 },
+        0xAA,
+        0xBB,
+        0xCC,
+    ];
+    let header = FrameHeaderV2::new(
+        EncodingFlag::Opus,
+        packet.len() as u32,
+        120,
+        48_000,
+        channels,
+        16,
+        Endianness::LittleEndian,
+        None,
+        Some(sequence * 120),
+        None,
+    )
+    .unwrap();
+    let mut frame = Vec::new();
+    header.encode(&mut frame).unwrap();
+    frame.extend_from_slice(&packet);
+    let mut bundle = Vec::new();
+    bundle.extend_from_slice(SOUNDKIT_V2_BUNDLE_MAGIC);
+    bundle.push(2); // Opus
+    bundle.extend_from_slice(&1_u64.to_be_bytes());
+    bundle.extend_from_slice(&9_u16.to_be_bytes());
+    bundle.extend_from_slice(&1_u16.to_be_bytes());
+    bundle.extend_from_slice(&9_u16.to_be_bytes());
+    bundle.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+    bundle.extend_from_slice(&frame);
+    let key = media_object::ObjectKey::for_payload(
+        "default",
+        STREAM.to_string(),
+        "audio",
+        0,
+        0,
+        sequence,
+        1,
+        &bundle,
+    )
+    .unwrap();
+    let object = MediaObject::builder(key, ObjectKind::Media, bundle)
+        .with_metadata("payload-format", b"soundkit-v2-bundle".to_vec())
+        .build()
+        .unwrap();
+    Bytes::from(media_object::encode(&object).unwrap())
+}
+
+/// A stream's initialization is its stored parts': a copy refused under a
+/// part's number, or one present already, leaves it alone (a `two-version`
+/// roll whose builds box the bundle differently).
+#[tokio::test]
+async fn a_copy_that_is_not_stored_leaves_the_stream_initialization_alone() {
+    let cache = journaled_cache().await;
+    let init = |cache: &LiveTsCache| {
+        let state = cache
+            .state
+            .try_read()
+            .unwrap()
+            .stream_inits
+            .get(&STREAM)
+            .cloned();
+        let stored = cache.chunk_cache.stream_initialization(STREAM);
+        assert_eq!(
+            state, stored,
+            "the state and the cache hold one initialization"
+        );
+        state.expect("the stream has an initialization")
+    };
+    let commit = |part: Bytes| {
+        let cache = Arc::clone(&cache);
+        async move { cache.commit_stream_payload(STREAM, part).await.unwrap() }
+    };
+    assert_eq!(commit(bundle_part(0, 1)).await, Committed::Stored(0));
+    let mono = init(&cache);
+    assert_eq!(
+        commit(bundle_part(0, 2)).await,
+        Committed::Refused(CommitRefusal::IdentityConflict)
+    );
+    assert_eq!(init(&cache), mono);
+    // A part stored from the other build brings its own.
+    assert_eq!(commit(bundle_part(1, 2)).await, Committed::Stored(1));
+    let stereo = init(&cache);
+    assert_ne!(stereo, mono, "the two builds' initializations differ");
+    assert_eq!(
+        commit(bundle_part(0, 1)).await,
+        Committed::AlreadyPresent(0)
+    );
+    assert_eq!(init(&cache), stereo);
+}
+
 /// The log lines of the dispatch seam's limiter for rejections of `kind`:
 /// the total each line gives.
 fn rejection_totals(log: &CapturedLog, kind: &str) -> Vec<u64> {

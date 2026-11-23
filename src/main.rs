@@ -9918,9 +9918,6 @@ impl LiveTsCache {
                 state.stream_last_ingest_unix_ms.insert(stream_id, now_ms);
                 state.observe_stream_seq(stream_id, seq);
                 state.stream_media_kinds.insert(stream_id, media_kind);
-                if let Some(reboxed) = &reboxed_audio {
-                    state.stream_inits.insert(stream_id, reboxed.init.clone());
-                }
                 if matches!(
                     kind,
                     ObjectKind::Initialization | ObjectKind::CodecConfiguration
@@ -9929,15 +9926,6 @@ impl LiveTsCache {
                         .stream_inits
                         .insert(stream_id, Bytes::copy_from_slice(object.payload()));
                 }
-            }
-
-            if let Some(reboxed) = &reboxed_audio {
-                self.chunk_cache
-                    .set_stream_initialization(stream_id, reboxed.init.clone())
-                    .await
-                    .map_err(|err| {
-                        anyhow!("Soundkit fMP4 initialization cache write failed: {err}")
-                    })?;
             }
 
             if matches!(
@@ -10025,6 +10013,14 @@ impl LiveTsCache {
                 return Ok(self.refuse_commit(CommitRefusal::IdentityConflict, stream_id, seq));
             }
             if write_result == PutIfAbsentResult::Inserted {
+                // A reboxed bundle's initialization is the stored part's: a
+                // copy that is present already or refused leaves the
+                // stream's alone. A reader that comes before it is set finds
+                // it in the part's slot.
+                if let Some(reboxed) = &reboxed_audio {
+                    self.remember_stream_init(stream_id, reboxed.init.clone())
+                        .await;
+                }
                 if let Some(handle) = handle {
                     self.observe_late_part(handle, seq, committed_us);
                     self.note_wide_hole(handle, slot_id);
