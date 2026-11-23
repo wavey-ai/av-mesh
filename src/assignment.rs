@@ -321,20 +321,63 @@ pub fn assign_udp_in_region(
     policy: AssignmentPolicy,
     candidates: &[CacheCandidate],
 ) -> Result<Assignment, AssignmentError> {
-    let relaxed = candidates
+    if request.pin.is_some() {
+        return assign(request, policy, candidates);
+    }
+    let healthy = |cache: &CacheCandidate| {
+        cache.region == request.region
+            && cache.serves_readers
+            && cache.playback_base_url.is_some()
+            && cache.fresh
+            && !cache.draining
+            && !cache.overloaded
+            && cache.load_permille < FULL_LOAD_PERMILLE
+    };
+    // Every healthy cache by the session's weighted rendezvous score alone
+    // (its weight the cache's own headroom), not by the tiers of `assign`:
+    // a crowd that spills is spread over the region, not all sent to the
+    // one cache that holds the playlist under the spread target (a slot
+    // that has just joined and warmed took all 60 of a lab crowd and
+    // overloaded).
+    let session = request.session.unwrap_or("");
+    let mut ranked = candidates
         .iter()
-        .map(|cache| CacheCandidate {
-            free_bps: None,
-            ..cache.clone()
-        })
+        .filter(|cache| healthy(cache))
+        .map(|cache| (rendezvous_score(session, cache), cache))
         .collect::<Vec<_>>();
-    let mut assignment = assign(request, policy, &relaxed)?;
-    if let Some(first) = assignment.caches.first_mut() {
-        if first.reason != AssignmentReason::Sticky && first.reason != AssignmentReason::Pinned {
-            first.reason = AssignmentReason::Spill;
+    ranked.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.1.node_id.cmp(&right.1.node_id))
+    });
+    let mut caches = Vec::new();
+    if let Some(current) = request.current {
+        if let Some((_, cache)) = ranked.iter().find(|(_, cache)| cache.node_id == current) {
+            caches.push(assigned(cache, AssignmentReason::Sticky));
         }
     }
-    Ok(assignment)
+    for (_, cache) in &ranked {
+        if caches.len() > policy.max_alternates {
+            break;
+        }
+        if caches.iter().any(|chosen| chosen.node_id == cache.node_id) {
+            continue;
+        }
+        let reason = if caches.is_empty() {
+            AssignmentReason::Spill
+        } else {
+            AssignmentReason::Alternate
+        };
+        caches.push(assigned(cache, reason));
+    }
+    if caches.is_empty() {
+        return Err(AssignmentError::NoCacheAvailable);
+    }
+    Ok(Assignment {
+        caches,
+        pinned: false,
+    })
 }
 
 fn assigned(cache: &CacheCandidate, reason: AssignmentReason) -> AssignedCache {
@@ -456,6 +499,28 @@ mod tests {
         // Spread over the region by the session, as before.
         assert_eq!(first.len(), 4, "{first:?}");
         assert!(first.values().all(|count| *count > 25), "{first:?}");
+        // One cache that holds the playlist under the spread target (a slot
+        // that has just warmed) takes its share by headroom, not the crowd.
+        let mut joined = caches.clone();
+        for cache in joined.iter_mut() {
+            cache.load_permille = 770;
+            cache.head_part = Some(900);
+        }
+        joined[3].load_permille = 0;
+        joined[3].head_part = None;
+        let mut first = HashMap::<String, usize>::new();
+        for index in 0..400 {
+            let session = format!("load-{index}");
+            let assignment =
+                assign_udp_in_region(request(&session), AssignmentPolicy::default(), &joined)
+                    .unwrap();
+            *first
+                .entry(assignment.caches[0].node_id.clone())
+                .or_default() += 1;
+        }
+        let share = first["edge-4"] as f64 / 400.0;
+        // Weights 1000 against 3 x 230: about 59%.
+        assert!(share > 0.45 && share < 0.75, "{first:?}");
         // A cache that says it is overloaded, full, draining or stale is
         // still left out: with none left, no assignment (the failover region).
         let mut sick = caches.clone();
