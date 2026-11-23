@@ -245,6 +245,10 @@ pub struct Counters {
     pub time_to_move: Histogram,
     pub move_lost: u64,
     pub missing_moved: u64,
+    /// Parts lost in moves away from this edge (from a listener's last part
+    /// here to its first on the next edge), booked here when they settle:
+    /// what a fault of this edge cost its listeners (wave 8 review).
+    pub left_lost: u64,
     /// Gauges: listeners with no part for `stranded_after` (5 s), and moved
     /// listeners still waiting for their first part on their new edge. At
     /// the end, `never_resumed`: moved listeners that never had one.
@@ -297,6 +301,7 @@ impl Counters {
         self.time_to_move.merge(&other.time_to_move);
         self.move_lost += other.move_lost;
         self.missing_moved += other.missing_moved;
+        self.left_lost += other.left_lost;
         self.stranded += other.stranded;
         self.resuming += other.resuming;
         self.never_resumed += other.never_resumed;
@@ -361,6 +366,7 @@ impl Counters {
         value["time_to_move_ms"] = self.time_to_move.summary_with_buckets();
         value["move_lost"] = json!(self.move_lost);
         value["missing_moved"] = json!(self.missing_moved);
+        value["left_lost"] = json!(self.left_lost);
         value["never_resumed"] = json!(self.never_resumed);
         value["assignments"] = json!(self.assignments);
         value["assignment_errors"] = json!(self.assignment_errors);
@@ -403,7 +409,12 @@ struct PartTrack {
     /// moves (from the part after its last on the old edge to its first on
     /// the new one; open until that comes).
     moved_from: Option<u64>,
-    windows: VecDeque<(u64, u64)>,
+    /// Each window: its first part, the part after its last (open until
+    /// the listener resumes) and the edge (book index) it left.
+    windows: VecDeque<(u64, u64, usize)>,
+    /// Parts lost in moves, by the edge left, not yet booked (see
+    /// [`PartTrack::book_left_lost`]).
+    left_lost: Vec<(usize, u64)>,
 }
 
 /// Moves whose parts a listener keeps track of.
@@ -420,18 +431,32 @@ impl PartTrack {
             jump: None,
             moved_from: None,
             windows: VecDeque::new(),
+            left_lost: Vec::new(),
         })
     }
 
     /// The listener leaves its edge: the parts from the next one on are a
     /// moved listener's, and those until it resumes are the move's.
-    fn move_begins(&mut self) {
+    fn move_begins(&mut self, left: usize) {
         let from = self.highest.map_or(self.next_settle, |highest| highest + 1);
         self.moved_from.get_or_insert(from);
         if self.windows.len() == MOVE_WINDOWS {
             self.windows.pop_front();
         }
-        self.windows.push_back((from, u64::MAX));
+        self.windows.push_back((from, u64::MAX, left));
+    }
+
+    /// Book the parts lost in moves on the edges the listener left
+    /// (`left_lost`): a scale run takes the moves off a faulted node as the
+    /// fault's, and every other loss as the unaffected listeners' (wave 8
+    /// review: `missing_moved` counted every part a listener lost after its
+    /// first move, whatever the cause, to the end of the run).
+    fn book_left_lost(&mut self, counters: &mut [Counters]) {
+        for (edge, lost) in self.left_lost.drain(..) {
+            if let Some(counters) = counters.get_mut(edge) {
+                counters.left_lost += lost;
+            }
+        }
     }
 
     /// The first part on the new edge closes the open moves.
@@ -482,12 +507,16 @@ impl PartTrack {
                     if self.moved_from.is_some_and(|from| part >= from) {
                         counters.missing_moved += 1;
                     }
-                    if self
+                    if let Some((_, _, left)) = self
                         .windows
                         .iter()
-                        .any(|(from, to)| *from <= part && part < *to)
+                        .find(|(from, to, _)| *from <= part && part < *to)
                     {
                         counters.move_lost += 1;
+                        match self.left_lost.last_mut() {
+                            Some((edge, lost)) if *edge == *left => *lost += 1,
+                            _ => self.left_lost.push((*left, 1)),
+                        }
                     }
                 }
             }
@@ -496,7 +525,7 @@ impl PartTrack {
             self.next_settle += 1;
         }
         let settled = self.next_settle;
-        self.windows.retain(|(_, to)| *to > settled);
+        self.windows.retain(|(_, to, _)| *to > settled);
     }
 
     fn mark(&mut self, part: u64, gap: bool, settle_parts: u64, counters: &mut Counters) -> Mark {
@@ -896,6 +925,13 @@ struct Listener {
     region: Vec<String>,
     failover: Option<String>,
     entry: Option<String>,
+    /// Since when it asks a failover region's entry point (it goes back to
+    /// its own on its next move once FAILOVER_HOLD has passed), and the
+    /// assignment failures in a row (FAILOVER_AFTER_FAILURES before it
+    /// asks a failover region; wave 8 review: one slow answer sent it out
+    /// of its region for good).
+    entry_since: Option<Instant>,
+    assign_failures: u32,
     /// When it last asked where to go: a listener that every edge
     /// refuses asks at most every ROUTE_GAP, not at the round trip's pace.
     routed_at: Option<Instant>,
@@ -1002,6 +1038,11 @@ const ASSIGN_WAIT_EXTRA: Duration = Duration::from_secs(1);
 const ASSIGN_RETRY: Duration = Duration::from_millis(500);
 /// A listener asks where to go at most this often.
 const ROUTE_GAP: Duration = Duration::from_millis(100);
+/// A listener sent to a failover region asks its own region again on its
+/// next move after this long.
+const FAILOVER_HOLD: Duration = Duration::from_secs(30);
+/// Assignment failures in a row before a listener asks a failover region.
+const FAILOVER_AFTER_FAILURES: u32 = 2;
 
 /// What a worker needs to place its listeners (Phase AM item 10).
 struct Placing<'a> {
@@ -1038,14 +1079,15 @@ impl Placing<'_> {
         if reason.starts_with("region-lost") {
             let region = std::mem::take(&mut listener.region);
             listener.skip.extend(region.into_iter().map(|node| (node, until)));
-            if listener.entry.is_none() {
+            if listener.entry.is_none() && listener.failover.is_some() {
                 listener.entry = listener.failover.clone();
+                listener.entry_since = Some(now);
             }
         }
         if listener.move_from.is_none() {
             listener.move_from = Some(listener.last_part_at.unwrap_or(listener.started));
         }
-        listener.track.move_begins();
+        listener.track.move_begins(listener.edge);
         self.route(listener, slot, counters, reason, now);
     }
 
@@ -1060,6 +1102,15 @@ impl Placing<'_> {
         now: Instant,
     ) {
         listener.skip.retain(|(_, until)| *until > now);
+        // Its own region again, once the hold has passed (it may have
+        // recovered; if not, the failures send it back).
+        if listener
+            .entry_since
+            .is_some_and(|since| now >= since + FAILOVER_HOLD)
+        {
+            listener.entry = None;
+            listener.entry_since = None;
+        }
         if let Some(at) = listener.routed_at.filter(|at| now < *at + ROUTE_GAP) {
             // Again so soon (every edge refuses it): a little later.
             let retry = at + ROUTE_GAP;
@@ -1182,10 +1233,16 @@ impl Placing<'_> {
             Ok(caches) => caches,
             Err(_) => {
                 counters[listener.edge].assignment_errors += 1;
-                // The region does not answer: a failover region that an
-                // earlier answer named, once.
-                if listener.entry.is_none() && listener.failover.is_some() {
+                listener.assign_failures += 1;
+                // The region does not answer, twice in a row: a failover
+                // region that an earlier answer named, once.
+                if listener.entry.is_none()
+                    && listener.failover.is_some()
+                    && listener.assign_failures >= FAILOVER_AFTER_FAILURES
+                {
+                    listener.assign_failures = 0;
                     listener.entry = listener.failover.clone();
+                    listener.entry_since = Some(now);
                     let reason = listener
                         .resolving
                         .take()
@@ -1197,6 +1254,7 @@ impl Placing<'_> {
                 return;
             }
         };
+        listener.assign_failures = 0;
         let regional: Vec<&AssignedCache> =
             caches.iter().filter(|cache| cache.addr.is_some()).collect();
         if let Some(failover) = caches.iter().find_map(|cache| cache.failover_url.clone()) {
@@ -1213,14 +1271,36 @@ impl Placing<'_> {
             subscribe_at(listener, counters, index, cache.addr.unwrap(), cache.node_id, now);
             return;
         }
-        // Every cache of the region was left: a failover region's entry
-        // point, if the answer names one not asked yet.
+        // Every cache of the region was left. For a lost region: a failover
+        // region's entry point, if the answer names one not asked yet. For
+        // anything else (a string of edge stalls) it stays in its region,
+        // at the cache it left longest ago (wave 8 review).
+        let region_lost = listener
+            .resolving
+            .as_ref()
+            .is_some_and(|resolving| resolving.reason.starts_with("region-lost"));
+        if !region_lost {
+            let oldest = regional.iter().min_by_key(|cache| {
+                listener
+                    .skip
+                    .iter()
+                    .find(|(node, _)| *node == cache.node_id)
+                    .map(|(_, until)| *until)
+            });
+            if let Some(cache) = oldest {
+                let cache = (*cache).clone();
+                let index = self.book.index(cache.addr.unwrap(), &cache.node_id);
+                subscribe_at(listener, counters, index, cache.addr.unwrap(), cache.node_id, now);
+                return;
+            }
+        }
         if let Some(url) = caches
             .iter()
             .find_map(|cache| cache.failover_url.clone())
             .filter(|url| listener.entry.as_deref() != Some(url.as_str()))
         {
             listener.entry = Some(url);
+            listener.entry_since = Some(now);
             listener.skip.clear();
             let reason = listener
                 .resolving
@@ -1619,6 +1699,8 @@ fn worker(
                     region: Vec::new(),
                     failover: None,
                     entry: None,
+                    entry_since: None,
+                    assign_failures: 0,
                     routed_at: None,
                     socket,
                     session,
@@ -1669,6 +1751,7 @@ fn worker(
                 if let Some(highest) = listener.track.highest {
                     listener.track.settle(highest + 1, &mut counters[edge]);
                 }
+                listener.track.book_left_lost(&mut counters);
                 counters[edge].stopped += 1;
             }
         }
@@ -1797,9 +1880,10 @@ fn worker(
                 for index in 0..received {
                     let datagram = bufs.get(index);
                     ensure(&mut counters, listener.edge);
-                    if let Some(reason) =
-                        handle_datagram(listener, &mut counters, &config, &datagram, now, now_us)
-                    {
+                    let reason =
+                        handle_datagram(listener, &mut counters, &config, &datagram, now, now_us);
+                    listener.track.book_left_lost(&mut counters);
+                    if let Some(reason) = reason {
                         if !draining {
                             let mut placing = Placing {
                                 config: &config,
@@ -1840,6 +1924,7 @@ fn worker(
         if let Some(highest) = listener.highest_at_end {
             listener.track.settle(highest + 1, &mut counters[edge]);
         }
+        listener.track.book_left_lost(&mut counters);
         if !listener.first_part {
             never_first += 1;
         }
@@ -2558,8 +2643,8 @@ mod tests {
         }
         // Leaves after part 9; resumes at 14 (10..13 never come), then
         // loses 20 later on its new edge.
-        track.move_begins();
-        assert_eq!(track.windows.front(), Some(&(10, u64::MAX)));
+        track.move_begins(3);
+        assert_eq!(track.windows.front(), Some(&(10, u64::MAX, 3)));
         track.mark(14, false, 1_000, &mut counters);
         track.move_ends(14);
         for part in (15..30).filter(|part| *part != 20) {
@@ -2570,6 +2655,12 @@ mod tests {
         assert_eq!(counters.move_lost, 4, "10..13: the move's");
         assert_eq!(counters.missing_moved, 5, "every part lost after the move");
         assert!(track.windows.is_empty(), "settled moves are forgotten");
+        // The move's parts are booked on the edge left (3), the later loss
+        // is not.
+        let mut book = vec![Counters::default(); 4];
+        track.book_left_lost(&mut book);
+        assert_eq!(book[3].left_lost, 4);
+        assert_eq!(book.iter().map(|edge| edge.left_lost).sum::<u64>(), 4);
     }
 
     #[test]

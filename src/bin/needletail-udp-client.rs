@@ -52,6 +52,16 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Semaphore};
 use tokio_rustls::TlsConnector;
 
+/// The edges a client has left are not taken again for this long (as
+/// needletail-load's skip set).
+const SKIP_FOR: Duration = Duration::from_secs(30);
+/// Assignment failures in a row before the client asks a failover region.
+const FAILOVER_AFTER_FAILURES: u32 = 2;
+/// Away from the region of `--entry` this long, the client probes it every
+/// HOME_PROBE_EVERY and goes back once it assigns a cache of its own.
+const HOME_HOLD: Duration = Duration::from_secs(30);
+const HOME_PROBE_EVERY: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "needletail-udp-client",
@@ -367,7 +377,7 @@ async fn assignment(
     entry: &str,
     args: &Args,
     current: Option<&str>,
-    skip: &BTreeSet<String>,
+    skip: &BTreeMap<String, Instant>,
 ) -> Result<(Vec<Cache>, Option<u16>)> {
     let entry = Url::parse(entry)?;
     let mut path = format!(
@@ -377,7 +387,7 @@ async fn assignment(
     // Phase AM item 10: the caches it has just left are not assigned.
     if !skip.is_empty() {
         path.push_str("&skip=");
-        path.push_str(&skip.iter().cloned().collect::<Vec<_>>().join(","));
+        path.push_str(&skip.keys().cloned().collect::<Vec<_>>().join(","));
     }
     if let Some(current) = current {
         path.push_str(&format!("&current={current}"));
@@ -487,6 +497,8 @@ struct Report {
     duration_seconds: u64,
     caches: Vec<String>,
     moves: Vec<MoveRecord>,
+    /// Moves back to the region of `--entry` after a failover (wave 8).
+    home_returns: u64,
     first_part: Option<u64>,
     last_part: Option<u64>,
     expected_parts: u64,
@@ -827,7 +839,10 @@ async fn main() -> Result<()> {
     let mut arrivals: BTreeMap<u64, (u64, usize, u64, u64, u64)> = BTreeMap::new();
 
     let mut current: Option<String> = None;
-    let mut skip: BTreeSet<String> = BTreeSet::new();
+    // The edges it left, and when (forgotten after SKIP_FOR, wave 8
+    // review: a set that never expired stranded a client that had left
+    // every edge of its region once).
+    let mut skip: BTreeMap<String, Instant> = BTreeMap::new();
     let mut move_reason = String::from("start");
     // Phase AM item 11: the entry point asked (the region's, or a failover
     // region's once this one is lost), the failover entries of the last
@@ -835,6 +850,14 @@ async fn main() -> Result<()> {
     let mut entry = args.entry.clone();
     let mut failover_entries: Vec<Cache> = Vec::new();
     let mut entry_failures = 0_u32;
+    // Wave 8 review: the region left is asked again (a probe of its entry
+    // point every HOME_PROBE_EVERY, once HOME_HOLD has passed), and the
+    // client goes back once it assigns a cache of its own.
+    let home = args.entry.clone();
+    let mut left_home_at: Option<Instant> = None;
+    let mut home_probe: Option<tokio::task::JoinHandle<Result<(Vec<Cache>, Option<u16>)>>> = None;
+    let mut next_home_probe = Instant::now();
+    let mut home_returns = 0_u64;
     let mut buf = vec![0_u8; 65_536];
     let mut first_published_us: Option<u64> = None;
     let mut last_published_us: Option<u64> = None;
@@ -853,6 +876,7 @@ async fn main() -> Result<()> {
     }
 
     'caches: while Instant::now() < deadline {
+        skip.retain(|_, at| at.elapsed() < SKIP_FOR);
         // MOVE region-lost: straight to a failover region that an earlier
         // answer named (this region's entry point may be silent too).
         if move_reason == "region-lost" {
@@ -864,6 +888,11 @@ async fn main() -> Result<()> {
                 move_reason = format!("region-lost via {}", next.node_id);
             }
         }
+        if entry != home {
+            left_home_at.get_or_insert_with(Instant::now);
+        } else {
+            left_home_at = None;
+        }
         let (caches, port) = match assignment(&http, &entry, &args, current.as_deref(), &skip).await {
             Ok(answer) => {
                 entry_failures = 0;
@@ -872,10 +901,11 @@ async fn main() -> Result<()> {
             Err(error) => {
                 eprintln!("assignment failed: {error:#}");
                 entry_failures += 1;
-                // The region's entry point does not answer (the region is
-                // lost): ask a failover region's that an earlier answer
+                // The region's entry point does not answer twice in a row
+                // (the region is lost; one slow answer is not, wave 8
+                // review): ask a failover region's that an earlier answer
                 // named.
-                if entry_failures >= 1 {
+                if entry_failures >= FAILOVER_AFTER_FAILURES {
                     if let Some(next) = failover_entries.first() {
                         eprintln!("asking the failover region {} instead", next.node_id);
                         entry = format!("https://{}", next.base.authority);
@@ -893,7 +923,7 @@ async fn main() -> Result<()> {
         // A lost region (MOVE region-lost): none of its caches.
         if move_reason == "region-lost" {
             for cache in caches.iter().filter(|cache| !cache.failover) {
-                skip.insert(cache.node_id.clone());
+                skip.insert(cache.node_id.clone(), Instant::now());
             }
         }
         startup.assignment_ms.get_or_insert(since_start(started));
@@ -901,10 +931,23 @@ async fn main() -> Result<()> {
             anyhow!("no client UDP port: the entry point names none; pass --udp-port")
         })?;
         // The first cache of the assignment that this client has not just
-        // left, or the first one when it has left them all.
+        // left. When it has left every cache of the region: the failover
+        // region only for a region lost, else the cache of the region it
+        // left longest ago (wave 8 review: not out of the region for a
+        // string of edge stalls), or the first one.
         let cache = caches
             .iter()
-            .find(|cache| !skip.contains(&cache.node_id))
+            .find(|cache| !skip.contains_key(&cache.node_id) && !cache.failover)
+            .or_else(|| {
+                if move_reason.starts_with("region-lost") {
+                    caches.iter().find(|cache| !skip.contains_key(&cache.node_id))
+                } else {
+                    caches
+                        .iter()
+                        .filter(|cache| !cache.failover)
+                        .min_by_key(|cache| skip.get(&cache.node_id).copied())
+                }
+            })
             .unwrap_or(&caches[0])
             .clone();
         if skip.len() >= caches.len() {
@@ -957,13 +1000,13 @@ async fn main() -> Result<()> {
             }
             Ok((status, _)) => {
                 eprintln!("{}: playlist answered {status}", cache.node_id);
-                skip.insert(cache.node_id.clone());
+                skip.insert(cache.node_id.clone(), Instant::now());
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
             Err(error) => {
                 eprintln!("{}: playlist failed: {error:#}", cache.node_id);
-                skip.insert(cache.node_id.clone());
+                skip.insert(cache.node_id.clone(), Instant::now());
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
@@ -977,7 +1020,7 @@ async fn main() -> Result<()> {
             Some(target) => target,
             None => {
                 eprintln!("{}: no address for {host}", cache.node_id);
-                skip.insert(cache.node_id.clone());
+                skip.insert(cache.node_id.clone(), Instant::now());
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
@@ -1049,9 +1092,40 @@ async fn main() -> Result<()> {
                 };
                 if let (Some(failure), false) = (failure, session.is_subscribed()) {
                     eprintln!("{}: {failure}", cache.node_id);
-                    skip.insert(cache.node_id.clone());
+                    skip.insert(cache.node_id.clone(), Instant::now());
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue 'caches;
+                }
+            }
+            // Away from its region: probe the region's entry point, and go
+            // back once it assigns a cache of the region.
+            if left_home_at.is_some_and(|at| at.elapsed() >= HOME_HOLD)
+                && home_probe.is_none()
+                && now >= next_home_probe
+                && !draining
+            {
+                next_home_probe = now + HOME_PROBE_EVERY;
+                let (http, home, args) = (http.clone(), home.clone(), args.clone());
+                home_probe = Some(tokio::spawn(async move {
+                    assignment(&http, &home, &args, None, &BTreeMap::new()).await
+                }));
+            }
+            if home_probe
+                .as_ref()
+                .is_some_and(|probe| probe.is_finished())
+            {
+                let answer = home_probe.take().expect("finished").await;
+                if let Ok(Ok((caches, _))) = answer {
+                    if caches.iter().any(|cache| !cache.failover) {
+                        eprintln!("the home region answers: moving back");
+                        entry = home.clone();
+                        left_home_at = None;
+                        skip.clear();
+                        entry_failures = 0;
+                        home_returns += 1;
+                        move_reason = "home-region".to_owned();
+                        continue 'caches;
+                    }
                 }
             }
             let fallbacks = session.compact_fallbacks;
@@ -1068,7 +1142,7 @@ async fn main() -> Result<()> {
             }
             if let Some(reason) = failed {
                 move_reason = reason;
-                skip.insert(cache.node_id.clone());
+                skip.insert(cache.node_id.clone(), Instant::now());
                 continue 'caches;
             }
             let end = if draining { deadline + drain } else { deadline };
@@ -1094,9 +1168,11 @@ async fn main() -> Result<()> {
             }
             match outcome {
                 Received::Media => {}
+                // The OK that the parts before it waited for: taken now.
+                Received::Subscribed { .. } if session.has_objects() => {}
                 Received::Move(reason) => {
                     move_reason = reason;
-                    skip.insert(cache.node_id.clone());
+                    skip.insert(cache.node_id.clone(), Instant::now());
                     continue 'caches;
                 }
                 _ => continue,
@@ -1269,6 +1345,7 @@ async fn main() -> Result<()> {
         duration_seconds: args.duration_seconds,
         caches: caches_used,
         moves,
+        home_returns,
         first_part: first,
         last_part: last,
         expected_parts: expected,

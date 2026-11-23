@@ -2218,6 +2218,19 @@ struct Args {
     )]
     client_udp_region_hold_ms: u64,
 
+    /// Wave 8 review: a failover region counts as fresh for `MOVE
+    /// region-lost` only when it holds parts newer than this region's head
+    /// by half the hold (it ingests the stream itself; a region that gets
+    /// it through the lost one has live nodes and a stale head). `false`:
+    /// any live cache that holds the playlist, as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_REGION_HEAD_CHECK",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    client_udp_region_head_check: bool,
+
     /// An edge that has heard none of its cache-mesh parents for this long
     /// has lost them: it answers 503 for a part or a playlist reload that it
     /// would otherwise hold, and moves its UDP clients. Keep it above the
@@ -3784,6 +3797,7 @@ async fn main() -> Result<()> {
         Duration::from_millis(args.client_udp_region_hold_ms),
         failover_probe(&args),
     )
+    .with_region_head_check(args.client_udp_region_head_check)
     .with_part_wait_due(args.edge_part_wait_due)
     .with_hole_distance(
         hole_trigger
@@ -4812,7 +4826,10 @@ async fn resolve_socket_addr_args(kind: &str, values: &[String]) -> Result<Vec<S
 struct FailoverProbe {
     connector: tokio_rustls::TlsConnector,
     server_name: String,
-    answers: tokio::sync::Mutex<HashMap<(String, u64), (Instant, bool)>>,
+    /// Per (region, stream): until when the answer holds, and the newest
+    /// part that a cache there that can take a reader holds (`None`: no
+    /// such cache).
+    answers: tokio::sync::Mutex<HashMap<(String, u64), (Instant, Option<u64>)>>,
 }
 
 impl FailoverProbe {
@@ -4841,31 +4858,42 @@ impl FailoverProbe {
     }
 
     /// Whether the failover region at `base_url` holds a fresh copy of
-    /// `stream_id`.
-    async fn fresh(&self, base_url: &str, stream_id: u64) -> bool {
+    /// `stream_id`: a cache there can take a reader and, with `min_head`,
+    /// holds that part or a newer one (wave 8 review: a region that gets
+    /// the stream through the lost one has fresh nodes and a stale head).
+    async fn fresh(&self, base_url: &str, stream_id: u64, min_head: Option<u64>) -> bool {
         let key = (base_url.to_owned(), stream_id);
-        if let Some((at, fresh)) = self.answers.lock().await.get(&key) {
-            if *at > Instant::now() {
-                return *fresh;
-            }
-        }
-        let fresh = tokio::time::timeout(FAILOVER_PROBE_TIMEOUT, self.ask(base_url, stream_id))
-            .await
-            .ok()
-            .and_then(|answer| {
-                answer
-                    .map_err(|error| debug!(base_url, error = %error, "failover region did not answer"))
-                    .ok()
-            })
-            .unwrap_or(false);
-        self.answers
+        let cached = self
+            .answers
             .lock()
             .await
-            .insert(key, (Instant::now() + FAILOVER_PROBE_CACHE, fresh));
-        fresh
+            .get(&key)
+            .filter(|(at, _)| *at > Instant::now())
+            .map(|(_, head)| *head);
+        let head = match cached {
+            Some(head) => head,
+            None => {
+                let head =
+                    tokio::time::timeout(FAILOVER_PROBE_TIMEOUT, self.ask(base_url, stream_id))
+                        .await
+                        .ok()
+                        .and_then(|answer| {
+                            answer
+                                .map_err(|error| debug!(base_url, error = %error, "failover region did not answer"))
+                                .ok()
+                        })
+                        .flatten();
+                self.answers
+                    .lock()
+                    .await
+                    .insert(key, (Instant::now() + FAILOVER_PROBE_CACHE, head));
+                head
+            }
+        };
+        head.is_some_and(|head| min_head.is_none_or(|min| head >= min))
     }
 
-    async fn ask(&self, base_url: &str, stream_id: u64) -> Result<bool> {
+    async fn ask(&self, base_url: &str, stream_id: u64) -> Result<Option<u64>> {
         use http_body_util::BodyExt;
         let authority = base_url
             .strip_prefix("https://")
@@ -4896,7 +4924,7 @@ impl FailoverProbe {
         let response = sender.send_request(request).await?;
         let body = response.into_body().collect().await?.to_bytes();
         let answer: serde_json::Value = serde_json::from_slice(&body)?;
-        Ok(failover_answer_is_fresh(&answer))
+        Ok(failover_answer_head(&answer))
     }
 
     /// A probe that trusts nothing: its answers are set by the test.
@@ -4918,25 +4946,28 @@ impl FailoverProbe {
 
     /// Fix the answer for a region (tests).
     #[cfg(test)]
-    async fn set_answer(&self, base_url: &str, stream_id: u64, fresh: bool) {
+    async fn set_answer(&self, base_url: &str, stream_id: u64, head: Option<u64>) {
         self.answers.lock().await.insert(
             (base_url.to_owned(), stream_id),
-            (Instant::now() + Duration::from_secs(3_600), fresh),
+            (Instant::now() + Duration::from_secs(3_600), head),
         );
     }
 }
 
-/// Whether an `/api/assignment` answer of a failover region names a cache
-/// that can take a reader of the stream now.
-fn failover_answer_is_fresh(answer: &serde_json::Value) -> bool {
-    answer["caches"].as_array().is_some_and(|caches| {
-        caches.iter().any(|cache| {
+/// The newest part held by a cache that an `/api/assignment` answer of a
+/// failover region names as able to take a reader of the stream now
+/// (fresh, serving readers, not draining, holding the playlist).
+fn failover_answer_head(answer: &serde_json::Value) -> Option<u64> {
+    answer["caches"]
+        .as_array()?
+        .iter()
+        .filter(|cache| {
             cache["fresh"].as_bool() == Some(true)
                 && cache["serves_readers"].as_bool() == Some(true)
                 && cache["draining"].as_bool() != Some(true)
-                && cache["head_part"].is_u64()
         })
-    })
+        .filter_map(|cache| cache["head_part"].as_u64())
+        .max()
 }
 
 /// The failover probe of a node with --failover-entry and
@@ -18616,6 +18647,9 @@ struct AppRouter {
     /// before), the silence's start, and how the failover regions are
     /// asked.
     region_hold: Option<Duration>,
+    /// A failover region is fresh only with parts newer than this region's
+    /// head (`--client-udp-region-head-check`).
+    region_head_check: bool,
     region_silence_since: Arc<StdMutex<Option<Instant>>>,
     failover_probe: Option<Arc<FailoverProbe>>,
     /// Whether the parents are lost, as last asked, and when (see
@@ -18658,6 +18692,26 @@ struct AppRouter {
     #[allow(clippy::type_complexity)]
     regional_view: Arc<tokio::sync::Mutex<Option<(Instant, Arc<Vec<MeshSnapshot>>)>>>,
     regional_view_ttl: Duration,
+}
+
+/// The candidates without the caches a moving client has just left (Phase
+/// AM item 10), unless that leaves none of the region's caches that serve
+/// readers: then the skip set is ignored, so that a client that has left
+/// every edge of its region once (a region-wide stall) is assigned in its
+/// region again, not refused for good or sent out of it (wave 8 review).
+fn without_skipped(
+    candidates: Vec<CacheCandidate>,
+    skip: &[String],
+    region: &str,
+) -> Vec<CacheCandidate> {
+    let skipped = |cache: &CacheCandidate| skip.iter().any(|name| *name == cache.node_id);
+    let regional_left = candidates
+        .iter()
+        .any(|cache| cache.region == region && cache.serves_readers && !skipped(cache));
+    if !regional_left {
+        return candidates;
+    }
+    candidates.into_iter().filter(|cache| !skipped(cache)).collect()
 }
 
 /// A request that the entry point answers for a reader.
@@ -18772,6 +18826,7 @@ impl AppRouter {
             region_silence_fresh_ms: None,
             liveness: Arc::new(LivenessCache::new(DEFAULT_EDGE_LIVENESS_CACHE_US)),
             region_hold: None,
+            region_head_check: true,
             region_silence_since: Arc::default(),
             failover_probe: None,
             part_wait_due: true,
@@ -18850,6 +18905,12 @@ impl AppRouter {
     fn with_region_failover(mut self, hold: Duration, probe: Option<Arc<FailoverProbe>>) -> Self {
         self.region_hold = (!hold.is_zero()).then_some(hold);
         self.failover_probe = probe;
+        self
+    }
+
+    /// See `--client-udp-region-head-check`.
+    fn with_region_head_check(mut self, check: bool) -> Self {
+        self.region_head_check = check;
         self
     }
 
@@ -19606,7 +19667,7 @@ impl AppRouter {
     ) -> (Result<Assignment, AssignmentError>, Vec<CacheCandidate>) {
         let mut candidates = self.cache_candidates(reader.stream_id).await;
         if !reader.skip.is_empty() {
-            candidates.retain(|cache| !reader.skip.iter().any(|skip| *skip == cache.node_id));
+            candidates = without_skipped(candidates, reader.skip, &self.node.region);
         }
         let playlist_bps = self.regional_playlist_bps(reader.stream_id).await;
         let now_ms = now_unix_ms();
@@ -20840,8 +20901,19 @@ impl AppRouter {
         if !held_for.is_some_and(|held| held >= hold) {
             return false;
         }
+        // The failover region must hold parts newer than this region's
+        // head by half the hold: it ingests while this region is silent.
+        let min_head = if self.region_head_check {
+            let part_us = self.cache.state.read().await.stream_part_us(stream_id).max(1);
+            let margin = (hold.as_micros() as u64 / 2 / part_us).max(1);
+            self.cache
+                .stream_head(stream_id)
+                .map(|head| head.saturating_add(margin))
+        } else {
+            None
+        };
         for (name, url) in self.failover_entries.iter() {
-            if probe.fresh(url, stream_id).await {
+            if probe.fresh(url, stream_id, min_head).await {
                 self.edge_udp_stats
                     .region_lost_checks
                     .fetch_add(1, Ordering::Relaxed);
@@ -25482,7 +25554,7 @@ mod tests {
         telemetry.ingest_snapshot(other).await;
         let failover = "https://127.0.0.1:9";
         let probe = Arc::new(FailoverProbe::for_tests());
-        probe.set_answer(failover, 77, true).await;
+        probe.set_answer(failover, 77, Some(u64::MAX)).await;
         let router = app_router_for_tests_with_telemetry(
             Arc::clone(&edge_cache),
             Arc::clone(&edge_mesh),
@@ -25507,8 +25579,20 @@ mod tests {
                 >= 1
         );
         // Another stream that the failover region does not hold fresh.
-        probe.set_answer(failover, 78, false).await;
+        probe.set_answer(failover, 78, None).await;
         assert!(!lost.region_is_lost(78).await);
+        // Wave 8 review: live caches whose head is not past this region's
+        // (the failover region gets the stream through this one) are not
+        // a fresh copy; without the check (before) they are.
+        for sequence in 0..5 {
+            commit_canonical_gap_test_part(&edge_cache, 77, sequence).await;
+        }
+        let local_head = edge_cache.stream_head(77).expect("the edge holds stream 77");
+        probe.set_answer(failover, 77, Some(local_head)).await;
+        assert!(!lost.region_is_lost(77).await, "a stale head is no fresh copy");
+        let unchecked = lost.clone().with_region_head_check(false);
+        assert!(unchecked.region_is_lost(77).await);
+        probe.set_answer(failover, 77, Some(u64::MAX)).await;
         // With the hold at 0 (before): held for as long as it lasts.
         let held = router
             .clone()
@@ -25545,7 +25629,7 @@ mod tests {
         let good = serde_json::json!({
             "fresh": true, "serves_readers": true, "draining": false, "head_part": 12
         });
-        assert!(failover_answer_is_fresh(&answer(good.clone())));
+        assert_eq!(failover_answer_head(&answer(good.clone())), Some(12));
         for (key, value) in [
             ("fresh", serde_json::json!(false)),
             ("serves_readers", serde_json::json!(false)),
@@ -25554,9 +25638,9 @@ mod tests {
         ] {
             let mut cache = good.clone();
             cache[key] = value;
-            assert!(!failover_answer_is_fresh(&answer(cache)), "{key}");
+            assert_eq!(failover_answer_head(&answer(cache)), None, "{key}");
         }
-        assert!(!failover_answer_is_fresh(&serde_json::json!({"error": "x"})));
+        assert_eq!(failover_answer_head(&serde_json::json!({"error": "x"})), None);
     }
 
     #[tokio::test]
@@ -34085,6 +34169,26 @@ mod tests {
             .map(|cache| cache["node_id"].as_str().unwrap())
             .collect();
         assert!(!assigned.is_empty() && !assigned.contains(&"edge-c"), "{api:#}");
+        // Wave 8 review: a client that has left every cache of the region is
+        // assigned in it again (the skip set is ignored), not refused.
+        let all: Vec<String> = api["caches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|cache| cache["node_id"].as_str().map(str::to_owned))
+            .chain(["edge-b".to_owned(), "edge-c".to_owned()])
+            .collect();
+        let api = get_for_tests(
+            &router,
+            &format!("/api/assignment?stream=801&sid=reader-7&skip={}", all.join(",")),
+        )
+        .await;
+        assert_eq!(api.status, StatusCode::OK);
+        let api: serde_json::Value = serde_json::from_str(&body_text(api)).unwrap();
+        assert!(
+            !api["assigned"].as_array().unwrap().is_empty(),
+            "{api:#}"
+        );
         mesh.shutdown();
     }
 
