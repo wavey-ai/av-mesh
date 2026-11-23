@@ -562,6 +562,12 @@ const MIN_STREAM_WINDOW_PARTS: usize = 32;
 const MAX_REMEMBERED_ASSIGNMENTS: usize = 50_000;
 /// How long an entry point remembers the cache of a session that is silent.
 const REMEMBERED_ASSIGNMENT_MS: u64 = 120_000;
+
+/// Wave 9 C4: movers are apportioned against those an entry point placed
+/// in this window (a paced drain sends its movers over 2 s), at most this
+/// many remembered.
+const RECENT_MOVERS_WINDOW: Duration = Duration::from_secs(5);
+const MAX_RECENT_MOVERS: usize = 4_096;
 const MESH_EVENTS_PATH: &str = "/api/mesh/events";
 const MESH_WEBSOCKET_PATH: &str = "/ws/mesh";
 const MISSION_CONTROL_DIST_ENV: &str = "NEEDLETAIL_MISSION_CONTROL_DIST";
@@ -2791,6 +2797,71 @@ struct Args {
     )]
     assignment_udp_in_region: bool,
 
+    /// Wave 9 C4: a moving UDP client (one that names the edges it has
+    /// just left: a drain, a kill, a rebalance) is assigned by each cache's
+    /// headroom alone, the caches under --rebalance-target-permille first,
+    /// and every cache's headroom counts the readers that this entry point
+    /// sent it since its last advertisement: the movers spread over the
+    /// survivors in proportion to their headroom (wave 8 proofs: the spread
+    /// tiers sent 17 of 36 movers to the one survivor under 60 %, 1.42x
+    /// the equal share). `false`: a mover is ranked as a new reader.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_ASSIGNMENT_MOVE_HEADROOM",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    assignment_move_headroom: bool,
+
+    /// Wave 9 C1: an edge whose load is over this sheds UDP listeners to an
+    /// edge of its region with room (`MOVE rebalance`,
+    /// --client-udp-rebalance), and a moving client goes to a cache under
+    /// it first (--assignment-move-headroom).
+    #[arg(
+        long,
+        env = "NEEDLETAIL_REBALANCE_TARGET_PERMILLE",
+        default_value_t = assignment::DEFAULT_REBALANCE_TARGET_PERMILLE
+    )]
+    rebalance_target_permille: u32,
+
+    /// Wave 9 C1: an edge over --rebalance-target-permille sends UDP
+    /// listeners to the edges of its region under the target less
+    /// --client-udp-rebalance-margin-permille, a round every
+    /// --client-udp-rebalance-interval-ms, paced over
+    /// --client-udp-drain-spread-ms (MOVE rebalance; the client asks the
+    /// assignment again without this edge, resumes from its oldest hole):
+    /// no more than the receivers' room under the target, shared among the
+    /// edges over it by their excess, so that a fresh edge takes the load
+    /// that its region had before it joined without being overshot.
+    /// `false`: listeners stay where they are, as before (only new
+    /// arrivals reach a new edge).
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_REBALANCE",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    client_udp_rebalance: bool,
+
+    /// Wave 9 C1: an edge takes rebalanced listeners only while its load is
+    /// under the target less this, and is filled to the target less half
+    /// of it.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_REBALANCE_MARGIN_PERMILLE",
+        default_value_t = edge_udp::DEFAULT_REBALANCE_MARGIN_PERMILLE
+    )]
+    client_udp_rebalance_margin_permille: u32,
+
+    /// Wave 9 C1: ms between two rebalance rounds of an edge (each from the
+    /// region's advertisements of that moment).
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_REBALANCE_INTERVAL_MS",
+        default_value_t = edge_udp::DEFAULT_REBALANCE_INTERVAL_MS
+    )]
+    client_udp_rebalance_interval_ms: u64,
+
     /// Entry point of a neighbouring region, as NAME=URL, for example
     /// `us-east=https://entry.us-east.example:443`. Repeat it. The
     /// Multivariant Playlist of this region lists each as the last pathway,
@@ -4013,11 +4084,24 @@ async fn main() -> Result<()> {
             spread_permille: u32::from(args.assignment_spread_percent.min(100)) * 10,
             max_alternates: args.assignment_alternates,
             max_head_lag_parts: args.assignment_max_head_lag_parts,
+            move_headroom: args.assignment_move_headroom,
+            rebalance_target_permille: args.rebalance_target_permille,
         },
         args.steering_ttl_seconds.max(1),
         args.telemetry_interval_ms,
     )
-    .with_assignment_udp_in_region(args.assignment_udp_in_region);
+    .with_assignment_udp_in_region(args.assignment_udp_in_region)
+    .with_rebalance(
+        (args.client_udp_rebalance
+            && args.client_udp_bind.is_some()
+            && cache_mesh_role == CacheMeshRole::Edge)
+            .then(|| RebalanceConfig {
+                target_permille: args.rebalance_target_permille,
+                margin_permille: args.client_udp_rebalance_margin_permille,
+                interval: Duration::from_millis(args.client_udp_rebalance_interval_ms.max(500)),
+                spread: Duration::from_millis(args.client_udp_drain_spread_ms),
+            }),
+    );
     let telemetry_fec_sender = if let Some(queue) = telemetry_fec_queue.clone() {
         Some(
             start_telemetry_fec_sender(
@@ -13871,6 +13955,10 @@ struct ClientUdpGauges {
     load_permille: u32,
     /// The CPU term of the load (wave 9 C2).
     cpu_permille: u32,
+    /// Clients this edge sent to another edge of its region because it was
+    /// over its target and that edge had room (`MOVE rebalance`, wave 9
+    /// C1; cumulative).
+    rebalance_moves: u64,
     /// Measured egress, bits a second, client UDP included.
     egress_observed_bps: u64,
     /// Bytes the client UDP lanes sent, IP and UDP headers included.
@@ -18935,6 +19023,12 @@ struct AppRouter {
     assignment_policy: AssignmentPolicy,
     /// --assignment-udp-in-region (wave 8 local proofs).
     assignment_udp_in_region: bool,
+    /// Wave 9 C1: this edge's rebalance of its UDP listeners (`None`: off)
+    /// and its rounds.
+    rebalance: Option<RebalanceConfig>,
+    rebalance_state: Arc<StdMutex<edge_udp::RebalanceState>>,
+    /// Wave 9 C4: the movers this entry point placed lately (when, where).
+    recent_mover_log: Arc<StdMutex<VecDeque<(Instant, String)>>>,
     steering_ttl_seconds: u64,
     /// An advertisement older than this does not make a cache assignable.
     assignment_fresh_ms: u64,
@@ -18974,6 +19068,15 @@ fn without_skipped(
         return candidates;
     }
     candidates.into_iter().filter(|cache| !skipped(cache)).collect()
+}
+
+/// Wave 9 C1: an edge's rebalance of its UDP listeners.
+#[derive(Debug, Clone, Copy)]
+struct RebalanceConfig {
+    target_permille: u32,
+    margin_permille: u32,
+    interval: Duration,
+    spread: Duration,
 }
 
 /// A request that the entry point answers for a reader.
@@ -19111,6 +19214,9 @@ impl AppRouter {
             edge_udp_stats: Arc::default(),
             assignment_policy: AssignmentPolicy::default(),
             assignment_udp_in_region: true,
+            rebalance: None,
+            rebalance_state: Arc::default(),
+            recent_mover_log: Arc::default(),
             steering_ttl_seconds: 5,
             assignment_fresh_ms: DEFAULT_TELEMETRY_INTERVAL_MS.saturating_mul(3),
             remembered_assignments: Arc::new(DashMap::new()),
@@ -19125,6 +19231,129 @@ impl AppRouter {
     fn with_assignment_udp_in_region(mut self, enabled: bool) -> Self {
         self.assignment_udp_in_region = enabled;
         self
+    }
+
+    /// Wave 9 C4: the movers placed here in the last
+    /// RECENT_MOVERS_WINDOW, per cache.
+    fn recent_movers(&self, now: Instant) -> Vec<(String, u32)> {
+        let mut movers = self
+            .recent_mover_log
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while movers
+            .front()
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= RECENT_MOVERS_WINDOW)
+        {
+            movers.pop_front();
+        }
+        let mut counts: Vec<(String, u32)> = Vec::new();
+        for (_, node_id) in movers.iter() {
+            match counts.iter_mut().find(|(name, _)| name == node_id) {
+                Some(entry) => entry.1 += 1,
+                None => counts.push((node_id.clone(), 1)),
+            }
+        }
+        counts
+    }
+
+    /// Wave 9 C1: rebalance this edge's UDP listeners (`None`: never).
+    fn with_rebalance(mut self, rebalance: Option<RebalanceConfig>) -> Self {
+        self.rebalance = rebalance;
+        self
+    }
+
+    /// Wave 9 C1: how many UDP listeners this edge sends away now, and
+    /// whether a round is still sending. A round is planned every
+    /// interval from the region's advertisements (see
+    /// [`edge_udp::rebalance_quota`]) and paced over the spread; none
+    /// while the edge drains or is not an edge.
+    async fn rebalance_due(&self, now: Instant) -> (usize, bool) {
+        let Some(config) = self.rebalance else {
+            return (0, false);
+        };
+        if self.cache_mesh_role != CacheMeshRole::Edge || self.lifecycle.is_draining().await {
+            return (0, false);
+        }
+        let plan = self
+            .rebalance_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take_plan_turn(now, config.interval);
+        if plan {
+            let quota = self.plan_rebalance(config, now).await;
+            if quota > 0 {
+                self.edge_udp_stats
+                    .rebalance_rounds
+                    .fetch_add(1, Ordering::Relaxed);
+                self.edge_udp_stats
+                    .rebalance_planned
+                    .fetch_add(quota as u64, Ordering::Relaxed);
+                info!(quota, "edge over its target: a rebalance round");
+            }
+            self.rebalance_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .start_round(now, quota);
+        }
+        let state = self
+            .rebalance_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (state.due(now, config.spread), state.active())
+    }
+
+    fn rebalance_sent(&self, now: Instant, count: usize) {
+        self.rebalance_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sent(now, count);
+    }
+
+    /// A round's quota from the region as this edge sees it now.
+    async fn plan_rebalance(&self, config: RebalanceConfig, now: Instant) -> usize {
+        let egress = self.edge_load.admission_snapshot();
+        let own = edge_udp::RebalanceEdge {
+            node_id: self.node.node_id.clone(),
+            load_permille: egress.load_permille,
+            subscribers: self.edge_udp_stats.live_subscribers().unwrap_or(0),
+        };
+        if own.subscribers == 0 || own.load_permille <= config.target_permille {
+            return 0;
+        }
+        let snapshots = self.regional_snapshots().await;
+        let now_ms = now_unix_ms();
+        let others = snapshots
+            .iter()
+            .filter(|snapshot| {
+                snapshot.node.node_id != self.node.node_id
+                    && snapshot.node.region == self.node.region
+                    && !snapshot.node.draining
+                    && self.telemetry.advertisement_age_ms(snapshot, now_ms)
+                        <= self.assignment_fresh_ms
+            })
+            .filter_map(|snapshot| {
+                let edge = snapshot.edge_service.as_ref()?;
+                (edge.cache_mesh_role == "edge" && !edge.draining).then_some(())?;
+                Some(edge_udp::RebalanceEdge {
+                    node_id: snapshot.node.node_id.clone(),
+                    load_permille: edge.load_permille,
+                    subscribers: edge.udp_subscribers?,
+                })
+            })
+            .collect::<Vec<_>>();
+        let window = Duration::from_secs(egress.window_seconds.max(1));
+        let recent = self
+            .rebalance_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .recent_shed(now, window);
+        edge_udp::rebalance_quota(
+            &own,
+            recent,
+            &others,
+            config.target_permille,
+            config.margin_permille,
+        )
     }
 
     fn with_client_udp_port(mut self, port: Option<u16>) -> Self {
@@ -19433,6 +19662,7 @@ impl AppRouter {
             hls_sessions: egress.active_sessions,
             load_permille: egress.load_permille,
             cpu_permille: egress.cpu_permille,
+            rebalance_moves: stats.rebalance_moves.load(Ordering::Relaxed),
             egress_observed_bps: egress.observed_bps,
             egress_wire_bytes: stats.egress_wire_bytes(),
             load_refusals: stats.load_refusals.load(Ordering::Relaxed),
@@ -19838,6 +20068,18 @@ impl AppRouter {
                         }
                     },
                     updated_unix_ms: snapshot.updated_unix_ms,
+                    pending_permille: if is_local || edge.egress_admission_bps == 0 {
+                        0
+                    } else {
+                        self.pending_assignments
+                            .get(&snapshot.node.node_id)
+                            .filter(|pending| pending.0 == snapshot.updated_unix_ms)
+                            .map_or(0, |pending| {
+                                (u128::from(pending.1) * 1_000
+                                    / u128::from(edge.egress_admission_bps))
+                                .min(u128::from(u32::MAX)) as u32
+                            })
+                    },
                 })
             })
             .collect()
@@ -19961,12 +20203,21 @@ impl AppRouter {
             .and_then(|key| self.remembered_assignments.get(key))
             .filter(|entry| now_ms.saturating_sub(entry.1) < REMEMBERED_ASSIGNMENT_MS)
             .map(|entry| entry.0.clone());
+        let moving = reader.udp && !reader.skip.is_empty() && reader.current.is_none();
+        // Wave 9 C4: the movers this entry point placed lately, per cache.
+        let recent_moves = if moving {
+            self.recent_movers(Instant::now())
+        } else {
+            Vec::new()
+        };
         let request = AssignmentRequest {
             region: &self.node.region,
             session: reader.session,
             pin: reader.pin,
             current: reader.current.or(remembered.as_deref()),
             playlist_bps,
+            moving,
+            recent_moves: &recent_moves,
         };
         let assignment = match assign(request, self.assignment_policy, &candidates) {
             Err(AssignmentError::NoCacheAvailable)
@@ -19980,9 +20231,27 @@ impl AppRouter {
         // advertised as taken. Count it until the cache advertises again, so
         // that a crowd is not all sent to the cache that was free a moment
         // ago.
-        if let (true, None, None, Ok(assignment)) =
-            (remember, remembered.as_ref(), reader.current, &assignment)
-        {
+        if let (true, Ok(assignment)) = (moving, &assignment) {
+            if let Some(first) = assignment.caches.first() {
+                let mut movers = self
+                    .recent_mover_log
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                movers.push_back((Instant::now(), first.node_id.clone()));
+                while movers.len() > MAX_RECENT_MOVERS {
+                    movers.pop_front();
+                }
+            }
+        }
+        // A mover (wave 9 C4) is charged at its new cache too, though the
+        // entry point remembers its old one: the movers of a drained edge
+        // ask within a second of each other.
+        if let (true, true, None, Ok(assignment)) = (
+            remember,
+            remembered.is_none() || request.moving,
+            reader.current,
+            &assignment,
+        ) {
             if let Some(candidate) = assignment.caches.first().and_then(|first| {
                 candidates
                     .iter()
@@ -20037,6 +20306,8 @@ impl AppRouter {
                 pin: None,
                 current: None,
                 playlist_bps,
+                moving: false,
+                recent_moves: &[],
             },
             policy,
             &candidates,
@@ -36325,6 +36596,39 @@ mod tests {
         assert!(!args.mlock_all);
         assert!(!args.malloc_tune);
         assert!(!args.prefault);
+    }
+
+    #[test]
+    fn the_wave9_stage_c_flags_default_on_and_can_be_turned_off() {
+        let args = Args::try_parse_from(["av-mesh"]).unwrap();
+        assert!(args.cpu_load);
+        assert_eq!(args.cpu_load_full_percent, 85);
+        assert_eq!(args.cpu_load_window_ms, 5_000);
+        assert!(args.assignment_move_headroom);
+        assert_eq!(args.rebalance_target_permille, 800);
+        assert!(args.client_udp_rebalance);
+        assert_eq!(args.client_udp_rebalance_margin_permille, 150);
+        assert_eq!(args.client_udp_rebalance_interval_ms, 3_000);
+        let args = Args::try_parse_from([
+            "av-mesh",
+            "--cpu-load",
+            "false",
+            "--assignment-move-headroom",
+            "false",
+            "--client-udp-rebalance",
+            "false",
+            "--cpu-load-full-percent",
+            "70",
+            "--rebalance-target-permille",
+            "750",
+        ])
+        .unwrap();
+        assert!(!args.cpu_load);
+        assert!(!args.assignment_move_headroom);
+        assert!(!args.client_udp_rebalance);
+        assert_eq!(args.cpu_load_full_percent, 70);
+        assert_eq!(args.rebalance_target_permille, 750);
+        assert!(Args::try_parse_from(["av-mesh", "--cpu-load-full-percent", "0"]).is_err());
     }
 
     #[test]

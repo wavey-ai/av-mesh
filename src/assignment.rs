@@ -67,11 +67,23 @@ pub struct CacheCandidate {
     /// take standby copies: the first alternate is the edge that holds the
     /// copy. `None` orders the alternates by the session, like the first.
     pub failover_rank: Option<u64>,
+    /// Load, in thousandths of the cache's limit, of the readers that this
+    /// entry point has sent to the cache since the cache last advertised
+    /// (wave 9 C4): counted in its headroom, so that readers asking at once
+    /// (a drained edge's movers) are not all weighed against the same
+    /// stale advertisement.
+    pub pending_permille: u32,
 }
 
 impl CacheCandidate {
     fn holds_playlist(&self) -> bool {
         self.head_part.is_some()
+    }
+
+    /// The advertised load and what this entry point has sent the cache
+    /// since (wave 9 C4).
+    fn effective_load_permille(&self) -> u32 {
+        self.load_permille.saturating_add(self.pending_permille)
     }
 }
 
@@ -85,7 +97,22 @@ pub struct AssignmentPolicy {
     /// A cache whose playlist is this many parts behind the newest copy in the
     /// region is stalled for that playlist. Zero disables the check.
     pub max_head_lag_parts: u64,
+    /// A moving reader (a UDP client that left an edge: drain, kill,
+    /// rebalance) is ranked by each cache's headroom alone, the caches
+    /// under `rebalance_target_permille` first (wave 9 C4,
+    /// `--assignment-move-headroom`): the movers of a drained or lost edge
+    /// spread over the survivors in proportion to their headroom, as a
+    /// spill does, not by the spread tiers, which send them all to the
+    /// caches under 60 %. `false`: a mover is ranked as a new reader.
+    pub move_headroom: bool,
+    /// The load above which an edge sheds UDP listeners to an edge with
+    /// room (wave 9 C1, `--rebalance-target-permille`); a mover goes to a
+    /// cache under it first.
+    pub rebalance_target_permille: u32,
 }
+
+/// Default of `--rebalance-target-permille`.
+pub const DEFAULT_REBALANCE_TARGET_PERMILLE: u32 = 800;
 
 impl Default for AssignmentPolicy {
     fn default() -> Self {
@@ -93,6 +120,8 @@ impl Default for AssignmentPolicy {
             spread_permille: 600,
             max_alternates: 2,
             max_head_lag_parts: 0,
+            move_headroom: true,
+            rebalance_target_permille: DEFAULT_REBALANCE_TARGET_PERMILLE,
         }
     }
 }
@@ -110,6 +139,12 @@ pub struct AssignmentRequest<'a> {
     /// region has measured it. A new reader is assigned only to a cache that
     /// has this much room.
     pub playlist_bps: Option<u64>,
+    /// The reader is moving: a UDP client that names caches it has just
+    /// left (wave 9 C4).
+    pub moving: bool,
+    /// Movers that this entry point placed lately, per cache (wave 9 C4):
+    /// a mover is apportioned against them.
+    pub recent_moves: &'a [(String, u32)],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -229,14 +264,20 @@ pub fn assign(
     };
 
     let session = request.session.unwrap_or("");
+    let moving = request.moving && policy.move_headroom;
     let mut ranked = regional
         .iter()
         .copied()
         .filter(|cache| admits(cache))
         .map(|cache| {
-            let tier = if cache.holds_playlist() && cache.load_permille < policy.spread_permille {
+            let load = cache.effective_load_permille();
+            let tier = if moving {
+                // Wave 9 C4: by headroom alone, under the rebalance target
+                // first (a mover never goes to an edge that would shed it).
+                u8::from(cache.load_permille >= policy.rebalance_target_permille)
+            } else if cache.holds_playlist() && load < policy.spread_permille {
                 0_u8
-            } else if !cache.holds_playlist() && cache.load_permille < policy.spread_permille {
+            } else if !cache.holds_playlist() && load < policy.spread_permille {
                 1
             } else {
                 2
@@ -262,9 +303,30 @@ pub fn assign(
         caches.push(assigned(cache, AssignmentReason::Sticky));
     }
     let mut ranked = ranked;
+    if moving && caches.is_empty() && !ranked.is_empty() {
+        // Wave 9 C4: the movers that this entry point placed lately are
+        // apportioned over the first tier by headroom (largest remainder):
+        // the one whose share is furthest behind takes this one, so that a
+        // drained edge's few dozen movers follow the headroom-weighted
+        // shares closely rather than by chance (a weighted rendezvous of
+        // 36 movers put 5 where 6.9 were due, 1/1.37 of the share).
+        let first_tier = ranked[0].0;
+        let pool = ranked
+            .iter()
+            .enumerate()
+            .filter(|(_, (tier, _, _))| *tier == first_tier)
+            .map(|(index, (_, _, cache))| (index, *cache))
+            .collect::<Vec<_>>();
+        if let Some(index) = apportion(&pool, request.recent_moves) {
+            let chosen = ranked.remove(index);
+            ranked.insert(0, chosen);
+        }
+    }
     if caches.is_empty() && !ranked.is_empty() {
         let (tier, _, cache) = ranked.remove(0);
         let reason = match tier {
+            _ if moving && cache.holds_playlist() => AssignmentReason::HoldsPlaylist,
+            _ if moving => AssignmentReason::NewCopy,
             0 => AssignmentReason::HoldsPlaylist,
             1 => AssignmentReason::NewCopy,
             _ => AssignmentReason::Spill,
@@ -390,6 +452,39 @@ fn assigned(cache: &CacheCandidate, reason: AssignmentReason) -> AssignedCache {
     }
 }
 
+/// Wave 9 C4: which of `pool` (index into the ranking, cache; in ranking
+/// order) a mover goes to, so that the movers placed lately
+/// (`recent_moves`: cache, count) and this one follow each cache's share of
+/// the pool's headroom: the cache whose due share less what it took is the
+/// largest. Ties go to the earlier in the ranking (the session's
+/// rendezvous). `None` for an empty pool.
+fn apportion(pool: &[(usize, &CacheCandidate)], recent_moves: &[(String, u32)]) -> Option<usize> {
+    let taken = |cache: &CacheCandidate| {
+        recent_moves
+            .iter()
+            .filter(|(node_id, _)| *node_id == cache.node_id)
+            .map(|(_, count)| f64::from(*count))
+            .sum::<f64>()
+    };
+    let headroom = |cache: &CacheCandidate| {
+        f64::from(
+            FULL_LOAD_PERMILLE
+                .saturating_sub(cache.load_permille)
+                .max(1),
+        )
+    };
+    let whole: f64 = pool.iter().map(|(_, cache)| headroom(cache)).sum();
+    let total: f64 = pool.iter().map(|(_, cache)| taken(cache)).sum::<f64>() + 1.0;
+    let mut best: Option<(f64, usize)> = None;
+    for (index, cache) in pool {
+        let deficit = headroom(cache) / whole * total - taken(cache);
+        if best.is_none_or(|(most, _)| deficit > most + 1e-9) {
+            best = Some((deficit, *index));
+        }
+    }
+    best.map(|(_, index)| index)
+}
+
 /// Rank of an edge for the standby copy of a playlist. Every node computes
 /// the same rank from the two names, so the edges of a region agree on who
 /// takes the copy, and the entry points on where a reader goes next, without
@@ -418,7 +513,7 @@ pub fn standby_rank(node_id: &str, stream_id: u64) -> u64 {
 fn rendezvous_score(session: &str, cache: &CacheCandidate) -> f64 {
     let free = f64::from(
         FULL_LOAD_PERMILLE
-            .saturating_sub(cache.load_permille)
+            .saturating_sub(cache.effective_load_permille())
             .max(1),
     );
     if session.is_empty() {
@@ -466,7 +561,93 @@ mod tests {
             session_charge_bps: None,
             updated_unix_ms: 0,
             failover_rank: None,
+            pending_permille: 0,
         }
+    }
+
+    /// Wave 9 C4: the movers of a drained edge spread over the survivors
+    /// in proportion to their headroom (the spread tiers sent them all to
+    /// the survivors under 60 %), apportioned against the movers placed
+    /// before them, and a survivor over the rebalance target takes none
+    /// while one under it has room.
+    #[test]
+    fn movers_spread_over_the_survivors_by_headroom() {
+        let caches = [
+            cache("edge-2", 290, Some(900)),
+            cache("edge-3", 720, Some(900)),
+            cache("edge-4", 520, Some(900)),
+        ];
+        // `count` movers, each told of those placed before it.
+        let place = |caches: &[CacheCandidate], policy: AssignmentPolicy, count: usize| {
+            let mut placed: Vec<(String, u32)> = Vec::new();
+            for index in 0..count {
+                let session = format!("mover-{index}");
+                let moving = AssignmentRequest {
+                    moving: true,
+                    recent_moves: &placed,
+                    ..request(&session)
+                };
+                let first = assign(moving, policy, caches).unwrap().caches[0]
+                    .node_id
+                    .clone();
+                match placed.iter_mut().find(|(node_id, _)| *node_id == first) {
+                    Some(entry) => entry.1 += 1,
+                    None => placed.push((first, 1)),
+                }
+            }
+            placed
+                .into_iter()
+                .collect::<HashMap<String, u32>>()
+        };
+        // The wave 9 local F1: headroom 710 / 280 / 480 of 1,470 and 36
+        // movers: 17.4 / 6.9 / 11.8 due; within one of each.
+        let moved = place(&caches, AssignmentPolicy::default(), 36);
+        for (name, due) in [("edge-2", 17.39), ("edge-3", 6.86), ("edge-4", 11.76)] {
+            let got = f64::from(moved.get(name).copied().unwrap_or(0));
+            assert!((got - due).abs() <= 1.0, "{name}: {moved:?}");
+        }
+        // As a new reader (the flag off), edge-3 above the spread target
+        // gets none.
+        let off = AssignmentPolicy {
+            move_headroom: false,
+            ..AssignmentPolicy::default()
+        };
+        let moved = place(&caches, off, 36);
+        assert!(!moved.contains_key("edge-3"), "{moved:?}");
+        // Over the rebalance target: none while a cache under it has room.
+        let mut over = caches.clone();
+        over[1].load_permille = 850;
+        let moved = place(&over, AssignmentPolicy::default(), 36);
+        assert!(!moved.contains_key("edge-3"), "{moved:?}");
+        // Every cache over the target: still assigned, by headroom.
+        let all_over = [
+            cache("edge-2", 900, Some(900)),
+            cache("edge-3", 820, Some(900)),
+        ];
+        let moved = place(&all_over, AssignmentPolicy::default(), 14);
+        assert_eq!(moved.get("edge-3"), Some(&9), "{moved:?}");
+        assert_eq!(moved.get("edge-2"), Some(&5), "{moved:?}");
+    }
+
+    /// The readers an entry point sent to a cache since its advertisement
+    /// count in its headroom for new readers (wave 9 C4).
+    #[test]
+    fn pending_readers_count_in_the_headroom_of_new_readers() {
+        let mut caches = vec![cache("edge-1", 300, None), cache("edge-2", 300, None)];
+        caches[0].pending_permille = 400;
+        let mut first = HashMap::<String, usize>::new();
+        for index in 0..2_000 {
+            let session = format!("new-{index}");
+            let assignment =
+                assign_udp_in_region(request(&session), AssignmentPolicy::default(), &caches)
+                    .unwrap();
+            *first
+                .entry(assignment.caches[0].node_id.clone())
+                .or_default() += 1;
+        }
+        // Headroom 300 against 700: about 30 %.
+        let share = first["edge-1"] as f64 / 2_000.0;
+        assert!(share > 0.25 && share < 0.35, "{first:?}");
     }
 
     #[test]
@@ -627,6 +808,8 @@ mod tests {
             pin: None,
             current: None,
             playlist_bps: None,
+            moving: false,
+            recent_moves: &[],
         }
     }
 

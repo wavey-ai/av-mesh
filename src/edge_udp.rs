@@ -226,6 +226,19 @@ pub(crate) const DEFAULT_KEEPALIVE_MS: u64 = 80;
 /// Default of `--client-udp-drain-spread-ms`.
 pub(crate) const DEFAULT_DRAIN_SPREAD_MS: u64 = 2_000;
 
+/// Default of `--client-udp-rebalance-margin-permille` (wave 9 C1).
+pub(crate) const DEFAULT_REBALANCE_MARGIN_PERMILLE: u32 = 150;
+
+/// Default of `--client-udp-rebalance-interval-ms` (wave 9 C1): a few
+/// advertisements apart, so that each round sees the last one's moves in
+/// the receivers' live subscriber gauges.
+pub(crate) const DEFAULT_REBALANCE_INTERVAL_MS: u64 = 3_000;
+
+/// A subscriber admitted less than this long ago is not rebalanced (wave 9
+/// C1): neither a new listener nor one that has just moved here moves
+/// again at once.
+pub(crate) const REBALANCE_MIN_AGE: Duration = Duration::from_secs(10);
+
 /// Default of `--client-udp-nack-edge-rate`.
 pub(crate) const DEFAULT_NACK_EDGE_RATE: u32 = 20_000;
 
@@ -336,6 +349,12 @@ pub(crate) struct EdgeUdpStats {
     /// clients moved for it (Phase AM item 11).
     pub region_lost_checks: AtomicU64,
     pub region_lost_moves: AtomicU64,
+    /// Wave 9 C1: rebalance rounds that found this edge over its target
+    /// with room in its region, the listeners they planned to send away,
+    /// and those sent (`MOVE rebalance`).
+    pub rebalance_rounds: AtomicU64,
+    pub rebalance_planned: AtomicU64,
+    pub rebalance_moves: AtomicU64,
 }
 
 /// The subscriber table, for the live gauges.
@@ -2877,6 +2896,9 @@ async fn run_stream_sender(
     // Phase AM item 9: the drain in progress (its start, the subscribers
     // there were, those sent away so far).
     let mut drain: Option<DrainPace> = None;
+    // The playlist's demand is kept once a second, also while a rebalance
+    // round runs the housekeeping every tick.
+    let mut demand_at = Instant::now();
     loop {
         let now = Instant::now();
         // The stream's class can become known after it started.
@@ -3057,17 +3079,83 @@ async fn run_stream_sender(
                     continue;
                 }
             } else {
-                // Keep the playlist held, as a reader's playlist reloads do
-                // (wave 9: without the wait for a playable copy, which held
-                // a cold edge's first subscribers' parts back).
-                if config.prompt_sender {
-                    router.open_playlist_demand(stream_id).await;
-                } else {
-                    router.ensure_playlist_copy(stream_id).await;
+                if now >= demand_at {
+                    demand_at = now + HOUSEKEEPING;
+                    // Keep the playlist held, as a reader's playlist reloads
+                    // do (wave 9: without the wait for a playable copy,
+                    // which held a cold edge's first subscribers' parts
+                    // back).
+                    if config.prompt_sender {
+                        router.open_playlist_demand(stream_id).await;
+                    } else {
+                        router.ensure_playlist_copy(stream_id).await;
+                    }
+                    router
+                        .request_replica_for_stream(stream_id, "udp-client-demand", None)
+                        .await;
                 }
-                router
-                    .request_replica_for_stream(stream_id, "udp-client-demand", None)
-                    .await;
+                // Wave 9 C1: over its target with room in the region, the
+                // edge sends some listeners there (a share every tick of
+                // the round). They ask the assignment again without this
+                // edge and resume from their oldest hole at the next.
+                let (due, active) = router.rebalance_due(now).await;
+                if due > 0 {
+                    let (leaving, kept) = {
+                        let mut guard = table.lock().unwrap();
+                        match guard.get_mut(&stream_id) {
+                            Some(entry) => {
+                                let leaving = take_movable_aged(
+                                    entry,
+                                    Duration::ZERO,
+                                    REBALANCE_MIN_AGE,
+                                    now,
+                                    Some(due),
+                                );
+                                let kept = entry.subscribers.len();
+                                if kept == 0 {
+                                    guard.remove(&stream_id);
+                                }
+                                if !leaving.is_empty() {
+                                    fast_lane_changed(&sockets, &guard);
+                                }
+                                (leaving, kept)
+                            }
+                            None => (Vec::new(), 0),
+                        }
+                    };
+                    router.rebalance_sent(now, leaving.len());
+                    if !leaving.is_empty() {
+                        stats
+                            .moves
+                            .fetch_add(leaving.len() as u64, Ordering::Relaxed);
+                        stats
+                            .rebalance_moves
+                            .fetch_add(leaving.len() as u64, Ordering::Relaxed);
+                        info!(
+                            stream_id,
+                            clients = leaving.len(),
+                            kept,
+                            "edge client UDP rebalances clients to an edge with room"
+                        );
+                    }
+                    for peer in leaving {
+                        send_control(
+                            &socket,
+                            peer,
+                            &Control::Move {
+                                stream_id,
+                                reason: "rebalance".into(),
+                            },
+                        )
+                        .await;
+                    }
+                    if kept == 0 {
+                        return;
+                    }
+                }
+                if active {
+                    housekeeping_at = Instant::now() + DRAIN_TICK;
+                }
             }
         }
 
@@ -3325,6 +3413,176 @@ impl DrainPace {
     }
 }
 
+/// One other edge of the region as a rebalance round sees it (wave 9 C1):
+/// its advertised load and its live UDP subscribers.
+#[derive(Debug, Clone)]
+pub(crate) struct RebalanceEdge {
+    #[allow(dead_code)]
+    pub(crate) node_id: String,
+    pub(crate) load_permille: u32,
+    pub(crate) subscribers: u64,
+}
+
+/// How many UDP listeners an edge sends away in one rebalance round (wave
+/// 9 C1), from its own load and subscribers and those of the other live
+/// edges of its region (fresh, serving, not draining).
+///
+/// The cost of a listener, `k` permille, is the median of load over
+/// subscribers among the edges with a few. An advertised load is a mean
+/// over the egress window and lags the subscribers, so:
+/// - this edge's load is less what it sent away in the window
+///   (`recent_shed`, listeners weighted by the share of the window still to
+///   come since each was sent);
+/// - a receiver's is the larger of its load and `k` x its live subscribers
+///   (listeners that came in since are counted), and it takes listeners
+///   while that is under `target - margin`, up to `target - margin / 2`;
+/// - another edge over the target asks its excess as this one does.
+///
+/// The receivers' room is shared among the edges over the target by their
+/// excess, so that none is overshot by several at once; an edge never
+/// sends more than its own excess.
+pub(crate) fn rebalance_quota(
+    own: &RebalanceEdge,
+    recent_shed: f64,
+    others: &[RebalanceEdge],
+    target: u32,
+    margin: u32,
+) -> usize {
+    let mut costs = std::iter::once(own)
+        .chain(others)
+        .filter(|edge| edge.subscribers >= 4 && edge.load_permille > 0)
+        .map(|edge| f64::from(edge.load_permille) / edge.subscribers as f64)
+        .collect::<Vec<_>>();
+    if costs.is_empty() {
+        return 0;
+    }
+    costs.sort_by(f64::total_cmp);
+    let k = costs[costs.len() / 2];
+    if k <= 0.0 {
+        return 0;
+    }
+    let target = f64::from(target);
+    let margin = f64::from(margin.min(target as u32));
+    let own_load = (f64::from(own.load_permille) - recent_shed * k).max(0.0);
+    if own_load <= target {
+        return 0;
+    }
+    let excess = |load: f64, subscribers: u64| -> f64 {
+        ((load - target) / k).ceil().clamp(0.0, subscribers as f64)
+    };
+    let own_excess = excess(own_load, own.subscribers);
+    if own_excess < 1.0 {
+        return 0;
+    }
+    let mut shedders = 1.0;
+    let mut total_excess = own_excess;
+    let mut total_room = 0.0;
+    for edge in others {
+        let live = k * edge.subscribers as f64;
+        let load = f64::from(edge.load_permille);
+        let high = load.max(live);
+        if high < target - margin {
+            total_room += ((target - margin / 2.0 - high) / k).floor().max(0.0);
+        }
+        let low = load.min(live);
+        if low > target {
+            let other = excess(low, edge.subscribers);
+            if other >= 1.0 {
+                shedders += 1.0;
+                total_excess += other;
+            }
+        }
+    }
+    if total_room < 1.0 {
+        return 0;
+    }
+    let share = (total_room * own_excess / total_excess).floor();
+    let share = if share < 1.0 && total_room >= shedders {
+        1.0
+    } else {
+        share
+    };
+    share.min(own_excess) as usize
+}
+
+/// An edge's rebalance rounds (wave 9 C1): when it last planned, the round
+/// in progress (paced as a drain), and what it sent in the last window.
+#[derive(Debug, Default)]
+pub(crate) struct RebalanceState {
+    planned_at: Option<Instant>,
+    round: Option<DrainPace>,
+    shed: VecDeque<(Instant, usize)>,
+}
+
+impl RebalanceState {
+    /// Whether a new round is due (and if so, it is now: the caller plans).
+    pub(crate) fn take_plan_turn(&mut self, now: Instant, interval: Duration) -> bool {
+        let due = self
+            .planned_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= interval);
+        if due {
+            self.planned_at = Some(now);
+        }
+        due
+    }
+
+    pub(crate) fn start_round(&mut self, now: Instant, total: usize) {
+        self.round = (total > 0).then_some(DrainPace {
+            started: now,
+            initial: total,
+            sent: 0,
+        });
+    }
+
+    /// Listeners to send away now: the round's share due by the next tick
+    /// (spread over `spread`), never past its total.
+    pub(crate) fn due(&self, now: Instant, spread: Duration) -> usize {
+        let Some(round) = self.round else {
+            return 0;
+        };
+        round
+            .due(now, spread)
+            .min(round.initial.saturating_sub(round.sent))
+    }
+
+    /// A round is still sending.
+    pub(crate) fn active(&self) -> bool {
+        self.round
+            .is_some_and(|round| round.sent < round.initial)
+    }
+
+    pub(crate) fn sent(&mut self, now: Instant, count: usize) {
+        if count == 0 {
+            return;
+        }
+        if let Some(round) = self.round.as_mut() {
+            round.sent += count;
+        }
+        self.shed.push_back((now, count));
+    }
+
+    /// What this edge sent away in the last `window`, each weighted by the
+    /// share of the window still to come since it was sent: the part of
+    /// them that its advertised mean still holds.
+    pub(crate) fn recent_shed(&mut self, now: Instant, window: Duration) -> f64 {
+        while self
+            .shed
+            .front()
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= window)
+        {
+            self.shed.pop_front();
+        }
+        let window = window.as_secs_f64().max(1e-3);
+        self.shed
+            .iter()
+            .map(|(at, count)| {
+                let age = now.saturating_duration_since(*at).as_secs_f64();
+                *count as f64 * (1.0 - age / window).max(0.0)
+            })
+            .sum()
+    }
+}
+
 /// Take the subscribers that may be moved: all of them, or with a
 /// hold-down all but those that came by a move less than that long ago;
 /// at most `limit` of them, if given (a paced drain).
@@ -3334,11 +3592,25 @@ fn take_movable(
     now: Instant,
     limit: Option<usize>,
 ) -> Vec<SocketAddr> {
+    take_movable_aged(entry, hold_down, Duration::ZERO, now, limit)
+}
+
+/// [`take_movable`], and none admitted less than `min_age` ago, nor one
+/// still catching up after a move (a rebalance, wave 9 C1).
+fn take_movable_aged(
+    entry: &mut StreamEntry,
+    hold_down: Duration,
+    min_age: Duration,
+    now: Instant,
+    limit: Option<usize>,
+) -> Vec<SocketAddr> {
     let leaving: Vec<SocketAddr> = entry
         .subscribers
         .iter()
         .filter(|(_, subscriber)| {
-            !subscriber.moved_in || now.duration_since(subscriber.admitted_at) >= hold_down
+            let age = now.saturating_duration_since(subscriber.admitted_at);
+            (!subscriber.moved_in || age >= hold_down)
+                && (min_age.is_zero() || (age >= min_age && !subscriber.catching_up))
         })
         .map(|(peer, _)| *peer)
         .take(limit.unwrap_or(usize::MAX))
@@ -4426,6 +4698,124 @@ mod tests {
     /// a share at each 50 ms tick, the first at once, and the last at the
     /// end of the spread: they leave across more than 1.5 s, at most a
     /// tick's share (~25) at once.
+    fn rebalance_edge(node_id: &str, load_permille: u32, subscribers: u64) -> RebalanceEdge {
+        RebalanceEdge {
+            node_id: node_id.into(),
+            load_permille,
+            subscribers,
+        }
+    }
+
+    #[test]
+    fn an_edge_over_its_target_sheds_into_the_room_of_its_region_and_no_more() {
+        // Wave 9 C1, the wave 8 autoscale proof: three edges at 30 permille
+        // a listener, one at 1,000, and a slot that has just joined.
+        let own = rebalance_edge("e3", 1_000, 33);
+        let others = [
+            rebalance_edge("e1", 850, 28),
+            rebalance_edge("e2", 900, 30),
+            rebalance_edge("e4", 0, 0),
+        ];
+        // k ~ 30.3; own excess (1000 - 800) / k -> 7; e2 (900) asks 4 and
+        // e1 (850) 2. The slot's room: (800 - 75) / k -> 23, so e3 takes
+        // 23 x 7 / 13 = 12 -> its excess, 7.
+        assert_eq!(rebalance_quota(&own, 0.0, &others, 800, 150), 7);
+        // The slot is the only receiver: with 3 edges asking 24 between
+        // them the round shares its room, never more than it has.
+        let crowded = [
+            rebalance_edge("e1", 1_000, 33),
+            rebalance_edge("e2", 1_000, 33),
+            rebalance_edge("e4", 600, 15),
+        ];
+        // Room (725 - max(600, 450)) / 30 -> 4; e3 asks 7 of 21: 1.
+        assert_eq!(rebalance_quota(&own, 0.0, &crowded, 800, 150), 1);
+        // A receiver whose live subscribers say it is fuller than its
+        // (lagging) load takes nothing: 22 x 30 = 660 > 650.
+        let filled = [rebalance_edge("e4", 200, 22), rebalance_edge("e1", 700, 23)];
+        assert_eq!(rebalance_quota(&own, 0.0, &filled, 800, 150), 0);
+        // No room anywhere, or under its own target: nothing.
+        let full = [rebalance_edge("e1", 760, 25), rebalance_edge("e2", 700, 23)];
+        assert_eq!(rebalance_quota(&own, 0.0, &full, 800, 150), 0);
+        assert_eq!(
+            rebalance_quota(&rebalance_edge("e3", 790, 26), 0.0, &others, 800, 150),
+            0
+        );
+        // What it sent away in the window (its load still holds 6 of them)
+        // counts: 1,000 - 6 x 30 = 820 -> 1 more.
+        assert_eq!(rebalance_quota(&own, 6.0, &others, 800, 150), 1);
+        assert_eq!(rebalance_quota(&own, 7.0, &others, 800, 150), 0);
+        // Never more than its own subscribers; none without a cost.
+        assert_eq!(
+            rebalance_quota(&rebalance_edge("e3", 1_000, 0), 0.0, &others, 800, 150),
+            0
+        );
+    }
+
+    #[test]
+    fn a_rebalance_round_is_paced_and_remembers_what_it_sent() {
+        let start = Instant::now();
+        let spread = Duration::from_millis(2_000);
+        let interval = Duration::from_millis(3_000);
+        let mut state = RebalanceState::default();
+        assert!(state.take_plan_turn(start, interval));
+        assert!(!state.take_plan_turn(start + Duration::from_millis(100), interval));
+        assert_eq!(state.due(start, spread), 0, "no round yet");
+        state.start_round(start, 40);
+        assert!(state.active());
+        let mut sent = 0;
+        let mut at = start;
+        let mut largest = 0;
+        while state.active() {
+            let due = state.due(at, spread);
+            largest = largest.max(due);
+            state.sent(at, due);
+            sent += due;
+            at += DRAIN_TICK;
+            assert!(at <= start + spread + DRAIN_TICK, "the round ends with its spread");
+        }
+        assert_eq!(sent, 40, "the round's total, never past it");
+        assert!(largest <= 2, "{largest}");
+        assert_eq!(state.due(at + spread, spread), 0);
+        // Its moves count in the next round's own load while the egress
+        // window still holds them, less and less.
+        let window = Duration::from_secs(10);
+        let early = state.recent_shed(start + Duration::from_secs(3), window);
+        let late = state.recent_shed(start + Duration::from_secs(9), window);
+        assert!(early > 30.0 && early < 34.0, "{early}");
+        assert!(late > 6.0 && late < 10.0, "{late}");
+        assert_eq!(state.recent_shed(start + Duration::from_secs(13), window), 0.0);
+        assert!(state.take_plan_turn(start + interval, interval));
+        state.start_round(start + interval, 0);
+        assert!(!state.active());
+    }
+
+    #[test]
+    fn a_rebalance_moves_neither_a_new_listener_nor_one_catching_up() {
+        let now = Instant::now();
+        let mut entry = StreamEntry::default();
+        let old = now - REBALANCE_MIN_AGE * 2;
+        for (index, (admitted_at, catching_up)) in [
+            (old, false),
+            (old, false),
+            (old, true),
+            (now, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut subscriber = subscriber(admitted_at);
+            subscriber.catching_up = catching_up;
+            entry
+                .subscribers
+                .insert(SocketAddr::from(([127, 0, 0, 1], 40_000 + index as u16)), subscriber);
+        }
+        let leaving = take_movable_aged(&mut entry, Duration::ZERO, REBALANCE_MIN_AGE, now, Some(5));
+        assert_eq!(leaving.len(), 2, "{leaving:?}");
+        assert_eq!(entry.subscribers.len(), 2);
+        let leaving = take_movable_aged(&mut entry, Duration::ZERO, REBALANCE_MIN_AGE, now, Some(5));
+        assert!(leaving.is_empty());
+    }
+
     #[test]
     fn a_paced_drain_spreads_a_thousand_moves_over_its_spread() {
         let start = Instant::now();
