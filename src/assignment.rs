@@ -302,6 +302,41 @@ pub fn assign(
     })
 }
 
+/// A UDP client's assignment when [`assign`] finds no cache with room for
+/// it (wave 8 local proofs): the caches of the region that are fresh, not
+/// draining, not overloaded and under full load are ranked again without
+/// the room check, and the first is a spill. `free_bps` counts the readers
+/// that entry points sent since the cache last advertised, each charged an
+/// LL-HLS reader's share (a 1 ms playlist's request rate: ~2 Mbit/s a
+/// reader where a 1 ms Opus UDP client sends ~0.8), so a crowd of UDP
+/// clients that starts within one advertisement interval used up every
+/// edge's estimate after ~40 each, and the rest were answered with the
+/// failover region alone: London listeners subscribed in New York. A UDP
+/// edge's own admission (`--client-udp-admit-by-load`) refuses a client it
+/// cannot take, and the client asks again with that edge in its skip set;
+/// the failover region is for a region that cannot serve, not for an
+/// estimate that ran out. `Err` when no cache of the region is healthy.
+pub fn assign_udp_in_region(
+    request: AssignmentRequest<'_>,
+    policy: AssignmentPolicy,
+    candidates: &[CacheCandidate],
+) -> Result<Assignment, AssignmentError> {
+    let relaxed = candidates
+        .iter()
+        .map(|cache| CacheCandidate {
+            free_bps: None,
+            ..cache.clone()
+        })
+        .collect::<Vec<_>>();
+    let mut assignment = assign(request, policy, &relaxed)?;
+    if let Some(first) = assignment.caches.first_mut() {
+        if first.reason != AssignmentReason::Sticky && first.reason != AssignmentReason::Pinned {
+            first.reason = AssignmentReason::Spill;
+        }
+    }
+    Ok(assignment)
+}
+
 fn assigned(cache: &CacheCandidate, reason: AssignmentReason) -> AssignedCache {
     AssignedCache {
         node_id: cache.node_id.clone(),
@@ -389,6 +424,59 @@ mod tests {
             updated_unix_ms: 0,
             failover_rank: None,
         }
+    }
+
+    #[test]
+    fn a_udp_client_spills_within_its_region_when_the_room_estimates_ran_out() {
+        // Every edge's free capacity is used up by readers sent to it since
+        // it last advertised; none is overloaded or full by its own count.
+        let caches = (1..=4)
+            .map(|index| CacheCandidate {
+                free_bps: Some(0),
+                session_charge_bps: Some(2_000_000),
+                ..cache(&format!("edge-{index}"), 300, Some(900))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            assign(request("load-7"), AssignmentPolicy::default(), &caches),
+            Err(AssignmentError::NoCacheAvailable)
+        );
+        let mut first = HashMap::<String, usize>::new();
+        for index in 0..200 {
+            let session = format!("load-{index}");
+            let assignment =
+                assign_udp_in_region(request(&session), AssignmentPolicy::default(), &caches)
+                    .unwrap();
+            assert_eq!(assignment.caches[0].reason, AssignmentReason::Spill);
+            assert_eq!(assignment.caches.len(), 3, "the first and two alternates");
+            *first
+                .entry(assignment.caches[0].node_id.clone())
+                .or_default() += 1;
+        }
+        // Spread over the region by the session, as before.
+        assert_eq!(first.len(), 4, "{first:?}");
+        assert!(first.values().all(|count| *count > 25), "{first:?}");
+        // A cache that says it is overloaded, full, draining or stale is
+        // still left out: with none left, no assignment (the failover region).
+        let mut sick = caches.clone();
+        sick[0].overloaded = true;
+        sick[1].load_permille = FULL_LOAD_PERMILLE;
+        sick[2].draining = true;
+        sick[3].fresh = false;
+        assert_eq!(
+            assign_udp_in_region(request("load-1"), AssignmentPolicy::default(), &sick),
+            Err(AssignmentError::NoCacheAvailable)
+        );
+        sick[3].fresh = true;
+        let assignment =
+            assign_udp_in_region(request("load-1"), AssignmentPolicy::default(), &sick).unwrap();
+        assert_eq!(assignment.caches[0].node_id, "edge-4");
+        // A cache with room is assigned as before, its reason unchanged.
+        let mut roomy = caches.clone();
+        roomy[2].free_bps = Some(50_000_000);
+        let assignment = assign(request("load-1"), AssignmentPolicy::default(), &roomy).unwrap();
+        assert_eq!(assignment.caches[0].node_id, "edge-3");
+        assert_eq!(assignment.caches[0].reason, AssignmentReason::HoldsPlaylist);
     }
 
     #[test]

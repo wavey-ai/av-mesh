@@ -12,8 +12,8 @@ mod link_telemetry;
 
 use anyhow::{anyhow, bail, Context, Result};
 use assignment::{
-    assign, standby_rank, AssignedCache, Assignment, AssignmentError, AssignmentPolicy,
-    AssignmentRequest, CacheCandidate,
+    assign, assign_udp_in_region, standby_rank, AssignedCache, Assignment, AssignmentError,
+    AssignmentPolicy, AssignmentRequest, CacheCandidate,
 };
 use async_trait::async_trait;
 use av_mesh::relay_ingress::{
@@ -2673,6 +2673,25 @@ struct Args {
     )]
     assignment_max_head_lag_parts: u64,
 
+    /// Wave 8 local proofs: a UDP client (`/api/assignment` naming its
+    /// session) that no cache of this region has room for by the entry
+    /// point's estimate is assigned in this region anyway (reason `spill`):
+    /// any cache that is fresh, not draining, not overloaded and under full
+    /// load, ranked by its session; the cache's own admission
+    /// (--client-udp-admit-by-load) refuses what it cannot take, and the
+    /// client asks again without it. The estimate counts the readers sent
+    /// since a cache last advertised at an LL-HLS reader's charge, so a
+    /// crowd of UDP clients starting at once used it up after ~40 an edge
+    /// and the rest were sent to the failover region (London listeners
+    /// played from New York). `false`: the failover region alone, as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_ASSIGNMENT_UDP_IN_REGION",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    assignment_udp_in_region: bool,
+
     /// Entry point of a neighbouring region, as NAME=URL, for example
     /// `us-east=https://entry.us-east.example:443`. Repeat it. The
     /// Multivariant Playlist of this region lists each as the last pathway,
@@ -3881,7 +3900,8 @@ async fn main() -> Result<()> {
         },
         args.steering_ttl_seconds.max(1),
         args.telemetry_interval_ms,
-    );
+    )
+    .with_assignment_udp_in_region(args.assignment_udp_in_region);
     let telemetry_fec_sender = if let Some(queue) = telemetry_fec_queue.clone() {
         Some(
             start_telemetry_fec_sender(
@@ -18773,6 +18793,8 @@ struct AppRouter {
     client_udp_port: Option<u16>,
     edge_udp_stats: Arc<edge_udp::EdgeUdpStats>,
     assignment_policy: AssignmentPolicy,
+    /// --assignment-udp-in-region (wave 8 local proofs).
+    assignment_udp_in_region: bool,
     steering_ttl_seconds: u64,
     /// An advertisement older than this does not make a cache assignable.
     assignment_fresh_ms: u64,
@@ -18817,6 +18839,10 @@ fn without_skipped(
 /// A request that the entry point answers for a reader.
 #[derive(Debug, Clone, Copy)]
 struct ReaderRequest<'a> {
+    /// A UDP client's assignment (`/api/assignment` naming its session):
+    /// with --assignment-udp-in-region it spills within the region when the
+    /// room estimates ran out, rather than being sent to the failover region.
+    udp: bool,
     stream_id: u64,
     session: Option<&'a str>,
     pin: Option<&'a str>,
@@ -18944,6 +18970,7 @@ impl AppRouter {
             client_udp_port: None,
             edge_udp_stats: Arc::default(),
             assignment_policy: AssignmentPolicy::default(),
+            assignment_udp_in_region: true,
             steering_ttl_seconds: 5,
             assignment_fresh_ms: DEFAULT_TELEMETRY_INTERVAL_MS.saturating_mul(3),
             remembered_assignments: Arc::new(DashMap::new()),
@@ -18953,6 +18980,11 @@ impl AppRouter {
             // told how long one reading serves.
             regional_view_ttl: Duration::ZERO,
         }
+    }
+
+    fn with_assignment_udp_in_region(mut self, enabled: bool) -> Self {
+        self.assignment_udp_in_region = enabled;
+        self
     }
 
     fn with_client_udp_port(mut self, port: Option<u16>) -> Self {
@@ -19434,6 +19466,7 @@ impl AppRouter {
             draining,
         });
         let reader = ReaderRequest {
+            udp: false,
             skip: &[],
             stream_id: stream_id.unwrap_or(self.cache.stream_id),
             session: session_id,
@@ -19780,17 +19813,21 @@ impl AppRouter {
             .and_then(|key| self.remembered_assignments.get(key))
             .filter(|entry| now_ms.saturating_sub(entry.1) < REMEMBERED_ASSIGNMENT_MS)
             .map(|entry| entry.0.clone());
-        let assignment = assign(
-            AssignmentRequest {
-                region: &self.node.region,
-                session: reader.session,
-                pin: reader.pin,
-                current: reader.current.or(remembered.as_deref()),
-                playlist_bps,
-            },
-            self.assignment_policy,
-            &candidates,
-        );
+        let request = AssignmentRequest {
+            region: &self.node.region,
+            session: reader.session,
+            pin: reader.pin,
+            current: reader.current.or(remembered.as_deref()),
+            playlist_bps,
+        };
+        let assignment = match assign(request, self.assignment_policy, &candidates) {
+            Err(AssignmentError::NoCacheAvailable)
+                if reader.udp && reader.pin.is_none() && self.assignment_udp_in_region =>
+            {
+                assign_udp_in_region(request, self.assignment_policy, &candidates)
+            }
+            other => other,
+        };
         // A reader that is placed now takes capacity that the cache has not
         // advertised as taken. Count it until the cache advertises again, so
         // that a crowd is not all sent to the cache that was free a moment
@@ -19915,6 +19952,7 @@ impl AppRouter {
             .and_then(percent_decode_query_value)
             .filter(|pin| !pin.is_empty());
         let reader = ReaderRequest {
+            udp: false,
             skip: &[],
             stream_id,
             session: session_id,
@@ -20116,6 +20154,7 @@ impl AppRouter {
         let (assignment, _) = self
             .assign_reader(
                 ReaderRequest {
+                    udp: false,
                     skip: &[],
                     stream_id,
                     session: session.as_deref(),
@@ -20167,6 +20206,7 @@ impl AppRouter {
         let (assignment, _) = self
             .assign_reader(
                 ReaderRequest {
+                    udp: false,
                     skip: &[],
                     stream_id,
                     session: session_id,
@@ -20289,6 +20329,9 @@ impl AppRouter {
         let (assignment, candidates) = self
             .assign_reader(
                 ReaderRequest {
+                    // A client that names its session asks for its UDP
+                    // assignment (needletail-udp-client, needletail-load).
+                    udp: remember,
                     skip: &skip,
                     stream_id,
                     session: session_id,
@@ -21919,6 +21962,7 @@ impl Router for AppRouter {
                             Ok(part) => part,
                             Err(ParentsLost) => {
                                 let reader = ReaderRequest {
+                                    udp: false,
                                     skip: &[],
                                     stream_id,
                                     session: session_id.as_deref(),
@@ -35902,6 +35946,12 @@ mod tests {
         assert!(args.client_udp_admit_by_load);
         assert_eq!(args.client_udp_drain_spread_ms, 2_000);
         assert_eq!(args.client_udp_region_hold_ms, 2_000);
+        assert!(args.assignment_udp_in_region);
+        assert!(
+            !Args::try_parse_from(["av-mesh", "--assignment-udp-in-region", "false"])
+                .unwrap()
+                .assignment_udp_in_region
+        );
         let args = Args::try_parse_from([
             "av-mesh",
             "--client-udp-egress-load",
