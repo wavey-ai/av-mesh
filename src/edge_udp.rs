@@ -175,6 +175,13 @@ pub(crate) struct EdgeUdpConfig {
     /// (a contributor gap, a failover promotion) is not taken for a dead
     /// edge by every listener at once.
     pub keepalive: Duration,
+    /// The stream's sender keeps the playlist's demand without waiting for
+    /// the edge's copy to be playable (`--client-udp-prompt-sender`, wave 9
+    /// cold start; `false`: its first look waits, up to 4 s, for a whole
+    /// segment, as an LL-HLS reader's first playlist request does, and the
+    /// parts between a new subscriber's first part and the fast lane's
+    /// first part for it wait with it: 200-300 ms late on a cold edge).
+    pub prompt_sender: bool,
 }
 
 impl EdgeUdpConfig {
@@ -202,6 +209,7 @@ impl EdgeUdpConfig {
             admit_by_load: true,
             drain_spread: Duration::from_millis(DEFAULT_DRAIN_SPREAD_MS),
             keepalive: Duration::from_millis(DEFAULT_KEEPALIVE_MS),
+            prompt_sender: true,
         }
     }
 }
@@ -2977,8 +2985,14 @@ async fn run_stream_sender(
                     continue;
                 }
             } else {
-                // Keep the playlist held, as a reader's playlist reloads do.
-                router.ensure_playlist_copy(stream_id).await;
+                // Keep the playlist held, as a reader's playlist reloads do
+                // (wave 9: without the wait for a playable copy, which held
+                // a cold edge's first subscribers' parts back).
+                if config.prompt_sender {
+                    router.open_playlist_demand(stream_id).await;
+                } else {
+                    router.ensure_playlist_copy(stream_id).await;
+                }
                 router
                     .request_replica_for_stream(stream_id, "udp-client-demand", None)
                     .await;

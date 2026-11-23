@@ -2193,6 +2193,21 @@ struct Args {
     )]
     client_udp_nack_edge_rate: u32,
 
+    /// Wave 9 (cold start): the stream's UDP sender keeps the playlist's
+    /// demand without waiting for this edge's copy to be playable. Its first
+    /// look used to wait, up to 4 s, for a whole segment as an LL-HLS
+    /// reader's first playlist request does, and on an edge taking a new
+    /// copy the parts between a new subscriber's first part and the fast
+    /// lane's first part for it came 200-300 ms late. `false`: the wait, as
+    /// before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_PROMPT_SENDER",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    client_udp_prompt_sender: bool,
+
     /// Wave 9 (cold start): lock the process's memory (mlockall
     /// MCL_CURRENT | MCL_FUTURE) once the node is set up, where it may lock
     /// without a limit (RLIMIT_MEMLOCK infinite: the deploy's unit has
@@ -4053,6 +4068,7 @@ async fn main() -> Result<()> {
                 admit_by_load: args.client_udp_admit_by_load,
                 drain_spread: Duration::from_millis(args.client_udp_drain_spread_ms),
                 keepalive: Duration::from_millis(args.client_udp_keepalive_ms),
+                prompt_sender: args.client_udp_prompt_sender,
             },
             Arc::clone(&router.edge_udp_stats),
             edge_cut_through.clone(),
@@ -35983,11 +35999,14 @@ mod tests {
     #[test]
     fn the_wave9_cold_start_flags_default_on_and_can_be_turned_off() {
         let args = Args::try_parse_from(["av-mesh"]).unwrap();
+        assert!(args.client_udp_prompt_sender);
         assert!(args.mlock_all);
         assert!(args.malloc_tune);
         assert!(args.prefault);
         let args = Args::try_parse_from([
             "av-mesh",
+            "--client-udp-prompt-sender",
+            "false",
             "--mlock-all",
             "false",
             "--malloc-tune",
@@ -35996,6 +36015,7 @@ mod tests {
             "false",
         ])
         .unwrap();
+        assert!(!args.client_udp_prompt_sender);
         assert!(!args.mlock_all);
         assert!(!args.malloc_tune);
         assert!(!args.prefault);
