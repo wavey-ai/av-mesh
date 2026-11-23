@@ -476,6 +476,12 @@ fn edge_hole_repair_window_parts(part_us: u64) -> usize {
 const EDGE_HOLE_REPAIR_WINDOW_MS: u64 = 500;
 /// How often an edge looks for playlists whose readers have gone.
 const PLAYLIST_DEMAND_SWEEP_MS: u64 = 500;
+/// --cache-mesh-warm-total-kbps (wave 8 stage 5, AM 13): a distributor's
+/// warm-up windows together, twice one child's default allowance.
+const DEFAULT_CACHE_MESH_WARM_TOTAL_KBPS: u64 = 40_000;
+/// A hole that holds the contiguous watermark longer than this counts as a
+/// watermark stall (the repair horizon's clamp, AM 13 / R5).
+const WATERMARK_STALL_US: u64 = 250_000;
 /// Longest wait for the first parts of a playlist that an edge has just
 /// subscribed to, before it answers the request that created the demand.
 const PLAYLIST_WARM_WAIT_MS: u64 = 4_000;
@@ -1516,6 +1522,54 @@ struct Args {
     #[arg(long, env = "NEEDLETAIL_RELAY_LEASE_FAILOVER_BIND")]
     relay_lease_failover_bind: Option<SocketAddr>,
 
+    /// Wave 8 stage 5 (AM 12): a lease child's Subscribe says where this
+    /// forwarder stands in the child's ranking of the playlist's parents;
+    /// rank 0 makes it the child's primary for that stream (video in full,
+    /// the first child port), any other rank its secondary. So an edge's
+    /// fast-plane parents follow its ranking of the live distributors,
+    /// stream by stream, a joining distributor slot included. A lease
+    /// without a rank keeps --relay-lease-primary-children. `false`: the
+    /// fixed list decides, as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_LEASE_RANKED",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_lease_ranked: bool,
+
+    /// Wave 8 stage 5 (AM 12): an edge with --relay-controlled-local admits
+    /// the RelaySession symbols of every distributor among its cache-mesh
+    /// --peer addresses, at the port of its primary parent (every
+    /// forwarder's --relay-lease-bind port), beside its two configured
+    /// parents: a distributor that its ranking makes a parent of a stream
+    /// (a slot that joined) feeds it on the fast plane. `false` admits the
+    /// two configured parents alone, as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_RANKED_PARENTS",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_ranked_parents: bool,
+
+    /// Wave 8 stage 5 (AM 12): a distributor whose relay parents are lease
+    /// parents (a forwarder slot, dist-c: a fast-plane lease child of its
+    /// region's dist-a and dist-b) subscribes at its cache-mesh parent
+    /// distributors (its non-edge --peer addresses) to every playlist that
+    /// its own children lease from it, and keeps the subscription while
+    /// they do (--cache-mesh-demand-idle-ms after the last). Its parents'
+    /// fast planes then feed it each stream as they feed an edge. Off by
+    /// default: a distributor of the contributor's lanes or of the
+    /// compiled relay tree must never subscribe to its peers.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CACHE_MESH_UPSTREAM_DEMAND",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    cache_mesh_upstream_demand: bool,
+
     /// An edge (--cache-mesh-role edge) with --relay-controlled-local takes
     /// its parents' RelaySession symbols on the fast plane: the class
     /// threads on its relay ports, a tee that commits each object into the
@@ -2464,6 +2518,68 @@ struct Args {
     )]
     cache_mesh_warm_kbps: u64,
 
+    /// Wave 8 stage 5 (AM 13): rate limit for the warm-up windows of all
+    /// children of this node together, in kbit/s, on top of each child's
+    /// --cache-mesh-warm-kbps. When many edges warm at once (edges join,
+    /// or the readers of a lost edge move to the others) a distributor
+    /// sends at most this, the children taking turns. Zero: no total limit.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CACHE_MESH_WARM_TOTAL_KBPS",
+        default_value_t = DEFAULT_CACHE_MESH_WARM_TOTAL_KBPS
+    )]
+    cache_mesh_warm_total_kbps: u64,
+
+    /// Wave 8 stage 5 (AM 12): this node's Subscribe frames say where each
+    /// parent stands in its ranking of the playlist's parents (see
+    /// --relay-lease-ranked). `false` sends the frame of before (a node of
+    /// before refuses the longer one).
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CACHE_MESH_SUBSCRIBE_RANK",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    cache_mesh_subscribe_rank: bool,
+
+    /// Wave 8 stage 5 (AM 12): a renewal that finds a playlist's ranked
+    /// parents changed (a distributor joined and ranks higher, or one is
+    /// draining) releases the parents that left the set at once, instead
+    /// of letting them feed this node until the lease lapses.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CACHE_MESH_RELEASE_UNRANKED_PARENTS",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    cache_mesh_release_unranked_parents: bool,
+
+    /// Wave 8 stage 5 (AM 12): a distributor that drains (POST
+    /// /api/control/drain-node) says so in its cache-mesh hellos, and its
+    /// children rank it after every live distributor that does not, so it
+    /// loses its leases (and its fast-plane lease children) at their next
+    /// renewal. `false`: a child ranks a draining parent as any other.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CACHE_MESH_AVOID_DRAINING_PARENTS",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    cache_mesh_avoid_draining_parents: bool,
+
+    /// Wave 8 stage 5 (AM 13): a cache whose copy of a playlist is more
+    /// than this many parts behind the newest copy in the region is
+    /// stalled for it and takes no reader of it. Zero (the default) turns
+    /// the check off: a cache's head part comes in its advertisement, once
+    /// every --telemetry-interval-ms, so at 1 ms parts a healthy copy reads
+    /// hundreds of parts behind one advertised later.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_ASSIGNMENT_MAX_HEAD_LAG_PARTS",
+        default_value_t = 0
+    )]
+    assignment_max_head_lag_parts: u64,
+
     /// Entry point of a neighbouring region, as NAME=URL, for example
     /// `us-east=https://entry.us-east.example:443`. Repeat it. The
     /// Multivariant Playlist of this region lists each as the last pathway,
@@ -2937,6 +3053,7 @@ async fn main() -> Result<()> {
 
     let args = Args::parse().normalized()?;
     let mesh_peers = resolve_socket_addr_args("peer", &args.peers).await?;
+    let mesh_peer_ips: Vec<std::net::IpAddr> = mesh_peers.iter().map(SocketAddr::ip).collect();
     let telemetry_peers = resolve_socket_addr_args("telemetry-peer", &args.telemetry_peers).await?;
     let mut telemetry_fec_targets =
         resolve_socket_addr_args("telemetry-fec-target", &args.telemetry_fec_targets).await?;
@@ -3112,6 +3229,10 @@ async fn main() -> Result<()> {
         .with_replication(replication)
         .with_subscription_lease(Duration::from_millis(args.cache_mesh_lease_ms.max(100)))
         .with_backfill_bytes_per_sec(args.cache_mesh_warm_kbps.saturating_mul(125))
+        .with_backfill_total_bytes_per_sec(args.cache_mesh_warm_total_kbps.saturating_mul(125))
+        .with_subscribe_rank(args.cache_mesh_subscribe_rank)
+        .with_release_unranked_parents(args.cache_mesh_release_unranked_parents)
+        .with_avoid_draining_parents(args.cache_mesh_avoid_draining_parents)
         .with_socket_buffer_bytes(if args.cache_mesh_socket_buffer_bytes > 0 {
             args.cache_mesh_socket_buffer_bytes
         } else {
@@ -3226,8 +3347,15 @@ async fn main() -> Result<()> {
         info!(bind = %class_addr, "cache mesh video class socket listening");
         fast_path_report.tune_receive_socket_at(class_addr, "cache mesh video");
     }
+    // A forwarder slot (--cache-mesh-upstream-demand) holds the playlists
+    // that its children lease from it as an edge holds those its readers
+    // ask for: by subscribing at its parent distributors (AM 12).
+    let upstream_demand = args.cache_mesh_upstream_demand
+        && replication == ReplicationMode::Demand
+        && cache_mesh_role == CacheMeshRole::Distributor;
     let playlist_demand = PlaylistDemand::new(PlaylistDemandConfig {
-        enabled: replication == ReplicationMode::Demand && cache_mesh_role == CacheMeshRole::Edge,
+        enabled: replication == ReplicationMode::Demand
+            && (cache_mesh_role == CacheMeshRole::Edge || upstream_demand),
         lease: Duration::from_millis(args.cache_mesh_lease_ms.max(100)),
         idle: Duration::from_millis(args.cache_mesh_demand_idle_ms.max(1_000)),
         warm_parts: if args.cache_mesh_warm_parts > 0 {
@@ -3283,6 +3411,13 @@ async fn main() -> Result<()> {
         playlist_demand.clone(),
         ingest_shutdown_rx.clone(),
     ));
+    let upstream_demand_task = upstream_demand.then(|| {
+        tokio::spawn(run_upstream_demand(
+            Arc::clone(&mesh_handle),
+            playlist_demand.clone(),
+            ingest_shutdown_rx.clone(),
+        ))
+    });
     let playlist_standby_task = tokio::spawn(run_playlist_standby(
         Arc::clone(&mesh_handle),
         edge_load.clone(),
@@ -3387,7 +3522,19 @@ async fn main() -> Result<()> {
         }
         twins
     };
-    let relay_dispatch = configured_relay_udp_dispatch(&args, &node_id)?;
+    let ranked_parents = if cache_mesh_role == CacheMeshRole::Edge {
+        ranked_lease_parents(&args, &mesh_peer_ips)
+    } else {
+        Vec::new()
+    };
+    let mut relay_dispatch = configured_relay_udp_dispatch(&args, &node_id)?;
+    bind_ranked_lease_parents(&mut relay_dispatch, &args, &node_id, &ranked_parents)?;
+    if !ranked_parents.is_empty() {
+        info!(
+            parents = ?ranked_parents,
+            "the fast plane admits every distributor of the region (--relay-ranked-parents)"
+        );
+    }
     let relay_forwards = args.relay_forwards.clone();
     let forward_class_offset =
         (class_ingest && args.relay_class_port_offset > 0).then_some(args.relay_class_port_offset);
@@ -3516,6 +3663,7 @@ async fn main() -> Result<()> {
         burst_copy_ms: args.relay_burst_copy_ms,
         loss_report: args.relay_loss_report,
         demand: node_demand,
+        ranked_parents: ranked_parents.clone(),
         lease: lease_children,
         edge_clients: fast_lane.clone(),
         holes: hole_trigger.clone(),
@@ -3634,7 +3782,7 @@ async fn main() -> Result<()> {
         AssignmentPolicy {
             spread_permille: u32::from(args.assignment_spread_percent.min(100)) * 10,
             max_alternates: args.assignment_alternates,
-            max_head_lag_parts: 0,
+            max_head_lag_parts: args.assignment_max_head_lag_parts,
         },
         args.steering_ttl_seconds.max(1),
         args.telemetry_interval_ms,
@@ -3892,6 +4040,9 @@ async fn main() -> Result<()> {
     let _ = mesh_applied_task.await;
     let _ = playlist_demand_task.await;
     let _ = playlist_standby_task.await;
+    if let Some(task) = upstream_demand_task {
+        let _ = task.await;
+    }
     http_runtime.shutdown_background();
     let _ = replication_planner_task.await;
     if let Some(task) = edge_udp_task {
@@ -4894,6 +5045,7 @@ async fn start_lease_children(
             class_port_offset: args.relay_class_port_offset,
             primary_children: args.relay_lease_primary_children.clone(),
             max_children: args.relay_max_lease_children,
+            ranked: args.relay_lease_ranked,
         },
         args.udp_socket_buffer_bytes,
     )?;
@@ -7808,6 +7960,10 @@ struct LiveTsCache {
     /// Releases of a hole by the repair horizon, and the parts they listed
     /// as gaps.
     repair_horizon_releases: AtomicU64,
+    /// The longest a hole held a stream's contiguous watermark (µs), and the
+    /// holes that held it longer than WATERMARK_STALL_US (AM 13).
+    watermark_stall_max_us: AtomicU64,
+    watermark_stalls_over: AtomicU64,
     /// Parts that came after they were listed as gaps: the cache has them
     /// for later readers.
     late_gap_fills: AtomicU64,
@@ -7954,6 +8110,8 @@ impl LiveTsCache {
             repair_horizon_floor_us: AtomicU64::new(REPAIR_HORIZON_MIN_MS * 1_000),
             source_epoch_observers: StdMutex::new(Vec::new()),
             repair_horizon_releases: AtomicU64::new(0),
+            watermark_stall_max_us: AtomicU64::new(0),
+            watermark_stalls_over: AtomicU64::new(0),
             late_gap_fills: AtomicU64::new(0),
             gap_parts: StdMutex::new(HashMap::new()),
             part_updates,
@@ -8393,6 +8551,24 @@ impl LiveTsCache {
             .store(delays.horizon_us(), Ordering::Relaxed);
     }
 
+    /// A hole held a stream's contiguous watermark for `held_us` (it was
+    /// filled, or the repair horizon released it).
+    fn record_watermark_stall(&self, held_us: u64) {
+        self.watermark_stall_max_us
+            .fetch_max(held_us, Ordering::Relaxed);
+        if held_us > WATERMARK_STALL_US {
+            self.watermark_stalls_over.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn watermark_stall_max_us(&self) -> u64 {
+        self.watermark_stall_max_us.load(Ordering::Relaxed)
+    }
+
+    fn watermark_stalls_over(&self) -> u64 {
+        self.watermark_stalls_over.load(Ordering::Relaxed)
+    }
+
     /// How long after the first stored part beyond it `part` came, if one
     /// is stored within the next 16: the time that its hole was open. Lock
     /// free: the registry's check and the slot tag, a slot.
@@ -8411,7 +8587,8 @@ impl LiveTsCache {
     /// the measured repair horizon is made of; a part already listed as a
     /// gap is a late fill, kept for later readers.
     fn observe_late_part(&self, handle: StreamHandle, seq: u64, committed_us: u64) {
-        if self.fill_gap_part(handle.stream_id(), seq) {
+        let was_gap = self.fill_gap_part(handle.stream_id(), seq);
+        if was_gap {
             self.late_gap_fills.fetch_add(1, Ordering::Relaxed);
         }
         let Ok(part) = usize::try_from(seq) else {
@@ -8425,6 +8602,11 @@ impl LiveTsCache {
             .filter(|delay_us| *delay_us >= REPAIR_REORDER_GRACE_US)
         {
             self.record_repair_delay(delay_us);
+            // A hole filled before the horizon released it held the
+            // watermark that long; a gap's late fill held nothing.
+            if !was_gap {
+                self.record_watermark_stall(delay_us);
+            }
         }
     }
 
@@ -8558,6 +8740,8 @@ impl LiveTsCache {
         let end = head.min(last.saturating_add(CANONICAL_GAP_SCAN_LIMIT));
         let mut ceiling = None;
         let mut in_hole = false;
+        // How long the first hole released held the watermark.
+        let mut held_us = None;
         for slot in first..=end {
             if committing == Some(slot) {
                 break;
@@ -8569,6 +8753,9 @@ impl LiveTsCache {
                     if in_hole && now_us.saturating_sub(written_us) < horizon_us {
                         break;
                     }
+                    if in_hole && held_us.is_none() {
+                        held_us = Some(now_us.saturating_sub(written_us));
+                    }
                     in_hole = false;
                     ceiling = Some(slot);
                 }
@@ -8579,6 +8766,9 @@ impl LiveTsCache {
             .advance_canonical_watermark(handle, last, ceiling, false)
             .await?;
         self.repair_horizon_releases.fetch_add(1, Ordering::Relaxed);
+        if let Some(held_us) = held_us {
+            self.record_watermark_stall(held_us);
+        }
         Some(watermark)
     }
 
@@ -12446,6 +12636,12 @@ struct MeshApiSnapshot {
     /// This node's client UDP gauges, when it serves UDP clients.
     #[serde(skip_serializing_if = "Option::is_none")]
     client_udp: Option<ClientUdpGauges>,
+    /// The lease children's live gauges (AM 12), on a node that feeds them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fast_plane: Option<FastPlaneGauges>,
+    /// The cache mesh's live gauges (AM 12, 13).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_mesh: Option<CacheMeshGauges>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -12711,6 +12907,20 @@ struct MeshFecRuntimeSnapshot {
     rx_decode_errors: u64,
     rx_expired_objects: u64,
     rx_inflight_objects: u64,
+    /// Carried from playlists (AM 13): what the copy here used to drop.
+    rx_evicted_objects: u64,
+    peer_limit_drops: u64,
+    replica_queue_depth: u64,
+    replica_queue_max_depth: u64,
+    replica_queue_drops: u64,
+    replica_requests_serviced: u64,
+    replica_parts_served: u64,
+    warm_parts_sent: u64,
+    warm_bytes_sent: u64,
+    warm_tick_max_bytes: u64,
+    warm_starved_ticks: u64,
+    warm_capped_ticks: u64,
+    parents_released: u64,
 }
 
 impl From<CacheMeshFecStats> for MeshFecRuntimeSnapshot {
@@ -12735,6 +12945,19 @@ impl From<CacheMeshFecStats> for MeshFecRuntimeSnapshot {
             rx_decode_errors: stats.rx_decode_errors,
             rx_expired_objects: stats.rx_expired_objects,
             rx_inflight_objects: stats.rx_inflight_objects,
+            rx_evicted_objects: stats.rx_evicted_objects,
+            peer_limit_drops: stats.peer_limit_drops,
+            replica_queue_depth: stats.replica_queue_depth,
+            replica_queue_max_depth: stats.replica_queue_max_depth,
+            replica_queue_drops: stats.replica_queue_drops,
+            replica_requests_serviced: stats.replica_requests_serviced,
+            replica_parts_served: stats.replica_parts_served,
+            warm_parts_sent: stats.warm_parts_sent,
+            warm_bytes_sent: stats.warm_bytes_sent,
+            warm_tick_max_bytes: stats.warm_tick_max_bytes,
+            warm_starved_ticks: stats.warm_starved_ticks,
+            warm_capped_ticks: stats.warm_capped_ticks,
+            parents_released: stats.parents_released,
         }
     }
 }
@@ -13303,6 +13526,57 @@ struct EdgeServiceSnapshot {
 }
 
 /// The live gauges of a node's client UDP lane, on /api/mesh/local and
+/// The fast plane's lease children now (AM 12): `/api/mesh/local` and
+/// `/api/assignment` `fast_plane`.
+#[derive(Debug, Clone, Default, Serialize)]
+struct FastPlaneGauges {
+    /// Children (edges, a forwarder slot) fed now, and (child, stream)
+    /// pairs.
+    lease_children: u64,
+    lease_pairs: u64,
+    /// Pairs this node is the child's primary for, and pairs whose role
+    /// the child's rank gave (--relay-lease-ranked).
+    lease_primary_pairs: u64,
+    lease_ranked_pairs: u64,
+    /// Children refused for --relay-max-lease-children (cumulative).
+    lease_refused: u64,
+}
+
+/// The cache mesh now (AM 12, 13): `/api/mesh/local` and `/api/assignment`
+/// `cache_mesh`.
+#[derive(Debug, Clone, Default, Serialize)]
+struct CacheMeshGauges {
+    /// Children that lease a playlist from this node, and (child, playlist)
+    /// leases; leases whose child ranks this node first.
+    children: u64,
+    pairs: u64,
+    first_parent_pairs: u64,
+    /// Playlists that this node subscribes to at its parents.
+    subscribed_playlists: u64,
+    /// This node says in its hellos that it drains; peers that say so.
+    draining: bool,
+    draining_peers: Vec<String>,
+    /// Warm-up parts still to send to the children now.
+    warm_parts_pending: u64,
+    /// Cumulative: warm-up parts and bytes queued, the largest warm-up
+    /// burst of one tick, ticks a child's own allowance or the node's
+    /// total (--cache-mesh-warm-total-kbps) stopped a window, parts that
+    /// answered replica requests, parents released for leaving a ranked
+    /// set.
+    warm_parts_sent: u64,
+    warm_bytes_sent: u64,
+    warm_tick_max_bytes: u64,
+    warm_starved_ticks: u64,
+    warm_capped_ticks: u64,
+    replica_parts_served: u64,
+    parents_released: u64,
+    /// The longest a hole held the contiguous watermark of a stream (from
+    /// the first part stored beyond it to its fill or release), and holes
+    /// that held it longer than 250 ms (cumulative).
+    watermark_stall_max_us: u64,
+    watermark_stalls_over_250ms: u64,
+}
+
 /// /api/assignment (Phase AM item 8): what an autoscaler waits on before it
 /// stops a drained node, beside the counters.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -14568,6 +14842,125 @@ async fn run_playlist_standby(
     }
 }
 
+/// A forwarder slot's demand (AM 12, --cache-mesh-upstream-demand): every
+/// playlist that a child leases from this distributor is demand like a
+/// reader, touched on each sweep, so the node subscribes at its parent
+/// distributors and renews while the lease lasts; run_playlist_demand
+/// releases a playlist that no child has leased for the idle time.
+async fn run_upstream_demand(
+    mesh: Arc<CacheMeshHandle>,
+    demand: PlaylistDemand,
+    mut shutdown_rx: watch::Receiver<()>,
+) {
+    let mut ticker = interval(Duration::from_millis(PLAYLIST_DEMAND_SWEEP_MS / 5));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut changed = mesh.served_changed();
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => return,
+            _ = ticker.tick() => {}
+            result = changed.changed() => {
+                if result.is_err() {
+                    return;
+                }
+            }
+        }
+        let now_ms = now_unix_ms();
+        let mut streams: Vec<u64> = mesh
+            .served_subscriptions()
+            .iter()
+            .map(|served| served.stream_id)
+            .collect();
+        streams.sort_unstable();
+        streams.dedup();
+        for stream_id in streams {
+            let touch = demand.touch(stream_id, now_ms);
+            if !touch.new {
+                continue;
+            }
+            match mesh.subscribe(stream_id, 0, demand.config.warm_parts).await {
+                Ok(parents) => info!(
+                    stream_id,
+                    parents = parents.len(),
+                    "a child's lease subscribed this forwarder at its parent distributors"
+                ),
+                Err(error) => warn!(
+                    stream_id,
+                    error = %error,
+                    "failed to subscribe a forwarder at its parent distributors"
+                ),
+            }
+        }
+    }
+}
+
+/// The distributors of the region that an edge admits on its fast plane
+/// beside its two configured parents (AM 12, --relay-ranked-parents): its
+/// cache-mesh peers (an edge lists its distributors), each at the port of
+/// its primary parent, which is every forwarder's --relay-lease-bind port.
+fn ranked_lease_parents(args: &Args, peer_ips: &[std::net::IpAddr]) -> Vec<SocketAddr> {
+    if !args.relay_ranked_parents || !args.relay_controlled_local || !args.edge_fast_ingest {
+        return Vec::new();
+    }
+    let Some(primary) = args.relay_primary_peer else {
+        return Vec::new();
+    };
+    let configured: Vec<std::net::IpAddr> = [args.relay_primary_peer, args.relay_secondary_peer]
+        .into_iter()
+        .flatten()
+        .map(|peer| peer.ip())
+        .collect();
+    let mut parents: Vec<SocketAddr> = peer_ips
+        .iter()
+        .filter(|ip| !configured.contains(ip) && **ip != args.mesh_bind.ip())
+        .map(|ip| SocketAddr::new(*ip, primary.port()))
+        .collect();
+    parents.sort_unstable();
+    parents.dedup();
+    parents
+}
+
+/// Bind each ranked lease parent as a parent session of its own, promoted
+/// (it may send sources and repair: whether it is the edge's primary for a
+/// stream is the socket its symbols come to), with the contributor's
+/// RelaySession identity, as the configured parents are.
+fn bind_ranked_lease_parents(
+    dispatch: &mut RelayUdpDispatch,
+    args: &Args,
+    node_id: &str,
+    parents: &[SocketAddr],
+) -> Result<()> {
+    if parents.is_empty() {
+        return Ok(());
+    }
+    let local = NodeId::new(node_id).context("invalid local RelaySession node identity")?;
+    let generation = TopologyGeneration::new(args.relay_topology_generation)
+        .context("invalid RelaySession topology generation")?;
+    let subscription_id = SubscriptionId::new(args.relay_subscription_id)
+        .context("invalid RelaySession subscription id")?;
+    for (index, peer) in parents.iter().enumerate() {
+        let session = ControlledRelayParentSession::new(
+            RANKED_PARENT_FIRST_SESSION + index as u64,
+            CarrierIdentity {
+                local: local.clone(),
+                peer: NodeId::new(format!("lease-parent-{}", peer.ip()))
+                    .context("invalid ranked lease parent identity")?,
+                kind: CarrierKind::PrivateUdp,
+                trust_mode: TrustMode::ControlledPrivateNetwork,
+            },
+            generation,
+            subscription_id,
+            ParentPath::PromotedSecondary,
+        )?;
+        dispatch.bind_controlled_peer(*peer, session)?;
+    }
+    Ok(())
+}
+
+/// Session ids of the ranked lease parents: after the configured parents'
+/// 1 and 2.
+const RANKED_PARENT_FIRST_SESSION: u64 = 16;
+
 async fn run_playlist_demand(
     cache: Arc<LiveTsCache>,
     mesh: Arc<CacheMeshHandle>,
@@ -15039,6 +15432,8 @@ impl MeshApiSnapshot {
             connections,
             streams,
             client_udp: None,
+            fast_plane: None,
+            cache_mesh: None,
         }
     }
 }
@@ -15292,6 +15687,64 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
             "Cache-mesh FEC datagrams rejected during decode.",
             snapshot.mesh_fec.rx_decode_errors,
         ),
+        (
+            "av_mesh_fec_rx_evicted_objects_total",
+            "Incomplete cache-mesh objects evicted for the in-flight limit.",
+            snapshot.mesh_fec.rx_evicted_objects,
+        ),
+        (
+            "av_mesh_cache_mesh_peer_limit_drops_total",
+            "Peers not admitted because the peer table was full.",
+            snapshot.mesh_fec.peer_limit_drops,
+        ),
+        (
+            "av_mesh_cache_mesh_replica_queue_drops_total",
+            "Replica requests dropped on a full queue.",
+            snapshot.mesh_fec.replica_queue_drops,
+        ),
+        (
+            "av_mesh_cache_mesh_replica_requests_serviced_total",
+            "Replica requests served.",
+            snapshot.mesh_fec.replica_requests_serviced,
+        ),
+        (
+            "av_mesh_cache_mesh_replica_parts_served_total",
+            "Parts that answered replica requests (hole fills and windows).",
+            snapshot.mesh_fec.replica_parts_served,
+        ),
+        (
+            "av_mesh_cache_mesh_warm_parts_sent_total",
+            "Warm-up parts queued for children.",
+            snapshot.mesh_fec.warm_parts_sent,
+        ),
+        (
+            "av_mesh_cache_mesh_warm_bytes_sent_total",
+            "Warm-up payload bytes queued for children.",
+            snapshot.mesh_fec.warm_bytes_sent,
+        ),
+        (
+            "av_mesh_cache_mesh_warm_starved_ticks_total",
+            "Sync ticks in which a child's own warm-up allowance stopped its window.",
+            snapshot.mesh_fec.warm_starved_ticks,
+        ),
+        (
+            "av_mesh_cache_mesh_warm_capped_ticks_total",
+            "Sync ticks in which the node's total warm-up allowance stopped a window.",
+            snapshot.mesh_fec.warm_capped_ticks,
+        ),
+        (
+            "av_mesh_cache_mesh_parents_released_total",
+            "Parents released because they left a playlist's ranked set.",
+            snapshot.mesh_fec.parents_released,
+        ),
+        (
+            "av_mesh_watermark_stalls_over_250ms_total",
+            "Holes that held a stream's contiguous watermark longer than 250 ms.",
+            snapshot
+                .cache_mesh
+                .as_ref()
+                .map_or(0, |gauges| gauges.watermark_stalls_over_250ms),
+        ),
     ] {
         push_prometheus_metric_header(&mut output, name, help, "counter");
         output.push_str(&format!("{name} {value}\n"));
@@ -15341,6 +15794,69 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
         output.push_str(&format!(
             "av_mesh_fec_rx_objects_total{{outcome=\"{outcome}\"}} {value}\n"
         ));
+    }
+
+    let cache_mesh = snapshot.cache_mesh.clone().unwrap_or_default();
+    let fast_plane = snapshot.fast_plane.clone().unwrap_or_default();
+    for (name, help, value) in [
+        (
+            "av_mesh_cache_mesh_replica_queue_depth",
+            "Replica requests waiting to be served.",
+            snapshot.mesh_fec.replica_queue_depth,
+        ),
+        (
+            "av_mesh_cache_mesh_replica_queue_max_depth",
+            "Deepest replica request queue seen.",
+            snapshot.mesh_fec.replica_queue_max_depth,
+        ),
+        (
+            "av_mesh_cache_mesh_warm_tick_max_bytes",
+            "The largest warm-up burst of one sync tick, in payload bytes.",
+            snapshot.mesh_fec.warm_tick_max_bytes,
+        ),
+        (
+            "av_mesh_cache_mesh_children",
+            "Children that lease a playlist from this node.",
+            cache_mesh.children,
+        ),
+        (
+            "av_mesh_cache_mesh_leases",
+            "(child, playlist) leases this node serves.",
+            cache_mesh.pairs,
+        ),
+        (
+            "av_mesh_cache_mesh_warm_parts_pending",
+            "Warm-up parts still to send to the children.",
+            cache_mesh.warm_parts_pending,
+        ),
+        (
+            "av_mesh_cache_mesh_subscribed_playlists",
+            "Playlists this node subscribes to at its parents.",
+            cache_mesh.subscribed_playlists,
+        ),
+        (
+            "av_mesh_cache_mesh_draining",
+            "Whether this node says in its hellos that it drains.",
+            u64::from(cache_mesh.draining),
+        ),
+        (
+            "av_mesh_watermark_stall_max_us",
+            "The longest a hole held a stream's contiguous watermark, in microseconds.",
+            cache_mesh.watermark_stall_max_us,
+        ),
+        (
+            "av_mesh_fast_plane_lease_children",
+            "Fast-plane lease children (edges, forwarder slots) fed now.",
+            fast_plane.lease_children,
+        ),
+        (
+            "av_mesh_fast_plane_lease_pairs",
+            "Fast-plane (lease child, stream) pairs fed now.",
+            fast_plane.lease_pairs,
+        ),
+    ] {
+        push_prometheus_metric_header(&mut output, name, help, "gauge");
+        output.push_str(&format!("{name} {value}\n"));
     }
 
     push_prometheus_metric_header(
@@ -18494,7 +19010,61 @@ impl AppRouter {
             self.demand.hole_repair_requests.load(Ordering::Relaxed);
         snapshot.cache_replication = self.cache_replication_snapshot();
         snapshot.client_udp = self.client_udp_gauges().await;
+        snapshot.fast_plane = self.fast_plane_gauges();
+        snapshot.cache_mesh = Some(self.cache_mesh_gauges());
         snapshot
+    }
+
+    /// The lease children's live gauges (AM 12), when this node feeds lease
+    /// children on its fast plane: how many edges (and slots) it feeds, so
+    /// an autoscaler can tell an empty forwarder.
+    fn fast_plane_gauges(&self) -> Option<FastPlaneGauges> {
+        let lease = self.cache.relay_ingress_snapshot().fast_plane.lease_children;
+        lease.enabled.then_some(FastPlaneGauges {
+            lease_children: lease.children,
+            lease_pairs: lease.pairs,
+            lease_primary_pairs: lease.primary_pairs,
+            lease_ranked_pairs: lease.ranked_pairs,
+            lease_refused: lease.refused,
+        })
+    }
+
+    /// The cache mesh's live gauges (AM 12, 13): the children that lease
+    /// playlists from this node, its own subscriptions, whether it says it
+    /// drains, and its warm-up counters.
+    fn cache_mesh_gauges(&self) -> CacheMeshGauges {
+        let served = self.mesh.served_subscriptions();
+        let children: HashSet<SocketAddr> = served.iter().map(|lease| lease.child).collect();
+        let stats = self.mesh.fec_stats();
+        CacheMeshGauges {
+            children: children.len() as u64,
+            pairs: served.len() as u64,
+            first_parent_pairs: served
+                .iter()
+                .filter(|lease| lease.rank == Some(0))
+                .count() as u64,
+            subscribed_playlists: self.mesh.subscribed_streams().len() as u64,
+            draining: self.mesh.is_draining(),
+            draining_peers: self
+                .mesh
+                .draining_peers()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            warm_parts_pending: served
+                .iter()
+                .map(|lease| lease.backfill_parts_pending as u64)
+                .sum(),
+            warm_parts_sent: stats.warm_parts_sent,
+            warm_bytes_sent: stats.warm_bytes_sent,
+            warm_tick_max_bytes: stats.warm_tick_max_bytes,
+            warm_starved_ticks: stats.warm_starved_ticks,
+            warm_capped_ticks: stats.warm_capped_ticks,
+            replica_parts_served: stats.replica_parts_served,
+            parents_released: stats.parents_released,
+            watermark_stall_max_us: self.cache.watermark_stall_max_us(),
+            watermark_stalls_over_250ms: self.cache.watermark_stalls_over(),
+        }
     }
 
     /// The client UDP lane's live gauges (Phase AM item 8), when this node
@@ -19651,6 +20221,9 @@ impl AppRouter {
         // Phase AM item 8: the live gauges beside the counters.
         let mut body = body;
         body["failover_entries"] = serde_json::Value::Array(failover_entries);
+        // AM 12, 13: the forwarder's lease children and cache-mesh children.
+        body["fast_plane"] = serde_json::to_value(self.fast_plane_gauges()).unwrap_or_default();
+        body["cache_mesh"] = serde_json::to_value(self.cache_mesh_gauges()).unwrap_or_default();
         if let (Some(block), Some(gauges)) = (body["client_udp"].as_object_mut(), gauges) {
             if let Ok(serde_json::Value::Object(gauges)) = serde_json::to_value(gauges) {
                 block.extend(gauges);
@@ -19932,14 +20505,18 @@ impl AppRouter {
             }
             ControlKind::CloseNode => {
                 self.lifecycle.set_draining(true).await;
+                self.mesh.set_draining(true);
                 "local close requested: draining".into()
             }
             ControlKind::DrainNode => {
                 self.lifecycle.set_draining(true).await;
+                // A distributor's children move their leases away (AM 12).
+                self.mesh.set_draining(true);
                 "local drain requested: readers move to other caches".into()
             }
             ControlKind::ResumeNode => {
                 self.lifecycle.set_draining(false).await;
+                self.mesh.set_draining(false);
                 "local resume requested: taking readers".into()
             }
             ControlKind::ProvisionNode => {
@@ -26785,6 +27362,23 @@ mod tests {
         assert!(metrics.contains("av_mesh_fec_rx_late_source_datagrams_total 1\n"));
         assert!(metrics.contains("av_mesh_fec_rx_presumed_lost_source_datagrams_total 2\n"));
         assert!(metrics.contains("av_mesh_fec_rx_inflight_objects 1\n"));
+        // AM 13: the playlists counters that the copy here used to drop,
+        // the warm-up counters and the forwarder gauges.
+        for name in [
+            "av_mesh_fec_rx_evicted_objects_total ",
+            "av_mesh_cache_mesh_peer_limit_drops_total ",
+            "av_mesh_cache_mesh_replica_queue_depth ",
+            "av_mesh_cache_mesh_replica_queue_drops_total ",
+            "av_mesh_cache_mesh_warm_parts_sent_total ",
+            "av_mesh_cache_mesh_warm_bytes_sent_total ",
+            "av_mesh_cache_mesh_warm_tick_max_bytes ",
+            "av_mesh_cache_mesh_warm_capped_ticks_total ",
+            "av_mesh_cache_mesh_children ",
+            "av_mesh_watermark_stall_max_us ",
+            "av_mesh_fast_plane_lease_children ",
+        ] {
+            assert!(metrics.contains(name), "{name} missing");
+        }
         assert!(metrics.contains("av_mesh_relay_session_parent_sessions{role=\"primary\"} 1\n"));
         assert!(metrics.contains("av_mesh_relay_session_active_object_bytes 24000\n"));
         assert!(metrics.contains("av_mesh_relay_session_datagrams_total{outcome=\"repair\"} 8\n"));
@@ -35100,6 +35694,235 @@ mod tests {
     }
 
     #[test]
+    fn the_stage5_forwarder_flags_default_on_and_can_be_turned_off() {
+        let args = Args::try_parse_from(["av-mesh"]).unwrap();
+        assert!(args.relay_lease_ranked);
+        assert!(args.relay_ranked_parents);
+        assert!(!args.cache_mesh_upstream_demand);
+        assert!(args.cache_mesh_subscribe_rank);
+        assert!(args.cache_mesh_release_unranked_parents);
+        assert!(args.cache_mesh_avoid_draining_parents);
+        assert_eq!(
+            args.cache_mesh_warm_total_kbps,
+            DEFAULT_CACHE_MESH_WARM_TOTAL_KBPS
+        );
+        assert_eq!(args.assignment_max_head_lag_parts, 0);
+        let args = Args::try_parse_from([
+            "av-mesh",
+            "--relay-lease-ranked",
+            "false",
+            "--relay-ranked-parents",
+            "false",
+            "--cache-mesh-upstream-demand",
+            "true",
+            "--cache-mesh-subscribe-rank",
+            "false",
+            "--cache-mesh-release-unranked-parents",
+            "false",
+            "--cache-mesh-avoid-draining-parents",
+            "false",
+            "--cache-mesh-warm-total-kbps",
+            "0",
+            "--assignment-max-head-lag-parts",
+            "400",
+        ])
+        .unwrap();
+        assert!(!args.relay_lease_ranked);
+        assert!(!args.relay_ranked_parents);
+        assert!(args.cache_mesh_upstream_demand);
+        assert!(!args.cache_mesh_subscribe_rank);
+        assert!(!args.cache_mesh_release_unranked_parents);
+        assert!(!args.cache_mesh_avoid_draining_parents);
+        assert_eq!(args.cache_mesh_warm_total_kbps, 0);
+        assert_eq!(args.assignment_max_head_lag_parts, 400);
+    }
+
+    /// AM 12: an edge admits every distributor of its region (its
+    /// cache-mesh peers) on its fast plane, at the lease port, beside its
+    /// two configured parents, and sends them no demand report.
+    #[test]
+    fn an_edge_admits_every_distributor_of_its_region_on_the_fast_plane() {
+        let edge = |extra: &[&str]| {
+            let mut argv = vec![
+                "av-mesh",
+                "--mesh-bind",
+                "10.0.0.21:29101",
+                "--relay-controlled-local",
+                "--relay-primary-promoted",
+                "--relay-secondary-promoted",
+                "--relay-primary-peer",
+                "10.0.0.11:22901",
+                "--relay-primary-id",
+                "dist-a",
+                "--relay-secondary-peer",
+                "10.0.0.12:22901",
+                "--relay-secondary-id",
+                "dist-b",
+            ];
+            argv.extend_from_slice(extra);
+            Args::try_parse_from(argv).unwrap()
+        };
+        let peers: Vec<std::net::IpAddr> = ["10.0.0.11", "10.0.0.12", "10.0.0.13", "10.0.0.21"]
+            .iter()
+            .map(|ip| ip.parse().unwrap())
+            .collect();
+        let args = edge(&[]);
+        let ranked = ranked_lease_parents(&args, &peers);
+        assert_eq!(ranked, vec!["10.0.0.13:22901".parse::<SocketAddr>().unwrap()]);
+        let mut dispatch = configured_relay_udp_dispatch(&args, "edge-1").unwrap();
+        bind_ranked_lease_parents(&mut dispatch, &args, "edge-1", &ranked).unwrap();
+        let admissions = dispatch.peer_admissions();
+        assert_eq!(admissions.len(), 3);
+        let slot = admissions[&ranked[0]];
+        assert_eq!(slot.parent_path, ParentPath::PromotedSecondary);
+        assert_eq!(
+            (slot.generation, slot.subscription_id),
+            (args.relay_topology_generation, args.relay_subscription_id)
+        );
+        // Off: the two configured parents alone.
+        assert!(ranked_lease_parents(&edge(&["--relay-ranked-parents", "false"]), &peers).is_empty());
+        // A node without relay parents has none to add.
+        let plain = Args::try_parse_from(["av-mesh"]).unwrap();
+        assert!(ranked_lease_parents(&plain, &peers).is_empty());
+    }
+
+    /// AM 12: a forwarder slot (dist-c, --cache-mesh-upstream-demand)
+    /// subscribes at its parent distributor to every playlist that its
+    /// children lease from it, so the parent's fast plane takes it as a
+    /// lease child (rank 0: it is dist-c's only parent here), and lets the
+    /// subscription go when no child leases the playlist. Its gauges say
+    /// how many children it feeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_forwarder_slot_subscribes_upstream_for_its_childrens_leases() {
+        let parent_addr = unused_loopback_addr();
+        let slot_addr = unused_loopback_addr();
+        let edge_addr = unused_loopback_addr();
+        let config = |name: &str, addr: SocketAddr, role: CacheMeshRole| {
+            let mut config = CacheMeshConfig::new(name, "uk", addr)
+                .with_same_region_only(true)
+                .with_role(role)
+                .with_replication(ReplicationMode::Demand)
+                .with_subscription_lease(Duration::from_millis(900));
+            config.sync_interval = Duration::from_millis(10);
+            config.announce_interval = Duration::from_millis(100);
+            config
+        };
+        let parent_cache = LiveTsCache::new(1, Duration::from_millis(250), 4, 16, 64).await;
+        let slot_cache = LiveTsCache::new(1, Duration::from_millis(250), 4, 16, 64).await;
+        let edge_cache = LiveTsCache::new(1, Duration::from_millis(250), 4, 16, 64).await;
+        let parent = CacheMesh::new(
+            Arc::clone(&parent_cache.chunk_cache),
+            config("dist-a", parent_addr, CacheMeshRole::Distributor).with_peer(slot_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        let slot = Arc::new(
+            CacheMesh::new(
+                Arc::clone(&slot_cache.chunk_cache),
+                config("dist-c", slot_addr, CacheMeshRole::Distributor)
+                    .with_peers([parent_addr, edge_addr]),
+            )
+            .start()
+            .await
+            .unwrap(),
+        );
+        let edge = CacheMesh::new(
+            Arc::clone(&edge_cache.chunk_cache),
+            config("edge-1", edge_addr, CacheMeshRole::Edge).with_peer(slot_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        let demand = PlaylistDemand::new(PlaylistDemandConfig {
+            enabled: true,
+            lease: Duration::from_millis(900),
+            idle: Duration::from_millis(1_200),
+            warm_parts: 16,
+            max_playlists: MAX_EDGE_PLAYLISTS,
+        });
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let router = app_router_for_tests(Arc::clone(&slot_cache), Arc::clone(&slot));
+        tokio::spawn(run_upstream_demand(
+            Arc::clone(&slot),
+            demand.clone(),
+            shutdown_rx.clone(),
+        ));
+        tokio::spawn(run_playlist_demand(
+            Arc::clone(&slot_cache),
+            Arc::clone(&slot),
+            router.edge_load.clone(),
+            demand.clone(),
+            shutdown_rx,
+        ));
+        // Every node has heard the others.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while slot.parents_for(77).await != vec![parent_addr]
+                || edge.parents_for(77).await != vec![slot_addr]
+                || parent.peers().await.is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(parent.served_subscriptions().is_empty());
+
+        // The edge leases playlist 77 from the slot; the slot leases it from
+        // its parent, which knows it is the slot's first parent.
+        edge.subscribe(77, 0, 0).await.unwrap();
+        let leased = |mesh: &CacheMeshHandle| {
+            mesh.served_subscriptions()
+                .iter()
+                .map(|served| (served.child, served.stream_id, served.rank))
+                .collect::<Vec<_>>()
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while leased(&parent) != vec![(slot_addr, 77, Some(0))] {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the slot did not subscribe at its parent");
+        assert_eq!(leased(&slot), vec![(edge_addr, 77, Some(0))]);
+        assert_eq!(slot.subscribed_streams(), vec![77]);
+        let gauges = router.cache_mesh_gauges();
+        assert_eq!((gauges.children, gauges.pairs, gauges.first_parent_pairs), (1, 1, 1));
+        assert_eq!(gauges.subscribed_playlists, 1);
+        assert!(router.fast_plane_gauges().is_none(), "no lease children here");
+
+        // The edge lets the playlist go: the slot's lease ends, and after the
+        // idle time the slot releases its own.
+        edge.unsubscribe(77).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !parent.served_subscriptions().is_empty() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the slot kept its subscription with no child");
+        assert!(slot.subscribed_streams().is_empty());
+        assert_eq!(router.cache_mesh_gauges().children, 0);
+
+        // A distributor that drains says so: its children's ranking leaves it.
+        router.mesh.set_draining(true);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !edge.draining_peers().contains(&slot_addr) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the drain did not reach the child");
+        assert!(router.cache_mesh_gauges().draining);
+
+        let _ = shutdown_tx.send(());
+        parent.shutdown();
+        slot.shutdown();
+        edge.shutdown();
+    }
+
+    #[test]
     fn the_edge_churn_flags_default_to_the_new_behaviour_and_can_be_turned_off() {
         let args = Args::try_parse_from(["av-mesh"]).unwrap();
         assert_eq!(args.edge_parents_silent_ms, 1_500);
@@ -38583,6 +39406,7 @@ mod tests {
                 burst_copy_ms: 0,
                 loss_report: false,
                 demand: None,
+                ranked_parents: Vec::new(),
                 test_tee_panic: Some(fast_plane::TrafficClass::Audio),
             },
         )

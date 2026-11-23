@@ -90,6 +90,11 @@ pub struct RelayClassConfig {
     /// `--relay-demand-report` (wave 7 item 5): the audio thread sends each
     /// relay parent this node's demand (`RLD1`, see `demand`).
     pub demand: Option<Arc<NodeDemand>>,
+    /// `--relay-ranked-parents` (wave 8 stage 5, AM 12): the distributors
+    /// of the region that this lease child admits beside its two configured
+    /// parents. They are lease parents, which read no demand report: none
+    /// is sent to them.
+    pub ranked_parents: Vec<SocketAddr>,
     /// Tests: the tee of this class panics on its first datagram.
     #[cfg(test)]
     pub test_tee_panic: Option<TrafficClass>,
@@ -109,6 +114,7 @@ impl Default for RelayClassConfig {
             burst_copy_ms: 0,
             loss_report: false,
             demand: None,
+            ranked_parents: Vec::new(),
             #[cfg(test)]
             test_tee_panic: None,
         }
@@ -829,6 +835,9 @@ struct ClassThread {
     burst_copy_ms: u64,
     loss_report: bool,
     demand: Option<Arc<NodeDemand>>,
+    /// The parents that demand reports go to: every admitted peer but the
+    /// ranked lease parents.
+    demand_peers: Arc<[SocketAddr]>,
 }
 
 /// How often the audio thread looks at its loss meters.
@@ -996,7 +1005,7 @@ impl ClassThread {
         if report.is_empty() {
             return;
         }
-        for peer in self.admissions.keys() {
+        for peer in self.demand_peers.iter() {
             for fd in fds {
                 if sys::send_batch(*fd, 1, |_| (report.as_slice(), *peer)).unwrap_or(0) == 1 {
                     self.stats.demand_reports.fetch_add(1, Ordering::Relaxed);
@@ -1688,6 +1697,13 @@ pub async fn run_relay_class_ingest(
     }
     cache.set_fast_plane_stats(Arc::clone(&stats));
     let admissions = Arc::new(dispatch.peer_admissions());
+    let mut demand_peers: Vec<SocketAddr> = admissions
+        .keys()
+        .copied()
+        .filter(|peer| !config.ranked_parents.contains(peer))
+        .collect();
+    demand_peers.sort_unstable();
+    let demand_peers: Arc<[SocketAddr]> = demand_peers.into();
     let limits = dispatch.receiver().config().relay_limits;
     let video_dispatch = dispatch
         .twin()
@@ -1742,6 +1758,7 @@ pub async fn run_relay_class_ingest(
             demand: (class == TrafficClass::Audio)
                 .then(|| config.demand.clone())
                 .flatten(),
+            demand_peers: Arc::clone(&demand_peers),
         };
         match std::thread::Builder::new()
             .name(format!("needletail-fast-{}", class.as_str()))

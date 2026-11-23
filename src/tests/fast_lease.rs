@@ -58,6 +58,7 @@ fn lease_children(ports: [u16; 2], primary: &[Ipv4Addr]) -> Arc<LeaseChildren> {
             class_port_offset: OFFSET,
             primary_children: primary.iter().map(|ip| IpAddr::V4(*ip)).collect(),
             max_children: 16,
+            ranked: true,
         },
         4 << 20,
     )
@@ -80,6 +81,7 @@ fn served(child: Ipv4Addr, stream_id: u64) -> ServedSubscription {
         child: SocketAddr::from((child, 9_101)),
         stream_id,
         backfill_parts_pending: 0,
+        rank: None,
     }
 }
 
@@ -433,6 +435,7 @@ async fn lease_children_above_the_cap_are_refused() {
             class_port_offset: OFFSET,
             primary_children: ips.iter().map(|ip| IpAddr::V4(*ip)).collect(),
             max_children: 1,
+            ranked: true,
         },
         4 << 20,
     )

@@ -17,6 +17,19 @@
 //! pair bound at `--relay-lease-bind`, the address that the edge binds as
 //! its parent.
 //!
+//! Which of its two parents a forwarder is for a stream (wave 8 stage 5,
+//! AM 12, `--relay-lease-ranked`): the child ranks the live distributors
+//! of its region for each playlist and subscribes at the first two; its
+//! Subscribe says where this forwarder stands (`ServedSubscription::rank`).
+//! Rank 0 makes it the child's primary for that stream, any other rank its
+//! secondary, so the fast-plane parents of an edge follow its ranking of
+//! the live distributors stream by stream, a third distributor (dist-c)
+//! included, and not the fixed pair of the deploy. A lease without a rank
+//! (a child from before) keeps the fixed rule:
+//! `--relay-lease-primary-children`. A child can so be this forwarder's
+//! primary for one stream and its secondary for another: the snapshot
+//! holds one entry for each (child, role).
+//!
 //! The per-class lane rule: an audio stream goes in full to every lease
 //! child. A video stream goes in full to the children this forwarder is
 //! primary for and as repair only to the others, which keep the sources in
@@ -64,6 +77,9 @@ pub struct LeaseChildConfig {
     pub primary_children: Vec<IpAddr>,
     /// Children fed at most. Further children are refused and logged.
     pub max_children: usize,
+    /// `--relay-lease-ranked`: a lease's rank (when the child gives one)
+    /// says whether this forwarder is the child's primary for the stream.
+    pub ranked: bool,
 }
 
 /// What a lease child takes of a symbol.
@@ -272,8 +288,13 @@ pub const FAST_PLANE_FED_WINDOW_US: u64 = 100_000;
 /// Counters of the lease children.
 #[derive(Debug, Default)]
 pub struct LeaseStats {
+    /// Children (addresses) fed, and (child, stream) pairs.
     pub children: AtomicU64,
     pub pairs: AtomicU64,
+    /// Pairs this forwarder is the child's primary for, and pairs whose
+    /// role came from the child's rank (AM 12).
+    pub primary_pairs: AtomicU64,
+    pub ranked_pairs: AtomicU64,
     /// Children refused because the forwarder had --relay-max-lease-children.
     pub refused: AtomicU64,
     pub rebuilds: AtomicU64,
@@ -304,7 +325,9 @@ pub struct LeaseChildren {
 
 #[derive(Default)]
 struct Known {
-    children: BTreeMap<IpAddr, Arc<LeaseChild>>,
+    /// By (address, primary): a child that ranks this forwarder first for
+    /// one stream and second for another has an entry for each.
+    children: BTreeMap<(IpAddr, bool), Arc<LeaseChild>>,
     refused: HashSet<IpAddr>,
     /// The feed clock of each leased stream, kept across rebuilds.
     fed: HashMap<Box<str>, Arc<AtomicU64>>,
@@ -374,18 +397,35 @@ impl LeaseChildren {
         self.snapshot.load()
     }
 
-    /// The child at an address, if it has a lease.
+    /// The child at an address, if it has a lease: its entry as a child
+    /// that takes video repair here (the one a promotion acts on), else its
+    /// entry as a primary child.
     pub fn child(&self, ip: IpAddr) -> Option<Arc<LeaseChild>> {
-        self.known
+        let known = self
+            .known
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        known
             .children
-            .get(&ip)
+            .get(&(ip, false))
+            .or_else(|| known.children.get(&(ip, true)))
             .cloned()
     }
 
-    fn new_child(&self, ip: IpAddr) -> Option<Arc<LeaseChild>> {
-        let primary = self.config.primary_children.contains(&ip);
+    /// Whether this forwarder is the primary of a lease's child for its
+    /// stream: by the child's rank when it gives one (and the rule is on),
+    /// else by --relay-lease-primary-children.
+    fn is_primary(&self, subscription: &ServedSubscription) -> bool {
+        match subscription.rank.filter(|_| self.config.ranked) {
+            Some(rank) => rank == 0,
+            None => self
+                .config
+                .primary_children
+                .contains(&subscription.child.ip()),
+        }
+    }
+
+    fn new_child(&self, ip: IpAddr, primary: bool) -> Option<Arc<LeaseChild>> {
         let port = self.config.child_ports[usize::from(!primary)];
         let audio = SocketAddr::new(ip, port);
         let video = class_addr(audio, TrafficClass::Video, self.config.class_port_offset).ok()?;
@@ -402,28 +442,35 @@ impl LeaseChildren {
     /// already fed keep their place; new ones are taken in address order
     /// up to the cap, and the rest are refused (logged once each).
     pub fn rebuild(&self, served: &[ServedSubscription]) {
-        let mut by_child: BTreeMap<IpAddr, Vec<u64>> = BTreeMap::new();
+        let mut by_child: BTreeMap<(IpAddr, bool), Vec<u64>> = BTreeMap::new();
+        let mut ranked_pairs = 0_u64;
         for subscription in served {
+            if self.config.ranked && subscription.rank.is_some() {
+                ranked_pairs += 1;
+            }
             by_child
-                .entry(subscription.child.ip())
+                .entry((subscription.child.ip(), self.is_primary(subscription)))
                 .or_default()
                 .push(subscription.stream_id);
         }
+        let ips: HashSet<IpAddr> = by_child.keys().map(|(ip, _)| *ip).collect();
         let max = self.config.max_children;
         let mut known = self
             .known
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Children whose leases have all gone are forgotten, with their
-        // warm rings.
-        known.children.retain(|ip, _| by_child.contains_key(ip));
-        known.refused.retain(|ip| by_child.contains_key(ip));
-        for ip in by_child.keys() {
-            if known.children.contains_key(ip) {
+        // warm rings (and an entry for a role the child no longer gives).
+        known.children.retain(|key, _| by_child.contains_key(key));
+        known.refused.retain(|ip| ips.contains(ip));
+        for &(ip, primary) in by_child.keys() {
+            if known.children.contains_key(&(ip, primary)) {
                 continue;
             }
-            if known.children.len() >= max {
-                if known.refused.insert(*ip) {
+            // The cap counts children (addresses), not their roles.
+            let fed: HashSet<IpAddr> = known.children.keys().map(|(ip, _)| *ip).collect();
+            if !fed.contains(&ip) && fed.len() >= max {
+                if known.refused.insert(ip) {
                     self.stats.refused.fetch_add(1, Ordering::Relaxed);
                     warn!(
                         child = %ip,
@@ -433,10 +480,10 @@ impl LeaseChildren {
                 }
                 continue;
             }
-            let Some(child) = self.new_child(*ip) else {
+            let Some(child) = self.new_child(ip, primary) else {
                 continue;
             };
-            known.refused.remove(ip);
+            known.refused.remove(&ip);
             info!(
                 child = %ip,
                 primary = child.primary,
@@ -444,13 +491,13 @@ impl LeaseChildren {
                 video = %child.targets[1],
                 "fast-plane lease child added"
             );
-            known.children.insert(*ip, child);
+            known.children.insert((ip, primary), child);
         }
         let children: Vec<Arc<LeaseChild>> = known.children.values().cloned().collect();
-        let index: HashMap<IpAddr, u16> = children
+        let index: HashMap<(IpAddr, bool), u16> = children
             .iter()
             .enumerate()
-            .map(|(index, child)| (child.ip, index as u16))
+            .map(|(index, child)| ((child.ip, child.primary), index as u16))
             .collect();
         let mut streams: HashMap<Box<str>, Vec<u16>> = HashMap::new();
         for (ip, stream_ids) in &by_child {
@@ -486,9 +533,25 @@ impl LeaseChildren {
             streams,
             children: children.into_boxed_slice(),
         };
+        let addresses: HashSet<IpAddr> = snapshot.children.iter().map(|child| child.ip).collect();
+        let primary_pairs: usize = snapshot
+            .streams
+            .values()
+            .map(|stream| {
+                stream
+                    .children
+                    .iter()
+                    .filter(|&&child| snapshot.children[usize::from(child)].primary)
+                    .count()
+            })
+            .sum();
         self.stats
             .children
-            .store(snapshot.children.len() as u64, Ordering::Relaxed);
+            .store(addresses.len() as u64, Ordering::Relaxed);
+        self.stats
+            .primary_pairs
+            .store(primary_pairs as u64, Ordering::Relaxed);
+        self.stats.ranked_pairs.store(ranked_pairs, Ordering::Relaxed);
         self.stats
             .pairs
             .store(snapshot.pairs() as u64, Ordering::Relaxed);
@@ -557,6 +620,8 @@ pub struct LeaseSnapshotStats {
     pub enabled: bool,
     pub children: u64,
     pub pairs: u64,
+    pub primary_pairs: u64,
+    pub ranked_pairs: u64,
     pub refused: u64,
     pub rebuilds: u64,
     pub audio_sent: u64,
@@ -578,6 +643,8 @@ impl LeaseStats {
             enabled: true,
             children: load(&self.children),
             pairs: load(&self.pairs),
+            primary_pairs: load(&self.primary_pairs),
+            ranked_pairs: load(&self.ranked_pairs),
             refused: load(&self.refused),
             rebuilds: load(&self.rebuilds),
             audio_sent: load(&self.sent[0]),
@@ -622,10 +689,18 @@ mod tests {
             child: child.parse().unwrap(),
             stream_id,
             backfill_parts_pending: 0,
+            rank: None,
         }
     }
 
-    fn lease(max_children: usize, primary: &[&str]) -> Arc<LeaseChildren> {
+    fn ranked(child: &str, stream_id: u64, rank: u8) -> ServedSubscription {
+        ServedSubscription {
+            rank: Some(rank),
+            ..served(child, stream_id)
+        }
+    }
+
+    fn lease_with(max_children: usize, primary: &[&str], ranked: bool) -> Arc<LeaseChildren> {
         LeaseChildren::bind(
             LeaseChildConfig {
                 bind: "127.0.0.1:0".parse().unwrap(),
@@ -633,10 +708,101 @@ mod tests {
                 class_port_offset: 1_000,
                 primary_children: primary.iter().map(|ip| ip.parse().unwrap()).collect(),
                 max_children,
+                ranked,
             },
             1 << 20,
         )
         .unwrap()
+    }
+
+    fn lease(max_children: usize, primary: &[&str]) -> Arc<LeaseChildren> {
+        lease_with(max_children, primary, true)
+    }
+
+    #[test]
+    fn a_ranked_lease_makes_this_forwarder_primary_for_its_first_parent_streams() {
+        // The deploy names 10.0.0.5 a primary child; its leases say rank 1
+        // for stream 1 and rank 0 for stream 2: the rank wins.
+        let lease = lease(16, &["10.0.0.5"]);
+        lease.rebuild(&[
+            ranked("10.0.0.5:9101", 1, 1),
+            ranked("10.0.0.5:9101", 2, 0),
+            ranked("10.0.0.6:9101", 1, 0),
+            // A lease without a rank keeps the fixed rule (not primary).
+            served("10.0.0.7:9101", 1),
+        ]);
+        let snapshot = lease.load();
+        let five: IpAddr = "10.0.0.5".parse().unwrap();
+        let six: IpAddr = "10.0.0.6".parse().unwrap();
+        let seven: IpAddr = "10.0.0.7".parse().unwrap();
+        assert_eq!(snapshot.feeds(five, 1), Some(false));
+        assert_eq!(snapshot.feeds(five, 2), Some(true));
+        assert_eq!(snapshot.feeds(six, 1), Some(true));
+        assert_eq!(snapshot.feeds(seven, 1), Some(false));
+        // The primary entry sends to the first port, the other to the second.
+        let as_primary = snapshot.child_feeding(five, 2).unwrap();
+        assert_eq!(as_primary.targets[0], "10.0.0.5:22001".parse().unwrap());
+        assert_eq!(as_primary.targets[1], "10.0.0.5:23001".parse().unwrap());
+        let as_secondary = snapshot.child_feeding(five, 1).unwrap();
+        assert_eq!(as_secondary.targets[0], "10.0.0.5:22002".parse().unwrap());
+        assert_eq!(
+            as_secondary.takes(TrafficClass::Video, MediaDatagramRole::Source),
+            LeaseTake::Warm
+        );
+        assert_eq!(
+            as_primary.takes(TrafficClass::Video, MediaDatagramRole::Source),
+            LeaseTake::Send
+        );
+        // Children count addresses, not roles.
+        let stats = lease.stats.snapshot();
+        assert_eq!((stats.children, stats.pairs), (3, 4));
+        assert_eq!((stats.primary_pairs, stats.ranked_pairs), (2, 3));
+        // A promotion acts on the entry that takes repair here.
+        assert_eq!(
+            lease.apply_failover(five, FailoverForwardMode::SourceAndRepair),
+            Some(true)
+        );
+        assert_eq!(
+            lease
+                .load()
+                .child_feeding(five, 1)
+                .unwrap()
+                .takes(TrafficClass::Video, MediaDatagramRole::Source),
+            LeaseTake::Send
+        );
+        // The child re-ranks: this forwarder is now its first parent for
+        // stream 1 as well; the secondary entry goes, with its warm ring.
+        lease.rebuild(&[
+            ranked("10.0.0.5:9101", 1, 0),
+            ranked("10.0.0.5:9101", 2, 0),
+        ]);
+        assert_eq!(lease.load().feeds(five, 1), Some(true));
+        assert_eq!(lease.load().children.len(), 1);
+        assert!(lease.child(five).unwrap().primary);
+    }
+
+    #[test]
+    fn with_the_ranked_rule_off_the_fixed_primary_list_decides() {
+        let lease = lease_with(16, &["10.0.0.5"], false);
+        lease.rebuild(&[ranked("10.0.0.5:9101", 1, 1), ranked("10.0.0.6:9101", 1, 0)]);
+        let snapshot = lease.load();
+        assert_eq!(snapshot.feeds("10.0.0.5".parse().unwrap(), 1), Some(true));
+        assert_eq!(snapshot.feeds("10.0.0.6".parse().unwrap(), 1), Some(false));
+        assert_eq!(lease.stats.snapshot().ranked_pairs, 0);
+    }
+
+    #[test]
+    fn the_cap_counts_a_child_with_two_roles_once() {
+        let lease = lease(1, &[]);
+        lease.rebuild(&[
+            ranked("10.0.0.5:9101", 1, 0),
+            ranked("10.0.0.5:9101", 2, 1),
+            ranked("10.0.0.6:9101", 1, 0),
+        ]);
+        let snapshot = lease.load();
+        assert_eq!(snapshot.children.len(), 2, "both roles of 10.0.0.5");
+        assert!(snapshot.feeds("10.0.0.6".parse().unwrap(), 1).is_none());
+        assert_eq!(lease.stats.snapshot().refused, 1);
     }
 
     #[test]

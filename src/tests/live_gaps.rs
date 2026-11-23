@@ -162,6 +162,10 @@ async fn a_hole_holds_the_watermark_only_for_the_repair_horizon() {
     assert_eq!(snapshot.repair_horizon_us, Some(40_000));
     assert_eq!(snapshot.repair_horizon_releases, 1);
     assert_eq!(snapshot.skipped_parts, 1);
+    // AM 13: the hole held the watermark about the horizon, under 250 ms.
+    let held_us = cache.watermark_stall_max_us();
+    assert!((40_000..250_000).contains(&held_us), "{held_us}");
+    assert_eq!(cache.watermark_stalls_over(), 0);
     assert_eq!(
         cache.live_hole_wait(STREAM, 5, Duration::ZERO),
         Some(Duration::ZERO)
@@ -177,6 +181,8 @@ async fn a_hole_holds_the_watermark_only_for_the_repair_horizon() {
     assert_eq!(snapshot.repair_delays, 1);
     assert!(snapshot.repair_delay_p90_us.unwrap() >= 40_000);
     assert_eq!(watermark(&cache).await, Some(10));
+    // The late fill of a gap held no watermark.
+    assert_eq!(cache.watermark_stall_max_us(), held_us);
 }
 
 #[tokio::test]
@@ -197,6 +203,8 @@ async fn a_repair_within_the_horizon_publishes_in_order_and_is_measured() {
     assert_eq!(snapshot.repair_delays, 1);
     let delay_us = snapshot.repair_delay_p90_us.unwrap();
     assert!((5_000..200_000).contains(&delay_us), "{delay_us}");
+    // AM 13: the repaired hole held the watermark as long as its repair.
+    assert_eq!(cache.watermark_stall_max_us(), delay_us);
     // Auto: twice the measured repair, at least the floor.
     assert_eq!(
         snapshot.repair_horizon_us,
