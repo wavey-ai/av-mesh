@@ -2646,7 +2646,13 @@ struct Args {
     )]
     canonical_repair_horizon: RepairHorizon,
 
-    #[arg(long, default_value_t = 2048)]
+    /// The largest part (and initialization) a cache slot takes, in KiB; a
+    /// larger part is refused by every cache (never in a playlist, never
+    /// answered to a NACK) and reaches UDP clients only on the fast lane.
+    /// Wave 9 D: 8 MiB (2 MiB before): the first frame of a 4K encode at
+    /// 160-300 Mbit/s is 4.6-5.9 MB, and a 4K IDR at 300 Mbit/s ~1.7 MB. A
+    /// limit, not an allocation.
+    #[arg(long, default_value_t = 8192)]
     slot_kb: usize,
 
     /// Playlists that this node can hold at one time. A relay and a
@@ -40171,8 +40177,19 @@ mod tests {
         let args = Args::try_parse_from(["av-mesh"]).unwrap();
         assert!(args.relay_video_gro);
         assert!(fast_plane::relay::RelayClassConfig::default().video_gro);
-        let args = Args::try_parse_from(["av-mesh", "--relay-video-gro", "false"]).unwrap();
+        // A 4K part of up to 8 MiB (the first frame of a 300 Mbit/s encode
+        // is ~5.9 MB) fits a cache slot.
+        assert_eq!(args.slot_kb, 8_192);
+        let args = Args::try_parse_from([
+            "av-mesh",
+            "--relay-video-gro",
+            "false",
+            "--slot-kb",
+            "2048",
+        ])
+        .unwrap();
         assert!(!args.relay_video_gro);
+        assert_eq!(args.slot_kb, 2_048);
     }
 
     #[tokio::test]
