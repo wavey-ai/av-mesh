@@ -242,6 +242,10 @@ pub struct Counters {
     /// the edge the listener is on when the part settles.
     pub moves_out: u64,
     pub moves_by_reason: BTreeMap<String, u64>,
+    /// Wave 9 review: the moves that came to this edge (`moves`), by the
+    /// reason the listener left its last edge (a scale run judges a
+    /// fault's spread by the fault's own reasons, not by rebalances).
+    pub moves_in_by_reason: BTreeMap<String, u64>,
     pub time_to_move: Histogram,
     pub move_lost: u64,
     pub missing_moved: u64,
@@ -295,6 +299,9 @@ impl Counters {
         self.ttok.merge(&other.ttok);
         self.recv_lag.merge(&other.recv_lag);
         self.moves_out += other.moves_out;
+        for (reason, count) in &other.moves_in_by_reason {
+            *self.moves_in_by_reason.entry(reason.clone()).or_default() += count;
+        }
         for (reason, count) in &other.moves_by_reason {
             *self.moves_by_reason.entry(reason.clone()).or_default() += count;
         }
@@ -363,6 +370,7 @@ impl Counters {
     fn am10_json(&self, value: &mut Value) {
         value["moves_out"] = json!(self.moves_out);
         value["moves_by_reason"] = json!(self.moves_by_reason);
+        value["moves_in_by_reason"] = json!(self.moves_in_by_reason);
         value["time_to_move_ms"] = self.time_to_move.summary_with_buckets();
         value["move_lost"] = json!(self.move_lost);
         value["missing_moved"] = json!(self.missing_moved);
@@ -919,6 +927,8 @@ struct Listener {
     node: Option<String>,
     skip: Vec<(String, Instant)>,
     resolving: Option<Resolving>,
+    /// Why it is moving (booked on the edge it comes to).
+    move_reason: Option<String>,
     generation: u32,
     last_part_at: Option<Instant>,
     move_from: Option<Instant>,
@@ -1072,6 +1082,7 @@ impl Placing<'_> {
         let edge = &mut counters[listener.edge];
         edge.moves_out += 1;
         *edge.moves_by_reason.entry(reason.to_owned()).or_default() += 1;
+        listener.move_reason = Some(reason.to_owned());
         let until = now + self.config.skip_for;
         if let Some(node) = listener.node.clone() {
             listener.skip.push((node, until));
@@ -1333,6 +1344,11 @@ fn subscribe_at(
     ensure(counters, index);
     if listener.node.is_some() {
         counters[index].moves += 1;
+        let reason = listener
+            .move_reason
+            .take()
+            .unwrap_or_else(|| "unknown".to_owned());
+        *counters[index].moves_in_by_reason.entry(reason).or_default() += 1;
     }
     listener.edge = index;
     listener.node = Some(node);
@@ -1693,6 +1709,7 @@ fn worker(
                     node: None,
                     skip: Vec::new(),
                     resolving: None,
+                    move_reason: None,
                     generation: 0,
                     last_part_at: None,
                     move_from: None,
