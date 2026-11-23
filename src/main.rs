@@ -250,6 +250,8 @@ const REPAIR_HORIZON_BURST_COPY_MARGIN_MS: u64 = 10;
 const REPAIR_DELAY_SAMPLES: usize = 128;
 /// Gaps remembered for each stream's playlist: the oldest are forgotten.
 const MAX_GAP_PARTS_PER_STREAM: usize = 4_096;
+/// Wide holes a stream keeps on record (`LiveTsCache::wide_hole_resume`).
+const WIDE_HOLE_RECORDS: usize = 8;
 
 /// `--canonical-repair-horizon`: how long a hole may hold back the
 /// contiguous watermark of a stream (the playlist and the cache-mesh push)
@@ -8499,11 +8501,13 @@ struct LiveTsCache {
     /// The parts of each stream that the watermark passed as holes: the
     /// playlist lists them as gaps while they are missing.
     gap_parts: StdMutex<HashMap<u64, BTreeSet<u64>>>,
-    /// Per stream, the lowest part stored more than
-    /// CANONICAL_GAP_SCAN_LIMIT above the watermark: where the walk of a
-    /// hole wider than its scan resumes (both contributors lost, a source
-    /// that jumped). Ignored once the watermark has passed it.
-    wide_hole_resume: StdMutex<HashMap<u64, u64>>,
+    /// Per stream, parts stored more than CANONICAL_GAP_SCAN_LIMIT above
+    /// the watermark, no two within the scan of each other (at most
+    /// WIDE_HOLE_RECORDS): where the walk of a hole wider than its scan
+    /// resumes (both contributors lost, a source that jumped), the lowest
+    /// above the watermark first. Dropped once the watermark has passed
+    /// them.
+    wide_hole_resume: StdMutex<HashMap<u64, BTreeSet<u64>>>,
     /// Holes wider than the scan that the repair horizon released.
     wide_hole_releases: AtomicU64,
     part_updates: watch::Sender<u64>,
@@ -9087,9 +9091,11 @@ impl LiveTsCache {
     }
 
     /// Part `slot` was stored: when it is more than the scan limit above
-    /// the watermark, the walk of the hole below it resumes there. The
-    /// lowest such part above the watermark is kept. A part near the
-    /// watermark costs one load and one comparison.
+    /// the watermark, the walk of a hole below it may have to resume there.
+    /// It is recorded unless a record within the scan below it reaches it
+    /// already, so that each of several wide holes (a contributor pair that
+    /// flaps, a straggler between two outages) has the part after it on
+    /// record. A part near the watermark costs one load and one comparison.
     fn note_wide_hole(&self, handle: StreamHandle, slot: usize) {
         let Some(last) = self.chunk_cache.last_for_handle(handle) else {
             return;
@@ -9098,26 +9104,34 @@ impl LiveTsCache {
             return;
         }
         let (last, slot) = (last as u64, slot as u64);
-        self.wide_hole_resume
+        let mut records = self
+            .wide_hole_resume
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(handle.stream_id())
-            .and_modify(|resume| {
-                if *resume <= last || slot < *resume {
-                    *resume = slot;
-                }
-            })
-            .or_insert(slot);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let starts = records.entry(handle.stream_id()).or_default();
+        starts.retain(|start| *start > last);
+        let reach = slot.saturating_sub(CANONICAL_GAP_SCAN_LIMIT as u64);
+        if starts.range(reach..=slot).next().is_some() {
+            return;
+        }
+        starts.insert(slot);
+        // The lowest are released first; a part beyond the kept records is
+        // recorded again by a later commit once they are passed.
+        if starts.len() > WIDE_HOLE_RECORDS {
+            starts.pop_last();
+        }
     }
 
-    /// Where the walk of a stream's wide hole resumes, if above `last`.
+    /// Where the walk of a stream's wide hole resumes: its lowest record
+    /// above `last`.
     fn wide_hole_resume_above(&self, stream_id: u64, last: usize) -> Option<usize> {
         self.wide_hole_resume
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&stream_id)
+            .get(&stream_id)?
+            .range(last as u64 + 1..)
+            .next()
             .and_then(|resume| usize::try_from(*resume).ok())
-            .filter(|resume| *resume > last)
     }
 
     /// A part `part` of a stream was stored after a later part: a repair
@@ -9327,14 +9341,8 @@ impl LiveTsCache {
             && match self.wide_hole_resume_above(stream_id, last) {
                 Some(resume) if resume <= head => {
                     let end = head.min(resume.saturating_add(CANONICAL_GAP_SCAN_LIMIT));
-                    walk = self.walk_holes(
-                        handle,
-                        resume..=end,
-                        true,
-                        committing,
-                        now_us,
-                        horizon_us,
-                    );
+                    walk =
+                        self.walk_holes(handle, resume..=end, true, committing, now_us, horizon_us);
                     true
                 }
                 _ => false,
