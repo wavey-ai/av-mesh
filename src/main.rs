@@ -1638,6 +1638,24 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_RELAY_SECONDARY_WARM_MS)]
     relay_secondary_warm_ms: u64,
 
+    /// Wave 8 stage 3 (S6): a lane switch must not double video in a loop.
+    /// A promotion of the warm secondary sends the child the sources from
+    /// both parents until the primary has been back for
+    /// --relay-primary-recovery-ms, which loads both parents and the child;
+    /// a primary that stalls again and again (an overloaded forwarder) would
+    /// switch each time. With this flag each promotion within the last 30 s
+    /// doubles the primary silence that the next one needs (at most 8 times
+    /// --relay-primary-silence-ms); a promotion that waits is counted
+    /// (deferred_promotions). The first promotion is as fast as before.
+    /// `false`: every silence promotes, as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_FAILOVER_PROMOTION_BACKOFF",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_failover_promotion_backoff: bool,
+
     #[arg(long, default_value_t = DEFAULT_RELAY_FAILOVER_HEARTBEAT_MS)]
     relay_failover_heartbeat_ms: u64,
 
@@ -5967,6 +5985,8 @@ struct RelayFailoverControllerSnapshot {
     promotions: u64,
     demotions: u64,
     secondary_unavailable_events: u64,
+    /// Promotions that waited for a longer silence (the backoff).
+    deferred_promotions: u64,
     primary_source_age_ms: u64,
     secondary_repair_age_ms: u64,
     last_detection_us: u64,
@@ -6008,8 +6028,19 @@ struct RelayFailoverController {
     promotion_sent_at: Option<Instant>,
     awaiting_secondary_source: bool,
     awaiting_post_promotion_object: bool,
+    /// --relay-failover-promotion-backoff, and the promotions of the last
+    /// [`FAILOVER_FLAP_WINDOW`].
+    promotion_backoff: bool,
+    recent_promotions: VecDeque<Instant>,
+    /// A promotion waits for the backoff now (counted once).
+    deferring: bool,
     snapshot: RelayFailoverControllerSnapshot,
 }
+
+/// Promotions within this window make the next one wait longer.
+const FAILOVER_FLAP_WINDOW: Duration = Duration::from_secs(30);
+/// The backoff's largest factor of the primary silence.
+const FAILOVER_MAX_BACKOFF_SHIFT: u32 = 3;
 
 impl RelayFailoverController {
     async fn bind(args: &Args) -> Result<Option<Self>> {
@@ -6048,6 +6079,9 @@ impl RelayFailoverController {
             promotion_sent_at: None,
             awaiting_secondary_source: false,
             awaiting_post_promotion_object: false,
+            promotion_backoff: args.relay_failover_promotion_backoff,
+            recent_promotions: VecDeque::new(),
+            deferring: false,
             snapshot: RelayFailoverControllerSnapshot {
                 state: RelayFailoverControllerState::Arming,
                 enabled: 1,
@@ -6101,6 +6135,9 @@ impl RelayFailoverController {
         let secondary_recent = self
             .last_secondary_repair
             .is_some_and(|seen| now.saturating_duration_since(seen) < self.secondary_warm);
+        if primary_recent {
+            self.deferring = false;
+        }
 
         match self.state {
             RelayFailoverControllerState::Disabled => {}
@@ -6109,7 +6146,7 @@ impl RelayFailoverController {
                     self.set_state(RelayFailoverControllerState::Healthy);
                 } else if self.last_primary_source.is_some() && !primary_recent {
                     if secondary_recent {
-                        self.promote(now);
+                        self.try_promote(now);
                     } else {
                         self.secondary_unavailable();
                     }
@@ -6118,7 +6155,7 @@ impl RelayFailoverController {
             RelayFailoverControllerState::Healthy => {
                 if !primary_recent {
                     if secondary_recent {
-                        self.promote(now);
+                        self.try_promote(now);
                     } else {
                         self.secondary_unavailable();
                     }
@@ -6128,7 +6165,7 @@ impl RelayFailoverController {
                 if primary_recent {
                     self.set_state(RelayFailoverControllerState::Healthy);
                 } else if secondary_recent && self.last_primary_source.is_some() {
-                    self.promote(now);
+                    self.try_promote(now);
                 }
             }
             RelayFailoverControllerState::Promoted | RelayFailoverControllerState::Recovering => {
@@ -6148,7 +6185,42 @@ impl RelayFailoverController {
         self.send_desired().await;
     }
 
+    /// The primary silence that a promotion needs now: the configured
+    /// silence, doubled for each promotion of the last
+    /// [`FAILOVER_FLAP_WINDOW`] with the backoff on.
+    fn promotion_silence(&mut self, now: Instant) -> Duration {
+        while self
+            .recent_promotions
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) >= FAILOVER_FLAP_WINDOW)
+        {
+            self.recent_promotions.pop_front();
+        }
+        if !self.promotion_backoff {
+            return self.silence;
+        }
+        let shift = (self.recent_promotions.len() as u32).min(FAILOVER_MAX_BACKOFF_SHIFT);
+        self.silence.saturating_mul(1 << shift)
+    }
+
+    /// Promote once the primary has been silent for the silence that a
+    /// promotion needs now; until then count the wait (once).
+    fn try_promote(&mut self, now: Instant) {
+        let needed = self.promotion_silence(now);
+        let silent_for = self
+            .last_primary_source
+            .map_or(Duration::MAX, |seen| now.saturating_duration_since(seen));
+        if silent_for >= needed {
+            self.deferring = false;
+            self.promote(now);
+        } else if !self.deferring {
+            self.deferring = true;
+            self.snapshot.deferred_promotions = self.snapshot.deferred_promotions.saturating_add(1);
+        }
+    }
+
     fn promote(&mut self, now: Instant) {
+        self.recent_promotions.push_back(now);
         self.desired_mode = FailoverForwardMode::SourceAndRepair;
         self.advance_transition();
         self.snapshot.promotions = self.snapshot.promotions.saturating_add(1);
@@ -12219,6 +12291,7 @@ struct RelaySessionIngressSnapshot {
     failover_promotions: u64,
     failover_demotions: u64,
     failover_secondary_unavailable_events: u64,
+    failover_deferred_promotions: u64,
     failover_primary_source_age_ms: u64,
     failover_secondary_repair_age_ms: u64,
     failover_last_detection_us: u64,
@@ -12305,6 +12378,7 @@ impl RelaySessionIngressSnapshot {
         self.failover_promotions = snapshot.promotions;
         self.failover_demotions = snapshot.demotions;
         self.failover_secondary_unavailable_events = snapshot.secondary_unavailable_events;
+        self.failover_deferred_promotions = snapshot.deferred_promotions;
         self.failover_primary_source_age_ms = snapshot.primary_source_age_ms;
         self.failover_secondary_repair_age_ms = snapshot.secondary_repair_age_ms;
         self.failover_last_detection_us = snapshot.last_detection_us;
@@ -15483,6 +15557,11 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
             "av_mesh_relay_failover_secondary_unavailable_total",
             "Primary failures where the secondary did not have a recent repair heartbeat.",
             snapshot.relay_session.failover_secondary_unavailable_events,
+        ),
+        (
+            "av_mesh_relay_failover_deferred_promotions_total",
+            "Promotions that waited for a longer primary silence after recent ones (S6 backoff).",
+            snapshot.relay_session.failover_deferred_promotions,
         ),
         (
             "av_mesh_relay_failover_lease_expirations_total",
@@ -30339,6 +30418,9 @@ mod tests {
             promotion_sent_at: None,
             awaiting_secondary_source: false,
             awaiting_post_promotion_object: false,
+            promotion_backoff: true,
+            recent_promotions: VecDeque::new(),
+            deferring: false,
             snapshot: RelayFailoverControllerSnapshot {
                 state: RelayFailoverControllerState::Arming,
                 enabled: 1,
@@ -30386,6 +30468,52 @@ mod tests {
             RelayFailoverControllerState::Healthy
         );
         assert_eq!(controller.snapshot().demotions, 1);
+
+        // Wave 8 S6: a primary that stalls again within 30 s needs twice
+        // the silence before the next promotion (no switch, and no doubled
+        // video, for each short stall of an overloaded forwarder).
+        let again = recovered + Duration::from_millis(150);
+        controller.observe(RelayIngressParentPath::Secondary, repair, again);
+        controller.tick(again).await;
+        assert_eq!(
+            controller.snapshot().state,
+            RelayFailoverControllerState::Healthy,
+            "150 ms of silence after a promotion is under the doubled 200 ms"
+        );
+        assert_eq!(controller.snapshot().promotions, 1);
+        assert_eq!(controller.snapshot().deferred_promotions, 1);
+        let longer = recovered + Duration::from_millis(201);
+        controller.observe(RelayIngressParentPath::Secondary, repair, longer);
+        controller.tick(longer).await;
+        assert_eq!(
+            controller.snapshot().state,
+            RelayFailoverControllerState::Promoted
+        );
+        assert_eq!(controller.snapshot().promotions, 2);
+        assert_eq!(controller.snapshot().deferred_promotions, 1);
+        // Without the backoff every silence promotes at once.
+        controller.promotion_backoff = false;
+        assert_eq!(controller.promotion_silence(longer), Duration::from_millis(100));
+        controller.promotion_backoff = true;
+        assert_eq!(controller.promotion_silence(longer), Duration::from_millis(400));
+        // The window forgets: 30 s later the silence is the configured one.
+        assert_eq!(
+            controller.promotion_silence(longer + FAILOVER_FLAP_WINDOW),
+            Duration::from_millis(100)
+        );
+    }
+
+    #[test]
+    fn the_failover_promotion_backoff_defaults_on_and_can_be_turned_off() {
+        let args = Args::try_parse_from(["av-mesh"]).unwrap();
+        assert!(args.relay_failover_promotion_backoff);
+        let args = Args::try_parse_from([
+            "av-mesh",
+            "--relay-failover-promotion-backoff",
+            "false",
+        ])
+        .unwrap();
+        assert!(!args.relay_failover_promotion_backoff);
     }
 
     #[tokio::test]
