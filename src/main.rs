@@ -2168,6 +2168,21 @@ struct Args {
     )]
     client_udp_egress_load: bool,
 
+    /// Wave 8 review: the client UDP datagrams a second that make this edge
+    /// full (its CPU, not its NIC: a g6-dedicated-2 sends ~390 listeners of
+    /// 1 ms parts, ~400,000 datagrams a second, at a few hundred Mbit/s).
+    /// With it, each client datagram counts in the load as at least
+    /// --egress-capacity-bps / 8 / this many bytes, so that
+    /// load_permille reaches 1,000 when the datagram rate does, whatever
+    /// the capacity in bits (an autoscaler's 700 permille then means a full
+    /// CPU). 0: bytes alone, as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_DATAGRAM_CAPACITY",
+        default_value_t = 0
+    )]
+    client_udp_datagram_capacity: u64,
+
     /// Phase AM item 8: a new UDP subscription is refused (`edge-busy`)
     /// while this edge's egress is overloaded, as a new HLS session is. A
     /// client that moves here (it names its next part) is still taken.
@@ -3869,10 +3884,13 @@ async fn main() -> Result<()> {
             // Phase AM item 8: the client lanes' bytes are this node's
             // egress too (read when the load is, from their counters).
             let stats = Arc::clone(&router.edge_udp_stats);
-            router
-                .edge_load
-                .egress
-                .add_egress_counter(Arc::new(move || stats.egress_wire_bytes()));
+            let per_datagram =
+                datagram_load_bytes(args.egress_capacity_bps, args.client_udp_datagram_capacity);
+            router.edge_load.egress.add_egress_counter(Arc::new(move || {
+                stats
+                    .egress_wire_bytes()
+                    .max(stats.egress_datagrams().saturating_mul(per_datagram))
+            }));
         }
         // The pair sends by the class of a stream, which an edge learns only
         // from the class socket of a split cache mesh: without the split
@@ -15006,6 +15024,16 @@ fn bind_ranked_lease_parents(
         dispatch.bind_controlled_peer(*peer, session)?;
     }
     Ok(())
+}
+
+/// The bytes that one client datagram counts as in the egress load with
+/// `--client-udp-datagram-capacity` (0: none): the capacity in bytes a
+/// second over the datagrams a second that fill the edge.
+fn datagram_load_bytes(capacity_bps: u64, datagram_capacity: u64) -> u64 {
+    if datagram_capacity == 0 {
+        return 0;
+    }
+    (capacity_bps / 8 / datagram_capacity).max(1)
 }
 
 /// Session ids of the ranked lease parents: after the configured parents'
@@ -35862,6 +35890,26 @@ mod tests {
         assert!(!args.cache_mesh_avoid_draining_parents);
         assert_eq!(args.cache_mesh_warm_total_kbps, 0);
         assert_eq!(args.assignment_max_head_lag_parts, 400);
+    }
+
+    /// Wave 8 review: with --client-udp-datagram-capacity, small client
+    /// datagrams count in the load by their rate, so a full CPU reads full
+    /// at a capacity in bits far above what the datagrams carry.
+    #[test]
+    fn a_datagram_capacity_makes_a_full_datagram_rate_a_full_load() {
+        let args = Args::try_parse_from(["av-mesh"]).unwrap();
+        assert_eq!(args.client_udp_datagram_capacity, 0);
+        assert_eq!(datagram_load_bytes(4_000_000_000, 0), 0);
+        let per_datagram = datagram_load_bytes(4_000_000_000, 400_000);
+        assert_eq!(per_datagram, 1_250);
+        // 400,000 datagrams of 125 bytes a second: 50 MB/s is a tenth of
+        // the 500 MB/s capacity by bytes, all of it by the datagram rate.
+        let bytes_per_second = 400_000_u64 * 125;
+        let counted = bytes_per_second.max(400_000 * per_datagram);
+        assert_eq!(counted, 4_000_000_000 / 8);
+        let args = Args::try_parse_from(["av-mesh", "--client-udp-datagram-capacity", "400000"])
+            .unwrap();
+        assert_eq!(args.client_udp_datagram_capacity, 400_000);
     }
 
     /// AM 12: an edge admits every distributor of its region (its

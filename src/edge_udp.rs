@@ -355,6 +355,15 @@ impl EdgeUdpStats {
         }
         bytes
     }
+
+    /// The client datagrams sent so far, every lane (the fast lane's too).
+    pub(crate) fn egress_datagrams(&self) -> u64 {
+        let mut datagrams = self.datagrams.load(Ordering::Relaxed);
+        if let Some(lane) = self.fast_lane.get() {
+            datagrams += lane.stats.datagrams.load(Ordering::Relaxed);
+        }
+        datagrams
+    }
 }
 
 /// The compact datagrams of each stream's recent parts, in their canonical
