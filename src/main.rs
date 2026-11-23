@@ -4042,6 +4042,12 @@ async fn main() -> Result<()> {
         forwarder: relay_forwarder.clone(),
         ..NodeStatusSource::default()
     };
+    let node_cpu_task = tokio::spawn(run_node_cpu_sampler(
+        edge_admission::process_cpu_us,
+        edge_admission::available_cpus(),
+        Arc::clone(&node_status_source.cpu_permille),
+        ingest_shutdown_rx.clone(),
+    ));
     let relay_ingest_runtime = RelayIngestRuntime {
         dispatch: relay_dispatch,
         secondary_socket: relay_secondary_socket,
@@ -4498,6 +4504,7 @@ async fn main() -> Result<()> {
     }
     http_runtime.shutdown_background();
     let _ = replication_planner_task.await;
+    let _ = node_cpu_task.await;
     if let Some(task) = edge_udp_task {
         let _ = task.await;
     }
@@ -19333,7 +19340,54 @@ struct NodeStatusSource {
     parents: Arc<Vec<(std::net::IpAddr, String, &'static str)>>,
     /// The compiled long-haul children, on a forwarder that has them.
     forwarder: Option<Arc<RelayDownstreamForwarder>>,
+    /// The process's CPU over its CPUs in the last whole second, in
+    /// permille, kept by `run_node_cpu_sampler`.
+    cpu_permille: Arc<std::sync::atomic::AtomicU32>,
     memory: Arc<StdMutex<NodeStatusMemory>>,
+}
+
+/// How often `run_node_cpu_sampler` reads the process's CPU time.
+const NODE_CPU_SAMPLE_EVERY: Duration = Duration::from_secs(1);
+
+/// The CPU time `cpu_us` over the wall time `wall_us` on `cpus` CPUs, in
+/// permille of all of them.
+fn cpu_permille(cpu_us: u64, wall_us: u64, cpus: u32) -> u32 {
+    (u128::from(cpu_us) * 1_000 / (u128::from(wall_us) * u128::from(cpus.max(1))).max(1))
+        .min(u128::from(u32::MAX)) as u32
+}
+
+/// `process.cpu_permille` of `GET /api/node`: once a second, the process's
+/// CPU time (`cpu_clock`, µs) over the second just ended, so the figure is
+/// always of the last whole second however seldom the status is read.
+async fn run_node_cpu_sampler(
+    cpu_clock: fn() -> Option<u64>,
+    cpus: u32,
+    figure: Arc<std::sync::atomic::AtomicU32>,
+    mut shutdown_rx: watch::Receiver<()>,
+) {
+    let mut tick = interval(NODE_CPU_SAMPLE_EVERY);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut last: Option<(Instant, u64)> = None;
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => return,
+            _ = tick.tick() => {
+                let at = Instant::now();
+                let Some(cpu_us) = cpu_clock() else {
+                    continue;
+                };
+                if let Some((before, before_us)) = last {
+                    let wall_us = u64::try_from(at.saturating_duration_since(before).as_micros())
+                        .unwrap_or(u64::MAX);
+                    figure.store(
+                        cpu_permille(cpu_us.saturating_sub(before_us), wall_us, cpus),
+                        Ordering::Relaxed,
+                    );
+                }
+                last = Some((at, cpu_us));
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -19342,10 +19396,6 @@ struct NodeStatusMemory {
     /// The warm-up was met (latched), and when the node was first ready.
     warm: bool,
     ready_unix_ms: Option<u64>,
-    /// The process's CPU time at the last sample, and the figure of the
-    /// last whole second.
-    cpu_sample: Option<(Instant, u64)>,
-    cpu_permille: u32,
     /// The lease pairs served at the last look, and when a new one last
     /// appeared (F5).
     lease_pairs: HashSet<(SocketAddr, u64)>,
@@ -20283,7 +20333,7 @@ impl AppRouter {
                 .collect::<HashSet<_>>()
                 .len() as u64,
             pairs: served.len() as u64,
-            subscribed_playlists: self.mesh.subscribed_streams().len() as u64,
+            subscribed_playlists: self.mesh.subscribed_streams(),
             warm_parts_pending: served
                 .iter()
                 .map(|pair| pair.backfill_parts_pending as u64)
@@ -20366,21 +20416,6 @@ impl AppRouter {
         if readiness.ready() && memory.ready_unix_ms.is_none() {
             memory.ready_unix_ms = Some(now_us / 1_000);
         }
-        // The process's CPU over its CPUs, a whole second at a time.
-        let cpus = edge_admission::available_cpus();
-        if let Some(cpu_us) = edge_admission::process_cpu_us() {
-            match memory.cpu_sample {
-                Some((at, before_us)) if now.saturating_duration_since(at) >= Duration::from_secs(1) => {
-                    let wall_us = now.saturating_duration_since(at).as_micros();
-                    memory.cpu_permille = (u128::from(cpu_us.saturating_sub(before_us)) * 1_000
-                        / (wall_us * u128::from(cpus.max(1))).max(1))
-                    .min(u128::from(u32::MAX)) as u32;
-                    memory.cpu_sample = Some((now, cpu_us));
-                }
-                Some(_) => {}
-                None => memory.cpu_sample = Some((now, cpu_us)),
-            }
-        }
         let status = Arc::new(NodeStatus {
             schema: node_status::SCHEMA.to_owned(),
             node_id: self.node.node_id.clone(),
@@ -20393,8 +20428,8 @@ impl AppRouter {
                 started_unix_ms: self.cache.started_unix_us / 1_000,
                 uptime_ms,
                 args_sha256: node_status::args_sha256().to_owned(),
-                cpus,
-                cpu_permille: memory.cpu_permille,
+                cpus: edge_admission::available_cpus(),
+                cpu_permille: self.node_status.cpu_permille.load(Ordering::Relaxed),
             },
             state: readiness.state,
             ready: readiness.ready(),
@@ -21972,6 +22007,15 @@ impl AppRouter {
                 MeshProtocolResponse::command(command)
             }
             MeshProtocolRequest::CloseNode { node_id, region } => {
+                // As on `POST /api/control/close-node`: a close names the node,
+                // or it is refused, and nothing is recorded or published.
+                let Some(node_id) = node_id.filter(|id| !id.trim().is_empty()) else {
+                    return MeshProtocolResponse::error(format!(
+                        "node_id is required for {}",
+                        ControlKind::CloseNode.as_str()
+                    ));
+                };
+                let node_id = Some(node_id);
                 let command = self
                     .execute_control(
                         ControlKind::CloseNode,
@@ -28468,10 +28512,18 @@ mod tests {
                 ..NodeStatusSource::default()
             },
         );
+        // A subscription with no parent to ask is still wanted, and listed.
+        mesh.subscribe(77, 0, 0).await.unwrap();
         let response = get_for_tests(&router, "/api/node").await;
         assert_eq!(response.status, StatusCode::OK);
-        let status: node_status::NodeStatus =
-            serde_json::from_slice(&response.body.unwrap()).unwrap();
+        let body = response.body.unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            raw["cache_mesh"]["subscribed_playlists"],
+            serde_json::json!([77]),
+            "the subscribed playlists are a list of stream ids"
+        );
+        let status: node_status::NodeStatus = serde_json::from_slice(&body).unwrap();
         assert_eq!(status.schema, node_status::SCHEMA);
         assert_eq!(status.node_id, router.node.node_id);
         assert_eq!(status.build.git, av_mesh::build::GIT);
@@ -28508,6 +28560,41 @@ mod tests {
             .unwrap()
             .contains(&serde_json::json!("draining: operator")));
         mesh.shutdown();
+    }
+
+    /// `process.cpu_permille` is the last whole second's, kept by its own
+    /// sampler, not the time between two status requests.
+    #[tokio::test]
+    async fn the_node_cpu_is_sampled_each_second() {
+        assert_eq!(cpu_permille(500_000, 1_000_000, 2), 250);
+        assert_eq!(cpu_permille(2_000_000, 1_000_000, 2), 1_000);
+        assert_eq!(cpu_permille(1, 0, 0), 1_000);
+
+        // A process that spends 0.4 s of CPU each time it is looked at,
+        // once a second, on two CPUs: 200 permille.
+        static CPU_US: AtomicU64 = AtomicU64::new(0);
+        fn clock() -> Option<u64> {
+            Some(CPU_US.fetch_add(400_000, Ordering::Relaxed) + 400_000)
+        }
+        let figure = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let sampler = tokio::spawn(run_node_cpu_sampler(
+            clock,
+            2,
+            Arc::clone(&figure),
+            shutdown_rx,
+        ));
+        tokio::time::sleep(NODE_CPU_SAMPLE_EVERY / 2).await;
+        assert_eq!(figure.load(Ordering::Relaxed), 0, "no whole second yet");
+        tokio::time::sleep(NODE_CPU_SAMPLE_EVERY).await;
+        let permille = figure.load(Ordering::Relaxed);
+        // The second between two looks stretches on a busy machine.
+        assert!((150..=210).contains(&permille), "{permille}");
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), sampler)
+            .await
+            .expect("the sampler stops at shutdown")
+            .unwrap();
     }
 
     #[test]
@@ -31569,6 +31656,18 @@ mod tests {
                 error,
                 serde_json::json!({"error": format!("node_id is required for {kind}")})
             );
+        }
+        // The mesh protocol's close (WebSocket, WebTransport, binary) is
+        // refused the same way.
+        for request in [
+            &br#"{"type":"close_node","region":"test-region"}"#[..],
+            br#"{"type":"close_node","node_id":" "}"#,
+        ] {
+            let answer: serde_json::Value =
+                serde_json::from_slice(&router.mesh_protocol_response_json(request).await.unwrap())
+                    .unwrap();
+            assert_eq!(answer["ok"], false);
+            assert_eq!(answer["error"], "node_id is required for close-node");
         }
         assert!(router.control.recent().await.is_empty());
         assert!(!router.lifecycle.is_draining().await);

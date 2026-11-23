@@ -117,7 +117,9 @@
     "parent_heard_age_ms": 40,
     "children": 3,
     "pairs": 6,
-    "subscribed_playlists": 0,
+    "subscribed_playlists": [
+      3001
+    ],
     "warm_parts_pending": 0
   },
   "client_udp": {

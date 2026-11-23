@@ -254,13 +254,14 @@ pub struct ChildrenStatus {
     pub lease: Option<LeaseStatus>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheMeshStatus {
     /// Since a cache-mesh parent was last heard; null before the first.
     pub parent_heard_age_ms: Option<u64>,
     pub children: u64,
     pub pairs: u64,
-    pub subscribed_playlists: u64,
+    /// The streams this node subscribes to on the cache mesh.
+    pub subscribed_playlists: Vec<u64>,
     pub warm_parts_pending: u64,
 }
 
@@ -1187,7 +1188,7 @@ mod tests {
                 parent_heard_age_ms: Some(40),
                 children: 3,
                 pairs: 6,
-                subscribed_playlists: 0,
+                subscribed_playlists: vec![3001],
                 warm_parts_pending: 0,
             },
             client_udp: Some(ClientUdpStatus {
