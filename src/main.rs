@@ -14568,6 +14568,10 @@ struct ServedSubscriptionSnapshot {
     child: String,
     stream_id: u64,
     warm_parts_pending: usize,
+    /// This node's place in the child's ranking of the playlist's parents
+    /// (0: its first parent), when the child said (AM 12).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rank: Option<u8>,
 }
 
 /// Journal the cache-mesh hops of a part that a parent delivered, from the
@@ -18974,6 +18978,7 @@ impl AppRouter {
                     child: served.child.to_string(),
                     stream_id: served.stream_id,
                     warm_parts_pending: served.backfill_parts_pending,
+                    rank: served.rank,
                 })
                 .collect(),
             link_loss: self
