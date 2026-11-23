@@ -1209,7 +1209,11 @@ fn decode_canonical_stream_object(payload: &[u8]) -> Result<Option<MediaObject>>
 }
 
 #[derive(Debug, Clone, Parser)]
-#[command(name = "av-mesh", about = "Run a local AV mesh node")]
+#[command(
+    name = "av-mesh",
+    version = av_mesh::build::VERSION,
+    about = "Run a local AV mesh node"
+)]
 struct Args {
     #[arg(long, default_value = "uk")]
     region: String,
@@ -27801,6 +27805,16 @@ mod tests {
         assert_eq!(
             args.udp_socket_buffer_bytes,
             DEFAULT_UDP_SOCKET_BUFFER_BYTES
+        );
+    }
+
+    #[test]
+    fn version_prints_the_build_id() {
+        let error = Args::try_parse_from(["av-mesh", "--version"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(
+            error.to_string(),
+            format!("av-mesh {}\n", av_mesh::build::VERSION)
         );
     }
 
