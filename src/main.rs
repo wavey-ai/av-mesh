@@ -34786,9 +34786,10 @@ mod tests {
             let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let answer = subscribe_udp_for_tests(&client, edge, Some(0)).await;
             assert!(matches!(answer, Control::Subscribed { .. }), "{answer:?}");
-            // 999 more, with no client behind them (ports nobody reads).
-            let crowd: Vec<SocketAddr> = (0..999_u16)
-                .map(|index| SocketAddr::from(([127, 0, 0, 3], 40_000 + index)))
+            // 999 more, with no client behind them: privileged ports that no
+            // socket of another test (ephemeral, any address) can hold.
+            let crowd: Vec<SocketAddr> = (1..=999_u16)
+                .map(|port| SocketAddr::from(([127, 0, 0, 3], port)))
                 .collect();
             edge_udp::insert_test_subscribers(&stats.table.get().unwrap().0, 77, &crowd, 4);
             assert_eq!(stats.live_subscribers(), Some(1_000));
