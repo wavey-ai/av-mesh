@@ -13,7 +13,9 @@
 //! record is counted (`dropped`) and never waited for. Consecutive events of
 //! one kind and thread less than 10 ms apart merge into one line (`dur_us`
 //! the longest, `span_us` first start to last end, `n` the count), so a storm
-//! cannot empty the ring.
+//! cannot empty the ring. Late ticks merge only with ticks of the same cause:
+//! a stop inside a run of overload is a line of its own, and neither takes
+//! the other's cause.
 //!
 //! **Tick threads.** One thread per CPU the process may run on, pinned to
 //! it, at normal scheduling (it never preempts a real-time class thread). It
@@ -168,11 +170,13 @@ impl StallThread {
     }
 
     /// Where the table of newest events keeps this thread's event of `kind`.
-    fn newest_slot(self, kind: StallKind) -> Option<usize> {
+    /// A tick thread has two places, its stopped ticks and the others, so
+    /// that a tick merges only with ticks of its own cause.
+    fn newest_slot(self, kind: StallKind, stopped: bool) -> Option<usize> {
         let named = match self {
             Self::Tick(cpu) => {
                 return (usize::from(cpu) < MAX_CPUS)
-                    .then(|| NAMED_THREADS * KINDS + usize::from(cpu));
+                    .then(|| NAMED_THREADS * KINDS + 2 * usize::from(cpu) + usize::from(stopped));
             }
             Self::Audio => 0,
             Self::Video => 1,
@@ -182,6 +186,9 @@ impl StallThread {
         Some(named * KINDS + kind as usize)
     }
 }
+
+/// Places in the table of each thread's newest event.
+const NEWEST_SLOTS: usize = NAMED_THREADS * KINDS + 2 * MAX_CPUS;
 
 /// One event of the ring: 48 bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,10 +206,11 @@ pub struct StallEvent {
     run_delay_us: u32,
     /// Events merged into this line.
     pub n: u32,
-    /// Class threads: the thread's page faults since its once-a-second
-    /// reading (a hint, up to a second wide).
-    pub minflt: u32,
-    pub majflt: u32,
+    /// Class threads: the thread's minor and major page faults since its
+    /// once-a-second reading (a hint, up to a second wide), the most of a
+    /// merged run. Ticks: the summed lateness of a merged run, in
+    /// microseconds (saturating), and zero.
+    words: [u32; 2],
     /// The CPU the recording thread was on (of the longest of a merged run).
     pub cpu: u16,
     pub thread: StallThread,
@@ -218,8 +226,7 @@ impl StallEvent {
         span_us: 0,
         run_delay_us: 0,
         n: 0,
-        minflt: 0,
-        majflt: 0,
+        words: [0; 2],
         cpu: 0,
         thread: StallThread::Audio,
         kind: StallKind::Tick,
@@ -232,8 +239,42 @@ impl StallEvent {
             .then_some(u64::from(self.run_delay_us))
     }
 
+    /// A class thread's minor page faults; zero for another thread.
+    pub fn minflt(&self) -> u32 {
+        if self.thread.is_class() {
+            self.words[0]
+        } else {
+            0
+        }
+    }
+
+    /// A class thread's major page faults; zero for another thread.
+    pub fn majflt(&self) -> u32 {
+        if self.thread.is_class() {
+            self.words[1]
+        } else {
+            0
+        }
+    }
+
+    /// A tick event's lateness summed over its merged run; `dur_us` for
+    /// one tick. Zero for another kind.
+    pub fn late_sum_us(&self) -> u64 {
+        if self.kind == StallKind::Tick {
+            u64::from(self.words[0])
+        } else {
+            0
+        }
+    }
+
     fn start_us(&self) -> u64 {
         self.t_us.saturating_sub(self.span_us)
+    }
+
+    /// A tick its thread slept through: its CPU was not run.
+    fn is_stopped_tick(&self) -> bool {
+        self.kind == StallKind::Tick
+            && tick_cause(self.dur_us, self.run_delay_us()) == Cause::Stopped
     }
 }
 
@@ -407,19 +448,31 @@ impl Ring {
 
     fn put(&mut self, mut event: StallEvent) {
         let capacity = self.events.len() as u64;
-        let slot = event.thread.newest_slot(event.kind);
+        let tick = event.kind == StallKind::Tick;
+        if tick {
+            event.words = [u32::try_from(event.dur_us).unwrap_or(u32::MAX), 0];
+        }
+        let slot = event
+            .thread
+            .newest_slot(event.kind, event.is_stopped_tick());
         let start_us = event.t_us.saturating_sub(event.dur_us);
         if let Some(index) = slot.and_then(|slot| self.newest[slot].checked_sub(1)) {
             let newest = &mut self.events[(index % capacity) as usize];
             if index + capacity >= self.pushed && start_us < newest.t_us + MERGE_WITHIN_US {
                 let first_start_us = newest.start_us().min(start_us);
+                // Within one place every tick has one cause: the longest
+                // keeps it.
                 if event.dur_us > newest.dur_us {
                     newest.dur_us = event.dur_us;
                     newest.run_delay_us = event.run_delay_us;
                     newest.cpu = event.cpu;
                 }
-                newest.minflt = newest.minflt.max(event.minflt);
-                newest.majflt = newest.majflt.max(event.majflt);
+                if tick {
+                    newest.words[0] = newest.words[0].saturating_add(event.words[0]);
+                } else {
+                    newest.words[0] = newest.words[0].max(event.words[0]);
+                    newest.words[1] = newest.words[1].max(event.words[1]);
+                }
                 newest.n = newest.n.saturating_add(1);
                 newest.t_us = event.t_us;
                 newest.span_us = event.t_us - first_start_us;
@@ -483,7 +536,7 @@ impl StallJournal {
         } else {
             (
                 (capacity / SEC_LINES_SHARE).max(SEC_LINES_MIN),
-                NAMED_THREADS * KINDS + MAX_CPUS,
+                NEWEST_SLOTS,
             )
         };
         let events = faulted(StallEvent::EMPTY, capacity);
@@ -551,8 +604,10 @@ impl StallJournal {
             None,
             StallEvent {
                 dur_us,
-                minflt: u32::try_from(minflt).unwrap_or(u32::MAX),
-                majflt: u32::try_from(majflt).unwrap_or(u32::MAX),
+                words: [
+                    u32::try_from(minflt).unwrap_or(u32::MAX),
+                    u32::try_from(majflt).unwrap_or(u32::MAX),
+                ],
                 cpu: os::current_cpu(),
                 thread,
                 kind,
@@ -769,20 +824,71 @@ pub fn tick_cause(late_us: u64, run_delay_us: Option<u64>) -> Cause {
 
 /// The intervals in which each CPU's tick thread found its CPU stopped.
 struct Stops {
-    /// (CPU, start, end), sorted; a CPU's intervals do not overlap.
-    intervals: Vec<(u16, u64, u64)>,
+    /// (CPU, start, end, longest tick, summed lateness), sorted; a CPU's
+    /// intervals do not overlap (its stopped ticks share one place in the
+    /// table of newest events, so each either merges or starts after the
+    /// last ended).
+    intervals: Vec<(u16, u64, u64, u64, u64)>,
 }
 
 impl Stops {
-    /// The time of `[start_us, end_us]` that `cpu` was stopped for.
-    fn overlap_us(&self, cpu: u16, start_us: u64, end_us: u64) -> u64 {
+    /// The stopped ticks among `ticks`.
+    fn new<'a>(ticks: impl Iterator<Item = &'a StallEvent>) -> Self {
+        let mut intervals: Vec<(u16, u64, u64, u64, u64)> = ticks
+            .filter(|event| event.is_stopped_tick())
+            .filter_map(|event| match event.thread {
+                StallThread::Tick(cpu) => Some((
+                    cpu,
+                    event.start_us(),
+                    event.t_us,
+                    event.dur_us,
+                    event.late_sum_us(),
+                )),
+                _ => None,
+            })
+            .collect();
+        intervals.sort_unstable();
+        Self { intervals }
+    }
+
+    /// The intervals of `cpu` that share time with `[start_us, end_us]`,
+    /// each with that shared time.
+    fn meeting(
+        &self,
+        cpu: u16,
+        start_us: u64,
+        end_us: u64,
+    ) -> impl Iterator<Item = (&(u16, u64, u64, u64, u64), u64)> {
         let from = self
             .intervals
-            .partition_point(|&(other, _, end)| (other, end) <= (cpu, start_us));
+            .partition_point(|&(other, _, end, ..)| (other, end) <= (cpu, start_us));
         self.intervals[from..]
             .iter()
-            .take_while(|&&(other, start, _)| other == cpu && start < end_us)
-            .map(|&(_, start, end)| end.min(end_us).saturating_sub(start.max(start_us)))
+            .take_while(move |&&(other, start, ..)| other == cpu && start < end_us)
+            .map(move |interval| {
+                let (_, start, end, ..) = *interval;
+                (
+                    interval,
+                    end.min(end_us).saturating_sub(start.max(start_us)),
+                )
+            })
+    }
+
+    /// The time of `[start_us, end_us]` that `cpu` was stopped for. A merged
+    /// run of stopped ticks was not stopped throughout: its ticks were late
+    /// by `late_sum` in all over the run. Of the time it shares with the
+    /// interval, it counts the interval's share of that sum, or its longest
+    /// tick when that is more (the interval may hold that whole stop), and
+    /// never more than the sum. One tick counts the time it shares.
+    fn overlap_us(&self, cpu: u16, start_us: u64, end_us: u64) -> u64 {
+        self.meeting(cpu, start_us, end_us)
+            .map(|(&(_, start, end, longest, late_sum), shared)| {
+                let span = end.saturating_sub(start).max(1);
+                let share =
+                    u64::try_from(u128::from(shared) * u128::from(late_sum) / u128::from(span))
+                        .unwrap_or(u64::MAX);
+                shared.min(late_sum).min(share.max(longest))
+            })
             .sum()
     }
 
@@ -803,22 +909,15 @@ impl Stops {
 ///   `own` work (`class_pass`, `send_slow`) or it `waited` (`class_gap`,
 ///   `rx_late`, `tee_lag`).
 ///
-/// An event covers `[t_us - span_us, t_us]`.
+/// An event covers `[t_us - span_us, t_us]`. A merged run of stopped ticks
+/// counts for the time it was stopped as `Stops::overlap_us` reckons it,
+/// not for the whole of its span.
 pub fn classify(events: &[StallEvent], tick_cpus: &[u16]) -> Vec<StallLine> {
     let tick_of = |event: &StallEvent| match event.thread {
         StallThread::Tick(cpu) if event.kind == StallKind::Tick => Some(cpu),
         _ => None,
     };
-    let mut intervals: Vec<(u16, u64, u64)> = events
-        .iter()
-        .filter_map(|event| {
-            let cpu = tick_of(event)?;
-            (tick_cause(event.dur_us, event.run_delay_us()) == Cause::Stopped)
-                .then(|| (cpu, event.start_us(), event.t_us))
-        })
-        .collect();
-    intervals.sort_unstable();
-    let stops = Stops { intervals };
+    let stops = Stops::new(events.iter());
     events
         .iter()
         .map(|event| {
@@ -872,7 +971,8 @@ fn write_event_line(body: &mut String, node_json: &str, line: &StallLine) {
         let _ = write!(
             body,
             ",\"minflt\":{},\"majflt\":{}",
-            event.minflt, event.majflt
+            event.minflt(),
+            event.majflt()
         );
     }
     let _ = write!(body, ",\"cause\":\"{}\"", line.cause.as_str());
@@ -1655,6 +1755,7 @@ mod tests {
         StallEvent {
             dur_us,
             run_delay_us,
+            words: [u32::try_from(dur_us).unwrap(), 0],
             cpu,
             thread: StallThread::Tick(cpu),
             kind: StallKind::Tick,
@@ -1722,6 +1823,8 @@ mod tests {
                     // First start to last end.
                     span_us: 23_000,
                     n: 3,
+                    // How late the three were in all.
+                    words: [11_500, 0],
                     ..tick(0, 0, 0)
                 },
                 at(1_040_000, tick(0, 4_000, 7)),
@@ -1935,8 +2038,7 @@ mod tests {
         journal.put(
             Some(1_795_381_726_393_400),
             StallEvent {
-                minflt: 17,
-                majflt: 1,
+                words: [17, 1],
                 ..event(StallKind::ClassPass, StallThread::Audio, 1, 673_900)
             },
         );
@@ -2064,6 +2166,121 @@ mod tests {
     }
 
     #[test]
+    fn a_stop_inside_overload_is_a_line_of_its_own() {
+        let journal = journal(256, &[0, 1]);
+        // CPU 1 is overloaded: its tick thread is 3 ms late every 4 ms, all
+        // of it on a run queue.
+        for k in 0..25 {
+            journal.put(Some(1_000_000 + 4_000 * k), tick(1, 3_000, 3_000));
+        }
+        // A stop of the CPU in the middle of it: 25 ms late, 0.1 ms queued.
+        journal.put(Some(1_125_000), tick(1, 25_000, 100));
+        for k in 0..25 {
+            journal.put(Some(1_129_000 + 4_000 * k), tick(1, 3_000, 3_000));
+        }
+        // CPU 0 is stopped on its own while CPU 1 is overloaded.
+        journal.put(Some(1_225_500), tick(0, 20_000, 0));
+        // CPU 0 again: a stop, then 5 ms later a longer wake it was queued
+        // for. The stop is not lost in the longer tick.
+        journal.put(Some(2_000_000), tick(0, 25_000, 100));
+        journal.put(Some(2_045_000), tick(0, 40_000, 39_000));
+        let lines = journal.query(None).events;
+        let seen: Vec<(u16, u64, u64, u32, Cause, Option<Scope>)> = lines
+            .iter()
+            .map(|line| {
+                let event = line.event;
+                let StallThread::Tick(cpu) = event.thread else {
+                    panic!("only ticks were recorded");
+                };
+                (
+                    cpu,
+                    event.start_us(),
+                    event.dur_us,
+                    event.n,
+                    line.cause,
+                    line.scope,
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                // The overload before the stop, the stop, and the overload
+                // after it: neither takes the other's cause.
+                (1, 997_000, 3_000, 25, Cause::Starved, None),
+                (1, 1_100_000, 25_000, 1, Cause::Stopped, Some(Scope::One)),
+                (1, 1_126_000, 3_000, 25, Cause::Starved, None),
+                // CPU 1 was busy, not stopped, while CPU 0 was stopped.
+                (0, 1_205_500, 20_000, 1, Cause::Stopped, Some(Scope::One)),
+                (0, 1_975_000, 25_000, 1, Cause::Stopped, Some(Scope::One)),
+                (0, 2_005_000, 40_000, 1, Cause::Starved, None),
+            ]
+        );
+        // A pass of the audio thread on CPU 1 during the overload is its
+        // own; one during the stop is the stop's.
+        let pass = |t_us: u64, dur_us: u64| {
+            at(
+                t_us,
+                event(StallKind::ClassPass, StallThread::Audio, 1, dur_us),
+            )
+        };
+        let mut events: Vec<StallEvent> = lines.iter().map(|line| line.event).collect();
+        events.push(pass(1_050_000, 40_000));
+        events.push(pass(1_124_000, 20_000));
+        events.push(pass(1_200_000, 70_000));
+        let classified = classify(&events, &[0, 1]);
+        let passes: Vec<Cause> = classified[classified.len() - 3..]
+            .iter()
+            .map(|line| line.cause)
+            .collect();
+        assert_eq!(passes, vec![Cause::Own, Cause::Stopped, Cause::Own]);
+    }
+
+    #[test]
+    fn a_run_of_short_stops_is_not_stopped_throughout() {
+        let journal = journal(256, &[0, 1]);
+        // CPU 0 is stopped 3 ms in every 8 ms for a second: one line.
+        for k in 1..=125 {
+            journal.put(Some(1_000_000 + 8_000 * k), tick(0, 3_000, 0));
+        }
+        // CPU 1 is stopped 300 ms, then 3 ms in every 8 ms for a second.
+        journal.put(Some(3_000_000), tick(1, 300_000, 0));
+        for k in 1..=125 {
+            journal.put(Some(3_000_000 + 8_000 * k), tick(1, 3_000, 0));
+        }
+        let runs: Vec<StallEvent> = journal
+            .query(None)
+            .events
+            .iter()
+            .map(|line| line.event)
+            .collect();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(
+            (runs[0].n, runs[0].span_us, runs[0].late_sum_us()),
+            (125, 995_000, 375_000)
+        );
+        assert_eq!(
+            (runs[1].n, runs[1].span_us, runs[1].late_sum_us()),
+            (126, 1_300_000, 675_000)
+        );
+        let cause_of = |cpu: u16, t_us: u64, dur_us: u64| {
+            let pass = at(
+                t_us,
+                event(StallKind::ClassPass, StallThread::Audio, cpu, dur_us),
+            );
+            classify(&[runs[0], runs[1], pass], &[0, 1])[2].cause
+        };
+        // Over the whole second: 375 ms of it stopped.
+        assert_eq!(cause_of(0, 2_000_000, 990_000), Cause::Own);
+        // 200 ms of it: about 75 ms stopped.
+        assert_eq!(cause_of(0, 1_600_000, 200_000), Cause::Own);
+        // 4 ms of it: it may hold a whole 3 ms stop.
+        assert_eq!(cause_of(0, 1_500_000, 4_000), Cause::Stopped);
+        // The 300 ms stop at the head of CPU 1's run.
+        assert_eq!(cause_of(1, 3_000_000, 300_000), Cause::Stopped);
+    }
+
+    #[test]
     fn a_cpu_s_second_is_kept_when_it_had_an_event_or_any_steal() {
         let journal = journal(64, &[0, 1, 2]);
         let second = |steal: u32| {
@@ -2133,7 +2350,7 @@ mod tests {
         unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) };
         let bytes = capacity * std::mem::size_of::<StallEvent>()
             + capacity / SEC_LINES_SHARE * std::mem::size_of::<SecLine>()
-            + (NAMED_THREADS * KINDS + MAX_CPUS) * 8;
+            + NEWEST_SLOTS * 8;
         if limit.rlim_cur == libc::RLIM_INFINITY || limit.rlim_cur as usize >= 4 * bytes {
             assert!(journal.ring_locked());
         }
@@ -2326,11 +2543,11 @@ mod tests {
         };
         let pass = of(StallKind::ClassPass);
         if cfg!(target_os = "linux") {
-            assert!(pass.minflt >= 1, "no fault counted");
+            assert!(pass.minflt() >= 1, "no fault counted");
             assert_eq!(pass.cpu, os::current_cpu());
         }
         // A tee reads no faults.
-        assert_eq!(of(StallKind::TeeLag).minflt, 0);
+        assert_eq!(of(StallKind::TeeLag).minflt(), 0);
         // SAFETY: the mapping made above.
         unsafe { libc::munmap(block, LEN) };
     }
