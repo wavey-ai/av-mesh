@@ -8,6 +8,7 @@ mod fast_control;
 mod fast_path;
 mod fast_plane;
 mod hop_journal;
+mod memory;
 mod link_telemetry;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -2192,6 +2193,30 @@ struct Args {
     )]
     client_udp_nack_edge_rate: u32,
 
+    /// Wave 9 (cold start): lock the process's memory (mlockall
+    /// MCL_CURRENT | MCL_FUTURE) once the node is set up, where it may lock
+    /// without a limit (RLIMIT_MEMLOCK infinite: the deploy's unit has
+    /// LimitMEMLOCK=infinity; or root): every page is faulted in then, and
+    /// later mappings when they are made, so no thread (the real-time class
+    /// threads among them) takes a page fault in the first session. With a
+    /// finite limit it is not tried (allocations past it would fail).
+    /// `false`: never, as before.
+    #[arg(long, env = "NEEDLETAIL_MLOCK_ALL", default_value_t = true, action = clap::ArgAction::Set)]
+    mlock_all: bool,
+
+    /// Wave 9 (cold start): glibc's heap trim threshold fixed at 256 MB and
+    /// mmap threshold at 32 MB, so freed memory stays in the heaps for the
+    /// next allocation instead of going back to the kernel and returning as
+    /// page faults. `false`: glibc's dynamic thresholds, as before.
+    #[arg(long, env = "NEEDLETAIL_MALLOC_TUNE", default_value_t = true, action = clap::ArgAction::Set)]
+    malloc_tune: bool,
+
+    /// Wave 9 (cold start): fault in the pages of preallocated rings (the
+    /// hop journal) at start-up, not one by one while the first session
+    /// fills them. `false`: as before.
+    #[arg(long, env = "NEEDLETAIL_PREFAULT", default_value_t = true, action = clap::ArgAction::Set)]
+    prefault: bool,
+
     /// Phase AM item 8: the bytes that the client UDP lanes send (every
     /// lane, with IP and UDP headers) count in the egress that this node
     /// measures, so in its advertised load_permille and free capacity, its
@@ -3164,6 +3189,16 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse().normalized()?;
+    // Wave 9 (cold start): memory before the first session, not in it.
+    hop_journal::PREFAULT.store(args.prefault, std::sync::atomic::Ordering::Relaxed);
+    match memory::tune_allocator(args.malloc_tune) {
+        Ok(()) => info!(
+            trim_threshold = memory::TRIM_THRESHOLD,
+            mmap_threshold = memory::MMAP_THRESHOLD,
+            "allocator keeps freed memory in its heaps"
+        ),
+        Err(reason) => info!(%reason, "allocator thresholds as glibc sets them"),
+    }
     let mesh_peers = resolve_socket_addr_args("peer", &args.peers).await?;
     let mesh_peer_ips: Vec<std::net::IpAddr> = mesh_peers.iter().map(SocketAddr::ip).collect();
     let telemetry_peers = resolve_socket_addr_args("telemetry-peer", &args.telemetry_peers).await?;
@@ -3283,6 +3318,12 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| hop_journal_capacity_for(args.part_us, args.hop_journal_seconds)),
     ));
     cache.set_hop_journal(Arc::clone(&hop_journal));
+    // Wave 9 (cold start): the cache and the journal are allocated; lock
+    // them and everything mapped from now on (where the limit allows).
+    match memory::lock_all(args.mlock_all) {
+        Ok(()) => info!("memory locked: every page is faulted in when it is mapped"),
+        Err(reason) => info!(%reason, "memory not locked"),
+    }
 
     let mut mesh_transport = MeshTransportConfigSnapshot {
         sync_interval_ms: args.mesh_sync_interval_ms,
@@ -35937,6 +35978,35 @@ mod tests {
         assert_eq!(args.client_udp_fanout_nice, 99);
         assert_eq!(args.client_udp_nack_edge_rate, 0);
         assert_eq!(args.relay_class_fallback_nice, 5);
+    }
+
+    #[test]
+    fn the_wave9_cold_start_flags_default_on_and_can_be_turned_off() {
+        let args = Args::try_parse_from(["av-mesh"]).unwrap();
+        assert!(args.mlock_all);
+        assert!(args.malloc_tune);
+        assert!(args.prefault);
+        let args = Args::try_parse_from([
+            "av-mesh",
+            "--mlock-all",
+            "false",
+            "--malloc-tune",
+            "false",
+            "--prefault",
+            "false",
+        ])
+        .unwrap();
+        assert!(!args.mlock_all);
+        assert!(!args.malloc_tune);
+        assert!(!args.prefault);
+    }
+
+    #[test]
+    fn a_class_thread_books_its_loop_lag() {
+        let stats = fast_plane::relay::FastPlaneStats::default();
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.audio_loop_busy_max_us, 0);
+        assert!(snapshot.process_minflt > 0, "the process has faulted pages in");
     }
 
     #[test]

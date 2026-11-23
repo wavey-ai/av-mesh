@@ -157,6 +157,10 @@ struct Ring {
     seen: Box<[SeenEntry]>,
 }
 
+/// Whether new journals fault their ring's pages in at once
+/// (`--prefault`, wave 9; set at start-up).
+pub static PREFAULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 /// The journal of one node.
 #[derive(Debug)]
 pub struct HopJournal {
@@ -172,10 +176,28 @@ impl HopJournal {
         let (events, seen) = if capacity == 0 {
             (VecDeque::new(), Vec::new().into_boxed_slice())
         } else {
-            (
-                VecDeque::with_capacity(capacity),
-                vec![SeenEntry::default(); SEEN_TABLE_SLOTS].into_boxed_slice(),
-            )
+            let mut events: Vec<HopEvent> = Vec::with_capacity(capacity);
+            let mut seen = vec![SeenEntry::default(); SEEN_TABLE_SLOTS].into_boxed_slice();
+            if PREFAULT.load(std::sync::atomic::Ordering::Relaxed) {
+                // Wave 9 (cold start): the ring's pages are faulted in now,
+                // not one by one under the journal's lock by the threads
+                // that record (the real-time class threads among them)
+                // while the first session fills the ring.
+                // SAFETY: the vector's capacity and the boxed table are
+                // owned and writable.
+                unsafe {
+                    crate::memory::prefault(
+                        events.as_mut_ptr().cast(),
+                        capacity * std::mem::size_of::<HopEvent>(),
+                    );
+                    crate::memory::prefault(
+                        seen.as_mut_ptr().cast(),
+                        seen.len() * std::mem::size_of::<SeenEntry>(),
+                    );
+                }
+            }
+            // A deque from a vector keeps its allocation.
+            (VecDeque::from(events), seen)
         };
         Self {
             node: node.into(),

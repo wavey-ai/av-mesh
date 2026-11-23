@@ -230,6 +230,39 @@ pub struct FastPlaneStats {
     pub demand_reports: AtomicU64,
     /// The lease children, whose counters the snapshot reports.
     pub lease: OnceLock<Arc<LeaseChildren>>,
+    /// Loop lag per class (wave 9, spec8 F-I2): the longest pass of a
+    /// class thread's loop (from a wait's return to the next wait), the
+    /// passes longer than 1, 5 and 50 ms, and the longest gap between two
+    /// returns of its wait that both brought datagrams with no idle timeout
+    /// between them (a timeout is STOP_POLL_MS, 50 ms). A pass is the
+    /// thread's own work (sends, a lock, a page fault); a gap past it is
+    /// time the thread did not run (preemption, a stalled host).
+    pub loop_busy_max_us: [AtomicU64; 2],
+    pub loop_busy_over: [[AtomicU64; 3]; 2],
+    pub loop_gap_max_us: [AtomicU64; 2],
+    /// Page faults (minor, major) of each class thread so far, read by the
+    /// thread itself about once a second (wave 9: a first session's faults
+    /// against a later one's).
+    pub thread_faults: [[AtomicU64; 2]; 2],
+}
+
+/// The thresholds of `FastPlaneStats::loop_busy_over`, in µs.
+pub const LOOP_BUSY_OVER_US: [u64; 3] = [1_000, 5_000, 50_000];
+
+impl FastPlaneStats {
+    /// Book one pass of a class thread's loop (see `loop_busy_max_us`).
+    fn record_loop(&self, class: TrafficClass, busy_us: u64, gap_us: Option<u64>) {
+        let index = class.index();
+        self.loop_busy_max_us[index].fetch_max(busy_us, Ordering::Relaxed);
+        for (threshold, counter) in LOOP_BUSY_OVER_US.iter().zip(&self.loop_busy_over[index]) {
+            if busy_us > *threshold {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if let Some(gap_us) = gap_us {
+            self.loop_gap_max_us[index].fetch_max(gap_us, Ordering::Relaxed);
+        }
+    }
 }
 
 /// What `/api/mesh` reports of the fast plane.
@@ -267,6 +300,27 @@ pub struct FastPlaneSnapshot {
     pub parent_loss_ppm: u64,
     pub demand_reports: u64,
     pub lease_children: LeaseSnapshotStats,
+    /// Loop lag (wave 9): see `FastPlaneStats::loop_busy_max_us`.
+    pub audio_loop_busy_max_us: u64,
+    pub audio_loop_busy_over_1ms: u64,
+    pub audio_loop_busy_over_5ms: u64,
+    pub audio_loop_busy_over_50ms: u64,
+    pub audio_loop_gap_max_us: u64,
+    pub video_loop_busy_max_us: u64,
+    pub video_loop_busy_over_1ms: u64,
+    pub video_loop_busy_over_5ms: u64,
+    pub video_loop_busy_over_50ms: u64,
+    pub video_loop_gap_max_us: u64,
+    /// Page faults (minor, major) of the class threads and of the process,
+    /// and whether its memory is locked and its allocator tuned (wave 9).
+    pub audio_thread_minflt: u64,
+    pub audio_thread_majflt: u64,
+    pub video_thread_minflt: u64,
+    pub video_thread_majflt: u64,
+    pub process_minflt: u64,
+    pub process_majflt: u64,
+    pub memory_locked: bool,
+    pub allocator_tuned: bool,
 }
 
 impl FastPlaneStats {
@@ -308,6 +362,24 @@ impl FastPlaneStats {
                 .get()
                 .map(|lease| lease.stats.snapshot())
                 .unwrap_or_default(),
+            audio_loop_busy_max_us: load(&self.loop_busy_max_us[0]),
+            audio_loop_busy_over_1ms: load(&self.loop_busy_over[0][0]),
+            audio_loop_busy_over_5ms: load(&self.loop_busy_over[0][1]),
+            audio_loop_busy_over_50ms: load(&self.loop_busy_over[0][2]),
+            audio_loop_gap_max_us: load(&self.loop_gap_max_us[0]),
+            video_loop_busy_max_us: load(&self.loop_busy_max_us[1]),
+            video_loop_busy_over_1ms: load(&self.loop_busy_over[1][0]),
+            video_loop_busy_over_5ms: load(&self.loop_busy_over[1][1]),
+            video_loop_busy_over_50ms: load(&self.loop_busy_over[1][2]),
+            video_loop_gap_max_us: load(&self.loop_gap_max_us[1]),
+            audio_thread_minflt: load(&self.thread_faults[0][0]),
+            audio_thread_majflt: load(&self.thread_faults[0][1]),
+            video_thread_minflt: load(&self.thread_faults[1][0]),
+            video_thread_majflt: load(&self.thread_faults[1][1]),
+            process_minflt: crate::memory::faults(false).0,
+            process_majflt: crate::memory::faults(false).1,
+            memory_locked: crate::memory::locked(),
+            allocator_tuned: crate::memory::tuned(),
         }
     }
 }
@@ -930,6 +1002,9 @@ impl ClassThread {
         };
         let mut last_loss_poll = Instant::now();
         let mut last_demand_report: Option<Instant> = None;
+        // Loop lag (wave 9): the last wait's return that brought datagrams.
+        let mut last_ready_at: Option<Instant> = None;
+        let mut faults_read_at = Instant::now();
         while !self.stop.load(Ordering::Relaxed) {
             // No longer than the next copy's due time.
             let timeout = copies
@@ -943,6 +1018,17 @@ impl ClassThread {
                     std::thread::sleep(Duration::from_millis(10));
                     continue;
                 }
+            };
+            let woke = Instant::now();
+            // A wait that timed out is idle time, not lag: the next gap
+            // starts after it.
+            let gap_us = if ready == 0 {
+                last_ready_at = None;
+                None
+            } else {
+                last_ready_at
+                    .replace(woke)
+                    .map(|at| woke.saturating_duration_since(at).as_micros() as u64)
             };
             for (index, (path, socket)) in self.sockets.iter().enumerate() {
                 if ready & (1 << index) == 0 {
@@ -989,6 +1075,20 @@ impl ClassThread {
             {
                 last_demand_report = Some(Instant::now());
                 self.report_demand(&fds);
+            }
+            if ready != 0 {
+                self.stats.record_loop(
+                    self.class,
+                    woke.elapsed().as_micros() as u64,
+                    gap_us,
+                );
+            }
+            if faults_read_at.elapsed() >= Duration::from_secs(1) {
+                faults_read_at = Instant::now();
+                let (minor, major) = crate::memory::faults(true);
+                let slot = &self.stats.thread_faults[self.class.index()];
+                slot[0].store(minor, Ordering::Relaxed);
+                slot[1].store(major, Ordering::Relaxed);
             }
         }
     }
@@ -1928,5 +2028,31 @@ mod tests {
         assert_eq!(snapshot.audio_secondary_kernel_dropped, 0);
         assert_eq!(snapshot.kernel_dropped, 15);
         assert_eq!(wrapping, 1);
+    }
+}
+
+#[cfg(test)]
+mod loop_lag_tests {
+    use super::*;
+
+    #[test]
+    fn loop_passes_and_gaps_are_booked_per_class() {
+        let stats = FastPlaneStats::default();
+        stats.record_loop(TrafficClass::Audio, 300, None);
+        stats.record_loop(TrafficClass::Audio, 6_000, Some(9_000));
+        stats.record_loop(TrafficClass::Video, 60_000, Some(70_000));
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.audio_loop_busy_max_us, 6_000);
+        assert_eq!(
+            (
+                snapshot.audio_loop_busy_over_1ms,
+                snapshot.audio_loop_busy_over_5ms,
+                snapshot.audio_loop_busy_over_50ms
+            ),
+            (1, 1, 0)
+        );
+        assert_eq!(snapshot.audio_loop_gap_max_us, 9_000);
+        assert_eq!(snapshot.video_loop_busy_over_50ms, 1);
+        assert_eq!(snapshot.video_loop_gap_max_us, 70_000);
     }
 }
