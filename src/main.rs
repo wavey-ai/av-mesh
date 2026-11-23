@@ -20593,12 +20593,32 @@ impl AppRouter {
         }
         let key = format!("{stream_id}/{session}");
         let now_ms = now_unix_ms();
-        let remembered = self
-            .remembered_assignments
-            .get(&key)
-            .filter(|entry| now_ms.saturating_sub(entry.1) < REMEMBERED_ASSIGNMENT_MS)
-            .map(|entry| entry.0.clone());
-        if remembered.as_deref() == Some(cache) {
+        if self.remembered_assignments.len() >= MAX_REMEMBERED_ASSIGNMENTS {
+            self.remembered_assignments
+                .retain(|_, entry| now_ms.saturating_sub(entry.1) < REMEMBERED_ASSIGNMENT_MS);
+        }
+        let room = self.remembered_assignments.len() < MAX_REMEMBERED_ASSIGNMENTS;
+        // Remembered first, in one step: of two confirmations at once
+        // (its repeat), one charges.
+        let first = match self.remembered_assignments.entry(key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                if entry.get().0 == cache
+                    && now_ms.saturating_sub(entry.get().1) < REMEMBERED_ASSIGNMENT_MS
+                {
+                    false
+                } else {
+                    *entry.get_mut() = (cache.to_owned(), now_ms);
+                    true
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                if room {
+                    entry.insert((cache.to_owned(), now_ms));
+                }
+                true
+            }
+        };
+        if !first {
             return false;
         }
         let snapshots = self.regional_snapshots().await;
@@ -20611,14 +20631,6 @@ impl AppRouter {
             !skip.is_empty(),
             Some(&key),
         );
-        if self.remembered_assignments.len() >= MAX_REMEMBERED_ASSIGNMENTS {
-            self.remembered_assignments
-                .retain(|_, entry| now_ms.saturating_sub(entry.1) < REMEMBERED_ASSIGNMENT_MS);
-        }
-        if self.remembered_assignments.len() < MAX_REMEMBERED_ASSIGNMENTS {
-            self.remembered_assignments
-                .insert(key, (cache.to_owned(), now_ms));
-        }
         true
     }
 
