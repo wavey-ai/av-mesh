@@ -3943,7 +3943,7 @@ async fn main() -> Result<()> {
         forwarder.set_batch(args.relay_forward_batch);
         forwarder.set_repair_lane_single_symbol(args.relay_repair_lane_single_symbol);
         forwarder.set_repair_lane_burst_copy(args.relay_repair_lane_burst_copy);
-        forwarder.set_warm_hold_ms(args.relay_media_deadline_ms);
+        forwarder.set_warm_hold_us(args.relay_media_deadline_us());
         forwarder.set_demand_groups(args.relay_demand_renditions.clone());
         fast_path_report.record_relay_forward_sockets(
             forwarder.socket_groups.len(),
@@ -4524,6 +4524,12 @@ fn lower_thread_priority() {
 }
 
 impl Args {
+    /// `--relay-media-deadline-ms` in µs: the budget of this node's media
+    /// clocks and the hold of its warm sources.
+    fn relay_media_deadline_us(&self) -> u64 {
+        self.relay_media_deadline_ms.saturating_mul(1_000)
+    }
+
     /// Threads that serve readers: the configured number, or as many as the
     /// media has.
     fn http_worker_threads(&self) -> usize {
@@ -5500,7 +5506,7 @@ async fn start_lease_children(
             primary_children: args.relay_lease_primary_children.clone(),
             max_children: args.relay_max_lease_children,
             ranked: args.relay_lease_ranked,
-            warm_hold_us: args.relay_media_deadline_ms.saturating_mul(1_000),
+            warm_hold_us: args.relay_media_deadline_us(),
         },
         args.udp_socket_buffer_bytes,
     )?;
@@ -5537,7 +5543,7 @@ async fn start_lease_children(
 
 fn configured_relay_udp_dispatch(args: &Args, node_id: &str) -> Result<RelayUdpDispatch> {
     let receiver = RelayObjectReceiver::new(RelayObjectReceiverConfig {
-        media_deadline_us: args.relay_media_deadline_ms.saturating_mul(1_000),
+        media_deadline_us: args.relay_media_deadline_us(),
         ..RelayObjectReceiverConfig::default()
     })
     .context("invalid RelaySession receive limits")?;
@@ -6474,9 +6480,10 @@ impl RelayDownstreamForwarder {
         self.nonblocking.store(nonblocking, Ordering::Relaxed);
     }
 
-    fn set_warm_hold_ms(&self, hold_ms: u64) {
-        self.warm_hold_us
-            .store(hold_ms.saturating_mul(1_000), Ordering::Relaxed);
+    /// How long a source held back from a warm child is kept, from its
+    /// receipt on this node's clock.
+    fn set_warm_hold_us(&self, hold_us: u64) {
+        self.warm_hold_us.store(hold_us, Ordering::Relaxed);
     }
 
     fn set_batch(&self, batch: bool) {
@@ -28036,6 +28043,18 @@ mod tests {
             normalize_playback_base_url("https://node/live/"),
             "https://node/live"
         );
+    }
+
+    /// `--relay-media-deadline-ms` is the budget of the receiver's media
+    /// clocks.
+    #[test]
+    fn the_media_budget_flag_reaches_the_receiver() {
+        let default = Args::try_parse_from(["av-mesh"]).unwrap();
+        assert_eq!(default.relay_media_deadline_us(), 1_000_000);
+        let args = Args::try_parse_from(["av-mesh", "--relay-media-deadline-ms", "500"]).unwrap();
+        assert_eq!(args.relay_media_deadline_us(), 500_000);
+        let dispatch = configured_relay_udp_dispatch(&args, "relay-london").unwrap();
+        assert_eq!(dispatch.receiver().config().media_deadline_us, 500_000);
     }
 
     #[test]

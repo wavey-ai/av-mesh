@@ -269,7 +269,7 @@ async fn a_warm_source_ages_on_the_local_clock() {
     .await
     .unwrap()
     .unwrap();
-    forwarder.set_warm_hold_ms(200);
+    forwarder.set_warm_hold_us(200_000);
     let hour_ago_us = now_unix_us() - 3_600_000_000;
     let symbols = fast_audio_symbols(STREAM, 1, hour_ago_us);
     let key = media_object::decode(&opaque_part(1, 1, &[1; 120]))
