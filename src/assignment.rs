@@ -172,6 +172,10 @@ pub struct AssignmentRequest<'a> {
     /// median of load over UDP subscribers among the edges with a few),
     /// when known: movers fill the survivors up to a common level.
     pub listener_permille: Option<f64>,
+    /// The region's entry points that answer assignments (0 is taken as
+    /// 1): each sees only its own movers, so the region's are reckoned as
+    /// its own times this when the level is raised.
+    pub entry_points: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -358,11 +362,13 @@ pub fn assign(
             Level {
                 at: policy.rebalance_receiver_permille(),
                 listener_permille: None,
+                movers_scale: 1.0,
             }
         } else {
             Level {
                 at: policy.rebalance_target_permille,
                 listener_permille: request.listener_permille,
+                movers_scale: f64::from(request.entry_points.max(1)),
             }
         };
         if let Some(index) = apportion(&pool, request.recent_moves, level) {
@@ -509,6 +515,9 @@ pub struct Level {
     /// What one listener costs (permille), when known: the level rises
     /// above `at` to where the movers fit.
     pub listener_permille: Option<f64>,
+    /// The region's movers per mover this entry point placed (its entry
+    /// points; at least 1).
+    pub movers_scale: f64,
 }
 
 /// The level at which `amount` permille poured over caches at `loads` fills
@@ -535,7 +544,7 @@ pub fn fill_level(loads: &[f64], amount: f64) -> f64 {
 pub fn headroom_to_level(loads: &[f64], movers: f64, level: Level) -> Vec<f64> {
     let mut at = f64::from(level.at);
     if let Some(cost) = level.listener_permille.filter(|cost| *cost > 0.0) {
-        at = at.max(fill_level(loads, movers * cost));
+        at = at.max(fill_level(loads, movers * level.movers_scale.max(1.0) * cost));
     }
     let to_level = loads
         .iter()
@@ -819,9 +828,22 @@ mod tests {
             Level {
                 at: 800,
                 listener_permille: Some(14.0),
+                movers_scale: 1.0,
             },
         );
         assert_eq!(rooms, vec![406.0, 247.0, 53.0]);
+        // Two entry points, each with 30 of 60 movers at 15: the level is
+        // where 60 fit over 724 and 524 (1,074), not 30 (849).
+        let rooms = headroom_to_level(
+            &[724.0, 524.0],
+            30.0,
+            Level {
+                at: 800,
+                listener_permille: Some(15.0),
+                movers_scale: 2.0,
+            },
+        );
+        assert_eq!(rooms, vec![350.0, 550.0]);
         // Nothing under the level: the headroom to full load.
         let rooms = headroom_to_level(
             &[900.0, 820.0],
@@ -829,6 +851,7 @@ mod tests {
             Level {
                 at: 800,
                 listener_permille: None,
+                movers_scale: 1.0,
             },
         );
         assert_eq!(rooms, vec![100.0, 180.0]);
@@ -1017,6 +1040,7 @@ mod tests {
             recent_moves: &[],
             rebalancing: false,
             listener_permille: None,
+            entry_points: 0,
         }
     }
 

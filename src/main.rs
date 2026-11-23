@@ -19403,6 +19403,26 @@ impl AppRouter {
             .min(f64::from(u32::MAX)) as u32
     }
 
+    /// The region's entry points (distributors) heard lately, this node
+    /// included if it is one: each apportions its own movers (wave 9
+    /// review).
+    fn region_entry_points(&self, snapshots: &[MeshSnapshot]) -> u32 {
+        let now = now_unix_ms();
+        let others = snapshots
+            .iter()
+            .filter(|snapshot| {
+                snapshot.node.node_id != self.node.node_id
+                    && snapshot.node.region == self.node.region
+                    && snapshot
+                        .edge_service
+                        .as_ref()
+                        .is_some_and(|edge| edge.cache_mesh_role == "distributor")
+                    && self.telemetry.advertisement_age_ms(snapshot, now) <= self.assignment_fresh_ms
+            })
+            .count() as u32;
+        others + u32::from(self.cache_mesh_role == CacheMeshRole::Distributor)
+    }
+
     /// Wave 9 C1: an advertisement this recent counts for a rebalance (a
     /// receiver, a rebalanced listener's cache): one interval, where the
     /// assignment allows three.
@@ -20407,6 +20427,7 @@ impl AppRouter {
                 .is_some_and(|node| !reader.skip.iter().any(|name| name == node));
         let snapshots = self.regional_snapshots().await;
         let listener_permille = region_listener_permille(&snapshots, &self.node.region);
+        let entry_points = self.region_entry_points(&snapshots);
         // Wave 9 C1: it left a live edge over its target (a rebalance), not
         // a draining or lost one.
         let rebalancing = moving
@@ -20432,6 +20453,7 @@ impl AppRouter {
             recent_moves: &recent_moves,
             rebalancing,
             listener_permille,
+            entry_points,
         };
         // A rebalanced listener goes only to a cache heard of lately (one
         // advertisement interval, not the assignment's three): an edge that
@@ -20660,6 +20682,7 @@ impl AppRouter {
                 recent_moves: &[],
                 rebalancing: false,
                 listener_permille: None,
+                entry_points: 0,
             },
             policy,
             &candidates,
