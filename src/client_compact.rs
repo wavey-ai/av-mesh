@@ -547,7 +547,9 @@ pub fn is_short(datagram: &[u8]) -> bool {
 /// it); `None` for a gap or a repair datagram, which keep the long form,
 /// and for a part that keeps it ([`keeps_long_form`]).
 pub fn shorten(datagram: &[u8]) -> Option<Vec<u8>> {
-    let mut short = Vec::with_capacity(datagram.len() - SHORT_SAVES);
+    // Shorter than a header is no part (`None` below): the length must not
+    // wrap first (a capacity overflow panic on an empty datagram).
+    let mut short = Vec::with_capacity(datagram.len().saturating_sub(SHORT_SAVES));
     shorten_into(datagram, &mut short)?;
     Some(short)
 }
@@ -3389,6 +3391,10 @@ mod tests {
         // and a part whose time is unknown (0: the short form would make a
         // time up to 8.4 s off of it).
         assert_eq!(shorten(&encode_gap(5)), None);
+        // Nothing, or less than a header, is no part and no panic.
+        for len in 0..HEADER_LEN {
+            assert_eq!(shorten(&vec![0_u8; len]), None, "{len} bytes");
+        }
         let unknown = encode_part(9, 0, &bytes).unwrap();
         assert_eq!(shorten(&unknown), None);
         let mut in_place = unknown.clone();
