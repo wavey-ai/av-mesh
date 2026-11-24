@@ -27,7 +27,15 @@
 //! Within a rule the choice is a weighted rendezvous hash of the session, so
 //! sessions spread in proportion to free capacity and a session keeps its
 //! order of caches while the set of caches is stable.
+//!
+//! A UDP listener may hold two legs (two subscriptions on two edges) and a
+//! spare (a token at a third edge). The leg it depends on follows the rules
+//! above. A redundant leg (the second of a join, or any leg of a listener
+//! that holds one already) goes only to a cache that stays under the
+//! rebalance target with it, and never spills. The spare is a cache that
+//! holds the playlist, with no load gate: it carries nothing until a hedge.
 
+use av_mesh::client_udp::MAX_PATHS;
 use serde::Serialize;
 
 /// Load at or above this, in thousandths of the limit of the cache, means the
@@ -115,7 +123,15 @@ pub struct AssignmentPolicy {
     /// listener goes only where it keeps the receiver under that (wave 9
     /// review).
     pub rebalance_margin_permille: u32,
+    /// A playlist whose regional bit rate is above this is given one leg
+    /// whatever the listener asks (`--assignment-two-path-max-bps`): a
+    /// second copy of a 4K feed is not worth an edge fault.
+    pub two_path_max_bps: u64,
 }
+
+/// Default of `--assignment-two-path-max-bps`: 1 ms PCM is 2.6 Mbit/s a
+/// leg, 4K is hundreds.
+pub const DEFAULT_TWO_PATH_MAX_BPS: u64 = 8_000_000;
 
 /// Default of `--rebalance-target-permille`.
 pub const DEFAULT_REBALANCE_TARGET_PERMILLE: u32 = 800;
@@ -129,6 +145,7 @@ impl Default for AssignmentPolicy {
             move_headroom: true,
             rebalance_target_permille: DEFAULT_REBALANCE_TARGET_PERMILLE,
             rebalance_margin_permille: DEFAULT_REBALANCE_MARGIN_PERMILLE,
+            two_path_max_bps: DEFAULT_TWO_PATH_MAX_BPS,
         }
     }
 }
@@ -144,7 +161,7 @@ impl AssignmentPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct AssignmentRequest<'a> {
     pub region: &'a str,
     /// Stable identifier of the playback session, for example the CMCD `sid`.
@@ -153,6 +170,10 @@ pub struct AssignmentRequest<'a> {
     pub pin: Option<&'a str>,
     /// Cache that the reader uses now, for example `_HLS_pathway`.
     pub current: Option<&'a str>,
+    /// Caches this entry point gave the session lately, that it has neither
+    /// left nor kept (B 3.6): a repeat is given them again, each only where
+    /// the rule of its place in the answer would still take it.
+    pub remembered: &'a [String],
     /// Bit rate of the playlist that the reader asks for, when a cache of the
     /// region has measured it. A new reader is assigned only to a cache that
     /// has this much room.
@@ -176,6 +197,35 @@ pub struct AssignmentRequest<'a> {
     /// 1): each sees only its own movers, so the region's are reckoned as
     /// its own times this when the level is raised.
     pub entry_points: u32,
+    /// Legs wanted (`p=`, 0 to [`MAX_PATHS`]); 1 for an LL-HLS reader.
+    pub paths: u8,
+    /// A spare is wanted (`s=1`).
+    pub spare: bool,
+    /// The listener holds a leg already (`h=` not empty): every leg of the
+    /// answer is redundant.
+    pub redundant: bool,
+}
+
+impl Default for AssignmentRequest<'_> {
+    /// A reader that wants one cache: the LL-HLS reader, a one-path client.
+    fn default() -> Self {
+        Self {
+            region: "",
+            session: None,
+            pin: None,
+            current: None,
+            remembered: &[],
+            playlist_bps: None,
+            moving: false,
+            recent_moves: &[],
+            rebalancing: false,
+            listener_permille: None,
+            entry_points: 0,
+            paths: 1,
+            spare: false,
+            redundant: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -193,6 +243,10 @@ pub enum AssignmentReason {
     Spill,
     /// Failover order after the assigned cache.
     Alternate,
+    /// A redundant leg: the listener's other leg delivers without it.
+    SecondPath,
+    /// The spare: the listener holds a token here and hedges to it.
+    Spare,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -206,9 +260,13 @@ pub struct AssignedCache {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Assignment {
-    /// The assigned cache first, then the failover order.
+    /// The legs granted first, then the spare, then the failover order.
     pub caches: Vec<AssignedCache>,
     pub pinned: bool,
+    /// The first `legs` caches are legs.
+    pub legs: u8,
+    /// The cache after the legs is the spare.
+    pub spare: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -258,6 +316,8 @@ pub fn assign(
         return Ok(Assignment {
             caches: vec![assigned(cache, AssignmentReason::Pinned)],
             pinned: true,
+            legs: 1,
+            spare: false,
         });
     }
 
@@ -296,6 +356,7 @@ pub fn assign(
 
     let session = request.session.unwrap_or("");
     let moving = request.moving && policy.move_headroom;
+    let rebalancing = moving && request.rebalancing;
     let mut ranked = regional
         .iter()
         .copied()
@@ -309,7 +370,7 @@ pub fn assign(
                 // (wave 9 review: under the target alone, a receiver at 780
                 // took a share and passed 900).
                 u8::from(
-                    request.rebalancing
+                    rebalancing
                         && f64::from(load) + request.listener_permille.unwrap_or(0.0)
                             >= f64::from(policy.rebalance_receiver_permille()),
                 )
@@ -323,6 +384,12 @@ pub fn assign(
             (tier, rendezvous_score(session, cache), cache)
         })
         .collect::<Vec<_>>();
+    if rebalancing {
+        // A rebalanced listener goes only to a receiver under the level, or
+        // nowhere: it stays where it was (B 3.6). Tier 1 handed a leg to an
+        // edge over the level.
+        ranked.retain(|(tier, _, _)| *tier == 0);
+    }
     ranked.sort_by(|left, right| {
         left.0
             .cmp(&right.0)
@@ -330,53 +397,105 @@ pub fn assign(
             .then_with(|| left.2.node_id.cmp(&right.2.node_id))
     });
 
-    let mut caches = Vec::new();
-    let sticky = request.current.and_then(|current| {
-        regional
-            .iter()
-            .copied()
-            .find(|cache| cache.node_id == current && healthy(cache))
-    });
-    if let Some(cache) = sticky {
-        caches.push(assigned(cache, AssignmentReason::Sticky));
-    }
-    let mut ranked = ranked;
-    if moving && caches.is_empty() && !ranked.is_empty() {
-        // Wave 9 C4: the movers that this entry point placed lately are
-        // apportioned over the first tier by headroom (largest remainder):
-        // the one whose share is furthest behind takes this one, so that a
-        // drained edge's few dozen movers follow the headroom-weighted
-        // shares closely rather than by chance (a weighted rendezvous of
-        // 36 movers put 5 where 6.9 were due, 1/1.37 of the share).
-        let first_tier = ranked[0].0;
-        let pool = ranked
-            .iter()
-            .enumerate()
-            .filter(|(_, (tier, _, _))| *tier == first_tier)
-            .map(|(index, (_, _, cache))| (index, *cache))
-            .collect::<Vec<_>>();
-        // A rebalanced listener fills receivers up to the rebalance's
-        // level; a drained or lost edge's movers fill the survivors up to
-        // the target, or higher if they do not fit under it.
-        let level = if request.rebalancing {
+    // Legs granted: one for a playlist over the two-path bit rate.
+    let wanted = if request
+        .playlist_bps
+        .is_some_and(|bps| bps > policy.two_path_max_bps)
+    {
+        request.paths.min(1)
+    } else {
+        request.paths.min(MAX_PATHS)
+    };
+    // The level a redundant leg keeps its cache under, and the level that
+    // movers fill the survivors up to.
+    let listener_permille = request.listener_permille.unwrap_or(0.0);
+    let (gate, level) = if rebalancing {
+        (
+            policy.rebalance_receiver_permille(),
             Level {
                 at: policy.rebalance_receiver_permille(),
                 listener_permille: None,
                 movers_scale: 1.0,
-            }
-        } else {
+            },
+        )
+    } else {
+        (
+            policy.rebalance_target_permille,
             Level {
                 at: policy.rebalance_target_permille,
                 listener_permille: request.listener_permille,
                 movers_scale: f64::from(request.entry_points.max(1)),
+            },
+        )
+    };
+
+    // A redundant leg's gate: the cache admits (and, in a rebalance, is a
+    // receiver under the level) and stays under the gate with the
+    // listener counted.
+    let passes_gate = |ranked: &[(u8, f64, &CacheCandidate)], cache: &CacheCandidate| {
+        ranked.iter().any(|(_, _, other)| other.node_id == cache.node_id)
+            && f64::from(cache.effective_load_permille()) + listener_permille < f64::from(gate)
+    };
+    // The caches the reader uses or was given lately keep it, each only
+    // where the rule of its place would take it now (review of B Z3): the
+    // leg it depends on while the cache is healthy, as before, and in a
+    // rebalance only on a receiver under the level; a redundant leg only
+    // through the gate. A memory of a cache the listener has since left
+    // gave it a leg over the level.
+    let mut stickies: Vec<&CacheCandidate> = Vec::new();
+    for name in request
+        .current
+        .into_iter()
+        .chain(request.remembered.iter().map(String::as_str))
+    {
+        if let Some(cache) = regional.iter().copied().find(|cache| cache.node_id == name) {
+            if !stickies.iter().any(|sticky| sticky.node_id == cache.node_id) {
+                stickies.push(cache);
             }
-        };
-        if let Some(index) = apportion(&pool, request.recent_moves, level) {
-            let chosen = ranked.remove(index);
-            ranked.insert(0, chosen);
         }
     }
-    if caches.is_empty() && !ranked.is_empty() {
+    let mut caches: Vec<AssignedCache> = Vec::new();
+    if wanted > 0 && !request.redundant {
+        let sticky = stickies.iter().copied().find(|cache| {
+            healthy(cache)
+                && (!rebalancing
+                    || ranked.iter().any(|(_, _, other)| other.node_id == cache.node_id))
+        });
+        if let Some(cache) = sticky {
+            caches.push(assigned(cache, AssignmentReason::Sticky));
+        }
+    }
+    if wanted > 0 && caches.is_empty() && !request.redundant {
+        // The leg the listener depends on: a new reader by the tiers, a
+        // mover by headroom.
+        if moving && !ranked.is_empty() {
+            // Wave 9 C4: the movers that this entry point placed lately are
+            // apportioned over the first tier by headroom (largest
+            // remainder): the one whose share is furthest behind takes
+            // this one, so that a drained edge's few dozen movers follow
+            // the headroom-weighted shares closely rather than by chance (a
+            // weighted rendezvous of 36 movers put 5 where 6.9 were due,
+            // 1/1.37 of the share). A rebalanced listener fills receivers
+            // up to the rebalance's level; a drained or lost edge's movers
+            // fill the survivors up to the target, or higher if they do
+            // not fit under it.
+            let first_tier = ranked[0].0;
+            let pool = ranked
+                .iter()
+                .enumerate()
+                .filter(|(_, (tier, _, _))| *tier == first_tier)
+                .map(|(index, (_, _, cache))| (index, *cache))
+                .collect::<Vec<_>>();
+            if let Some(index) = apportion(&pool, request.recent_moves, level) {
+                let chosen = ranked.remove(index);
+                ranked.insert(0, chosen);
+            }
+        }
+        if ranked.is_empty() {
+            // Nothing takes the listener: the caller spills it, or sends
+            // it to the failover region.
+            return Err(AssignmentError::NoCacheAvailable);
+        }
         let (tier, _, cache) = ranked.remove(0);
         let reason = match tier {
             _ if moving && cache.holds_playlist() => AssignmentReason::HoldsPlaylist,
@@ -387,7 +506,114 @@ pub fn assign(
         };
         caches.push(assigned(cache, reason));
     }
-    // The caches after the first are where the reader goes when its cache
+    // Redundant legs: only where the cache stays under the gate with the
+    // listener counted, and never a spill.
+    while caches.len() < usize::from(wanted) {
+        let taken = |cache: &CacheCandidate| caches.iter().any(|leg| leg.node_id == cache.node_id);
+        if let Some(cache) = stickies
+            .iter()
+            .copied()
+            .find(|cache| !taken(cache) && passes_gate(&ranked, cache))
+        {
+            caches.push(assigned(cache, AssignmentReason::Sticky));
+            continue;
+        }
+        let pool = ranked
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, _, cache))| !taken(cache) && passes_gate(&ranked, cache))
+            .map(|(index, (_, _, cache))| (index, *cache))
+            .collect::<Vec<_>>();
+        let chosen = if moving {
+            // The legs of this answer count as movers placed already, so
+            // that two replacements follow the shares as two movers do.
+            let mut moves = request.recent_moves.to_vec();
+            for leg in &caches {
+                match moves.iter_mut().find(|(node_id, _)| *node_id == leg.node_id) {
+                    Some(entry) => entry.1 += 1,
+                    None => moves.push((leg.node_id.clone(), 1)),
+                }
+            }
+            apportion(&pool, &moves, level)
+        } else {
+            // Another holder by the session's weighted rendezvous, else the
+            // edge first in line for the standby copy: a small stream is
+            // then held on two edges, its holder and its standby.
+            pool.iter()
+                .filter(|(_, cache)| cache.holds_playlist())
+                .max_by(|left, right| {
+                    rendezvous_score(session, left.1)
+                        .total_cmp(&rendezvous_score(session, right.1))
+                        .then_with(|| right.1.node_id.cmp(&left.1.node_id))
+                })
+                .or_else(|| {
+                    pool.iter().max_by(|left, right| {
+                        left.1
+                            .failover_rank
+                            .cmp(&right.1.failover_rank)
+                            .then_with(|| {
+                                rendezvous_score(session, left.1)
+                                    .total_cmp(&rendezvous_score(session, right.1))
+                            })
+                            .then_with(|| right.1.node_id.cmp(&left.1.node_id))
+                    })
+                })
+                .map(|(index, _)| *index)
+        };
+        let Some(index) = chosen else {
+            break;
+        };
+        let (_, _, cache) = ranked.remove(index);
+        caches.push(assigned(cache, AssignmentReason::SecondPath));
+    }
+    let legs = u8::try_from(caches.len()).unwrap_or(MAX_PATHS);
+    if rebalancing && legs == 0 && wanted > 0 {
+        // No receiver under the level: no cache of the region is named.
+        // A request for a spare alone is answered as any.
+        return Err(AssignmentError::NoCacheAvailable);
+    }
+    // The spare: a holder of the playlist by the session's weighted
+    // rendezvous, else a cache that admits. No load gate: a spare carries
+    // nothing, and its edge refuses a hedge when it is overloaded.
+    let mut spare = false;
+    if request.spare {
+        let free = |cache: &&CacheCandidate| {
+            !caches.iter().any(|leg| leg.node_id == cache.node_id)
+        };
+        fn best<'c>(session: &str, pool: Vec<&'c CacheCandidate>) -> Option<&'c CacheCandidate> {
+            pool.into_iter().max_by(|left, right| {
+                rendezvous_score(session, left)
+                    .total_cmp(&rendezvous_score(session, right))
+                    .then_with(|| right.node_id.cmp(&left.node_id))
+            })
+        }
+        let holder = best(
+            session,
+            regional
+                .iter()
+                .copied()
+                .filter(free)
+                .filter(|cache| cache.holds_playlist() && healthy(cache))
+                .collect(),
+        );
+        let chosen = holder.or_else(|| {
+            best(
+                session,
+                regional
+                    .iter()
+                    .copied()
+                    .filter(free)
+                    .filter(|cache| admits(cache))
+                    .collect(),
+            )
+        });
+        if let Some(cache) = chosen {
+            ranked.retain(|(_, _, other)| other.node_id != cache.node_id);
+            caches.push(assigned(cache, AssignmentReason::Spare));
+            spare = true;
+        }
+    }
+    // The caches after these are where the reader goes when its cache
     // fails. A cache that holds the playlist comes first, and then the
     // caches in the order in which they take the standby copy, so that the
     // reader finds a warm copy at its first alternate. The readers of one
@@ -400,8 +626,9 @@ pub fn assign(
             .then_with(|| right.1.total_cmp(&left.1))
             .then_with(|| left.2.node_id.cmp(&right.2.node_id))
     });
+    let named = caches.len();
     for (_tier, _, cache) in ranked {
-        if caches.len() > policy.max_alternates {
+        if caches.len() >= named + policy.max_alternates {
             break;
         }
         if caches.iter().any(|chosen| chosen.node_id == cache.node_id) {
@@ -415,6 +642,8 @@ pub fn assign(
     Ok(Assignment {
         caches,
         pinned: false,
+        legs,
+        spare,
     })
 }
 
@@ -493,6 +722,8 @@ pub fn assign_udp_in_region(
     Ok(Assignment {
         caches,
         pinned: false,
+        legs: 1,
+        spare: false,
     })
 }
 
@@ -831,6 +1062,439 @@ mod tests {
         assert_eq!(moved.get("edge-2"), Some(&5), "{moved:?}");
     }
 
+    /// The legs of an answer, by name.
+    fn legs(assignment: &Assignment) -> Vec<&str> {
+        assignment.caches[..usize::from(assignment.legs)]
+            .iter()
+            .map(|cache| cache.node_id.as_str())
+            .collect()
+    }
+
+    /// B 3.6: the second leg of a join goes to another holder of the
+    /// playlist by the session's weighted rendezvous (by headroom), else to
+    /// the edge first in line for the standby copy.
+    #[test]
+    fn the_second_path_is_another_holder_by_headroom_else_the_standby_copy() {
+        fn two(session: &str) -> AssignmentRequest<'_> {
+            AssignmentRequest {
+                paths: 2,
+                ..request(session)
+            }
+        }
+        let caches = [
+            cache("edge-1", 100, Some(9)),
+            cache("edge-2", 100, Some(9)),
+            cache("edge-3", 400, Some(9)),
+            CacheCandidate {
+                failover_rank: Some(50),
+                ..cache("edge-4", 0, None)
+            },
+        ];
+        let mut second = HashMap::<String, usize>::new();
+        for index in 0..3_000 {
+            let session = format!("listener-{index}");
+            let assignment = assign(two(&session), AssignmentPolicy::default(), &caches).unwrap();
+            assert_eq!(assignment.legs, 2);
+            assert!(!assignment.spare);
+            assert_eq!(assignment.caches[1].reason, AssignmentReason::SecondPath);
+            assert_ne!(assignment.caches[0].node_id, assignment.caches[1].node_id);
+            assert!(assignment.caches[1].holds_playlist, "{assignment:?}");
+            // The same answer each time it asks.
+            assert_eq!(
+                assignment,
+                assign(two(&session), AssignmentPolicy::default(), &caches).unwrap()
+            );
+            *second
+                .entry(assignment.caches[1].node_id.clone())
+                .or_default() += 1;
+        }
+        // Free capacity 900 / 900 / 600: edge-3 is the second leg of
+        // 0.75 x 0.4 = 30 % of listeners, each of the others of 35 %.
+        let share = second["edge-3"] as f64 / 3_000.0;
+        assert!(share > 0.26 && share < 0.34, "{second:?}");
+        assert!(!second.contains_key("edge-4"), "{second:?}");
+        // One holder: the second leg is the edge first for the standby
+        // copy, for every listener.
+        let ranked = [
+            cache("edge-1", 100, Some(9)),
+            CacheCandidate {
+                failover_rank: Some(10),
+                ..cache("edge-2", 0, None)
+            },
+            CacheCandidate {
+                failover_rank: Some(30),
+                ..cache("edge-3", 300, None)
+            },
+            CacheCandidate {
+                failover_rank: Some(20),
+                ..cache("edge-4", 0, None)
+            },
+        ];
+        for index in 0..50 {
+            let session = format!("listener-{index}");
+            let assignment = assign(two(&session), AssignmentPolicy::default(), &ranked).unwrap();
+            assert_eq!(legs(&assignment), ["edge-1", "edge-3"], "{session}");
+        }
+        // The standby edge over the target: the next in line.
+        let mut busy = ranked.clone();
+        busy[2].load_permille = 810;
+        let assignment = assign(two("listener-1"), AssignmentPolicy::default(), &busy).unwrap();
+        assert_eq!(legs(&assignment), ["edge-1", "edge-4"]);
+    }
+
+    /// B 3.6: a redundant leg only where its cache stays under the
+    /// rebalance target with the listener counted, and never a spill.
+    #[test]
+    fn a_redundant_leg_is_not_given_over_the_target() {
+        let caches = [cache("edge-1", 300, Some(9)), cache("edge-2", 790, Some(9))];
+        let two = AssignmentRequest {
+            paths: 2,
+            listener_permille: Some(16.0),
+            ..request("listener")
+        };
+        let assignment = assign(two, AssignmentPolicy::default(), &caches).unwrap();
+        assert_eq!(legs(&assignment), ["edge-1"]);
+        // edge-2 is still the failover order.
+        assert_eq!(assignment.caches[1].node_id, "edge-2");
+        assert_eq!(assignment.caches[1].reason, AssignmentReason::Alternate);
+        // At 790 with no cost known it fits under 800.
+        let unknown = AssignmentRequest {
+            listener_permille: None,
+            ..two
+        };
+        let assignment = assign(unknown, AssignmentPolicy::default(), &caches).unwrap();
+        assert_eq!(legs(&assignment), ["edge-1", "edge-2"]);
+        // What this entry point sent it since its advert counts.
+        let mut pending = caches.clone();
+        pending[1].load_permille = 700;
+        pending[1].pending_permille = 100;
+        let assignment = assign(unknown, AssignmentPolicy::default(), &pending).unwrap();
+        assert_eq!(legs(&assignment), ["edge-1"]);
+        // An edge that admits nobody gives no leg however light.
+        let mut overloaded = caches.clone();
+        overloaded[1].load_permille = 100;
+        overloaded[1].overloaded = true;
+        let assignment = assign(unknown, AssignmentPolicy::default(), &overloaded).unwrap();
+        assert_eq!(legs(&assignment), ["edge-1"]);
+        // A listener that holds edge-1 and asks for a second leg: none,
+        // and nothing spills.
+        let held = [caches[1].clone()];
+        let redundant = AssignmentRequest {
+            paths: 1,
+            redundant: true,
+            ..two
+        };
+        let assignment = assign(redundant, AssignmentPolicy::default(), &held).unwrap();
+        assert_eq!(assignment.legs, 0);
+        assert!(assignment
+            .caches
+            .iter()
+            .all(|cache| cache.reason == AssignmentReason::Alternate));
+        let full = [cache("edge-2", FULL_LOAD_PERMILLE, Some(9))];
+        assert_eq!(
+            assign(redundant, AssignmentPolicy::default(), &full),
+            Err(AssignmentError::NoCacheAvailable)
+        );
+        // Under the target, the held listener's leg is a second path.
+        let assignment = assign(
+            AssignmentRequest {
+                listener_permille: None,
+                ..redundant
+            },
+            AssignmentPolicy::default(),
+            &held,
+        )
+        .unwrap();
+        assert_eq!(legs(&assignment), ["edge-2"]);
+        assert_eq!(assignment.caches[0].reason, AssignmentReason::SecondPath);
+    }
+
+    /// B 3.6: the spare is a holder of the playlist that is not a leg, by
+    /// the session, with no load gate; else a cache that admits.
+    #[test]
+    fn the_spare_is_a_holder_that_is_not_a_leg() {
+        let caches = [
+            cache("edge-1", 100, Some(9)),
+            cache("edge-2", 100, Some(9)),
+            cache("edge-3", 100, Some(9)),
+            cache("edge-4", 0, None),
+        ];
+        fn ask(session: &str) -> AssignmentRequest<'_> {
+            AssignmentRequest {
+                paths: 2,
+                spare: true,
+                ..request(session)
+            }
+        }
+        let mut spares = HashMap::<String, usize>::new();
+        for index in 0..600 {
+            let session = format!("listener-{index}");
+            let assignment = assign(ask(&session), AssignmentPolicy::default(), &caches).unwrap();
+            assert_eq!(assignment.legs, 2);
+            assert!(assignment.spare);
+            let spare = &assignment.caches[2];
+            assert_eq!(spare.reason, AssignmentReason::Spare);
+            assert!(spare.holds_playlist, "{assignment:?}");
+            assert!(!legs(&assignment).contains(&spare.node_id.as_str()));
+            *spares.entry(spare.node_id.clone()).or_default() += 1;
+        }
+        // Spread over the holders by the session.
+        assert_eq!(spares.len(), 3, "{spares:?}");
+        assert!(spares.values().all(|count| *count > 120), "{spares:?}");
+        // A holder that admits nobody is still a spare.
+        let mut overloaded = caches.clone();
+        overloaded[2].overloaded = true;
+        overloaded[2].load_permille = 1_200;
+        let assignment = assign(ask("listener-1"), AssignmentPolicy::default(), &overloaded).unwrap();
+        let mut held = legs(&assignment);
+        held.sort_unstable();
+        assert_eq!(held, ["edge-1", "edge-2"]);
+        assert_eq!(assignment.caches[2].node_id, "edge-3");
+        assert_eq!(assignment.caches[2].reason, AssignmentReason::Spare);
+        // Two holders, both legs: the spare is a cache that admits.
+        let two_holders = [caches[0].clone(), caches[1].clone(), caches[3].clone()];
+        let assignment = assign(ask("listener-1"), AssignmentPolicy::default(), &two_holders).unwrap();
+        assert_eq!(assignment.caches[2].node_id, "edge-4");
+        assert_eq!(assignment.caches[2].reason, AssignmentReason::Spare);
+        // A spare alone, beside the legs a listener holds.
+        let spare_only = AssignmentRequest {
+            paths: 0,
+            redundant: true,
+            ..ask("listener-1")
+        };
+        let assignment = assign(spare_only, AssignmentPolicy::default(), &caches).unwrap();
+        assert_eq!(assignment.legs, 0);
+        assert!(assignment.spare);
+        assert_eq!(assignment.caches[0].reason, AssignmentReason::Spare);
+        assert!(assignment.caches[0].holds_playlist);
+    }
+
+    /// B 3.6: a region with one serving edge gives one leg and no spare.
+    #[test]
+    fn one_serving_edge_gives_one_path_and_no_spare() {
+        let caches = [
+            cache("edge-1", 100, Some(9)),
+            CacheCandidate {
+                draining: true,
+                ..cache("edge-2", 100, Some(9))
+            },
+        ];
+        let assignment = assign(
+            AssignmentRequest {
+                paths: 2,
+                spare: true,
+                ..request("listener")
+            },
+            AssignmentPolicy::default(),
+            &caches,
+        )
+        .unwrap();
+        assert_eq!(assignment.legs, 1);
+        assert!(!assignment.spare);
+        assert_eq!(assignment.caches.len(), 1);
+        assert_eq!(first(&assignment), ("edge-1", AssignmentReason::HoldsPlaylist));
+        // A playlist over the two-path bit rate gets one leg and its spare.
+        let caches = [cache("edge-1", 100, Some(9)), cache("edge-2", 100, Some(9))];
+        let video = AssignmentRequest {
+            paths: 2,
+            spare: true,
+            playlist_bps: Some(DEFAULT_TWO_PATH_MAX_BPS + 1),
+            ..request("viewer")
+        };
+        let assignment = assign(video, AssignmentPolicy::default(), &caches).unwrap();
+        assert_eq!(assignment.legs, 1);
+        assert!(assignment.spare);
+        assert_eq!(assignment.caches[1].reason, AssignmentReason::Spare);
+        // An LL-HLS reader (the defaults) is answered as before.
+        let assignment = assign(request("reader"), AssignmentPolicy::default(), &caches).unwrap();
+        assert_eq!((assignment.legs, assignment.spare), (1, false));
+        assert!(assignment.caches[1..]
+            .iter()
+            .all(|cache| cache.reason == AssignmentReason::Alternate));
+    }
+
+    /// B 3.6: a rebalanced listener goes only to a receiver that stays
+    /// under the rebalance's level with it counted, or nowhere: no other
+    /// tier, no cache of the region named.
+    #[test]
+    fn a_rebalanced_listener_gets_a_receiver_under_the_level_or_none() {
+        let caches = [
+            cache("edge-2", 290, Some(9)),
+            cache("edge-3", 720, Some(9)),
+            cache("edge-4", 520, Some(9)),
+        ];
+        fn rebalanced(session: &str) -> AssignmentRequest<'_> {
+            AssignmentRequest {
+                moving: true,
+                rebalancing: true,
+                listener_permille: Some(16.0),
+                spare: true,
+                ..request(session)
+            }
+        }
+        for index in 0..40 {
+            let session = format!("rebalanced-{index}");
+            let assignment = assign(rebalanced(&session), AssignmentPolicy::default(), &caches).unwrap();
+            assert_eq!(assignment.legs, 1);
+            assert_ne!(assignment.caches[0].node_id, "edge-3", "{session}");
+            // A listener that holds another leg: the same rule.
+            let held = AssignmentRequest {
+                redundant: true,
+                ..rebalanced(&session)
+            };
+            let assignment = assign(held, AssignmentPolicy::default(), &caches).unwrap();
+            assert_eq!(assignment.legs, 1);
+            assert_ne!(assignment.caches[0].node_id, "edge-3", "{session}");
+        }
+        // No receiver under 725 with the listener: nothing at all, with a
+        // held leg or without, and no spare.
+        let full = [cache("edge-3", 720, Some(9)), cache("edge-5", 750, Some(9))];
+        assert_eq!(
+            assign(rebalanced("rebalanced-1"), AssignmentPolicy::default(), &full),
+            Err(AssignmentError::NoCacheAvailable)
+        );
+        assert_eq!(
+            assign(
+                AssignmentRequest {
+                    redundant: true,
+                    ..rebalanced("rebalanced-1")
+                },
+                AssignmentPolicy::default(),
+                &full
+            ),
+            Err(AssignmentError::NoCacheAvailable)
+        );
+        // A drain's mover is still placed there: over the level, under full.
+        let drained = AssignmentRequest {
+            rebalancing: false,
+            ..rebalanced("mover-1")
+        };
+        assert_eq!(
+            assign(drained, AssignmentPolicy::default(), &full)
+                .unwrap()
+                .legs,
+            1
+        );
+        // A request for a spare alone is answered as any (review of B Z3).
+        let spare_only = AssignmentRequest {
+            paths: 0,
+            redundant: true,
+            ..rebalanced("rebalanced-1")
+        };
+        let assignment = assign(spare_only, AssignmentPolicy::default(), &full).unwrap();
+        assert_eq!((assignment.legs, assignment.spare), (0, true));
+    }
+
+    /// Review of B Z3: a cache the reader uses or was given lately keeps it
+    /// only where the rule of its place would take it now. In a rebalance,
+    /// a sticky over the receiver level is no leg; a redundant leg passes
+    /// the gate, sticky or not; the leg a reader depends on stays while its
+    /// cache is healthy, as before.
+    #[test]
+    fn a_sticky_cache_is_kept_only_where_its_place_would_take_it() {
+        let caches = [cache("edge-2", 720, Some(9)), cache("edge-3", 300, Some(9))];
+        let remembered = vec!["edge-2".to_owned()];
+        let rebalanced = AssignmentRequest {
+            moving: true,
+            rebalancing: true,
+            listener_permille: Some(16.0),
+            ..request("give-up")
+        };
+        // 720 + 16 is over the receiver level, 725.
+        for request in [
+            AssignmentRequest {
+                current: Some("edge-2"),
+                ..rebalanced
+            },
+            AssignmentRequest {
+                remembered: &remembered,
+                ..rebalanced
+            },
+        ] {
+            let assignment = assign(request, AssignmentPolicy::default(), &caches).unwrap();
+            assert_eq!(first(&assignment), ("edge-3", AssignmentReason::HoldsPlaylist));
+            // With no receiver at all, no leg rather than the sticky.
+            let assignment = assign(request, AssignmentPolicy::default(), &caches[..1]);
+            assert_eq!(assignment, Err(AssignmentError::NoCacheAvailable));
+        }
+        // A redundant leg: the remembered cache under the gate is kept, the
+        // one over it is not.
+        let held = AssignmentRequest {
+            redundant: true,
+            listener_permille: Some(16.0),
+            remembered: &remembered,
+            ..request("held")
+        };
+        let assignment = assign(held, AssignmentPolicy::default(), &caches).unwrap();
+        assert_eq!(first(&assignment), ("edge-2", AssignmentReason::Sticky));
+        let over = [cache("edge-2", 790, Some(9)), cache("edge-3", 300, Some(9))];
+        let assignment = assign(held, AssignmentPolicy::default(), &over).unwrap();
+        assert_eq!(first(&assignment), ("edge-3", AssignmentReason::SecondPath));
+        // Two remembered legs are the two legs of a repeat.
+        let both = vec!["edge-3".to_owned(), "edge-2".to_owned()];
+        let repeat = AssignmentRequest {
+            paths: 2,
+            remembered: &both,
+            ..request("repeat")
+        };
+        let assignment = assign(repeat, AssignmentPolicy::default(), &caches).unwrap();
+        assert_eq!(assignment.legs, 2);
+        assert_eq!(
+            [&assignment.caches[0], &assignment.caches[1]]
+                .map(|leg| (leg.node_id.as_str(), leg.reason)),
+            [
+                ("edge-3", AssignmentReason::Sticky),
+                ("edge-2", AssignmentReason::Sticky)
+            ]
+        );
+    }
+
+    /// B 3.6: a mover that asks for two legs gets two edges, and the legs
+    /// of many movers follow the survivors' headroom as single movers do.
+    #[test]
+    fn two_replacements_are_apportioned_to_two_edges() {
+        let caches = [
+            cache("edge-2", 300, Some(9)),
+            cache("edge-3", 300, Some(9)),
+            cache("edge-4", 500, Some(9)),
+            cache("edge-5", 600, None),
+        ];
+        let mut placed: Vec<(String, u32)> = Vec::new();
+        for index in 0..20 {
+            let session = format!("mover-{index}");
+            let request = AssignmentRequest {
+                moving: true,
+                paths: 2,
+                recent_moves: &placed,
+                ..request(&session)
+            };
+            let assignment = assign(request, AssignmentPolicy::default(), &caches).unwrap();
+            let names = legs(&assignment)
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            assert_eq!(names.len(), 2, "{assignment:?}");
+            assert_ne!(names[0], names[1]);
+            for name in names {
+                match placed.iter_mut().find(|(node_id, _)| *node_id == name) {
+                    Some(entry) => entry.1 += 1,
+                    None => placed.push((name, 1)),
+                }
+            }
+        }
+        // Headroom to 800: 500 / 500 / 300 / 200 of 1,500 and 40 legs.
+        let placed = placed.into_iter().collect::<HashMap<String, u32>>();
+        for (name, due) in [
+            ("edge-2", 13.33),
+            ("edge-3", 13.33),
+            ("edge-4", 8.0),
+            ("edge-5", 5.33),
+        ] {
+            let got = f64::from(placed.get(name).copied().unwrap_or(0));
+            assert!((got - due).abs() <= 1.5, "{name}: {placed:?}");
+        }
+    }
+
     #[test]
     fn the_fill_level_spreads_an_amount_evenly_over_the_lowest() {
         assert!((fill_level(&[394.0, 553.0, 747.0], 658.0) - 784.0).abs() < 1e-9);
@@ -1048,12 +1712,16 @@ mod tests {
             session: Some(session),
             pin: None,
             current: None,
+            remembered: &[],
             playlist_bps: None,
             moving: false,
             recent_moves: &[],
             rebalancing: false,
             listener_permille: None,
             entry_points: 0,
+            paths: 1,
+            spare: false,
+            redundant: false,
         }
     }
 

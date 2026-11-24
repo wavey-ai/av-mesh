@@ -27,8 +27,8 @@ use crate::{AppRouter, ParentsLost};
 use av_mesh::client_compact as compact;
 use av_mesh::client_udp::{
     block_id, cut_through_block_id, cut_through_symbol_size, encode_block, encode_object, geometry,
-    source_datagram, CompactPlan, Control, ObjectKind, PartObject, RepairPolicy, KEEPALIVE,
-    MIN_ASSIGN_REQUEST_BYTES, MIN_FIRST_REQUEST_BYTES, SUBSCRIPTION_TTL,
+    source_datagram, AssignedCache, CompactPlan, Control, ObjectKind, PartObject, RepairPolicy,
+    KEEPALIVE, MIN_ASSIGN_REQUEST_BYTES, MIN_FIRST_REQUEST_BYTES, SUBSCRIPTION_TTL,
 };
 use bytes::Bytes;
 use playlists::mesh::{chunk_frame_slot, CacheMeshReceiveObserver};
@@ -197,6 +197,10 @@ pub(crate) struct EdgeUdpConfig {
     /// Answer a client's `ASSIGN` (`--client-udp-assign`, wave 9 B) with the
     /// assignment that `/api/assignment` gives over HTTPS.
     pub assign: bool,
+    /// Assignment confirmations taken from one address a second at most
+    /// (`--client-udp-assign-confirms-per-source`, B 2.3): a load host
+    /// confirms for every listener it runs from one address.
+    pub assign_confirms_per_source: u32,
 }
 
 impl EdgeUdpConfig {
@@ -227,6 +231,7 @@ impl EdgeUdpConfig {
             keepalive: Duration::from_millis(DEFAULT_KEEPALIVE_MS),
             prompt_sender: true,
             assign: true,
+            assign_confirms_per_source: DEFAULT_ASSIGN_CONFIRMS_PER_SOURCE,
         }
     }
 }
@@ -320,6 +325,10 @@ pub(crate) struct EdgeUdpStats {
     /// rate, or the session already charged there).
     pub assignment_confirms: AtomicU64,
     pub assignment_confirms_refused: AtomicU64,
+    /// B 2.3: confirmations turned away by the per-source limit
+    /// (`--client-udp-assign-confirms-per-source`) or by the assignments in
+    /// flight, not counted as refused.
+    pub assignment_confirms_limited: AtomicU64,
     /// Parts forwarded cut-through, and their datagrams.
     pub cut_through_parts: AtomicU64,
     pub cut_through_datagrams: AtomicU64,
@@ -445,6 +454,22 @@ impl EdgeUdpStats {
             }
         }
         Some(legs)
+    }
+
+    /// Subscribers now of each stream that has any (B 3.6: a stream's UDP
+    /// legs count as its sessions where the edge advertises its playlists).
+    pub(crate) fn live_subscribers_by_stream(&self) -> HashMap<u64, u64> {
+        let Some(table) = self.table.get() else {
+            return HashMap::new();
+        };
+        table
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, entry)| !entry.subscribers.is_empty())
+            .map(|(stream_id, entry)| (*stream_id, entry.subscribers.len() as u64))
+            .collect()
     }
 
     /// Bytes that the client lanes sent, every lane (cache-fed,
@@ -1738,11 +1763,26 @@ pub(crate) async fn run_edge_udp(
                 session,
                 skip,
                 current,
+                paths,
+                spare,
+                hold,
                 token,
-                ..
             } => {
                 edge.on_assign(
-                    socket, peer, len, stream_id, nonce, session, skip, current, token,
+                    socket,
+                    peer,
+                    len,
+                    AssignRequest {
+                        stream_id,
+                        nonce,
+                        session,
+                        skip,
+                        current,
+                        paths,
+                        spare,
+                        hold,
+                        token,
+                    },
                 );
             }
             _ => {}
@@ -2008,18 +2048,12 @@ impl EdgeControl {
 
     /// `ASSIGN`: a client's confirmation of the assignment it took (with
     /// this node's token), or a padded request for one.
-    #[allow(clippy::too_many_arguments)]
     fn on_assign(
         &mut self,
         socket: Arc<UdpSocket>,
         peer: SocketAddr,
         len: usize,
-        stream_id: u64,
-        nonce: u64,
-        session: String,
-        skip: Vec<String>,
-        current: Vec<String>,
-        token: Option<u64>,
+        request: AssignRequest,
     ) {
         if !self.config.assign {
             self.stats
@@ -2027,28 +2061,39 @@ impl EdgeControl {
                 .fetch_add(1, Ordering::Relaxed);
             return;
         }
+        let AssignRequest {
+            stream_id,
+            nonce,
+            session,
+            skip,
+            current,
+            paths,
+            spare,
+            hold,
+            token,
+        } = request;
         // Wave 9 review: the client's confirmation of the answer
         // it took, with this node's token for its address (so its
-        // source is proven): the cache is charged and the session
-        // remembered, at most CONFIRMS_PER_SOURCE a second from one
-        // address. Not answered.
+        // source is proven): the legs it names are remembered and
+        // the new ones charged, at most
+        // `assign_confirms_per_source` a second from one address.
+        // Not answered.
         if let Some(token) = token {
-            let Some(cache) = current
-                .into_iter()
-                .next()
-                .filter(|_| self.tokens.valid(peer, token))
-            else {
+            if current.is_empty() || !self.tokens.valid(peer, token) {
                 self.stats.bad_tokens.fetch_add(1, Ordering::Relaxed);
                 self.stats
                     .assignment_confirms_refused
                     .fetch_add(1, Ordering::Relaxed);
                 return;
-            };
-            if !self.confirms.allow(peer.ip(), Instant::now())
-                || self.assigning.load(Ordering::Relaxed) >= MAX_ASSIGNMENTS_IN_FLIGHT
+            }
+            if !self.confirms.allow(
+                peer.ip(),
+                Instant::now(),
+                self.config.assign_confirms_per_source,
+            ) || self.assigning.load(Ordering::Relaxed) >= MAX_ASSIGNMENTS_IN_FLIGHT
             {
                 self.stats
-                    .assignment_confirms_refused
+                    .assignment_confirms_limited
                     .fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -2060,7 +2105,7 @@ impl EdgeControl {
             );
             tokio::spawn(async move {
                 let counter = if router
-                    .confirm_udp_assignment(stream_id, &session, &skip, &cache)
+                    .confirm_udp_assignment(stream_id, &session, &skip, &current, &hold)
                     .await
                 {
                     &stats.assignment_confirms
@@ -2098,40 +2143,20 @@ impl EdgeControl {
             Arc::clone(&self.assigning),
         );
         tokio::spawn(async move {
-            let (port, mut caches) = router
+            let (port, caches, legs, spare) = router
                 .udp_assignment(
                     stream_id,
                     &session,
                     &skip,
                     current.first().map(String::as_str),
+                    &hold,
+                    paths,
+                    spare,
                 )
                 .await;
-            let answer = loop {
-                let answer = Control::Assigned {
-                    stream_id,
-                    nonce,
-                    port,
-                    caches: caches.clone(),
-                    paths: 1,
-                    spare: false,
-                }
-                .encode();
-                if answer.len() <= budget || caches.is_empty() {
-                    break answer;
-                }
-                // The last cache that fits: the failover order is
-                // cut from its end (the assigned cache first).
-                let failover_at = caches.iter().position(|cache| cache.failover);
-                match failover_at {
-                    Some(at) if at > 1 => {
-                        caches.remove(at - 1);
-                    }
-                    _ => {
-                        caches.pop();
-                    }
-                }
-            };
-            if answer.len() <= budget {
+            if let Some(answer) =
+                assigned_within(stream_id, nonce, port, caches, legs, spare, budget)
+            {
                 stats.assignments.fetch_add(1, Ordering::Relaxed);
                 stats.tokens_sent.fetch_add(1, Ordering::Relaxed);
                 // The token first: the client confirms as soon as
@@ -2150,14 +2175,72 @@ impl EdgeControl {
     }
 }
 
+/// The `ASSIGNED` answer in at most `budget` bytes: the alternates are cut
+/// from the end of the region's list, then the failover entries from
+/// theirs; the legs and the spare never (B 2.1). `None` when the legs and
+/// the spare alone do not fit.
+fn assigned_within(
+    stream_id: u64,
+    nonce: u64,
+    port: Option<u16>,
+    mut caches: Vec<AssignedCache>,
+    legs: u8,
+    spare: bool,
+    budget: usize,
+) -> Option<Vec<u8>> {
+    let kept = usize::from(legs) + usize::from(spare);
+    loop {
+        let answer = Control::Assigned {
+            stream_id,
+            nonce,
+            port,
+            caches: caches.clone(),
+            paths: legs,
+            spare,
+        }
+        .encode();
+        if answer.len() <= budget {
+            return Some(answer);
+        }
+        if caches.len() <= kept {
+            return None;
+        }
+        // The last cache of the region after the legs and the spare while
+        // there is one, then the last failover entry.
+        match caches.iter().position(|cache| cache.failover) {
+            Some(at) if at > kept => {
+                caches.remove(at - 1);
+            }
+            _ => {
+                caches.pop();
+            }
+        }
+    }
+}
+
+/// The fields of an `ASSIGN` ([`Control::Assign`]), for
+/// [`EdgeControl::on_assign`].
+struct AssignRequest {
+    stream_id: u64,
+    nonce: u64,
+    session: String,
+    skip: Vec<String>,
+    current: Vec<String>,
+    paths: u8,
+    spare: bool,
+    hold: Vec<String>,
+    token: Option<u64>,
+}
+
 /// Wave 9 B: `ASSIGN` requests answered at once at most; more are dropped
 /// (the client repeats its request).
 const MAX_ASSIGNMENTS_IN_FLIGHT: usize = 256;
 
-/// Wave 9 review: assignment confirmations taken from one address a second
-/// at most (a host behind one address may run a few dozen clients; a
-/// proven source that confirms many sessions charges no more).
-const CONFIRMS_PER_SOURCE: u32 = 64;
+/// Default of `--client-udp-assign-confirms-per-source` (wave 9 review):
+/// assignment confirmations taken from one address a second at most (a host
+/// behind one address may run a few dozen clients; a proven source that
+/// confirms many sessions charges no more).
+pub(crate) const DEFAULT_ASSIGN_CONFIRMS_PER_SOURCE: u32 = 64;
 /// Addresses the confirmation limit remembers at most (beyond, the window
 /// starts again for all).
 const CONFIRM_SOURCES: usize = 4_096;
@@ -2171,7 +2254,7 @@ struct ConfirmLimit {
 }
 
 impl ConfirmLimit {
-    fn allow(&mut self, source: std::net::IpAddr, now: Instant) -> bool {
+    fn allow(&mut self, source: std::net::IpAddr, now: Instant, limit: u32) -> bool {
         if self
             .window
             .is_none_or(|start| now.saturating_duration_since(start) >= Duration::from_secs(1))
@@ -2181,7 +2264,7 @@ impl ConfirmLimit {
             self.counts.clear();
         }
         let count = self.counts.entry(source).or_default();
-        if *count >= CONFIRMS_PER_SOURCE {
+        if *count >= limit {
             return false;
         }
         *count += 1;
@@ -7002,5 +7085,84 @@ mod tests {
                 .is_err(),
             "a dropped datagram is not sent"
         );
+    }
+
+    /// B 2.1: the cut that keeps an `ASSIGNED` no longer than its request
+    /// takes the alternates from the end of the region's list, then the
+    /// failover entries, and never the legs or the spare; an answer whose
+    /// legs and spare do not fit is not sent.
+    #[test]
+    fn the_assigned_cut_never_removes_the_legs_or_the_spare() {
+        let cache = |name: &str, failover: bool| AssignedCache {
+            node_id: name.to_owned(),
+            playback_base_url: format!("https://{name}.example/live/with/a/long/path"),
+            failover,
+        };
+        let caches = vec![
+            cache("leg-one", false),
+            cache("leg-two", false),
+            cache("spare", false),
+            cache("alternate-one", false),
+            cache("alternate-two", false),
+            cache("failover-entry-one", true),
+            cache("failover-entry-two", true),
+        ];
+        let names = |answer: &[u8]| match Control::decode(answer) {
+            Some(Control::Assigned {
+                caches,
+                paths,
+                spare,
+                ..
+            }) => (
+                caches
+                    .into_iter()
+                    .map(|cache| cache.node_id)
+                    .collect::<Vec<_>>(),
+                paths,
+                spare,
+            ),
+            other => panic!("{other:?}"),
+        };
+        let encoded = |indices: &[usize]| {
+            Control::Assigned {
+                stream_id: 801,
+                nonce: 7,
+                port: Some(19_446),
+                caches: indices.iter().map(|index| caches[*index].clone()).collect(),
+                paths: 2,
+                spare: true,
+            }
+            .encode()
+            .len()
+        };
+        let within = |budget: usize| {
+            assigned_within(801, 7, Some(19_446), caches.clone(), 2, true, budget)
+        };
+        // Room for all.
+        let (all, paths, spare) = names(&within(encoded(&[0, 1, 2, 3, 4, 5, 6])).unwrap());
+        assert_eq!((all.len(), paths, spare), (7, 2, true));
+        // One byte short: the last alternate of the region goes first.
+        let (cut, _, _) = names(&within(encoded(&[0, 1, 2, 3, 4, 5, 6]) - 1).unwrap());
+        assert_eq!(
+            cut,
+            [
+                "leg-one",
+                "leg-two",
+                "spare",
+                "alternate-one",
+                "failover-entry-one",
+                "failover-entry-two"
+            ]
+        );
+        // Room for the legs, the spare and one more: the alternates went,
+        // then the last failover entry.
+        let (cut, paths, spare) = names(&within(encoded(&[0, 1, 2, 5])).unwrap());
+        assert_eq!(cut, ["leg-one", "leg-two", "spare", "failover-entry-one"]);
+        assert_eq!((paths, spare), (2, true));
+        // The legs and the spare exactly.
+        let (cut, _, _) = names(&within(encoded(&[0, 1, 2])).unwrap());
+        assert_eq!(cut, ["leg-one", "leg-two", "spare"]);
+        // They do not fit: nothing is sent, rather than a shorter answer.
+        assert!(within(encoded(&[0, 1, 2]) - 1).is_none());
     }
 }

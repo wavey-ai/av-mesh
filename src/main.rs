@@ -2284,6 +2284,18 @@ struct Args {
     )]
     client_udp_assign: bool,
 
+    /// B 2.3: assignment confirmations (`ASSIGN` with this node's token)
+    /// taken from one address a second at most; more are counted in
+    /// `assignment_confirms_limited` and charge nothing. Labs that run
+    /// needletail-load set 4096: a load host confirms for every listener
+    /// it runs from one address.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_ASSIGN_CONFIRMS_PER_SOURCE",
+        default_value_t = edge_udp::DEFAULT_ASSIGN_CONFIRMS_PER_SOURCE
+    )]
+    client_udp_assign_confirms_per_source: u32,
+
     /// Wave 9 (cold start): a forwarder's audio thread sends a lease child
     /// that is new to a stream (an edge taking a new copy) the stream's last
     /// whole one-symbol part, which carries the descriptor of the compact
@@ -2891,6 +2903,17 @@ struct Args {
         action = clap::ArgAction::Set
     )]
     assignment_udp_in_region: bool,
+
+    /// B 3.6: a playlist whose regional bit rate is above this is given one
+    /// leg whatever a UDP listener asks (`p=` of its `ASSIGN`, `paths=` of
+    /// /api/assignment): no second edge is asked to send or take a copy of
+    /// a video feed. 1 ms PCM is 2.6 Mbit/s a leg.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_ASSIGNMENT_TWO_PATH_MAX_BPS",
+        default_value_t = assignment::DEFAULT_TWO_PATH_MAX_BPS
+    )]
+    assignment_two_path_max_bps: u64,
 
     /// Wave 9 C4: a moving UDP client (one that names the edges it has
     /// just left: a drain, a kill, a rebalance) is assigned by each cache's
@@ -4198,6 +4221,7 @@ async fn main() -> Result<()> {
             move_headroom: args.assignment_move_headroom,
             rebalance_target_permille: args.rebalance_target_permille,
             rebalance_margin_permille: args.client_udp_rebalance_margin_permille,
+            two_path_max_bps: args.assignment_two_path_max_bps,
         },
         args.steering_ttl_seconds.max(1),
         args.telemetry_interval_ms,
@@ -4344,6 +4368,7 @@ async fn main() -> Result<()> {
                 keepalive: Duration::from_millis(args.client_udp_keepalive_ms),
                 prompt_sender: args.client_udp_prompt_sender,
                 assign: args.client_udp_assign,
+                assign_confirms_per_source: args.client_udp_assign_confirms_per_source,
             },
             Arc::clone(&router.edge_udp_stats),
             edge_cut_through.clone(),
@@ -19192,10 +19217,11 @@ struct AppRouter {
     steering_ttl_seconds: u64,
     /// An advertisement older than this does not make a cache assignable.
     assignment_fresh_ms: u64,
-    /// The cache that this entry point last assigned to each session, with
-    /// the time. It keeps a session on its cache when the session asks again
-    /// without naming the cache that it uses.
-    remembered_assignments: Arc<DashMap<String, (String, u64)>>,
+    /// The caches that this entry point last assigned to each session (its
+    /// legs, two at most), with the time. It keeps a session on its cache
+    /// when the session asks again without naming the cache that it uses,
+    /// and charges a cache once for a session.
+    remembered_assignments: Arc<DashMap<String, (Vec<String>, u64)>>,
     /// Capacity that this entry point has given away at each cache since
     /// the advertisement of the cache that it last read: the time of that
     /// advertisement, and the bits per second.
@@ -19230,6 +19256,13 @@ fn without_skipped(
     candidates.into_iter().filter(|cache| !skipped(cache)).collect()
 }
 
+/// The key under which a mover is logged ([`AppRouter::log_mover`]): the
+/// session (`<stream>/<sid>`), the caches it left and the leg's place among
+/// the new legs of its answer.
+fn mover_key(session: &str, skip: &[String], place: usize) -> String {
+    format!("{session}|{}|{place}", skip.join(","))
+}
+
 /// Wave 9 C1: an edge's rebalance of its UDP listeners.
 #[derive(Debug, Clone, Copy)]
 struct RebalanceConfig {
@@ -19258,6 +19291,30 @@ struct ReaderRequest<'a> {
     /// spread by the region's ranking instead of all taking the shared
     /// first alternate.
     skip: &'a [String],
+    /// The legs a UDP listener holds and keeps (`h=`, B 3.6): never in the
+    /// answer, never counted as caches it left.
+    hold: &'a [String],
+    /// Legs wanted (`p=`); 1 for an LL-HLS reader.
+    paths: u8,
+    /// A spare is wanted (`s=1`).
+    spare: bool,
+}
+
+impl Default for ReaderRequest<'_> {
+    /// An LL-HLS reader of the node's default stream: one cache, no spare.
+    fn default() -> Self {
+        Self {
+            udp: false,
+            stream_id: 0,
+            session: None,
+            pin: None,
+            current: None,
+            skip: &[],
+            hold: &[],
+            paths: 1,
+            spare: false,
+        }
+    }
 }
 
 impl AppRouter {
@@ -19420,10 +19477,13 @@ impl AppRouter {
         counts
     }
 
-    /// Wave 9 C4: log a mover placed at `node_id`. A session is logged
-    /// once in the window (wave 9 review): a repeated request, a hedge or
-    /// the confirmation of an answer already logged is not logged again,
-    /// and one placed elsewhere since moves its entry there.
+    /// Wave 9 C4: log a mover placed at `node_id`. A key ([`mover_key`]:
+    /// the session, its skip list and the leg's place among the new legs
+    /// of the answer) is logged once in the window (wave 9 review): a
+    /// repeated request, a hedge or the confirmation of an answer already
+    /// logged is not logged again, and one placed elsewhere since moves its
+    /// entry there; two legs of one session replaced within the window are
+    /// two movers (B 3.6).
     fn log_mover(&self, node_id: &str, key: Option<&str>) {
         let now = Instant::now();
         let mut movers = self
@@ -19794,6 +19854,9 @@ impl AppRouter {
             }
         }
         let sessions = self.edge_load.egress.sessions_by_playlist();
+        // B 3.6: a stream's UDP legs are its sessions too, so that a
+        // UDP-only stream gets its standby copy as one with readers does.
+        let udp_legs = self.edge_udp_stats.live_subscribers_by_stream();
         let mut edge_service = self.edge_load.snapshot(
             &node,
             self.playback_base_url.clone(),
@@ -19826,7 +19889,8 @@ impl AppRouter {
                         .egress
                         .measured_playlist_bps(stream.stream_id)
                         .or(stream.bitrate_bps),
-                    sessions: sessions.get(&stream.stream_id).copied().unwrap_or(0),
+                    sessions: sessions.get(&stream.stream_id).copied().unwrap_or(0)
+                        + udp_legs.get(&stream.stream_id).copied().unwrap_or(0),
                     request_rate: self
                         .edge_load
                         .egress
@@ -20200,6 +20264,7 @@ impl AppRouter {
             session: session_id,
             pin: None,
             current: None,
+            ..ReaderRequest::default()
         };
         if admission == PlaybackAdmission::Rejected {
             let alternatives = self.alternate_cache_urls(reader, path, query).await;
@@ -20540,54 +20605,90 @@ impl AppRouter {
     }
 
     /// Assign a reader. With `remember`, the entry point keeps the assigned
-    /// cache of the session, so that the session gets the same cache when it
-    /// asks again, even after another cache has become a better first choice.
+    /// caches of the session, so that the session gets the same cache when
+    /// it asks again, even after another cache has become a better first
+    /// choice, and charges each cache it grants that it had not given the
+    /// session already.
     async fn assign_reader(
         &self,
         reader: ReaderRequest<'_>,
         remember: bool,
     ) -> (Result<Assignment, AssignmentError>, Vec<CacheCandidate>) {
-        let mut candidates = self.cache_candidates(reader.stream_id).await;
-        let candidates_all = if reader.skip.is_empty() {
-            Vec::new()
-        } else {
-            candidates.clone()
+        let candidates_all = self.cache_candidates(reader.stream_id).await;
+        let skipped = |node_id: &str| reader.skip.iter().any(|name| name == node_id);
+        let held = |node_id: &str| reader.hold.iter().any(|name| name == node_id);
+        // B 2.5: a cache the client names as current and has left is not
+        // its current one, and a UDP client that names caches it has left
+        // is a mover whatever else it names.
+        let current = reader.current.filter(|current| !skipped(current));
+        let moving = reader.udp && !reader.skip.is_empty();
+        let snapshots = self.regional_snapshots().await;
+        // A cache heard of lately (one advertisement interval, not the
+        // assignment's three): an edge that has just died still looks
+        // fresh, with its last load, for a few seconds.
+        let heard_lately = |node_id: &str| {
+            let now = now_unix_ms();
+            node_id == self.node.node_id
+                || snapshots.iter().any(|snapshot| {
+                    snapshot.node.node_id == node_id
+                        && self.telemetry.advertisement_age_ms(snapshot, now)
+                            <= self.recent_advert_ms()
+                })
         };
-        if !reader.skip.is_empty() {
-            candidates = without_skipped(candidates, reader.skip, &self.node.region);
-        }
+        // Wave 9 C1: it left a live edge over its target (a rebalance), not
+        // a draining or lost one. Live is heard of lately (review of B Z3):
+        // a killed edge over the target is no rebalance once its last
+        // advertisement is older than one interval.
+        let rebalancing = moving
+            && candidates_all.iter().any(|cache| {
+                skipped(&cache.node_id)
+                    && cache.fresh
+                    && !cache.draining
+                    && cache.load_permille >= self.assignment_policy.rebalance_target_permille
+                    && heard_lately(&cache.node_id)
+            });
+        // The caches it has left are not assigned: for a rebalance
+        // strictly, otherwise unless that leaves none of the region's live
+        // caches (its held legs count as live). The legs it holds never.
+        let mut candidates = if rebalancing {
+            candidates_all
+                .into_iter()
+                .filter(|cache| !skipped(&cache.node_id))
+                .collect()
+        } else if reader.skip.is_empty() {
+            candidates_all
+        } else {
+            without_skipped(candidates_all, reader.skip, &self.node.region)
+        };
+        candidates.retain(|cache| !held(&cache.node_id));
         let playlist_bps = self.regional_playlist_bps(reader.stream_id).await;
         let now_ms = now_unix_ms();
         let key = reader
             .session
             .map(|session| format!("{}/{session}", reader.stream_id));
+        // The caches this entry point gave the session lately.
         let remembered = key
             .as_ref()
-            .filter(|_| reader.current.is_none() && reader.pin.is_none())
+            .filter(|_| reader.pin.is_none())
             .and_then(|key| self.remembered_assignments.get(key))
             .filter(|entry| now_ms.saturating_sub(entry.1) < REMEMBERED_ASSIGNMENT_MS)
-            .map(|entry| entry.0.clone());
-        let moving = reader.udp && !reader.skip.is_empty() && reader.current.is_none();
-        // Wave 9 review: a move this entry point has answered already (the
-        // session's remembered cache is not one it has left: a repeat, a
-        // hedge over HTTPS, a confirmation) gets the same cache and is not
-        // charged or logged again.
-        let repeated_move = moving
-            && remembered
-                .as_ref()
-                .is_some_and(|node| !reader.skip.iter().any(|name| name == node));
-        let snapshots = self.regional_snapshots().await;
+            .map(|entry| entry.0.clone())
+            .unwrap_or_default();
+        // A request this entry point has answered already (a repeat, a
+        // hedge over HTTPS) keeps the caches it was given that are neither
+        // ones it has left nor ones it holds; a reader that names its
+        // cache keeps that one.
+        let stickies = if current.is_some() {
+            Vec::new()
+        } else {
+            remembered
+                .iter()
+                .filter(|node_id| !skipped(node_id) && !held(node_id))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         let listener_permille = region_listener_permille(&snapshots, &self.node.region);
         let entry_points = self.region_entry_points(&snapshots);
-        // Wave 9 C1: it left a live edge over its target (a rebalance), not
-        // a draining or lost one.
-        let rebalancing = moving
-            && candidates_all.iter().any(|cache| {
-                reader.skip.iter().any(|name| *name == cache.node_id)
-                    && cache.fresh
-                    && !cache.draining
-                    && cache.load_permille >= self.assignment_policy.rebalance_target_permille
-            });
         // Wave 9 C4: the movers this entry point placed lately, per cache.
         let recent_moves = if moving {
             self.recent_movers(Instant::now())
@@ -20598,30 +20699,26 @@ impl AppRouter {
             region: &self.node.region,
             session: reader.session,
             pin: reader.pin,
-            current: reader.current.or(remembered.as_deref()),
+            current,
+            remembered: &stickies,
             playlist_bps,
             moving,
             recent_moves: &recent_moves,
             rebalancing,
             listener_permille,
             entry_points,
+            paths: reader.paths,
+            spare: reader.spare,
+            redundant: !reader.hold.is_empty(),
         };
-        // A rebalanced listener goes only to a cache heard of lately (one
-        // advertisement interval, not the assignment's three): an edge that
-        // has just died still looks fresh, and empty, for a few seconds.
+        // A rebalanced listener goes only to a cache heard of lately: an
+        // edge that has just died still looks fresh, and empty, for a few
+        // seconds.
         let recent_only;
         let candidates = if rebalancing {
-            let heard = self.recent_advert_ms();
-            let now = now_unix_ms();
             recent_only = candidates
                 .iter()
-                .filter(|cache| {
-                    cache.node_id == self.node.node_id
-                        || snapshots.iter().any(|snapshot| {
-                            snapshot.node.node_id == cache.node_id
-                                && self.telemetry.advertisement_age_ms(snapshot, now) <= heard
-                        })
-                })
+                .filter(|cache| heard_lately(&cache.node_id))
                 .cloned()
                 .collect::<Vec<_>>();
             if recent_only.is_empty() {
@@ -20632,14 +20729,37 @@ impl AppRouter {
         } else {
             candidates
         };
-        let assignment = match assign(request, self.assignment_policy, &candidates) {
-            Err(AssignmentError::NoCacheAvailable)
-                if reader.udp && reader.pin.is_none() && self.assignment_udp_in_region =>
-            {
-                assign_udp_in_region(request, self.assignment_policy, &candidates)
-            }
-            other => other,
-        };
+        let holds_nothing = reader.hold.is_empty();
+        let mut assignment = assign(request, self.assignment_policy, &candidates);
+        if rebalancing && holds_nothing && assignment.is_err() {
+            // Departure from B 3.6 (review of B Z3): a rebalance with no
+            // receiver names no cache only for a listener that holds a
+            // leg. The entry cannot tell a rebalance from a kill of an edge
+            // over its target inside that edge's last advertisement, and a
+            // shedding edge sends `MOVE rebalance` only while it sees a
+            // receiver: a listener that holds nothing and finds none is
+            // placed as a mover of a lost edge, by headroom to the target,
+            // and its director keeps the new leg only if it is level.
+            assignment = assign(
+                AssignmentRequest {
+                    rebalancing: false,
+                    remembered: &[],
+                    ..request
+                },
+                self.assignment_policy,
+                &candidates,
+            );
+        }
+        // Only a listener with nothing spills (B 3.6): a redundant leg that
+        // finds no cache is not granted.
+        if holds_nothing
+            && reader.udp
+            && reader.pin.is_none()
+            && self.assignment_udp_in_region
+            && matches!(assignment, Err(AssignmentError::NoCacheAvailable))
+        {
+            assignment = assign_udp_in_region(request, self.assignment_policy, &candidates);
+        }
         // A reader that is placed now takes capacity that the cache has not
         // advertised as taken. Count it until the cache advertises again, so
         // that a crowd is not all sent to the cache that was free a moment
@@ -20647,37 +20767,54 @@ impl AppRouter {
         // a UDP confirmation) is charged (wave 9 review: a forged UDP
         // ASSIGN filled every cache's pending load); an unproven mover is
         // logged for the apportionment alone, which places a forged one as
-        // it places any, so it skews nothing.
+        // it places any, so it skews nothing. A leg this entry point gave
+        // the session already is neither charged nor logged again.
         if let Ok(assignment) = &assignment {
-            if let Some(first) = assignment.caches.first() {
-                if moving && !repeated_move && !remember {
-                    self.log_mover(&first.node_id, key.as_deref());
-                }
-                if remember
-                    && reader.current.is_none()
-                    && (remembered.is_none() || (moving && !repeated_move))
-                {
+            let new_legs = assignment
+                .caches
+                .iter()
+                .take(usize::from(assignment.legs))
+                .filter(|leg| !remembered.contains(&leg.node_id));
+            for (place, leg) in new_legs.enumerate() {
+                let mover = key
+                    .as_deref()
+                    .map(|key| mover_key(key, reader.skip, place));
+                if remember && current.is_none() {
                     self.charge_reader(
-                        &first.node_id,
+                        &leg.node_id,
                         &candidates,
                         &snapshots,
                         playlist_bps,
                         moving,
-                        key.as_deref(),
+                        mover.as_deref(),
                     );
+                } else if moving && !remember {
+                    self.log_mover(&leg.node_id, mover.as_deref());
                 }
             }
         }
         if let (true, Some(key), Ok(assignment)) = (remember, key, &assignment) {
-            if !assignment.pinned {
+            // The legs granted and those it keeps: what it holds now.
+            let mut legs = assignment
+                .caches
+                .iter()
+                .take(usize::from(assignment.legs))
+                .map(|leg| leg.node_id.clone())
+                .collect::<Vec<_>>();
+            for node_id in reader.hold {
+                if !legs.contains(node_id) {
+                    legs.push(node_id.clone());
+                }
+            }
+            legs.truncate(usize::from(av_mesh::client_udp::MAX_PATHS));
+            if !assignment.pinned && !legs.is_empty() {
                 if self.remembered_assignments.len() >= MAX_REMEMBERED_ASSIGNMENTS {
                     self.remembered_assignments.retain(|_, entry| {
                         now_ms.saturating_sub(entry.1) < REMEMBERED_ASSIGNMENT_MS
                     });
                 }
                 if self.remembered_assignments.len() < MAX_REMEMBERED_ASSIGNMENTS {
-                    self.remembered_assignments
-                        .insert(key, (assignment.caches[0].node_id.clone(), now_ms));
+                    self.remembered_assignments.insert(key, (legs, now_ms));
                 }
             }
         }
@@ -20748,20 +20885,32 @@ impl AppRouter {
 
     /// Wave 9 review: a UDP client's confirmation of the assignment it
     /// took (an `ASSIGN` with this node's token for its address, so its
-    /// source is proven): cache `cache` is charged for the session and
-    /// remembered, once (a session already remembered there is not charged
-    /// again). Returns whether it charged.
+    /// source is proven). `current` is every leg the listener holds after
+    /// the change (B 2.1): the entry point remembers them, and charges each
+    /// that it had not given the session already and that is not among the
+    /// legs the client says it kept (`hold`). Of two confirmations at once
+    /// (its repeat), one charges. Returns whether it charged.
     pub(crate) async fn confirm_udp_assignment(
         &self,
         stream_id: u64,
         session: &str,
         skip: &[String],
-        cache: &str,
+        current: &[String],
+        hold: &[String],
     ) -> bool {
         let candidates = self.cache_candidates(stream_id).await;
-        if !candidates.iter().any(|candidate| {
-            candidate.node_id == cache && candidate.region == self.node.region
-        }) {
+        let mut legs: Vec<String> = Vec::new();
+        for node_id in current {
+            if !legs.contains(node_id)
+                && candidates.iter().any(|candidate| {
+                    candidate.node_id == *node_id && candidate.region == self.node.region
+                })
+            {
+                legs.push(node_id.clone());
+            }
+        }
+        legs.truncate(usize::from(av_mesh::client_udp::MAX_PATHS));
+        if legs.is_empty() {
             return false;
         }
         let key = format!("{stream_id}/{session}");
@@ -20771,39 +20920,45 @@ impl AppRouter {
                 .retain(|_, entry| now_ms.saturating_sub(entry.1) < REMEMBERED_ASSIGNMENT_MS);
         }
         let room = self.remembered_assignments.len() < MAX_REMEMBERED_ASSIGNMENTS;
-        // Remembered first, in one step: of two confirmations at once
-        // (its repeat), one charges.
-        let first = match self.remembered_assignments.entry(key.clone()) {
+        let new_legs = |given: &[String]| {
+            legs.iter()
+                .filter(|node_id| !given.contains(node_id) && !hold.contains(node_id))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        // Remembered first, in one step: of two confirmations at once, one
+        // charges.
+        let charge = match self.remembered_assignments.entry(key.clone()) {
             dashmap::mapref::entry::Entry::Occupied(mut entry) => {
-                if entry.get().0 == cache
-                    && now_ms.saturating_sub(entry.get().1) < REMEMBERED_ASSIGNMENT_MS
-                {
-                    false
-                } else {
-                    *entry.get_mut() = (cache.to_owned(), now_ms);
-                    true
-                }
+                let fresh = now_ms.saturating_sub(entry.get().1) < REMEMBERED_ASSIGNMENT_MS;
+                let given: &[String] = if fresh { &entry.get().0 } else { &[] };
+                let charge = new_legs(given);
+                *entry.get_mut() = (legs.clone(), now_ms);
+                charge
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let charge = new_legs(&[]);
                 if room {
-                    entry.insert((cache.to_owned(), now_ms));
+                    entry.insert((legs.clone(), now_ms));
                 }
-                true
+                charge
             }
         };
-        if !first {
+        if charge.is_empty() {
             return false;
         }
         let snapshots = self.regional_snapshots().await;
         let playlist_bps = self.regional_playlist_bps(stream_id).await;
-        self.charge_reader(
-            cache,
-            &candidates,
-            &snapshots,
-            playlist_bps,
-            !skip.is_empty(),
-            Some(&key),
-        );
+        for (place, node_id) in charge.iter().enumerate() {
+            self.charge_reader(
+                node_id,
+                &candidates,
+                &snapshots,
+                playlist_bps,
+                !skip.is_empty(),
+                Some(&mover_key(&key, skip, place)),
+            );
+        }
         true
     }
 
@@ -20834,6 +20989,7 @@ impl AppRouter {
                 rebalancing: false,
                 listener_permille: None,
                 entry_points: 0,
+                ..AssignmentRequest::default()
             },
             policy,
             &candidates,
@@ -20903,6 +21059,7 @@ impl AppRouter {
             session: session_id,
             pin: pin.as_deref(),
             current: None,
+            ..ReaderRequest::default()
         };
         let (assignment, _) = self.assign_reader(reader, true).await;
         let caches = match assignment {
@@ -21105,6 +21262,7 @@ impl AppRouter {
                     session: session.as_deref(),
                     pin: None,
                     current: None,
+                    ..ReaderRequest::default()
                 },
                 true,
             )
@@ -21157,6 +21315,7 @@ impl AppRouter {
                     session: session_id,
                     pin: pin.as_deref(),
                     current: current.as_deref(),
+                    ..ReaderRequest::default()
                 },
                 true,
             )
@@ -21248,33 +21407,14 @@ impl AppRouter {
     /// `ASSIGN` of wave 9 B.
     async fn client_assignment(
         &self,
-        stream_id: u64,
-        pin: Option<&str>,
-        current: Option<&str>,
-        skip: &[String],
-        session_id: Option<&str>,
+        reader: ReaderRequest<'_>,
         remember: bool,
-        udp: bool,
     ) -> (
         Result<Assignment, AssignmentError>,
         Vec<CacheCandidate>,
         serde_json::Value,
     ) {
-        let (assignment, candidates) = self
-            .assign_reader(
-                ReaderRequest {
-                    // A client that names its session asks for its UDP
-                    // assignment (needletail-udp-client, needletail-load).
-                    udp,
-                    skip,
-                    stream_id,
-                    session: session_id,
-                    pin,
-                    current,
-                },
-                remember,
-            )
-            .await;
+        let (assignment, candidates) = self.assign_reader(reader, remember).await;
         // Phase AM item 11: the neighbouring regions' entry points come
         // last, as in the HLS steering list: a UDP client that loses this
         // region asks one of them for its caches. With no cache here that
@@ -21283,7 +21423,7 @@ impl AppRouter {
             .as_ref()
             .map(|assignment| serde_json::to_value(&assignment.caches).unwrap_or_default())
             .unwrap_or(serde_json::Value::Null);
-        if pin.is_none() && !self.failover_entries.is_empty() {
+        if reader.pin.is_none() && !self.failover_entries.is_empty() {
             let entries = self.failover_entries.iter().map(|(name, url)| {
                 serde_json::json!({
                     "node_id": name,
@@ -21305,16 +21445,39 @@ impl AppRouter {
     /// cache is charged and the session is not remembered (wave 9 review):
     /// the client's confirmation does that
     /// ([`Self::confirm_udp_assignment`]).
+    ///
+    /// Also returns the legs granted and whether the cache after them is
+    /// the spare (`p=`, `s=` of `ASSIGNED`, B 2.1).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn udp_assignment(
         &self,
         stream_id: u64,
         session: &str,
         skip: &[String],
         current: Option<&str>,
-    ) -> (Option<u16>, Vec<av_mesh::client_udp::AssignedCache>) {
-        let (_, _, assigned) = self
-            .client_assignment(stream_id, None, current, skip, Some(session), false, true)
+        hold: &[String],
+        paths: u8,
+        spare: bool,
+    ) -> (Option<u16>, Vec<av_mesh::client_udp::AssignedCache>, u8, bool) {
+        let (assignment, _, assigned) = self
+            .client_assignment(
+                ReaderRequest {
+                    udp: true,
+                    stream_id,
+                    session: Some(session),
+                    pin: None,
+                    current,
+                    skip,
+                    hold,
+                    paths,
+                    spare,
+                },
+                false,
+            )
             .await;
+        let (legs, spare) = assignment
+            .as_ref()
+            .map_or((0, false), |assignment| (assignment.legs, assignment.spare));
         let caches = assigned
             .as_array()
             .map(|list| {
@@ -21329,7 +21492,7 @@ impl AppRouter {
                     .collect()
             })
             .unwrap_or_default();
-        (self.client_udp_port, caches)
+        (self.client_udp_port, caches, legs, spare)
     }
 
     async fn assignment_api_response(
@@ -21345,16 +21508,24 @@ impl AppRouter {
         };
         let pin = decoded("cache");
         let current = decoded("current");
-        // Phase AM item 10: the caches a moving client has just left.
-        let skip: Vec<String> = decoded("skip")
-            .map(|list| {
-                list.split(',')
-                    .map(str::trim)
-                    .filter(|name| !name.is_empty())
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let names = |name: &str| -> Vec<String> {
+            decoded(name)
+                .map(|list| {
+                    list.split(',')
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        // Phase AM item 10: the caches a moving client has just left; B
+        // 2.2: the legs it holds and keeps, the legs it wants and a spare.
+        let skip = names("skip");
+        let hold = names("hold");
+        let paths = parse_query_u64(query, "paths")
+            .map_or(1, |paths| paths.min(u64::from(av_mesh::client_udp::MAX_PATHS)) as u8);
+        let spare = parse_query_u64(query, "spare") == Some(1);
         // A client that names its session (a UDP client: this answer is its
         // assignment) is counted against the cache it is sent to until the
         // cache advertises again, as a reader of the steering list is, so a
@@ -21363,12 +21534,17 @@ impl AppRouter {
         let remember = decoded("sid").is_some();
         let (assignment, candidates, assigned) = self
             .client_assignment(
-                stream_id,
-                pin.as_deref(),
-                current.as_deref(),
-                &skip,
-                session_id,
-                remember,
+                ReaderRequest {
+                    udp: remember,
+                    stream_id,
+                    session: session_id,
+                    pin: pin.as_deref(),
+                    current: current.as_deref(),
+                    skip: &skip,
+                    hold: &hold,
+                    paths,
+                    spare,
+                },
                 remember,
             )
             .await;
@@ -21455,6 +21631,18 @@ impl AppRouter {
         });
         // Phase AM item 8: the live gauges beside the counters.
         let mut body = body;
+        // B 2.2: the legs granted (the first caches of `assigned`) and the
+        // spare after them.
+        body["paths"] = assignment
+            .as_ref()
+            .map_or(0, |assignment| assignment.legs)
+            .into();
+        body["spare"] = assignment
+            .as_ref()
+            .filter(|assignment| assignment.spare)
+            .and_then(|assignment| assignment.caches.get(usize::from(assignment.legs)))
+            .map(|cache| cache.node_id.clone())
+            .into();
         body["failover_entries"] = serde_json::Value::Array(failover_entries);
         // AM 12, 13: the forwarder's lease children and cache-mesh children.
         body["fast_plane"] = serde_json::to_value(self.fast_plane_gauges()).unwrap_or_default();
@@ -21479,6 +21667,12 @@ impl AppRouter {
             block.insert(
                 "assignment_confirms_refused".into(),
                 stats.assignment_confirms_refused.load(Ordering::Relaxed).into(),
+            );
+            // B 2.3: confirmations turned away by the per-source limit or
+            // by the assignments in flight.
+            block.insert(
+                "assignment_confirms_limited".into(),
+                stats.assignment_confirms_limited.load(Ordering::Relaxed).into(),
             );
         }
         if let (Some(block), Some(gauges)) = (body["client_udp"].as_object_mut(), gauges) {
@@ -23000,6 +23194,7 @@ impl Router for AppRouter {
                                     session: session_id.as_deref(),
                                     pin: None,
                                     current: None,
+                                    ..ReaderRequest::default()
                                 };
                                 let alternatives =
                                     self.alternate_cache_urls(reader, path, query).await;
@@ -35581,7 +35776,7 @@ mod tests {
                 .remembered_assignments
                 .get("801/reader-u")
                 .map(|entry| entry.0.clone()),
-            Some(taken.clone())
+            Some(vec![taken.clone()])
         );
         // Confirmations are not answered.
         assert!(
@@ -35652,6 +35847,778 @@ mod tests {
                 .await
                 .is_err()
         );
+        mesh.shutdown();
+    }
+
+    /// A reader cache of the test region holding stream 801 at an audio
+    /// bit rate (under --assignment-two-path-max-bps).
+    fn audio_cache_snapshot_for_tests(
+        node_id: &str,
+        load_permille: u32,
+        head_part: Option<u64>,
+    ) -> MeshSnapshot {
+        let mut snapshot = reader_cache_snapshot_for_tests(node_id, load_permille, head_part);
+        if let Some(edge) = snapshot.edge_service.as_mut() {
+            for playlist in &mut edge.playlists {
+                playlist.bitrate_bps = Some(96_000);
+            }
+        }
+        snapshot
+    }
+
+    async fn start_edge_udp_for_tests(
+        router: &AppRouter,
+        config: edge_udp::EdgeUdpConfig,
+    ) -> (SocketAddr, watch::Sender<()>) {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        tokio::spawn(edge_udp::run_edge_udp(
+            edge_udp::EdgeSockets::single(socket),
+            router.clone(),
+            config,
+            Arc::clone(&router.edge_udp_stats),
+            Vec::new(),
+            shutdown_rx,
+        ));
+        (port, shutdown_tx)
+    }
+
+    fn names_for_tests(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    /// A UDP `ASSIGN` for stream 801 and its answer: the token, then
+    /// `ASSIGNED`.
+    #[allow(clippy::too_many_arguments)]
+    async fn udp_assign_for_tests(
+        client: &UdpSocket,
+        edge: SocketAddr,
+        session: &str,
+        skip: &[&str],
+        current: &[&str],
+        hold: &[&str],
+        paths: u8,
+        spare: bool,
+    ) -> (u64, av_mesh::client_udp::Control) {
+        use av_mesh::client_udp::Control;
+        let request = Control::Assign {
+            stream_id: 801,
+            nonce: 0x7a,
+            session: session.into(),
+            skip: names_for_tests(skip),
+            current: names_for_tests(current),
+            paths,
+            spare,
+            hold: names_for_tests(hold),
+            token: None,
+        }
+        .encode();
+        client.send_to(&request, edge).await.unwrap();
+        let mut buf = vec![0_u8; 2_048];
+        let mut token = None;
+        loop {
+            let (len, _) =
+                tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+                    .await
+                    .expect("an answer")
+                    .unwrap();
+            match Control::decode(&buf[..len]) {
+                Some(Control::Token { token: given, .. }) => token = Some(given),
+                Some(answer @ Control::Assigned { .. }) => {
+                    return (token.expect("the token comes first"), answer)
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    fn assigned_names(api: &serde_json::Value) -> Vec<String> {
+        api["assigned"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|cache| cache["node_id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// B 2.1, 2.2, 3.6: a listener that asks for two paths and a spare is
+    /// given two holders as its legs and a third as its spare, over UDP and
+    /// over HTTPS alike; HTTPS charges and remembers the legs, not the spare.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_assignment_for_two_paths_names_two_edges_and_a_spare() {
+        use av_mesh::client_udp::Control;
+        let (router, mesh) = entry_point_for_tests(vec![
+            audio_cache_snapshot_for_tests("edge-b", 100, Some(500)),
+            audio_cache_snapshot_for_tests("edge-c", 100, Some(500)),
+            audio_cache_snapshot_for_tests("edge-d", 100, Some(500)),
+        ])
+        .await;
+        let router = router.with_client_udp_port(Some(19_446));
+        let (edge, _shutdown) =
+            start_edge_udp_for_tests(&router, edge_udp::EdgeUdpConfig::with_defaults(1_200, 16))
+                .await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_, answer) =
+            udp_assign_for_tests(&client, edge, "pair-1", &[], &[], &[], 2, true).await;
+        let Control::Assigned {
+            caches,
+            paths,
+            spare,
+            ..
+        } = answer
+        else {
+            panic!("{answer:?}");
+        };
+        assert_eq!((paths, spare), (2, true));
+        let udp = caches
+            .iter()
+            .take(3)
+            .map(|cache| cache.node_id.clone())
+            .collect::<Vec<_>>();
+        let mut distinct = udp.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct, ["edge-b", "edge-c", "edge-d"], "{caches:?}");
+        // Unproven: nothing charged or remembered.
+        assert!(router.pending_assignments.is_empty());
+        let api: serde_json::Value = serde_json::from_str(&body_text(
+            get_for_tests(&router, "/api/assignment?stream=801&sid=pair-1&paths=2&spare=1").await,
+        ))
+        .unwrap();
+        assert_eq!(api["paths"], 2, "{api:#}");
+        assert_eq!(assigned_names(&api)[..3], udp[..], "{api:#}");
+        assert_eq!(api["assigned"][1]["reason"], "second_path");
+        assert_eq!(api["assigned"][2]["reason"], "spare");
+        assert_eq!(api["spare"], udp[2].as_str());
+        // HTTPS with a session charges and remembers each leg, not the
+        // spare.
+        assert!(router.pending_assignments.contains_key(&udp[0]));
+        assert!(router.pending_assignments.contains_key(&udp[1]));
+        assert!(!router.pending_assignments.contains_key(&udp[2]));
+        assert_eq!(
+            router
+                .remembered_assignments
+                .get("801/pair-1")
+                .map(|entry| entry.0.clone()),
+            Some(udp[..2].to_vec())
+        );
+        // One path asked: one leg, as before.
+        let api: serde_json::Value = serde_json::from_str(&body_text(
+            get_for_tests(&router, "/api/assignment?stream=801&sid=pair-2").await,
+        ))
+        .unwrap();
+        assert_eq!(api["paths"], 1);
+        assert!(api["spare"].is_null());
+        assert_eq!(api["assigned"][1]["reason"], "alternate");
+        mesh.shutdown();
+    }
+
+    /// B 3.6, 3.9: a playlist over --assignment-two-path-max-bps (a 4K
+    /// feed) is given one leg whatever the listener asks; its spare still.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_playlist_over_the_bit_rate_gets_one_leg() {
+        use av_mesh::client_udp::Control;
+        assert_eq!(
+            Args::try_parse_from(["av-mesh"])
+                .unwrap()
+                .assignment_two_path_max_bps,
+            8_000_000
+        );
+        assert_eq!(
+            Args::try_parse_from(["av-mesh", "--assignment-two-path-max-bps", "20000000"])
+                .unwrap()
+                .assignment_two_path_max_bps,
+            20_000_000
+        );
+        // 16 Mbit/s.
+        let (router, mesh) = entry_point_for_tests(vec![
+            reader_cache_snapshot_for_tests("edge-b", 100, Some(500)),
+            reader_cache_snapshot_for_tests("edge-c", 100, Some(500)),
+            reader_cache_snapshot_for_tests("edge-d", 100, Some(500)),
+        ])
+        .await;
+        let router = router.with_client_udp_port(Some(19_446));
+        let api: serde_json::Value = serde_json::from_str(&body_text(
+            get_for_tests(&router, "/api/assignment?stream=801&sid=video-1&paths=2&spare=1").await,
+        ))
+        .unwrap();
+        assert_eq!(api["paths"], 1, "{api:#}");
+        assert_eq!(api["assigned"][1]["reason"], "spare");
+        assert_eq!(api["spare"], api["assigned"][1]["node_id"]);
+        let (edge, _shutdown) =
+            start_edge_udp_for_tests(&router, edge_udp::EdgeUdpConfig::with_defaults(1_200, 16))
+                .await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_, answer) =
+            udp_assign_for_tests(&client, edge, "video-2", &[], &[], &[], 2, true).await;
+        assert!(
+            matches!(
+                answer,
+                Control::Assigned {
+                    paths: 1,
+                    spare: true,
+                    ..
+                }
+            ),
+            "{answer:?}"
+        );
+        // Raised over the bit rate: two legs.
+        let mut router = router;
+        router.assignment_policy.two_path_max_bps = 20_000_000;
+        let api: serde_json::Value = serde_json::from_str(&body_text(
+            get_for_tests(&router, "/api/assignment?stream=801&sid=video-3&paths=2").await,
+        ))
+        .unwrap();
+        assert_eq!(api["paths"], 2, "{api:#}");
+        mesh.shutdown();
+    }
+
+    /// B 2.5: a UDP client that names the edge it left as `current` (the
+    /// referee's client) is a mover: placed by headroom, away from that
+    /// edge, and logged for the apportionment.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_udp_mover_that_names_its_old_edge_as_current_is_a_mover() {
+        let (router, mesh) = entry_point_for_tests(vec![
+            audio_cache_snapshot_for_tests("edge-b", 100, Some(500)),
+            audio_cache_snapshot_for_tests("edge-c", 100, Some(500)),
+        ])
+        .await;
+        let router = router.with_client_udp_port(Some(19_446));
+        let movers = |router: &AppRouter| {
+            router
+                .recent_movers(Instant::now())
+                .iter()
+                .map(|(_, count)| *count)
+                .sum::<u32>()
+        };
+        let api: serde_json::Value = serde_json::from_str(&body_text(
+            get_for_tests(
+                &router,
+                "/api/assignment?stream=801&sid=mover-1&skip=edge-b&current=edge-b",
+            )
+            .await,
+        ))
+        .unwrap();
+        let assigned = assigned_names(&api);
+        assert!(!assigned.contains(&"edge-b".to_owned()), "{api:#}");
+        assert_ne!(api["assigned"][0]["reason"], "sticky", "{api:#}");
+        assert_eq!(movers(&router), 1);
+        // The same over UDP (unproven: logged, not charged).
+        let (edge, _shutdown) =
+            start_edge_udp_for_tests(&router, edge_udp::EdgeUdpConfig::with_defaults(1_200, 16))
+                .await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let charged = router.pending_assignments.len();
+        let (_, answer) = udp_assign_for_tests(
+            &client,
+            edge,
+            "mover-2",
+            &["edge-b"],
+            &["edge-b"],
+            &[],
+            1,
+            false,
+        )
+        .await;
+        let av_mesh::client_udp::Control::Assigned { caches, .. } = answer else {
+            panic!("{answer:?}");
+        };
+        assert!(caches.iter().all(|cache| cache.node_id != "edge-b"), "{caches:?}");
+        assert_eq!(movers(&router), 2);
+        assert_eq!(router.pending_assignments.len(), charged);
+        // An LL-HLS reader's current that it has not left still holds it.
+        let api: serde_json::Value = serde_json::from_str(&body_text(
+            get_for_tests(&router, "/api/assignment?stream=801&sid=reader-1&current=edge-b").await,
+        ))
+        .unwrap();
+        assert_eq!(api["assigned"][0]["node_id"], "edge-b");
+        assert_eq!(api["assigned"][0]["reason"], "sticky");
+        mesh.shutdown();
+    }
+
+    /// B 2.1, 3.6: the legs a listener holds and keeps (`h=`, `hold=`) are
+    /// never in its answer, as a leg, a spare or an alternate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replacement_is_never_an_edge_the_client_holds() {
+        use av_mesh::client_udp::Control;
+        let (router, mesh) = entry_point_for_tests(vec![
+            audio_cache_snapshot_for_tests("edge-b", 100, Some(500)),
+            audio_cache_snapshot_for_tests("edge-c", 100, Some(500)),
+            audio_cache_snapshot_for_tests("edge-d", 100, Some(500)),
+        ])
+        .await;
+        let router = router.with_client_udp_port(Some(19_446));
+        for index in 0..20 {
+            let api: serde_json::Value = serde_json::from_str(&body_text(
+                get_for_tests(
+                    &router,
+                    &format!("/api/assignment?stream=801&sid=held-{index}&hold=edge-b&paths=1&spare=1"),
+                )
+                .await,
+            ))
+            .unwrap();
+            assert!(!assigned_names(&api).contains(&"edge-b".to_owned()), "{api:#}");
+            assert_eq!(api["paths"], 1, "{api:#}");
+            assert_eq!(api["assigned"][0]["reason"], "second_path", "{api:#}");
+            assert!(api["spare"].is_string(), "{api:#}");
+            // Remembered with the leg it keeps: the confirmation does not
+            // charge that one again.
+            let remembered = router
+                .remembered_assignments
+                .get(&format!("801/held-{index}"))
+                .map(|entry| entry.0.clone())
+                .unwrap();
+            assert_eq!(remembered[1], "edge-b");
+        }
+        let (edge, _shutdown) =
+            start_edge_udp_for_tests(&router, edge_udp::EdgeUdpConfig::with_defaults(1_200, 16))
+                .await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for index in 0..20 {
+            let (_, answer) = udp_assign_for_tests(
+                &client,
+                edge,
+                &format!("held-udp-{index}"),
+                &[],
+                &[],
+                &["edge-b", "edge-c"],
+                0,
+                true,
+            )
+            .await;
+            let Control::Assigned {
+                caches,
+                paths,
+                spare,
+                ..
+            } = answer
+            else {
+                panic!("{answer:?}");
+            };
+            assert_eq!((paths, spare), (0, true));
+            assert_eq!(caches[0].node_id, "edge-d", "{caches:?}");
+            assert!(
+                caches
+                    .iter()
+                    .all(|cache| cache.node_id != "edge-b" && cache.node_id != "edge-c"),
+                "{caches:?}"
+            );
+        }
+        mesh.shutdown();
+    }
+
+    /// B 3.6: a confirmation names every leg the listener holds; the entry
+    /// point charges each leg it had not given the session and that the
+    /// client did not say it kept, once, and remembers the legs.
+    #[tokio::test]
+    async fn the_confirmation_charges_each_new_leg_once() {
+        let (router, mesh) = entry_point_for_tests(vec![
+            reader_cache_snapshot_for_tests("edge-b", 100, Some(500)),
+            reader_cache_snapshot_for_tests("edge-c", 100, Some(500)),
+            reader_cache_snapshot_for_tests("edge-d", 100, Some(500)),
+        ])
+        .await;
+        let charged = |node: &str| {
+            router
+                .pending_assignments
+                .get(node)
+                .map_or(0, |entry| entry.1)
+        };
+        let remembered = || {
+            router
+                .remembered_assignments
+                .get("801/pair")
+                .map(|entry| entry.0.clone())
+                .unwrap_or_default()
+        };
+        let confirm = |current: &[&str], hold: &[&str], skip: &[&str]| {
+            let router = router.clone();
+            let (current, hold, skip) = (
+                names_for_tests(current),
+                names_for_tests(hold),
+                names_for_tests(skip),
+            );
+            async move {
+                router
+                    .confirm_udp_assignment(801, "pair", &skip, &current, &hold)
+                    .await
+            }
+        };
+        let bps = 16_000_000;
+        // A join: both legs charged.
+        assert!(confirm(&["edge-b", "edge-c"], &[], &[]).await);
+        assert_eq!((charged("edge-b"), charged("edge-c")), (bps, bps));
+        assert_eq!(remembered(), ["edge-b", "edge-c"]);
+        // Its repeat charges nothing.
+        assert!(!confirm(&["edge-b", "edge-c"], &[], &[]).await);
+        assert_eq!((charged("edge-b"), charged("edge-c")), (bps, bps));
+        // edge-b drained: its replacement edge-d is charged, edge-c (kept)
+        // is not; a mover is logged once.
+        assert!(confirm(&["edge-c", "edge-d"], &["edge-c"], &["edge-b"]).await);
+        assert_eq!(
+            (charged("edge-b"), charged("edge-c"), charged("edge-d")),
+            (bps, bps, bps)
+        );
+        assert_eq!(remembered(), ["edge-c", "edge-d"]);
+        assert_eq!(router.recent_movers(Instant::now()), [("edge-d".to_owned(), 1)]);
+        // A leg the client kept is not charged even when the entry point
+        // has forgotten it.
+        router.remembered_assignments.clear();
+        assert!(!confirm(&["edge-c", "edge-d"], &["edge-c", "edge-d"], &[]).await);
+        assert_eq!((charged("edge-c"), charged("edge-d")), (bps, bps));
+        // A node outside the region is no leg.
+        assert!(!confirm(&["elsewhere"], &[], &[]).await);
+        mesh.shutdown();
+    }
+
+    /// B 3.6: a stream's UDP legs count as its sessions where an edge
+    /// advertises its playlists, so a UDP-only stream gets its standby copy.
+    #[tokio::test]
+    async fn a_udp_only_stream_gets_its_standby_copy() {
+        use av_mesh::client_udp::Control;
+        let cache = LiveTsCache::new(1, Duration::from_millis(250), 4, 32, 64).await;
+        for sequence in 0..6_u64 {
+            cache
+                .commit_stream_payload(
+                    77,
+                    encode_test_canonical_fmp4_bundle_with_duration(
+                        77,
+                        sequence,
+                        (sequence == 0).then_some(b"ftyp-fLaC-moov".as_slice()),
+                        &[sequence as u8; 400],
+                        Some(250),
+                        true,
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let mut router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let edge = socket.local_addr().unwrap();
+        router.client_udp_port = Some(edge.port());
+        let sessions = |snapshot: &MeshSnapshot| {
+            snapshot
+                .edge_service
+                .as_ref()
+                .unwrap()
+                .playlists
+                .iter()
+                .find(|playlist| playlist.stream_id == 77)
+                .map(|playlist| playlist.sessions)
+        };
+        let own = router.node.node_id.clone();
+        let edges = vec![own.clone(), "edge-x".to_owned()];
+        let wants = |sessions: u64| {
+            wants_standby_copy(
+                "edge-x",
+                77,
+                2,
+                &[StandbyHolder {
+                    node_id: own.clone(),
+                    sessions,
+                }],
+                &edges,
+            )
+        };
+        assert_eq!(sessions(&router.local_mesh_snapshot().await), Some(0));
+        assert!(!wants(0));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(());
+        tokio::spawn(edge_udp::run_edge_udp(
+            edge_udp::EdgeSockets::single(socket),
+            router.clone(),
+            edge_udp::EdgeUdpConfig::with_defaults(1_200, 16),
+            Arc::clone(&router.edge_udp_stats),
+            Vec::new(),
+            shutdown_rx,
+        ));
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let answer = subscribe_udp_for_tests(&client, edge, Some(0)).await;
+            assert!(matches!(answer, Control::Subscribed { .. }), "{answer:?}");
+            clients.push(client);
+        }
+        let advertised = sessions(&router.local_mesh_snapshot().await).unwrap();
+        assert_eq!(advertised, 2);
+        assert!(wants(advertised));
+        mesh.shutdown();
+    }
+
+    /// B 2.3: confirmations over --client-udp-assign-confirms-per-source
+    /// are counted in `assignment_confirms_limited`, not as refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn confirmations_over_the_limit_are_counted_apart() {
+        use av_mesh::client_udp::Control;
+        assert_eq!(
+            Args::try_parse_from(["av-mesh"])
+                .unwrap()
+                .client_udp_assign_confirms_per_source,
+            64
+        );
+        assert_eq!(
+            Args::try_parse_from(["av-mesh", "--client-udp-assign-confirms-per-source", "4096"])
+                .unwrap()
+                .client_udp_assign_confirms_per_source,
+            4_096
+        );
+        let (router, mesh) = entry_point_for_tests(vec![
+            audio_cache_snapshot_for_tests("edge-b", 100, Some(500)),
+            audio_cache_snapshot_for_tests("edge-c", 100, Some(500)),
+        ])
+        .await;
+        let router = router.with_client_udp_port(Some(19_446));
+        let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, 16);
+        config.assign_confirms_per_source = 3;
+        let (edge, _shutdown) = start_edge_udp_for_tests(&router, config).await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (token, _) = udp_assign_for_tests(&client, edge, "load-0", &[], &[], &[], 1, false).await;
+        let confirm = |session: &str, token: u64| {
+            Control::Assign {
+                stream_id: 801,
+                nonce: 0x7a,
+                session: session.into(),
+                skip: Vec::new(),
+                current: vec!["edge-b".into()],
+                paths: 1,
+                spare: false,
+                hold: Vec::new(),
+                token: Some(token),
+            }
+            .encode()
+        };
+        // Five listeners of one load host confirm in one second, and one
+        // confirmation has a bad token.
+        for index in 0..5 {
+            client
+                .send_to(&confirm(&format!("load-{index}"), token), edge)
+                .await
+                .unwrap();
+        }
+        client.send_to(&confirm("load-9", token ^ 1), edge).await.unwrap();
+        let stats = Arc::clone(&router.edge_udp_stats);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stats.assignment_confirms.load(Ordering::Relaxed)
+                + stats.assignment_confirms_refused.load(Ordering::Relaxed)
+                + stats.assignment_confirms_limited.load(Ordering::Relaxed)
+                < 6
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the confirmations settle");
+        // Three in the one-second window, two over it; on a loaded machine
+        // the window may turn between the five, and a fourth gets through.
+        let confirmed = stats.assignment_confirms.load(Ordering::Relaxed);
+        let limited = stats.assignment_confirms_limited.load(Ordering::Relaxed);
+        assert_eq!(confirmed + limited, 5);
+        assert!((3..=4).contains(&confirmed), "{confirmed} confirmed");
+        assert_eq!(stats.assignment_confirms_refused.load(Ordering::Relaxed), 1);
+        let api: serde_json::Value = serde_json::from_str(&body_text(
+            get_for_tests(&router, "/api/assignment?stream=801").await,
+        ))
+        .unwrap();
+        assert_eq!(api["client_udp"]["assignment_confirms_limited"], limited, "{api:#}");
+        mesh.shutdown();
+    }
+
+    /// The first leg of an HTTPS answer: its node, reason and load.
+    fn first_leg(api: &serde_json::Value) -> (String, String, u64) {
+        let leg = &api["assigned"][0];
+        (
+            leg["node_id"].as_str().unwrap_or_default().to_owned(),
+            leg["reason"].as_str().unwrap_or_default().to_owned(),
+            leg["load_permille"].as_u64().unwrap_or_default(),
+        )
+    }
+
+    /// Review of B Z3: a cache the entry point remembers for a session is
+    /// given again only where the rule of its place would take it. A
+    /// one-path listener whose director gave up a rebalance (it confirmed
+    /// edge-c, found it not level and went back to edge-a) is shed again:
+    /// edge-c, now over the receiver level, is not its leg, and a two-path
+    /// listener does not get it as a redundant leg either.
+    #[tokio::test]
+    async fn a_remembered_cache_over_the_level_takes_no_rebalanced_listener() {
+        let (mut router, mesh) = entry_point_for_tests(vec![
+            audio_cache_snapshot_for_tests("edge-a", 850, Some(500)),
+            audio_cache_snapshot_for_tests("edge-b", 600, Some(500)),
+            audio_cache_snapshot_for_tests("edge-c", 790, Some(500)),
+            audio_cache_snapshot_for_tests("edge-d", 500, Some(500)),
+        ])
+        .await;
+        router.cache_mesh_role = CacheMeshRole::Distributor;
+        let router = router.with_client_udp_port(Some(19_446));
+        let remember = |session: &str, legs: &[&str]| {
+            router.remembered_assignments.insert(
+                format!("801/{session}"),
+                (names_for_tests(legs), now_unix_ms()),
+            );
+        };
+        let ask = |query: String| {
+            let router = router.clone();
+            async move {
+                serde_json::from_str::<serde_json::Value>(&body_text(
+                    get_for_tests(&router, &format!("/api/assignment?stream=801&{query}")).await,
+                ))
+                .unwrap()
+            }
+        };
+        remember("give-up", &["edge-c"]);
+        let api = ask("sid=give-up&skip=edge-a".into()).await;
+        let (node, reason, load) = first_leg(&api);
+        assert_eq!(api["paths"], 1, "{api:#}");
+        assert_ne!(node, "edge-c", "{api:#}");
+        assert_ne!(reason, "sticky", "{api:#}");
+        assert!(load < 725, "{api:#}");
+        // A two-path listener that keeps edge-b and is shed off edge-a.
+        remember("give-up-2", &["edge-c", "edge-b"]);
+        let api = ask("sid=give-up-2&skip=edge-a&hold=edge-b".into()).await;
+        assert_eq!(api["paths"], 1, "{api:#}");
+        assert_eq!(first_leg(&api).0, "edge-d", "{api:#}");
+        // A redundant leg remembered under the gate is kept, as sticky.
+        remember("kept-2", &["edge-d", "edge-b"]);
+        let api = ask("sid=kept-2&hold=edge-b".into()).await;
+        assert_eq!(api["paths"], 1, "{api:#}");
+        assert_eq!(
+            (first_leg(&api).0.as_str(), first_leg(&api).1.as_str()),
+            ("edge-d", "sticky"),
+            "{api:#}"
+        );
+        // Over the gate it is not: edge-c at 790 with no listener's cost
+        // counted is under 800, so raise it over.
+        router
+            .telemetry
+            .ingest_snapshot({
+                let mut over = audio_cache_snapshot_for_tests("edge-c", 820, Some(500));
+                over.updated_unix_ms = now_unix_ms();
+                over
+            })
+            .await;
+        *router.regional_view.lock().await = None;
+        remember("over-2", &["edge-c", "edge-b"]);
+        let api = ask("sid=over-2&hold=edge-b".into()).await;
+        assert_ne!(first_leg(&api).0, "edge-c", "{api:#}");
+        mesh.shutdown();
+    }
+
+    /// Review of B Z3: an edge over its target that is killed still looks
+    /// fresh, with its last load, for its last advertisement's life. A
+    /// listener that held nothing else is given a cache of its region
+    /// though no survivor is under the receiver level; once the dead edge's
+    /// advertisement is older than one interval, its listeners are movers of
+    /// a lost edge, not rebalanced ones (the redundant gate is 800, not
+    /// 725).
+    #[tokio::test]
+    async fn a_killed_edge_over_the_target_leaves_its_listeners_in_the_region() {
+        let (mut router, mesh) = entry_point_for_tests(vec![
+            audio_cache_snapshot_for_tests("edge-a", 810, Some(500)),
+            audio_cache_snapshot_for_tests("edge-b", 760, Some(500)),
+            audio_cache_snapshot_for_tests("edge-c", 760, Some(500)),
+        ])
+        .await;
+        router.cache_mesh_role = CacheMeshRole::Distributor;
+        let router = router.with_client_udp_port(Some(19_446));
+        let ask = |query: &str| {
+            let router = router.clone();
+            let query = query.to_owned();
+            async move {
+                serde_json::from_str::<serde_json::Value>(&body_text(
+                    get_for_tests(&router, &format!("/api/assignment?stream=801&{query}")).await,
+                ))
+                .unwrap()
+            }
+        };
+        // Inside the dead edge's last advertisement interval: taken for a
+        // rebalance, which finds no receiver under 725.
+        let api = ask("sid=killed-1&skip=edge-a").await;
+        assert_eq!(api["paths"], 1, "{api:#}");
+        assert!(["edge-b", "edge-c"].contains(&first_leg(&api).0.as_str()), "{api:#}");
+        // A two-path listener keeps edge-b: a rebalance's gate gives it no
+        // second leg while edge-a looks live.
+        let api = ask("sid=killed-2&skip=edge-a&hold=edge-b").await;
+        assert_eq!(api["paths"], 0, "{api:#}");
+        // edge-a's last advertisement is older than one interval: a lost
+        // edge, and the gate is the target's.
+        let aged = now_unix_ms().saturating_sub(router.recent_advert_ms() + 1_000);
+        router
+            .telemetry
+            .heard
+            .write()
+            .unwrap()
+            .get_mut("edge-a")
+            .unwrap()
+            .1 = aged;
+        let api = ask("sid=killed-3&skip=edge-a&hold=edge-b").await;
+        assert_eq!(api["paths"], 1, "{api:#}");
+        assert_eq!(first_leg(&api).0, "edge-c", "{api:#}");
+        mesh.shutdown();
+    }
+
+    /// B 3.6: two legs of one session replaced at once are two movers; a
+    /// repeat of the request gets the same two legs and is neither charged
+    /// nor logged again, and its confirmation charges nothing.
+    #[tokio::test]
+    async fn two_replaced_legs_are_two_movers_and_a_repeat_is_none() {
+        let (mut router, mesh) = entry_point_for_tests(vec![
+            audio_cache_snapshot_for_tests("edge-b", 100, Some(500)),
+            audio_cache_snapshot_for_tests("edge-c", 100, Some(500)),
+            audio_cache_snapshot_for_tests("edge-d", 100, Some(500)),
+            audio_cache_snapshot_for_tests("edge-e", 100, Some(500)),
+            audio_cache_snapshot_for_tests("edge-f", 100, Some(500)),
+        ])
+        .await;
+        router.cache_mesh_role = CacheMeshRole::Distributor;
+        let router = router.with_client_udp_port(Some(19_446));
+        let movers = |router: &AppRouter| {
+            router
+                .recent_movers(Instant::now())
+                .iter()
+                .map(|(_, count)| *count)
+                .sum::<u32>()
+        };
+        let pending = |router: &AppRouter| {
+            router
+                .pending_assignments
+                .iter()
+                .map(|entry| entry.value().1)
+                .sum::<u64>()
+        };
+        let query = "/api/assignment?stream=801&sid=both&skip=edge-b,edge-c&paths=2";
+        let api: serde_json::Value =
+            serde_json::from_str(&body_text(get_for_tests(&router, query).await)).unwrap();
+        assert_eq!(api["paths"], 2, "{api:#}");
+        let legs = assigned_names(&api)[..2].to_vec();
+        assert_ne!(legs[0], legs[1]);
+        assert!(legs.iter().all(|leg| leg != "edge-b" && leg != "edge-c"), "{api:#}");
+        assert_eq!(movers(&router), 2);
+        let charged = pending(&router);
+        assert!(charged > 0);
+        // The repeat (the HTTPS hedge of the same request).
+        let again: serde_json::Value =
+            serde_json::from_str(&body_text(get_for_tests(&router, query).await)).unwrap();
+        assert_eq!(assigned_names(&again)[..2], legs[..], "{again:#}");
+        assert_eq!(again["assigned"][0]["reason"], "sticky");
+        assert_eq!(again["assigned"][1]["reason"], "sticky");
+        assert_eq!(movers(&router), 2);
+        assert_eq!(pending(&router), charged);
+        // Its confirmation names the same legs: nothing new to charge.
+        assert!(
+            !router
+                .confirm_udp_assignment(
+                    801,
+                    "both",
+                    &names_for_tests(&["edge-b", "edge-c"]),
+                    &legs,
+                    &[]
+                )
+                .await
+        );
+        assert_eq!(movers(&router), 2);
+        assert_eq!(pending(&router), charged);
         mesh.shutdown();
     }
 
