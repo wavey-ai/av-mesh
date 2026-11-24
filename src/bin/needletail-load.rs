@@ -616,25 +616,25 @@ mod tests {
         assert_eq!(config.stranded_after, Duration::from_secs(5));
         assert_eq!(config.sid_prefix, "lon-1");
         // The client's defaults (B 2.4): exactly the director and session
-        // that needletail-udp-client makes for the same stream.
+        // that needletail-udp-client makes for the same stream (the
+        // referee's rule, integration 2): the library's defaults, compared
+        // whole, so a field added later is compared too. Only the run's own
+        // values (entries, sids, nonces) and the parts a listener keeps
+        // (`--known-parts`, memory) are the load's.
         let client = av_mesh::client_director::DirectorConfig::new(4001, "", Vec::new());
-        assert_eq!(director.paths, 2);
-        assert!(director.spare);
-        assert_eq!(director.paths, client.paths);
-        assert_eq!(director.spare, client.spare);
-        assert_eq!(director.token_wait, client.token_wait);
-        assert_eq!(director.rebalance_giveup, client.rebalance_giveup);
-        assert_eq!(director.level_wait, client.level_wait);
-        assert_eq!(director.first_retry, client.first_retry);
-        assert_eq!(director.assignment_udp_port, client.assignment_udp_port);
-        assert_eq!(director.assignment_https_after, client.assignment_https_after);
-        assert_eq!(director.assignment_timeout, client.assignment_timeout);
-        assert_eq!(director.udp_port, client.udp_port);
+        assert_eq!((director.paths, director.spare), (2, true));
+        let expected = av_mesh::client_director::DirectorConfig {
+            entries: director.entries.clone(),
+            session: director.session.clone(),
+            nonce_seed: director.nonce_seed,
+            ..client.clone()
+        };
+        assert_eq!(format!("{director:#?}"), format!("{expected:#?}"));
         let session = SessionConfig {
             known_parts: config.session.known_parts,
             ..SessionConfig::new(4001)
         };
-        assert_eq!(format!("{:?}", config.session), format!("{session:?}"));
+        assert_eq!(format!("{:#?}", config.session), format!("{session:#?}"));
         assert_eq!(assign.timeout, client.assignment_timeout);
         // --entry needs the CA; neither edges nor an entry, or both, is an
         // error; so is a third path.

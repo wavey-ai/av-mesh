@@ -2029,6 +2029,28 @@ mod tests {
         assert!((control.session_config().residual_target - 0.002).abs() < 1e-12);
     }
 
+    /// The referee's rule (probes and simulated listeners configured alike,
+    /// integration 2): the probe's director and session are, field for
+    /// field, the library's defaults (`DirectorConfig::new`,
+    /// `SessionConfig::new`), to which needletail-load's are held as well
+    /// (`the_entry_points_and_the_director_take_the_client_s_flags_and_defaults`
+    /// there). Compared whole, so a
+    /// field added to either is compared too.
+    #[test]
+    fn the_probe_runs_the_library_s_director_and_session() {
+        let args = Args::try_parse_from(PROBE).unwrap();
+        let director = args.director_config(7);
+        let expected = DirectorConfig {
+            nonce_seed: 7,
+            ..DirectorConfig::new(args.stream, args.session.clone(), args.entry.clone())
+        };
+        assert_eq!(format!("{director:#?}"), format!("{expected:#?}"));
+        assert_eq!(
+            format!("{:#?}", args.session_config()),
+            format!("{:#?}", SessionConfig::new(args.stream))
+        );
+    }
+
     fn report(node: &str, datagrams: u64, first: u64) -> LegReport {
         LegReport {
             node: node.into(),
