@@ -2224,12 +2224,12 @@ impl Director {
         // room now it is kept, served by its draining edge, and the leg is
         // asked for again on ONE_PATH_BACKOFF (fix 4, F6a/F6b: released, the
         // listener sat on one path for 3 to 25 s in rolls; kept with the
-        // old backoff, it stayed until its edge cut it).
+        // old backoff, it stayed until its edge cut it). An answer empty only
+        // for the edges the listener left lately keeps the drained leg and
+        // is asked again at once without them.
         let no_leg = granted == 0 && chosen.is_empty();
         let no_cache = usable.is_empty() || no_leg;
-        if no_cache {
-            self.no_cache(legs, &request, usable.is_empty(), now, out);
-        }
+        let again = no_cache && self.no_cache(legs, &request, usable.is_empty(), now, out);
         // An answer to a request that did not ask for every place missing
         // now (one sent before the last MOVE or failure, or for the spare
         // alone) holds nothing back: the loop asks at once for the rest.
@@ -2239,7 +2239,7 @@ impl Director {
         // for at once.
         let short = chosen.len() < need
             || (request.spare && request.spare_held.is_none() && self.spare_wanted());
-        if !asked_all {
+        if !asked_all || again {
             self.retry_at = None;
         } else if no_cache || short {
             let leaving = self.legs.iter().any(|leg| leg.leaving.is_some());
@@ -2282,7 +2282,13 @@ impl Director {
     /// It speaks for a leaving leg only when the request asked for its
     /// replacement (it asked for a leg and was sent after the `MOVE`) and no
     /// leg has been added for it: a spare's request answered empty says
-    /// nothing of a leg whose replacement is joining.
+    /// nothing of a leg whose replacement is joining. Returns whether the
+    /// leaving leg's place is to be asked for again at once: the request
+    /// skipped edges the listener left lately ([`SKIP_AFTER_MOVE`]), so the
+    /// empty answer says nothing of the region (integration 4,
+    /// `roll_of_three_edges`: a drain within 3 s of two earlier moves
+    /// released the drained leg, and the listener was on one path until
+    /// the backoff's next answer).
     fn no_cache<S: SessionLegs>(
         &mut self,
         legs: &mut S,
@@ -2290,10 +2296,16 @@ impl Director {
         region_empty: bool,
         now: Instant,
         out: &mut Vec<Action>,
-    ) {
+    ) -> bool {
         if request.paths == 0 {
-            return;
+            return false;
         }
+        let left_lately = request.skip.iter().any(|node| {
+            self.skip
+                .get(node)
+                .is_some_and(|skip| skip.cause == SkipCause::Moved && skip.until.is_some())
+        });
+        let mut again = false;
         let leaving: Vec<(LegKey, bool, bool)> = self
             .legs
             .iter()
@@ -2315,6 +2327,10 @@ impl Director {
                 // A cache of the region without room now: kept (see the
                 // caller), asked again soon.
                 continue;
+            } else if left_lately {
+                // Kept, and asked for again at once without the edges left
+                // lately.
+                again = true;
             } else if self.any_delivering(legs, now, Some(key)) {
                 self.release(legs, key, now, out);
                 self.lost_place = true;
@@ -2322,6 +2338,11 @@ impl Director {
                 self.take_back(legs, key, now, out);
             }
         }
+        if again {
+            self.skip
+                .retain(|_, skip| !(skip.cause == SkipCause::Moved && skip.until.is_some()));
+        }
+        again
     }
 
     fn confirm_to(
@@ -3060,12 +3081,17 @@ impl Director {
 /// that is sooner. A session that never gets its second leg (a short grant
 /// for the gate or for one edge, a join whose second edge is dead in a
 /// region with no third) is on one path from the end of the allowance
-/// (review of B Y2, finding 5).
+/// (review of B Y2, finding 5). A span never begins before the last moment
+/// two legs were seen delivering: a leg released with no replacement yet (a
+/// drained leg let go for want of a cache) leaves no second leg to date the
+/// span by.
 #[derive(Debug, Clone)]
 pub struct SinglePath {
     allowance: Duration,
     /// When time on one path begins to count.
     counts_from: Option<Instant>,
+    /// The last observation with two legs delivering.
+    two_seen: Option<Instant>,
     open: Option<Instant>,
     /// Each span, closed.
     pub spans: Vec<(Instant, Instant)>,
@@ -3078,6 +3104,7 @@ impl SinglePath {
         Self {
             allowance,
             counts_from: None,
+            two_seen: None,
             open: None,
             spans: Vec::new(),
             total: Duration::ZERO,
@@ -3088,8 +3115,8 @@ impl SinglePath {
     /// (live or leaving); `two_paths`: two legs are wanted now. Call it at
     /// every media datagram and every wake: a span ends at the datagram
     /// that brings a second leg back, and begins when the second-freshest
-    /// leg's media went stale (or, with no second leg, when time begins to
-    /// count).
+    /// leg's media went stale (or, with no second leg, when two legs were
+    /// last seen delivering, else when time begins to count).
     pub fn observe(
         &mut self,
         now: Instant,
@@ -3112,6 +3139,7 @@ impl SinglePath {
         }
         if delivering >= 2 {
             self.counts_from = Some(self.counts_from.map_or(now, |from| from.min(now)));
+            self.two_seen = Some(now);
         } else if self.counts_from.is_none() {
             self.counts_from = first.map(|first| first + self.allowance);
         }
@@ -3123,7 +3151,14 @@ impl SinglePath {
             return;
         };
         if self.open.is_none() {
-            let since = second.map_or(from, |second| (second + window).max(from));
+            // From the second leg's staleness, but not before two legs were
+            // last seen delivering: a leg released since (its media is no
+            // longer among `lasts`) did not take the time since the join
+            // with it (roll_of_three_edges: spans of 13 to 14 s from the
+            // join).
+            let since = second
+                .map_or(from, |second| (second + window).max(from))
+                .max(self.two_seen.unwrap_or(from));
             self.open = Some(since.min(now));
         }
     }
@@ -5800,5 +5835,248 @@ mod tests {
         clean.observe(ms(310), window, [ms(310), ms(310)], true);
         clean.close(ms(2_000));
         assert_eq!(clean.total, Duration::ZERO);
+    }
+
+    /// Feed `path` as a caller does: the last media of each leg the director
+    /// holds.
+    fn observe_legs(w: &World, path: &mut SinglePath, window: Duration) {
+        let lasts: Vec<Instant> =
+            w.d.legs()
+                .iter()
+                .filter_map(|leg| w.s.views.get(&leg.key).and_then(|view| view.last_media))
+                .collect();
+        path.observe(w.now, window, lasts, w.d.want() >= 2);
+    }
+
+    /// Integration 4, `two_paths::roll_of_three_edges` in the whole suite:
+    /// a drained leg released at an answer that names no cache the listener
+    /// can take (its other edges skipped after earlier moves) leaves the
+    /// session one leg, and no second leg's media to date the span by. The
+    /// span began at the join (13 to 14 s in the suite's rolls); it begins
+    /// at the release.
+    #[test]
+    fn a_leg_released_for_want_of_a_cache_is_on_one_path_from_its_release_not_the_join() {
+        let mut w = World::new("released-1", 2, false);
+        w.join(&[1, 2], None);
+        let joined = w.now;
+        let (e1, e2) = (w.key("e1"), w.key("e2"));
+        let window = Duration::from_millis(20);
+        let mut path = SinglePath::new(Duration::from_millis(400));
+        // Both legs deliver for 10 s.
+        while w.ms() < 10_000 {
+            w.run_to(w.ms() + 10);
+            let now = w.now;
+            for key in [e1, e2] {
+                w.s.views.entry(key).or_default().last_media = Some(now);
+            }
+            observe_legs(&w, &mut path, window);
+        }
+        assert!(path.spans.is_empty() && !path.is_open());
+        let released = w.now;
+        // e1 drained; the answer names no cache: e1 goes at once beside e2.
+        w.event(LegEvent::Moved {
+            leg: e1,
+            reason: "draining".into(),
+        });
+        let (to, nonce, _) = w.requests().pop().expect("e1's replacement asked for");
+        w.answer(to, nonce, Vec::new(), 0, false, None);
+        assert!(w.s.legs[&e1].released, "{:?}", w.s.log);
+        observe_legs(&w, &mut path, window);
+        assert!(path.is_open());
+        // Asked again on the one-path backoff: e3 comes.
+        let (to, nonce) = loop {
+            w.run_to(w.ms() + 1);
+            let now = w.now;
+            w.s.views.entry(e2).or_default().last_media = Some(now);
+            observe_legs(&w, &mut path, window);
+            if let Some((to, nonce, _)) = w.requests().pop() {
+                break (to, nonce);
+            }
+            assert!(w.ms() < 12_000, "the lost place is asked for again");
+        };
+        w.answer(to, nonce, vec![cache(3)], 1, false, None);
+        w.live("e3");
+        let back = w.now;
+        w.s.views.entry(e2).or_default().last_media = Some(back);
+        observe_legs(&w, &mut path, window);
+        assert!(!path.is_open());
+        assert_eq!(path.spans.len(), 1);
+        let (since, until) = path.spans[0];
+        assert!(
+            since >= released,
+            "the span began {:?} after the join, before the release at {:?}",
+            since - joined,
+            released - joined
+        );
+        assert_eq!(until, back);
+        assert!(path.total < Duration::from_millis(500), "{:?}", path.total);
+    }
+
+    /// Integration 4, `two_paths::roll_of_three_edges` in the whole suite
+    /// (roll-3: e1 -> e2 drained, e4 -> e3 rebalanced, then e2 gone with no
+    /// record): a drain that comes within 3 s of two earlier moves finds
+    /// every other edge skipped by the listener itself. The entry names
+    /// nothing; the drained leg was released at once beside the other, and
+    /// the listener was on one path until the backoff's next answer. It is
+    /// kept, and its place asked for again at once without the edges left
+    /// lately: make before break.
+    #[test]
+    fn a_drain_soon_after_two_moves_keeps_its_leg_and_asks_again_without_the_edges_left() {
+        let mut w = World::new("roll-3", 2, false);
+        w.join(&[1, 4], None);
+        let window = Duration::from_millis(20);
+        let mut path = SinglePath::new(Duration::from_millis(400));
+        observe_legs(&w, &mut path, window);
+        // e1 drained, its place given to e2; e4 rebalanced to e3.
+        for (old, new, reason) in [(1, 2, "draining"), (4, 3, "rebalance")] {
+            let old_key = w.key(&format!("e{old}"));
+            w.event(LegEvent::Moved {
+                leg: old_key,
+                reason: reason.into(),
+            });
+            let (to, nonce, _) = w.requests().pop().expect("a place asked for");
+            w.answer(to, nonce, vec![cache(new)], 1, false, None);
+            w.live(&format!("e{new}"));
+            let new_key = w.key(&format!("e{new}"));
+            w.s.level.insert((new_key, old_key));
+            w.run_to(w.ms() + 5);
+            assert!(w.s.legs[&old_key].released);
+            observe_legs(&w, &mut path, window);
+            w.run_to(w.ms() + 1_000);
+            let now = w.now;
+            for node in w.held() {
+                w.view(&node, |view| view.last_media = Some(now));
+            }
+            observe_legs(&w, &mut path, window);
+        }
+        assert_eq!(w.held(), ["e2", "e3"]);
+        // e2 drained 1 s after the last move: e1 and e4 are still skipped.
+        let e2 = w.key("e2");
+        w.event(LegEvent::Moved {
+            leg: e2,
+            reason: "draining".into(),
+        });
+        let (to, nonce, request) = w.requests().pop().expect("e2's place asked for");
+        let Control::Assign { skip, hold, .. } = request else {
+            unreachable!()
+        };
+        assert_eq!(skip, ["e1", "e2", "e4"]);
+        assert_eq!(hold, ["e3"]);
+        // The entry names none of the edges skipped, and holds e3.
+        w.answer_why(
+            to,
+            nonce,
+            Vec::new(),
+            0,
+            false,
+            None,
+            Some(ShortGrant::OneEdge),
+        );
+        observe_legs(&w, &mut path, window);
+        assert!(
+            !w.s.legs[&e2].released,
+            "e2 is released for want of a cache the listener skips itself: {:?}",
+            w.s.log
+        );
+        let (to, nonce, request) = w.requests().pop().expect("asked again at once");
+        let Control::Assign { skip, hold, .. } = request else {
+            unreachable!()
+        };
+        assert_eq!((skip, hold), (vec!["e2".to_owned()], vec!["e3".to_owned()]));
+        w.answer(to, nonce, vec![cache(1)], 1, false, None);
+        w.live("e1");
+        let e1 = w.key("e1");
+        w.s.level.insert((e1, e2));
+        w.run_to(w.ms() + 5);
+        assert!(w.s.legs[&e2].released);
+        assert_eq!(w.held(), ["e3", "e1"]);
+        let records: Vec<(&str, &str, ReplacementKind)> =
+            w.d.replacements
+                .iter()
+                .map(|record| (record.from.as_str(), record.to.as_str(), record.kind))
+                .collect();
+        assert_eq!(
+            records,
+            [
+                ("e1", "e2", ReplacementKind::Handover),
+                ("e4", "e3", ReplacementKind::Handover),
+                ("e2", "e1", ReplacementKind::Handover)
+            ]
+        );
+        observe_legs(&w, &mut path, window);
+        assert!(path.spans.is_empty() && !path.is_open(), "{:?}", path.spans);
+    }
+
+    /// The lead's question after integration 4: both legs sent away for a
+    /// rebalance in the same poll. One request asks for both places (no leg
+    /// is held), each new leg stands for its own old one, and each old leg
+    /// stays until its own replacement is level: no time on one path.
+    #[test]
+    fn two_rebalance_moves_in_one_poll_are_each_replaced_make_before_break() {
+        let mut w = World::new("two-rebalances", 2, true);
+        w.join(&[1, 2], Some(3));
+        let (e1, e2) = (w.key("e1"), w.key("e2"));
+        let window = Duration::from_millis(20);
+        let mut path = SinglePath::new(Duration::from_millis(400));
+        observe_legs(&w, &mut path, window);
+        w.s.events.push_back(LegEvent::Moved {
+            leg: e1,
+            reason: "rebalance".into(),
+        });
+        w.s.events.push_back(LegEvent::Moved {
+            leg: e2,
+            reason: "rebalance".into(),
+        });
+        w.poll();
+        assert!(w.leaving("e1") && w.leaving("e2"));
+        let requests = w.requests();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        let (to, nonce, request) = requests[0].clone();
+        let Control::Assign {
+            paths, skip, hold, ..
+        } = request
+        else {
+            unreachable!()
+        };
+        assert_eq!(paths, 2);
+        assert!(hold.is_empty(), "{hold:?}");
+        assert!(skip.contains(&"e1".to_owned()) && skip.contains(&"e2".to_owned()));
+        // The entry names the spare's edge and another for the two places.
+        w.answer(to, nonce, vec![cache(3), cache(4), cache(5)], 2, true, None);
+        let (e3, e4) = (w.key("e3"), w.key("e4"));
+        let stands_for = |w: &World, key: LegKey| {
+            w.d.legs()
+                .iter()
+                .find(|leg| leg.key == key)
+                .and_then(|leg| leg.stands_for)
+        };
+        assert_eq!(stands_for(&w, e3), Some(e1));
+        assert_eq!(stands_for(&w, e4), Some(e2));
+        w.live("e3");
+        w.live("e4");
+        // e3 level first: e1 goes, e2 stays for e4.
+        w.s.level.insert((e3, e1));
+        w.run_to(w.ms() + 5);
+        observe_legs(&w, &mut path, window);
+        assert!(w.s.legs[&e1].released && !w.s.legs[&e2].released);
+        assert_eq!(stands_for(&w, e4), Some(e2));
+        w.s.level.insert((e4, e2));
+        w.run_to(w.ms() + 5);
+        observe_legs(&w, &mut path, window);
+        assert!(w.s.legs[&e2].released);
+        assert_eq!(w.held(), ["e3", "e4"]);
+        let handovers: Vec<(&str, &str, ReplacementKind)> =
+            w.d.replacements
+                .iter()
+                .map(|record| (record.from.as_str(), record.to.as_str(), record.kind))
+                .collect();
+        assert_eq!(
+            handovers,
+            [
+                ("e1", "e3", ReplacementKind::Handover),
+                ("e2", "e4", ReplacementKind::Handover)
+            ]
+        );
+        assert!(path.spans.is_empty() && !path.is_open(), "{:?}", path.spans);
     }
 }
