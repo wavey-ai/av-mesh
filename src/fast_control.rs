@@ -352,3 +352,147 @@ pub(crate) async fn run_video_socket_buffers(
         }
     }
 }
+
+/// The cache mesh's receive sockets sized to their traffic (integration 4),
+/// as the fast plane's video sockets are (`relay::VideoSocketBuffers`).
+/// The cache mesh's sockets were made with --cache-mesh-socket-buffer-bytes
+/// (else --udp-socket-buffer-bytes) and dropped what a stall overflowed:
+/// the main (audio) socket 1,864 datagrams at one edge of the local gate in
+/// a 4K stream's first second, the class (video) socket 122k at one edge
+/// during Linode node stops. Once a second, each socket whose busiest
+/// second so far, times `ms`, is more than it was asked for is asked for
+/// that, up to `max`; never less. Off every hot path: a counter read and,
+/// when a socket grows, a setsockopt.
+#[derive(Debug)]
+pub(crate) struct MeshSocketBuffers {
+    ms: u64,
+    /// What the sockets were made with, and the least they are grown to at
+    /// the first look, before any traffic.
+    configured: usize,
+    floor: usize,
+    max: usize,
+    /// Per socket (`main`, `class`): bytes asked, wire bytes at the last
+    /// look, and the busiest second's bytes.
+    lanes: HashMap<&'static str, MeshSocketLane>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MeshSocketLane {
+    pub asked: usize,
+    pub last_bytes: u64,
+    pub busiest_per_second: u64,
+    /// The buffer as the kernel reports it (twice what was asked).
+    pub granted: usize,
+}
+
+impl MeshSocketBuffers {
+    pub(crate) fn new(ms: u64, configured: usize, floor: usize, max: usize) -> Self {
+        Self {
+            ms,
+            configured,
+            floor: floor.max(configured),
+            max,
+            lanes: HashMap::new(),
+        }
+    }
+
+    /// One look: `sockets` as `CacheMeshHandle::receive_sockets` gives them.
+    pub(crate) fn turn<S: std::os::fd::AsRawFd>(
+        &mut self,
+        sockets: &[(&'static str, S, u64)],
+        elapsed: Duration,
+    ) {
+        for (lane, socket, bytes) in sockets {
+            let state = self.lanes.entry(*lane).or_insert(MeshSocketLane {
+                asked: self.configured,
+                last_bytes: *bytes,
+                ..MeshSocketLane::default()
+            });
+            let delta = bytes.saturating_sub(state.last_bytes);
+            state.last_bytes = *bytes;
+            let per_second = (delta as f64 / elapsed.as_secs_f64().max(1e-3)) as u64;
+            state.busiest_per_second = state.busiest_per_second.max(per_second);
+            let target = crate::fast_plane::relay::video_socket_buffer_target(
+                state.busiest_per_second,
+                self.ms,
+                self.floor,
+                self.max,
+            );
+            if self.ms > 0 && target > state.asked {
+                let granted = sys::grow_receive_buffer(socket, target);
+                tracing::info!(
+                    lane = *lane,
+                    bytes_per_second = state.busiest_per_second,
+                    asked_bytes = target,
+                    granted_bytes = granted,
+                    "a cache-mesh socket's receive buffer grows to its traffic"
+                );
+                state.asked = target;
+            }
+            state.granted = sys::receive_buffer(socket).unwrap_or(0);
+        }
+    }
+
+    pub(crate) fn lane(&self, lane: &str) -> Option<MeshSocketLane> {
+        self.lanes.get(lane).copied()
+    }
+}
+
+/// [`MeshSocketBuffers`] once a second until shutdown.
+pub(crate) async fn run_cache_mesh_socket_buffers(
+    mesh: Arc<CacheMeshHandle>,
+    mut buffers: MeshSocketBuffers,
+    mut shutdown_rx: watch::Receiver<()>,
+) {
+    let mut tick = interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut last = Instant::now();
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => return,
+            _ = tick.tick() => {
+                let now = Instant::now();
+                buffers.turn(&mesh.receive_sockets(), now.duration_since(last));
+                last = now;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod mesh_socket_buffer_tests {
+    use super::*;
+
+    /// Integration 4: a cache-mesh socket grows to 2 s of its busiest
+    /// second, from the configured size up to the cap, and never shrinks.
+    #[test]
+    fn a_cache_mesh_socket_grows_to_two_seconds_of_its_busiest_second() {
+        let socket = Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+        let floor = 256 << 10;
+        let max = 4 << 20;
+        let _ = sys::grow_receive_buffer(&*socket, 128 << 10);
+        let mut buffers = MeshSocketBuffers::new(2_000, 128 << 10, floor, max);
+        let second = Duration::from_secs(1);
+        // The first look, before any traffic: the floor.
+        buffers.turn(&[("main", Arc::clone(&socket), 0)], second);
+        assert_eq!(buffers.lane("main").unwrap().asked, floor);
+        // An audio second: 300 kB/s wants 600 kB.
+        buffers.turn(&[("main", Arc::clone(&socket), 300_000)], second);
+        let lane = buffers.lane("main").unwrap();
+        assert_eq!((lane.busiest_per_second, lane.asked), (300_000, 600_000));
+        // A quiet second asks for nothing less.
+        buffers.turn(&[("main", Arc::clone(&socket), 300_100)], second);
+        assert_eq!(buffers.lane("main").unwrap().asked, 600_000);
+        // A burst of 10 MB/s asks for the cap, and no more.
+        buffers.turn(&[("main", Arc::clone(&socket), 10_300_100)], second);
+        let lane = buffers.lane("main").unwrap();
+        assert_eq!((lane.busiest_per_second, lane.asked), (10_000_000, max));
+        // The kernel grants at least what rmem_max allows (doubled).
+        assert!(lane.granted >= 2 * floor, "{lane:?}");
+        // With ms 0 nothing is asked.
+        let mut off = MeshSocketBuffers::new(0, floor, floor, max);
+        off.turn(&[("class", Arc::clone(&socket), 0)], second);
+        off.turn(&[("class", Arc::clone(&socket), 50_000_000)], second);
+        assert_eq!(off.lane("class").unwrap().asked, floor);
+    }
+}

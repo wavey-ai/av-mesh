@@ -236,6 +236,12 @@ const DEFAULT_CANONICAL_GAP_HOLD_MS: u64 = 1_000;
 /// Upper bound on the slots probed per commit while a hole blocks the
 /// watermark, so a long loss burst cannot make every commit rescan it.
 const CANONICAL_GAP_SCAN_LIMIT: usize = 1_024;
+/// What each cache-mesh receive socket is grown to at once, before its
+/// traffic says more (integration 4): a stream's first second arrives
+/// before any second has been measured (lp2: 1,864 drops on the main socket
+/// in the 4K stream's first second). 32 MiB asked, 64 MiB booked: about
+/// 1.5 s of 4K at 247 Mbit/s.
+const CACHE_MESH_SOCKET_BUFFER_FLOOR: usize = 32 << 20;
 /// `/api/node`'s `missed_10s`: its window, and the seconds kept per stream.
 const MISSED_WINDOW_S: u64 = 10;
 const MISSED_SECONDS: usize = 12;
@@ -3137,6 +3143,16 @@ struct Args {
     )]
     cache_mesh_socket_buffer_bytes: usize,
 
+    /// Milliseconds of its busiest second that each cache-mesh receive
+    /// socket's buffer grows to, once a second (0: it keeps the size above).
+    #[arg(long, env = "NEEDLETAIL_CACHE_MESH_SOCKET_BUFFER_MS", default_value_t = 2_000)]
+    cache_mesh_socket_buffer_ms: u64,
+
+    /// MiB a cache-mesh socket's receive buffer may be asked for at most
+    /// (the kernel books twice that while it is full).
+    #[arg(long, env = "NEEDLETAIL_CACHE_MESH_SOCKET_BUFFER_MAX_MB", default_value_t = 128)]
+    cache_mesh_socket_buffer_max_mb: usize,
+
     /// Fault injection for tests: drop this many received cache-mesh datagrams
     /// in each million, as a lossy private network would.
     #[arg(
@@ -4018,6 +4034,23 @@ async fn main() -> Result<()> {
     );
 
     let (ingest_shutdown_tx, ingest_shutdown_rx) = watch::channel(());
+    // Integration 4: the cache mesh's receive sockets grow to their traffic.
+    if args.cache_mesh_socket_buffer_ms > 0 {
+        tokio::spawn(fast_control::run_cache_mesh_socket_buffers(
+            Arc::clone(&mesh_handle),
+            fast_control::MeshSocketBuffers::new(
+                args.cache_mesh_socket_buffer_ms,
+                if args.cache_mesh_socket_buffer_bytes > 0 {
+                    args.cache_mesh_socket_buffer_bytes
+                } else {
+                    args.udp_socket_buffer_bytes
+                },
+                CACHE_MESH_SOCKET_BUFFER_FLOOR,
+                args.cache_mesh_socket_buffer_max_mb.saturating_mul(1 << 20),
+            ),
+            ingest_shutdown_rx.clone(),
+        ));
+    }
     link_telemetry.start(ingest_shutdown_rx.clone());
     // An edge finds its holes by part distance: in its fast-plane tee when
     // the class threads feed it, and otherwise as the cache mesh applies.
