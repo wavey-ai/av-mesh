@@ -3734,7 +3734,16 @@ async fn main() -> Result<()> {
         } else {
             args.udp_socket_buffer_bytes
         })
-        .with_applied_tx(mesh_applied_tx);
+        .with_applied_tx(mesh_applied_tx)
+        // C CR2: a parent that leaves a stream's ranked set is kept until
+        // its replacement feeds, at most two of this node's renewal periods
+        // (`cache_mesh_parent_release_after`); the hello carries the boot id
+        // that `GET /api/node` shows.
+        .with_parent_release_after(cache_mesh_parent_release_after(args.cache_mesh_lease_ms))
+        .with_boot_id(cache.started_unix_us)
+        // A PL1 (A 2.7): a part from a parent keeps the first copy of its
+        // epoch (two contributors publish the same parts).
+        .with_slot_epoch(mesh_slot_epoch);
     let mesh_config = with_low_latency_mesh_options(mesh_config, &hop_journal);
     // An edge with a client UDP port forwards the parts that reach it over
     // the cache mesh to its UDP clients as their datagrams arrive.
@@ -4149,6 +4158,13 @@ async fn main() -> Result<()> {
         forwarder: relay_forwarder.clone(),
         ..NodeStatusSource::default()
     };
+    // C CR2's make-before-break release needs a caller of release_pending;
+    // until the lifecycle unit's run_parent_release (C CR8) lands, the
+    // stopgap releases a pending parent at its timer only (pl-mesh.fix.md).
+    let parent_release_task = tokio::spawn(run_parent_release_stopgap(
+        Arc::clone(&mesh_handle),
+        ingest_shutdown_rx.clone(),
+    ));
     let node_cpu_task = tokio::spawn(run_node_cpu_sampler(
         edge_admission::process_cpu_us,
         edge_admission::available_cpus(),
@@ -4619,6 +4635,7 @@ async fn main() -> Result<()> {
     http_runtime.shutdown_background();
     let _ = replication_planner_task.await;
     let _ = node_cpu_task.await;
+    let _ = parent_release_task.await;
     if let Some(task) = edge_udp_task {
         let _ = task.await;
     }
@@ -12534,6 +12551,34 @@ struct MeshPartRecord {
     stamp: Option<PartStamp>,
 }
 
+/// A PL1 (A 2.7): the epoch of the origin that made a cached part, for the
+/// cache mesh's first-copy rule (`CacheMeshConfig::with_slot_epoch`). It is
+/// the key epoch of a canonical slot's media object, as
+/// [`MeshPartRecord::from_slot`] reads it, taken from the envelope's header
+/// without decoding the object: the mesh asks on every write over an
+/// occupied slot, under the slot's lock, and a 4K part is hundreds of kB.
+/// `None` for any other slot, which a parent's part then replaces as before.
+fn mesh_slot_epoch(bytes: &[u8]) -> Option<u64> {
+    if !bytes.starts_with(&CANONICAL_LIVE_SLOT_MAGIC[..]) {
+        return None;
+    }
+    let envelope = bytes.get(CANONICAL_LIVE_SLOT_HEADER_LEN..)?;
+    if envelope.get(..4)? != media_object::WIRE_MAGIC
+        || envelope.get(4..6)? != media_object::WIRE_VERSION.to_be_bytes()
+    {
+        return None;
+    }
+    // The 12-byte header; kind, key frame and a reserved u16; then the key:
+    // tenant, stream and track (each a u16 length and its bytes), then the
+    // epoch, all big-endian.
+    let mut at = 16;
+    for _ in 0..3 {
+        let len = u16::from_be_bytes(envelope.get(at..at + 2)?.try_into().ok()?);
+        at += 2 + usize::from(len);
+    }
+    Some(u64::from_be_bytes(envelope.get(at..at + 8)?.try_into().ok()?))
+}
+
 impl MeshPartRecord {
     fn from_slot(bytes: &Bytes, stream_id: u64) -> Option<Self> {
         let slot = LiveSlotPayload::decode_for_stream(bytes.clone(), stream_id);
@@ -13822,6 +13867,18 @@ struct MeshFecRuntimeSnapshot {
     parents_released: u64,
     /// Cache-mesh datagrams from addresses that are not peers.
     rx_unauthorized_datagrams: u64,
+    /// C CR1: frames of a kind or a hello role this build does not know (a
+    /// later build's, during a roll), and frames that did not decode.
+    rx_unknown_kinds: u64,
+    rx_unknown_roles: u64,
+    rx_invalid_frames: u64,
+    /// C CR2: parents released at their timer, their replacement not
+    /// confirmed.
+    parents_released_unconfirmed: u64,
+    /// A PL1: parts from a parent that kept the first copy of their epoch,
+    /// and parts of an older epoch (or an older id) that were dropped.
+    apply_conflicts: u64,
+    apply_stale: u64,
 }
 
 impl From<CacheMeshFecStats> for MeshFecRuntimeSnapshot {
@@ -13860,6 +13917,12 @@ impl From<CacheMeshFecStats> for MeshFecRuntimeSnapshot {
             warm_capped_ticks: stats.warm_capped_ticks,
             parents_released: stats.parents_released,
             rx_unauthorized_datagrams: stats.rx_unauthorized_datagrams,
+            rx_unknown_kinds: stats.rx_unknown_kinds,
+            rx_unknown_roles: stats.rx_unknown_roles,
+            rx_invalid_frames: stats.rx_invalid_frames,
+            parents_released_unconfirmed: stats.parents_released_unconfirmed,
+            apply_conflicts: stats.apply_conflicts,
+            apply_stale: stats.apply_stale,
         }
     }
 }
@@ -16762,6 +16825,36 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
             "av_mesh_cache_mesh_parents_released_total",
             "Parents released because they left a playlist's ranked set.",
             snapshot.mesh_fec.parents_released,
+        ),
+        (
+            "av_mesh_cache_mesh_parents_released_unconfirmed_total",
+            "Parents released at their timer, their replacement not confirmed.",
+            snapshot.mesh_fec.parents_released_unconfirmed,
+        ),
+        (
+            "av_mesh_cache_mesh_rx_unknown_kinds_total",
+            "Cache-mesh frames of a kind this build does not know.",
+            snapshot.mesh_fec.rx_unknown_kinds,
+        ),
+        (
+            "av_mesh_cache_mesh_rx_unknown_roles_total",
+            "Cache-mesh hellos of a role this build does not know.",
+            snapshot.mesh_fec.rx_unknown_roles,
+        ),
+        (
+            "av_mesh_cache_mesh_rx_invalid_frames_total",
+            "Cache-mesh frames that did not decode.",
+            snapshot.mesh_fec.rx_invalid_frames,
+        ),
+        (
+            "av_mesh_cache_mesh_apply_conflicts_total",
+            "Parts from a parent that kept the first copy of their epoch.",
+            snapshot.mesh_fec.apply_conflicts,
+        ),
+        (
+            "av_mesh_cache_mesh_apply_stale_total",
+            "Parts from a parent of an older epoch or id, dropped.",
+            snapshot.mesh_fec.apply_stale,
         ),
         (
             "av_mesh_watermark_stalls_over_250ms_total",
@@ -19774,6 +19867,43 @@ fn cpu_permille(cpu_us: u64, wall_us: u64, cpus: u32) -> u32 {
 /// `process.cpu_permille` of `GET /api/node`: once a second, the process's
 /// CPU time (`cpu_clock`, µs) over the second just ended, so the figure is
 /// always of the last whole second however seldom the status is read.
+/// How often the stopgap asks the cache mesh to release the parents that
+/// wait (C CR8's run_parent_release runs as often).
+const PARENT_RELEASE_EVERY: Duration = Duration::from_millis(100);
+
+/// C CR2 (pl-mesh.fix.md): how long a parent that left a stream's ranked set
+/// is renewed while its replacement is not confirmed: two of this node's
+/// renewal periods of a subscription lease (lease / 3 + the demand sweep),
+/// 4.3 s at the 5 s lease. Playlists' own default (2/3 of the lease) is
+/// shorter than this node's renewals.
+fn cache_mesh_parent_release_after(lease_ms: u64) -> Duration {
+    Duration::from_millis(2 * (lease_ms.max(100) / 3 + PLAYLIST_DEMAND_SWEEP_MS))
+}
+
+/// The stopgap for C CR8's `run_parent_release` (pl-mesh.fix.md): every
+/// 100 ms the cache mesh releases each parent that has waited
+/// `parent_release_after` since it left a ranked set. No parent is
+/// confirmed early (`|_, _| false`): today's behaviour, with a timer in
+/// place of the lease lapsing. CR8 replaces it with the fast plane's
+/// `ParentFeeds::delivering` and the early renewals.
+async fn run_parent_release_stopgap(
+    mesh: Arc<CacheMeshHandle>,
+    mut shutdown_rx: watch::Receiver<()>,
+) {
+    let mut tick = interval(PARENT_RELEASE_EVERY);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => return,
+            _ = tick.tick() => {
+                for (stream_id, parent, confirmed) in mesh.release_pending(&|_, _| false).await {
+                    debug!(stream_id, %parent, confirmed, "cache mesh released a parent that left the ranked set");
+                }
+            }
+        }
+    }
+}
+
 async fn run_node_cpu_sampler(
     cpu_clock: fn() -> Option<u64>,
     cpus: u32,
@@ -28975,6 +29105,200 @@ mod tests {
             cache.get_init_for_stream_id(stream_id).await.unwrap(),
             Bytes::from_static(b"ftypmoov-replicated")
         );
+    }
+
+    /// The playlists pin's new counters (C CR1, CR2; A PL1) reach
+    /// `/api/mesh/local`'s `mesh_fec` and Prometheus.
+    #[test]
+    fn the_cache_mesh_s_new_counters_are_carried() {
+        let stats = CacheMeshFecStats {
+            rx_unknown_kinds: 1,
+            rx_unknown_roles: 2,
+            rx_invalid_frames: 3,
+            parents_released_unconfirmed: 4,
+            apply_conflicts: 5,
+            apply_stale: 6,
+            ..CacheMeshFecStats::default()
+        };
+        let json = serde_json::to_value(MeshFecRuntimeSnapshot::from(stats)).unwrap();
+        for (field, value) in [
+            ("rx_unknown_kinds", 1),
+            ("rx_unknown_roles", 2),
+            ("rx_invalid_frames", 3),
+            ("parents_released_unconfirmed", 4),
+            ("apply_conflicts", 5),
+            ("apply_stale", 6),
+        ] {
+            assert_eq!(json[field], value, "{field}");
+        }
+    }
+
+    /// A PL1: the epoch that the cache mesh's first-copy rule reads from a
+    /// cached part is the key epoch that the full decode of its canonical
+    /// slot gives, for short and long stream names; any other slot, and a
+    /// cut one, has none (the part then replaces as before).
+    #[tokio::test]
+    async fn the_mesh_reads_a_slot_s_epoch_as_the_full_decode_does() {
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        for (index, epoch) in [0, 1, 1_763_924_000_123_456, u64::MAX >> 1]
+            .into_iter()
+            .enumerate()
+        {
+            let stream_id = [7, 4_001, 77_777_777_777, u64::MAX >> 2][index];
+            let envelope = encode_test_canonical_fmp4_object_with_epoch(
+                stream_id,
+                epoch,
+                3,
+                ObjectKind::Media,
+                true,
+                b"moofmdat-epoch",
+            );
+            cache
+                .commit_stream_payload(stream_id, envelope)
+                .await
+                .unwrap();
+            let (slot, _) = cache
+                .chunk_cache
+                .get_for_stream_id(stream_id, 3)
+                .await
+                .unwrap();
+            assert_eq!(
+                MeshPartRecord::from_slot(&slot, stream_id).unwrap().epoch,
+                Some(epoch)
+            );
+            assert_eq!(mesh_slot_epoch(&slot), Some(epoch), "stream {stream_id}");
+            // Cut inside the key: no epoch, and no panic.
+            for cut in [CANONICAL_LIVE_SLOT_HEADER_LEN + 3, CANONICAL_LIVE_SLOT_HEADER_LEN + 20] {
+                assert_eq!(mesh_slot_epoch(&slot[..cut]), None);
+            }
+        }
+        assert_eq!(mesh_slot_epoch(b"moofmdat-not-a-canonical-slot"), None);
+        assert_eq!(mesh_slot_epoch(&[]), None);
+    }
+
+    /// C CR2 with the stopgap for C CR8 (pl-mesh.fix.md): a parent that
+    /// drains leaves the edge's ranked set and waits; nothing confirms its
+    /// replacement, so the 100 ms task releases it once it has waited
+    /// `parent_release_after`, not before, and counts it unconfirmed. At
+    /// the 5 s lease the wait is two of this node's renewal periods.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_stopgap_releases_a_parent_that_left_at_its_timer() {
+        use playlists::mesh::{CacheMesh, CacheMeshConfig};
+        assert_eq!(
+            cache_mesh_parent_release_after(5_000),
+            Duration::from_millis(4_332)
+        );
+        let lease = Duration::from_millis(600);
+        let release_after = Duration::from_millis(400);
+        let config = |name: &str, addr: SocketAddr, role: CacheMeshRole| {
+            let mut config = CacheMeshConfig::new(name, "uk", addr)
+                .with_same_region_only(true)
+                .with_role(role)
+                .with_replication(ReplicationMode::Demand)
+                .with_subscription_lease(lease);
+            config.sync_interval = Duration::from_millis(10);
+            config.announce_interval = Duration::from_millis(100);
+            config
+        };
+        let addrs = [
+            unused_loopback_addr(),
+            unused_loopback_addr(),
+            unused_loopback_addr(),
+        ];
+        let edge_addr = unused_loopback_addr();
+        let mut parents = Vec::new();
+        for (index, addr) in addrs.iter().enumerate() {
+            let cache = canonical_gap_test_cache().await;
+            commit_canonical_gap_test_part(&cache, 7, 0).await;
+            let parent = CacheMesh::new(
+                Arc::clone(&cache.chunk_cache),
+                config(&format!("dist-{index}"), *addr, CacheMeshRole::Distributor)
+                    .with_peer(edge_addr),
+            )
+            .start()
+            .await
+            .unwrap();
+            parents.push((parent, cache));
+        }
+        let edge_cache = canonical_gap_test_cache().await;
+        let edge = Arc::new(
+            CacheMesh::new(
+                Arc::clone(&edge_cache.chunk_cache),
+                config("edge", edge_addr, CacheMeshRole::Edge)
+                    .with_peers(addrs)
+                    .with_max_parents(2)
+                    .with_parent_release_after(release_after),
+            )
+            .start()
+            .await
+            .unwrap(),
+        );
+        let wait = |what: &'static str, done: Box<dyn Fn() -> bool + Send + Sync>| async move {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !done() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{what}"));
+        };
+        // The parents' hellos, then a subscription ranked over two of them.
+        let ranked = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let heard = edge
+                    .peer_statuses()
+                    .await
+                    .iter()
+                    .filter(|peer| peer.heard.is_some() && peer.role.is_some())
+                    .count();
+                if heard == 3 {
+                    let ranked = edge.subscribe(7, 0, 0).await.unwrap();
+                    if ranked.len() == 2 {
+                        break ranked;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("two of the parents rank");
+        let first = addrs.iter().position(|addr| *addr == ranked[0]).unwrap();
+        parents[first].0.set_draining(true);
+        let draining = Arc::clone(&edge);
+        let left = addrs[first];
+        wait(
+            "the draining hello arrives",
+            Box::new(move || draining.draining_peers().contains(&left)),
+        )
+        .await;
+        let ranked = edge.subscribe(7, 0, 0).await.unwrap();
+        let left_at = Instant::now();
+        assert!(!ranked.contains(&left), "{ranked:?}");
+        assert_eq!(edge.pending_parents(), vec![(7, left)]);
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let task = tokio::spawn(run_parent_release_stopgap(Arc::clone(&edge), shutdown_rx));
+        let pending = Arc::clone(&edge);
+        wait(
+            "the stopgap releases the parent",
+            Box::new(move || pending.pending_parents().is_empty()),
+        )
+        .await;
+        let waited = left_at.elapsed();
+        assert!(waited + Duration::from_millis(50) >= release_after, "{waited:?}");
+        assert!(
+            waited <= release_after + PARENT_RELEASE_EVERY * 5,
+            "{waited:?}"
+        );
+        let stats = edge.fec_stats();
+        assert_eq!(
+            (stats.parents_released, stats.parents_released_unconfirmed),
+            (1, 1)
+        );
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("the stopgap ends at shutdown")
+            .unwrap();
     }
 
     #[tokio::test]
