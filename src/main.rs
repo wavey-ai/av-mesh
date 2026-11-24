@@ -8,6 +8,7 @@ mod fast_control;
 mod fast_path;
 mod fast_plane;
 mod hop_journal;
+mod lifecycle;
 mod memory;
 mod link_telemetry;
 mod node_status;
@@ -54,6 +55,7 @@ use frame_header::FrameHeaderV2;
 use futures_util::{future::join_all, SinkExt, StreamExt};
 use h3_webtransport::server::{AcceptedBi, WebTransportSession};
 use hop_journal::{HopEvent, HopJournal, HopQuery, HopStage, DEFAULT_HOP_JOURNAL_CAPACITY};
+use lifecycle::{LifecycleConfig, NodeLifecycle};
 use http::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use link_telemetry::{LinkObservation, LinkTelemetry};
@@ -3102,6 +3104,53 @@ struct Args {
     )]
     cache_mesh_test_receive_loss_ppm: u32,
 
+    /// For the proof that two builds interoperate (C 2.1): this node speaks
+    /// as a later build might. Its cache-mesh frames carry the next version,
+    /// an unknown hello extension and longer subscribes, with a frame of an
+    /// unknown kind each second; its telemetry snapshots and the control
+    /// envelopes it publishes carry a field `x_future`.
+    #[arg(
+        long,
+        hide = true,
+        env = "NEEDLETAIL_CACHE_MESH_TEST_FUTURE_FRAMES",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    cache_mesh_test_future_frames: bool,
+
+    /// C 3.1: the node starts with the drain reason `start` and drops it by
+    /// itself once warm: an edge takes no listener and a forwarder's hellos
+    /// say draining until then. `false`: it serves from its start.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_START_DRAINED",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    start_drained: bool,
+
+    /// C 3.1: the longest an edge's start waits for its copies to be warm
+    /// before it drops `start` anyway, and says so (`ready_forced`).
+    #[arg(long, env = "NEEDLETAIL_START_WARM_MS", default_value_t = 4_000)]
+    start_warm_ms: u64,
+
+    /// C 3.2, B 3.12: the longest an edge waits on SIGTERM for its listeners
+    /// and readers to leave. 0: --client-udp-drain-spread-ms +
+    /// --client-udp-move-grace-ms + 2,000 (14,000 with their defaults).
+    #[arg(long, env = "NEEDLETAIL_STOP_DRAIN_MS", default_value_t = 0)]
+    stop_drain_ms: u64,
+
+    /// C 3.2: how long a forwarder keeps forwarding after SIGTERM while its
+    /// hellos say it is leaving (three hellos).
+    #[arg(long, env = "NEEDLETAIL_STOP_LINGER_MS", default_value_t = 300)]
+    stop_linger_ms: u64,
+
+    /// C 2.2: where an operator's drain (`drain-node`, `close-node`) is kept
+    /// until `resume-node`, so that it holds across a restart. None: it
+    /// ends with the process.
+    #[arg(long, env = "NEEDLETAIL_DRAIN_STATE_FILE")]
+    drain_state_file: Option<PathBuf>,
+
     /// Most playback sessions that this node serves at one time. Zero sets
     /// no limit. A node at the limit rejects a new session and names other
     /// caches of the region.
@@ -3520,6 +3569,8 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse().normalized()?;
+    // From here on SIGTERM and SIGINT are a stop the node makes itself.
+    let mut stop = lifecycle::stop_signal().context("failed to listen for SIGTERM and SIGINT")?;
     // Wave 9 (cold start): memory before the first session, not in it.
     hop_journal::PREFAULT.store(args.prefault, std::sync::atomic::Ordering::Relaxed);
     match memory::tune_allocator(args.malloc_tune) {
@@ -3564,9 +3615,11 @@ async fn main() -> Result<()> {
         ..ReplicationPolicy::default()
     };
     let control_plane = ControlPlane::default();
-    let control_dispatch = ControlDispatch::default();
+    let control_dispatch = ControlDispatch {
+        future_fields: args.cache_mesh_test_future_frames,
+        ..ControlDispatch::default()
+    };
     let demand_tracker = DemandTracker::default();
-    let lifecycle = NodeLifecycle::default();
     let telemetry_aggregator = TelemetryAggregator::new(args.telemetry_stale_ms);
     let telemetry_peer_monitor = TelemetryPeerMonitor::new(&telemetry_peers);
     let telemetry_fec_queue =
@@ -3709,6 +3762,25 @@ async fn main() -> Result<()> {
         .cache_mesh_region
         .clone()
         .unwrap_or_else(|| args.region.clone());
+    let cache_mesh_role: CacheMeshRole = args.cache_mesh_role.into();
+    let replication = effective_replication(args.cache_mesh_replication, cache_mesh_role);
+    // A forwarder slot (--cache-mesh-upstream-demand) holds the playlists
+    // that its children lease from it as an edge holds those its readers
+    // ask for: by subscribing at its parent distributors (AM 12).
+    let upstream_demand = args.cache_mesh_upstream_demand
+        && replication == ReplicationMode::Demand
+        && cache_mesh_role == CacheMeshRole::Distributor;
+    let demand_enabled = replication == ReplicationMode::Demand
+        && (cache_mesh_role == CacheMeshRole::Edge || upstream_demand);
+    // C 3.1: the drain reasons, an operator's from the drain-state file;
+    // the hello says draining from the mesh's start while any holds. A node
+    // that replicates on demand opens at its start what must be warm.
+    let lifecycle = NodeLifecycle::new(LifecycleConfig {
+        edge: cache_mesh_role == CacheMeshRole::Edge,
+        start_drained: args.start_drained,
+        state_file: args.drain_state_file.clone(),
+        warm_pass: demand_enabled,
+    });
     let mut mesh_config = CacheMeshConfig::new(node_id.clone(), cache_mesh_region, args.mesh_bind)
         .with_peers(mesh_peers)
         .with_same_region_only(true)
@@ -3721,8 +3793,6 @@ async fn main() -> Result<()> {
     mesh_config.repair_ratio = args.mesh_repair_ratio;
     mesh_config.max_repair_symbols = args.mesh_max_repair_symbols;
     mesh_config.symbol_size = args.mesh_symbol_size;
-    let cache_mesh_role: CacheMeshRole = args.cache_mesh_role.into();
-    let replication = effective_replication(args.cache_mesh_replication, cache_mesh_role);
     let (mesh_applied_tx, mesh_applied_rx) = mpsc::unbounded_channel();
     let mesh_config = mesh_config
         .with_receive_loss_ppm(args.cache_mesh_test_receive_loss_ppm)
@@ -3748,6 +3818,10 @@ async fn main() -> Result<()> {
         // that `GET /api/node` shows.
         .with_parent_release_after(cache_mesh_parent_release_after(args.cache_mesh_lease_ms))
         .with_boot_id(cache.started_unix_us)
+        // C CR6: the hello gives this node's build and state.
+        .with_build(av_mesh::build::GIT.to_owned())
+        .with_hello_state(lifecycle.hello())
+        .with_test_future_frames(args.cache_mesh_test_future_frames)
         // A PL1 (A 2.7): a part from a parent keeps the first copy of its
         // epoch (two contributors publish the same parts).
         .with_slot_epoch(mesh_slot_epoch);
@@ -3854,20 +3928,14 @@ async fn main() -> Result<()> {
         .await?
         .context("failed to start cache mesh")?,
     );
+    lifecycle.attach_mesh(&mesh_handle);
     fast_path_report.tune_receive_socket_at(mesh_handle.local_addr(), "cache mesh");
     if let Some(class_addr) = mesh_handle.class_local_addr() {
         info!(bind = %class_addr, "cache mesh video class socket listening");
         fast_path_report.tune_receive_socket_at(class_addr, "cache mesh video");
     }
-    // A forwarder slot (--cache-mesh-upstream-demand) holds the playlists
-    // that its children lease from it as an edge holds those its readers
-    // ask for: by subscribing at its parent distributors (AM 12).
-    let upstream_demand = args.cache_mesh_upstream_demand
-        && replication == ReplicationMode::Demand
-        && cache_mesh_role == CacheMeshRole::Distributor;
     let playlist_demand = PlaylistDemand::new(PlaylistDemandConfig {
-        enabled: replication == ReplicationMode::Demand
-            && (cache_mesh_role == CacheMeshRole::Edge || upstream_demand),
+        enabled: demand_enabled,
         lease: Duration::from_millis(args.cache_mesh_lease_ms.max(100)),
         idle: Duration::from_millis(args.cache_mesh_demand_idle_ms.max(1_000)),
         warm_parts: if args.cache_mesh_warm_parts > 0 {
@@ -3923,13 +3991,6 @@ async fn main() -> Result<()> {
         playlist_demand.clone(),
         ingest_shutdown_rx.clone(),
     ));
-    let upstream_demand_task = upstream_demand.then(|| {
-        tokio::spawn(run_upstream_demand(
-            Arc::clone(&mesh_handle),
-            playlist_demand.clone(),
-            ingest_shutdown_rx.clone(),
-        ))
-    });
     let playlist_standby_task = tokio::spawn(run_playlist_standby(
         Arc::clone(&mesh_handle),
         edge_load.clone(),
@@ -4165,11 +4226,11 @@ async fn main() -> Result<()> {
         forwarder: relay_forwarder.clone(),
         ..NodeStatusSource::default()
     };
-    // C CR2's make-before-break release needs a caller of release_pending;
-    // until the lifecycle unit's run_parent_release (C CR8) lands, the
-    // stopgap releases a pending parent at its timer only (pl-mesh.fix.md).
-    let parent_release_task = tokio::spawn(run_parent_release_stopgap(
+    // C CR2's make-before-break release: a parent that left a ranked set
+    // goes once the fast plane sees its replacement deliver.
+    let parent_release_task = tokio::spawn(run_parent_release(
         Arc::clone(&mesh_handle),
+        Arc::clone(&cache),
         ingest_shutdown_rx.clone(),
     ));
     let node_cpu_task = tokio::spawn(run_node_cpu_sampler(
@@ -4360,6 +4421,29 @@ async fn main() -> Result<()> {
                 to_mean: args.client_udp_rebalance_to_mean,
             }),
     );
+    // C 3.1: a node that starts drained takes its place once warm.
+    let start_task = if cache_mesh_role == CacheMeshRole::Edge {
+        tokio::spawn(lifecycle::start_edge(
+            router.clone(),
+            Duration::from_millis(args.start_warm_ms),
+            ingest_shutdown_rx.clone(),
+        ))
+    } else {
+        tokio::spawn(lifecycle::start_forwarder(
+            router.clone(),
+            ingest_shutdown_rx.clone(),
+        ))
+    };
+    // A slot holds what its children lease, and at its start what its
+    // region's edges hold (F7).
+    let upstream_demand_task = upstream_demand.then(|| {
+        tokio::spawn(run_upstream_demand(
+            router.clone(),
+            ingest_shutdown_rx.clone(),
+        ))
+    });
+    // The stop (C 3.2) drives the node through its router.
+    let stop_router = router.clone();
     let telemetry_fec_sender = if let Some(queue) = telemetry_fec_queue.clone() {
         Some(
             start_telemetry_fec_sender(
@@ -4391,6 +4475,7 @@ async fn main() -> Result<()> {
     let telemetry_publisher_task = start_telemetry_publisher(
         router.clone(),
         args.telemetry_interval_ms,
+        args.cache_mesh_test_future_frames,
         if args.telemetry_snapshots_fec_only {
             None
         } else {
@@ -4605,10 +4690,12 @@ async fn main() -> Result<()> {
     // The relay ingest ends only at shutdown. If it ends before (an error,
     // or a fast-plane tee that failed), the node no longer takes or commits
     // media: it shuts down with the error, so that its supervisor restarts it.
+    // SIGTERM and SIGINT are a graceful stop (C 3.2): an edge drains first, a
+    // forwarder says it is leaving; a second signal skips what is left.
     let mut fec_ingest_task = fec_ingest_task;
     let ingest_failure = tokio::select! {
-        signal = tokio::signal::ctrl_c() => {
-            signal?;
+        signal = stop.recv() => {
+            info!(signal, "stopping");
             None
         }
         ended = &mut fec_ingest_task => Some(match ended {
@@ -4619,6 +4706,29 @@ async fn main() -> Result<()> {
     };
     if let Some(error) = &ingest_failure {
         error!(error = %format!("{error:#}"), "shutting down");
+    } else {
+        let second = async {
+            let signal = stop.recv().await;
+            warn!(signal, "a second signal: the stop skips what is left of its waits");
+        };
+        let stopped = if cache_mesh_role == CacheMeshRole::Edge {
+            lifecycle::stop_edge(&stop_router, args.stop_drain(), second).await
+        } else {
+            lifecycle::stop_forwarder(
+                &stop_router,
+                Duration::from_millis(args.stop_linger_ms),
+                upstream_demand,
+                second,
+            )
+            .await
+        };
+        info!(
+            drained = stopped.drained,
+            skipped = stopped.skipped,
+            waited_ms = stopped.waited.as_millis() as u64,
+            released = stopped.released,
+            "stopped taking part: shutting down"
+        );
     }
     mesh_handle.shutdown();
     let _ = ingest_shutdown_tx.send(());
@@ -4644,6 +4754,7 @@ async fn main() -> Result<()> {
     let _ = replication_planner_task.await;
     let _ = node_cpu_task.await;
     let _ = parent_release_task.await;
+    let _ = start_task.await;
     if let Some(task) = edge_udp_task {
         let _ = task.await;
     }
@@ -4690,6 +4801,18 @@ impl Args {
     /// clocks and the hold of its warm sources.
     fn relay_media_deadline_us(&self) -> u64 {
         self.relay_media_deadline_ms.saturating_mul(1_000)
+    }
+
+    /// An edge's stop bound (C 3.2, B 3.12): `--stop-drain-ms`, or B's drain
+    /// spread and move grace and 2 s.
+    fn stop_drain(&self) -> Duration {
+        Duration::from_millis(if self.stop_drain_ms > 0 {
+            self.stop_drain_ms
+        } else {
+            self.client_udp_drain_spread_ms
+                .saturating_add(self.client_udp_move_grace_ms)
+                .saturating_add(lifecycle::STOP_DRAIN_SPARE_MS)
+        })
     }
 
     /// Threads that serve readers: the configured number, or as many as the
@@ -14620,6 +14743,10 @@ struct PlaylistHolding {
     /// Requests that one reader of the playlist makes in a second.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     request_rate: Option<u64>,
+    /// The playlist is video, as the cache learnt from where it arrived:
+    /// a starting edge opens no copy of it to be warm (C 3.1 E5).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    video: bool,
 }
 
 impl EdgeServiceSnapshot {
@@ -15282,42 +15409,6 @@ struct ControlEnvelope {
 }
 
 #[derive(Debug, Clone, Default)]
-struct NodeLifecycle {
-    draining: Arc<RwLock<bool>>,
-    /// When the node last began to drain (`None` while it serves).
-    draining_since: Arc<StdMutex<Option<Instant>>>,
-    /// Woken when the node begins or stops draining: the telemetry
-    /// publisher advertises the change at once instead of at its next tick.
-    changed: Arc<tokio::sync::Notify>,
-}
-
-impl NodeLifecycle {
-    async fn is_draining(&self) -> bool {
-        *self.draining.read().await
-    }
-
-    async fn set_draining(&self, draining: bool) {
-        let was = std::mem::replace(&mut *self.draining.write().await, draining);
-        if was != draining {
-            *self.draining_since.lock().unwrap() = draining.then(Instant::now);
-            // A stored permit when the publisher is not waiting yet.
-            self.changed.notify_one();
-        }
-    }
-
-    /// How much longer a draining node waits before its first moves, so
-    /// that the advertisement saying it drains (sent at once on the change)
-    /// reaches the entry points first: otherwise the movers of an edge
-    /// drained at the same moment are sent to this one, and moved again.
-    fn drain_advert_wait(&self, now: Instant, grace: Duration) -> Option<Duration> {
-        let since = (*self.draining_since.lock().unwrap())?;
-        grace
-            .checked_sub(now.saturating_duration_since(since))
-            .filter(|wait| !wait.is_zero())
-    }
-}
-
-#[derive(Debug, Clone, Default)]
 struct DemandTracker {
     last_replica_request_unix_ms: Arc<DashMap<u64, AtomicU64>>,
     last_hole_repair_unix_us: Arc<DashMap<u64, AtomicU64>>,
@@ -15884,19 +15975,208 @@ async fn run_playlist_standby(
     }
 }
 
+/// What one edge of the region advertised of one playlist's head, from
+/// one of its advertisements to the next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeadSeen {
+    /// The advertisement's own time: a new one is a new advertisement.
+    advert_ms: u64,
+    head: u64,
+    /// Advertisements of it seen (two are enough to tell).
+    adverts: u8,
+    /// The head moved between the last two.
+    moved: bool,
+    video: bool,
+}
+
+/// The heads of the playlists that the region's fresh, serving edges hold
+/// (the list `run_playlist_standby` reads), from advertisement to
+/// advertisement (C 3.1 E5, F7): a playlist whose head moved between a
+/// holder's last two advertisements has a live source. A held playlist
+/// with none never decodes, and a copy outlives its readers by the demand
+/// idle time, so only moving heads count.
+///
+/// A node advertises once each telemetry interval, a new process holds no
+/// advertisement and peers do not replay theirs: an empty view, or one in
+/// which a holder's first advertisement has not arrived yet, is not an idle
+/// region. So the heads are known only once the region has been heard for
+/// one and a half of its advertisement intervals (as its nodes' own
+/// advertisements space them: every node whose link was up when the first
+/// was heard has advertised by then, whatever its phase), every fresh node
+/// of it has been seen in two of its advertisements, and every playlist of
+/// every fresh holder in two of that holder's.
+#[derive(Debug, Default)]
+struct RegionHeads {
+    /// When a node of the region was first heard.
+    heard_ms: Option<u64>,
+    /// The region's fresh nodes (any role), by node id.
+    nodes: HashMap<String, NodeAdverts>,
+    seen: HashMap<(String, u64), HeadSeen>,
+}
+
+/// The advertisements seen of one node of the region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NodeAdverts {
+    /// The last advertisement's own time.
+    advert_ms: u64,
+    adverts: u8,
+    /// The time between its last two advertisements (0 until two).
+    spacing_ms: u64,
+}
+
+impl RegionHeads {
+    /// Read the region's advertisements now. True when the region has been
+    /// heard, every fresh node of it has been seen in two advertisements,
+    /// and every playlist of every fresh holder in two of that holder's:
+    /// the moving heads are known (none in a region where no edge holds
+    /// anything).
+    async fn observe(
+        &mut self,
+        telemetry: &TelemetryAggregator,
+        node: &MeshNode,
+        fresh_ms: u64,
+        now_ms: u64,
+    ) -> bool {
+        let mut nodes = HashMap::new();
+        let mut seen = HashMap::new();
+        for snapshot in telemetry.snapshots.read().await.values() {
+            if snapshot.node.node_id == node.node_id
+                || snapshot.node.region != node.region
+                || telemetry.advertisement_age_ms(snapshot, now_ms) > fresh_ms
+            {
+                continue;
+            }
+            let advert_ms = snapshot.updated_unix_ms;
+            let advert = match self.nodes.get(&snapshot.node.node_id) {
+                Some(before) if before.advert_ms == advert_ms => *before,
+                Some(before) => NodeAdverts {
+                    advert_ms,
+                    adverts: before.adverts.saturating_add(1),
+                    spacing_ms: advert_ms.saturating_sub(before.advert_ms),
+                },
+                None => NodeAdverts {
+                    advert_ms,
+                    adverts: 1,
+                    spacing_ms: 0,
+                },
+            };
+            nodes.insert(snapshot.node.node_id.clone(), advert);
+            let Some(edge) = snapshot.edge_service.as_ref() else {
+                continue;
+            };
+            if edge.cache_mesh_role != "edge" || edge.draining || snapshot.node.draining {
+                continue;
+            }
+            for playlist in &edge.playlists {
+                let key = (snapshot.node.node_id.clone(), playlist.stream_id);
+                let next = match self.seen.get(&key) {
+                    Some(before) if before.advert_ms == snapshot.updated_unix_ms => *before,
+                    Some(before) => HeadSeen {
+                        advert_ms: snapshot.updated_unix_ms,
+                        head: playlist.head_part,
+                        adverts: before.adverts.saturating_add(1),
+                        moved: playlist.head_part > before.head,
+                        video: playlist.video,
+                    },
+                    None => HeadSeen {
+                        advert_ms: snapshot.updated_unix_ms,
+                        head: playlist.head_part,
+                        adverts: 1,
+                        moved: false,
+                        video: playlist.video,
+                    },
+                };
+                seen.insert(key, next);
+            }
+        }
+        self.nodes = nodes;
+        self.seen = seen;
+        if self.nodes.is_empty() {
+            return false;
+        }
+        let heard_ms = *self.heard_ms.get_or_insert(now_ms);
+        let interval_ms = self
+            .nodes
+            .values()
+            .map(|node| node.spacing_ms)
+            .max()
+            .unwrap_or(0);
+        self.nodes.values().all(|node| node.adverts >= 2)
+            && self.seen.values().all(|head| head.adverts >= 2)
+            && now_ms.saturating_sub(heard_ms) >= interval_ms.saturating_mul(3) / 2
+    }
+
+    /// The playlists whose head moves at some holder, each with the highest
+    /// head advertised for it and whether it is video, by stream id.
+    fn moving(&self) -> BTreeMap<u64, (u64, bool)> {
+        let mut moving: BTreeMap<u64, (u64, bool)> = BTreeMap::new();
+        for ((_, stream_id), head) in &self.seen {
+            if head.moved {
+                let entry = moving.entry(*stream_id).or_insert((head.head, head.video));
+                entry.0 = entry.0.max(head.head);
+                entry.1 |= head.video;
+            }
+        }
+        moving
+    }
+}
+
+/// E5 (C 3.1): while an edge starts drained, it opens a copy of every audio
+/// playlist whose head moves in its region (`RegionHeads`), up to
+/// `standby_playlist_limit`, as a reader would (`open_playlist_demand`),
+/// and gives the readiness evaluator the copies with the highest head
+/// advertised when each was opened. The copies are ordinary demand and
+/// lapse by the idle rule unless a listener comes. Video is never opened
+/// for a warm-up: a 4K copy that nobody reads costs a 2-vCPU edge most of
+/// its processor for the idle time.
+async fn warm_playlists(router: &AppRouter, heads: &mut RegionHeads) {
+    if !router.playlist_demand.config.enabled {
+        // A node that holds every playlist has none to open (its lifecycle
+        // has no warm pass to judge).
+        return;
+    }
+    let judged = heads
+        .observe(
+            &router.telemetry,
+            &router.node,
+            router.assignment_fresh_ms,
+            now_unix_ms(),
+        )
+        .await;
+    let limit = standby_playlist_limit(router.playlist_demand.config.max_playlists);
+    let mut copies = router.lifecycle.warm_pass().copies;
+    for (stream_id, (head, video)) in heads.moving() {
+        if video || copies.len() >= limit || copies.iter().any(|(held, _)| *held == stream_id) {
+            continue;
+        }
+        if router.open_playlist_demand(stream_id).await {
+            info!(
+                stream_id,
+                head, "a starting edge opens a copy of a live playlist to be warm before it serves"
+            );
+            copies.push((stream_id, head));
+        }
+    }
+    router.lifecycle.set_warm_copies(copies, judged);
+}
+
 /// A forwarder slot's demand (AM 12, --cache-mesh-upstream-demand): every
 /// playlist that a child leases from this distributor is demand like a
 /// reader, touched on each sweep, so the node subscribes at its parent
 /// distributors and renews while the lease lasts; run_playlist_demand
 /// releases a playlist that no child has leased for the idle time.
-async fn run_upstream_demand(
-    mesh: Arc<CacheMeshHandle>,
-    demand: PlaylistDemand,
-    mut shutdown_rx: watch::Receiver<()>,
-) {
+///
+/// F7 (C 3.1): while the slot starts drained it is cut from every child's
+/// ranked set and so leases nothing; it holds instead every playlist that a
+/// fresh edge of its region holds with a moving head (every class, up to
+/// `standby_playlist_limit`), until it is warm, so that its window is full
+/// when it clears its bit.
+async fn run_upstream_demand(router: AppRouter, mut shutdown_rx: watch::Receiver<()>) {
+    let (mesh, demand) = (Arc::clone(&router.mesh), router.playlist_demand.clone());
     let mut ticker = interval(Duration::from_millis(PLAYLIST_DEMAND_SWEEP_MS / 5));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut changed = mesh.served_changed();
+    let mut heads = RegionHeads::default();
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => return,
@@ -15913,6 +16193,20 @@ async fn run_upstream_demand(
             .iter()
             .map(|served| served.stream_id)
             .collect();
+        if router.lifecycle.holds(node_status::DrainReason::Start) {
+            let judged = heads
+                .observe(&router.telemetry, &router.node, router.assignment_fresh_ms, now_ms)
+                .await;
+            let limit = standby_playlist_limit(demand.config.max_playlists);
+            let mut held = router.lifecycle.warm_pass().slot_streams;
+            for stream_id in heads.moving().into_keys() {
+                if held.len() < limit && !held.contains(&stream_id) {
+                    held.push(stream_id);
+                }
+            }
+            streams.extend(&held);
+            router.lifecycle.set_slot_streams(held, judged);
+        }
         streams.sort_unstable();
         streams.dedup();
         for stream_id in streams {
@@ -15924,7 +16218,7 @@ async fn run_upstream_demand(
                 Ok(parents) => info!(
                     stream_id,
                     parents = parents.len(),
-                    "a child's lease subscribed this forwarder at its parent distributors"
+                    "a child's lease or the slot's start subscribed this forwarder at its parent distributors"
                 ),
                 Err(error) => warn!(
                     stream_id,
@@ -16024,6 +16318,60 @@ fn reports_relay_demand(args: &Args, role: CacheMeshRole, upstream_demand: bool)
 /// 1 and 2.
 const RANKED_PARENT_FIRST_SESSION: u64 = 16;
 
+/// C 2.1 (b): after a parent changed, the subscribe of each held playlist
+/// is sent again this long after the first, unless every parent it ranks
+/// already delivers it here.
+const EARLY_RENEWALS: [Duration; 2] = [Duration::from_millis(100), Duration::from_millis(300)];
+
+/// A parent is confirmed for a playlist while this node's fast plane has an
+/// admitted source of it from the parent's address this recently (C 2.1 d).
+const PARENT_CONFIRMED_WITHIN_US: u64 = 100_000;
+
+/// Subscribe a held playlist from the first part this node lacks: a parent
+/// that already serves the lease only extends it, a parent new to it sends
+/// the parts from there. Returns the parents it ranks.
+async fn subscribe_held_playlist(
+    cache: &LiveTsCache,
+    mesh: &CacheMeshHandle,
+    stream_id: u64,
+    warm_parts: usize,
+) -> Vec<SocketAddr> {
+    let from_slot = cache
+        .stream_position_for_id(stream_id)
+        .await
+        .map_or(0, |(_, last)| last.saturating_add(1));
+    match mesh.subscribe(stream_id, from_slot, warm_parts).await {
+        Ok(parents) => parents,
+        Err(error) => {
+            warn!(stream_id, error = %error, "failed to renew a playlist subscription");
+            Vec::new()
+        }
+    }
+}
+
+/// Every parent a playlist ranks delivers it on this node's fast plane now
+/// (C 2.1 d); never on a node without the fast plane.
+fn ranked_parents_deliver(cache: &LiveTsCache, stream_id: u64, ranked: &[SocketAddr]) -> bool {
+    let Some(feeds) = cache.parent_feeds() else {
+        return false;
+    };
+    let now_us = now_unix_us();
+    !ranked.is_empty()
+        && ranked.iter().all(|parent| {
+            feeds.delivering(parent.ip(), stream_id, now_us, PARENT_CONFIRMED_WITHIN_US)
+        })
+}
+
+/// Hold the playlists that have demand: subscribe at the first request
+/// (elsewhere), renew at a third of the lease, release after the idle time.
+///
+/// C 2.1 (b): when a parent is new, has restarted, is heard again or
+/// changes its draining bit (`parents_changed`), this node greets its
+/// parents (a parent that has just started drops a subscribe from a peer
+/// of unknown region), subscribes every held playlist again at once
+/// (re-ranked), and repeats each 100 ms and 300 ms later unless every
+/// parent it ranks already delivers it. A restarted parent so has its
+/// leases back within a hello and 300 ms, not at the next renewal.
 async fn run_playlist_demand(
     cache: Arc<LiveTsCache>,
     mesh: Arc<CacheMeshHandle>,
@@ -16034,13 +16382,79 @@ async fn run_playlist_demand(
     if !demand.config.enabled {
         return;
     }
+    enum Wake {
+        Sweep,
+        ParentsChanged,
+        Early,
+    }
     let mut ticker = interval(Duration::from_millis(PLAYLIST_DEMAND_SWEEP_MS));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut parents_changed = mesh.parents_changed();
+    let mut parents_open = true;
+    let mut early_tick = interval(EARLY_RENEWALS[0]);
+    early_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // The early renewals due, and the parents each held playlist ranked.
+    let mut early: Vec<(Instant, u64)> = Vec::new();
+    let mut ranked: HashMap<u64, Vec<SocketAddr>> = HashMap::new();
     loop {
-        tokio::select! {
+        let wake = tokio::select! {
             _ = shutdown_rx.changed() => return,
-            _ = ticker.tick() => {}
+            _ = ticker.tick() => Wake::Sweep,
+            changed = parents_changed.changed(), if parents_open => {
+                // The mesh has stopped: no parent changes any more.
+                parents_open = changed.is_ok();
+                if !parents_open {
+                    continue;
+                }
+                Wake::ParentsChanged
+            }
+            _ = early_tick.tick(), if !early.is_empty() => Wake::Early,
+        };
+        match wake {
+            Wake::Sweep => {}
+            Wake::ParentsChanged => {
+                if let Err(error) = mesh.greet_parents().await {
+                    debug!(error = %error, "the greeting of the cache-mesh parents failed");
+                }
+                let now = Instant::now();
+                let held: Vec<u64> = demand.streams.iter().map(|entry| *entry.key()).collect();
+                for stream_id in held {
+                    let parents =
+                        subscribe_held_playlist(&cache, &mesh, stream_id, demand.config.warm_parts)
+                            .await;
+                    ranked.insert(stream_id, parents);
+                    early.retain(|(_, stream)| *stream != stream_id);
+                    early.extend(EARLY_RENEWALS.iter().map(|after| (now + *after, stream_id)));
+                }
+                continue;
+            }
+            Wake::Early => {
+                let now = Instant::now();
+                let mut due: Vec<u64> = early
+                    .iter()
+                    .filter(|(at, _)| *at <= now)
+                    .map(|(_, stream_id)| *stream_id)
+                    .collect();
+                early.retain(|(at, _)| *at > now);
+                due.sort_unstable();
+                due.dedup();
+                for stream_id in due {
+                    if !demand.streams.contains_key(&stream_id)
+                        || ranked
+                            .get(&stream_id)
+                            .is_some_and(|parents| ranked_parents_deliver(&cache, stream_id, parents))
+                    {
+                        continue;
+                    }
+                    let parents =
+                        subscribe_held_playlist(&cache, &mesh, stream_id, demand.config.warm_parts)
+                            .await;
+                    ranked.insert(stream_id, parents);
+                }
+                continue;
+            }
         }
+        ranked.retain(|stream_id, _| demand.streams.contains_key(stream_id));
         let now_ms = now_unix_ms();
         for stream_id in demand.take_idle(now_ms) {
             if let Err(error) = mesh.unsubscribe(stream_id).await {
@@ -16051,19 +16465,9 @@ async fn run_playlist_demand(
             info!(stream_id, "released a playlist that has no readers");
         }
         for stream_id in demand.take_renewals(now_ms) {
-            // A renewal names the first part that this edge lacks. A parent
-            // that already serves the lease only extends it. A parent that
-            // is new to this edge sends the parts from there.
-            let from_slot = cache
-                .stream_position_for_id(stream_id)
-                .await
-                .map_or(0, |(_, last)| last.saturating_add(1));
-            if let Err(error) = mesh
-                .subscribe(stream_id, from_slot, demand.config.warm_parts)
-                .await
-            {
-                warn!(stream_id, error = %error, "failed to renew a playlist subscription");
-            }
+            let parents =
+                subscribe_held_playlist(&cache, &mesh, stream_id, demand.config.warm_parts).await;
+            ranked.insert(stream_id, parents);
         }
     }
 }
@@ -18850,6 +19254,9 @@ impl ControlPlane {
 #[derive(Debug, Clone, Default)]
 struct ControlDispatch {
     tx: Arc<RwLock<Option<mpsc::Sender<TcpChangesMessage>>>>,
+    /// `--cache-mesh-test-future-frames`: envelopes carry a field no build
+    /// knows.
+    future_fields: bool,
 }
 
 impl ControlDispatch {
@@ -18865,7 +19272,8 @@ impl ControlDispatch {
         let Some(tx) = self.tx.read().await.clone() else {
             return Ok(false);
         };
-        let json = serde_json::to_vec(envelope).context("failed to encode control envelope")?;
+        let json = json_with_future_field(envelope, self.future_fields)
+            .context("failed to encode control envelope")?;
         tx.send(TcpChangesMessage::new(CONTROL_TAG, vec![Bytes::from(json)]))
             .await
             .map_err(|_| anyhow!("tcp changes control feed is closed"))?;
@@ -19503,9 +19911,63 @@ impl TelemetryFecPublisher {
     }
 }
 
+/// `--cache-mesh-test-future-frames` (C 2.1): the field that a node
+/// speaking as a later build adds to its telemetry snapshots and control
+/// envelopes, which no struct of this build knows.
+const FUTURE_FIELD: &str = "x_future";
+
+/// `value` as JSON, with [`FUTURE_FIELD`] when `future` is set.
+fn json_with_future_field<T: Serialize>(value: &T, future: bool) -> serde_json::Result<Vec<u8>> {
+    if !future {
+        return serde_json::to_vec(value);
+    }
+    let mut json = serde_json::to_value(value)?;
+    if let Some(object) = json.as_object_mut() {
+        object.insert(FUTURE_FIELD.to_owned(), serde_json::Value::from(1));
+    }
+    serde_json::to_vec(&json)
+}
+
+/// A MessagePack map (a snapshot as `rmp_serde::to_vec_named` writes it)
+/// with one more entry, [`FUTURE_FIELD`]: 1. Anything else comes back as
+/// it was.
+fn msgpack_with_future_field(payload: Vec<u8>) -> Vec<u8> {
+    let Some(&first) = payload.first() else {
+        return payload;
+    };
+    let (entries, header) = match first {
+        0x80..=0x8f => (u32::from(first & 0x0f), 1),
+        0xde if payload.len() >= 3 => (u32::from(u16::from_be_bytes([payload[1], payload[2]])), 3),
+        0xdf if payload.len() >= 5 => (
+            u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]),
+            5,
+        ),
+        _ => return payload,
+    };
+    let Some(entries) = entries.checked_add(1) else {
+        return payload;
+    };
+    let mut out = Vec::with_capacity(payload.len() + 16);
+    if entries <= 15 {
+        out.push(0x80 | entries as u8);
+    } else if let Ok(entries) = u16::try_from(entries) {
+        out.push(0xde);
+        out.extend_from_slice(&entries.to_be_bytes());
+    } else {
+        out.push(0xdf);
+        out.extend_from_slice(&entries.to_be_bytes());
+    }
+    out.extend_from_slice(&payload[header..]);
+    out.push(0xa0 | FUTURE_FIELD.len() as u8);
+    out.extend_from_slice(FUTURE_FIELD.as_bytes());
+    out.push(0x01);
+    out
+}
+
 fn start_telemetry_publisher(
     router: AppRouter,
     interval_ms: u64,
+    future_fields: bool,
     tcp_tx: Option<mpsc::Sender<TcpChangesMessage>>,
     fec: Option<TelemetryFecPublisher>,
     mut shutdown_rx: watch::Receiver<()>,
@@ -19516,25 +19978,29 @@ fn start_telemetry_publisher(
     Some(tokio::spawn(async move {
         let mut ticker = interval(Duration::from_millis(interval_ms));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let lifecycle_changed = Arc::clone(&router.lifecycle.changed);
+        let lifecycle_changed = router.lifecycle.changed();
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => return,
                 _ = ticker.tick() => {}
-                // A drain or resume is advertised at once (the entry points
-                // stop sending readers to a draining node before it moves
-                // its own); the ticks go on as before.
+                // A drain, a resume or the end of a start is advertised at
+                // once (the entry points stop sending readers to a draining
+                // node before it moves its own, and learn a warm one at
+                // once); the ticks go on as before.
                 _ = lifecycle_changed.notified() => {}
             }
             let snapshot = router.local_mesh_snapshot().await;
             if let Some(fec) = &fec {
                 match encode_mesh_telemetry_binary(&snapshot) {
+                    Ok(payload) if future_fields => {
+                        fec.submit(&snapshot, msgpack_with_future_field(payload), interval_ms)
+                    }
                     Ok(payload) => fec.submit(&snapshot, payload, interval_ms),
                     Err(_) => fec.monitor.record_encode_error(),
                 }
             }
             if let Some(tx) = &tcp_tx {
-                let Ok(json) = serde_json::to_vec(&snapshot) else {
+                let Ok(json) = json_with_future_field(&snapshot, future_fields) else {
                     continue;
                 };
                 let message = TcpChangesMessage::new(TELEMETRY_TAG, vec![Bytes::from(json)]);
@@ -19975,8 +20441,8 @@ fn cpu_permille(cpu_us: u64, wall_us: u64, cpus: u32) -> u32 {
 /// `process.cpu_permille` of `GET /api/node`: once a second, the process's
 /// CPU time (`cpu_clock`, µs) over the second just ended, so the figure is
 /// always of the last whole second however seldom the status is read.
-/// How often the stopgap asks the cache mesh to release the parents that
-/// wait (C CR8's run_parent_release runs as often).
+/// How often `run_parent_release` asks the cache mesh to release the
+/// parents that wait (C 2.1 d).
 const PARENT_RELEASE_EVERY: Duration = Duration::from_millis(100);
 
 /// C CR2 (pl-mesh.fix.md): how long a parent that left a stream's ranked set
@@ -19988,27 +20454,58 @@ fn cache_mesh_parent_release_after(lease_ms: u64) -> Duration {
     Duration::from_millis(2 * (lease_ms.max(100) / 3 + PLAYLIST_DEMAND_SWEEP_MS))
 }
 
-/// The stopgap for C CR8's `run_parent_release` (pl-mesh.fix.md): every
-/// 100 ms the cache mesh releases each parent that has waited
-/// `parent_release_after` since it left a ranked set. No parent is
-/// confirmed early (`|_, _| false`): today's behaviour, with a timer in
-/// place of the lease lapsing. CR8 replaces it with the fast plane's
-/// `ParentFeeds::delivering` and the early renewals.
-async fn run_parent_release_stopgap(
+/// Make-before-break release of parents (C 2.1 c, d): every 100 ms the
+/// cache mesh releases a parent that left a playlist's ranked set once every
+/// parent the playlist ranks is confirmed, that is, this node's fast plane
+/// has an admitted source of the playlist from the parent's address within
+/// 100 ms on this look and on the one before (`ParentFeeds::delivering`);
+/// or, confirmed or not, once it has waited `parent_release_after`. The
+/// fast plane feeds a lease child and the cache mesh then pushes it
+/// nothing, so only the fast plane can say that a parent delivers. A node
+/// without the fast plane confirms nothing and gets the timed release.
+async fn run_parent_release(
     mesh: Arc<CacheMeshHandle>,
+    cache: Arc<LiveTsCache>,
     mut shutdown_rx: watch::Receiver<()>,
 ) {
     let mut tick = interval(PARENT_RELEASE_EVERY);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // The (playlist, parent address) pairs that delivered on the last look.
+    let mut delivered: HashSet<(u64, std::net::IpAddr)> = HashSet::new();
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => return,
-            _ = tick.tick() => {
-                for (stream_id, parent, confirmed) in mesh.release_pending(&|_, _| false).await {
-                    debug!(stream_id, %parent, confirmed, "cache mesh released a parent that left the ranked set");
-                }
-            }
+            _ = tick.tick() => {}
         }
+        if mesh.pending_parents().is_empty() {
+            delivered.clear();
+            continue;
+        }
+        let feeds = cache.parent_feeds().cloned();
+        let now_us = now_unix_us();
+        // The mesh asks about the ranked parents of each playlist with a
+        // parent waiting, in rank order and until one is not confirmed: a
+        // parent first seen delivering is confirmed on the next look.
+        let delivering = StdMutex::new(HashSet::new());
+        let previous = &delivered;
+        let confirmed = |stream_id: u64, parent: SocketAddr| {
+            let now = feeds.as_ref().is_some_and(|feeds| {
+                feeds.delivering(parent.ip(), stream_id, now_us, PARENT_CONFIRMED_WITHIN_US)
+            });
+            if now {
+                delivering
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert((stream_id, parent.ip()));
+            }
+            now && previous.contains(&(stream_id, parent.ip()))
+        };
+        for (stream_id, parent, confirmed) in mesh.release_pending(&confirmed).await {
+            debug!(stream_id, %parent, confirmed, "cache mesh released a parent that left the ranked set");
+        }
+        delivered = delivering
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
 }
 
@@ -20265,6 +20762,8 @@ impl AppRouter {
         private_discovery: PrivateDiscoveryStatus,
         operations_snapshot_file: Option<PathBuf>,
     ) -> Self {
+        // The router's mesh is the one whose hello says this node drains.
+        lifecycle.attach_mesh(&mesh);
         Self {
             cache,
             llhls_default_tail_parts,
@@ -20781,6 +21280,8 @@ impl AppRouter {
                         .edge_load
                         .egress
                         .playlist_request_rate(stream.stream_id),
+                    video: self.cache.stream_classes().class(stream.stream_id)
+                        == fast_plane::TrafficClass::Video,
                 })
             })
             .collect();
@@ -20920,7 +21421,7 @@ impl AppRouter {
     /// telemetry merge, no replica plan) and kept for 100 ms.
     async fn node_status(&self) -> Arc<node_status::NodeStatus> {
         use node_status::{
-            CacheMeshStatus, ClientUdpStatus, DrainReasons, FastPlaneStatus, IngestStatus,
+            CacheMeshPeerStatus, CacheMeshStatus, ClientUdpStatus, FastPlaneStatus, IngestStatus,
             LeasePair, LeaseStatus, LeaseStream, NodeStatus, ParentStatus, ParentStreamStatus,
             ProcessStatus, Readiness, ReadinessInputs, StreamStatus,
         };
@@ -21114,8 +21615,33 @@ impl AppRouter {
             .parents_silent_for()
             .await
             .map(|silent| u64::try_from(silent.as_millis()).unwrap_or(u64::MAX));
+        let mesh_peers = self.mesh.peer_statuses().await;
+        let mesh_stats = self.mesh.fec_stats();
         let cache_mesh = CacheMeshStatus {
             parent_heard_age_ms,
+            parents_live: mesh_peers
+                .iter()
+                .filter(|peer| {
+                    peer.parent
+                        && peer.heard.is_some_and(|heard| {
+                            heard.as_millis() <= u128::from(node_status::PARENT_HEARD_WITHIN_MS)
+                        })
+                })
+                .count() as u64,
+            pending_release: self.mesh.pending_parents().len() as u64,
+            peers: mesh_peers
+                .iter()
+                .map(|peer| CacheMeshPeerStatus {
+                    peer: peer.peer.to_string(),
+                    role: peer.role.map(|role| cache_mesh_role_label(role).to_owned()),
+                    boot_id: peer.boot_id,
+                    build: peer.build.clone(),
+                    state: peer.state.map(|state| lifecycle::hello_state_name(state).to_owned()),
+                    heard_age_ms: peer
+                        .heard
+                        .map(|heard| u64::try_from(heard.as_millis()).unwrap_or(u64::MAX)),
+                })
+                .collect(),
             children: served
                 .iter()
                 .map(|pair| pair.child)
@@ -21127,6 +21653,9 @@ impl AppRouter {
                 .iter()
                 .map(|pair| pair.backfill_parts_pending as u64)
                 .sum(),
+            rx_unknown_kinds: mesh_stats.rx_unknown_kinds,
+            rx_unknown_roles: mesh_stats.rx_unknown_roles,
+            rx_invalid_frames: mesh_stats.rx_invalid_frames,
         };
 
         let parents_lost = self.parents_are_lost().await;
@@ -21151,10 +21680,25 @@ impl AppRouter {
             .telemetry
             .region_entry(&self.node, self.assignment_fresh_ms, now_us / 1_000)
             .await;
-        let drain = DrainReasons {
-            operator: self.lifecycle.is_draining().await,
-            ..DrainReasons::default()
-        };
+        let drain = self.lifecycle.reasons();
+        // E5's copies and F7's start demand, from the start's warm pass.
+        let warm = self.lifecycle.warm_pass();
+        let warm_copies = warm
+            .copies
+            .iter()
+            .map(|&(stream_id, target_head)| {
+                let stream = streams.iter().find(|stream| stream.stream_id == stream_id);
+                node_status::WarmCopy {
+                    stream_id,
+                    opened: self.playlist_demand.streams.contains_key(&stream_id),
+                    decoded: stream.is_some_and(|stream| stream.decoded),
+                    head_part: stream.and_then(|stream| stream.head_part),
+                    target_head,
+                    window_parts: stream.map_or(0, |stream| stream.window_parts),
+                    needed_parts: stream.map_or(source.warm_parts, |stream| stream.warm_parts),
+                }
+            })
+            .collect();
 
         let mut memory = lock_memory();
         // F5: a pair served now that was not at the last look opened a
@@ -21177,6 +21721,9 @@ impl AppRouter {
             parent_heard_age_ms,
             parents_lost,
             regional_view,
+            // E5 and F7 have their playlists once the region's moving heads
+            // are known.
+            region_heads_known: warm.judged,
             fast_plane,
             parents: parents.clone(),
             streams: streams.clone(),
@@ -21189,12 +21736,9 @@ impl AppRouter {
                 u64::try_from(now.saturating_duration_since(at).as_millis()).unwrap_or(u64::MAX)
             }),
             drain,
-            // E5's warm copies and F7's start demand come with the warm
-            // pass of the lifecycle (CR8), `start`, `stopping` and the
-            // forced start with its start and stop (CR6).
-            warm_copies: Vec::new(),
-            slot_streams: Vec::new(),
-            ready_forced: false,
+            warm_copies,
+            slot_streams: warm.slot_streams,
+            ready_forced: self.lifecycle.ready_forced(),
         };
         let readiness = if edge {
             Readiness::edge(&inputs, memory.warm)
@@ -21202,6 +21746,7 @@ impl AppRouter {
             Readiness::forwarder(&inputs, memory.warm)
         };
         memory.warm = readiness.warm;
+        self.lifecycle.set_hello_state(readiness.state, drain);
         if readiness.ready() && memory.ready_unix_ms.is_none() {
             memory.ready_unix_ms = Some(now_us / 1_000);
         }
@@ -23242,20 +23787,20 @@ impl AppRouter {
                 .await;
                 "local warm requested".into()
             }
+            // C 2.4: the operator's reason, kept in the drain-state file; the
+            // hello says draining with it (a distributor's children move
+            // their leases away, AM 12).
             ControlKind::CloseNode => {
-                self.lifecycle.set_draining(true).await;
-                self.mesh.set_draining(true);
+                self.lifecycle.drain(node_status::DrainReason::Operator);
                 "local close requested: draining".into()
             }
             ControlKind::DrainNode => {
-                self.lifecycle.set_draining(true).await;
-                // A distributor's children move their leases away (AM 12).
-                self.mesh.set_draining(true);
+                self.lifecycle.drain(node_status::DrainReason::Operator);
                 "local drain requested: readers move to other caches".into()
             }
+            // Only the operator's reason goes: a start or a stop holds.
             ControlKind::ResumeNode => {
-                self.lifecycle.set_draining(false).await;
-                self.mesh.set_draining(false);
+                self.lifecycle.resume(node_status::DrainReason::Operator);
                 "local resume requested: taking readers".into()
             }
             ControlKind::ProvisionNode => {
@@ -29310,13 +29855,13 @@ mod tests {
         assert_eq!(mesh_slot_epoch(&[]), None);
     }
 
-    /// C CR2 with the stopgap for C CR8 (pl-mesh.fix.md): a parent that
-    /// drains leaves the edge's ranked set and waits; nothing confirms its
-    /// replacement, so the 100 ms task releases it once it has waited
+    /// C CR2, CR8: a parent that drains leaves the edge's ranked set and
+    /// waits; this edge has no fast plane, so nothing confirms its
+    /// replacement, and the 100 ms task releases it once it has waited
     /// `parent_release_after`, not before, and counts it unconfirmed. At
     /// the 5 s lease the wait is two of this node's renewal periods.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_stopgap_releases_a_parent_that_left_at_its_timer() {
+    async fn an_unconfirmed_parent_is_released_at_its_timer() {
         use playlists::mesh::{CacheMesh, CacheMeshConfig};
         assert_eq!(
             cache_mesh_parent_release_after(5_000),
@@ -29410,10 +29955,14 @@ mod tests {
         assert!(!ranked.contains(&left), "{ranked:?}");
         assert_eq!(edge.pending_parents(), vec![(7, left)]);
         let (shutdown_tx, shutdown_rx) = watch::channel(());
-        let task = tokio::spawn(run_parent_release_stopgap(Arc::clone(&edge), shutdown_rx));
+        let task = tokio::spawn(run_parent_release(
+            Arc::clone(&edge),
+            Arc::clone(&edge_cache),
+            shutdown_rx,
+        ));
         let pending = Arc::clone(&edge);
         wait(
-            "the stopgap releases the parent",
+            "the timer releases the parent",
             Box::new(move || pending.pending_parents().is_empty()),
         )
         .await;
@@ -29431,7 +29980,7 @@ mod tests {
         shutdown_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(1), task)
             .await
-            .expect("the stopgap ends at shutdown")
+            .expect("the release task ends at shutdown")
             .unwrap();
     }
 
@@ -29817,7 +30366,7 @@ mod tests {
         assert_eq!(local["status"]["schema"], node_status::SCHEMA);
         assert_eq!(local["status"]["process"]["boot_id"], cache.started_unix_us);
 
-        router.lifecycle.set_draining(true).await;
+        router.lifecycle.drain(node_status::DrainReason::Operator);
         tokio::time::sleep(NODE_STATUS_CACHE + Duration::from_millis(20)).await;
         let response = get_for_tests(&router, "/api/node").await;
         let drained: serde_json::Value = serde_json::from_slice(&response.body.unwrap()).unwrap();
@@ -32274,7 +32823,8 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         // A tick a minute: only the first snapshot comes from the ticker.
         let task =
-            start_telemetry_publisher(router.clone(), 60_000, Some(tx), None, shutdown_rx).unwrap();
+            start_telemetry_publisher(router.clone(), 60_000, false, Some(tx), None, shutdown_rx)
+                .unwrap();
         let draining_of = |message: TcpChangesMessage| {
             let snapshot: MeshSnapshot = serde_json::from_slice(&message.data()[0]).unwrap();
             snapshot.node.draining
@@ -32321,7 +32871,7 @@ mod tests {
             None
         );
         // Draining again changes nothing and is not advertised again.
-        router.lifecycle.set_draining(true).await;
+        router.lifecycle.drain(node_status::DrainReason::Operator);
         assert!(timeout(Duration::from_millis(200), rx.recv())
             .await
             .is_err());
@@ -32387,6 +32937,7 @@ mod tests {
         let publisher_task = start_telemetry_publisher(
             source_router.clone(),
             50,
+            false,
             Some(telemetry_runtime.tx.clone()),
             None,
             publisher_shutdown_rx,
@@ -37381,6 +37932,7 @@ mod tests {
                 head_part,
                 bitrate_bps: Some(16_000_000),
                 sessions: 3,
+                video: false,
             })
             .into_iter()
             .collect();
@@ -39758,7 +40310,7 @@ mod tests {
         );
 
         // A draining edge sends its clients to the next cache.
-        router.lifecycle.set_draining(true).await;
+        router.lifecycle.drain(node_status::DrainReason::Operator);
         let moved = timeout(Duration::from_secs(5), async {
             loop {
                 let (len, _) = client.recv_from(&mut buf).await.unwrap();
@@ -39957,7 +40509,7 @@ mod tests {
         assert!(matches!(answer, Control::Subscribed { .. }), "{answer:?}");
         assert_eq!(stats.live_subscribers(), Some(4));
         // Draining shows on the gauges.
-        router.lifecycle.set_draining(true).await;
+        router.lifecycle.drain(node_status::DrainReason::Operator);
         let api: serde_json::Value = serde_json::from_slice(
             get_for_tests(&router, "/api/assignment?stream=77")
                 .await
@@ -40192,7 +40744,7 @@ mod tests {
         // The cached parts arrive.
         udp_receive_for_tests(&leaver, Duration::from_millis(300)).await;
         udp_receive_for_tests(&stayer, Duration::from_millis(300)).await;
-        edge.router.lifecycle.set_draining(true).await;
+        edge.router.lifecycle.drain(node_status::DrainReason::Operator);
         let marked_by = Instant::now();
         for client in [&leaver, &stayer] {
             assert!(
@@ -40270,7 +40822,7 @@ mod tests {
         config.move_grace = Duration::from_millis(4_000);
         let edge = UdpEdgeForTests::start(config).await;
         let (client, _) = edge.client().await;
-        edge.router.lifecycle.set_draining(true).await;
+        edge.router.lifecycle.drain(node_status::DrainReason::Operator);
         // The first within a housekeeping second, then one every 250 ms
         // (the sender looks at least every keepalive, 80 ms).
         assert!(
@@ -40363,7 +40915,7 @@ mod tests {
             edge_udp::insert_test_subscribers(&stats.table.get().unwrap().0, 77, &crowd, 4);
             assert_eq!(stats.live_subscribers(), Some(1_000));
             let moves_before = stats.moves.load(Ordering::Relaxed);
-            edge.router.lifecycle.set_draining(true).await;
+            edge.router.lifecycle.drain(node_status::DrainReason::Operator);
             let started = Instant::now();
             let (mut first_mark, mut last_mark, mut first_gone) = (None, None, None);
             let (mut leaving_seen, mut unsubscribed) = (0, false);
@@ -40501,7 +41053,7 @@ mod tests {
         let block = gauges().await;
         assert_eq!(block["leaving"], 0, "{block:#}");
         assert_eq!(block["move_grace_ms"], 1_500, "{block:#}");
-        edge.router.lifecycle.set_draining(true).await;
+        edge.router.lifecycle.drain(node_status::DrainReason::Operator);
         tokio::time::timeout(Duration::from_secs(3), async {
             while edge.stats().legs().unwrap().leaving != 4 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -41194,12 +41746,9 @@ mod tests {
             max_playlists: MAX_EDGE_PLAYLISTS,
         });
         let (shutdown_tx, shutdown_rx) = watch::channel(());
-        let router = app_router_for_tests(Arc::clone(&slot_cache), Arc::clone(&slot));
-        tokio::spawn(run_upstream_demand(
-            Arc::clone(&slot),
-            demand.clone(),
-            shutdown_rx.clone(),
-        ));
+        let router = app_router_for_tests(Arc::clone(&slot_cache), Arc::clone(&slot))
+            .with_playlist_demand(demand.clone());
+        tokio::spawn(run_upstream_demand(router.clone(), shutdown_rx.clone()));
         tokio::spawn(run_playlist_demand(
             Arc::clone(&slot_cache),
             Arc::clone(&slot),
@@ -45492,4 +46041,8 @@ mod tests {
     /// first integration): one leg as the wave 9 client, two legs on two
     /// edges.
     mod two_leg_session;
+    /// The node's lifecycle (C CR6, CR8): SIGTERM as a graceful stop, the
+    /// drain reasons, the start that waits until the node is warm, and the
+    /// make-before-break release of parents.
+    mod node_lifecycle;
 }

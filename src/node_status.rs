@@ -258,11 +258,38 @@ pub struct ChildrenStatus {
 pub struct CacheMeshStatus {
     /// Since a cache-mesh parent was last heard; null before the first.
     pub parent_heard_age_ms: Option<u64>,
+    /// The peers this node may take playlists from that it heard within
+    /// the peer timeout, draining or not.
+    pub parents_live: u64,
+    /// Parents that left a playlist's ranked set and are not released yet
+    /// (make-before-break).
+    pub pending_release: u64,
+    /// Every peer as its newest hello described it.
+    pub peers: Vec<CacheMeshPeerStatus>,
     pub children: u64,
     pub pairs: u64,
     /// The streams this node subscribes to on the cache mesh.
     pub subscribed_playlists: Vec<u64>,
     pub warm_parts_pending: u64,
+    /// Frames of a kind, hellos of a role, and frames that this build
+    /// cannot read (a later build's are read as far as they are known).
+    pub rx_unknown_kinds: u64,
+    pub rx_unknown_roles: u64,
+    pub rx_invalid_frames: u64,
+}
+
+/// One cache-mesh peer, from its newest hello.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheMeshPeerStatus {
+    pub peer: String,
+    /// `peer`, `distributor` or `edge`; null before its first hello and for
+    /// a role this build does not know.
+    pub role: Option<String>,
+    pub boot_id: Option<u64>,
+    pub build: Option<String>,
+    /// `starting`, `ready`, `degraded`, `draining` or `stopping`.
+    pub state: Option<String>,
+    pub heard_age_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -377,8 +404,14 @@ pub struct ReadinessInputs {
     pub parents_lost: bool,
     /// E4: a telemetry snapshot of the region was received.
     pub regional_view: bool,
-    /// E5: the warm copies (the lifecycle unit's warm pass, CR8; empty
-    /// until it runs, which an idle region also gives).
+    /// E5, F7: the region's moving heads are known (every fresh node of the
+    /// region and every playlist of every fresh holder seen in two
+    /// advertisements; latched), or this node opens nothing at its start
+    /// (`WarmPass::judged`). An empty view is not an idle region: once the
+    /// region has been heard, E4's two seconds do not stand in for it.
+    pub region_heads_known: bool,
+    /// E5: the warm copies (the start's warm pass, `warm_playlists`; empty
+    /// in an idle region).
     pub warm_copies: Vec<WarmCopy>,
     /// F2, F3: the fast plane's figures.
     pub fast_plane: FastPlaneStatus,
@@ -391,13 +424,11 @@ pub struct ReadinessInputs {
     pub lease_renewal_ms: u64,
     pub lease_opened_age_ms: Option<u64>,
     /// F7: the playlists a slot opened upstream demand for at its start
-    /// (the lifecycle unit's slot start demand, CR8; empty until then).
+    /// (`run_upstream_demand`).
     pub slot_streams: Vec<u64>,
-    /// The drain reasons (`start` and `stopping` come with the lifecycle
-    /// unit, CR6; until then only `operator` is set).
+    /// The drain reasons (`NodeLifecycle`).
     pub drain: DrainReasons,
-    /// An edge dropped `start` after `--start-warm-ms` without its warm-up
-    /// (CR6).
+    /// An edge dropped `start` after `--start-warm-ms` without its warm-up.
     pub ready_forced: bool,
 }
 
@@ -441,6 +472,7 @@ impl Readiness {
         if !inputs.regional_view && inputs.uptime_ms < REGIONAL_VIEW_WAIT_MS {
             conditions.warm_up.push("no regional view".to_owned());
         }
+        region_heads_condition(inputs, &mut conditions);
         for copy in &inputs.warm_copies {
             let stream = copy.stream_id;
             if !copy.opened || !copy.decoded {
@@ -519,7 +551,8 @@ impl Readiness {
         {
             conditions.warm_up.push("leases settling".to_owned());
         }
-        // F7: a slot's start demand, decoded and windowed.
+        // F7: a slot's start demand, decoded and windowed, once it is known.
+        region_heads_condition(inputs, &mut conditions);
         for stream_id in &inputs.slot_streams {
             match inputs
                 .streams
@@ -595,6 +628,18 @@ fn threads_condition(inputs: &ReadinessInputs, conditions: &mut Conditions) {
     }
 }
 
+/// E5, F7: what must be warm is known only once the region's moving heads
+/// are. A region never heard (an edge alone, or no telemetry) goes without
+/// after E4's wait; a region heard waits for its heads, at most an edge's
+/// start timeout.
+fn region_heads_condition(inputs: &ReadinessInputs, conditions: &mut Conditions) {
+    if !inputs.region_heads_known
+        && (inputs.regional_view || inputs.uptime_ms < REGIONAL_VIEW_WAIT_MS)
+    {
+        conditions.warm_up.push("region heads not known".to_owned());
+    }
+}
+
 /// F4, F6 of one stream.
 fn stream_warm_up(stream: &StreamStatus, conditions: &mut Conditions) {
     let stream_id = stream.stream_id;
@@ -635,6 +680,8 @@ mod tests {
             streams: vec![stream(3001)],
             lease_renewal_ms: 2_200,
             lease_opened_age_ms: Some(30_000),
+            regional_view: true,
+            region_heads_known: true,
             ..ReadinessInputs::default()
         }
     }
@@ -649,6 +696,7 @@ mod tests {
             client_udp_running: true,
             parent_heard_age_ms: Some(40),
             regional_view: true,
+            region_heads_known: true,
             ..ReadinessInputs::default()
         }
     }
@@ -850,6 +898,53 @@ mod tests {
         // An idle region has no copy to warm: met at once.
         edge.warm_copies.clear();
         ready(&Readiness::edge(&edge, false));
+    }
+
+    /// E5 and F7 are judged only once the region's moving heads are known:
+    /// a region that has been heard waits for them whatever the uptime (E4's
+    /// two seconds do not stand in for them); a region never heard goes
+    /// without after E4's wait.
+    #[test]
+    fn region_heads_are_a_warm_up_condition_of_their_own() {
+        for (evaluate, healthy) in [
+            (
+                Readiness::edge as fn(&ReadinessInputs, bool) -> Readiness,
+                serving_edge(),
+            ),
+            (Readiness::forwarder, fed_forwarder()),
+        ] {
+            warm_up(
+                evaluate,
+                &healthy,
+                |inputs| inputs.region_heads_known = false,
+                "region heads not known",
+            );
+            let mut heard_early = healthy.clone();
+            heard_early.uptime_ms = 1_500;
+            // A forwarder's leases settle in a shorter renewal here (F5).
+            heard_early.lease_renewal_ms = 1_000;
+            warm_up(
+                evaluate,
+                &heard_early,
+                |inputs| inputs.region_heads_known = false,
+                "region heads not known",
+            );
+            // Never heard: two seconds after the start the node goes
+            // without; before them it waits.
+            let mut unheard = healthy.clone();
+            unheard.regional_view = false;
+            unheard.region_heads_known = false;
+            ready(&evaluate(&unheard, false));
+            unheard.uptime_ms = 1_999;
+            let readiness = evaluate(&unheard, false);
+            assert_eq!(readiness.state, NodeState::Starting, "{readiness:?}");
+            assert!(
+                readiness
+                    .not_ready
+                    .contains(&"region heads not known".to_owned()),
+                "{readiness:?}"
+            );
+        }
     }
 
     #[test]
@@ -1190,10 +1285,23 @@ mod tests {
             },
             cache_mesh: CacheMeshStatus {
                 parent_heard_age_ms: Some(40),
+                parents_live: 2,
+                pending_release: 0,
+                peers: vec![CacheMeshPeerStatus {
+                    peer: "10.80.3.12:29101".to_owned(),
+                    role: Some("distributor".to_owned()),
+                    boot_id: Some(1_763_923_000_000_000),
+                    build: Some("3f2a9c1d77e0".to_owned()),
+                    state: Some("ready".to_owned()),
+                    heard_age_ms: Some(40),
+                }],
                 children: 3,
                 pairs: 6,
                 subscribed_playlists: vec![3001],
                 warm_parts_pending: 0,
+                rx_unknown_kinds: 0,
+                rx_unknown_roles: 0,
+                rx_invalid_frames: 0,
             },
             client_udp: Some(ClientUdpStatus {
                 subscribers: Some(120),

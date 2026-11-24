@@ -353,7 +353,8 @@ impl LaneEdge {
             .class_socket(fast_plane::TrafficClass::Audio)
             .local_addr()
             .unwrap();
-        let stats: Arc<edge_udp::EdgeUdpStats> = Arc::default();
+        // The router's gauges are the client lane's, as in a node.
+        let stats = Arc::clone(&router.edge_udp_stats);
         let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, max_subscribers);
         // A host stall must not make the cache-fed lane skip a part it owes.
         config.playout = Duration::from_secs(5);

@@ -116,12 +116,27 @@
   },
   "cache_mesh": {
     "parent_heard_age_ms": 40,
+    "parents_live": 2,
+    "pending_release": 0,
+    "peers": [
+      {
+        "peer": "10.80.3.12:29101",
+        "role": "distributor",
+        "boot_id": 1763923000000000,
+        "build": "3f2a9c1d77e0",
+        "state": "ready",
+        "heard_age_ms": 40
+      }
+    ],
     "children": 3,
     "pairs": 6,
     "subscribed_playlists": [
       3001
     ],
-    "warm_parts_pending": 0
+    "warm_parts_pending": 0,
+    "rx_unknown_kinds": 0,
+    "rx_unknown_roles": 0,
+    "rx_invalid_frames": 0
   },
   "client_udp": {
     "subscribers": 120,
