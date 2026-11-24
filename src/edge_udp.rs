@@ -673,8 +673,38 @@ impl CompactStore {
 
     /// The compact datagram of an object (a part or a gap), kept or made
     /// and kept; `None` for one that does not fit a datagram (or an init).
-    pub(crate) fn of_object(&self, object: &PartObject) -> Option<Bytes> {
-        let ring = self.ring(object.stream_id);
+    ///
+    /// `epoch` is the part's own source epoch as its slot carries it (0:
+    /// not known, a gap). A part is stamped with its own epoch's
+    /// generation, and a newer epoch is taken up by the stream (its old
+    /// parts forgotten) before the part is kept: a cache-mesh copy writes a
+    /// new session's parts into the cache before the cache records their
+    /// epoch (`observe_mesh_part` runs after the write), so a reader of the
+    /// cache (a new subscriber's first part, the cache-fed lane, a NACK, a
+    /// cut-through block) can see a part before its stream's epoch moved.
+    /// Stamped with the ring's epoch, that part carried the previous
+    /// session's generation (fix4-listener F2, the edge half). A part of an
+    /// older epoch than the stream's is late: stamped with its own
+    /// generation and not kept.
+    pub(crate) fn of_object(&self, object: &PartObject, epoch: u64) -> Option<Bytes> {
+        let ring = if epoch != 0 {
+            self.observe_epoch(object.stream_id, epoch);
+            let ring = self.ring(object.stream_id);
+            if epoch < ring.epoch() {
+                let mut datagram = compact::encode_part(
+                    object.part,
+                    object.published_unix_us,
+                    &object.payload,
+                )?;
+                compact::set_generation(&mut datagram, compact::generation_of_epoch(epoch));
+                return (object.kind == ObjectKind::Part).then(|| Bytes::from(datagram));
+            }
+            // A ring made before any epoch was known takes this one up.
+            ring.observe_epoch(epoch);
+            ring
+        } else {
+            self.ring(object.stream_id)
+        };
         if let Some(kept) = ring.get(object.part) {
             // A gap kept gives way to the part.
             if !(object.kind == ObjectKind::Part && compact::is_gap(&kept)) {
@@ -688,7 +718,11 @@ impl CompactStore {
             ObjectKind::Gap => compact::encode_gap(object.part),
             ObjectKind::Init => return None,
         };
-        compact::set_generation(&mut datagram, ring.generation());
+        let generation = match epoch {
+            0 => ring.generation(),
+            epoch => compact::generation_of_epoch(epoch),
+        };
+        compact::set_generation(&mut datagram, generation);
         Some(ring.put(object.part, Bytes::from(datagram)))
     }
 
@@ -2647,8 +2681,13 @@ pub(crate) async fn answer_nack_from_cache(
             continue;
         };
         let times = router.cache.part_times_for_handle(handle, part).await;
+        let epoch = router
+            .cache
+            .part_epoch_for_stream_id(stream_id, part, &bytes)
+            .await
+            .unwrap_or(0);
         let object = part_object_with_times(stream_id, part, bytes, times);
-        if let Some(kept) = sockets.compact().of_object(&object) {
+        if let Some(kept) = sockets.compact().of_object(&object, epoch) {
             if !charge_nack_bytes(table, stream_id, peer, kept.len() as u64) {
                 refused += 1;
                 continue;
@@ -3556,6 +3595,15 @@ async fn deliver(
     if targets.is_empty() && compact_targets.is_empty() {
         return false;
     }
+    // The part's own epoch, for its compact datagram's generation.
+    let epoch = match &bytes {
+        Some(bytes) if !compact_targets.is_empty() => router
+            .cache
+            .part_epoch_for_stream_id(stream_id, part, bytes)
+            .await
+            .unwrap_or(0),
+        _ => 0,
+    };
     let object = match bytes {
         Some(bytes) => {
             let everyone: Targets = targets
@@ -3581,7 +3629,7 @@ async fn deliver(
     };
     let is_part = object.kind == ObjectKind::Part;
     if !compact_targets.is_empty() {
-        match store.of_object(&object) {
+        match store.of_object(&object, epoch) {
             Some(canonical) => {
                 send_compact(out, config, stats, &canonical, &compact_targets).await;
                 if is_part {
@@ -5540,9 +5588,17 @@ fn new_route(
             .is_some_and(|entry| entry.subscribers.values().any(wants_compact)))
     .then(|| first_symbol.get(..header.transfer_length as usize))
     .flatten()
-    .and_then(av_mesh::client_udp::cut_through_part)
-    .filter(|object| object.stream_id == stream_id && object.part == slot)
-    .and_then(|object| inner.sockets.compact().of_object(&object));
+    .and_then(|frame| {
+        let object = av_mesh::client_udp::cut_through_part(frame)?;
+        // The part's own epoch, from its slot in the frame: the cache has
+        // not recorded it yet (the frame is not even applied).
+        let epoch = playlists::mesh::chunk_frame_payload(frame)
+            .and_then(|(_, _, payload)| crate::mesh_slot_epoch(&payload))
+            .unwrap_or(0);
+        Some((object, epoch))
+    })
+    .filter(|(object, _)| object.stream_id == stream_id && object.part == slot)
+    .and_then(|(object, epoch)| inner.sockets.compact().of_object(&object, epoch));
     let mut compact_clients: Vec<(SocketAddr, RepairPolicy, CompactPlan)> = Vec::new();
     let clients: Vec<(SocketAddr, RepairPolicy)> = {
         let mut table = inner.table.lock().unwrap();
@@ -5619,7 +5675,7 @@ mod tests {
     fn a_gap_in_the_compact_ring_gives_way_to_the_part() {
         let store = CompactStore::default();
         let gap = gap_object(9, 40);
-        let kept = store.of_object(&gap).unwrap();
+        let kept = store.of_object(&gap, 0).unwrap();
         assert!(compact::is_gap(&kept));
         assert_eq!(store.ring(9).get_part(40), None);
         // The part comes late (a repair after the horizon): it replaces the
@@ -5633,15 +5689,76 @@ mod tests {
             published_unix_us: 7,
             payload: Bytes::from_static(b"late part"),
         };
-        let kept = store.of_object(&part).unwrap();
+        let kept = store.of_object(&part, 0).unwrap();
         assert!(!compact::is_gap(&kept));
         assert_eq!(compact::parse(&kept).unwrap().payload, b"late part");
         assert_eq!(store.get(9, 40), Some(kept.clone()));
         assert_eq!(store.ring(9).get_part(40), Some(kept.clone()));
         // A gap never replaces a part, and a part never another.
-        assert_eq!(store.of_object(&gap), Some(kept.clone()));
+        assert_eq!(store.of_object(&gap, 0), Some(kept.clone()));
         let other = Bytes::from(compact::encode_part(40, 7, b"other").unwrap());
         assert_eq!(store.ring(9).put(40, other), kept);
+    }
+
+    /// Integration 4 (the edge half of fix4-listener F2): a new session's
+    /// part read from the cache before the cache recorded its epoch (a
+    /// cache-mesh copy writes first) is stamped with its own generation,
+    /// and the stream takes the epoch up then; the cache's record that
+    /// follows changes nothing. Stamped with the ring's epoch (the order
+    /// before), the new subscriber's first part carried the old session's
+    /// generation and the client could stick on it.
+    #[test]
+    fn a_part_is_stamped_with_its_own_epoch_before_its_stream_records_it() {
+        let store = CompactStore::default();
+        let object = |part: u64, payload: &'static [u8]| PartObject {
+            kind: ObjectKind::Part,
+            datagrams: 0,
+            stream_id: 9,
+            part,
+            available_unix_us: 0,
+            published_unix_us: 0,
+            payload: Bytes::from_static(payload),
+        };
+        let gap = |part: u64| PartObject {
+            kind: ObjectKind::Gap,
+            payload: Bytes::new(),
+            ..object(part, b"")
+        };
+        let old_epoch = 1_700_000_000_000_000;
+        let new_epoch = old_epoch + 60_000_000;
+        store.observe_epoch(9, old_epoch);
+        store.of_object(&object(40, b"old session"), old_epoch).unwrap();
+        // The cache-mesh copy wrote part 2 of the new session; the cache
+        // has not recorded the new epoch: the first part a subscriber gets.
+        let first = store.of_object(&object(2, b"new session"), new_epoch).unwrap();
+        let view = compact::parse(&first).unwrap();
+        assert_eq!(view.generation, compact::generation_of_epoch(new_epoch));
+        assert_ne!(view.generation, compact::generation_of_epoch(old_epoch));
+        assert_eq!(store.ring(9).epoch(), new_epoch, "the stream took it up");
+        assert_eq!(store.get(9, 40), None, "the old session's parts are gone");
+        // A gap now carries the new generation too.
+        let hole = store.of_object(&gap(3), 0).unwrap();
+        assert_eq!(
+            compact::parse(&hole).unwrap().generation,
+            compact::generation_of_epoch(new_epoch)
+        );
+        // The cache's record follows: nothing changes.
+        store.observe_epoch(9, new_epoch);
+        assert_eq!(store.get(9, 2), Some(first.clone()));
+        // A late part of the old session is stamped as its own and not kept.
+        let late = store.of_object(&object(41, b"old, late"), old_epoch).unwrap();
+        assert_eq!(
+            compact::parse(&late).unwrap().generation,
+            compact::generation_of_epoch(old_epoch)
+        );
+        assert_eq!(store.get(9, 41), None);
+        // A part whose epoch is not known (no canonical slot) takes the
+        // stream's, as before.
+        let unknown = store.of_object(&object(4, b"opaque"), 0).unwrap();
+        assert_eq!(
+            compact::parse(&unknown).unwrap().generation,
+            compact::generation_of_epoch(new_epoch)
+        );
     }
 
     #[test]
@@ -5658,7 +5775,7 @@ mod tests {
         };
         let old_epoch = 1_700_000_000_000_000;
         store.observe_epoch(9, old_epoch);
-        let old = store.of_object(&object(40, b"old epoch")).unwrap();
+        let old = store.of_object(&object(40, b"old epoch"), 0).unwrap();
         assert_eq!(
             compact::parse(&old).unwrap().generation,
             compact::generation_of_epoch(old_epoch)
@@ -5668,7 +5785,7 @@ mod tests {
         let new_epoch = old_epoch + 60_000_000;
         store.observe_epoch(9, new_epoch);
         assert_eq!(store.get(9, 40), None);
-        let new = store.of_object(&object(40, b"new epoch")).unwrap();
+        let new = store.of_object(&object(40, b"new epoch"), 0).unwrap();
         let view = compact::parse(&new).unwrap();
         assert_eq!(view.payload, b"new epoch");
         assert_eq!(view.generation, compact::generation_of_epoch(new_epoch));

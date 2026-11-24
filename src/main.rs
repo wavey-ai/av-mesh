@@ -11844,6 +11844,19 @@ impl LiveTsCache {
         Some((media, hash))
     }
 
+    /// The source epoch that part `seq`'s slot carries (a canonical slot's
+    /// key epoch), if its media is still `media`, the bytes the caller read
+    /// from it (a slot replaced in between says nothing of them).
+    async fn part_epoch_for_stream_id(&self, stream_id: u64, seq: u64, media: &Bytes) -> Option<u64> {
+        let (bytes, _) = self
+            .chunk_cache
+            .get_for_stream_id(stream_id, usize::try_from(seq).ok()?)
+            .await?;
+        let epoch = mesh_slot_epoch(&bytes)?;
+        let slot = LiveSlotPayload::decode_for_stream(bytes, stream_id);
+        (slot.has_media() && slot.media() == *media).then_some(epoch)
+    }
+
     async fn part_available_unix_us(&self, stream_id: u64, seq: u64) -> Option<u64> {
         self.part_times_unix_us(stream_id, seq)
             .await
@@ -30285,6 +30298,59 @@ mod tests {
     /// A PL1: the epoch that the cache mesh's first-copy rule reads from a
     /// cached part is the key epoch that the full decode of its canonical
     /// slot gives, for short and long stream names; any other slot, and a
+    /// Integration 4 (the edge half of fix4-listener F2): a cache-mesh copy
+    /// writes a new session's part into the cache before the cache records
+    /// its epoch. The part's own epoch is read from its slot, so the edge
+    /// stamps it with its own generation whatever the cache has recorded;
+    /// a slot replaced since the reader took its media says nothing.
+    #[tokio::test]
+    async fn a_part_s_epoch_is_read_from_its_slot_before_the_cache_records_it() {
+        let stream_id = 4_001;
+        let (old_epoch, new_epoch) = (1_763_924_000_000_000, 1_763_924_060_000_000);
+        let edge = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let parent = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let envelope = |epoch, payload: &'static [u8]| {
+            encode_test_canonical_fmp4_object_with_epoch(
+                stream_id,
+                epoch,
+                3,
+                ObjectKind::Media,
+                true,
+                payload,
+            )
+        };
+        edge.commit_stream_payload(stream_id, envelope(old_epoch, b"moofmdat-old"))
+            .await
+            .unwrap();
+        parent
+            .commit_stream_payload(stream_id, envelope(new_epoch, b"moofmdat-new"))
+            .await
+            .unwrap();
+        // The mesh's write: the new session's slot, nothing recorded yet.
+        let (slot, _) = parent.chunk_cache.get_for_stream_id(stream_id, 3).await.unwrap();
+        edge.chunk_cache
+            .add_for_stream_id(stream_id, 3, slot)
+            .await
+            .unwrap();
+        assert_eq!(
+            edge.state.read().await.stream_canonical_epoch.get(&stream_id),
+            Some(&old_epoch),
+            "the cache still holds the old session's epoch"
+        );
+        let (media, _) = edge.get_part_for_stream_id(stream_id, 3).await.unwrap();
+        assert_eq!(
+            edge.part_epoch_for_stream_id(stream_id, 3, &media).await,
+            Some(new_epoch)
+        );
+        // Media read from what the slot held before: no epoch for it.
+        assert_eq!(
+            edge.part_epoch_for_stream_id(stream_id, 3, &Bytes::from_static(b"moofmdat-old"))
+                .await,
+            None
+        );
+        assert_eq!(edge.part_epoch_for_stream_id(stream_id, 9, &media).await, None);
+    }
+
     /// cut one, has none (the part then replaces as before).
     #[tokio::test]
     async fn the_mesh_reads_a_slot_s_epoch_as_the_full_decode_does() {
