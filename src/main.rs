@@ -35965,7 +35965,7 @@ mod tests {
                             else {
                                 break;
                             };
-                            if let Some(object) = receiver.push(&buf[..len]) {
+                            if let Some(object) = receiver.push(av_mesh::client_compact::LegId::FIRST, &buf[..len]) {
                                 if object.kind == UdpObjectKind::Part && object.part >= 1 {
                                     arrived
                                         .entry(object.part)
@@ -36264,7 +36264,7 @@ mod tests {
                         else {
                             break;
                         };
-                        if let Some(object) = receiver.push(&buf[..len]) {
+                        if let Some(object) = receiver.push(av_mesh::client_compact::LegId::FIRST, &buf[..len]) {
                             if object.kind == UdpObjectKind::Part && object.part >= 1 {
                                 arrived.entry(object.part).or_insert_with(Instant::now);
                             }
@@ -36470,7 +36470,7 @@ mod tests {
             if index % 3 == 0 {
                 continue; // a third of the datagrams are lost
             }
-            if let Some(object) = receiver.push(&buf[..len]) {
+            if let Some(object) = receiver.push(av_mesh::client_compact::LegId::FIRST, &buf[..len]) {
                 match object.kind {
                     UdpObjectKind::Init => init = Some(object.payload),
                     UdpObjectKind::Part => {
@@ -36504,7 +36504,7 @@ mod tests {
                 .await
                 .expect("the new part arrives")
                 .unwrap();
-            if let Some(object) = receiver.push(&buf[..len]) {
+            if let Some(object) = receiver.push(av_mesh::client_compact::LegId::FIRST, &buf[..len]) {
                 if object.part == 5 && object.kind == UdpObjectKind::Part {
                     break object.payload;
                 }

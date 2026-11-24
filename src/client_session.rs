@@ -530,7 +530,7 @@ impl UdpSession {
         }
         if now >= self.next_loss_check {
             self.next_loss_check = now + LOSS_CHECK;
-            if let Some(loss) = self.receiver.take_loss(self.repair) {
+            if let Some(loss) = self.receiver.take_loss(LegId::FIRST, self.repair) {
                 self.loss_max = Some(self.loss_max.map_or(loss, |max| max.max(loss)));
                 // Rise at once, fall slowly.
                 let estimate = match self.loss_estimate {
@@ -790,8 +790,12 @@ impl UdpSession {
                     if first {
                         self.first_subscribed_at.get_or_insert(now);
                         self.first_subscribed_part.get_or_insert(next_part);
-                        self.receiver
-                            .expect(self.config.stream_id, next_part, compact);
+                        self.receiver.expect(
+                            LegId::FIRST,
+                            self.config.stream_id,
+                            next_part,
+                            compact,
+                        );
                     }
                     self.compact_confirmed = compact;
                     if compact {
@@ -835,7 +839,7 @@ impl UdpSession {
         } else {
             self.moved_for_silence = false;
             self.media_here = true;
-            self.pending = self.receiver.push(datagram);
+            self.pending = self.receiver.push(LegId::FIRST, datagram);
             Received::Media
         }
     }

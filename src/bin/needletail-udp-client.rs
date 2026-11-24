@@ -1555,7 +1555,9 @@ async fn main() -> Result<()> {
         }
     }
     tokio::time::sleep(Duration::from_millis(600)).await;
-    let _ = session.receiver.take_loss(session.repair);
+    let _ = session
+        .receiver
+        .take_loss(av_mesh::client_compact::LegId::FIRST, session.repair);
     let since = |at: Option<Instant>| {
         at.map(|at| at.saturating_duration_since(started).as_secs_f64() * 1_000.0)
     };

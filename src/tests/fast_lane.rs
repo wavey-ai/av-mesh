@@ -187,7 +187,7 @@ async fn a_contributor_object_decodes_on_the_fast_lane_to_the_part_the_tee_commi
                 datagram.len() <= 36 + 1_088,
                 "a last-mile datagram fits 1,124 bytes"
             );
-            if let Some(object) = receiver.push(&datagram) {
+            if let Some(object) = receiver.push(av_mesh::client_compact::LegId::FIRST, &datagram) {
                 assert!(decoded.is_none(), "{packaging:?}: one object");
                 assert_eq!(receiver.last_fast_envelope_bytes, Some(envelope.len()));
                 decoded = Some(object);
@@ -236,7 +236,7 @@ async fn a_soundkit_bundle_is_refused_on_the_fast_lane() {
     );
     let mut receiver = ObjectReceiver::new();
     for symbol in &sources {
-        assert!(receiver.push(&fast_datagram(symbol, 3)).is_none());
+        assert!(receiver.push(av_mesh::client_compact::LegId::FIRST, &fast_datagram(symbol, 3)).is_none());
     }
     assert_eq!(receiver.errors, 1);
     assert_eq!(receiver.fast_parts, 0);
@@ -552,7 +552,7 @@ async fn lane_client(
         if lose.lost() {
             continue;
         }
-        let Some(object) = receiver.push(datagram) else {
+        let Some(object) = receiver.push(av_mesh::client_compact::LegId::FIRST, datagram) else {
             continue;
         };
         let fast = receiver.last_fast_envelope_bytes.is_some();

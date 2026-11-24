@@ -454,7 +454,7 @@ pub(super) async fn listen(
         }
         if now >= next_loss_check {
             next_loss_check = now + Duration::from_millis(150);
-            if let Some(loss) = receiver.take_loss(repair) {
+            if let Some(loss) = receiver.take_loss(LegId::FIRST, repair) {
                 let value = match estimate {
                     Some(previous) if loss < previous => previous * 0.8 + loss * 0.2,
                     _ => loss,
@@ -520,7 +520,7 @@ pub(super) async fn listen(
             {
                 if run.first.is_none() {
                     run.first = Some(next_part);
-                    receiver.expect(stream_id, next_part, compact);
+                    receiver.expect(LegId::FIRST, stream_id, next_part, compact);
                 }
                 run.compact_confirmed = compact;
                 // An edge that does not serve the compact lane: the RaptorQ
@@ -549,7 +549,7 @@ pub(super) async fn listen(
             run.lost_on_path += 1;
             continue;
         }
-        let objects = receiver.push_all(datagram);
+        let objects = receiver.push_all(LegId::FIRST, datagram);
         let fast = std::mem::take(&mut receiver.last_compact_fast_lane);
         for object in objects {
             match object.kind {
