@@ -44947,6 +44947,57 @@ mod tests {
         assert_eq!(state.stream_window_parts(77, 4_800), 4_800);
     }
 
+    /// Integration 5: the deploy renders `--min-part-us` from the shortest
+    /// part it publishes (1 ms by default). With the lab's flags the ring is
+    /// 48,000 slots, not 132,000 (~160 MB less index on a node of 16
+    /// playlists), and a stream of 1 ms parts with stamps keeps the same 30 s
+    /// window and its three target durations after it; one without stamps
+    /// keeps 12 s, four of its windows in the ring, more than three target
+    /// durations.
+    #[test]
+    fn a_ring_sized_for_one_ms_parts_keeps_the_window_of_one_ms_audio() {
+        let lab = |min: &str| {
+            Args::try_parse_from([
+                "av-mesh",
+                "--part-us",
+                "2500",
+                "--segment-ms",
+                "1000",
+                "--window-parts",
+                "12000",
+                "--min-part-us",
+                min,
+            ])
+            .unwrap()
+            .normalized()
+            .unwrap()
+        };
+        assert_eq!(lab("1000").ring_parts, 48_000);
+        assert_eq!(lab("250").ring_parts, 132_000);
+        let window = |ring: usize, part_us: u32, stamped: bool| {
+            let mut state = LiveState::new();
+            state.nominal_part_us = 2_500;
+            state.ring_parts = ring;
+            if stamped {
+                state.stream_declared_us.insert(77, (part_us, 1_000_000));
+            } else {
+                state.stream_max_part_duration_us.insert(77, part_us);
+            }
+            (
+                state.stream_window_parts(77, 12_000),
+                state.stream_retained_parts(77, 12_000),
+            )
+        };
+        assert_eq!(window(48_000, 1_000, true), window(132_000, 1_000, true));
+        assert_eq!(window(48_000, 1_000, true).0, 30_000);
+        assert!(window(48_000, 1_000, true).1 <= 48_000);
+        assert_eq!(window(48_000, 1_000, false).0, 12_000);
+        assert!(window(48_000, 1_000, false).0 >= 3_000);
+        // 2.5 ms Opus and longer parts keep the configured window either way.
+        assert_eq!(window(48_000, 2_500, true), window(132_000, 2_500, true));
+        assert_eq!(window(48_000, 33_367, true), window(132_000, 33_367, true));
+    }
+
     #[test]
     fn the_ring_holds_the_window_of_the_shortest_part() {
         let args = Args::try_parse_from(["av-mesh"])
