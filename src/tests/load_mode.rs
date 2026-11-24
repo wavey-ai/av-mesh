@@ -1017,6 +1017,8 @@ fn change_one_edge(
         })
         .collect();
     let ports: Vec<SocketAddr> = edges.iter().map(|(edge, _)| edge.client_port()).collect();
+    let distinct: std::collections::BTreeSet<_> = ports.iter().collect();
+    assert_eq!(distinct.len(), ports.len(), "four edges, four addresses: {ports:?}");
     let alive: Vec<(String, SocketAddr)> = ports
         .iter()
         .enumerate()

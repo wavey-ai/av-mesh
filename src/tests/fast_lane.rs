@@ -340,8 +340,12 @@ impl LaneEdge {
         })
         .await;
         let router = app_router_for_tests(Arc::clone(&cache), mesh);
+        // On the edge's own loopback address: the client sockets are
+        // SO_REUSEPORT, and a bind to port 0 with it may be given a port that
+        // another reuseport socket of this process holds, so two edges at
+        // 127.0.0.1 could share one address (and its datagrams).
         let client_sockets = bind_edge_class_sockets_with(
-            "127.0.0.1:0".parse().unwrap(),
+            SocketAddr::from((ip, 0)),
             4 << 20,
             cache.stream_classes(),
             send_twins,
