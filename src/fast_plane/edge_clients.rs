@@ -2329,21 +2329,7 @@ impl ClientPlan {
             let message = usize::from(send.message);
             if !copied[message] {
                 copied[message] = true;
-                let start = message * REWRAP_BYTES;
-                let len = usize::from(self.lens[message]);
-                into.buffers[start..start + len].copy_from_slice(&self.buffers[start..start + len]);
-                into.lens[message] = self.lens[message];
-                let compact_len = usize::from(self.compact_lens[message]);
-                into.compact_lens[message] = self.compact_lens[message];
-                if compact_len > 0 {
-                    for variant in 0..COMPACT_SLOTS as u8 {
-                        let at = compact_at(message, variant);
-                        into.compact_buffers[at..at + compact_len]
-                            .copy_from_slice(&self.compact_buffers[at..at + compact_len]);
-                    }
-                }
-                into.streams[message] = self.streams[message];
-                into.parts[message] = self.parts[message];
+                self.copy_message(message, into);
             }
             into.sends.push(PlannedClient {
                 client: into.clients.len() as u32,
@@ -2354,7 +2340,38 @@ impl ClientPlan {
         }
         if with_repair {
             into.compact_sent.extend_from_slice(&self.compact_sent);
+            // The shard that takes the window repair reads each repaired
+            // part's canonical bytes from its own plan (window_repair keeps
+            // them in the ring, class_window_repair hands them on): it gets
+            // them also for a part that none of its clients is sent, or it
+            // would keep a message's stale or empty bytes as that part's.
+            for &(_, _, _, message) in &self.compact_sent {
+                let message = usize::from(message);
+                if !copied[message] {
+                    copied[message] = true;
+                    self.copy_message(message, into);
+                }
+            }
         }
+    }
+
+    /// One message's bytes, lengths and numbers into `into` (no allocation).
+    fn copy_message(&self, message: usize, into: &mut ClientPlan) {
+        let start = message * REWRAP_BYTES;
+        let len = usize::from(self.lens[message]);
+        into.buffers[start..start + len].copy_from_slice(&self.buffers[start..start + len]);
+        into.lens[message] = self.lens[message];
+        let compact_len = usize::from(self.compact_lens[message]);
+        into.compact_lens[message] = self.compact_lens[message];
+        if compact_len > 0 {
+            for variant in 0..COMPACT_SLOTS as u8 {
+                let at = compact_at(message, variant);
+                into.compact_buffers[at..at + compact_len]
+                    .copy_from_slice(&self.compact_buffers[at..at + compact_len]);
+            }
+        }
+        into.streams[message] = self.streams[message];
+        into.parts[message] = self.parts[message];
     }
 
     /// Shed the sends of fan-out `shard` (of `shards`) unsent: each part
@@ -3227,6 +3244,42 @@ mod tests {
         let mut one = ClientPlan::new();
         plan.split_into(0, 1, &mut one, true);
         assert_eq!(one.sends.len(), plan.sends.len());
+    }
+
+    /// The shard that takes the batch's window repair has the repaired
+    /// part's canonical bytes even when none of its clients is sent that
+    /// part: before, its plan kept the message's stale (or zero) length, so
+    /// the repair kept an empty or another part's datagram in the ring under
+    /// this part's number, and a NACK answer from the ring panicked in
+    /// `shorten` (capacity overflow) with the subscriber table locked.
+    #[test]
+    fn the_shard_with_the_window_repair_has_the_repaired_part_s_bytes() {
+        let (mut plan, _clients) = audio_plan(3, 40);
+        let shards = 2;
+        // Message 1 (the compact part being repaired) goes only to the
+        // clients of shard 1.
+        plan.sends
+            .retain(|send| send.message != 1 || shard_of(send.peer, shards) == 1);
+        assert!(plan.sends.iter().any(|send| send.message == 1));
+        // A plan reused from an earlier batch: message 1's slot holds an
+        // older length and bytes.
+        let mut first = ClientPlan::new();
+        first.compact_lens[1] = 33;
+        let at = compact_at(1, 0);
+        first.compact_buffers[at..at + 33].fill(0xEE);
+        plan.split_into(0, shards, &mut first, true);
+        assert!(first.sends.iter().all(|send| send.message != 1));
+        assert_eq!(first.compact_sent, plan.compact_sent, "shard 0 took the repair");
+        assert_eq!(first.compact_lens[1], 70);
+        for copies in 0..COMPACT_VARIANTS as u8 {
+            let at = compact_at(1, copies);
+            assert_eq!(first.compact_buffers[at..at + 70], plan.compact_buffers[at..at + 70]);
+        }
+        assert_eq!((first.streams[1], first.parts[1]), (4001, 101));
+        // Without the repair a shard copies only what its clients are sent.
+        let mut second = ClientPlan::new();
+        plan.split_into(0, shards, &mut second, false);
+        assert_eq!(second.compact_lens[1], 0);
     }
 
     /// A fan-out thread that has FANOUT_DEPTH batches in hand is not
