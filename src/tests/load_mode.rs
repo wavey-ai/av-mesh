@@ -79,6 +79,10 @@ const LOAD_THREADS: &str = "nt-load";
 
 struct Bench {
     listeners: usize,
+    /// `--paths` and `--spare` (with one edge, `--edges` alone: one leg
+    /// either way, the second asked for again and again).
+    paths: u8,
+    spare: bool,
     seconds: u64,
     threads: usize,
     edge_threads: usize,
@@ -181,6 +185,8 @@ fn run_bench(bench: &Bench, ip: u8) -> BenchResult {
     // form (as before wave 7 item 9).
     session.compact_short_header = env_u64("LOAD_BENCH_SHORT_HEADER", 1) != 0;
     let mut config = LoadConfig::new(session, vec![edge.client_port()], bench.listeners);
+    config.director.paths = bench.paths;
+    config.director.spare = bench.spare;
     config.duration = Duration::from_secs(bench.seconds);
     config.threads = bench.threads;
     config.start_rate = 4_000.0;
@@ -288,11 +294,20 @@ fn out_dir(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// B Y3: with `--paths 1 --spare false` and with the defaults (two paths
+/// and a spare; one edge here, so one leg).
 #[test]
 fn load_mode_counts_every_part_of_every_listener() {
-    let dir = out_dir("check");
+    counts_every_part("check-one-path", 1, false, 41);
+    counts_every_part("check", 2, true, 43);
+}
+
+fn counts_every_part(name: &str, paths: u8, spare: bool, ip: u8) {
+    let dir = out_dir(name);
     let _ = std::fs::remove_dir_all(&dir);
     let bench = Bench {
+        paths,
+        spare,
         listeners: 20,
         seconds: 4,
         threads: 2,
@@ -302,7 +317,7 @@ fn load_mode_counts_every_part_of_every_listener() {
         out_dir: dir.clone(),
         measure_from: 1.5,
     };
-    let result = run_bench(&bench, 41);
+    let result = run_bench(&bench, ip);
     let summary = &result.summary;
     let total = &summary["total"];
     assert_eq!(total["listeners_started"], 20, "{summary:#}");
@@ -396,6 +411,8 @@ fn load_mode_cost_per_listener() {
     let dir = out_dir(&name);
     let _ = std::fs::remove_dir_all(&dir);
     let bench = Bench {
+        paths: 1,
+        spare: false,
         listeners,
         seconds,
         threads,
@@ -691,6 +708,8 @@ fn load_mode_cost_against_a_synthetic_edge() {
         edge.addresses.clone(),
         listeners,
     );
+    // LOAD_SYNTH_PATHS=1: one leg a listener (the cost before B Y3).
+    config.director.paths = env_u64("LOAD_SYNTH_PATHS", 2) as u8;
     config.duration = Duration::from_secs(seconds);
     config.threads = threads;
     config.start_rate = 4_000.0;
@@ -726,22 +745,25 @@ fn load_mode_cost_against_a_synthetic_edge() {
     let window_from = window_start.duration_since(started).as_secs_f64();
     let window_to = window_end.duration_since(started).as_secs_f64();
     let intervals = std::fs::read_to_string(dir.join("intervals.jsonl")).unwrap();
-    let (mut datagrams, mut counted) = (0_u64, 0.0_f64);
+    let (mut datagrams, mut parts, mut counted) = (0_u64, 0_u64, 0.0_f64);
     let mut loops = Vec::new();
     for line in intervals.lines() {
         let line: Value = serde_json::from_str(line).unwrap();
         let t = line["t"].as_f64().unwrap_or(0.0);
         if line["phase"] == "run" && t - 1.0 >= window_from - 0.5 && t <= window_to + 0.5 {
             datagrams += line["total"]["datagrams"].as_u64().unwrap_or(0);
+            parts += line["total"]["parts"].as_u64().unwrap_or(0);
             counted += 1.0;
             loops.push(line["load_host"]["loop"].clone());
         }
     }
     let per_second = datagrams as f64 / counted.max(1.0);
+    let parts_per_second = parts as f64 / counted.max(1.0);
     let us_per_datagram = load_cpu * 1e6 / per_second.max(1.0);
     let total = &summary["total"];
     let line = serde_json::json!({
         "listeners": listeners,
+        "paths": env_u64("LOAD_SYNTH_PATHS", 2),
         "load_threads": threads,
         "coalesce_us": coalesce_us,
         "kernel_timestamps": env_u64("LOAD_BENCH_KERNEL_TIMESTAMPS", 1) == 1,
@@ -752,6 +774,8 @@ fn load_mode_cost_against_a_synthetic_edge() {
         "synthetic_edge_sent": sent,
         "load_cpu": load_cpu,
         "load_us_per_datagram": us_per_datagram,
+        // A listener's part costs a datagram from each of its legs.
+        "load_us_per_listener_part": load_cpu * 1e6 / parts_per_second.max(1.0),
         "load_system_share": system_share,
         "load_cpu_percent_per_listener_at_1000_parts_s": us_per_datagram * 1_000.0 / 1e6 * 100.0,
         "synthetic_edge_cpu": edge_cpu,
@@ -782,9 +806,10 @@ fn load_mode_cost_against_a_synthetic_edge() {
 // ------------------------------------------------------- moves (Phase AM 10)
 
 /// An entry point for the load's assignment (`/api/assignment` over
-/// HTTPS/2): it lists the edges that are alive, ranked for each session by
-/// rendezvous, as a region's entry point ranks its caches. The CA file is
-/// its own self-signed certificate (for `localhost`).
+/// HTTPS/2, B 2.2): it lists the edges that are alive, ranked for each
+/// session by rendezvous, as a region's entry point ranks its caches, and
+/// names the legs it grants (`paths`) and the spare. The CA file is its own
+/// self-signed certificate (for `localhost`).
 struct FakeEntry {
     url: String,
     ca: PathBuf,
@@ -829,14 +854,25 @@ async fn fake_entry(name: &str, alive: Vec<(String, SocketAddr)>) -> FakeEntry {
                     move |request: http::Request<hyper::body::Incoming>| {
                         let alive = Arc::clone(&alive);
                         async move {
-                            let sid = request
-                                .uri()
-                                .query()
-                                .unwrap_or("")
-                                .split('&')
-                                .find_map(|pair| pair.strip_prefix("sid="))
-                                .unwrap_or("")
-                                .to_owned();
+                            let query = request.uri().query().unwrap_or("").to_owned();
+                            let field = |name: &str| -> String {
+                                query
+                                    .split('&')
+                                    .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+                                    .unwrap_or("")
+                                    .to_owned()
+                            };
+                            let list = |name: &str| -> Vec<String> {
+                                field(name)
+                                    .split(',')
+                                    .filter(|node| !node.is_empty())
+                                    .map(str::to_owned)
+                                    .collect()
+                            };
+                            let sid = field("sid");
+                            let (skip, hold) = (list("skip"), list("hold"));
+                            let paths: usize = field("paths").parse().unwrap_or(1);
+                            let spare = field("spare") == "1";
                             let mut caches = alive.lock().unwrap().clone();
                             caches.sort_by_key(|(node, _)| {
                                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -844,6 +880,16 @@ async fn fake_entry(name: &str, alive: Vec<(String, SocketAddr)>) -> FakeEntry {
                                 node.hash(&mut hasher);
                                 std::cmp::Reverse(hasher.finish())
                             });
+                            // B 3.6: the held legs never, the skipped ones
+                            // unless no cache is left; the first `paths` are
+                            // the legs, the next the spare.
+                            caches.retain(|(node, _)| !hold.contains(node));
+                            if caches.iter().any(|(node, _)| !skip.contains(node)) {
+                                caches.retain(|(node, _)| !skip.contains(node));
+                            }
+                            let granted = paths.min(caches.len());
+                            let spare = (spare && caches.len() > granted)
+                                .then(|| caches[granted].0.clone());
                             let assigned: Vec<Value> = caches
                                 .iter()
                                 .map(|(node, addr)| {
@@ -854,7 +900,12 @@ async fn fake_entry(name: &str, alive: Vec<(String, SocketAddr)>) -> FakeEntry {
                                     })
                                 })
                                 .collect();
-                            let body = serde_json::json!({ "assigned": assigned }).to_string();
+                            let body = serde_json::json!({
+                                "assigned": assigned,
+                                "paths": granted,
+                                "spare": spare,
+                            })
+                            .to_string();
                             Ok::<_, std::convert::Infallible>(http::Response::new(
                                 http_body_util::Full::new(Bytes::from(body)),
                             ))
@@ -877,10 +928,11 @@ async fn fake_entry(name: &str, alive: Vec<(String, SocketAddr)>) -> FakeEntry {
     }
 }
 
-/// Four edges of 2.5 ms Opus, 500 listeners spread over them; 4 s in, the
-/// first edge is killed. Returns the load's summary, its interval lines and
-/// the killed edge's address.
-fn kill_one_edge(name: &str, assigned: bool, rendezvous: bool, ip: u8) -> (Value, Vec<Value>, String) {
+/// Four edges of 2.5 ms Opus, 500 listeners spread over them by the entry
+/// point, with `--paths` and `--spare` as given; 4 s in, the first edge is
+/// killed. Returns the load's summary, its interval lines and the killed
+/// edge's address.
+fn kill_one_edge(name: &str, paths: u8, spare: bool, ip: u8) -> (Value, Vec<Value>, String) {
     let edge_rt = runtime("kill-edge-rt", 4);
     let pub_rt = runtime("kill-pub-rt", 2);
     let payload = Payload::Opus;
@@ -929,26 +981,25 @@ fn kill_one_edge(name: &str, assigned: bool, rendezvous: bool, ip: u8) -> (Value
     let dir = out_dir(name);
     let _ = std::fs::remove_dir_all(&dir);
     let session = SessionConfig::new(stream_id);
-    let static_edges = if assigned { Vec::new() } else { ports.clone() };
-    let mut config = LoadConfig::new(session, static_edges, 500);
+    let mut config = LoadConfig::new(session, Vec::new(), 500);
     config.duration = Duration::from_secs(seconds);
     config.threads = 2;
     config.start_rate = 4_000.0;
     config.out_dir = Some(dir.clone());
     config.thread_name = "kill-load-w".into();
-    config.rendezvous_moves = rendezvous;
     config.sid_prefix = name.into();
-    if assigned {
-        config.assign = Some(av_mesh::load_assign::AssignConfig {
-            entries: vec![entry.url.clone()],
-            stream_id,
-            tls_ca: entry.ca.clone(),
-            server_name: Some("localhost".into()),
-            udp_port: None,
-            in_flight: 64,
-            timeout: Duration::from_secs(2),
-        });
-    }
+    config.director.entries = vec![entry.url.clone()];
+    config.director.paths = paths;
+    config.director.spare = spare;
+    // The fake entry point answers HTTPS alone.
+    config.director.assignment_udp_port = 0;
+    config.director.assignment_timeout = Duration::from_secs(2);
+    config.assign = Some(av_mesh::load_assign::AssignConfig {
+        tls_ca: entry.ca.clone(),
+        server_name: Some("localhost".into()),
+        in_flight: 64,
+        timeout: Duration::from_secs(2),
+    });
     let load = std::thread::spawn(move || run(config, &mut |_| {}).unwrap());
     std::thread::sleep(Duration::from_secs(4));
     // Kill edge 0: the region no longer lists it, its stream stops, it
@@ -997,69 +1048,70 @@ fn move_spread(summary: &Value, killed: &str) -> (Vec<u64>, f64, u64) {
     (into, if mean > 0.0 { max / mean } else { 0.0 }, out)
 }
 
-/// Phase AM item 10: 500 listeners that subscribe through `/api/assignment`
-/// over four edges; one edge is killed. Its listeners move by assignment
-/// (the edges left, ranked for each session), spread over the three
-/// others (max/mean of the moves at most 1.5), none stranded, every one
-/// resumed; each move's reason and time from the last part on the old
-/// edge to the first on the new one are counted. With the static list and
-/// the rule of before (the next edge), they all pile onto one edge.
+/// Phase AM item 10, B Y3: 500 listeners that ask `/api/assignment` for
+/// their legs over four edges; one edge is killed. With `--paths 1 --spare
+/// false` its listeners' legs are replaced through the entry point (the
+/// edges left, ranked for each session); with the defaults (two legs and a
+/// spare) the spare takes the dead leg's place. Either way the replacements
+/// spread over the three others (max/mean at most 1.5), none is stranded,
+/// every listener resumes; each replacement's reason is counted, and the
+/// time to move of the listeners left with no leg.
 #[test]
 fn load_mode_moves_spread_over_the_edges_left_when_one_is_killed() {
-    let (summary, lines, killed) = kill_one_edge("kill-assigned", true, true, 71);
-    let total = &summary["total"];
-    let (into, spread, out) = move_spread(&summary, &killed);
-    let started = total["listeners_started"].as_u64().unwrap();
-    assert_eq!(started, 500, "{summary:#}");
-    assert_eq!(summary["listeners_without_parts"], 0, "{summary:#}");
-    assert_eq!(summary["never_resumed"], 0, "{summary:#}");
-    assert!(total["assignments"].as_u64().unwrap() >= 500, "{summary:#}");
-    assert_eq!(total["fallbacks"], 0, "{summary:#}");
-    // About a quarter of them were on the killed edge.
-    assert!((80..=200).contains(&out), "moves out {out}: {summary:#}");
-    assert_eq!(into.len(), 3, "{into:?}");
-    // Every move landed (a concurrent test's stray MOVE can add a few).
-    assert!(into.iter().sum::<u64>() >= out, "every move landed: {into:?}");
-    assert!(into.iter().all(|moves| *moves > 0), "{into:?}");
-    assert!(spread <= 1.5, "spread {spread:.2}: {into:?}");
-    let stranded = lines
-        .iter()
-        .filter(|line| line["phase"] == "run")
-        .filter_map(|line| line["total"]["stranded"].as_u64())
-        .max()
-        .unwrap_or(0);
-    assert_eq!(stranded, 0, "no listener without a part for 5 s");
-    let moved = &total["time_to_move_ms"];
-    assert!(moved["count"].as_u64().unwrap() >= out, "every move timed: {summary:#}");
-    let p99 = moved["p99"].as_f64().unwrap();
-    assert!(p99 <= 1_500.0, "time to move p99 {p99} ms");
-    let reasons = summary["per_edge"][&killed]["moves_by_reason"].clone();
-    assert!(
-        reasons.as_object().unwrap().keys().all(|reason| reason.starts_with("silence")
-            || reason.starts_with("no-answer")),
-        "{reasons}"
-    );
-
-    // Before: the static list and the next edge.
-    let (before, _, killed_before) = kill_one_edge("kill-next", false, false, 75);
-    let (into_before, spread_before, out_before) = move_spread(&before, &killed_before);
-    eprintln!(
-        "{}",
-        serde_json::json!({
-            "assigned": {
-                "moves_out": out, "into": into, "spread": spread,
+    for (name, paths, spare, ip, legs) in [
+        ("kill-one-path", 1, false, 71, (80, 200)),
+        ("kill-two-paths", 2, true, 75, (180, 330)),
+    ] {
+        let (summary, lines, killed) = kill_one_edge(name, paths, spare, ip);
+        let total = &summary["total"];
+        let (into, spread, out) = move_spread(&summary, &killed);
+        let started = total["listeners_started"].as_u64().unwrap();
+        assert_eq!(started, 500, "{name}: {summary:#}");
+        assert_eq!(summary["listeners_without_parts"], 0, "{name}: {summary:#}");
+        assert_eq!(summary["never_resumed"], 0, "{name}: {summary:#}");
+        assert!(total["assignments"].as_u64().unwrap() >= 500, "{name}: {summary:#}");
+        // A quarter of the listeners had their leg on the killed edge with
+        // one path, half of them with two.
+        assert!(
+            (legs.0..=legs.1).contains(&out),
+            "{name}: moves out {out}: {summary:#}"
+        );
+        assert_eq!(into.len(), 3, "{name}: {into:?}");
+        // Every move landed (a concurrent test's stray MOVE can add a few).
+        assert!(into.iter().sum::<u64>() >= out, "{name}: every move landed: {into:?}");
+        assert!(into.iter().all(|moves| *moves > 0), "{name}: {into:?}");
+        assert!(spread <= 1.5, "{name}: spread {spread:.2}: {into:?}");
+        let stranded = lines
+            .iter()
+            .filter(|line| line["phase"] == "run")
+            .filter_map(|line| line["total"]["stranded"].as_u64())
+            .max()
+            .unwrap_or(0);
+        assert_eq!(stranded, 0, "{name}: no listener without a part for 5 s");
+        let reasons = summary["per_edge"][&killed]["moves_by_reason"].clone();
+        assert!(
+            reasons.as_object().unwrap().keys().all(|reason| {
+                ["silence", "unanswered", "no-answer"]
+                    .iter()
+                    .any(|cause| reason.starts_with(cause))
+            }),
+            "{name}: {reasons}"
+        );
+        let moved = &total["time_to_move_ms"];
+        if paths == 1 {
+            // Each listener of the killed edge had no leg until its new one.
+            assert!(moved["count"].as_u64().unwrap() >= out, "{name}: every move timed: {summary:#}");
+            let p99 = moved["p99"].as_f64().unwrap();
+            assert!(p99 <= 1_500.0, "{name}: time to move p99 {p99} ms");
+        }
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "run": name, "moves_out": out, "into": into, "spread": spread,
                 "time_to_move_ms": moved, "missing": total["missing"],
                 "move_lost": total["move_lost"], "missing_moved": total["missing_moved"],
                 "assignment_ms": total["assignment_ms"], "ttfp_ms": total["ttfp_ms"],
-            },
-            "static_next": {
-                "moves_out": out_before, "into": into_before, "spread": spread_before,
-                "time_to_move_ms": before["total"]["time_to_move_ms"],
-                "missing": before["total"]["missing"],
-                "move_lost": before["total"]["move_lost"],
-            },
-        })
-    );
-    assert!(out_before >= 80, "{before:#}");
-    assert!(spread_before >= 2.5, "all onto one edge: {into_before:?}");
+            })
+        );
+    }
 }

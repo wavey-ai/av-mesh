@@ -1,13 +1,15 @@
-//! Assignment for `needletail-load` (Phase AM item 10): each simulated
-//! listener asks a region's entry point (`/api/assignment`, any healthy node
-//! of the region) where to subscribe, as `needletail-udp-client` does, when
-//! it starts and each time it moves.
+//! The load tool's transport for its listeners' directors (B Y3): the
+//! HTTPS hedge of an assignment request (`/api/assignment`, asked of an
+//! entry point beside the `ASSIGN` datagram that each listener sends from its
+//! own socket, as `needletail-udp-client` does) and the name lookups that a
+//! director asks for ([`crate::client_director::Action::Https`] and
+//! [`crate::client_director::Action::Resolve`]).
 //!
-//! The listeners live on synchronous worker threads; the HTTPS/2 requests
-//! run on one thread of their own (a current-thread runtime), one HTTP/2
-//! connection per entry point, many requests in flight on it. A worker
-//! sends a [`ResolveRequest`] and reads the [`ResolveAnswer`] from its own
-//! channel when it next looks (every loop of the worker, at most a few ms).
+//! The listeners live on synchronous worker threads; the requests run on one
+//! thread of their own (a current-thread runtime), one HTTP/2 connection per
+//! entry point, many requests in flight on it. A worker sends a
+//! [`ResolveRequest`] and reads the [`ResolveAnswer`] from its own channel
+//! when it next looks (every loop of the worker, at most a few ms).
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::{Bytes, BytesMut};
@@ -16,72 +18,70 @@ use hyper::client::conn::http2::SendRequest;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::net::SocketAddr;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
-/// How to reach the entry points.
+/// How to reach the entry points over HTTPS.
 #[derive(Debug, Clone)]
 pub struct AssignConfig {
-    /// Entry points of the region, `https://host:port` (any node of the
-    /// region answers `/api/assignment`); a request goes to one chosen by
-    /// its session, and to the next on failure.
-    pub entries: Vec<String>,
-    pub stream_id: u64,
     /// PEM file of the nodes' certificate authority.
     pub tls_ca: PathBuf,
     /// TLS name of the nodes, when it is not their address.
     pub server_name: Option<String>,
-    /// Client UDP port of the caches when an answer does not name one.
-    pub udp_port: Option<u16>,
     /// Requests in flight at most.
     pub in_flight: usize,
-    /// How long an entry point has to answer.
+    /// How long one request may take (the director's whole budget of an
+    /// assignment, `--assignment-timeout-ms`).
     pub timeout: Duration,
 }
 
-/// One cache of an answer, in its order.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AssignedCache {
-    pub node_id: String,
-    /// Its client UDP address; `None` for a failover region's entry point.
-    pub addr: Option<SocketAddr>,
-    /// A failover region's entry point (Phase AM item 11): asked for its
-    /// own caches when this region's are lost.
-    pub failover_url: Option<String>,
+/// What a director asked for.
+#[derive(Debug, Clone)]
+pub enum Job {
+    /// `GET <entry><path>` with the CMCD session header.
+    Https {
+        id: u64,
+        entry: String,
+        path: String,
+        sid: String,
+    },
+    /// The address of a host name.
+    Resolve { host: String },
 }
 
 #[derive(Debug, Clone)]
 pub struct ResolveRequest {
     pub worker: usize,
     pub slot: usize,
-    pub generation: u32,
-    pub sid: String,
-    /// Ask this entry point, not the region's (a failover region).
-    pub entry: Option<String>,
-    /// The caches the listener has just left: the entry point assigns
-    /// none of them (`skip=`), so a lost cache's listeners spread.
-    pub skip: Vec<String>,
+    /// The listener's session number in its worker: an answer for a session
+    /// that has gone is dropped.
+    pub listener: u64,
+    pub job: Job,
+}
+
+/// The answer to a [`Job`].
+#[derive(Debug)]
+pub enum Reply {
+    /// The body, or `None` on any failure.
+    Https { id: u64, body: Option<Bytes> },
+    Resolved { host: String, ip: Option<IpAddr> },
 }
 
 #[derive(Debug)]
 pub struct ResolveAnswer {
     pub slot: usize,
-    pub generation: u32,
-    pub caches: std::result::Result<Vec<AssignedCache>, String>,
-    /// The request's time, from the worker's send to the answer.
-    pub took: Duration,
-    /// The entry point that answered.
-    pub entry: Option<String>,
+    pub listener: u64,
+    pub reply: Reply,
 }
 
 /// The resolver thread: send it requests, read each worker's answers from
 /// its receiver.
 pub struct Resolver {
-    tx: tokio::sync::mpsc::UnboundedSender<(ResolveRequest, Instant)>,
+    tx: tokio::sync::mpsc::UnboundedSender<ResolveRequest>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -91,11 +91,8 @@ impl Resolver {
         config: AssignConfig,
         workers: usize,
     ) -> Result<(Self, Vec<mpsc::Receiver<ResolveAnswer>>)> {
-        if config.entries.is_empty() {
-            bail!("no entry point to ask for assignments");
-        }
         let connector = tls_connector(&config.tls_ca)?;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(ResolveRequest, Instant)>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ResolveRequest>();
         let (answer_txs, answer_rxs): (Vec<_>, Vec<_>) =
             (0..workers).map(|_| mpsc::channel::<ResolveAnswer>()).unzip();
         let thread = std::thread::Builder::new()
@@ -110,13 +107,11 @@ impl Resolver {
                         connector,
                         server_name: config.server_name.clone(),
                         connections: tokio::sync::Mutex::new(HashMap::new()),
-                        addresses: tokio::sync::Mutex::new(HashMap::new()),
-                        failed: std::sync::Mutex::new(HashMap::new()),
                     });
                     let config = Arc::new(config);
                     let limit = Arc::new(tokio::sync::Semaphore::new(config.in_flight.max(1)));
                     let answer_txs = Arc::new(answer_txs);
-                    while let Some((request, sent)) = rx.recv().await {
+                    while let Some(request) = rx.recv().await {
                         let (http, config, limit, answer_txs) = (
                             Arc::clone(&http),
                             Arc::clone(&config),
@@ -125,14 +120,40 @@ impl Resolver {
                         );
                         tokio::spawn(async move {
                             let _permit = limit.acquire().await;
-                            let (caches, entry) = resolve(&http, &config, &request).await;
+                            let reply = match request.job {
+                                Job::Https {
+                                    id,
+                                    entry,
+                                    path,
+                                    sid,
+                                } => {
+                                    let body = tokio::time::timeout(
+                                        config.timeout,
+                                        ask(&http, &entry, &path, &sid),
+                                    )
+                                    .await
+                                    .ok()
+                                    .and_then(Result::ok);
+                                    Reply::Https { id, body }
+                                }
+                                Job::Resolve { host } => {
+                                    let ip = tokio::time::timeout(
+                                        config.timeout,
+                                        tokio::net::lookup_host((host.as_str(), 0)),
+                                    )
+                                    .await
+                                    .ok()
+                                    .and_then(Result::ok)
+                                    .and_then(|mut addrs| addrs.next())
+                                    .map(|addr| addr.ip());
+                                    Reply::Resolved { host, ip }
+                                }
+                            };
                             if let Some(tx) = answer_txs.get(request.worker) {
                                 let _ = tx.send(ResolveAnswer {
                                     slot: request.slot,
-                                    generation: request.generation,
-                                    caches: caches.map_err(|error| format!("{error:#}")),
-                                    took: sent.elapsed(),
-                                    entry,
+                                    listener: request.listener,
+                                    reply,
                                 });
                             }
                         });
@@ -150,7 +171,7 @@ impl Resolver {
     }
 
     pub fn request(&self, request: ResolveRequest) {
-        let _ = self.tx.send((request, Instant::now()));
+        let _ = self.tx.send(request);
     }
 }
 
@@ -175,111 +196,11 @@ pub fn entry_for(entries: &[String], sid: &str) -> usize {
     (hasher.finish() % entries.len() as u64) as usize
 }
 
-async fn resolve(
-    http: &Http,
-    config: &AssignConfig,
-    request: &ResolveRequest,
-) -> (Result<Vec<AssignedCache>>, Option<String>) {
-    let mut entries: Vec<&str> = match &request.entry {
-        Some(entry) => vec![entry.as_str()],
-        None => {
-            let first = entry_for(&config.entries, &request.sid);
-            (0..config.entries.len())
-                .map(|offset| config.entries[(first + offset) % config.entries.len()].as_str())
-                .collect()
-        }
-    };
-    // An entry point that failed lately is asked last: a stopped node
-    // (its kernel still takes the connection) costs one timeout, once.
-    {
-        let now = Instant::now();
-        let failed = http.failed.lock().unwrap();
-        entries.sort_by_key(|entry| failed.get(*entry).is_some_and(|until| *until > now));
-    }
-    let skip = request.skip.join(",");
-    let mut last = anyhow!("no entry point");
-    for entry in entries {
-        match tokio::time::timeout(config.timeout, ask(http, config, entry, &request.sid, &skip))
-            .await
-        {
-            Ok(Ok(caches)) => {
-                http.failed.lock().unwrap().remove(entry);
-                return (Ok(caches), Some(entry.to_owned()));
-            }
-            Ok(Err(error)) => last = error.context(entry.to_owned()),
-            Err(_) => last = anyhow!("{entry}: no answer in {:?}", config.timeout),
-        }
-        http.failed
-            .lock()
-            .unwrap()
-            .insert(entry.to_owned(), Instant::now() + ENTRY_FAILED_FOR);
-    }
-    (Err(last), None)
-}
-
-/// How long an entry point that failed is asked last.
-const ENTRY_FAILED_FOR: Duration = Duration::from_secs(10);
-
-async fn ask(
-    http: &Http,
-    config: &AssignConfig,
-    entry: &str,
-    sid: &str,
-    skip: &str,
-) -> Result<Vec<AssignedCache>> {
+/// The HTTPS hedge: `GET <entry><path>` (the director's assignment path),
+/// the body as it came.
+async fn ask(http: &Http, entry: &str, path: &str, sid: &str) -> Result<Bytes> {
     let authority = authority_of(entry)?;
-    let mut path = format!("/api/assignment?stream={}&sid={sid}", config.stream_id);
-    if !skip.is_empty() {
-        path.push_str("&skip=");
-        path.push_str(skip);
-    }
-    let body = http.get(&authority, &path, sid).await?;
-    let answer: serde_json::Value =
-        serde_json::from_slice(&body).context("the assignment answer is not JSON")?;
-    let port = config
-        .udp_port
-        .or_else(|| answer["client_udp_port"].as_u64().map(|port| port as u16));
-    let assigned = answer["assigned"]
-        .as_array()
-        .ok_or_else(|| anyhow!("no assignment: {}", answer["error"]))?;
-    let mut caches = Vec::new();
-    for cache in assigned {
-        let Some(node_id) = cache["node_id"].as_str() else {
-            continue;
-        };
-        let base = cache["playback_base_url"].as_str().unwrap_or_default();
-        if cache["failover_entry"].as_bool() == Some(true) {
-            caches.push(AssignedCache {
-                node_id: node_id.to_owned(),
-                addr: None,
-                failover_url: Some(base.trim_end_matches('/').to_owned()),
-            });
-            continue;
-        }
-        // A cache may name its own port (tests; a deployment gives one).
-        let Some(port) = cache["client_udp_port"]
-            .as_u64()
-            .map(|port| port as u16)
-            .or(port)
-        else {
-            bail!("no client UDP port: the entry point names none");
-        };
-        let Ok(authority) = authority_of(base) else {
-            continue;
-        };
-        let host = host_of(&authority);
-        if let Some(addr) = http.address(&host, port).await {
-            caches.push(AssignedCache {
-                node_id: node_id.to_owned(),
-                addr: Some(addr),
-                failover_url: None,
-            });
-        }
-    }
-    if caches.is_empty() {
-        bail!("the assignment names no cache");
-    }
-    Ok(caches)
+    http.get(&authority, path, sid).await
 }
 
 /// `host:port` of an `https://host:port/...` URL.
@@ -320,9 +241,6 @@ struct Http {
     connector: TlsConnector,
     server_name: Option<String>,
     connections: tokio::sync::Mutex<HashMap<String, SendRequest<Empty<Bytes>>>>,
-    addresses: tokio::sync::Mutex<HashMap<(String, u16), SocketAddr>>,
-    /// Entry points that failed, until when they are asked last.
-    failed: std::sync::Mutex<HashMap<String, Instant>>,
 }
 
 impl Http {
@@ -360,6 +278,9 @@ impl Http {
                 .header("cmcd-session", format!("sid=\"{sid}\""))
                 .body(Empty::<Bytes>::new())?;
             let response = sender.send_request(request).await?;
+            if !response.status().is_success() {
+                bail!("{authority}{path}: {}", response.status());
+            }
             let (_, mut body) = response.into_parts();
             let mut bytes = BytesMut::new();
             while let Some(frame) = body.frame().await {
@@ -375,30 +296,25 @@ impl Http {
         }
         result
     }
-
-    async fn address(&self, host: &str, port: u16) -> Option<SocketAddr> {
-        let key = (host.to_owned(), port);
-        if let Some(addr) = self.addresses.lock().await.get(&key) {
-            return Some(*addr);
-        }
-        let addr = tokio::net::lookup_host((host, port)).await.ok()?.next()?;
-        self.addresses.lock().await.insert(key, addr);
-        Some(addr)
-    }
 }
 
 /// Rendezvous over `candidates` for a session: the one whose hash with the
-/// session is highest. A fallback when no entry point answers.
+/// session is highest (the order in which `--edges` alone, the in-process
+/// tests' mode, names its edges to a session).
 pub fn rendezvous<'a, T: Hash>(sid: &str, candidates: impl Iterator<Item = &'a T>) -> Option<&'a T>
 where
     T: 'a,
 {
-    candidates.max_by_key(|candidate| {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        sid.hash(&mut hasher);
-        candidate.hash(&mut hasher);
-        hasher.finish()
-    })
+    candidates.max_by_key(|candidate| rendezvous_score(sid, *candidate))
+}
+
+/// A session's rendezvous score of one candidate: candidates in falling
+/// order of it are the session's ranking.
+pub fn rendezvous_score<T: Hash + ?Sized>(sid: &str, candidate: &T) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    sid.hash(&mut hasher);
+    candidate.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[cfg(test)]

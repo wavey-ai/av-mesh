@@ -4,9 +4,14 @@
 //! a few worker threads for all of them. See `av_mesh::load`.
 //!
 //! ```text
-//! needletail-load --edges 10.0.0.21:19446,10.0.0.22:19446 --stream 4001 \
-//!     --ramp 100@0,1000@30,5000@60 --duration 120 --sample 20 --out target/load/run1
+//! needletail-load --entry https://lon-dist-a:19444,https://lon-dist-b:19444 --tls-ca ca.crt \
+//!     --stream 4001 --ramp 100@0,1000@30,5000@60 --duration 120 --sample 20 --out run1
 //! ```
+//!
+//! Each listener runs the session and the director of `needletail-udp-client`
+//! with its defaults and flags of the same names (B 2.4): two legs on two
+//! edges and a spare (`--paths 2 --spare true`), its legs asked of an entry
+//! point with `ASSIGN` from its own socket and HTTPS beside it.
 //!
 //! Writes `<out>/intervals.jsonl` (one line an interval: per edge and in
 //! total, listeners active and subscribed, parts, gaps, missing, recovered,
@@ -39,22 +44,16 @@ use std::time::Duration;
     about = "Simulated UDP listeners of a Needletail stream, thousands per host"
 )]
 struct Args {
-    /// The edges' client UDP ports, `host:port,...`. Without --entry,
-    /// listener i starts at edge i mod n; a listener that must move (its
-    /// edge says `MOVE` or `REFUSED`, does not answer, or goes silent) goes
-    /// to the edge that rendezvous of its session picks among those it has
-    /// not left in the last --skip-ms (--move-rule next: the next edge of
-    /// the list, as before). With --entry, the fallback when no entry point
-    /// answers.
+    /// The edges' client UDP ports, `host:port,...`, without --entry (the
+    /// in-process tests' mode): each listener's director is answered from
+    /// this list in the session's rendezvous order (legs on different edges,
+    /// no spare).
     #[arg(long, value_delimiter = ',')]
     edges: Vec<String>,
-    /// Phase AM item 10: entry points of the region, `https://host:port`,
-    /// any node of it (comma list): each listener asks one
-    /// (`/api/assignment`, its own session id) where to subscribe when it
-    /// starts and each time it moves, as needletail-udp-client does, and
-    /// takes the first cache of the answer that it has not left in the
-    /// last --skip-ms (a failover region's entry point, Phase AM item 11,
-    /// once its region is lost).
+    /// Entry points of the home region, `https://host:port` (comma list),
+    /// as needletail-udp-client takes them: each listener asks one
+    /// (`entries[hash of its session]`, the next too after --first-retry-ms)
+    /// for its legs and its spare.
     #[arg(long, value_delimiter = ',')]
     entry: Vec<String>,
     /// PEM file of the nodes' certificate authority (with --entry).
@@ -63,26 +62,59 @@ struct Args {
     /// TLS server name of the nodes, when it is not their address.
     #[arg(long)]
     server_name: Option<String>,
-    /// Client UDP port of the caches when the entry point names none.
+    /// The caches' client UDP port, over what an answer names.
     #[arg(long)]
     udp_port: Option<u16>,
-    /// Assignment requests in flight at most, and an entry point's time to
-    /// answer (ms) before the next is asked.
+    /// HTTPS requests to the entry points in flight at most.
     #[arg(long, default_value_t = 256)]
     assign_in_flight: usize,
-    #[arg(long, default_value_t = 500)]
-    assign_timeout_ms: u64,
-    /// A moving listener does not go back to an edge it left within this.
-    #[arg(long, default_value_t = 30_000)]
-    skip_ms: u64,
+    /// Legs held on a stream the entry grants two for (B 2.4).
+    #[arg(long, default_value_t = av_mesh::client_director::DEFAULT_PATHS)]
+    paths: u8,
+    /// Hold a spare and hedge to it; false: a dead leg is replaced through
+    /// the entry.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    spare: bool,
+    /// A leg with no TOKEN after this (or four round trips to its entry) is
+    /// passed over.
+    #[arg(long, default_value_t = av_mesh::client_session::DEFAULT_TOKEN_MS)]
+    token_ms: u64,
+    /// A leg with no media this long while another delivers is hedged at
+    /// the spare.
+    #[arg(long, default_value_t = av_mesh::client_session::DEFAULT_HEDGE_AFTER_MS)]
+    hedge_after_ms: u64,
+    /// The only leg with no datagram this long is hedged at the spare.
+    #[arg(long, default_value_t = av_mesh::client_session::DEFAULT_LONE_HEDGE_AFTER_MS)]
+    lone_hedge_after_ms: u64,
+    /// After MOVE rebalance: a replacement not level by then is released and
+    /// the old edge asked to keep the listener.
+    #[arg(long, default_value_t = av_mesh::client_director::DEFAULT_REBALANCE_GIVEUP_MS)]
+    rebalance_giveup_ms: u64,
+    /// After any other MOVE: a replacement steady this long takes over
+    /// though it is not level.
+    #[arg(long, default_value_t = av_mesh::client_director::DEFAULT_LEVEL_WAIT_MS)]
+    level_wait_ms: u64,
+    /// A leg's first SUBs are each sent again this soon (0: off).
+    #[arg(long, default_value_t = av_mesh::client_session::DEFAULT_FIRST_DOUBLE_MS)]
+    first_double_ms: u64,
+    /// The compact plan's residual loss target, parts per million.
+    #[arg(long, default_value_t = (av_mesh::client_compact::RESIDUAL_TARGET * 1e6).round() as u64)]
+    compact_residual_ppm: u64,
+    /// A hole is given up after this long.
+    #[arg(long, default_value_t = av_mesh::client_compact::HOLE_GIVE_UP.as_millis() as u64)]
+    hole_give_up_ms: u64,
+    /// The entry points' client UDP port for ASSIGN (0: HTTPS alone).
+    #[arg(long, default_value_t = av_mesh::client_udp::DEFAULT_CLIENT_UDP_PORT)]
+    assignment_udp_port: u16,
+    /// The HTTPS hedge of an assignment request goes after this long.
+    #[arg(long, default_value_t = av_mesh::client_director::DEFAULT_ASSIGNMENT_HTTPS_AFTER_MS)]
+    assignment_https_after_ms: u64,
+    /// The whole budget of one assignment request.
+    #[arg(long, default_value_t = av_mesh::client_director::DEFAULT_ASSIGNMENT_TIMEOUT_MS)]
+    assignment_timeout_ms: u64,
     /// A listener with no part for this long counts as stranded.
     #[arg(long, default_value_t = 5_000)]
     stranded_ms: u64,
-    /// Where a listener moves without an assignment: `rendezvous` (of its
-    /// session over the edges not left) or `next` (the next edge of
-    /// --edges, as before).
-    #[arg(long, default_value = "rendezvous")]
-    move_rule: String,
     /// Session ids are `<prefix>-<listener>` (by default the label, or
     /// `load-<pid>`).
     #[arg(long)]
@@ -245,14 +277,14 @@ fn config(args: &Args) -> Result<LoadConfig> {
         .map(|entry| entry.trim().trim_end_matches('/').to_owned())
         .filter(|entry| !entry.is_empty())
         .collect();
-    if edges.is_empty() && entries.is_empty() {
-        bail!("--edges or --entry must name the edges or an entry point");
+    match (edges.is_empty(), entries.is_empty()) {
+        (true, true) => bail!("--edges or --entry must name the edges or an entry point"),
+        (false, false) => bail!("--edges or --entry, not both"),
+        _ => {}
     }
-    let rendezvous_moves = match args.move_rule.as_str() {
-        "rendezvous" => true,
-        "next" => false,
-        other => bail!("--move-rule {other:?}: rendezvous or next"),
-    };
+    if !(1..=2).contains(&args.paths) {
+        bail!("--paths must be 1 or 2");
+    }
     if args.settle_parts == 0 || args.settle_parts >= 4_096 {
         bail!("--settle-parts must be 1 to 4095");
     }
@@ -287,16 +319,26 @@ fn config(args: &Args) -> Result<LoadConfig> {
         },
         known_parts: args.known_parts,
         first_retry: Duration::from_millis(args.first_retry_ms),
-        residual_target: av_mesh::client_compact::RESIDUAL_TARGET,
-        hole_give_up: av_mesh::client_compact::HOLE_GIVE_UP,
-        token_wait: Duration::from_millis(av_mesh::client_session::DEFAULT_TOKEN_MS),
-        first_double: Duration::from_millis(av_mesh::client_session::DEFAULT_FIRST_DOUBLE_MS),
-        hedge_after: Duration::from_millis(av_mesh::client_session::DEFAULT_HEDGE_AFTER_MS),
-        lone_hedge_after: Duration::from_millis(
-            av_mesh::client_session::DEFAULT_LONE_HEDGE_AFTER_MS,
-        ),
+        residual_target: args.compact_residual_ppm as f64 / 1e6,
+        hole_give_up: Duration::from_millis(args.hole_give_up_ms),
+        token_wait: Duration::from_millis(args.token_ms),
+        first_double: Duration::from_millis(args.first_double_ms),
+        hedge_after: Duration::from_millis(args.hedge_after_ms),
+        lone_hedge_after: Duration::from_millis(args.lone_hedge_after_ms),
     };
     let mut config = LoadConfig::new(session, edges, args.listeners);
+    let director = &mut config.director;
+    director.entries = entries;
+    director.paths = args.paths;
+    director.spare = args.spare;
+    director.token_wait = Duration::from_millis(args.token_ms);
+    director.rebalance_giveup = Duration::from_millis(args.rebalance_giveup_ms);
+    director.level_wait = Duration::from_millis(args.level_wait_ms);
+    director.first_retry = Duration::from_millis(args.first_retry_ms);
+    director.assignment_udp_port = args.assignment_udp_port;
+    director.assignment_https_after = Duration::from_millis(args.assignment_https_after_ms);
+    director.assignment_timeout = Duration::from_millis(args.assignment_timeout_ms.max(1));
+    director.udp_port = args.udp_port;
     if let Some(text) = &args.ramp {
         config.ramp = parse_ramp(text).map_err(anyhow::Error::msg)?;
     }
@@ -317,26 +359,21 @@ fn config(args: &Args) -> Result<LoadConfig> {
     config.progress = !args.quiet;
     config.label = args.label.clone();
     config.coalesce = Duration::from_micros(args.coalesce_us);
-    config.skip_for = Duration::from_millis(args.skip_ms);
     config.stranded_after = Duration::from_millis(args.stranded_ms);
-    config.rendezvous_moves = rendezvous_moves;
     config.sid_prefix = args.sid_prefix.clone().unwrap_or_else(|| {
         args.label
             .clone()
             .unwrap_or_else(|| format!("load-{}", std::process::id()))
     });
-    if !entries.is_empty() {
+    if !config.director.entries.is_empty() {
         let Some(tls_ca) = args.tls_ca.clone() else {
             bail!("--entry needs --tls-ca");
         };
         config.assign = Some(AssignConfig {
-            entries,
-            stream_id: args.stream,
             tls_ca,
             server_name: args.server_name.clone(),
-            udp_port: args.udp_port,
             in_flight: args.assign_in_flight.max(1),
-            timeout: Duration::from_millis(args.assign_timeout_ms.max(1)),
+            timeout: config.director.assignment_timeout,
         });
     }
     Ok(config)
@@ -477,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn the_phase_am_flags_ask_the_entry_points_and_move_by_rendezvous() {
+    fn the_entry_points_and_the_director_take_the_client_s_flags_and_defaults() {
         let args = Args::try_parse_from([
             "needletail-load",
             "--stream",
@@ -493,32 +530,62 @@ mod tests {
         ])
         .unwrap();
         let config = config(&args).unwrap();
-        let assign = config.assign.as_ref().expect("assignment");
+        let director = &config.director;
         assert_eq!(
-            assign.entries,
+            director.entries,
             vec!["https://10.80.1.1:19444", "https://10.80.1.2:19444"]
         );
+        let assign = config.assign.as_ref().expect("the HTTPS hedge");
         assert_eq!(assign.server_name.as_deref(), Some("local.wavey.ai"));
         assert!(config.edges.is_empty());
-        assert!(config.rendezvous_moves);
-        assert_eq!(config.skip_for, Duration::from_secs(30));
         assert_eq!(config.stranded_after, Duration::from_secs(5));
         assert_eq!(config.sid_prefix, "lon-1");
-        // --entry needs the CA; neither edges nor an entry is an error.
+        // The client's defaults (B 2.4): exactly the director and session
+        // that needletail-udp-client makes for the same stream.
+        let client = av_mesh::client_director::DirectorConfig::new(4001, "", Vec::new());
+        assert_eq!(director.paths, 2);
+        assert!(director.spare);
+        assert_eq!(director.paths, client.paths);
+        assert_eq!(director.spare, client.spare);
+        assert_eq!(director.token_wait, client.token_wait);
+        assert_eq!(director.rebalance_giveup, client.rebalance_giveup);
+        assert_eq!(director.level_wait, client.level_wait);
+        assert_eq!(director.first_retry, client.first_retry);
+        assert_eq!(director.assignment_udp_port, client.assignment_udp_port);
+        assert_eq!(director.assignment_https_after, client.assignment_https_after);
+        assert_eq!(director.assignment_timeout, client.assignment_timeout);
+        assert_eq!(director.udp_port, client.udp_port);
+        let session = SessionConfig {
+            known_parts: config.session.known_parts,
+            ..SessionConfig::new(4001)
+        };
+        assert_eq!(format!("{:?}", config.session), format!("{session:?}"));
+        assert_eq!(assign.timeout, client.assignment_timeout);
+        // --entry needs the CA; neither edges nor an entry, or both, is an
+        // error; so is a third path.
         assert!(config_of(&["needletail-load", "--stream", "1", "--entry", "https://a:1"]).is_err());
         assert!(config_of(&["needletail-load", "--stream", "1"]).is_err());
-        // The rule of before: the next edge of the list.
+        assert!(config_of(&[
+            "needletail-load", "--stream", "1", "--entry", "https://a:1", "--tls-ca", "ca",
+            "--edges", "127.0.0.1:1",
+        ])
+        .is_err());
+        assert!(config_of(&["needletail-load", "--stream", "1", "--edges", "127.0.0.1:1", "--paths", "3"]).is_err());
+        // One path and no spare, the control of B 2.4.
         let config = config_of(&[
             "needletail-load",
             "--stream",
             "1",
             "--edges",
             "127.0.0.1:1",
-            "--move-rule",
-            "next",
+            "--paths",
+            "1",
+            "--spare",
+            "false",
         ])
         .unwrap();
-        assert!(!config.rendezvous_moves && config.assign.is_none());
+        assert_eq!((config.director.paths, config.director.spare), (1, false));
+        assert!(config.director.entries.is_empty() && config.assign.is_none());
     }
 
     fn config_of(argv: &[&str]) -> Result<LoadConfig> {
