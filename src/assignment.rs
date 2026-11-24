@@ -279,6 +279,10 @@ pub enum AssignmentError {
     UnknownPinnedCache,
     /// No cache of the region can take the reader now.
     NoCacheAvailable,
+    /// A listener that holds a leg asked for another and no cache of the
+    /// region takes one (B 3.6: nothing spills), with the reason that
+    /// `ASSIGNED` carries (`why=`, B Y2).
+    NoLegGranted(ShortGrant),
 }
 
 impl std::fmt::Display for AssignmentError {
@@ -290,6 +294,11 @@ impl std::fmt::Display for AssignmentError {
             Self::NoCacheAvailable => {
                 formatter.write_str("no cache of this region can take a new reader now")
             }
+            Self::NoLegGranted(why) => write!(
+                formatter,
+                "no cache of this region can take another leg of this listener now ({})",
+                why.word()
+            ),
         }
     }
 }
@@ -577,26 +586,20 @@ pub fn assign(
         caches.push(assigned(cache, AssignmentReason::SecondPath));
     }
     let legs = u8::try_from(caches.len()).unwrap_or(MAX_PATHS);
-    // Why fewer legs than asked: the bit rate, else no other edge of the
-    // region that serves at all, else none through the gate.
-    let short = if wanted < request.paths.min(MAX_PATHS) {
-        Some(ShortGrant::Bitrate)
-    } else if legs < wanted {
-        let other = regional
-            .iter()
-            .any(|cache| healthy(cache) && !caches.iter().any(|leg| leg.node_id == cache.node_id));
-        Some(if other {
-            ShortGrant::Gate
-        } else {
-            ShortGrant::OneEdge
-        })
-    } else {
-        None
+    let other_serving = regional
+        .iter()
+        .any(|cache| healthy(cache) && !caches.iter().any(|leg| leg.node_id == cache.node_id));
+    let short = short_grant(request.paths, wanted, legs, other_serving);
+    // A listener that holds a leg and is granted nothing hears why, as one
+    // granted fewer legs than asked does (review of B Y2, finding 1).
+    let none_named = match short {
+        Some(why) if request.redundant => AssignmentError::NoLegGranted(why),
+        _ => AssignmentError::NoCacheAvailable,
     };
     if rebalancing && legs == 0 && wanted > 0 {
         // No receiver under the level: no cache of the region is named.
         // A request for a spare alone is answered as any.
-        return Err(AssignmentError::NoCacheAvailable);
+        return Err(none_named);
     }
     // The spare: a holder of the playlist by the session's weighted
     // rendezvous, else a cache that admits. No load gate: a spare carries
@@ -663,7 +666,7 @@ pub fn assign(
         caches.push(assigned(cache, AssignmentReason::Alternate));
     }
     if caches.is_empty() {
-        return Err(AssignmentError::NoCacheAvailable);
+        return Err(none_named);
     }
     Ok(Assignment {
         caches,
@@ -672,6 +675,24 @@ pub fn assign(
         spare,
         short,
     })
+}
+
+/// Why a request for `asked` legs was granted `legs` (B Y2, the lead's
+/// decision): the bit rate cut the legs `wanted`; else no other edge of the
+/// region serves the stream (`other_serving`: fresh and not draining); else
+/// none passed the gate. `None` for a full grant.
+fn short_grant(asked: u8, wanted: u8, legs: u8, other_serving: bool) -> Option<ShortGrant> {
+    if wanted < asked.min(MAX_PATHS) {
+        Some(ShortGrant::Bitrate)
+    } else if legs < wanted {
+        Some(if other_serving {
+            ShortGrant::Gate
+        } else {
+            ShortGrant::OneEdge
+        })
+    } else {
+        None
+    }
 }
 
 /// A UDP client's assignment when [`assign`] finds no cache with room for
@@ -696,14 +717,15 @@ pub fn assign_udp_in_region(
     if request.pin.is_some() {
         return assign(request, policy, candidates);
     }
-    let healthy = |cache: &CacheCandidate| {
+    let serving = |cache: &CacheCandidate| {
         cache.region == request.region
             && cache.serves_readers
             && cache.playback_base_url.is_some()
             && cache.fresh
             && !cache.draining
-            && !cache.overloaded
-            && cache.load_permille < FULL_LOAD_PERMILLE
+    };
+    let healthy = |cache: &CacheCandidate| {
+        serving(cache) && !cache.overloaded && cache.load_permille < FULL_LOAD_PERMILLE
     };
     // Every healthy cache by the session's weighted rendezvous score alone
     // (its weight the cache's own headroom), not by the tiers of `assign`:
@@ -743,16 +765,28 @@ pub fn assign_udp_in_region(
         };
         caches.push(assigned(cache, reason));
     }
-    if caches.is_empty() {
+    let Some(spilled) = caches.first().map(|cache| cache.node_id.clone()) else {
         return Err(AssignmentError::NoCacheAvailable);
-    }
+    };
+    // One leg, and why not the legs asked: as `assign` reckons it (review
+    // of B Y2, finding 8).
+    let wanted = if request
+        .playlist_bps
+        .is_some_and(|bps| bps > policy.two_path_max_bps)
+    {
+        request.paths.min(1)
+    } else {
+        request.paths.min(MAX_PATHS)
+    };
+    let other_serving = candidates
+        .iter()
+        .any(|cache| serving(cache) && cache.node_id != spilled);
     Ok(Assignment {
         caches,
         pinned: false,
         legs: 1,
         spare: false,
-        // A spill: no cache took a redundant leg either.
-        short: (request.paths > 1).then_some(ShortGrant::Gate),
+        short: short_grant(request.paths, wanted, 1, other_serving),
     })
 }
 
@@ -1222,7 +1256,7 @@ mod tests {
         let full = [cache("edge-2", FULL_LOAD_PERMILLE, Some(9))];
         assert_eq!(
             assign(redundant, AssignmentPolicy::default(), &full),
-            Err(AssignmentError::NoCacheAvailable)
+            Err(AssignmentError::NoLegGranted(ShortGrant::Gate))
         );
         // Under the target, the held listener's leg is a second path.
         let assignment = assign(
@@ -1375,6 +1409,47 @@ mod tests {
         // Two legs granted, or one asked: no reason.
         assert_eq!(short(two("d"), &pair), (2, None));
         assert_eq!(short(request("e"), &pair), (1, None));
+
+        // A listener that holds a leg (the held edge is never a candidate)
+        // and asks for one more: none granted, and why (review of B Y2,
+        // finding 1). The other edge drains: no other edge serves.
+        let held = |session| AssignmentRequest {
+            redundant: true,
+            ..request(session)
+        };
+        let draining = [CacheCandidate {
+            draining: true,
+            ..cache("edge-2", 100, Some(9))
+        }];
+        assert_eq!(
+            assign(held("f"), policy, &draining),
+            Err(AssignmentError::NoLegGranted(ShortGrant::OneEdge))
+        );
+        // The other edge serves at full load: it fails the gate.
+        let at_full = [cache("edge-2", FULL_LOAD_PERMILLE, Some(9))];
+        assert_eq!(
+            assign(held("g"), policy, &at_full),
+            Err(AssignmentError::NoLegGranted(ShortGrant::Gate))
+        );
+        // Nothing serves a listener that holds nothing: no reason, the
+        // caller spills it or sends it to the failover region.
+        assert_eq!(
+            assign(two("h"), policy, &draining),
+            Err(AssignmentError::NoCacheAvailable)
+        );
+
+        // A spill names its reason as `assign` does (finding 8).
+        let spill = |request, caches: &[CacheCandidate]| {
+            assign_udp_in_region(request, policy, caches).unwrap().short
+        };
+        assert_eq!(spill(two("i"), &pair), Some(ShortGrant::Gate));
+        assert_eq!(spill(two("j"), &alone), Some(ShortGrant::OneEdge));
+        let video = AssignmentRequest {
+            playlist_bps: Some(DEFAULT_TWO_PATH_MAX_BPS + 1),
+            ..two("k")
+        };
+        assert_eq!(spill(video, &pair), Some(ShortGrant::Bitrate));
+        assert_eq!(spill(request("l"), &pair), None);
     }
 
     /// B 3.6: a rebalanced listener goes only to a receiver that stays
@@ -1426,7 +1501,7 @@ mod tests {
                 AssignmentPolicy::default(),
                 &full
             ),
-            Err(AssignmentError::NoCacheAvailable)
+            Err(AssignmentError::NoLegGranted(ShortGrant::Gate))
         );
         // A drain's mover is still placed there: over the level, under full.
         let drained = AssignmentRequest {

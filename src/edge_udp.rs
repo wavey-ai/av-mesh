@@ -27,8 +27,8 @@ use crate::{AppRouter, ParentsLost};
 use av_mesh::client_compact as compact;
 use av_mesh::client_udp::{
     block_id, cut_through_block_id, cut_through_symbol_size, encode_block, encode_object, geometry,
-    source_datagram, AssignedCache, CompactPlan, Control, ObjectKind, PartObject, RepairPolicy,
-    KEEPALIVE, MIN_ASSIGN_REQUEST_BYTES, MIN_FIRST_REQUEST_BYTES, SUBSCRIPTION_TTL,
+    source_datagram, CompactPlan, Control, ObjectKind, PartObject, RepairPolicy, KEEPALIVE,
+    MIN_ASSIGN_REQUEST_BYTES, MIN_FIRST_REQUEST_BYTES, SUBSCRIPTION_TTL,
 };
 use bytes::Bytes;
 use playlists::mesh::{chunk_frame_slot, CacheMeshReceiveObserver};
@@ -5511,6 +5511,7 @@ fn new_route(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use av_mesh::client_udp::AssignedCache;
 
     #[test]
     fn a_gap_in_the_compact_ring_gives_way_to_the_part() {
