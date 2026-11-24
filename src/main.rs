@@ -46308,6 +46308,9 @@ mod tests {
     /// drain reasons, the start that waits until the node is warm, and the
     /// make-before-break release of parents.
     mod node_lifecycle;
+    /// What a steady one-leg listener costs on the wire against the base
+    /// (integration 2, the local smoke's +4 %): an ignored measurement.
+    mod client_traffic;
     /// Two-path listeners (the director over the session) against four
     /// edges and two entry points in this process, through the referee's
     /// changes (B Y5).
