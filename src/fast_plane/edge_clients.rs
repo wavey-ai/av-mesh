@@ -64,6 +64,7 @@ use super::sys;
 use super::view::RlsView;
 use super::TrafficClass;
 use crate::edge_udp::{EdgeSockets, EdgeUdpStats, Table};
+use crate::memory::touch_spare;
 use arc_swap::ArcSwap;
 use av_mesh::client_compact as compact;
 use av_mesh::client_udp::{fast_block_id, rewrap_fast, CompactPlan, RepairPolicy};
@@ -72,7 +73,7 @@ use raptorq_datagram_fec::{
     DatagramFecHeader, MediaObjectKind, RaptorQBlockProfile, RaptorQRepairEncoder,
 };
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -180,11 +181,27 @@ impl StreamRate {
 }
 
 /// The video thread's pacing state: each stream's rate, each client's
-/// next departure.
-#[derive(Debug, Default)]
+/// next departure. Made with room for [`PACER_STREAMS`] streams and
+/// [`PLAN_PEERS`] clients, so that the video thread's maps do not grow in
+/// a pass (stall follow-up); beyond them they grow, once each.
+#[derive(Debug)]
 struct Pacer {
     rates: HashMap<u64, StreamRate>,
     next: HashMap<SocketAddr, u64>,
+}
+
+/// Streams whose rate a video plan has room for.
+const PACER_STREAMS: usize = 64;
+/// Clients a video plan has room for in its maps.
+const PLAN_PEERS: usize = 1_024;
+
+impl Default for Pacer {
+    fn default() -> Self {
+        Self {
+            rates: HashMap::with_capacity(PACER_STREAMS),
+            next: HashMap::with_capacity(PLAN_PEERS),
+        }
+    }
 }
 
 impl Pacer {
@@ -234,11 +251,13 @@ pub struct FastClient {
 }
 
 impl FastClient {
+    /// Made by the thread that takes the client's SUB, which faults its
+    /// ring in: the class thread writes it at the client's first part (a
+    /// zeroed allocation's pages are not mapped until written).
     pub fn new(fast_from: u64) -> Arc<Self> {
-        Arc::new(Self {
-            fast_from,
-            ring: (0..CLAIM_RING).map(|_| AtomicU64::new(0)).collect(),
-        })
+        let mut ring: Box<[AtomicU64]> = (0..CLAIM_RING).map(|_| AtomicU64::new(0)).collect();
+        crate::memory::touch_owned(&mut *ring);
+        Arc::new(Self { fast_from, ring })
     }
 
     fn slot(&self, part: u64) -> &AtomicU64 {
@@ -313,6 +332,20 @@ pub struct FastGroup {
 #[derive(Debug, Default)]
 pub struct FastSnapshot {
     pub streams: HashMap<u64, Vec<FastGroup>>,
+    /// The compact ring of each stream with compact clients, made by the
+    /// rebuild (an ordinary thread), so that the class thread never makes
+    /// one for a new stream (stall follow-up).
+    pub(crate) rings: CompactRings,
+}
+
+/// The snapshot's compact rings, by stream.
+#[derive(Default)]
+pub(crate) struct CompactRings(HashMap<u64, Arc<crate::edge_udp::CompactRing>>);
+
+impl std::fmt::Debug for CompactRings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_set().entries(self.0.keys()).finish()
+    }
 }
 
 impl FastSnapshot {
@@ -516,12 +549,15 @@ struct Armed {
 /// client sockets and the subscriber table once they exist.
 pub struct EdgeFastLane {
     snapshot: ArcSwap<FastSnapshot>,
-    /// The snapshot that the last rebuild replaced, kept until the next
-    /// one: a class thread that loaded it for a batch is then never the
-    /// last to let it go, so its HashMap, groups and clients are freed by
-    /// the rebuilding (ordinary) thread, not by the real-time thread into
-    /// another thread's allocator arena on a subscriber's join or leave.
-    retired: std::sync::Mutex<Option<Arc<FastSnapshot>>>,
+    /// The snapshots that rebuilds replaced, kept while a class thread
+    /// holds one (see `retired`): their HashMap, groups and clients are
+    /// freed by a rebuilding (ordinary) thread, not by the real-time thread
+    /// into another thread's allocator arena on a subscriber's join or
+    /// leave.
+    retired: super::retired::Retired<FastSnapshot>,
+    /// The clients that rebuilds dropped, kept while a class thread's plan
+    /// holds one (a plan keeps its clients until its next batch).
+    gone: super::retired::Retired<FastClient>,
     /// Streams the tee has seen commit: `true` for a canonical slot (the
     /// lane may carry them), `false` for a reboxed one.
     eligible: DashMap<u64, bool>,
@@ -530,10 +566,6 @@ pub struct EdgeFastLane {
     fds: [AtomicU64; 2],
     rank: u32,
     next_sequence: AtomicU32,
-    /// The compact datagram of a part is made from its envelope read in
-    /// place (`--client-udp-compact-fast-parse`), not from a full decode and
-    /// slot.
-    compact_fast_parse: AtomicBool,
     /// A one-symbol part decoded from repair alone goes to the compact
     /// clients at once from the decoded envelope
     /// (`--client-udp-compact-top-up`; `false`: the cache-fed lane sends
@@ -578,6 +610,10 @@ struct RepairJob {
     part: u64,
     windows: [u8; REPAIR_JOB_WINDOWS],
     count: u8,
+    /// The part's canonical compact datagram, which the repair thread keeps
+    /// in the ring before the window's repair reads it.
+    canonical: [u8; compact::MAX_DATAGRAM],
+    len: u16,
 }
 
 /// The plans' windows a job carries (distinct windows of one part: the
@@ -604,15 +640,16 @@ impl std::fmt::Debug for EdgeFastLane {
 impl EdgeFastLane {
     /// `rank` (`--client-udp-edge-rank`) keeps the repair of edges apart.
     pub fn new(rank: u32) -> Arc<Self> {
-        Arc::new(Self {
+        // Faulted in here: the class threads write its counters.
+        crate::memory::touched_arc(Self {
             snapshot: ArcSwap::from_pointee(FastSnapshot::default()),
-            retired: std::sync::Mutex::new(None),
+            retired: super::retired::Retired::default(),
+            gone: super::retired::Retired::default(),
             eligible: DashMap::new(),
             armed: OnceLock::new(),
             fds: [AtomicU64::new(u64::MAX), AtomicU64::new(u64::MAX)],
             rank,
             next_sequence: AtomicU32::new(0),
-            compact_fast_parse: AtomicBool::new(true),
             compact_top_up: AtomicBool::new(true),
             compact_mark: AtomicBool::new(true),
             pace_percent: AtomicU32::new(0),
@@ -646,7 +683,13 @@ impl EdgeFastLane {
     /// or, with `--client-udp-repair-thread false` (or a repair thread that
     /// did not start), run here. Never waits on a lock when handed off; a
     /// full queue drops the job (counted): the part's clients then have NACK.
-    fn class_window_repair(self: &EdgeFastLane, stream_id: u64, part: u64, windows: &[u8]) {
+    fn class_window_repair(
+        self: &EdgeFastLane,
+        stream_id: u64,
+        part: u64,
+        windows: &[u8],
+        canonical: &[u8],
+    ) {
         let Some(armed) = self.armed.get() else {
             return;
         };
@@ -656,7 +699,13 @@ impl EdgeFastLane {
             .then(|| self.repair_jobs.get())
             .flatten();
         let Some(jobs) = jobs else {
+            // Without the repair thread (--client-udp-repair-thread false,
+            // or it did not start) the class thread keeps the part and
+            // repairs itself, allocating as it does.
             let started = Instant::now();
+            let mut kept = canonical.to_vec();
+            compact::set_flags(&mut kept, 0, false);
+            self.keep_canonical(stream_id, part, &kept);
             crate::edge_udp::window_repair_now(
                 &armed.sockets,
                 &armed.table,
@@ -683,7 +732,15 @@ impl EdgeFastLane {
             part,
             windows: [0; REPAIR_JOB_WINDOWS],
             count: 0,
+            canonical: [0; compact::MAX_DATAGRAM],
+            len: 0,
         };
+        if canonical.len() <= compact::MAX_DATAGRAM {
+            job.canonical[..canonical.len()].copy_from_slice(canonical);
+            // The canonical form: no copies, no mark.
+            compact::set_flags(&mut job.canonical[..canonical.len()], 0, false);
+            job.len = canonical.len() as u16;
+        }
         for window in windows {
             if usize::from(job.count) == REPAIR_JOB_WINDOWS {
                 break;
@@ -731,6 +788,12 @@ impl EdgeFastLane {
                 }
                 while let Ok(job) = rx.recv() {
                     let started = Instant::now();
+                    if job.len > 0 {
+                        sockets.compact().ring(job.stream_id).put(
+                            job.part,
+                            bytes::Bytes::copy_from_slice(&job.canonical[..usize::from(job.len)]),
+                        );
+                    }
                     crate::edge_udp::window_repair_now(
                         &sockets,
                         &table,
@@ -851,12 +914,6 @@ impl EdgeFastLane {
         self.txtime.store(state, Ordering::Release);
     }
 
-    /// Make compact datagrams from the envelope read in place (`true`, the
-    /// default) or from the full decode and slot, as before (`false`).
-    pub fn set_compact_fast_parse(&self, fast: bool) {
-        self.compact_fast_parse.store(fast, Ordering::Relaxed);
-    }
-
     /// Send a one-symbol part decoded from repair alone to the compact
     /// clients from the decoded envelope (`true`, the default), or leave it
     /// to the cache-fed lane, as before (`false`).
@@ -947,14 +1004,38 @@ impl EdgeFastLane {
                 streams.insert(*stream_id, groups);
             }
         }
-        let old = self.snapshot.swap(Arc::new(FastSnapshot { streams }));
-        // The one retired before is dropped here, after the lock is let go.
-        let older = self
-            .retired
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .replace(old);
-        drop(older);
+        // Each stream with compact clients has its ring made here, not by
+        // the class thread at its first part.
+        let mut rings = HashMap::new();
+        if let Some(armed) = self.armed.get() {
+            for (stream_id, groups) in &streams {
+                if groups.iter().any(|group| group.compact.is_some()) {
+                    rings.insert(*stream_id, armed.sockets.compact().ring(*stream_id));
+                }
+            }
+        }
+        let new = Arc::new(FastSnapshot {
+            streams,
+            rings: CompactRings(rings),
+        });
+        let old = self.snapshot.swap(Arc::clone(&new));
+        let kept: HashSet<*const FastClient> = new
+            .streams
+            .values()
+            .flatten()
+            .flat_map(|group| group.clients.iter().map(|(_, client)| Arc::as_ptr(client)))
+            .collect();
+        for (_, client) in old
+            .streams
+            .values()
+            .flatten()
+            .flat_map(|group| &group.clients)
+        {
+            if !kept.contains(&Arc::as_ptr(client)) {
+                self.gone.keep(Arc::clone(client));
+            }
+        }
+        self.retired.keep(old);
     }
 
     pub fn snapshot_stats(&self) -> FastLaneSnapshot {
@@ -1012,26 +1093,47 @@ impl EdgeFastLane {
         }
     }
 
-    /// The compact datagram of a one-symbol object whose source symbol is
-    /// `view` (in canonical form), kept in the edge's compact ring (or the
-    /// one kept there already); `None` when the object is not a canonical
-    /// part that fits one datagram.
-    fn compact_of(&self, stream_id: u64, view: &RlsView<'_>) -> Option<bytes::Bytes> {
-        let armed = self.armed.get()?;
-        let ring = armed.sockets.compact().ring(stream_id);
-        // A part of an older source epoch is late; a newer epoch (the
-        // contributor restarted) forgets the old one's parts.
-        if !ring.observe_epoch(view.epoch) {
+    /// The canonical compact datagram of a one-symbol object whose source
+    /// symbol is `view`, written into `out`: the one the stream's ring keeps,
+    /// else made from the part read in place; its length, or `None` when the
+    /// object is not a canonical part that fits one datagram, is late, or
+    /// cannot be read in place. The class thread's: no allocation, no lock
+    /// but the ring slot's, and no write to the ring (the tee keeps the part
+    /// there, `keep_compact`, and a window repair's thread before it runs).
+    fn compact_into(
+        &self,
+        snapshot: &FastSnapshot,
+        stream_id: u64,
+        view: &RlsView<'_>,
+        out: &mut [u8],
+    ) -> Option<usize> {
+        let ring = snapshot.rings.0.get(&stream_id)?;
+        let ring_epoch = ring.epoch();
+        // A part of an older source epoch is late. A newer epoch (the
+        // contributor restarted) is the ring's to take up (on the tee): its
+        // kept parts are the old epoch's and are not read.
+        if view.epoch != 0 && view.epoch < ring_epoch {
             return None;
         }
+        let newer = view.epoch > ring_epoch;
         // A gap kept (the cache-fed lane gave the part up) gives way to the
         // part.
-        if let Some(kept) = ring.get_part(view.object) {
-            return Some(kept);
+        if !newer {
+            if let Some(len) = ring.copy_part(view.object, out) {
+                return Some(len);
+            }
         }
+        let generation = match if view.epoch != 0 {
+            view.epoch
+        } else {
+            ring_epoch
+        } {
+            0 => 0,
+            epoch => compact::generation_of_epoch(epoch),
+        };
         // A compact (RLC1) datagram of an opaque part: the slim object
         // holds the part itself, and every copy is whole.
-        if let Some(slim) = view.slim {
+        let len = if let Some(slim) = view.slim {
             if view.track != "opaque-audio" {
                 return None;
             }
@@ -1042,42 +1144,72 @@ impl EdgeFastLane {
             let published_us = slim
                 .published_unix_ns()
                 .map_or(0, |ns| u64::try_from(ns / 1_000).unwrap_or(0));
-            let mut datagram = compact::encode_part(view.object, published_us, slim.payload)?;
-            compact::set_generation(&mut datagram, ring.generation());
-            return Some(ring.put(view.object, bytes::Bytes::from(datagram)));
-        }
-        let header = DatagramFecHeader::decode(view.fec).ok()?;
-        if header.source_symbols != 1 || view.esi != 0 {
-            return None;
-        }
-        let symbol = header.payload(view.fec).ok()?;
-        let envelope = symbol.get(4..4 + header.transfer_length as usize)?;
-        // The part read in place: no decode, no slot, no allocation but the
-        // datagram's. Anything it does not plainly read takes the decode.
-        if self.compact_fast_parse.load(Ordering::Relaxed) {
-            if let Some(part) = av_mesh::canonical_slot::envelope_part(envelope) {
-                if part.stream_id != stream_id || part.object != view.object {
-                    return None;
-                }
-                let mut datagram =
-                    compact::encode_part(view.object, part.published_unix_us, part.media)?;
-                compact::set_generation(&mut datagram, ring.generation());
-                return Some(ring.put(view.object, bytes::Bytes::from(datagram)));
+            compact::encode_part_into(view.object, published_us, slim.payload, out)?
+        } else {
+            let envelope = one_symbol_envelope(view)?;
+            // The part read in place: no decode, no slot (the only way the
+            // class thread makes it: a full decode allocates). What it does
+            // not plainly read gets no compact datagram here; the tee
+            // decodes it for the ring (`keep_compact`).
+            let part = av_mesh::canonical_slot::envelope_part(envelope)?;
+            if part.stream_id != stream_id || part.object != view.object {
+                return None;
             }
+            compact::encode_part_into(view.object, part.published_unix_us, part.media, out)?
+        };
+        compact::set_generation(&mut out[..len], generation);
+        Some(len)
+    }
+
+    /// The tee's half of `compact_into`: keep the part's compact datagram
+    /// in its stream's ring (the first lane to make it keeps it), for a
+    /// stream with compact clients.
+    pub fn keep_compact(&self, stream_id: u64, view: &RlsView<'_>) {
+        if !self.load().rings.0.contains_key(&stream_id) {
+            return;
         }
-        let part = av_mesh::canonical_slot::canonical_part_from_envelope(
-            bytes::Bytes::copy_from_slice(envelope),
-        )
-        .ok()?;
-        if part.stream_id != stream_id || part.object.key().object() != view.object {
-            return None;
+        let Some(armed) = self.armed.get() else {
+            return;
+        };
+        let ring = armed.sockets.compact().ring(stream_id);
+        if !ring.observe_epoch(view.epoch) || ring.get_part(view.object).is_some() {
+            return;
         }
-        let (media, _init) = av_mesh::canonical_slot::slot_media(&part.slot, part.stream_id)?;
-        let published =
-            av_mesh::canonical_slot::object_published_unix_us(&part.object).unwrap_or(0);
-        let mut datagram = compact::encode_part(view.object, published, &media)?;
-        compact::set_generation(&mut datagram, ring.generation());
-        Some(ring.put(view.object, bytes::Bytes::from(datagram)))
+        let datagram = if let Some(slim) = view.slim {
+            if view.track != "opaque-audio" {
+                return;
+            }
+            let Ok(slim) = playlists::compact_object::SlimView::parse(slim) else {
+                return;
+            };
+            if slim.object != view.object {
+                return;
+            }
+            let published_us = slim
+                .published_unix_ns()
+                .map_or(0, |ns| u64::try_from(ns / 1_000).unwrap_or(0));
+            compact::encode_part(view.object, published_us, slim.payload)
+        } else {
+            one_symbol_envelope(view)
+                .and_then(|envelope| compact_of_envelope(stream_id, view.object, envelope))
+        };
+        if let Some(mut datagram) = datagram {
+            compact::set_generation(&mut datagram, ring.generation());
+            ring.put(view.object, bytes::Bytes::from(datagram));
+        }
+    }
+
+    /// Keep a part's canonical compact datagram in its stream's ring before
+    /// a window repair that it completes reads the ring (the repair thread
+    /// and the fan-out threads, which may run before the tee keeps it).
+    fn keep_canonical(&self, stream_id: u64, part: u64, canonical: &[u8]) {
+        if let Some(armed) = self.armed.get() {
+            armed
+                .sockets
+                .compact()
+                .ring(stream_id)
+                .put(part, bytes::Bytes::copy_from_slice(canonical));
+        }
     }
 
     /// A one-symbol part that this edge decoded from repair alone (its source
@@ -1290,6 +1422,17 @@ impl EdgeFastLane {
     }
 }
 
+/// The envelope of a one-symbol object, read in place from its source
+/// symbol `view`; `None` for any other symbol.
+fn one_symbol_envelope<'a>(view: &RlsView<'a>) -> Option<&'a [u8]> {
+    let header = DatagramFecHeader::decode(view.fec).ok()?;
+    if header.source_symbols != 1 || view.esi != 0 {
+        return None;
+    }
+    let symbol = header.payload(view.fec).ok()?;
+    symbol.get(4..4 + header.transfer_length as usize)
+}
+
 /// The canonical compact datagram of part `part` of `stream_id` from its
 /// decoded envelope; `None` when it is not a canonical part that fits one.
 fn compact_of_envelope(stream_id: u64, part: u64, envelope: &[u8]) -> Option<Vec<u8>> {
@@ -1367,7 +1510,7 @@ pub struct ClientPlan {
     /// The compact parts of the batch and their plans' windows (stream,
     /// part, window): after the sends, the window repair of each window
     /// that one of them completes goes from here.
-    compact_sent: Vec<(u64, u64, u8)>,
+    compact_sent: Vec<(u64, u64, u8, u16)>,
     /// When the class thread handed this plan to a fan-out thread.
     dispatched_at: Option<Instant>,
 }
@@ -1418,13 +1561,22 @@ fn touch_pages(bytes: &mut [u8]) {
     }
 }
 
-/// Fault in the pages of a list's spare room.
-fn touch_spare<T>(list: &mut Vec<T>) {
-    let spare = list.spare_capacity_mut();
-    let bytes = std::mem::size_of_val(spare);
-    // SAFETY: the spare capacity is owned, writable and uninitialized: no
-    // byte of it is needed.
-    unsafe { crate::memory::prefault(spare.as_mut_ptr().cast::<u8>(), bytes) };
+/// Fault in a map's whole table (its buckets are untouched until an
+/// insert writes them): fill it to its capacity with keys made by `key`,
+/// then empty it, which keeps the table.
+fn touch_map<K: std::hash::Hash + Eq, V: Default>(
+    map: &mut HashMap<K, V>,
+    key: impl Fn(usize) -> K,
+) {
+    for index in 0..map.capacity() {
+        map.insert(key(index), V::default());
+    }
+    map.clear();
+}
+
+/// A distinct address for each index, for [`touch_map`].
+fn touch_peer(index: usize) -> SocketAddr {
+    SocketAddr::from((std::net::Ipv4Addr::from(index as u32), 0))
 }
 
 impl ClientPlan {
@@ -1438,7 +1590,7 @@ impl ClientPlan {
             clients: Vec::with_capacity(sys::RECV_BATCH * 8),
             memo: Vec::with_capacity(REPAIR_MEMO),
             memo_next: 0,
-            turns: HashMap::new(),
+            turns: HashMap::with_capacity(PLAN_PEERS),
             gso: false,
             video: false,
             now_ns: 0,
@@ -1472,6 +1624,9 @@ impl ClientPlan {
         touch_spare(&mut self.runs);
         touch_spare(&mut self.departures);
         touch_spare(&mut self.compact_sent);
+        touch_map(&mut self.turns, touch_peer);
+        touch_map(&mut self.pacer.next, touch_peer);
+        touch_map(&mut self.pacer.rates, |index| index as u64);
     }
 
     /// The bytes that the plan holds (its buffers and its lists' room).
@@ -1615,7 +1770,7 @@ impl ClientPlan {
                     // The compact ring's map and slot locks, which ordinary
                     // threads take too, and the datagram's allocation.
                     let started = Instant::now();
-                    let made = self.make_compact(lane, stream_id, message, view);
+                    let made = self.make_compact(lane, snapshot, stream_id, message, view);
                     lane.stats
                         .class_compact_max_us
                         .fetch_max(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1624,10 +1779,9 @@ impl ClientPlan {
                 if made {
                     copies = Some(plan.copies);
                     short = plan.short_header;
-                    if plan.window_repair > 0
-                        && !self.compact_sent.contains(&(stream_id, part, plan.window))
-                    {
-                        self.compact_sent.push((stream_id, part, plan.window));
+                    let sent = (stream_id, part, plan.window, message as u16);
+                    if plan.window_repair > 0 && !self.compact_sent.contains(&sent) {
+                        self.compact_sent.push(sent);
                     }
                 }
             }
@@ -1693,19 +1847,30 @@ impl ClientPlan {
     fn make_compact(
         &mut self,
         lane: &EdgeFastLane,
+        snapshot: &FastSnapshot,
         stream_id: u64,
         message: usize,
         view: &RlsView<'_>,
     ) -> bool {
-        let Some(canonical) = lane.compact_of(stream_id, view) else {
+        // The canonical form, written in place in the long form's first
+        // variant, which the others copy.
+        let canonical_at = compact_at(message, 0);
+        let Some(len) = lane.compact_into(
+            snapshot,
+            stream_id,
+            view,
+            &mut self.compact_buffers[canonical_at..canonical_at + compact::MAX_DATAGRAM],
+        ) else {
             lane.stats.compact_failed.fetch_add(1, Ordering::Relaxed);
             return false;
         };
-        let len = canonical.len();
-        for copies in 0..COMPACT_VARIANTS as u8 {
+        for copies in (0..COMPACT_VARIANTS as u8).rev() {
             let start = compact_at(message, copies);
+            if copies > 0 {
+                self.compact_buffers
+                    .copy_within(canonical_at..canonical_at + len, start);
+            }
             let buffer = &mut self.compact_buffers[start..start + len];
-            buffer.copy_from_slice(&canonical);
             compact::set_flags(buffer, copies, false);
             lane.mark_compact(buffer);
             // The same in the short form, for the clients that ask for it.
@@ -1728,7 +1893,11 @@ impl ClientPlan {
             self.turns.entry(send.peer).or_insert(turn);
         }
         let turns = &self.turns;
-        self.sends.sort_by_key(|send| turns[&send.peer]);
+        // In place (a stable sort takes a buffer): a client's own sends
+        // are in message order, and sends equal in both are copies of one
+        // compact part.
+        self.sends
+            .sort_unstable_by_key(|send| (turns[&send.peer], send.message));
     }
 
     /// Cut each client's sends into runs of about [`PACING_SLICE_US`] of
@@ -2072,22 +2241,29 @@ impl ClientPlan {
         if self.compact_sent.is_empty() {
             return;
         }
-        let mut windows: Vec<u8> = Vec::new();
-        for (index, (stream_id, part, _)) in self.compact_sent.iter().enumerate() {
+        let mut windows = [0_u8; REPAIR_JOB_WINDOWS];
+        for (index, (stream_id, part, _, message)) in self.compact_sent.iter().enumerate() {
             if self.compact_sent[..index]
                 .iter()
-                .any(|(other, at, _)| other == stream_id && at == part)
+                .any(|(other, at, _, _)| other == stream_id && at == part)
             {
                 continue;
             }
-            windows.clear();
-            windows.extend(
-                self.compact_sent
-                    .iter()
-                    .filter(|(other, at, _)| other == stream_id && at == part)
-                    .map(|(_, _, window)| *window),
-            );
-            lane.class_window_repair(*stream_id, *part, &windows);
+            let mut count = 0;
+            for (_, _, window, _) in self
+                .compact_sent
+                .iter()
+                .filter(|(other, at, _, _)| other == stream_id && at == part)
+            {
+                if count < REPAIR_JOB_WINDOWS && !windows[..count].contains(window) {
+                    windows[count] = *window;
+                    count += 1;
+                }
+            }
+            let message = usize::from(*message);
+            let at = compact_at(message, 0);
+            let canonical = &self.compact_buffers[at..at + usize::from(self.compact_lens[message])];
+            lane.class_window_repair(*stream_id, *part, &windows[..count], canonical);
         }
         self.compact_sent.clear();
     }
@@ -2101,11 +2277,11 @@ impl ClientPlan {
         }
         if let Some(armed) = lane.armed.get() {
             let mut windows: Vec<u8> = Vec::new();
-            for (index, (stream_id, part, _)) in self.compact_sent.iter().enumerate() {
+            for (index, (stream_id, part, _, message)) in self.compact_sent.iter().enumerate() {
                 // Once for each part, with all its plans' windows.
                 if self.compact_sent[..index]
                     .iter()
-                    .any(|(other, at, _)| other == stream_id && at == part)
+                    .any(|(other, at, _, _)| other == stream_id && at == part)
                 {
                     continue;
                 }
@@ -2113,9 +2289,16 @@ impl ClientPlan {
                 windows.extend(
                     self.compact_sent
                         .iter()
-                        .filter(|(other, at, _)| other == stream_id && at == part)
-                        .map(|(_, _, window)| *window),
+                        .filter(|(other, at, _, _)| other == stream_id && at == part)
+                        .map(|(_, _, window, _)| *window),
                 );
+                // The ring has the part before its window's repair reads it.
+                let message = usize::from(*message);
+                let at = compact_at(message, 0);
+                let mut canonical =
+                    self.compact_buffers[at..at + usize::from(self.compact_lens[message])].to_vec();
+                compact::set_flags(&mut canonical, 0, false);
+                lane.keep_canonical(*stream_id, *part, &canonical);
                 crate::edge_udp::window_repair_now(
                     &armed.sockets,
                     &armed.table,
@@ -2809,7 +2992,7 @@ mod tests {
                 plan.clients.push(Arc::clone(client));
             }
         }
-        plan.compact_sent.push((4001, 101, 32));
+        plan.compact_sent.push((4001, 101, 32, 1));
         (plan, clients)
     }
 
@@ -2958,7 +3141,7 @@ mod tests {
         let (work, _) = &mut receivers[0];
         let mut in_hand = 0;
         while let Some(batch) = work.pop() {
-            assert_eq!(batch.compact_sent, vec![(4001, 101, 32)]);
+            assert_eq!(batch.compact_sent, vec![(4001, 101, 32, 1)]);
             in_hand += 1;
         }
         assert_eq!(in_hand, FANOUT_DEPTH);

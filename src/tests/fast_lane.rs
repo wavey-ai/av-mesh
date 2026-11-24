@@ -283,6 +283,19 @@ impl LaneEdge {
         max_subscribers: usize,
         send_twins: bool,
     ) -> Self {
+        Self::start_configured(ip, hole_distance, max_subscribers, send_twins, |_| {}).await
+    }
+
+    /// [`Self::start_with_capacity`], with `configure` given the class
+    /// threads' configuration last (the allocation test's counter and lease
+    /// children).
+    pub(super) async fn start_configured(
+        ip: Ipv4Addr,
+        hole_distance: Duration,
+        max_subscribers: usize,
+        send_twins: bool,
+        configure: impl FnOnce(&mut RelayClassConfig),
+    ) -> Self {
         let (ports, sockets) = bind_edge_class_ports(ip);
         let forwarders = [
             UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap(),
@@ -325,14 +338,18 @@ impl LaneEdge {
                 failover_heartbeat: Duration::from_millis(100),
                 link_telemetry: None,
             },
-            RelayClassConfig {
-                port_offset: OFFSET,
-                cpus: [None, None],
-                realtime: false,
-                tee_capacity: 8_192,
-                edge_clients: Some(Arc::clone(&lane)),
-                holes: holes.clone(),
-                ..Default::default()
+            {
+                let mut config = RelayClassConfig {
+                    port_offset: OFFSET,
+                    cpus: [None, None],
+                    realtime: false,
+                    tee_capacity: 8_192,
+                    edge_clients: Some(Arc::clone(&lane)),
+                    holes: holes.clone(),
+                    ..Default::default()
+                };
+                configure(&mut config);
+                config
             },
         ));
         wait_until("the edge's threads start", || {

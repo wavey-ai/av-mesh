@@ -141,13 +141,14 @@ impl Feed {
     }
 
     /// Book one admitted datagram. Called by the entry's one writer.
-    fn record(&self, view: &RlsView<'_>, rx_us: u64) {
+    fn record(&self, view: &Sample) {
+        let rx_us = view.rx_us;
         let seq = self.seq.load(Ordering::Relaxed);
         self.seq.store(seq.wrapping_add(1), Ordering::Relaxed);
         // What follows is not seen without the odd sequence before it.
         fence(Ordering::Release);
         bump(&self.datagrams, 1);
-        match view.role {
+        match view.role() {
             MediaDatagramRole::Source => {
                 bump(&self.sources, 1);
                 self.last_source_us.store(rx_us, Ordering::Relaxed);
@@ -404,10 +405,181 @@ impl Table {
     }
 }
 
+/// What an entry books of one datagram (the fields of its view it reads).
+#[derive(Debug, Clone, Copy, Default)]
+struct Sample {
+    source: bool,
+    source_symbols: u16,
+    epoch: u64,
+    object: u64,
+    deadline_us: u64,
+    rx_us: u64,
+}
+
+impl Sample {
+    fn of(view: &RlsView<'_>, rx_us: u64) -> Self {
+        Self {
+            source: matches!(view.role, MediaDatagramRole::Source),
+            source_symbols: view.source_symbols,
+            epoch: view.epoch,
+            object: view.object,
+            deadline_us: view.deadline_us,
+            rx_us,
+        }
+    }
+
+    fn role(&self) -> MediaDatagramRole {
+        if self.source {
+            MediaDatagramRole::Source
+        } else {
+            MediaDatagramRole::Repair
+        }
+    }
+}
+
+/// The room of a held key's stream and track ids: any id the wire admits.
+const KEY_BYTES: usize = super::media_clock::ID_ROOM_BYTES;
+
+/// The (address, stream, track) of an entry to make, held without an
+/// allocation.
+#[derive(Debug, Clone, Copy)]
+struct InlineKey {
+    ip: IpAddr,
+    stream: [u8; KEY_BYTES],
+    stream_len: u8,
+    track: [u8; KEY_BYTES],
+    track_len: u8,
+}
+
+impl InlineKey {
+    fn new(ip: IpAddr, stream: &str, track: &str) -> Option<Self> {
+        if stream.len() > KEY_BYTES || track.len() > KEY_BYTES {
+            return None;
+        }
+        let mut key = Self {
+            ip,
+            stream: [0; KEY_BYTES],
+            stream_len: stream.len() as u8,
+            track: [0; KEY_BYTES],
+            track_len: track.len() as u8,
+        };
+        key.stream[..stream.len()].copy_from_slice(stream.as_bytes());
+        key.track[..track.len()].copy_from_slice(track.as_bytes());
+        Some(key)
+    }
+
+    fn stream(&self) -> &str {
+        std::str::from_utf8(&self.stream[..usize::from(self.stream_len)]).unwrap_or_default()
+    }
+
+    fn track(&self) -> &str {
+        std::str::from_utf8(&self.track[..usize::from(self.track_len)]).unwrap_or_default()
+    }
+
+    fn is(&self, ip: IpAddr, stream: &str, track: &str) -> bool {
+        self.ip == ip && self.stream() == stream && self.track() == track
+    }
+}
+
+/// Keys a class thread holds datagrams of while their entries are made.
+const MISSES: usize = 16;
+/// Datagrams held per key: a few milliseconds of a 1 ms stream, more than
+/// the tee takes to make the entry.
+const MISS_SAMPLES: usize = 64;
+/// A key whose entry has not come this long after its first datagram is
+/// given up (its datagrams count as untracked).
+const MISS_GIVE_UP_US: u64 = 1_000_000;
+/// Entries asked for and not yet made, at most.
+const REQUESTS: usize = 32;
+
+#[derive(Clone, Copy)]
+struct Miss {
+    hash: u64,
+    key: InlineKey,
+    samples: [Sample; MISS_SAMPLES],
+    count: usize,
+    first_us: u64,
+    /// The tee has been asked to make the entry.
+    requested: bool,
+}
+
+/// One class thread's datagrams of keys that have no entry yet (stall
+/// follow-up): the thread does not make an entry (an allocation and a
+/// copy of the table on the real-time thread) but asks the tee to
+/// (`ParentFeeds::make_requested`) and holds the key's datagrams here, then
+/// books them in order once the entry exists, before anything newer of
+/// the key, so the record is the same as if the entry had been there.
+/// Fixed size, made before the thread runs.
+pub struct FeedMisses {
+    /// The slots' pin, first so that it unlocks before they are freed.
+    _pin: crate::memory::Pinned,
+    misses: Box<[Option<Miss>]>,
+    held: usize,
+}
+
+impl FeedMisses {
+    /// The slots, faulted in and locked now, before the thread runs.
+    pub fn new() -> Self {
+        let mut misses = vec![None; MISSES].into_boxed_slice();
+        Self {
+            _pin: crate::memory::pin_slice("feed misses", &mut misses),
+            misses,
+            held: 0,
+        }
+    }
+}
+
+impl FeedMisses {
+    /// Keys held now.
+    #[cfg(test)]
+    pub fn held(&self) -> usize {
+        self.held
+    }
+}
+
+impl Default for FeedMisses {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The entries the class threads asked for.
+struct Requests {
+    keys: [Option<(u64, InlineKey)>; REQUESTS],
+}
+
+impl Requests {
+    /// Whether the key is asked for and not yet taken by the tee.
+    fn asked(&self, hash: u64, key: &InlineKey) -> bool {
+        self.keys
+            .iter()
+            .flatten()
+            .any(|(other, asked)| *other == hash && asked.is(key.ip, key.stream(), key.track()))
+    }
+
+    /// Ask for the key's entry; `false` when the requests are full.
+    fn ask(&mut self, hash: u64, key: &InlineKey) -> bool {
+        if self.asked(hash, key) {
+            return true;
+        }
+        match self.keys.iter_mut().find(|slot| slot.is_none()) {
+            Some(slot) => {
+                *slot = Some((hash, *key));
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 /// The feed records of a node: one entry per (parent address, stream,
 /// track) that an admitted datagram came from.
 pub struct ParentFeeds {
     table: ArcSwap<Table>,
+    /// Tables replaced while a class thread read them (see `retired`).
+    retired: super::retired::Retired<Table>,
+    /// Entries the class threads asked for: they `try_lock` it, never wait.
+    requests: StdMutex<Requests>,
     hasher: std::collections::hash_map::RandomState,
     /// Datagrams not recorded because the table was full.
     untracked: AtomicU64,
@@ -422,6 +594,10 @@ impl Default for ParentFeeds {
     fn default() -> Self {
         Self {
             table: ArcSwap::from_pointee(Table::default()),
+            retired: super::retired::Retired::default(),
+            requests: StdMutex::new(Requests {
+                keys: [None; REQUESTS],
+            }),
             hasher: std::collections::hash_map::RandomState::new(),
             untracked: AtomicU64::new(0),
             plane: StdMutex::new(Plane::default()),
@@ -457,43 +633,185 @@ impl ParentFeeds {
     /// Book one admitted datagram from the parent at `ip`, received at
     /// `rx_us` (Unix µs). Called by the class thread of the datagram's
     /// stream for every admitted datagram, before the first-arrival test:
-    /// no lock, and no allocation once the entry exists or while the table
-    /// is full.
-    pub fn observe(&self, ip: IpAddr, view: &RlsView<'_>, rx_us: u64) {
+    /// no lock, and no allocation. A key with no entry yet is held in the
+    /// thread's `misses` and its entry asked of the tee (`make_requested`);
+    /// a full table takes no new key (`untracked`).
+    pub fn observe(&self, ip: IpAddr, view: &RlsView<'_>, rx_us: u64, misses: &mut FeedMisses) {
         let hash = self.hash(ip, view.stream, view.track);
         let table = self.table.load();
+        let sample = Sample::of(view, rx_us);
         if let Some(feed) = table.find(hash, ip, view.stream, view.track) {
-            feed.record(view, rx_us);
+            if misses.held > 0 {
+                Self::book_held(feed, hash, misses);
+            }
+            feed.record(&sample);
             return;
         }
-        // A full table takes no new key: count it before anything is made,
-        // so an untracked stream costs no allocation per datagram. `insert`
-        // tests again for a table that filled since this load.
-        let inserted = if table.len >= MAX_FEEDS {
-            None
-        } else {
-            self.insert(hash, ip, view.stream, view.track)
-        };
-        match inserted {
-            Some(feed) => feed.record(view, rx_us),
-            None => {
-                self.untracked.fetch_add(1, Ordering::Relaxed);
+        if table.len >= MAX_FEEDS {
+            self.untracked.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.hold(hash, ip, view, sample, misses);
+    }
+
+    /// Book what `misses` holds of the key whose entry `feed` is, in order.
+    fn book_held(feed: &Feed, hash: u64, misses: &mut FeedMisses) {
+        for slot in misses.misses.iter_mut() {
+            let Some(miss) = slot else {
+                continue;
+            };
+            if miss.hash == hash && miss.key.is(feed.ip, &feed.stream, &feed.track) {
+                for sample in &miss.samples[..miss.count] {
+                    feed.record(sample);
+                }
+                *slot = None;
+                misses.held -= 1;
+                return;
             }
         }
     }
 
-    /// The entry of a new (address, stream, track): the table is copied
-    /// with it. `None` when the table is full.
-    fn insert(&self, hash: u64, ip: IpAddr, stream: &str, track: &str) -> Option<Arc<Feed>> {
-        let made = Arc::new(Feed::new(ip, stream, track));
-        let mut entry = None;
-        self.table.rcu(|table| {
-            if let Some(existing) = table.find(hash, ip, stream, track) {
-                entry = Some(Arc::clone(existing));
-                return Arc::clone(table);
+    /// Hold a datagram of a key without an entry, and ask for the entry.
+    fn hold(
+        &self,
+        hash: u64,
+        ip: IpAddr,
+        view: &RlsView<'_>,
+        sample: Sample,
+        misses: &mut FeedMisses,
+    ) {
+        // A key given up is freed after the pass (`book_misses`).
+        let mut free = None;
+        let mut found = None;
+        for (index, slot) in misses.misses.iter().enumerate() {
+            match slot {
+                Some(miss) if miss.hash == hash && miss.key.is(ip, view.stream, view.track) => {
+                    found = Some(index);
+                    break;
+                }
+                None => free = free.or(Some(index)),
+                Some(_) => {}
             }
-            if table.len >= MAX_FEEDS {
-                entry = None;
+        }
+        let index = match (found, free) {
+            (Some(index), _) => index,
+            (None, Some(index)) => {
+                let Some(key) = InlineKey::new(ip, view.stream, view.track) else {
+                    self.untracked.fetch_add(1, Ordering::Relaxed);
+                    return;
+                };
+                misses.misses[index] = Some(Miss {
+                    hash,
+                    key,
+                    samples: [Sample::default(); MISS_SAMPLES],
+                    count: 0,
+                    first_us: sample.rx_us,
+                    requested: false,
+                });
+                misses.held += 1;
+                index
+            }
+            (None, None) => {
+                self.untracked.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+        let Some(miss) = misses.misses[index].as_mut() else {
+            return;
+        };
+        if miss.count == MISS_SAMPLES {
+            self.untracked.fetch_add(1, Ordering::Relaxed);
+        } else {
+            miss.samples[miss.count] = sample;
+            miss.count += 1;
+        }
+        if !miss.requested {
+            miss.requested = self.request(miss.hash, miss.key);
+        }
+    }
+
+    /// Ask the tee to make an entry; `false` when the requests are in use
+    /// or full (the key asks again after the pass, `book_misses`).
+    fn request(&self, hash: u64, key: InlineKey) -> bool {
+        let Ok(mut requests) = self.requests.try_lock() else {
+            return false;
+        };
+        requests.ask(hash, &key)
+    }
+
+    /// After each of a class thread's passes: book what it holds of keys
+    /// whose entries now exist; give up (as untracked) a key whose entry has
+    /// not come [`MISS_GIVE_UP_US`] after its first datagram, whether the
+    /// tee was not asked, refused it (a full table) or is late; and ask
+    /// again for a key whose request the tee took without making its entry.
+    pub fn book_misses(&self, misses: &mut FeedMisses, now_us: u64) {
+        if misses.held == 0 {
+            return;
+        }
+        let table = self.table.load();
+        // The requests not yet taken by the tee (`None`: in use by another
+        // thread, so this pass asks for nothing).
+        let mut requests = self.requests.try_lock().ok();
+        for index in 0..misses.misses.len() {
+            let Some((hash, key, first_us, count, requested)) = misses.misses[index]
+                .as_ref()
+                .map(|miss| (miss.hash, miss.key, miss.first_us, miss.count, miss.requested))
+            else {
+                continue;
+            };
+            if let Some(feed) = table.find(hash, key.ip, key.stream(), key.track()) {
+                Self::book_held(feed, hash, misses);
+                continue;
+            }
+            if now_us.saturating_sub(first_us) > MISS_GIVE_UP_US {
+                self.untracked.fetch_add(count as u64, Ordering::Relaxed);
+                misses.misses[index] = None;
+                misses.held -= 1;
+                continue;
+            }
+            let Some(requests) = requests.as_mut() else {
+                continue;
+            };
+            if !requested || !requests.asked(hash, &key) {
+                if let Some(held) = misses.misses[index].as_mut() {
+                    held.requested = requests.ask(hash, &key);
+                }
+            }
+        }
+    }
+
+    /// Make the entries the class threads asked for (the tee, after each of
+    /// its batches).
+    pub fn make_requested(&self) {
+        let asked = {
+            let mut requests = lock(&self.requests);
+            if requests.keys.iter().all(Option::is_none) {
+                return;
+            }
+            std::mem::replace(&mut requests.keys, [None; REQUESTS])
+        };
+        for (hash, key) in asked.into_iter().flatten() {
+            self.insert(hash, key.ip, key.stream(), key.track());
+        }
+    }
+
+    /// The class thread's first look at the table, before it runs: the
+    /// lock-free snapshots register a thread on first use.
+    pub fn warm_up(&self) {
+        drop(self.table.load());
+    }
+
+    /// Make the entry of a new (address, stream, track), unless it exists
+    /// or the table is full: the table is copied with it.
+    fn insert(&self, hash: u64, ip: IpAddr, stream: &str, track: &str) {
+        // Faulted in here: the class thread writes its counters.
+        let made = crate::memory::touched_arc(Feed::new(ip, stream, track));
+        // Whether the closure's last run replaced the table (rcu may run it
+        // again after a race): one that kept it has nothing to retire.
+        let replaced = std::cell::Cell::new(false);
+        let old = self.table.rcu(|table| {
+            if table.find(hash, ip, stream, track).is_some() || table.len >= MAX_FEEDS {
+                replaced.set(false);
                 return Arc::clone(table);
             }
             let mut next = Table::clone(table);
@@ -502,10 +820,12 @@ impl ParentFeeds {
                 .or_default()
                 .push(Arc::clone(&made));
             next.len += 1;
-            entry = Some(Arc::clone(&made));
+            replaced.set(true);
             Arc::new(next)
         });
-        entry
+        if replaced.get() {
+            self.retired.keep(old);
+        }
     }
 
     /// Datagrams that found the table full.
@@ -550,7 +870,7 @@ impl ParentFeeds {
             plane.not_admitted = not_admitted;
         }
         if idle {
-            self.table.rcu(|table| {
+            let old = self.table.rcu(|table| {
                 let mut next = Table::default();
                 for feed in table.feeds() {
                     let counters = feed.read();
@@ -564,6 +884,7 @@ impl ParentFeeds {
                 }
                 Arc::new(next)
             });
+            self.retired.keep(old);
         }
     }
 
@@ -638,42 +959,26 @@ mod tests {
     use raptorq_datagram_fec::{MediaObjectKind, MediaPathIntent};
     use std::net::{Ipv4Addr, SocketAddr};
 
-    /// Counts the allocations made by the current thread, so that a test
-    /// can show that a path of the class thread allocates nothing. The
-    /// test binary's allocator is the system's, as the node's is.
-    struct CountingAllocator;
+    /// The allocations of the calling thread so far (the test binary's
+    /// counting allocator, `crate::alloc_count`).
+    fn allocations() -> u64 {
+        crate::alloc_count::allocations()
+    }
 
     thread_local! {
-        static ALLOCATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static MISSES: std::cell::RefCell<FeedMisses> = std::cell::RefCell::new(FeedMisses::new());
     }
 
-    // SAFETY: every call is passed on to the system allocator unchanged.
-    unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
-        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-            let _ = ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
-            unsafe { std::alloc::System.alloc(layout) }
-        }
-
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
-            unsafe { std::alloc::System.dealloc(ptr, layout) }
-        }
-
-        unsafe fn realloc(
-            &self,
-            ptr: *mut u8,
-            layout: std::alloc::Layout,
-            new_size: usize,
-        ) -> *mut u8 {
-            let _ = ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
-            unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
-        }
-    }
-
-    #[global_allocator]
-    static ALLOCATOR: CountingAllocator = CountingAllocator;
-
-    fn allocations() -> u64 {
-        ALLOCATIONS.with(std::cell::Cell::get)
+    /// The class thread's call, with the entry it asks for made at once
+    /// (as the tee makes it after its batch) and what it held booked (as
+    /// the thread books it after its pass).
+    fn observe(feeds: &ParentFeeds, ip: IpAddr, view: &RlsView<'_>, rx_us: u64) {
+        MISSES.with(|misses| {
+            let mut misses = misses.borrow_mut();
+            feeds.observe(ip, view, rx_us, &mut misses);
+            feeds.make_requested();
+            feeds.book_misses(&mut misses, rx_us);
+        });
     }
 
     static NO_HASH: [u8; 32] = [0; 32];
@@ -735,19 +1040,20 @@ mod tests {
         let feeds = ParentFeeds::default();
         let ip = parent(11);
         for object in [10, 11, 12] {
-            feeds.observe(ip, &source(object, T0 + SECOND), T0);
+            observe(&feeds, ip, &source(object, T0 + SECOND), T0);
         }
         // 13 and 14 never come from this parent; 15 comes as its repair
         // (a one-symbol object decodes from either), then 16.
-        feeds.observe(
+        observe(
+            &feeds,
             ip,
             &view("3001", 7, 15, MediaDatagramRole::Repair, T0 + SECOND),
             T0 + 3_000,
         );
-        feeds.observe(ip, &source(16, T0 + SECOND), T0 + 4_000);
+        observe(&feeds, ip, &source(16, T0 + SECOND), T0 + 4_000);
         // One that comes late and out of order is neither an advance nor a
         // skip taken back.
-        feeds.observe(ip, &source(13, T0 + SECOND), T0 + 5_000);
+        observe(&feeds, ip, &source(13, T0 + SECOND), T0 + 5_000);
         feeds.sample(6, 0, T0 + 10_000);
         let row = only(&feeds, T0 + 10_000);
         assert_eq!(row.head_object, Some(16));
@@ -770,11 +1076,11 @@ mod tests {
         // later (the compiled lane's burst copy), 13 ms past it.
         for object in 0..100_u64 {
             let sent = T0 + object * 1_000;
-            feeds.observe(ip, &source(object, sent + 7_000), sent);
+            observe(&feeds, ip, &source(object, sent + 7_000), sent);
         }
         for object in 0..100_u64 {
             let sent = T0 + object * 1_000;
-            feeds.observe(ip, &source(object, sent + 7_000), sent + 20_000);
+            observe(&feeds, ip, &source(object, sent + 7_000), sent + 20_000);
         }
         feeds.sample(200, 0, T0 + 200_000);
         let row = only(&feeds, T0 + 200_000);
@@ -789,7 +1095,7 @@ mod tests {
         // An object whose original was lost: its copy is the advance, and
         // its lateness is the truth.
         let sent = T0 + 100_000;
-        feeds.observe(ip, &source(100, sent + 7_000), sent + 20_000);
+        observe(&feeds, ip, &source(100, sent + 7_000), sent + 20_000);
         feeds.sample(201, 0, T0 + SECOND + 200_000);
         let row = only(&feeds, T0 + SECOND + 200_000);
         assert_eq!(row.objects_1s, 1);
@@ -802,7 +1108,7 @@ mod tests {
         let feeds = ParentFeeds::default();
         let ip = parent(11);
         for object in 5_000..5_010_u64 {
-            feeds.observe(ip, &source(object, T0 + SECOND), T0);
+            observe(&feeds, ip, &source(object, T0 + SECOND), T0);
         }
         feeds.sample(10, 0, T0 + 1_000);
         feeds.sample(10, 0, T0 + SECOND + 1_000);
@@ -811,7 +1117,8 @@ mod tests {
         // The contributor starts again and counts from zero in a new epoch:
         // not 5,009 objects skipped backwards, and nothing skipped forwards.
         for object in 0..3_u64 {
-            feeds.observe(
+            observe(
+                &feeds,
                 ip,
                 &view("3001", 8, object, MediaDatagramRole::Source, T0 + 3 * SECOND),
                 T0 + SECOND + 2_000,
@@ -827,17 +1134,20 @@ mod tests {
 
         // The same epoch far behind the head is a stream that started
         // again too; a little behind it is a late datagram.
-        feeds.observe(
+        observe(
+            &feeds,
             ip,
             &view("3001", 8, 50_000, MediaDatagramRole::Source, T0 + 3 * SECOND),
             T0 + 2 * SECOND + 2_000,
         );
-        feeds.observe(
+        observe(
+            &feeds,
             ip,
             &view("3001", 8, 49_990, MediaDatagramRole::Source, T0 + 3 * SECOND),
             T0 + 2 * SECOND + 3_000,
         );
-        feeds.observe(
+        observe(
+            &feeds,
             ip,
             &view("3001", 8, 40_000, MediaDatagramRole::Source, T0 + 3 * SECOND),
             T0 + 2 * SECOND + 4_000,
@@ -858,10 +1168,11 @@ mod tests {
         let other: SocketAddr = "10.80.3.12:22401".parse().unwrap();
         for object in 0..10_u64 {
             let flow = if object % 2 == 0 { flow_a } else { flow_b };
-            feeds.observe(flow.ip(), &source(object, T0 + SECOND), T0 + object);
-            feeds.observe(other.ip(), &source(object, T0 + SECOND), T0 + object);
+            observe(&feeds, flow.ip(), &source(object, T0 + SECOND), T0 + object);
+            observe(&feeds, other.ip(), &source(object, T0 + SECOND), T0 + object);
         }
-        feeds.observe(
+        observe(
+            &feeds,
             other.ip(),
             &view("4001", 7, 0, MediaDatagramRole::Source, T0 + SECOND),
             T0 + 10,
@@ -896,7 +1207,7 @@ mod tests {
             for index in 0..100_u64 {
                 let at = T0 + second * SECOND + index * 1_000;
                 let slack = if second == 2 && index == 40 { 3_000 } else { 9_000 };
-                feeds.observe(ip, &source(object, at + slack), at);
+                observe(&feeds, ip, &source(object, at + slack), at);
                 object += 1;
                 received += 1;
             }
@@ -939,11 +1250,129 @@ mod tests {
     }
 
     #[test]
+    fn a_new_key_is_held_without_allocating_and_booked_in_order_once_made() {
+        // Stall follow-up: the class thread makes no entry. It holds a new
+        // key's datagrams, asks the tee for the entry, and books them in
+        // order when the entry exists, so the record is the one it would
+        // have been.
+        let feeds = ParentFeeds::default();
+        let mut misses = FeedMisses::new();
+        let ip = parent(31);
+        // As the class thread does before it runs (arc-swap registers a
+        // thread at its first load).
+        feeds.warm_up();
+        let before = allocations();
+        for object in [40, 41, 43] {
+            feeds.observe(ip, &source(object, T0 + SECOND), T0 + object, &mut misses);
+        }
+        assert_eq!(allocations() - before, 0, "allocations on the class thread");
+        assert_eq!(misses.held(), 1);
+        assert!(feeds.snapshot(T0 + 100).is_empty(), "no entry made on the class thread");
+        // The tee makes it; the thread's next datagram of the key books the
+        // held ones first.
+        feeds.make_requested();
+        feeds.observe(ip, &source(44, T0 + SECOND), T0 + 44, &mut misses);
+        assert_eq!(misses.held(), 0);
+        feeds.sample(4, 0, T0 + 200);
+        let feed = only(&feeds, T0 + 200);
+        assert_eq!(feed.head_object, Some(44));
+        assert_eq!(feed.objects_1s, 4);
+        assert_eq!(feed.skipped_10s, 1, "object 42 was skipped, in order");
+        assert_eq!(feeds.untracked(), 0);
+        // A key whose entry is made after its last datagram is booked after
+        // the thread's pass.
+        let other = parent(32);
+        feeds.observe(other, &source(7, T0 + SECOND), T0 + 300, &mut misses);
+        feeds.make_requested();
+        feeds.book_misses(&mut misses, T0 + 301);
+        assert_eq!(misses.held(), 0);
+        assert_eq!(feeds.snapshot(T0 + 400).len(), 2);
+    }
+
+    #[test]
+    fn the_longest_admitted_ids_are_held_without_allocating_and_get_their_entry() {
+        // D3 review 2: a held key has room for any id the wire admits
+        // (128 bytes), so such a stream gets its entry like any other.
+        static LONG: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+        let (stream, track) =
+            LONG.get_or_init(|| ("s".repeat(KEY_BYTES), "t".repeat(KEY_BYTES)));
+        assert_eq!(KEY_BYTES, relay_session::RelayLimits::HARD.max_identifier_bytes);
+        let feeds = ParentFeeds::default();
+        let mut misses = FeedMisses::new();
+        let ip = parent(33);
+        let mut long = source(40, T0 + SECOND);
+        long.stream = stream;
+        long.track = track;
+        // As the class thread does before it runs.
+        feeds.warm_up();
+        let before = allocations();
+        feeds.observe(ip, &long, T0 + 40, &mut misses);
+        assert_eq!(allocations() - before, 0, "allocations on the class thread");
+        assert_eq!(misses.held(), 1);
+        feeds.make_requested();
+        long.object = 41;
+        feeds.observe(ip, &long, T0 + 41, &mut misses);
+        assert_eq!(misses.held(), 0);
+        assert_eq!(feeds.untracked(), 0);
+        let feed = only(&feeds, T0 + 100);
+        assert_eq!((feed.stream.as_str(), feed.track.as_str()), (stream.as_str(), track.as_str()));
+        assert_eq!(feed.head_object, Some(41));
+    }
+
+    #[test]
+    fn a_held_key_whose_entry_is_refused_is_asked_again_then_given_up() {
+        // D3 review 5: the tee took the request but the table filled first.
+        // The key is asked for again after the pass, and given up (its
+        // datagrams counted untracked) a second after its first datagram,
+        // so the thread stops holding it.
+        let feeds = ParentFeeds::default();
+        let mut misses = FeedMisses::new();
+        let ip = parent(51);
+        feeds.observe(ip, &source(1, T0 + SECOND), T0, &mut misses);
+        feeds.observe(ip, &source(2, T0 + SECOND), T0 + 1, &mut misses);
+        assert_eq!(misses.held(), 1);
+        for last in 0..MAX_FEEDS as u32 {
+            let other = IpAddr::V4(Ipv4Addr::from(0x0c00_0000 + last));
+            feeds.insert(feeds.hash(other, "3001", "opaque-audio"), other, "3001", "opaque-audio");
+        }
+        feeds.make_requested();
+        assert!(lock(&feeds.requests).keys.iter().all(Option::is_none));
+        feeds.book_misses(&mut misses, T0 + 10);
+        assert_eq!(misses.held(), 1);
+        assert!(
+            lock(&feeds.requests).keys.iter().flatten().count() == 1,
+            "asked again"
+        );
+        feeds.make_requested();
+        feeds.book_misses(&mut misses, T0 + MISS_GIVE_UP_US + 1);
+        assert_eq!(misses.held(), 0);
+        assert_eq!(feeds.untracked(), 2);
+        assert_eq!(feeds.snapshot(T0).len(), MAX_FEEDS);
+    }
+
+    #[test]
+    fn an_insert_that_changes_nothing_retires_nothing() {
+        // D3 review 4: an insert of a key that exists (or into a full
+        // table) leaves the table as it is; it used to hand the current
+        // table to `retired`, where it and its feeds stayed for good.
+        let feeds = ParentFeeds::default();
+        let ip = parent(41);
+        let hash = feeds.hash(ip, "3001", "opaque-audio");
+        feeds.insert(hash, ip, "3001", "opaque-audio");
+        assert_eq!(feeds.retired.len(), 0);
+        for _ in 0..10 {
+            feeds.insert(hash, ip, "3001", "opaque-audio");
+        }
+        assert_eq!(feeds.retired.len(), 0);
+        assert_eq!(Arc::strong_count(&feeds.table.load_full()), 2, "the swap's and this one");
+    }
+
+    #[test]
     fn a_full_table_records_no_new_entry_and_counts_it() {
         let feeds = ParentFeeds::default();
         for last in 0..MAX_FEEDS as u32 + 3 {
             let ip = IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + last));
-            feeds.observe(ip, &source(0, T0 + SECOND), T0);
+            observe(&feeds, ip, &source(0, T0 + SECOND), T0);
         }
         assert_eq!(feeds.snapshot(T0).len(), MAX_FEEDS);
         assert_eq!(feeds.untracked(), 3);
@@ -954,8 +1383,8 @@ mod tests {
         let untracked = IpAddr::V4(Ipv4Addr::from(0x0b00_0000));
         let before = allocations();
         for object in 1..=100 {
-            feeds.observe(tracked, &source(object, T0 + SECOND), T0);
-            feeds.observe(untracked, &source(object, T0 + SECOND), T0);
+            observe(&feeds, tracked, &source(object, T0 + SECOND), T0);
+            observe(&feeds, untracked, &source(object, T0 + SECOND), T0);
         }
         assert_eq!(allocations() - before, 0, "allocations on the class thread");
         assert_eq!(feeds.untracked(), 103);

@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod alloc_count;
 mod assignment;
 mod control;
 mod edge_admission;
@@ -9,9 +11,9 @@ mod fast_path;
 mod fast_plane;
 mod hop_journal;
 mod lifecycle;
-mod memory;
 mod link_telemetry;
 mod node_status;
+mod node_warm;
 
 use anyhow::{anyhow, bail, Context, Result};
 use assignment::{
@@ -26,6 +28,7 @@ use av_mesh::relay_ingress::{
 use av_mesh::replication::{
     DemandSignal, MeshNode, ReplicaPlacement, ReplicaReason, ReplicationPolicy, StreamInfo,
 };
+use av_mesh::memory;
 use av_mesh::stall_journal::{self, StallJournal, StallSnapshot, TickConfig};
 use av_mesh::telemetry_fec::{
     LatestTelemetryQueue, QueuePushOutcome, TelemetryDecodeOutcome, TelemetryEnvelope,
@@ -2105,21 +2108,6 @@ struct Args {
     )]
     client_udp_compact_short_header: bool,
 
-    /// The fast lane makes a part's compact datagram on the class thread
-    /// from the contributor's envelope read in place (the part bytes and its
-    /// publication time, payload hash checked), before it sends: no decode,
-    /// no slot, no allocation but the datagram. That took about 20 µs at the
-    /// median and 45 µs at p99 of each part's send in the loopback bench
-    /// (wave 5, W1). `false` decodes the envelope and builds its slot, as
-    /// before. The bytes are the same either way.
-    #[arg(
-        long,
-        env = "NEEDLETAIL_CLIENT_UDP_COMPACT_FAST_PARSE",
-        default_value_t = true,
-        action = clap::ArgAction::Set
-    )]
-    client_udp_compact_fast_parse: bool,
-
     /// A one-symbol part that the edge's fast plane decoded from repair
     /// alone (its source symbol was lost upstream) goes to the compact
     /// clients at once, made from the decoded envelope (low-latency wave 5
@@ -2361,20 +2349,24 @@ struct Args {
     )]
     relay_lease_descriptors: bool,
 
-    /// Wave 9 (cold start): lock the process's memory (mlockall
-    /// MCL_CURRENT | MCL_FUTURE) once the node is set up, where it may lock
-    /// without a limit (RLIMIT_MEMLOCK infinite: the deploy's unit has
-    /// LimitMEMLOCK=infinity; or root): every page is faulted in then, and
-    /// later mappings when they are made, so no thread (the real-time class
-    /// threads among them) takes a page fault in the first session. With a
-    /// finite limit it is not tried (allocations past it would fail).
-    /// Default `false` (wave 9 review): never measured on a deploy (the lab
-    /// cannot lock: its limit is 8 MB); with it every later mapping, each
-    /// thread's whole stack included, is populated and nothing can be paged
-    /// out, so memory pressure ends in the OOM killer. Turn it on only after
-    /// measuring VmLck, RSS and faults on the deploy's plan.
-    #[arg(long, env = "NEEDLETAIL_MLOCK_ALL", default_value_t = false, action = clap::ArgAction::Set)]
-    mlock_all: bool,
+    /// D 2.3: what the long-lived rings are pinned with. `rings` (the
+    /// default): each ring that a class thread or a journal writes (the hop
+    /// and stall journals, the first-arrival tables, the receive batches,
+    /// the tee rings) is faulted in (with --prefault) and locked with
+    /// `mlock` when it is made, before the class threads run; a lock the
+    /// memlock limit refuses is counted (`/api/mesh/local` `memory`
+    /// `lock_refused_bytes`) and the ring stays faulted in. `off`: nothing
+    /// is locked. Replaces --mlock-all (mlockall), removed.
+    #[arg(long, env = "NEEDLETAIL_MLOCK", value_enum, default_value_t = memory::LockMode::Rings)]
+    mlock: memory::LockMode,
+
+    /// D 2.4: the boot check's record (`needletail-nodecheck boot --out`,
+    /// `/run/needletail/node-warm.json`), read once at start into
+    /// `node_warm` of `/api/mesh/local` and `/api/node`. A node given a
+    /// file whose verdict is not `complete` (or that it cannot read) is
+    /// never ready. Unset: no check is configured.
+    #[arg(long, env = "NEEDLETAIL_NODE_WARM_FILE")]
+    node_warm_file: Option<PathBuf>,
 
     /// Wave 9 (cold start): glibc's heap trim threshold fixed at 256 MB and
     /// mmap threshold at 32 MB, so freed memory stays in the heaps for the
@@ -2384,8 +2376,8 @@ struct Args {
     malloc_tune: bool,
 
     /// Wave 9 (cold start): fault in the pages of preallocated rings (the
-    /// hop journal) at start-up, not one by one while the first session
-    /// fills them. `false`: as before.
+    /// ones --mlock names) at start-up, not one by one while the first
+    /// session fills them. `false`: as before.
     #[arg(long, env = "NEEDLETAIL_PREFAULT", default_value_t = true, action = clap::ArgAction::Set)]
     prefault: bool,
 
@@ -3572,7 +3564,8 @@ async fn main() -> Result<()> {
     // From here on SIGTERM and SIGINT are a stop the node makes itself.
     let mut stop = lifecycle::stop_signal().context("failed to listen for SIGTERM and SIGINT")?;
     // Wave 9 (cold start): memory before the first session, not in it.
-    hop_journal::PREFAULT.store(args.prefault, std::sync::atomic::Ordering::Relaxed);
+    memory::configure(args.mlock, args.prefault);
+    node_warm::install(args.node_warm_file.as_deref());
     match memory::tune_allocator(args.malloc_tune) {
         Ok(()) => info!(
             trim_threshold = memory::TRIM_THRESHOLD,
@@ -3719,11 +3712,18 @@ async fn main() -> Result<()> {
         run_delay_known = stall_ticks.threads().iter().all(|thread| thread.run_delay),
         "stall journal"
     );
-    // Wave 9 (cold start): the cache and the journal are allocated; lock
-    // them and everything mapped from now on (where the limit allows).
-    match memory::lock_all(args.mlock_all) {
-        Ok(()) => info!("memory locked: every page is faulted in when it is mapped"),
-        Err(reason) => info!(%reason, "memory not locked"),
+    {
+        // D 2.3: the journals' rings are pinned; the class threads pin
+        // theirs as they start.
+        let memory = memory::report();
+        info!(
+            mode = ?memory.mode,
+            prefaulted_bytes = memory.prefaulted_bytes,
+            locked_bytes = memory.locked_bytes,
+            lock_refused_bytes = memory.lock_refused_bytes,
+            thp = memory.thp,
+            "memory regions pinned"
+        );
     }
 
     let mut mesh_transport = MeshTransportConfigSnapshot {
@@ -3841,7 +3841,6 @@ async fn main() -> Result<()> {
         && fast_plane::sys::supported())
     .then(|| fast_plane::edge_clients::EdgeFastLane::new(args.client_udp_edge_rank));
     if let Some(lane) = &fast_lane {
-        lane.set_compact_fast_parse(args.client_udp_compact_fast_parse);
         lane.set_compact_top_up(args.client_udp_compact_top_up);
         lane.set_compact_mark(args.client_udp_compact_mark_fast_lane);
         lane.set_repair_thread(args.client_udp_repair_thread);
@@ -13701,6 +13700,11 @@ struct MeshApiSnapshot {
     /// has the events).
     #[serde(skip_serializing_if = "Option::is_none")]
     stall: Option<StallSnapshot>,
+    /// D 2.3: the pinned regions and the process's memory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory: Option<memory::MemoryReport>,
+    /// D 2.4: the boot check's record; null when none is configured.
+    node_warm: Option<node_warm::NodeWarmStatus>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -16939,6 +16943,8 @@ impl MeshApiSnapshot {
             cache_mesh: None,
             status: None,
             stall: None,
+            memory: None,
+            node_warm: None,
         }
     }
 }
@@ -21361,6 +21367,8 @@ impl AppRouter {
         snapshot.cache_mesh = Some(self.cache_mesh_gauges());
         snapshot.status = Some((*self.node_status().await).clone());
         snapshot.stall = stall_journal::installed().map(|journal| journal.snapshot());
+        snapshot.memory = Some(memory::report());
+        snapshot.node_warm = node_warm::installed().cloned();
         snapshot
     }
 
@@ -21739,6 +21747,7 @@ impl AppRouter {
             warm_copies,
             slot_streams: warm.slot_streams,
             ready_forced: self.lifecycle.ready_forced(),
+            node_warm_complete: node_warm::installed().map(|status| status.complete),
         };
         let readiness = if edge {
             Readiness::edge(&inputs, memory.warm)
@@ -21782,6 +21791,7 @@ impl AppRouter {
             cache_mesh,
             client_udp,
             entry,
+            node_warm: node_warm::installed().cloned(),
         });
         memory.cached = Some((now, Arc::clone(&status)));
         status
@@ -41448,13 +41458,6 @@ mod tests {
     fn the_wave9_cold_start_flags_default_on_and_can_be_turned_off() {
         let args = Args::try_parse_from(["av-mesh"]).unwrap();
         assert!(args.client_udp_prompt_sender);
-        // Off until measured on a deploy (wave 9 review); it can be asked.
-        assert!(!args.mlock_all);
-        assert!(
-            Args::try_parse_from(["av-mesh", "--mlock-all", "true"])
-                .unwrap()
-                .mlock_all
-        );
         assert!(args.malloc_tune);
         assert!(args.prefault);
         assert!(args.relay_lease_descriptors);
@@ -41467,8 +41470,6 @@ mod tests {
             "av-mesh",
             "--client-udp-prompt-sender",
             "false",
-            "--mlock-all",
-            "false",
             "--malloc-tune",
             "false",
             "--prefault",
@@ -41476,9 +41477,38 @@ mod tests {
         ])
         .unwrap();
         assert!(!args.client_udp_prompt_sender);
-        assert!(!args.mlock_all);
         assert!(!args.malloc_tune);
         assert!(!args.prefault);
+    }
+
+    #[test]
+    fn mlock_defaults_to_rings_and_mlock_all_is_gone() {
+        // D 2.3: rings are pinned by default; `off` can be asked, by flag or
+        // by NEEDLETAIL_MLOCK; --mlock-all is no longer a flag.
+        assert_eq!(
+            Args::try_parse_from(["av-mesh"]).unwrap().mlock,
+            memory::LockMode::Rings
+        );
+        assert_eq!(
+            Args::try_parse_from(["av-mesh", "--mlock", "off"])
+                .unwrap()
+                .mlock,
+            memory::LockMode::Off
+        );
+        assert!(Args::try_parse_from(["av-mesh", "--mlock", "all"]).is_err());
+        assert!(Args::try_parse_from(["av-mesh", "--mlock-all", "true"]).is_err());
+        let file = "/run/needletail/node-warm.json";
+        assert_eq!(
+            Args::try_parse_from(["av-mesh", "--node-warm-file", file])
+                .unwrap()
+                .node_warm_file
+                .as_deref(),
+            Some(Path::new(file))
+        );
+        assert!(Args::try_parse_from(["av-mesh"])
+            .unwrap()
+            .node_warm_file
+            .is_none());
     }
 
     #[test]
@@ -42973,6 +43003,64 @@ mod tests {
         let none = AppRouter::stalls_response(None, Some("since_us=5")).await;
         assert_eq!(none.status, StatusCode::OK);
         assert!(none.body.unwrap().is_empty());
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn the_node_warm_file_reaches_the_snapshot() {
+        // D 2.4: the boot check's record, read at start, is `node_warm` of
+        // /api/mesh/local and /api/node; D 2.3: `memory` beside it. The
+        // record is complete, so no other test of this process loses its
+        // readiness to it.
+        let path = std::env::temp_dir().join(format!(
+            "needletail-node-warm-test-{}-{}.json",
+            std::process::id(),
+            now_unix_us()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"schema":"needletail.node-warm.v2","complete":true,"verdict":"ok","unix_us":1795383000000000,"warm":{"ran":true,"finished":true,"gib":3.31,"seconds":2.84,"worst_page_us":310,"pages_over_1ms":0,"pages_over_100ms":0},"check":{"seconds":60,"cpus":2,"stops_over_20ms":0,"stop_max_ms":0,"stopped_ms":0,"steal_permille":0,"late_max_us":180}}"#,
+        )
+        .unwrap();
+        node_warm::install(Some(&path));
+        std::fs::remove_file(&path).unwrap();
+        let cache = LiveTsCache::new(1, Duration::from_millis(5), 2, 64, 64).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
+        let json = |response: HandlerResponse| -> serde_json::Value {
+            serde_json::from_slice(response.body.as_ref().unwrap()).unwrap()
+        };
+        let local = json(get_for_tests(&router, "/api/mesh/local").await);
+        let warm = &local["node_warm"];
+        assert_eq!(warm["configured"], true, "{local:#}");
+        assert_eq!(warm["complete"], true);
+        assert_eq!(warm["verdict"], "ok");
+        assert_eq!(warm["warm"]["gib"], 3.31);
+        assert_eq!(warm["check"]["late_max_us"], 180);
+        let memory = &local["memory"];
+        assert_eq!(memory["mode"], "rings", "{memory:#}");
+        for field in [
+            "prefaulted_bytes",
+            "mappings_populated_bytes",
+            "locked_bytes",
+            "lock_refused_bytes",
+            "vm_size_kb",
+            "vm_rss_kb",
+            "vm_lck_kb",
+        ] {
+            assert!(memory[field].is_u64(), "{field}: {memory:#}");
+        }
+        assert!(memory["thp"].is_string() && memory["allocator_tuned"].is_boolean());
+        let node = json(get_for_tests(&router, NODE_STATUS_PATH).await);
+        assert_eq!(node["node_warm"], *warm);
+        assert!(
+            !node["not_ready"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason == "node warm check not complete"),
+            "{node:#}"
+        );
         mesh.shutdown();
     }
 
@@ -45560,6 +45648,7 @@ mod tests {
                 video_gro: true,
                 media_deadline_us: fast_plane::relay::DEFAULT_MEDIA_DEADLINE_US,
                 test_tee_panic: Some(fast_plane::TrafficClass::Audio),
+                test_alloc_counter: None,
             },
         )
         .await;
@@ -46003,6 +46092,10 @@ mod tests {
     /// The compact client lane: bytes per listener, zero loss through loss
     /// and bursts, the edge's cost per listener.
     mod compact_lane;
+
+    /// The audio class thread allocates and frees nothing once it runs
+    /// (stall follow-up to wave 9).
+    mod alloc_free;
 
     /// The repair horizon of the live path: holes hold the watermark only
     /// briefly, and are listed as gaps.

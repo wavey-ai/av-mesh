@@ -157,13 +157,12 @@ struct Ring {
     seen: Box<[SeenEntry]>,
 }
 
-/// Whether new journals fault their ring's pages in at once
-/// (`--prefault`, wave 9; set at start-up).
-pub static PREFAULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
 /// The journal of one node.
 #[derive(Debug)]
 pub struct HopJournal {
+    /// The ring's and the seen table's pins (D 2.3), first so that they
+    /// unlock before the ring is freed.
+    _pins: [crate::memory::Pinned; 2],
     node: String,
     capacity: usize,
     ring: Mutex<Ring>,
@@ -171,32 +170,36 @@ pub struct HopJournal {
 
 impl HopJournal {
     /// A journal that keeps the newest `capacity` events. Zero keeps none:
-    /// every record is a no-op.
+    /// every record is a no-op. Its ring and seen table are faulted in and
+    /// locked now (`memory::pin_region`, `--prefault`, `--mlock`), not one
+    /// page at a time under the journal's lock by the threads that record
+    /// (the real-time class threads among them) while the first session
+    /// fills the ring.
     pub fn new(node: impl Into<String>, capacity: usize) -> Self {
-        let (events, seen) = if capacity == 0 {
-            (VecDeque::new(), Vec::new().into_boxed_slice())
+        let (events, seen, pins) = if capacity == 0 {
+            (
+                VecDeque::new(),
+                Vec::new().into_boxed_slice(),
+                [crate::memory::Pinned::none(), crate::memory::Pinned::none()],
+            )
         } else {
             let mut events: Vec<HopEvent> = Vec::with_capacity(capacity);
-            // `vec!` writes every entry of the table: its pages are in.
-            let seen = vec![SeenEntry::default(); SEEN_TABLE_SLOTS].into_boxed_slice();
-            if PREFAULT.load(std::sync::atomic::Ordering::Relaxed) {
-                // Wave 9 (cold start): the ring's pages are faulted in now,
-                // not one by one under the journal's lock by the threads
-                // that record (the real-time class threads among them)
-                // while the first session fills the ring.
-                // SAFETY: the vector's spare capacity is owned, writable
-                // and holds nothing yet.
-                unsafe {
-                    crate::memory::prefault(
-                        events.as_mut_ptr().cast(),
-                        capacity * std::mem::size_of::<HopEvent>(),
-                    );
-                }
-            }
-            // A deque from a vector keeps its allocation.
-            (VecDeque::from(events), seen)
+            let mut seen = vec![SeenEntry::default(); SEEN_TABLE_SLOTS].into_boxed_slice();
+            // SAFETY: the vector's spare capacity is owned and writable and
+            // stays where it is: a deque from a vector keeps its allocation,
+            // which the ring never grows past `capacity`.
+            let ring_pin = unsafe {
+                crate::memory::pin_region(
+                    "hop journal ring",
+                    events.as_mut_ptr().cast(),
+                    capacity * std::mem::size_of::<HopEvent>(),
+                )
+            };
+            let seen_pin = crate::memory::pin_slice("hop journal seen table", &mut seen);
+            (VecDeque::from(events), seen, [ring_pin, seen_pin])
         };
         Self {
+            _pins: pins,
             node: node.into(),
             capacity,
             ring: Mutex::new(Ring {

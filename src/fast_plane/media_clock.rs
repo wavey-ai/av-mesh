@@ -42,6 +42,12 @@ use xxhash_rust::xxh3::xxh3_64;
 /// The neighbouring slots that a stream's clock may be in.
 const PROBE: usize = 8;
 
+/// The longest tenant, stream or track id that an RLS1 datagram may carry
+/// (relay-session's hard ceiling, which `RlsView::parse` admits): the room
+/// that the class threads' fixed tables give an id, so that no valid id
+/// grows a table on a real-time thread.
+pub const ID_ROOM_BYTES: usize = relay_session::RelayLimits::HARD.max_identifier_bytes;
+
 /// A clock that has judged nothing fresh for this long is idle.
 pub const IDLE_US: u64 = 5 * 60 * 1_000_000;
 
@@ -85,6 +91,7 @@ struct Clock {
     followed: u64,
 }
 
+
 /// A fixed-size table of media clocks, owned by one thread.
 pub struct MediaClocks {
     clocks: Box<[Clock]>,
@@ -100,7 +107,21 @@ impl MediaClocks {
     pub fn new(capacity: usize) -> Self {
         let slots = capacity.max(PROBE).next_power_of_two();
         Self {
-            clocks: (0..slots).map(|_| Clock::default()).collect(),
+            // Each name's room made and every byte of it touched now: a new
+            // stream's clock takes its name (any id the wire admits) without
+            // an allocation or a first touch on the class thread (stall
+            // follow-up).
+            clocks: (0..slots)
+                .map(|_| {
+                    let mut stream = String::with_capacity(ID_ROOM_BYTES);
+                    stream.extend(std::iter::repeat_n('\0', ID_ROOM_BYTES));
+                    stream.clear();
+                    Clock {
+                        stream,
+                        ..Clock::default()
+                    }
+                })
+                .collect(),
             mask: slots - 1,
             now_us: 0,
             overflow: 0,
@@ -337,9 +358,13 @@ impl ValidatedEpochs {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         let slots = capacity.max(1).next_power_of_two();
+        let mut slots: Box<[EpochSlot]> = (0..slots).map(|_| EpochSlot::default()).collect();
+        // Faulted in by the maker: the class threads read the slots (a
+        // zeroed allocation is not written, and a read maps its page then).
+        crate::memory::touch_owned(&mut *slots);
         Self {
-            slots: (0..slots).map(|_| EpochSlot::default()).collect(),
-            mask: slots - 1,
+            mask: slots.len() - 1,
+            slots,
             version: AtomicU64::new(0),
             unrecorded: AtomicU64::new(0),
         }
@@ -422,6 +447,18 @@ mod tests {
     use super::*;
 
     const BUDGET: u64 = 1_000_000;
+
+    /// The longest id the wire admits takes a clock in the room made for
+    /// it: no allocation on the class thread (D3 review 2).
+    #[test]
+    fn a_clock_takes_the_longest_admitted_name_in_its_room() {
+        let mut clocks = MediaClocks::new(8);
+        let rooms: Vec<*const u8> = clocks.clocks.iter().map(|clock| clock.stream.as_ptr()).collect();
+        let name = "s".repeat(ID_ROOM_BYTES);
+        let index = clocks.find_or_make(MediaClocks::key("t", &name)).unwrap();
+        assert_eq!(clocks.clocks[index].stream, name);
+        assert_eq!(clocks.clocks[index].stream.as_ptr(), rooms[index]);
+    }
     const EPOCH: u64 = 1_763_924_000_001_000;
     /// The deadline of the first part of the test stream.
     const START: u64 = 1_763_924_001_000_000;

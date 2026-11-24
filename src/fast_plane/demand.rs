@@ -129,13 +129,20 @@ impl RenditionGroups {
     }
 }
 
-/// The last demand report of one lane.
+/// The last demand report of one lane. The audio thread reads it for every
+/// datagram; a report it replaces is freed by the recording thread, never by
+/// the reader (`retired`).
 #[derive(Debug, Default)]
-pub struct DemandSlot(ArcSwapOption<(Instant, Vec<u64>)>);
+pub struct DemandSlot(
+    ArcSwapOption<(Instant, Vec<u64>)>,
+    super::retired::Retired<(Instant, Vec<u64>)>,
+);
 
 impl DemandSlot {
     pub fn record(&self, streams: Vec<u64>, now: Instant) {
-        self.0.store(Some(Arc::new((now, streams))));
+        if let Some(old) = self.0.swap(Some(Arc::new((now, streams)))) {
+            self.1.keep(old);
+        }
     }
 
     /// The streams of the last report, if it is fresh.
@@ -148,8 +155,10 @@ impl DemandSlot {
 
 /// What this node reports to its parents: rebuilt every
 /// [`DEMAND_REPORT_INTERVAL`], read by the audio thread.
+/// A report it replaces is freed by the setting thread, never by the audio
+/// thread (`retired`).
 #[derive(Debug, Default)]
-pub struct NodeDemand(arc_swap::ArcSwap<Vec<u8>>);
+pub struct NodeDemand(arc_swap::ArcSwap<Vec<u8>>, super::retired::Retired<Vec<u8>>);
 
 impl NodeDemand {
     /// Report `streams`. More than [`MAX_DEMAND_STREAMS`] would not fit one
@@ -163,12 +172,12 @@ impl NodeDemand {
             self.clear();
             return;
         }
-        self.0.store(Arc::new(encode_demand(&streams)));
+        self.1.keep(self.0.swap(Arc::new(encode_demand(&streams))));
     }
 
     /// Report nothing: the node's demand is unknown.
     pub fn clear(&self) {
-        self.0.store(Arc::new(Vec::new()));
+        self.1.keep(self.0.swap(Arc::new(Vec::new())));
     }
 
     /// The `RLD1` datagram to send; empty before the first `set`.

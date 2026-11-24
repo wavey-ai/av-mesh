@@ -242,12 +242,6 @@ fn measure(feed: Feed, payload: Payload, listeners: usize, seconds: u64) -> Stri
     let (edge, first) = edge_rt
         .block_on(async { tokio::spawn(AnyEdge::start(feed, payload, stream_id, 43)).await })
         .unwrap();
-    // FIXED_COST_FAST_PARSE=false: the compact datagram from the full
-    // decode, as before --client-udp-compact-fast-parse.
-    let fast_parse = std::env::var("FIXED_COST_FAST_PARSE").as_deref() != Ok("false");
-    if let AnyEdge::Fast(lane_edge) = &edge {
-        lane_edge.lane.set_compact_fast_parse(fast_parse);
-    }
     let edge = Arc::new(edge);
     let shared = Shared::new();
     let client_handle = client_rt.handle().clone();
@@ -387,7 +381,7 @@ fn measure(feed: Feed, payload: Payload, listeners: usize, seconds: u64) -> Stri
         }
     }
     let line = format!(
-        "{feed:?} {:<30} {listeners} {mode:?} listeners (fast parse {fast_parse}), {} parts (last {last}): p50/p99/max ms \
+        "{feed:?} {:<30} {listeners} {mode:?} listeners, {} parts (last {last}): p50/p99/max ms \
          publish->edge receipt {} | wake (relay_woken - relay_first) {} | edge work \
          (udp_sent - relay_woken) {} | edge receipt->udp_sent {} | udp_sent->arrival {} | \
          publish->arrival {} | receipt->committed (LL-HLS) {}{}",
@@ -437,15 +431,6 @@ fn edge_fixed_costs() {
         }
     }
     println!("\n{}", lines.join("\n"));
-}
-
-#[test]
-fn the_compact_fast_parse_flag_defaults_on_and_can_be_turned_off() {
-    let args = Args::try_parse_from(["av-mesh"]).unwrap();
-    assert!(args.client_udp_compact_fast_parse);
-    let args =
-        Args::try_parse_from(["av-mesh", "--client-udp-compact-fast-parse", "false"]).unwrap();
-    assert!(!args.client_udp_compact_fast_parse);
 }
 
 /// The class thread's cost of a part's compact datagram: the envelope read

@@ -423,15 +423,31 @@ fn encode(kind: Kind, part_low: u32, field: [u8; 4], payload: &[u8]) -> Vec<u8> 
 /// retransmission, generation 0 until [`set_generation`]); `None` when the
 /// part does not fit one datagram.
 pub fn encode_part(part: u64, published_unix_us: u64, payload: &[u8]) -> Option<Vec<u8>> {
-    if payload.len() > MAX_PAYLOAD {
+    let mut datagram = vec![0; HEADER_LEN + payload.len()];
+    let len = encode_part_into(part, published_unix_us, payload, &mut datagram)?;
+    datagram.truncate(len);
+    Some(datagram)
+}
+
+/// [`encode_part`] written into `out`, without allocating: its length, or
+/// `None` when the part does not fit one datagram or `out`.
+pub fn encode_part_into(
+    part: u64,
+    published_unix_us: u64,
+    payload: &[u8],
+    out: &mut [u8],
+) -> Option<usize> {
+    let len = HEADER_LEN + payload.len();
+    if payload.len() > MAX_PAYLOAD || out.len() < len {
         return None;
     }
-    Some(encode(
-        Kind::Part,
-        part as u32,
-        (published_unix_us as u32).to_be_bytes(),
-        payload,
-    ))
+    out[0] = MAGIC | Kind::Part.code();
+    out[FLAGS_AT] = 0;
+    out[GENERATION_AT] = 0;
+    out[PART_AT..FIELD_AT].copy_from_slice(&(part as u32).to_be_bytes());
+    out[FIELD_AT..HEADER_LEN].copy_from_slice(&(published_unix_us as u32).to_be_bytes());
+    out[HEADER_LEN..len].copy_from_slice(payload);
+    Some(len)
 }
 
 /// The compact datagram of a gap.
