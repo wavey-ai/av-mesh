@@ -32,7 +32,7 @@
 use anyhow::{bail, Context, Result};
 use av_mesh::client_compact::NackTiming;
 use av_mesh::client_session::SessionConfig;
-use av_mesh::load::{parse_ramp, run, IntervalBuckets, LoadConfig};
+use av_mesh::load::{parse_range_ms, parse_ramp, run, Churn, IntervalBuckets, LoadConfig, Waves};
 use av_mesh::load_assign::AssignConfig;
 use clap::Parser;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
@@ -132,6 +132,31 @@ struct Args {
     /// `100@0,1000@30,5000@60`): from each second on, that many listeners.
     #[arg(long)]
     ramp: Option<String>,
+    /// The listening party: this percentage of the listeners present leave
+    /// in a minute (at random times, in random order) and each comes back
+    /// as a new session after --churn-absence-ms (0: none).
+    #[arg(long, default_value_t = 0.0)]
+    churn_percent_per_min: f64,
+    /// The absence of a listener that left, drawn evenly from `MIN-MAX`
+    /// milliseconds.
+    #[arg(long, default_value = "10000-60000")]
+    churn_absence_ms: String,
+    /// Joins in waves: the target is reached --wave-size listeners at a
+    /// time, every --wave-every-ms (0: as --ramp and --start-rate say).
+    #[arg(long, default_value_t = 0)]
+    wave_size: usize,
+    #[arg(long, default_value_t = 10_000)]
+    wave_every_ms: u64,
+    /// Seed of the churn's draws (by default from the session-id prefix,
+    /// the process and the time: two hosts do not churn together).
+    #[arg(long)]
+    seed: Option<u64>,
+    /// One listener in this many writes every part it receives first to
+    /// <out>/raw/worker-<w>.csv (session id, part, arrival, bytes,
+    /// publication, availability, edge); the summary states the share (0:
+    /// none).
+    #[arg(long, default_value_t = 0)]
+    raw_sample: usize,
     /// Seconds of the run (a drain follows).
     #[arg(long, default_value_t = 30)]
     duration: u64,
@@ -387,6 +412,34 @@ fn config(args: &Args) -> Result<LoadConfig> {
             .clone()
             .unwrap_or_else(|| format!("load-{}", std::process::id()))
     });
+    if !(0.0..=6_000.0).contains(&args.churn_percent_per_min) {
+        bail!("--churn-percent-per-min must be 0 to 6000");
+    }
+    if args.churn_percent_per_min > 0.0 {
+        let (absent_min, absent_max) =
+            parse_range_ms(&args.churn_absence_ms).map_err(anyhow::Error::msg)?;
+        config.churn = Some(Churn {
+            per_minute: args.churn_percent_per_min / 100.0,
+            absent_min,
+            absent_max,
+        });
+    }
+    if args.wave_size > 0 {
+        if args.wave_every_ms == 0 {
+            bail!("--wave-every-ms must be above 0");
+        }
+        config.waves = Some(Waves {
+            size: args.wave_size,
+            every: Duration::from_millis(args.wave_every_ms),
+        });
+    }
+    config.seed = args.seed.unwrap_or_else(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+        av_mesh::load_assign::rendezvous_score(&config.sid_prefix, &(std::process::id(), nanos))
+    });
+    config.raw_sample = args.raw_sample;
     if !config.director.entries.is_empty() {
         let Some(tls_ca) = args.tls_ca.clone() else {
             bail!("--entry needs --tls-ca");
@@ -608,6 +661,40 @@ mod tests {
         .unwrap();
         assert_eq!((config.director.paths, config.director.spare), (1, false));
         assert!(config.director.entries.is_empty() && config.assign.is_none());
+    }
+
+    #[test]
+    fn the_party_flags_make_churn_waves_and_the_raw_sample() {
+        let config = config_of(&["needletail-load", "--stream", "1", "--edges", "127.0.0.1:1"]).unwrap();
+        assert!(config.churn.is_none() && config.waves.is_none());
+        assert_eq!(config.raw_sample, 0);
+        let config = config_of(&[
+            "needletail-load", "--stream", "1", "--edges", "127.0.0.1:1",
+            "--churn-percent-per-min", "5", "--churn-absence-ms", "2000-30000",
+            "--wave-size", "500", "--wave-every-ms", "15000", "--seed", "42", "--raw-sample", "50",
+        ])
+        .unwrap();
+        assert_eq!(
+            config.churn,
+            Some(Churn {
+                per_minute: 0.05,
+                absent_min: Duration::from_secs(2),
+                absent_max: Duration::from_secs(30),
+            })
+        );
+        assert_eq!(
+            config.waves,
+            Some(Waves {
+                size: 500,
+                every: Duration::from_secs(15),
+            })
+        );
+        assert_eq!((config.seed, config.raw_sample), (42, 50));
+        // Without --seed two hosts draw differently.
+        let a = config_of(&["needletail-load", "--stream", "1", "--edges", "127.0.0.1:1", "--label", "lon-1"]).unwrap();
+        let b = config_of(&["needletail-load", "--stream", "1", "--edges", "127.0.0.1:1", "--label", "lon-2"]).unwrap();
+        assert_ne!(a.seed, b.seed);
+        assert!(config_of(&["needletail-load", "--stream", "1", "--edges", "127.0.0.1:1", "--churn-percent-per-min", "5", "--churn-absence-ms", "9-3"]).is_err());
     }
 
     #[test]

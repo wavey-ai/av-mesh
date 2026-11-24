@@ -23,7 +23,7 @@ use super::fast_lane::LaneEdge;
 use super::fast_lease::loopback;
 use super::*;
 use av_mesh::client_session::SessionConfig;
-use av_mesh::load::{run, LoadConfig};
+use av_mesh::load::{run, Churn, LoadConfig, Waves};
 use serde_json::Value;
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -85,6 +85,9 @@ struct Bench {
     spare: bool,
     /// `--ramp` (none: `listeners` from the start).
     ramp: Option<Vec<(Duration, usize)>>,
+    /// The party: churn, join waves and the raw sample (`None, None, 0`:
+    /// none).
+    party: (Option<Churn>, Option<Waves>, usize),
     seconds: u64,
     threads: usize,
     edge_threads: usize,
@@ -192,6 +195,8 @@ fn run_bench(bench: &Bench, ip: u8) -> BenchResult {
     if let Some(ramp) = &bench.ramp {
         config.ramp = ramp.clone();
     }
+    (config.churn, config.waves, config.raw_sample) = bench.party;
+    config.seed = 11;
     config.duration = Duration::from_secs(bench.seconds);
     config.threads = bench.threads;
     config.start_rate = 4_000.0;
@@ -314,6 +319,7 @@ fn counts_every_part(name: &str, paths: u8, spare: bool, ip: u8) {
         paths,
         spare,
         ramp: None,
+        party: (None, None, 0),
         listeners: 20,
         seconds: 4,
         threads: 2,
@@ -420,6 +426,7 @@ fn load_mode_cost_per_listener() {
         paths: 1,
         spare: false,
         ramp: None,
+        party: (None, None, 0),
         listeners,
         seconds,
         threads,
@@ -1320,6 +1327,7 @@ fn a_falling_ramp_books_nothing_missing() {
         paths: 2,
         spare: true,
         ramp: Some(vec![(Duration::ZERO, 40), (Duration::from_secs(3), 10)]),
+        party: (None, None, 0),
         listeners: 40,
         seconds: 5,
         threads: 2,
@@ -1346,4 +1354,105 @@ fn a_falling_ramp_books_nothing_missing() {
     assert_eq!(total["missing"], 0, "{summary:#}");
     assert_eq!(summary["listeners_with_missing"], 0, "{summary:#}");
     assert_eq!(summary["listeners_interrupted"], 0, "{summary:#}");
+}
+
+// ------------------------------------------------------- the listening party
+
+/// The owner's listening party, in small: 60 listeners join in waves of 20
+/// a second; listeners leave (three in a hundred a second) and come back
+/// after 0.3 to 0.8 s as new sessions; one in ten writes its parts to the
+/// raw sample. Joins, leaves and rejoins are counted per interval, each
+/// join's and rejoin's time to first audio apart, and nothing is missing.
+#[test]
+fn a_party_joins_in_waves_and_comes_back_after_leaving() {
+    let dir = out_dir("party");
+    let _ = std::fs::remove_dir_all(&dir);
+    let churn = Churn {
+        per_minute: 1.8,
+        absent_min: Duration::from_millis(300),
+        absent_max: Duration::from_millis(800),
+    };
+    let waves = Waves {
+        size: 20,
+        every: Duration::from_secs(1),
+    };
+    let bench = Bench {
+        paths: 2,
+        spare: true,
+        ramp: None,
+        party: (Some(churn), Some(waves), 10),
+        listeners: 60,
+        seconds: 6,
+        threads: 2,
+        edge_threads: 2,
+        payload: Payload::Pcm,
+        sample: 0,
+        out_dir: dir.clone(),
+        measure_from: 1.0,
+    };
+    let result = run_bench(&bench, 105);
+    let summary = &result.summary;
+    let total = &summary["total"];
+    let lines: Vec<Value> = std::fs::read_to_string(dir.join("intervals.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    // The waves: 20, 40, then 60 wanted, a second apart (a line gives the
+    // target at its end, when the next wave may have come).
+    let waved: Vec<u64> = run_lines(&lines, 0.0)
+        .map(|line| line["wave_target"].as_u64().unwrap())
+        .collect();
+    assert!(waved[0] == 20 || waved[0] == 40, "{waved:?}");
+    assert!(waved.windows(2).all(|pair| pair[1] >= pair[0] && pair[1] - pair[0] <= 20), "{waved:?}");
+    assert!(waved.iter().all(|wanted| wanted % 20 == 0) && waved[3] == 60, "{waved:?}");
+    let first = run_lines(&lines, 0.0).next().unwrap();
+    assert!(first["total"]["joins"].as_u64().unwrap() <= 40, "{first}");
+    assert_eq!(summary["joins"], 60, "{summary:#}");
+    let leaves = summary["leaves"].as_u64().unwrap();
+    let rejoins = summary["rejoins"].as_u64().unwrap();
+    // 1.8 a minute of 60 listeners: about 1.8 a second over 5 s.
+    assert!((3..=25).contains(&leaves), "{leaves} leaves");
+    assert!(rejoins >= 1 && rejoins <= leaves, "{rejoins} rejoins of {leaves} leaves");
+    let by_line = |name: &str| -> u64 {
+        lines
+            .iter()
+            .map(|line| line["total"][name].as_u64().unwrap_or(0))
+            .sum()
+    };
+    assert_eq!(by_line("leaves"), leaves);
+    assert_eq!(by_line("rejoins"), rejoins);
+    assert_eq!(total["listeners_started"].as_u64(), Some(60 + rejoins));
+    assert_eq!(count(total, "join_first_audio_ms"), 60);
+    let back = count(total, "rejoin_first_audio_ms");
+    assert!(back + 2 >= rejoins && back <= rejoins, "{back} of {rejoins} rejoins had audio");
+    assert!(total["rejoin_first_audio_ms"]["buckets_us"].is_array());
+    assert_eq!(total["missing"], 0, "{summary:#}");
+    assert_eq!(summary["listeners_with_missing"], 0, "{summary:#}");
+    // The raw sample: one listener in ten (by number, over its sessions).
+    assert_eq!(summary["raw_sample"]["one_in"], 10);
+    let files = summary["raw_sample"]["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2, "a file a worker");
+    let mut rows = 0;
+    for file in files {
+        let text = std::fs::read_to_string(file.as_str().unwrap()).unwrap();
+        let mut csv = text.lines();
+        assert_eq!(
+            csv.next(),
+            Some("sid,part,arrival_unix_us,bytes,published_unix_us,available_unix_us,edge")
+        );
+        for row in csv {
+            let sid = row.split(',').next().unwrap();
+            let number: usize = sid
+                .trim_start_matches("load-")
+                .split('.')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(number % 10, 0, "{row}");
+            rows += 1;
+        }
+    }
+    assert!(rows >= 6 * 3_000, "{rows} rows");
 }
