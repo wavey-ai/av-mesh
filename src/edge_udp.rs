@@ -1464,7 +1464,6 @@ pub(crate) async fn run_edge_udp(
         .await;
     let table: Table = Arc::default();
     let _ = stats.table.set(LiveTable(Arc::clone(&table)));
-    let moved: MovedAway = Arc::default();
     if let Some(lane) = sockets.fast_lane() {
         let _ = stats.fast_lane.set(Arc::clone(lane));
         // The lane's own copy of the sockets does not hold the lane.
@@ -1482,16 +1481,24 @@ pub(crate) async fn run_edge_udp(
             Arc::clone(&stats),
         );
     }
-    let admitting: Admitting = Arc::default();
-    let rebuilds: Arc<Rebuilds> = Arc::default();
-    let mut nack_budget = EdgeNackBudget::new(config.nack_edge_rate, Instant::now());
-    let tokens = Tokens(RandomState::new());
-    let assigning: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
-    let mut confirms = ConfirmLimit::default();
+    let mut edge = EdgeControl {
+        nack_budget: EdgeNackBudget::new(config.nack_edge_rate, Instant::now()),
+        sockets,
+        router,
+        config,
+        stats,
+        table,
+        moved: Arc::default(),
+        admitting: Arc::default(),
+        rebuilds: Arc::default(),
+        tokens: Tokens(RandomState::new()),
+        assigning: Arc::default(),
+        confirms: ConfirmLimit::default(),
+    };
     let mut audio_buf = vec![0_u8; 2_048];
     let mut video_buf = vec![0_u8; 2_048];
     // The send-only twins' share of the requests, watched for reading only.
-    let twins = match &sockets.send_twins {
+    let twins = match &edge.sockets.send_twins {
         Some([audio, video]) => Some([
             tokio::io::unix::AsyncFd::with_interest(
                 Arc::clone(audio),
@@ -1506,8 +1513,8 @@ pub(crate) async fn run_edge_udp(
     };
     let mut twin_bufs = [vec![0_u8; 2_048], vec![0_u8; 2_048]];
     info!(
-        bind = %sockets.audio.local_addr()?,
-        class_sockets = sockets.video.is_some(),
+        bind = %edge.sockets.audio.local_addr()?,
+        class_sockets = edge.sockets.video.is_some(),
         "edge client UDP (RaptorQ FEC) listening"
     );
     loop {
@@ -1518,10 +1525,10 @@ pub(crate) async fn run_edge_udp(
                 // The streams' senders end with their subscribers: a stopped
                 // edge sends no more WAIT (which, every 80 ms, would hold
                 // its clients on it until their subscriptions expired).
-                table.lock().unwrap().clear();
+                edge.table.lock().unwrap().clear();
                 return Ok(());
             }
-            received = sockets.audio.recv_from(&mut audio_buf) => match received {
+            received = edge.sockets.audio.recv_from(&mut audio_buf) => match received {
                 Ok((len, peer)) => (len, peer, 0),
                 Err(error) => {
                     // An ICMP port unreachable of a departed client surfaces
@@ -1530,7 +1537,7 @@ pub(crate) async fn run_edge_udp(
                     continue;
                 }
             },
-            received = recv_optional(sockets.video.as_ref(), &mut video_buf) => match received {
+            received = recv_optional(edge.sockets.video.as_ref(), &mut video_buf) => match received {
                 Ok((len, peer)) => (len, peer, 1),
                 Err(error) => {
                     debug!(error = %error, "edge client UDP receive error");
@@ -1556,15 +1563,15 @@ pub(crate) async fn run_edge_udp(
         // to; all have the client's address.
         let (socket, request) = match source {
             1 => (
-                sockets.video.as_ref().expect("received on it"),
+                edge.sockets.video.as_ref().expect("received on it"),
                 &video_buf[..len],
             ),
             3 => (
-                sockets.video.as_ref().expect("a twin of the pair"),
+                edge.sockets.video.as_ref().expect("a twin of the pair"),
                 &twin_bufs[1][..len],
             ),
-            2 => (&sockets.audio, &twin_bufs[0][..len]),
-            _ => (&sockets.audio, &audio_buf[..len]),
+            2 => (&edge.sockets.audio, &twin_bufs[0][..len]),
+            _ => (&edge.sockets.audio, &audio_buf[..len]),
         };
         let socket = Arc::clone(socket);
         let Some(control) = Control::decode(request) else {
@@ -1580,184 +1587,20 @@ pub(crate) async fn run_edge_udp(
                 compact,
                 ..
             } => {
-                let compact = compact.filter(|_| config.compact).map(|plan| {
-                    plan.with_short_header(plan.short_header && config.compact_short_header)
-                });
-                let valid = token.is_some_and(|token| tokens.valid(peer, token));
-                if !valid {
-                    if token.is_some() {
-                        stats.bad_tokens.fetch_add(1, Ordering::Relaxed);
-                    }
-                    // Answer only a request at least as large as the answer.
-                    if len >= MIN_FIRST_REQUEST_BYTES || token.is_some() {
-                        stats.tokens_sent.fetch_add(1, Ordering::Relaxed);
-                        send_control(
-                            &socket,
-                            peer,
-                            &Control::Token {
-                                stream_id,
-                                token: tokens.current(peer),
-                            },
-                        )
-                        .await;
-                    }
-                    continue;
-                }
-                let repair = repair.bounded();
-                let window = router.cache.window_parts_for(stream_id).await as u64;
-                let head = head_part(&router, stream_id).await;
-                let refreshed = {
-                    let mut guard = table.lock().unwrap();
-                    let refreshed = match guard
-                        .get_mut(&stream_id)
-                        .and_then(|entry| entry.subscribers.get_mut(&peer))
-                    {
-                        Some(subscriber) => {
-                            subscriber.expires_at = Instant::now() + SUBSCRIPTION_TTL;
-                            // A fast-lane client whose repair changed moves
-                            // to the group of its new policy.
-                            let regroup = subscriber.fast.is_some()
-                                && (subscriber.repair != repair || subscriber.compact != compact);
-                            subscriber.repair = repair;
-                            subscriber.compact = compact;
-                            // A client that names a part has not yet heard
-                            // the edge's answer: it resumes there.
-                            if let (Some(part), Some(head)) = (from_part, head) {
-                                if part < subscriber.next_part && head.saturating_sub(part) < window
-                                {
-                                    subscriber.next_part = part;
-                                }
-                            }
-                            Some((subscriber.next_part, regroup))
-                        }
-                        None => None,
-                    };
-                    if refreshed.is_some_and(|(_, regroup)| regroup) {
-                        if config.batched_admission {
-                            let (sockets, table, rebuilds) =
-                                (sockets.clone(), Arc::clone(&table), Arc::clone(&rebuilds));
-                            tokio::spawn(async move {
-                                rebuilds.after_change(&sockets, &table).await;
-                            });
-                        } else {
-                            fast_lane_changed(&sockets, &guard);
-                        }
-                    }
-                    refreshed.map(|(next_part, _)| next_part)
-                };
-                if let Some(next_part) = refreshed {
-                    send_control(
-                        &socket,
-                        peer,
-                        &Control::Subscribed {
-                            stream_id,
-                            next_part,
-                            compact: compact.is_some(),
-                        },
-                    )
-                    .await;
-                    continue;
-                }
-                if !admitting.lock().unwrap().insert((peer, stream_id)) {
-                    continue;
-                }
-                let pending = admitting.lock().unwrap().len();
-                if subscriber_count(&table) + pending > config.max_subscribers {
-                    admitting.lock().unwrap().remove(&(peer, stream_id));
-                    stats.refusals.fetch_add(1, Ordering::Relaxed);
-                    send_control(
-                        &socket,
-                        peer,
-                        &Control::Refused {
-                            stream_id,
-                            reason: "edge-full".into(),
-                        },
-                    )
-                    .await;
-                    continue;
-                }
-                let admission = admit(
-                    Arc::clone(&socket),
-                    sockets.clone(),
-                    router.clone(),
-                    Arc::clone(&table),
-                    Arc::clone(&moved),
-                    config,
-                    Arc::clone(&stats),
-                    Arc::clone(&rebuilds),
-                    peer,
-                    stream_id,
-                    from_part,
-                    repair,
-                    fast_lane,
-                    compact,
-                );
-                let admitting = Arc::clone(&admitting);
-                tokio::spawn(async move {
-                    admission.await;
-                    admitting.lock().unwrap().remove(&(peer, stream_id));
-                });
+                edge.on_subscribe(
+                    socket, peer, len, stream_id, from_part, repair, token, fast_lane, compact,
+                )
+                .await;
             }
             Control::Unsubscribe { stream_id, token } => {
-                if !tokens.valid(peer, token) {
-                    stats.bad_tokens.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                let mut guard = table.lock().unwrap();
-                let removed = guard
-                    .get_mut(&stream_id)
-                    .and_then(|entry| entry.subscribers.remove(&peer));
-                if removed.is_some_and(|subscriber| subscriber.fast.is_some()) {
-                    if config.batched_admission {
-                        drop(guard);
-                        let (sockets, table, rebuilds) =
-                            (sockets.clone(), Arc::clone(&table), Arc::clone(&rebuilds));
-                        tokio::spawn(async move {
-                            rebuilds.after_change(&sockets, &table).await;
-                        });
-                    } else {
-                        fast_lane_changed(&sockets, &guard);
-                    }
-                }
+                edge.on_unsubscribe(peer, stream_id, token);
             }
             Control::Nack {
                 stream_id,
                 token,
                 parts,
             } => {
-                if !tokens.valid(peer, token) {
-                    stats.bad_tokens.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                // The control loop answers from the compact ring only; parts
-                // that need a cache read or an encode (a 4K part takes
-                // milliseconds) are answered on a task of their own, so a
-                // lossy listener's NACKs do not hold up the other clients'
-                // SUBs, refreshes and NACKs.
-                if let Some((misses, repair)) =
-                    answer_nack(
-                        &sockets,
-                        &table,
-                        &stats,
-                        peer,
-                        stream_id,
-                        &parts,
-                        config.nack_send_unlocked,
-                        &mut nack_budget,
-                    )
-                {
-                    let sockets = sockets.clone();
-                    let router = router.clone();
-                    let table = Arc::clone(&table);
-                    let stats = Arc::clone(&stats);
-                    tokio::spawn(async move {
-                        answer_nack_from_cache(
-                            &sockets, &router, &table, config, &stats, peer, stream_id, misses,
-                            repair,
-                        )
-                        .await;
-                    });
-                }
+                edge.on_nack(peer, stream_id, token, &parts);
             }
             Control::Assign {
                 stream_id,
@@ -1768,125 +1611,373 @@ pub(crate) async fn run_edge_udp(
                 token,
                 ..
             } => {
-                if !config.assign {
-                    stats.assignments_dropped.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                // Wave 9 review: the client's confirmation of the answer
-                // it took, with this node's token for its address (so its
-                // source is proven): the cache is charged and the session
-                // remembered, at most CONFIRMS_PER_SOURCE a second from one
-                // address. Not answered.
-                if let Some(token) = token {
-                    let Some(cache) = current
-                        .into_iter()
-                        .next()
-                        .filter(|_| tokens.valid(peer, token))
-                    else {
-                        stats.bad_tokens.fetch_add(1, Ordering::Relaxed);
-                        stats
-                            .assignment_confirms_refused
-                            .fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    };
-                    if !confirms.allow(peer.ip(), Instant::now())
-                        || assigning.load(Ordering::Relaxed) >= MAX_ASSIGNMENTS_IN_FLIGHT
-                    {
-                        stats
-                            .assignment_confirms_refused
-                            .fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    assigning.fetch_add(1, Ordering::Relaxed);
-                    let (router, stats, assigning) =
-                        (router.clone(), Arc::clone(&stats), Arc::clone(&assigning));
-                    tokio::spawn(async move {
-                        let counter = if router
-                            .confirm_udp_assignment(stream_id, &session, &skip, &cache)
-                            .await
-                        {
-                            &stats.assignment_confirms
-                        } else {
-                            &stats.assignment_confirms_refused
-                        };
-                        counter.fetch_add(1, Ordering::Relaxed);
-                        assigning.fetch_sub(1, Ordering::Relaxed);
-                    });
-                    continue;
-                }
-                // Wave 9 B: the assignment over UDP. Answered only to a
-                // padded request, never with more bytes than it carried
-                // (the answer and this node's token for the client's
-                // confirmation), and on a task of its own (the assignment
-                // reads the region's adverts), a bounded number at once.
-                if len < MIN_ASSIGN_REQUEST_BYTES
-                    || assigning.load(Ordering::Relaxed) >= MAX_ASSIGNMENTS_IN_FLIGHT
-                {
-                    stats.assignments_dropped.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                assigning.fetch_add(1, Ordering::Relaxed);
-                let given = Control::Token {
-                    stream_id,
-                    token: tokens.current(peer),
-                }
-                .encode();
-                let budget = len.saturating_sub(given.len());
-                let (router, stats, assigning) =
-                    (router.clone(), Arc::clone(&stats), Arc::clone(&assigning));
-                tokio::spawn(async move {
-                    let (port, mut caches) = router
-                        .udp_assignment(
-                            stream_id,
-                            &session,
-                            &skip,
-                            current.first().map(String::as_str),
-                        )
-                        .await;
-                    let answer = loop {
-                        let answer = Control::Assigned {
-                            stream_id,
-                            nonce,
-                            port,
-                            caches: caches.clone(),
-                            paths: 1,
-                            spare: false,
-                        }
-                        .encode();
-                        if answer.len() <= budget || caches.is_empty() {
-                            break answer;
-                        }
-                        // The last cache that fits: the failover order is
-                        // cut from its end (the assigned cache first).
-                        let failover_at = caches.iter().position(|cache| cache.failover);
-                        match failover_at {
-                            Some(at) if at > 1 => {
-                                caches.remove(at - 1);
-                            }
-                            _ => {
-                                caches.pop();
-                            }
-                        }
-                    };
-                    if answer.len() <= budget {
-                        stats.assignments.fetch_add(1, Ordering::Relaxed);
-                        stats.tokens_sent.fetch_add(1, Ordering::Relaxed);
-                        // The token first: the client confirms as soon as
-                        // it has the answer.
-                        if let Err(error) = socket.send_to(&given, peer).await {
-                            debug!(%peer, error = %error, "edge client UDP token send failed");
-                        }
-                        if let Err(error) = socket.send_to(&answer, peer).await {
-                            debug!(%peer, error = %error, "edge client UDP assignment send failed");
-                        }
-                    } else {
-                        stats.assignments_dropped.fetch_add(1, Ordering::Relaxed);
-                    }
-                    assigning.fetch_sub(1, Ordering::Relaxed);
-                });
+                edge.on_assign(
+                    socket, peer, len, stream_id, nonce, session, skip, current, token,
+                );
             }
             _ => {}
         }
+    }
+}
+
+/// What the edge's control loop keeps between requests: each kind of
+/// request is answered by a method of its own.
+struct EdgeControl {
+    sockets: EdgeSockets,
+    router: AppRouter,
+    config: EdgeUdpConfig,
+    stats: Arc<EdgeUdpStats>,
+    table: Table,
+    moved: MovedAway,
+    admitting: Admitting,
+    rebuilds: Arc<Rebuilds>,
+    nack_budget: EdgeNackBudget,
+    tokens: Tokens,
+    assigning: Arc<std::sync::atomic::AtomicUsize>,
+    confirms: ConfirmLimit,
+}
+
+impl EdgeControl {
+    /// `SUB`: a token for a client without a valid one, a refresh of a
+    /// subscription the edge holds, or an admission.
+    #[allow(clippy::too_many_arguments)]
+    async fn on_subscribe(
+        &self,
+        socket: Arc<UdpSocket>,
+        peer: SocketAddr,
+        len: usize,
+        stream_id: u64,
+        from_part: Option<u64>,
+        repair: RepairPolicy,
+        token: Option<u64>,
+        fast_lane: bool,
+        compact: Option<CompactPlan>,
+    ) {
+        let config = self.config;
+        let compact = compact
+            .filter(|_| config.compact)
+            .map(|plan| plan.with_short_header(plan.short_header && config.compact_short_header));
+        let valid = token.is_some_and(|token| self.tokens.valid(peer, token));
+        if !valid {
+            if token.is_some() {
+                self.stats.bad_tokens.fetch_add(1, Ordering::Relaxed);
+            }
+            // Answer only a request at least as large as the answer.
+            if len >= MIN_FIRST_REQUEST_BYTES || token.is_some() {
+                self.stats.tokens_sent.fetch_add(1, Ordering::Relaxed);
+                send_control(
+                    &socket,
+                    peer,
+                    &Control::Token {
+                        stream_id,
+                        token: self.tokens.current(peer),
+                    },
+                )
+                .await;
+            }
+            return;
+        }
+        let repair = repair.bounded();
+        let window = self.router.cache.window_parts_for(stream_id).await as u64;
+        let head = head_part(&self.router, stream_id).await;
+        let refreshed = {
+            let mut guard = self.table.lock().unwrap();
+            let refreshed = match guard
+                .get_mut(&stream_id)
+                .and_then(|entry| entry.subscribers.get_mut(&peer))
+            {
+                Some(subscriber) => {
+                    subscriber.expires_at = Instant::now() + SUBSCRIPTION_TTL;
+                    // A fast-lane client whose repair changed moves
+                    // to the group of its new policy.
+                    let regroup = subscriber.fast.is_some()
+                        && (subscriber.repair != repair || subscriber.compact != compact);
+                    subscriber.repair = repair;
+                    subscriber.compact = compact;
+                    // A client that names a part has not yet heard
+                    // the edge's answer: it resumes there.
+                    if let (Some(part), Some(head)) = (from_part, head) {
+                        if part < subscriber.next_part && head.saturating_sub(part) < window {
+                            subscriber.next_part = part;
+                        }
+                    }
+                    Some((subscriber.next_part, regroup))
+                }
+                None => None,
+            };
+            if refreshed.is_some_and(|(_, regroup)| regroup) {
+                if config.batched_admission {
+                    let (sockets, table, rebuilds) = (
+                        self.sockets.clone(),
+                        Arc::clone(&self.table),
+                        Arc::clone(&self.rebuilds),
+                    );
+                    tokio::spawn(async move {
+                        rebuilds.after_change(&sockets, &table).await;
+                    });
+                } else {
+                    fast_lane_changed(&self.sockets, &guard);
+                }
+            }
+            refreshed.map(|(next_part, _)| next_part)
+        };
+        if let Some(next_part) = refreshed {
+            send_control(
+                &socket,
+                peer,
+                &Control::Subscribed {
+                    stream_id,
+                    next_part,
+                    compact: compact.is_some(),
+                },
+            )
+            .await;
+            return;
+        }
+        if !self.admitting.lock().unwrap().insert((peer, stream_id)) {
+            return;
+        }
+        let pending = self.admitting.lock().unwrap().len();
+        if subscriber_count(&self.table) + pending > config.max_subscribers {
+            self.admitting.lock().unwrap().remove(&(peer, stream_id));
+            self.stats.refusals.fetch_add(1, Ordering::Relaxed);
+            send_control(
+                &socket,
+                peer,
+                &Control::Refused {
+                    stream_id,
+                    reason: "edge-full".into(),
+                },
+            )
+            .await;
+            return;
+        }
+        let admission = admit(
+            Arc::clone(&socket),
+            self.sockets.clone(),
+            self.router.clone(),
+            Arc::clone(&self.table),
+            Arc::clone(&self.moved),
+            config,
+            Arc::clone(&self.stats),
+            Arc::clone(&self.rebuilds),
+            peer,
+            stream_id,
+            from_part,
+            repair,
+            fast_lane,
+            compact,
+        );
+        let admitting = Arc::clone(&self.admitting);
+        tokio::spawn(async move {
+            admission.await;
+            admitting.lock().unwrap().remove(&(peer, stream_id));
+        });
+    }
+
+    /// `UNSUB`: the subscription ends at once.
+    fn on_unsubscribe(&self, peer: SocketAddr, stream_id: u64, token: u64) {
+        if !self.tokens.valid(peer, token) {
+            self.stats.bad_tokens.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let mut guard = self.table.lock().unwrap();
+        let removed = guard
+            .get_mut(&stream_id)
+            .and_then(|entry| entry.subscribers.remove(&peer));
+        if removed.is_some_and(|subscriber| subscriber.fast.is_some()) {
+            if self.config.batched_admission {
+                drop(guard);
+                let (sockets, table, rebuilds) = (
+                    self.sockets.clone(),
+                    Arc::clone(&self.table),
+                    Arc::clone(&self.rebuilds),
+                );
+                tokio::spawn(async move {
+                    rebuilds.after_change(&sockets, &table).await;
+                });
+            } else {
+                fast_lane_changed(&self.sockets, &guard);
+            }
+        }
+    }
+
+    /// `NACK`: the parts asked for again.
+    fn on_nack(&mut self, peer: SocketAddr, stream_id: u64, token: u64, parts: &[u64]) {
+        if !self.tokens.valid(peer, token) {
+            self.stats.bad_tokens.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        // The control loop answers from the compact ring only; parts
+        // that need a cache read or an encode (a 4K part takes
+        // milliseconds) are answered on a task of their own, so a
+        // lossy listener's NACKs do not hold up the other clients'
+        // SUBs, refreshes and NACKs.
+        if let Some((misses, repair)) = answer_nack(
+            &self.sockets,
+            &self.table,
+            &self.stats,
+            peer,
+            stream_id,
+            parts,
+            self.config.nack_send_unlocked,
+            &mut self.nack_budget,
+        ) {
+            let config = self.config;
+            let sockets = self.sockets.clone();
+            let router = self.router.clone();
+            let table = Arc::clone(&self.table);
+            let stats = Arc::clone(&self.stats);
+            tokio::spawn(async move {
+                answer_nack_from_cache(
+                    &sockets, &router, &table, config, &stats, peer, stream_id, misses, repair,
+                )
+                .await;
+            });
+        }
+    }
+
+    /// `ASSIGN`: a client's confirmation of the assignment it took (with
+    /// this node's token), or a padded request for one.
+    #[allow(clippy::too_many_arguments)]
+    fn on_assign(
+        &mut self,
+        socket: Arc<UdpSocket>,
+        peer: SocketAddr,
+        len: usize,
+        stream_id: u64,
+        nonce: u64,
+        session: String,
+        skip: Vec<String>,
+        current: Vec<String>,
+        token: Option<u64>,
+    ) {
+        if !self.config.assign {
+            self.stats
+                .assignments_dropped
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        // Wave 9 review: the client's confirmation of the answer
+        // it took, with this node's token for its address (so its
+        // source is proven): the cache is charged and the session
+        // remembered, at most CONFIRMS_PER_SOURCE a second from one
+        // address. Not answered.
+        if let Some(token) = token {
+            let Some(cache) = current
+                .into_iter()
+                .next()
+                .filter(|_| self.tokens.valid(peer, token))
+            else {
+                self.stats.bad_tokens.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .assignment_confirms_refused
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            if !self.confirms.allow(peer.ip(), Instant::now())
+                || self.assigning.load(Ordering::Relaxed) >= MAX_ASSIGNMENTS_IN_FLIGHT
+            {
+                self.stats
+                    .assignment_confirms_refused
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            self.assigning.fetch_add(1, Ordering::Relaxed);
+            let (router, stats, assigning) = (
+                self.router.clone(),
+                Arc::clone(&self.stats),
+                Arc::clone(&self.assigning),
+            );
+            tokio::spawn(async move {
+                let counter = if router
+                    .confirm_udp_assignment(stream_id, &session, &skip, &cache)
+                    .await
+                {
+                    &stats.assignment_confirms
+                } else {
+                    &stats.assignment_confirms_refused
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
+                assigning.fetch_sub(1, Ordering::Relaxed);
+            });
+            return;
+        }
+        // Wave 9 B: the assignment over UDP. Answered only to a
+        // padded request, never with more bytes than it carried
+        // (the answer and this node's token for the client's
+        // confirmation), and on a task of its own (the assignment
+        // reads the region's adverts), a bounded number at once.
+        if len < MIN_ASSIGN_REQUEST_BYTES
+            || self.assigning.load(Ordering::Relaxed) >= MAX_ASSIGNMENTS_IN_FLIGHT
+        {
+            self.stats
+                .assignments_dropped
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.assigning.fetch_add(1, Ordering::Relaxed);
+        let given = Control::Token {
+            stream_id,
+            token: self.tokens.current(peer),
+        }
+        .encode();
+        let budget = len.saturating_sub(given.len());
+        let (router, stats, assigning) = (
+            self.router.clone(),
+            Arc::clone(&self.stats),
+            Arc::clone(&self.assigning),
+        );
+        tokio::spawn(async move {
+            let (port, mut caches) = router
+                .udp_assignment(
+                    stream_id,
+                    &session,
+                    &skip,
+                    current.first().map(String::as_str),
+                )
+                .await;
+            let answer = loop {
+                let answer = Control::Assigned {
+                    stream_id,
+                    nonce,
+                    port,
+                    caches: caches.clone(),
+                    paths: 1,
+                    spare: false,
+                }
+                .encode();
+                if answer.len() <= budget || caches.is_empty() {
+                    break answer;
+                }
+                // The last cache that fits: the failover order is
+                // cut from its end (the assigned cache first).
+                let failover_at = caches.iter().position(|cache| cache.failover);
+                match failover_at {
+                    Some(at) if at > 1 => {
+                        caches.remove(at - 1);
+                    }
+                    _ => {
+                        caches.pop();
+                    }
+                }
+            };
+            if answer.len() <= budget {
+                stats.assignments.fetch_add(1, Ordering::Relaxed);
+                stats.tokens_sent.fetch_add(1, Ordering::Relaxed);
+                // The token first: the client confirms as soon as
+                // it has the answer.
+                if let Err(error) = socket.send_to(&given, peer).await {
+                    debug!(%peer, error = %error, "edge client UDP token send failed");
+                }
+                if let Err(error) = socket.send_to(&answer, peer).await {
+                    debug!(%peer, error = %error, "edge client UDP assignment send failed");
+                }
+            } else {
+                stats.assignments_dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            assigning.fetch_sub(1, Ordering::Relaxed);
+        });
     }
 }
 
@@ -3030,17 +3121,13 @@ async fn run_stream_sender(
     stats: Arc<EdgeUdpStats>,
     stream_id: u64,
 ) {
-    let mut housekeeping_at = Instant::now();
+    let mut house = Housekeeping {
+        at: Instant::now(),
+        held_while_lost: false,
+        drain: None,
+        demand_at: Instant::now(),
+    };
     let mut last_sent = Instant::now();
-    // The edge has lost its parents but keeps subscribers within the move
-    // hold-down: it serves them from its cache alone, without repair.
-    let mut held_while_lost = false;
-    // Phase AM item 9: the drain in progress (its start, the subscribers
-    // there were, those sent away so far).
-    let mut drain: Option<DrainPace> = None;
-    // The playlist's demand is kept once a second, also while a rebalance
-    // round runs the housekeeping every tick.
-    let mut demand_at = Instant::now();
     loop {
         let now = Instant::now();
         // The stream's class can become known after it started.
@@ -3122,195 +3209,16 @@ async fn run_stream_sender(
             )
         };
 
-        if now >= housekeeping_at {
-            housekeeping_at = now + HOUSEKEEPING;
-            held_while_lost = false;
-            let reason = move_reason(&router, stream_id).await;
-            let paced = reason == Some("draining") && !config.drain_spread.is_zero();
-            if !paced {
-                drain = None;
-            }
-            // A drain begun a moment ago waits until the entry points have
-            // heard that it drains, so that its movers are not sent to
-            // another edge drained at the same moment (sent away again).
-            let advert_wait = if reason == Some("draining") {
-                router.lifecycle.drain_advert_wait(now, DRAIN_ADVERT_GRACE)
-            } else {
-                None
-            };
-            if let Some(wait) = advert_wait {
-                housekeeping_at = now + wait;
-            } else if let Some(reason) = reason {
-                // Lost parents do not move a subscriber that came by a
-                // move within the hold-down: it may have just come from an
-                // edge that lost its parents too. A subscriber that did not
-                // move here goes at once, and draining moves every one
-                // (spread over --client-udp-drain-spread-ms).
-                let hold_down = if reason == "parents-lost" {
-                    config.move_hold_down
-                } else {
-                    Duration::ZERO
-                };
-                let (leaving, kept, newly_held) = {
-                    let mut guard = table.lock().unwrap();
-                    match guard.get_mut(&stream_id) {
-                        Some(entry) => {
-                            let limit = paced.then(|| {
-                                let pace = drain.get_or_insert_with(|| DrainPace {
-                                    started: now,
-                                    initial: entry.subscribers.len(),
-                                    sent: 0,
-                                });
-                                pace.due(now, config.drain_spread)
-                            });
-                            let leaving = take_movable(entry, hold_down, now, limit);
-                            if let Some(pace) = drain.as_mut() {
-                                pace.sent += leaving.len();
-                            }
-                            let kept = entry.subscribers.len();
-                            let newly_held = count_held_down(entry);
-                            if kept == 0 {
-                                guard.remove(&stream_id);
-                            }
-                            if !leaving.is_empty() {
-                                fast_lane_changed(&sockets, &guard);
-                            }
-                            (leaving, kept, newly_held)
-                        }
-                        None => (Vec::new(), 0, 0),
-                    }
-                };
-                if newly_held > 0 {
-                    stats
-                        .moves_held_down
-                        .fetch_add(newly_held, Ordering::Relaxed);
-                }
-                if !leaving.is_empty() {
-                    stats
-                        .moves
-                        .fetch_add(leaving.len() as u64, Ordering::Relaxed);
-                    if reason == "region-lost" {
-                        stats
-                            .region_lost_moves
-                            .fetch_add(leaving.len() as u64, Ordering::Relaxed);
-                    }
-                    info!(
-                        stream_id,
-                        reason,
-                        clients = leaving.len(),
-                        kept,
-                        "edge client UDP moves its clients"
-                    );
-                    if !hold_down.is_zero() {
-                        let mut moved = moved.lock().unwrap();
-                        for peer in &leaving {
-                            moved.insert((*peer, stream_id), now);
-                        }
-                    }
-                }
-                for peer in leaving {
-                    send_control(
-                        &socket,
-                        peer,
-                        &Control::Move {
-                            stream_id,
-                            reason: reason.into(),
-                        },
-                    )
-                    .await;
-                }
-                if kept == 0 {
-                    return;
-                }
-                if paced {
-                    // The next share soon; those not yet sent away are
-                    // served as before (their parts, repaired).
-                    housekeeping_at = Instant::now() + DRAIN_TICK;
-                } else {
-                    held_while_lost = true;
-                    continue;
-                }
-            } else {
-                if now >= demand_at {
-                    demand_at = now + HOUSEKEEPING;
-                    // Keep the playlist held, as a reader's playlist reloads
-                    // do (wave 9: without the wait for a playable copy,
-                    // which held a cold edge's first subscribers' parts
-                    // back).
-                    if config.prompt_sender {
-                        router.open_playlist_demand(stream_id).await;
-                    } else {
-                        router.ensure_playlist_copy(stream_id).await;
-                    }
-                    router
-                        .request_replica_for_stream(stream_id, "udp-client-demand", None)
-                        .await;
-                }
-                // Wave 9 C1: over its target with room in the region, the
-                // edge sends some listeners there (a share every tick of
-                // the round). They ask the assignment again without this
-                // edge and resume from their oldest hole at the next.
-                // The share is reserved now, so that the senders of the
-                // edge's other streams do not take it too (wave 9 review);
-                // what this one does not send is handed back.
-                let (due, active) = router.rebalance_due(now).await;
-                if due > 0 {
-                    let (leaving, kept) = {
-                        let mut guard = table.lock().unwrap();
-                        match guard.get_mut(&stream_id) {
-                            Some(entry) => {
-                                let leaving = take_movable_aged(
-                                    entry,
-                                    Duration::ZERO,
-                                    REBALANCE_MIN_AGE,
-                                    now,
-                                    Some(due),
-                                );
-                                let kept = entry.subscribers.len();
-                                if kept == 0 {
-                                    guard.remove(&stream_id);
-                                }
-                                if !leaving.is_empty() {
-                                    fast_lane_changed(&sockets, &guard);
-                                }
-                                (leaving, kept)
-                            }
-                            None => (Vec::new(), 0),
-                        }
-                    };
-                    router.rebalance_sent(now, due, leaving.len());
-                    if !leaving.is_empty() {
-                        stats
-                            .moves
-                            .fetch_add(leaving.len() as u64, Ordering::Relaxed);
-                        stats
-                            .rebalance_moves
-                            .fetch_add(leaving.len() as u64, Ordering::Relaxed);
-                        info!(
-                            stream_id,
-                            clients = leaving.len(),
-                            kept,
-                            "edge client UDP rebalances clients to an edge with room"
-                        );
-                    }
-                    for peer in leaving {
-                        send_control(
-                            &socket,
-                            peer,
-                            &Control::Move {
-                                stream_id,
-                                reason: "rebalance".into(),
-                            },
-                        )
-                        .await;
-                    }
-                    if kept == 0 {
-                        return;
-                    }
-                }
-                if active {
-                    housekeeping_at = Instant::now() + DRAIN_TICK;
-                }
+        if now >= house.at {
+            match housekeeping_moves(
+                &mut house, &sockets, &router, &table, &moved, config, &stats, &socket, stream_id,
+                now,
+            )
+            .await
+            {
+                AfterHousekeeping::Send => {}
+                AfterHousekeeping::Again => continue,
+                AfterHousekeeping::Stop => return,
             }
         }
 
@@ -3322,7 +3230,7 @@ async fn run_stream_sender(
             // deadline (HOLE_WAIT without one), or send a gap.
             let bytes = match router.cache.get_part_for_stream_id(stream_id, part).await {
                 Some((bytes, _)) => Some(bytes),
-                None if held_while_lost => None,
+                None if house.held_while_lost => None,
                 None => {
                     let age = hole_age(&router, stream_id, head, part).await;
                     let mut wait = hole_budget(age, config.playout).unwrap_or(HOLE_WAIT);
@@ -3345,7 +3253,7 @@ async fn run_stream_sender(
                         {
                             Ok(Ok(Some((bytes, _)))) => Some(bytes),
                             Ok(Err(ParentsLost)) => {
-                                housekeeping_at = Instant::now();
+                                house.at = Instant::now();
                                 continue;
                             }
                             _ => None,
@@ -3391,7 +3299,7 @@ async fn run_stream_sender(
             config.keepalive
         };
         let live_wait = LIVE_WAIT.min(keepalive);
-        let waited = if held_while_lost {
+        let waited = if house.held_while_lost {
             Ok(Ok(router
                 .cache
                 .get_part_until_for_stream_id(stream_id, part, Instant::now() + live_wait)
@@ -3407,10 +3315,11 @@ async fn run_stream_sender(
                 .map_or(live_wait, |horizon_us| {
                     live_wait.min(Duration::from_micros(horizon_us).max(Duration::from_millis(1)))
                 });
-            if drain.is_some() {
+            if house.drain.is_some() {
                 // A paced drain's next share is due at its tick.
                 slice = slice.min(
-                    housekeeping_at
+                    house
+                        .at
                         .saturating_duration_since(Instant::now())
                         .max(Duration::from_millis(1)),
                 );
@@ -3446,7 +3355,7 @@ async fn run_stream_sender(
             }
             Ok(Err(ParentsLost)) => {
                 // Housekeeping sends the clients away.
-                housekeeping_at = Instant::now();
+                house.at = Instant::now();
             }
             Ok(Ok(None)) | Err(_) => {
                 if last_sent.elapsed() >= keepalive {
@@ -3467,6 +3376,237 @@ async fn run_stream_sender(
             }
         }
     }
+}
+
+/// A stream sender's housekeeping: when it runs next, and what it left for
+/// the sending between its runs.
+struct Housekeeping {
+    at: Instant,
+    /// The edge has lost its parents but keeps subscribers within the move
+    /// hold-down: it serves them from its cache alone, without repair.
+    held_while_lost: bool,
+    /// Phase AM item 9: the drain in progress (its start, the subscribers
+    /// there were, those sent away so far).
+    drain: Option<DrainPace>,
+    /// The playlist's demand is kept once a second, also while a rebalance
+    /// round runs the housekeeping every tick.
+    demand_at: Instant,
+}
+
+/// What the stream sender does after its housekeeping.
+enum AfterHousekeeping {
+    /// Send the subscribers' next part.
+    Send,
+    /// Look at the stream again before it sends (subscribers are held while
+    /// the edge has lost its parents).
+    Again,
+    /// The stream has no subscriber left: the sender ends.
+    Stop,
+}
+
+/// The housekeeping of a stream's sender: with a reason to move its
+/// subscribers (drain, lost parents, lost region) it sends them `MOVE`,
+/// paced for a drain; without, it keeps the playlist's demand and sends a
+/// rebalance round's share away.
+#[allow(clippy::too_many_arguments)]
+async fn housekeeping_moves(
+    house: &mut Housekeeping,
+    sockets: &EdgeSockets,
+    router: &AppRouter,
+    table: &Table,
+    moved: &MovedAway,
+    config: EdgeUdpConfig,
+    stats: &EdgeUdpStats,
+    socket: &UdpSocket,
+    stream_id: u64,
+    now: Instant,
+) -> AfterHousekeeping {
+    house.at = now + HOUSEKEEPING;
+    house.held_while_lost = false;
+    let reason = move_reason(router, stream_id).await;
+    let paced = reason == Some("draining") && !config.drain_spread.is_zero();
+    if !paced {
+        house.drain = None;
+    }
+    // A drain begun a moment ago waits until the entry points have
+    // heard that it drains, so that its movers are not sent to
+    // another edge drained at the same moment (sent away again).
+    let advert_wait = if reason == Some("draining") {
+        router.lifecycle.drain_advert_wait(now, DRAIN_ADVERT_GRACE)
+    } else {
+        None
+    };
+    if let Some(wait) = advert_wait {
+        house.at = now + wait;
+        return AfterHousekeeping::Send;
+    }
+    if let Some(reason) = reason {
+        // Lost parents do not move a subscriber that came by a
+        // move within the hold-down: it may have just come from an
+        // edge that lost its parents too. A subscriber that did not
+        // move here goes at once, and draining moves every one
+        // (spread over --client-udp-drain-spread-ms).
+        let hold_down = if reason == "parents-lost" {
+            config.move_hold_down
+        } else {
+            Duration::ZERO
+        };
+        let (leaving, kept, newly_held) = {
+            let mut guard = table.lock().unwrap();
+            match guard.get_mut(&stream_id) {
+                Some(entry) => {
+                    let limit = paced.then(|| {
+                        let pace = house.drain.get_or_insert_with(|| DrainPace {
+                            started: now,
+                            initial: entry.subscribers.len(),
+                            sent: 0,
+                        });
+                        pace.due(now, config.drain_spread)
+                    });
+                    let leaving = take_movable(entry, hold_down, now, limit);
+                    if let Some(pace) = house.drain.as_mut() {
+                        pace.sent += leaving.len();
+                    }
+                    let kept = entry.subscribers.len();
+                    let newly_held = count_held_down(entry);
+                    if kept == 0 {
+                        guard.remove(&stream_id);
+                    }
+                    if !leaving.is_empty() {
+                        fast_lane_changed(sockets, &guard);
+                    }
+                    (leaving, kept, newly_held)
+                }
+                None => (Vec::new(), 0, 0),
+            }
+        };
+        if newly_held > 0 {
+            stats
+                .moves_held_down
+                .fetch_add(newly_held, Ordering::Relaxed);
+        }
+        if !leaving.is_empty() {
+            stats
+                .moves
+                .fetch_add(leaving.len() as u64, Ordering::Relaxed);
+            if reason == "region-lost" {
+                stats
+                    .region_lost_moves
+                    .fetch_add(leaving.len() as u64, Ordering::Relaxed);
+            }
+            info!(
+                stream_id,
+                reason,
+                clients = leaving.len(),
+                kept,
+                "edge client UDP moves its clients"
+            );
+            if !hold_down.is_zero() {
+                let mut moved = moved.lock().unwrap();
+                for peer in &leaving {
+                    moved.insert((*peer, stream_id), now);
+                }
+            }
+        }
+        for peer in leaving {
+            send_control(
+                socket,
+                peer,
+                &Control::Move {
+                    stream_id,
+                    reason: reason.into(),
+                },
+            )
+            .await;
+        }
+        if kept == 0 {
+            return AfterHousekeeping::Stop;
+        }
+        if paced {
+            // The next share soon; those not yet sent away are
+            // served as before (their parts, repaired).
+            house.at = Instant::now() + DRAIN_TICK;
+            return AfterHousekeeping::Send;
+        }
+        house.held_while_lost = true;
+        return AfterHousekeeping::Again;
+    }
+    if now >= house.demand_at {
+        house.demand_at = now + HOUSEKEEPING;
+        // Keep the playlist held, as a reader's playlist reloads
+        // do (wave 9: without the wait for a playable copy,
+        // which held a cold edge's first subscribers' parts
+        // back).
+        if config.prompt_sender {
+            router.open_playlist_demand(stream_id).await;
+        } else {
+            router.ensure_playlist_copy(stream_id).await;
+        }
+        router
+            .request_replica_for_stream(stream_id, "udp-client-demand", None)
+            .await;
+    }
+    // Wave 9 C1: over its target with room in the region, the
+    // edge sends some listeners there (a share every tick of
+    // the round). They ask the assignment again without this
+    // edge and resume from their oldest hole at the next.
+    // The share is reserved now, so that the senders of the
+    // edge's other streams do not take it too (wave 9 review);
+    // what this one does not send is handed back.
+    let (due, active) = router.rebalance_due(now).await;
+    if due > 0 {
+        let (leaving, kept) = {
+            let mut guard = table.lock().unwrap();
+            match guard.get_mut(&stream_id) {
+                Some(entry) => {
+                    let leaving =
+                        take_movable_aged(entry, Duration::ZERO, REBALANCE_MIN_AGE, now, Some(due));
+                    let kept = entry.subscribers.len();
+                    if kept == 0 {
+                        guard.remove(&stream_id);
+                    }
+                    if !leaving.is_empty() {
+                        fast_lane_changed(sockets, &guard);
+                    }
+                    (leaving, kept)
+                }
+                None => (Vec::new(), 0),
+            }
+        };
+        router.rebalance_sent(now, due, leaving.len());
+        if !leaving.is_empty() {
+            stats
+                .moves
+                .fetch_add(leaving.len() as u64, Ordering::Relaxed);
+            stats
+                .rebalance_moves
+                .fetch_add(leaving.len() as u64, Ordering::Relaxed);
+            info!(
+                stream_id,
+                clients = leaving.len(),
+                kept,
+                "edge client UDP rebalances clients to an edge with room"
+            );
+        }
+        for peer in leaving {
+            send_control(
+                socket,
+                peer,
+                &Control::Move {
+                    stream_id,
+                    reason: "rebalance".into(),
+                },
+            )
+            .await;
+        }
+        if kept == 0 {
+            return AfterHousekeeping::Stop;
+        }
+    }
+    if active {
+        house.at = Instant::now() + DRAIN_TICK;
+    }
+    AfterHousekeeping::Send
 }
 
 /// A subscriber's next part against the stream's `head`: a part the window
