@@ -624,6 +624,19 @@ pub fn standby_rank(node_id: &str, stream_id: u64) -> u64 {
     hash ^ (hash >> 29)
 }
 
+/// A node's tag (B rule R1): how a listener's other legs (`o=`) are kept
+/// at an edge, eight bytes each, and matched against the region's nodes.
+/// FNV-1a of the node id, the same on every node and in every build; never
+/// 0, which stands for no node.
+pub fn node_tag(node_id: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in node_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash.max(1)
+}
+
 /// Weighted rendezvous score of a cache for a session. The cache with the
 /// highest score wins. The weight is the free capacity of the cache, so a
 /// cache with twice the room takes about twice the new sessions.

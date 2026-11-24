@@ -960,7 +960,10 @@ fn kill_one_edge(name: &str, assigned: bool, rendezvous: bool, ip: u8) -> (Value
     let _ = pub_rt.block_on(first);
     let (killed, _) = edges.remove(0);
     let killed = Arc::try_unwrap(killed).ok().expect("the killed edge is not shared");
-    edge_rt.block_on(killed.stop());
+    let AnyEdge::Fast(killed) = killed else {
+        panic!("the edges here are fast-lane edges");
+    };
+    edge_rt.block_on(killed.kill());
     let summary = load.join().unwrap();
     for publisher in publishers {
         publisher.abort();
