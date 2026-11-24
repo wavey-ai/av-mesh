@@ -25,6 +25,7 @@ use av_mesh::relay_ingress::{
 use av_mesh::replication::{
     DemandSignal, MeshNode, ReplicaPlacement, ReplicaReason, ReplicationPolicy, StreamInfo,
 };
+use av_mesh::stall_journal::{self, StallJournal, StallSnapshot, TickConfig};
 use av_mesh::telemetry_fec::{
     LatestTelemetryQueue, QueuePushOutcome, TelemetryDecodeOutcome, TelemetryEnvelope,
     TelemetryFecDecoder, TelemetryFecEncoder, DEFAULT_TELEMETRY_REPAIR_PERCENT,
@@ -511,6 +512,8 @@ const ASSIGNMENT_PATH: &str = "/api/assignment";
 const HOPS_PATH: &str = "/api/hops";
 /// The node's build, process and readiness (`node_status`).
 const NODE_STATUS_PATH: &str = "/api/node";
+/// The stall journal of the node, as NDJSON.
+const STALLS_PATH: &str = "/api/stalls";
 /// Reply events journaled for one part: the first few readers show the
 /// delay of the last hop; a crowd would only fill the ring.
 const HOP_JOURNAL_REPLIES_PER_PART: u32 = 4;
@@ -1257,6 +1260,30 @@ struct Args {
         default_value_t = DEFAULT_HOP_JOURNAL_SECONDS
     )]
     hop_journal_seconds: u64,
+
+    /// Events that the stall journal keeps in memory and serves on
+    /// /api/stalls: the times a tick thread woke late, a class thread's
+    /// pass, wake or batch was late, a tee lagged or a send was slow, each
+    /// dated and with its cause (see `stall_journal`). Zero turns the
+    /// journal and its tick threads off.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_STALL_JOURNAL_CAPACITY",
+        default_value_t = stall_journal::DEFAULT_CAPACITY
+    )]
+    stall_journal_capacity: usize,
+
+    /// The period in microseconds of the stall journal's tick threads: one
+    /// thread on each CPU the process may run on, at normal scheduling,
+    /// that sleeps to a deadline every period and books how late it woke.
+    /// Zero starts none; the journal then holds no tick, and nothing in it
+    /// can be told to be a stopped CPU.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_STALL_TICK_US",
+        default_value_t = stall_journal::DEFAULT_TICK_US
+    )]
+    stall_tick_us: u64,
 
     /// Forward a RelaySession datagram to every downstream child with a
     /// non-blocking send first, and wait only for the children whose socket
@@ -3615,6 +3642,23 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| hop_journal_capacity_for(args.part_us, args.hop_journal_seconds)),
     ));
     cache.set_hop_journal(Arc::clone(&hop_journal));
+    // The stall journal runs from the node's first second: its ring is
+    // faulted in and locked, and its tick threads start here, before any
+    // thread of the node is pinned or made real-time.
+    let stalls = stall_journal::install(Arc::new(StallJournal::new(
+        node_id.clone(),
+        args.stall_journal_capacity,
+    )));
+    let stall_ticks = stall_journal::spawn_ticks(stalls, TickConfig::every(args.stall_tick_us));
+    info!(
+        capacity = args.stall_journal_capacity,
+        ring_locked = stalls.ring_locked(),
+        tick_us = args.stall_tick_us,
+        tick_threads = stall_ticks.threads().len(),
+        tick_pinned = stall_ticks.pinned(),
+        run_delay_known = stall_ticks.threads().iter().all(|thread| thread.run_delay),
+        "stall journal"
+    );
     // Wave 9 (cold start): the cache and the journal are allocated; lock
     // them and everything mapped from now on (where the limit allows).
     match memory::lock_all(args.mlock_all) {
@@ -13477,6 +13521,10 @@ struct MeshApiSnapshot {
     /// records build and readiness with no second request.
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<node_status::NodeStatus>,
+    /// The stall journal's counters, on a node that has one (/api/stalls
+    /// has the events).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stall: Option<StallSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -16411,6 +16459,7 @@ impl MeshApiSnapshot {
             fast_plane: None,
             cache_mesh: None,
             status: None,
+            stall: None,
         }
     }
 }
@@ -19904,6 +19953,55 @@ impl AppRouter {
         .with_no_store()
     }
 
+    /// `GET /api/stalls?since_us=<t>`: the stall journal of this node as
+    /// NDJSON, oldest first: every event with its cause and every kept
+    /// `sec` line, or those recorded at `t` or later, up to the moment the
+    /// read began. An earlier event whose cause or scope a stopped tick of
+    /// this read decides comes again: a collector keys events by kind,
+    /// thread and start (`t_us - span_us`), keeps the later line, and asks
+    /// next from the last `t_us` it saw plus one. It reads no cache and is
+    /// no session.
+    ///
+    /// The read copies the ring and works the causes out over all of it, so
+    /// it runs on a blocking thread, as the hop journal's does.
+    async fn stalls_response(
+        journal: Option<Arc<StallJournal>>,
+        query: Option<&str>,
+    ) -> HandlerResponse {
+        let Ok(since_us) = query_value(query, "since_us")
+            .map(str::parse::<u64>)
+            .transpose()
+        else {
+            return response(
+                StatusCode::BAD_REQUEST,
+                Some(Bytes::from_static(
+                    b"since_us must be an unsigned integer\n",
+                )),
+                Some("text/plain; charset=utf-8"),
+            )
+            .with_no_store();
+        };
+        let body = match journal {
+            Some(journal) => {
+                match tokio::task::spawn_blocking(move || journal.render_ndjson(since_us)).await {
+                    Ok(body) => body,
+                    Err(err) => {
+                        warn!(error = %err, "stall journal read failed");
+                        return response(StatusCode::INTERNAL_SERVER_ERROR, None, None)
+                            .with_no_store();
+                    }
+                }
+            }
+            None => String::new(),
+        };
+        response(
+            StatusCode::OK,
+            Some(Bytes::from(body)),
+            Some("application/x-ndjson"),
+        )
+        .with_no_store()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         cache: Arc<LiveTsCache>,
@@ -20515,6 +20613,7 @@ impl AppRouter {
         snapshot.fast_plane = self.fast_plane_gauges();
         snapshot.cache_mesh = Some(self.cache_mesh_gauges());
         snapshot.status = Some((*self.node_status().await).clone());
+        snapshot.stall = stall_journal::installed().map(|journal| journal.snapshot());
         snapshot
     }
 
@@ -23756,6 +23855,9 @@ impl Router for AppRouter {
                 .assignment_api_response(query, session_id.as_deref())
                 .await),
             HOPS_PATH => Ok(self.hops_response(query).await),
+            STALLS_PATH => {
+                Ok(Self::stalls_response(stall_journal::installed().cloned(), query).await)
+            }
             "/api/stats" => {
                 let json = serde_json::to_vec(&self.cache.stats(&self.mesh).await)
                     .map_err(|err| ServerError::Handler(Box::new(err)))?;
@@ -41636,6 +41738,121 @@ mod tests {
         let response = get_for_tests(&quiet_router, "/api/hops").await;
         assert_eq!(response.status, StatusCode::OK);
         assert!(response.body.unwrap().is_empty());
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn stalls_endpoint_filters_by_since_us() {
+        // The process's journal: other tests' fast-plane threads record
+        // into it when the machine stalls under them, and an event merges
+        // with one of its kind and thread that ended less than 10 ms before
+        // it began, or that begins less than 10 ms after it. This test's
+        // events are short, of durations a real event is unlikely to have,
+        // and are recorded again (at most five times, 30 ms apart) until
+        // neither has merged with another.
+        let journal = stall_journal::install(Arc::new(StallJournal::new("stalls-test", 4_096)));
+        const PASS_US: u64 = 2_347;
+        const RX_US: u64 = 2_351;
+        let video = stall_journal::StallThread::Video;
+        let ours = |kind: stall_journal::StallKind, dur_us: u64| {
+            journal
+                .query(None)
+                .events
+                .iter()
+                .rev()
+                .map(|line| line.event)
+                .find(|event| event.kind == kind && event.thread == video && event.dur_us == dur_us)
+        };
+        // As another test's stalled fast plane would: a pass of the video
+        // thread just before, with page faults of its own. The first try
+        // merges with it.
+        journal.record(stall_journal::StallKind::ClassPass, video, 3_000, 647, 0);
+        let mut first_t_us = None;
+        for _ in 0..5 {
+            journal.record(stall_journal::StallKind::ClassPass, video, PASS_US, 3, 0);
+            journal.record(stall_journal::StallKind::RxLate, video, RX_US, 0, 0);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let pass = ours(stall_journal::StallKind::ClassPass, PASS_US);
+            let rx = ours(stall_journal::StallKind::RxLate, RX_US);
+            if let (Some(pass), Some(rx)) = (pass, rx) {
+                if pass.n == 1 && rx.n == 1 {
+                    first_t_us = Some(pass.t_us);
+                    break;
+                }
+            }
+        }
+        let first_t_us = first_t_us.expect("the test's events stand apart from real ones");
+        let marked = |body: &str| -> Vec<serde_json::Value> {
+            body.lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|line| {
+                    line["thread"] == "video"
+                        && line["t_us"].as_u64().is_some_and(|t_us| t_us >= first_t_us)
+                        && line["dur_us"]
+                            .as_u64()
+                            .is_some_and(|dur| dur == PASS_US || dur == RX_US)
+                })
+                .collect()
+        };
+        let cache = LiveTsCache::new(1, Duration::from_millis(5), 2, 64, 64).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
+
+        let all = get_for_tests(&router, "/api/stalls").await;
+        assert_eq!(all.status, StatusCode::OK);
+        assert_eq!(all.content_type.as_deref(), Some("application/x-ndjson"));
+        let lines = marked(&String::from_utf8(all.body.unwrap().to_vec()).unwrap());
+        let kinds: Vec<&str> = lines
+            .iter()
+            .map(|line| line["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, vec!["class_pass", "rx_late"], "oldest first");
+        assert_eq!(lines[0]["thread"], "video");
+        assert_eq!(lines[0]["minflt"], 3);
+        assert_eq!(lines[0]["t_us"], first_t_us);
+        assert!(lines[0]["node"].is_string());
+        // No tick of its CPU was stopped under it: the thread's own work.
+        assert_eq!(lines[0]["cause"], "own");
+        assert_eq!(lines[1]["thread"], "video");
+        assert_eq!(lines[1]["cause"], "waited");
+
+        let since = format!("/api/stalls?since_us={}", first_t_us + 1);
+        let later = get_for_tests(&router, &since).await;
+        assert_eq!(later.status, StatusCode::OK);
+        let lines = marked(&String::from_utf8(later.body.unwrap().to_vec()).unwrap());
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["kind"], "rx_late");
+        let at = format!("/api/stalls?since_us={first_t_us}");
+        let from = get_for_tests(&router, &at).await;
+        assert_eq!(
+            marked(&String::from_utf8(from.body.unwrap().to_vec()).unwrap()).len(),
+            2,
+            "since_us is inclusive"
+        );
+
+        let bad = get_for_tests(&router, "/api/stalls?since_us=yesterday").await;
+        assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+
+        // The node's snapshot carries the journal's counters.
+        let local: serde_json::Value = serde_json::from_slice(
+            get_for_tests(&router, "/api/mesh/local")
+                .await
+                .body
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            local["stall"]["events"].as_u64().unwrap() >= 2,
+            "{:#}",
+            local["stall"]
+        );
+        assert!(local["stall"]["tick_threads"].is_u64());
+
+        // A process without a journal answers with nothing.
+        let none = AppRouter::stalls_response(None, Some("since_us=5")).await;
+        assert_eq!(none.status, StatusCode::OK);
+        assert!(none.body.unwrap().is_empty());
         mesh.shutdown();
     }
 
