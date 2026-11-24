@@ -61,7 +61,6 @@
 //!   cache-fed lane) and the class thread reads on.
 
 use super::sys;
-use std::time::{Duration, Instant};
 use super::view::RlsView;
 use super::TrafficClass;
 use crate::edge_udp::{EdgeSockets, EdgeUdpStats, Table};
@@ -78,6 +77,7 @@ use std::net::SocketAddr;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use tracing::debug;
 
 /// Parts that a client's ring remembers: the fast lane and the cache-fed
@@ -395,6 +395,37 @@ pub struct FastLaneStats {
     pub fanout_lag_max_us: AtomicU64,
     pub fanout_lag_over_1ms: AtomicU64,
     pub fanout_inline_sends: AtomicU64,
+    /// The fan-out threads' start (wave 9 first-session stall): threads
+    /// that set their own scheduling and run, how long the start took
+    /// (µs, its buffers made and touched included), and the bytes of the
+    /// plans made for them. They start with the class thread, before it is
+    /// made real-time and pinned, never on its first client.
+    pub fanout_started: AtomicU64,
+    pub fanout_start_us: AtomicU64,
+    pub fanout_plan_bytes: AtomicU64,
+    /// The scheduling that the fan-out threads run under, as each read it
+    /// back once set: their policies (bit `1 << SCHED_*`: 1 is SCHED_OTHER,
+    /// 2 SCHED_FIFO), their CPUs (bit per CPU, the first 64) and their nice
+    /// value.
+    pub fanout_policies: AtomicU64,
+    pub fanout_cpus: AtomicU64,
+    pub fanout_nice: std::sync::atomic::AtomicI32,
+    /// The class thread's longest hand-off of a batch (µs), and the page
+    /// faults that it took over its first hand-off (its buffers are touched
+    /// before, so 0 is expected).
+    pub fanout_dispatch_max_us: AtomicU64,
+    pub fanout_first_dispatch_faults: AtomicU64,
+    /// Times a plan's list of sends grew on the class thread (an allocation
+    /// on it: a batch with more sends than any before).
+    pub class_plan_grows: AtomicU64,
+    /// The class thread's longest compact datagram (µs: the compact ring's
+    /// locks, shared with ordinary threads, and an allocation), and its
+    /// longest send of a batch itself (µs).
+    pub class_compact_max_us: AtomicU64,
+    pub class_send_max_us: AtomicU64,
+    /// The audio class thread's allocator heap grown and touched before it
+    /// was made real-time (bytes).
+    pub class_arena_warm_bytes: AtomicU64,
 }
 
 /// What `/api/mesh` reports of the fast client lane.
@@ -448,6 +479,30 @@ pub struct FastLaneSnapshot {
     pub fanout_inline_sends: u64,
     #[serde(default)]
     pub bytes: u64,
+    #[serde(default)]
+    pub fanout_started: u64,
+    #[serde(default)]
+    pub fanout_start_us: u64,
+    #[serde(default)]
+    pub fanout_plan_bytes: u64,
+    #[serde(default)]
+    pub fanout_policies: u64,
+    #[serde(default)]
+    pub fanout_cpus: u64,
+    #[serde(default)]
+    pub fanout_nice: i64,
+    #[serde(default)]
+    pub fanout_dispatch_max_us: u64,
+    #[serde(default)]
+    pub fanout_first_dispatch_faults: u64,
+    #[serde(default)]
+    pub class_plan_grows: u64,
+    #[serde(default)]
+    pub class_compact_max_us: u64,
+    #[serde(default)]
+    pub class_send_max_us: u64,
+    #[serde(default)]
+    pub class_arena_warm_bytes: u64,
 }
 
 struct Armed {
@@ -461,6 +516,12 @@ struct Armed {
 /// client sockets and the subscriber table once they exist.
 pub struct EdgeFastLane {
     snapshot: ArcSwap<FastSnapshot>,
+    /// The snapshot that the last rebuild replaced, kept until the next
+    /// one: a class thread that loaded it for a batch is then never the
+    /// last to let it go, so its HashMap, groups and clients are freed by
+    /// the rebuilding (ordinary) thread, not by the real-time thread into
+    /// another thread's allocator arena on a subscriber's join or leave.
+    retired: std::sync::Mutex<Option<Arc<FastSnapshot>>>,
     /// Streams the tee has seen commit: `true` for a canonical slot (the
     /// lane may carry them), `false` for a reboxed one.
     eligible: DashMap<u64, bool>,
@@ -545,6 +606,7 @@ impl EdgeFastLane {
     pub fn new(rank: u32) -> Arc<Self> {
         Arc::new(Self {
             snapshot: ArcSwap::from_pointee(FastSnapshot::default()),
+            retired: std::sync::Mutex::new(None),
             eligible: DashMap::new(),
             armed: OnceLock::new(),
             fds: [AtomicU64::new(u64::MAX), AtomicU64::new(u64::MAX)],
@@ -580,15 +642,20 @@ impl EdgeFastLane {
     }
 
     /// The window repair of `part` for the plans' `windows`, from the class
-    /// thread: handed to the repair thread (started when first needed), or,
-    /// with `--client-udp-repair-thread false`, run here. Never waits on a
-    /// lock when handed off; a full queue drops the job (counted): the
-    /// part's clients then have NACK.
+    /// thread: handed to the repair thread (started when the lane was armed),
+    /// or, with `--client-udp-repair-thread false` (or a repair thread that
+    /// did not start), run here. Never waits on a lock when handed off; a
+    /// full queue drops the job (counted): the part's clients then have NACK.
     fn class_window_repair(self: &EdgeFastLane, stream_id: u64, part: u64, windows: &[u8]) {
         let Some(armed) = self.armed.get() else {
             return;
         };
-        if !self.repair_thread.load(Ordering::Relaxed) {
+        let jobs = self
+            .repair_thread
+            .load(Ordering::Relaxed)
+            .then(|| self.repair_jobs.get())
+            .flatten();
+        let Some(jobs) = jobs else {
             let started = Instant::now();
             crate::edge_udp::window_repair_now(
                 &armed.sockets,
@@ -609,9 +676,6 @@ impl EdgeFastLane {
                     .class_repair_over_1ms
                     .fetch_add(1, Ordering::Relaxed);
             }
-            return;
-        }
-        let Some(jobs) = self.repair_jobs() else {
             return;
         };
         let mut job = RepairJob {
@@ -635,13 +699,19 @@ impl EdgeFastLane {
         };
     }
 
-    /// The repair thread's queue, the thread started on first use (at
-    /// ordinary priority, on any of the process's CPUs).
-    fn repair_jobs(&self) -> Option<&std::sync::mpsc::SyncSender<RepairJob>> {
-        if let Some(jobs) = self.repair_jobs.get() {
-            return Some(jobs);
+    /// Start the repair thread (at ordinary priority, on any of the
+    /// process's CPUs) from the thread that arms the lane. It used to start
+    /// on first use, from the class thread: a thread inherits the policy and
+    /// the CPUs of the thread that starts it, so it was born SCHED_FIFO on the
+    /// class thread's CPU, and the start's allocations and system calls ran
+    /// on the real-time thread with clients waiting (wave 9).
+    fn start_repair_thread(&self) {
+        if self.repair_jobs.get().is_some() {
+            return;
         }
-        let armed = self.armed.get()?;
+        let Some(armed) = self.armed.get() else {
+            return;
+        };
         let (tx, rx) = std::sync::mpsc::sync_channel::<RepairJob>(REPAIR_QUEUE);
         let sockets = armed.sockets.clone();
         let table = Arc::clone(&armed.table);
@@ -654,7 +724,10 @@ impl EdgeFastLane {
             .name("nt-window-repair".into())
             .spawn(move || {
                 if let Err(error) = sys::set_ordinary_at(nice) {
-                    tracing::warn!(error, "the repair thread keeps the class thread's scheduling");
+                    tracing::warn!(
+                        error,
+                        "the repair thread keeps the class thread's scheduling"
+                    );
                 }
                 while let Ok(job) = rx.recv() {
                     let started = Instant::now();
@@ -677,17 +750,17 @@ impl EdgeFastLane {
         if let Err(error) = spawned {
             tracing::warn!(error = %error, "the repair thread did not start: window repair runs on the class thread");
             self.repair_thread.store(false, Ordering::Relaxed);
-            return None;
+            return;
         }
         // Another thread may have set it first: its sender is used, and
         // this thread's ends with its channel.
         let _ = self.repair_jobs.set(tx);
-        self.repair_jobs.get()
     }
 
     /// The audio class thread hands batches of more than `inline_sends`
     /// sends to `threads` fan-out threads (`0`: it sends every batch itself,
-    /// as before). Read when the thread first needs them.
+    /// as before). The threads are started with the class thread
+    /// ([`ClientSender::new`]): set before it starts.
     pub fn set_fanout(&self, threads: usize, inline_sends: usize) {
         self.fanout_threads
             .store(threads.min(64) as u32, Ordering::Relaxed);
@@ -821,6 +894,9 @@ impl EdgeFastLane {
             self.fds[0].store(audio as u64, Ordering::Release);
             self.fds[1].store(video as u64, Ordering::Release);
             self.enable_txtime();
+            if self.repair_thread.load(Ordering::Relaxed) {
+                self.start_repair_thread();
+            }
         }
     }
 
@@ -871,7 +947,14 @@ impl EdgeFastLane {
                 streams.insert(*stream_id, groups);
             }
         }
-        self.snapshot.store(Arc::new(FastSnapshot { streams }));
+        let old = self.snapshot.swap(Arc::new(FastSnapshot { streams }));
+        // The one retired before is dropped here, after the lock is let go.
+        let older = self
+            .retired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(old);
+        drop(older);
     }
 
     pub fn snapshot_stats(&self) -> FastLaneSnapshot {
@@ -914,6 +997,18 @@ impl EdgeFastLane {
             fanout_lag_over_1ms: load(&self.stats.fanout_lag_over_1ms),
             fanout_inline_sends: load(&self.stats.fanout_inline_sends),
             bytes: load(&self.stats.bytes),
+            fanout_started: load(&self.stats.fanout_started),
+            fanout_start_us: load(&self.stats.fanout_start_us),
+            fanout_plan_bytes: load(&self.stats.fanout_plan_bytes),
+            fanout_policies: load(&self.stats.fanout_policies),
+            fanout_cpus: load(&self.stats.fanout_cpus),
+            fanout_nice: i64::from(self.stats.fanout_nice.load(Ordering::Relaxed)),
+            fanout_dispatch_max_us: load(&self.stats.fanout_dispatch_max_us),
+            fanout_first_dispatch_faults: load(&self.stats.fanout_first_dispatch_faults),
+            class_plan_grows: load(&self.stats.class_plan_grows),
+            class_compact_max_us: load(&self.stats.class_compact_max_us),
+            class_send_max_us: load(&self.stats.class_send_max_us),
+            class_arena_warm_bytes: load(&self.stats.class_arena_warm_bytes),
         }
     }
 
@@ -1309,9 +1404,32 @@ impl Default for ClientPlan {
     }
 }
 
+/// The size of the pages that [`touch_pages`] writes one byte of.
+const TOUCH_PAGE: usize = 4_096;
+
+/// Write a byte of every page of `bytes` (with the value it holds), so that
+/// a page that `calloc` handed over untouched is faulted in now.
+fn touch_pages(bytes: &mut [u8]) {
+    for at in (0..bytes.len()).step_by(TOUCH_PAGE) {
+        let byte = &mut bytes[at];
+        // SAFETY: a valid, aligned, exclusive reference; volatile so that
+        // the write of the value already there is not elided.
+        unsafe { std::ptr::write_volatile(byte, *byte) };
+    }
+}
+
+/// Fault in the pages of a list's spare room.
+fn touch_spare<T>(list: &mut Vec<T>) {
+    let spare = list.spare_capacity_mut();
+    let bytes = std::mem::size_of_val(spare);
+    // SAFETY: the spare capacity is owned, writable and uninitialized: no
+    // byte of it is needed.
+    unsafe { crate::memory::prefault(spare.as_mut_ptr().cast::<u8>(), bytes) };
+}
+
 impl ClientPlan {
     pub fn new() -> Self {
-        Self {
+        let mut plan = Self {
             buffers: vec![0_u8; sys::RECV_BATCH * REWRAP_BYTES],
             lens: vec![0; sys::RECV_BATCH],
             compact_buffers: vec![0_u8; sys::RECV_BATCH * COMPACT_SLOTS * compact::MAX_DATAGRAM],
@@ -1333,7 +1451,45 @@ impl ClientPlan {
             sent_us: 0,
             compact_sent: Vec::with_capacity(sys::RECV_BATCH),
             dispatched_at: None,
+        };
+        plan.touch();
+        plan
+    }
+
+    /// Write every page of the plan's buffers and of its lists' room, so
+    /// that their page faults are taken now, by the thread that makes the
+    /// plan, and not by the class thread when its first clients arrive
+    /// (wave 9: the plans were made on the real-time thread at the first
+    /// client, and their pages faulted in on it as it wrote them).
+    fn touch(&mut self) {
+        touch_pages(&mut self.buffers);
+        touch_pages(&mut self.compact_buffers);
+        touch_spare(&mut self.lens);
+        touch_spare(&mut self.compact_lens);
+        touch_spare(&mut self.sends);
+        touch_spare(&mut self.clients);
+        touch_spare(&mut self.memo);
+        touch_spare(&mut self.runs);
+        touch_spare(&mut self.departures);
+        touch_spare(&mut self.compact_sent);
+    }
+
+    /// The bytes that the plan holds (its buffers and its lists' room).
+    fn bytes(&self) -> usize {
+        fn room<T>(list: &Vec<T>) -> usize {
+            list.capacity() * std::mem::size_of::<T>()
         }
+        std::mem::size_of::<Self>()
+            + room(&self.buffers)
+            + room(&self.lens)
+            + room(&self.compact_buffers)
+            + room(&self.compact_lens)
+            + room(&self.sends)
+            + room(&self.clients)
+            + room(&self.memo)
+            + room(&self.runs)
+            + room(&self.departures)
+            + room(&self.compact_sent)
     }
 
     /// Send video as UDP GSO messages (--relay-video-gso).
@@ -1455,8 +1611,16 @@ impl ClientPlan {
                         .fetch_add(group.clients.len() as u64, Ordering::Relaxed);
                     continue;
                 }
-                let made = *compact_made
-                    .get_or_insert_with(|| self.make_compact(lane, stream_id, message, view));
+                let made = *compact_made.get_or_insert_with(|| {
+                    // The compact ring's map and slot locks, which ordinary
+                    // threads take too, and the datagram's allocation.
+                    let started = Instant::now();
+                    let made = self.make_compact(lane, stream_id, message, view);
+                    lane.stats
+                        .class_compact_max_us
+                        .fetch_max(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    made
+                });
                 if made {
                     copies = Some(plan.copies);
                     short = plan.short_header;
@@ -2006,13 +2170,117 @@ fn shard_of(peer: SocketAddr, shards: usize) -> usize {
     ((mixed >> 32) % shards as u64) as usize
 }
 
+/// A ring of plans from one thread to one other (single producer, single
+/// consumer), of [`FANOUT_DEPTH`] slots, each empty or holding a plan.
+///
+/// It replaces `std::sync::mpsc::sync_channel` between the class thread and
+/// a fan-out thread (wave 9 first-session stall). The standard channel is
+/// lock-free but not wait-free: `try_send` and `try_recv` spin (and yield)
+/// while the other side is between claiming a slot and marking it done. A
+/// fan-out thread may run on the class thread's CPU, where the SCHED_FIFO
+/// class thread preempts it whenever it wakes; caught between the two
+/// steps, it stays preempted for as long as the class thread spins, and a
+/// yield of a real-time thread never lets an ordinary one run. Only the
+/// kernel's guard against real-time starvation ended such a wait (CFS gets
+/// 50 ms of each second after about 950 ms), a stall of about a second.
+///
+/// Here each side keeps its own place in the ring and touches one slot per
+/// call, once: a push fills an empty slot, a pop empties a full one, and
+/// neither ever waits for the other.
+struct PlanRing {
+    slots: Box<[std::sync::atomic::AtomicPtr<ClientPlan>]>,
+}
+
+impl Drop for PlanRing {
+    fn drop(&mut self) {
+        for slot in self.slots.iter_mut() {
+            let plan = std::mem::replace(slot.get_mut(), std::ptr::null_mut());
+            if !plan.is_null() {
+                // SAFETY: a slot holds only a pointer from `Box::into_raw`
+                // whose plan was moved into the ring and not taken out.
+                drop(unsafe { Box::from_raw(plan) });
+            }
+        }
+    }
+}
+
+/// The sending side of a [`PlanRing`]: one per ring, used by one thread.
+struct PlanTx {
+    ring: Arc<PlanRing>,
+    next: usize,
+}
+
+/// The receiving side of a [`PlanRing`]: one per ring, used by one thread.
+struct PlanRx {
+    ring: Arc<PlanRing>,
+    next: usize,
+}
+
+/// A plan crosses threads through the ring.
+const _: () = {
+    const fn sendable<T: Send>() {}
+    sendable::<Box<ClientPlan>>();
+};
+
+fn plan_ring(slots: usize) -> (PlanTx, PlanRx) {
+    let ring = Arc::new(PlanRing {
+        slots: (0..slots.max(1))
+            .map(|_| std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()))
+            .collect(),
+    });
+    (
+        PlanTx {
+            ring: Arc::clone(&ring),
+            next: 0,
+        },
+        PlanRx { ring, next: 0 },
+    )
+}
+
+impl PlanTx {
+    /// Hand `plan` over, or give it back if the ring is full. Never waits.
+    fn push(&mut self, plan: Box<ClientPlan>) -> Result<(), Box<ClientPlan>> {
+        let slot = &self.ring.slots[self.next];
+        // Acquire: the receiver is done with the slot before it is reused.
+        if !slot.load(Ordering::Acquire).is_null() {
+            return Err(plan);
+        }
+        // Release: the plan's contents before its pointer.
+        slot.store(Box::into_raw(plan), Ordering::Release);
+        self.next = (self.next + 1) % self.ring.slots.len();
+        Ok(())
+    }
+}
+
+impl PlanRx {
+    /// The next plan, if one was handed over. Never waits.
+    fn pop(&mut self) -> Option<Box<ClientPlan>> {
+        let slot = &self.ring.slots[self.next];
+        let plan = slot.load(Ordering::Acquire);
+        if plan.is_null() {
+            return None;
+        }
+        slot.store(std::ptr::null_mut(), Ordering::Release);
+        self.next = (self.next + 1) % self.ring.slots.len();
+        // SAFETY: the sender stored a pointer from `Box::into_raw` and gave
+        // up the plan; this side is the only one that empties the slot.
+        Some(unsafe { Box::from_raw(plan) })
+    }
+}
+
 struct FanoutShard {
-    work: Option<std::sync::mpsc::SyncSender<Box<ClientPlan>>>,
-    free: std::sync::mpsc::Receiver<Box<ClientPlan>>,
+    /// Batches to the thread, and its plans back once sent.
+    work: PlanTx,
+    free: PlanRx,
     spare: Option<Box<ClientPlan>>,
     /// Batches handed to the thread and not yet sent.
     in_hand: Arc<AtomicU32>,
+    /// The thread is to end (the class thread is ending).
+    closed: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// The thread, woken when a batch is handed to it (a futex wake only
+    /// when it sleeps).
+    waker: Option<std::thread::Thread>,
 }
 
 /// The fan-out threads of a class thread.
@@ -2023,59 +2291,187 @@ struct Fanout {
     inline: Option<Box<ClientPlan>>,
 }
 
+/// How long the start of the fan-out waits for each thread to confirm that
+/// it runs at its own scheduling.
+const FANOUT_READY_WAIT: Duration = Duration::from_secs(2);
+
+/// The scheduling that a thread runs under, as it reads it back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Scheduling {
+    /// `SCHED_OTHER`, `SCHED_FIFO`, ...
+    policy: i32,
+    /// The CPUs it may run on (the first 64).
+    cpus: u64,
+    nice: i32,
+}
+
+/// The calling thread's scheduling.
+fn current_scheduling() -> Scheduling {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: pid 0 is the calling thread.
+        let policy = unsafe { libc::sched_getscheduler(0) };
+        // SAFETY: a zeroed cpu_set_t is valid; sched_getaffinity writes at
+        // most its size.
+        let cpus = unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0 {
+                (0..64_usize)
+                    .filter(|cpu| libc::CPU_ISSET(*cpu, &set))
+                    .fold(0_u64, |mask, cpu| mask | 1 << cpu)
+            } else {
+                0
+            }
+        };
+        // SAFETY: errno is reset first, as -1 is also a nice value; gettid
+        // has no preconditions.
+        let nice = unsafe {
+            *libc::__errno_location() = 0;
+            let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+            libc::getpriority(libc::PRIO_PROCESS, tid)
+        };
+        Scheduling {
+            policy: policy.max(0),
+            cpus,
+            nice,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Scheduling {
+            policy: 0,
+            cpus: 0,
+            nice: 0,
+        }
+    }
+}
+
 impl Fanout {
+    /// Start `threads` fan-out threads for the class thread of `class`,
+    /// with every plan that they and the class thread will hand each other
+    /// made and touched, and wait until each runs at its own scheduling.
+    ///
+    /// Called by the class thread before it is made real-time and pinned
+    /// (`ClientSender::new`), never on its first client: a thread inherits
+    /// the policy, the priority and the CPUs of the thread that starts it,
+    /// so a fan-out thread started by the SCHED_FIFO class thread was born
+    /// on its one CPU at its priority, and could not even set itself
+    /// ordinary until the class thread slept; and the start's allocations
+    /// (FANOUT_DEPTH plans of about 750 KB a thread), its two `clone`s and
+    /// the plans' page faults all ran on the real-time thread as the first
+    /// clients arrived (wave 9 first-session stall). Each thread still sets
+    /// its policy, its CPUs and its nice value itself, never inheriting them.
     fn start(
         lane: &Arc<EdgeFastLane>,
         class: TrafficClass,
         threads: usize,
     ) -> std::io::Result<Self> {
-        let mut shards = Vec::with_capacity(threads);
-        for index in 0..threads {
-            let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<Box<ClientPlan>>(FANOUT_DEPTH);
-            let (free_tx, free_rx) = std::sync::mpsc::sync_channel::<Box<ClientPlan>>(FANOUT_DEPTH);
-            // FANOUT_DEPTH plans in all: one spare, the rest free.
-            for _ in 1..FANOUT_DEPTH {
-                let _ = free_tx.send(Box::new(ClientPlan::new()));
-            }
-            let in_hand = Arc::new(AtomicU32::new(0));
-            let thread = {
-                let lane = Arc::clone(lane);
-                let in_hand = Arc::clone(&in_hand);
-                std::thread::Builder::new()
-                    .name(format!("nt-fanout-{}{index}", class.as_str()))
-                    .spawn(move || {
-                        // Not the class thread's real-time priority or CPU;
-                        // above the runtime's threads (wave 8).
-                        let nice = lane.fanout_nice.load(Ordering::Relaxed);
-                        let nice = (nice != FANOUT_NICE_PROCESS).then_some(nice);
-                        if let Err(error) = sys::set_ordinary_at(nice) {
-                            tracing::warn!(
-                                error,
-                                "a fan-out thread keeps the class thread's scheduling"
-                            );
-                        }
-                        run_fanout(&work_rx, &free_tx, &lane, class, &in_hand);
-                    })?
-            };
-            shards.push(FanoutShard {
-                work: Some(work_tx),
-                free: free_rx,
-                spare: Some(Box::new(ClientPlan::new())),
-                in_hand,
-                thread: Some(thread),
-            });
-        }
+        let started = Instant::now();
+        let nice = lane.fanout_nice.load(Ordering::Relaxed);
+        let nice = (nice != FANOUT_NICE_PROCESS).then_some(nice);
         let inline = lane
             .fanout_inline_shard
             .load(Ordering::Relaxed)
             .then(|| Box::new(ClientPlan::new()));
+        let mut plan_bytes = inline.as_ref().map_or(0, |plan| plan.bytes());
+        // Built as the threads start: a thread that fails to start ends the
+        // ones before it (the fan-out's drop).
+        let mut fanout = Self {
+            shards: Vec::with_capacity(threads),
+            inline,
+        };
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Scheduling, String>>();
+        for index in 0..threads {
+            let (work_tx, work_rx) = plan_ring(FANOUT_DEPTH);
+            let (mut free_tx, free_rx) = plan_ring(FANOUT_DEPTH);
+            // FANOUT_DEPTH plans in all: one spare, the rest free.
+            for _ in 1..FANOUT_DEPTH {
+                let plan = Box::new(ClientPlan::new());
+                plan_bytes += plan.bytes();
+                if free_tx.push(plan).is_err() {
+                    unreachable!("a ring of FANOUT_DEPTH slots takes FANOUT_DEPTH - 1 plans");
+                }
+            }
+            let spare = Box::new(ClientPlan::new());
+            plan_bytes += spare.bytes();
+            let in_hand = Arc::new(AtomicU32::new(0));
+            let closed = Arc::new(AtomicBool::new(false));
+            let thread = {
+                let lane = Arc::clone(lane);
+                let in_hand = Arc::clone(&in_hand);
+                let closed = Arc::clone(&closed);
+                let ready = ready_tx.clone();
+                std::thread::Builder::new()
+                    .name(format!("nt-fanout-{}{index}", class.as_str()))
+                    .spawn(move || {
+                        // Not the class thread's real-time priority or CPU;
+                        // above the runtime's threads (wave 8). Set here,
+                        // whatever the starting thread ran at.
+                        let set = sys::set_ordinary_at(nice).map(|()| current_scheduling());
+                        if let Ok(scheduling) = &set {
+                            lane.stats
+                                .fanout_policies
+                                .fetch_or(1 << scheduling.policy.min(62), Ordering::Relaxed);
+                            lane.stats
+                                .fanout_cpus
+                                .fetch_or(scheduling.cpus, Ordering::Relaxed);
+                            lane.stats
+                                .fanout_nice
+                                .store(scheduling.nice, Ordering::Relaxed);
+                        }
+                        lane.stats.fanout_started.fetch_add(1, Ordering::Relaxed);
+                        let _ = ready.send(set);
+                        drop(ready);
+                        run_fanout(work_rx, free_tx, &closed, &lane, class, &in_hand);
+                    })?
+            };
+            let waker = Some(thread.thread().clone());
+            fanout.shards.push(FanoutShard {
+                work: work_tx,
+                free: free_rx,
+                spare: Some(spare),
+                in_hand,
+                closed,
+                thread: Some(thread),
+                waker,
+            });
+        }
+        drop(ready_tx);
+        for _ in 0..threads {
+            match ready_rx.recv_timeout(FANOUT_READY_WAIT) {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        error,
+                        "a fan-out thread keeps the scheduling it started with"
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!("a fan-out thread did not confirm its scheduling in time");
+                    break;
+                }
+            }
+        }
+        let start_us = started.elapsed().as_micros() as u64;
+        lane.stats
+            .fanout_start_us
+            .store(start_us, Ordering::Relaxed);
+        lane.stats
+            .fanout_plan_bytes
+            .fetch_add(plan_bytes as u64, Ordering::Relaxed);
+        let scheduling = lane.snapshot_stats();
         tracing::info!(
             class = class.as_str(),
             threads,
-            inline_shard = inline.is_some(),
-            "edge client UDP: the fan-out to clients runs off the ingest thread"
+            inline_shard = fanout.inline.is_some(),
+            start_us,
+            plan_bytes,
+            policies = scheduling.fanout_policies,
+            cpus = scheduling.fanout_cpus,
+            nice = scheduling.fanout_nice,
+            "edge client UDP: the fan-out to clients runs off the ingest thread (started before the first client)"
         );
-        Ok(Self { shards, inline })
+        Ok(fanout)
     }
 
     /// Whether a fan-out thread still has batches in hand.
@@ -2093,12 +2489,15 @@ impl Fanout {
         let shards = self.shards.len() + usize::from(self.inline.is_some());
         // The batch's window repair goes with the first shard that takes it.
         let mut repair_kept = !plan.compact_sent.is_empty();
+        let mut grew = 0;
         for (index, shard) in self.shards.iter_mut().enumerate() {
-            let Some(mut next) = shard.spare.take().or_else(|| shard.free.try_recv().ok()) else {
+            let Some(mut next) = shard.spare.take().or_else(|| shard.free.pop()) else {
                 plan.shed_shard(index, shards, lane);
                 continue;
             };
+            let room = next.sends.capacity();
             plan.split_into(index, shards, &mut next, repair_kept);
+            grew += u64::from(next.sends.capacity() > room);
             if next.sends.is_empty() && next.compact_sent.is_empty() {
                 shard.spare = Some(next);
                 continue;
@@ -2107,27 +2506,26 @@ impl Fanout {
             let with_repair = !next.compact_sent.is_empty();
             next.dispatched_at = Some(Instant::now());
             shard.in_hand.fetch_add(1, Ordering::AcqRel);
-            match shard.work.as_ref().map(|work| work.try_send(next)) {
-                Some(Ok(())) => {
+            match shard.work.push(next) {
+                Ok(()) => {
+                    if let Some(waker) = &shard.waker {
+                        waker.unpark();
+                    }
                     repair_kept &= !with_repair;
                     lane.stats.fanout_batches.fetch_add(1, Ordering::Relaxed);
                     lane.stats.fanout_sends.fetch_add(sends, Ordering::Relaxed);
                 }
-                Some(Err(
-                    std::sync::mpsc::TrySendError::Full(back)
-                    | std::sync::mpsc::TrySendError::Disconnected(back),
-                )) => {
+                Err(back) => {
                     shard.in_hand.fetch_sub(1, Ordering::AcqRel);
                     back.shed_shard(0, 1, lane);
                     shard.spare = Some(back);
                 }
-                None => {
-                    shard.in_hand.fetch_sub(1, Ordering::AcqRel);
-                }
             }
         }
         if let Some(inline) = self.inline.as_mut() {
+            let room = inline.sends.capacity();
             plan.split_into(shards - 1, shards, inline, false);
+            grew += u64::from(inline.sends.capacity() > room);
             if !inline.sends.is_empty() {
                 lane.stats
                     .fanout_inline_sends
@@ -2136,14 +2534,22 @@ impl Fanout {
                 inline.journal_sent(lane);
             }
         }
+        if grew > 0 {
+            lane.stats
+                .class_plan_grows
+                .fetch_add(grew, Ordering::Relaxed);
+        }
         plan.handed_off(lane, repair_kept);
     }
 }
 
 impl Drop for Fanout {
     fn drop(&mut self) {
-        for shard in &mut self.shards {
-            shard.work = None;
+        for shard in &self.shards {
+            shard.closed.store(true, Ordering::Release);
+            if let Some(waker) = &shard.waker {
+                waker.unpark();
+            }
         }
         for shard in &mut self.shards {
             if let Some(thread) = shard.thread.take() {
@@ -2158,16 +2564,28 @@ impl Drop for Fanout {
 const FANOUT_SEND_PATIENCE: Duration = Duration::from_millis(2);
 
 fn run_fanout(
-    work: &std::sync::mpsc::Receiver<Box<ClientPlan>>,
-    free: &std::sync::mpsc::SyncSender<Box<ClientPlan>>,
+    mut work: PlanRx,
+    mut free: PlanTx,
+    closed: &AtomicBool,
     lane: &EdgeFastLane,
     class: TrafficClass,
     in_hand: &AtomicU32,
 ) {
-    while let Ok(mut plan) = work.recv() {
+    loop {
+        let Some(mut plan) = work.pop() else {
+            if closed.load(Ordering::Acquire) {
+                break;
+            }
+            // Woken by the class thread's next hand-off (or at once if it
+            // came between the pop and here).
+            std::thread::park();
+            continue;
+        };
         if let Some(at) = plan.dispatched_at.take() {
             let lag = at.elapsed().as_micros() as u64;
-            lane.stats.fanout_lag_max_us.fetch_max(lag, Ordering::Relaxed);
+            lane.stats
+                .fanout_lag_max_us
+                .fetch_max(lag, Ordering::Relaxed);
             if lag > 1_000 {
                 lane.stats
                     .fanout_lag_over_1ms
@@ -2180,50 +2598,134 @@ fn run_fanout(
         plan.window_repair(lane);
         plan.journal_sent(lane);
         in_hand.fetch_sub(1, Ordering::AcqRel);
-        if free.try_send(plan).is_err() {
-            break;
-        }
+        // FANOUT_DEPTH plans in all, so the ring of free plans has room.
+        let _ = free.push(plan);
     }
 }
 
+/// Memory that the audio class thread allocates, touches and frees before it
+/// is made real-time ([`warm_thread_arena`]).
+pub const CLASS_ARENA_WARM_BYTES: usize = 32 << 20;
+/// The blocks it does so in: well under `--malloc-tune`'s mmap threshold
+/// (32 MB), so that they come from the thread's own heap.
+const ARENA_WARM_BLOCK: usize = 1 << 20;
+
+/// Grow the calling thread's allocator heap by about `bytes`, its pages
+/// faulted in, and give it back to the heap. The class thread allocates for
+/// every datagram (the tee's copy) and for every compact part; in the first
+/// session its glibc arena grows under that load, and each growth is an
+/// `mprotect` under the process's mmap lock and fresh pages faulted in, on
+/// the real-time thread, waiting on whichever ordinary thread holds the
+/// lock (wave 9: the stops were in the first session only, at the first
+/// load; the second, with the heap grown, was clean). With
+/// `--malloc-tune` the freed heap is kept (trim threshold 256 MB), so the
+/// growth happens here, before the thread is real-time. Returns the bytes
+/// touched.
+fn warm_thread_arena(bytes: usize) -> usize {
+    let mut blocks: Vec<Vec<u8>> = Vec::with_capacity(bytes / ARENA_WARM_BLOCK + 1);
+    let mut touched = 0;
+    while touched < bytes {
+        let mut block: Vec<u8> = Vec::with_capacity(ARENA_WARM_BLOCK);
+        touch_spare(&mut block);
+        touched += block.capacity();
+        blocks.push(block);
+    }
+    drop(blocks);
+    touched
+}
+
 /// How a class thread sends its batches to the edge's clients: itself, or
-/// through its fan-out threads (started when first needed).
+/// through its fan-out threads, started with it ([`ClientSender::new`]).
 #[derive(Default)]
 pub struct ClientSender {
     fanout: Option<Fanout>,
-    /// The fan-out threads could not start: the class thread sends.
-    failed: bool,
+    /// The room of the class thread's own plan's sends, as last seen (its
+    /// growth is an allocation on the class thread).
+    room: usize,
+    /// The first hand-off is still to come (its page faults are counted).
+    dispatched: bool,
 }
 
 impl ClientSender {
-    /// Send the batch's planned sends (see the module's documentation).
-    pub fn send(&mut self, plan: &mut ClientPlan, lane: &Arc<EdgeFastLane>, class: TrafficClass) {
-        let (threads, inline_sends) = lane.fanout();
-        let offload = class == TrafficClass::Audio
-            && threads > 0
-            && !self.failed
-            && (plan.pending_sends() > inline_sends
-                || self.fanout.as_ref().is_some_and(Fanout::busy));
-        if !offload {
-            plan.send(lane, class);
-            return;
+    /// The sender of a class thread, its fan-out threads started now when
+    /// the class (audio) and the lane's settings have them: called by the
+    /// class thread before it is made real-time and pinned, so that the
+    /// threads inherit nothing of it and its first client finds them
+    /// running, with every buffer made. Without a lane, without fan-out
+    /// threads, or if they do not start, the class thread sends.
+    pub fn new(lane: Option<&Arc<EdgeFastLane>>, class: TrafficClass) -> Self {
+        let Some(lane) = lane else {
+            return Self::default();
+        };
+        if class == TrafficClass::Audio {
+            let warmed = warm_thread_arena(CLASS_ARENA_WARM_BYTES);
+            lane.stats
+                .class_arena_warm_bytes
+                .store(warmed as u64, Ordering::Relaxed);
         }
-        if self.fanout.is_none() {
-            match Fanout::start(lane, class, threads) {
-                Ok(fanout) => self.fanout = Some(fanout),
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "the fan-out threads did not start: the class thread sends to its clients"
-                    );
-                    self.failed = true;
-                    plan.send(lane, class);
-                    return;
-                }
+        let (threads, _) = lane.fanout();
+        if class != TrafficClass::Audio || threads == 0 {
+            return Self::default();
+        }
+        match Fanout::start(lane, class, threads) {
+            Ok(fanout) => Self {
+                fanout: Some(fanout),
+                ..Self::default()
+            },
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "the fan-out threads did not start: the class thread sends to its clients"
+                );
+                Self::default()
             }
         }
-        if let Some(fanout) = self.fanout.as_mut() {
-            fanout.dispatch(plan, lane);
+    }
+
+    /// Whether the fan-out threads run.
+    #[cfg(test)]
+    pub fn has_fanout(&self) -> bool {
+        self.fanout.is_some()
+    }
+
+    /// Send the batch's planned sends (see the module's documentation).
+    /// Starts nothing, and waits for nothing.
+    pub fn send(&mut self, plan: &mut ClientPlan, lane: &Arc<EdgeFastLane>, class: TrafficClass) {
+        let room = plan.sends.capacity();
+        if room > self.room {
+            if self.room > 0 {
+                lane.stats.class_plan_grows.fetch_add(1, Ordering::Relaxed);
+            }
+            self.room = room;
+        }
+        let (_, inline_sends) = lane.fanout();
+        let offload = self.fanout.as_ref().is_some_and(|fanout| {
+            class == TrafficClass::Audio && (plan.pending_sends() > inline_sends || fanout.busy())
+        });
+        let Some(fanout) = self.fanout.as_mut().filter(|_| offload) else {
+            let started = (plan.pending_sends() > 0).then(Instant::now);
+            plan.send(lane, class);
+            if let Some(started) = started {
+                lane.stats
+                    .class_send_max_us
+                    .fetch_max(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+            return;
+        };
+        let first = !self.dispatched;
+        self.dispatched = true;
+        // The first hand-off's page faults: two getrusage calls, once.
+        let faults_before = first.then(|| crate::memory::faults(true).0);
+        let started = Instant::now();
+        fanout.dispatch(plan, lane);
+        lane.stats
+            .fanout_dispatch_max_us
+            .fetch_max(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if let Some(before) = faults_before {
+            let after = crate::memory::faults(true).0;
+            lane.stats
+                .fanout_first_dispatch_faults
+                .store(after.saturating_sub(before), Ordering::Relaxed);
         }
     }
 }
@@ -2379,17 +2881,19 @@ mod tests {
         let mut receivers = Vec::new();
         let mut shards = Vec::new();
         for _ in 0..2 {
-            let (work_tx, work_rx) = std::sync::mpsc::sync_channel(FANOUT_DEPTH);
-            let (free_tx, free_rx) = std::sync::mpsc::sync_channel(FANOUT_DEPTH);
+            let (work_tx, work_rx) = plan_ring(FANOUT_DEPTH);
+            let (mut free_tx, free_rx) = plan_ring(FANOUT_DEPTH);
             for _ in 1..FANOUT_DEPTH {
-                free_tx.send(Box::new(ClientPlan::new())).unwrap();
+                assert!(free_tx.push(Box::new(ClientPlan::new())).is_ok());
             }
             shards.push(FanoutShard {
-                work: Some(work_tx),
+                work: work_tx,
                 free: free_rx,
                 spare: Some(Box::new(ClientPlan::new())),
                 in_hand: Arc::new(AtomicU32::new(0)),
+                closed: Arc::new(AtomicBool::new(false)),
                 thread: None,
+                waker: None,
             });
             // Shard 0's thread never takes its batches; shard 1's sends
             // them at once (gives its plans back).
@@ -2405,12 +2909,12 @@ mod tests {
             fanout.dispatch(&mut plan, &lane);
             assert!(plan.sends.is_empty() && plan.compact_sent.is_empty());
             // Shard 1's thread.
-            let (work, free) = &receivers[1];
-            while let Ok(mut done) = work.try_recv() {
+            let (work, free) = &mut receivers[1];
+            while let Some(mut done) = work.pop() {
                 done.clear();
                 done.sends.clear();
                 fanout.shards[1].in_hand.fetch_sub(1, Ordering::AcqRel);
-                free.send(done).unwrap();
+                assert!(free.push(done).is_ok());
                 handed += 1;
             }
             let shed = lane.stats.fanout_shed.load(Ordering::Relaxed);
@@ -2451,9 +2955,9 @@ mod tests {
         );
         // Shard 0's batches are all still there, each with its window
         // repair (the first shard that takes a batch takes its repair).
-        let (work, _) = &receivers[0];
+        let (work, _) = &mut receivers[0];
         let mut in_hand = 0;
-        while let Ok(batch) = work.try_recv() {
+        while let Some(batch) = work.pop() {
             assert_eq!(batch.compact_sent, vec![(4001, 101, 32)]);
             in_hand += 1;
         }
@@ -2471,6 +2975,269 @@ mod tests {
         lane.set_fanout(0, 10);
         assert_eq!(lane.fanout(), (0, 10));
         assert_eq!(lane.snapshot_stats().fanout_threads, 0);
+    }
+
+    // ---------------------------------------------- the fan-out's start (wave 9)
+
+    /// The CPUs of the process's main thread, as a mask of the first 64.
+    fn process_cpus() -> u64 {
+        // SAFETY: a zeroed cpu_set_t is valid; sched_getaffinity writes at
+        // most its size; getpid is the main thread's id.
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            assert_eq!(
+                libc::sched_getaffinity(
+                    libc::getpid(),
+                    std::mem::size_of::<libc::cpu_set_t>(),
+                    &mut set
+                ),
+                0
+            );
+            (0..64_usize)
+                .filter(|cpu| libc::CPU_ISSET(*cpu, &set))
+                .fold(0, |mask, cpu| mask | 1 << cpu)
+        }
+    }
+
+    /// Make the calling thread a stand-in for a deployed class thread:
+    /// pinned to one CPU, at a policy other than SCHED_OTHER. SCHED_FIFO
+    /// needs CAP_SYS_NICE, which tests do not have; SCHED_BATCH does not,
+    /// and is inherited the same way.
+    fn become_class_thread_stand_in() -> usize {
+        let cpu = process_cpus().trailing_zeros() as usize;
+        crate::fast_path::pin_current_thread(cpu).unwrap();
+        let param = libc::sched_param { sched_priority: 0 };
+        // SAFETY: pid 0 is the calling thread; the parameter is valid.
+        assert_eq!(
+            unsafe { libc::sched_setscheduler(0, libc::SCHED_BATCH, &param) },
+            0
+        );
+        cpu
+    }
+
+    /// The fan-out threads' names in /proc/self/task.
+    fn fanout_threads_running() -> usize {
+        std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .flatten()
+            .filter(|task| {
+                std::fs::read_to_string(task.path().join("comm"))
+                    .is_ok_and(|name| name.starts_with("nt-fanout-audio"))
+            })
+            .count()
+    }
+
+    /// The mechanism of the wave 9 first-session stall, as far as it shows
+    /// without real-time privileges: a thread started by a pinned thread at
+    /// a policy of its own is born with that policy and on that one CPU. A
+    /// fan-out thread started by the SCHED_FIFO class thread on its first
+    /// client was born SCHED_FIFO 10 on the class thread's CPU, where it
+    /// could not run (to set itself ordinary) until the class thread slept.
+    #[test]
+    fn a_thread_inherits_the_policy_and_the_cpus_of_the_thread_that_starts_it() {
+        std::thread::spawn(|| {
+            let cpu = become_class_thread_stand_in();
+            let child = std::thread::spawn(current_scheduling).join().unwrap();
+            assert_eq!(child.policy, libc::SCHED_BATCH, "{child:?}");
+            assert_eq!(child.cpus, 1 << cpu, "{child:?}");
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// The fix: the fan-out threads run before the first client, started
+    /// with the class thread (here from a pinned stand-in at another
+    /// policy, which they must not inherit), each at SCHED_OTHER on the
+    /// process's CPUs at the nice value asked for; the class thread's first
+    /// hand-off starts no thread and takes no page fault; the threads send
+    /// and give their plans back; and they end with the sender.
+    #[test]
+    fn the_fan_out_threads_run_before_the_first_client_at_their_own_scheduling() {
+        let lane = EdgeFastLane::new(0);
+        lane.set_fanout(2, 0);
+        // Raising a thread's nice value needs no privilege (the tests may
+        // run niced already).
+        // SAFETY: getpriority takes plain integers.
+        let process =
+            unsafe { libc::getpriority(libc::PRIO_PROCESS, libc::getpid() as libc::id_t) };
+        let nice = (process + 2).min(19);
+        lane.set_fanout_nice(nice);
+        let class_lane = Arc::clone(&lane);
+        std::thread::spawn(move || {
+            let lane = class_lane;
+            let before = fanout_threads_running();
+            become_class_thread_stand_in();
+            let mut sender = ClientSender::new(Some(&lane), TrafficClass::Audio);
+            assert!(sender.has_fanout());
+            let stats = lane.snapshot_stats();
+            // Running before any client, each at its own scheduling.
+            assert_eq!(stats.fanout_started, 2, "{stats:?}");
+            assert_eq!(fanout_threads_running(), before + 2);
+            assert_eq!(stats.fanout_policies, 1 << libc::SCHED_OTHER, "{stats:?}");
+            assert_eq!(stats.fanout_cpus, process_cpus(), "{stats:?}");
+            assert_eq!(stats.fanout_nice, i64::from(nice), "{stats:?}");
+            // 2 x FANOUT_DEPTH plans of about 750 KB, made and touched.
+            assert!(
+                stats.fanout_plan_bytes >= 2 * FANOUT_DEPTH as u64 * 700_000,
+                "{stats:?}"
+            );
+            // The first client: a batch for 120 clients, handed off.
+            let (mut plan, _clients) = audio_plan(3, 120);
+            let sends = plan.pending_sends() as u64;
+            sender.send(&mut plan, &lane, TrafficClass::Audio);
+            let stats = lane.snapshot_stats();
+            assert_eq!(fanout_threads_running(), before + 2, "no thread started");
+            assert_eq!(stats.fanout_sends, sends, "{stats:?}");
+            assert_eq!(stats.fanout_batches, 2, "{stats:?}");
+            assert_eq!(stats.fanout_shed, 0, "{stats:?}");
+            assert!(
+                stats.fanout_first_dispatch_faults <= 4,
+                "the first hand-off faulted: {stats:?}"
+            );
+            assert_eq!(stats.class_plan_grows, 0, "{stats:?}");
+            // The threads took their batches (the lane has no socket: the
+            // sends are dropped) and gave their plans back.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while sender.fanout.as_ref().is_some_and(Fanout::busy) {
+                assert!(Instant::now() < deadline, "the fan-out threads never ran");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // Many more batches: every one handed off, none shed, the plans
+            // going round.
+            for _ in 0..200 {
+                let (mut plan, _clients) = audio_plan(3, 120);
+                sender.send(&mut plan, &lane, TrafficClass::Audio);
+                while sender.fanout.as_ref().is_some_and(Fanout::busy) {
+                    std::thread::yield_now();
+                }
+            }
+            let stats = lane.snapshot_stats();
+            assert_eq!(stats.fanout_batches, 2 * 201, "{stats:?}");
+            assert_eq!(stats.fanout_shed, 0, "{stats:?}");
+            assert_eq!(stats.class_plan_grows, 0, "{stats:?}");
+            drop(sender);
+            assert_eq!(fanout_threads_running(), before, "the threads ended");
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// Without fan-out threads (none asked for, the video class, or no
+    /// lane) the class thread sends every batch itself, starting nothing.
+    #[test]
+    fn a_sender_without_fan_out_threads_starts_none_and_sends_itself() {
+        let lane = EdgeFastLane::new(0);
+        assert!(!ClientSender::new(None, TrafficClass::Audio).has_fanout());
+        assert!(!ClientSender::new(Some(&lane), TrafficClass::Video).has_fanout());
+        lane.set_fanout(0, 0);
+        let mut sender = ClientSender::new(Some(&lane), TrafficClass::Audio);
+        assert!(!sender.has_fanout());
+        let (mut plan, _clients) = audio_plan(2, 50);
+        sender.send(&mut plan, &lane, TrafficClass::Audio);
+        assert_eq!(plan.pending_sends(), 0);
+        let stats = lane.snapshot_stats();
+        assert_eq!(stats.fanout_started, 0);
+        assert_eq!(stats.fanout_batches, 0);
+    }
+
+    /// A rebuild keeps the snapshot it replaced until the next one, so that
+    /// a class thread holding it for a batch is never the one that frees it
+    /// (a subscriber's join or leave rebuilds).
+    #[test]
+    fn a_replaced_snapshot_is_freed_by_the_next_rebuild_not_its_reader() {
+        let lane = EdgeFastLane::new(0);
+        let read = arc_swap::Guard::into_inner(lane.load());
+        lane.rebuild_locked(&HashMap::new());
+        assert_eq!(
+            Arc::strong_count(&read),
+            2,
+            "the reader's and the retired copy"
+        );
+        let weak = Arc::downgrade(&read);
+        drop(read);
+        assert!(weak.upgrade().is_some(), "the reader did not free it");
+        lane.rebuild_locked(&HashMap::new());
+        assert!(weak.upgrade().is_none(), "the next rebuild freed it");
+    }
+
+    /// The class thread's heap, grown and touched before it is real-time,
+    /// serves its later allocations without page faults (with the
+    /// allocator tuned as on a deployed node).
+    #[test]
+    fn a_warmed_thread_allocates_without_page_faults() {
+        crate::memory::tune_allocator(true).unwrap();
+        let (warmed, faults) = std::thread::spawn(|| {
+            let warmed = warm_thread_arena(8 << 20);
+            let before = crate::memory::faults(true).0;
+            let mut blocks = Vec::new();
+            for _ in 0..64 {
+                let mut block: Vec<u8> = Vec::with_capacity(64 << 10);
+                touch_spare(&mut block);
+                blocks.push(block);
+            }
+            (warmed, crate::memory::faults(true).0 - before)
+        })
+        .join()
+        .unwrap();
+        assert!(warmed >= 8 << 20);
+        // 4 MB is 1,024 pages of 4 KB cold.
+        assert!(faults <= 64, "{faults} faults after the warm-up");
+    }
+
+    /// The ring between the class thread and a fan-out thread: plans come
+    /// out in the order they went in, a full ring gives the plan back at
+    /// once, and between two threads (plans going round, as in the
+    /// fan-out) nothing is lost, repeated or reordered.
+    #[test]
+    fn a_plan_ring_hands_plans_over_in_order_and_never_waits() {
+        let (mut tx, mut rx) = plan_ring(FANOUT_DEPTH);
+        assert!(rx.pop().is_none());
+        for mark in 0..FANOUT_DEPTH {
+            let mut plan = Box::new(ClientPlan::new());
+            plan.parts[0] = mark as u64;
+            assert!(tx.push(plan).is_ok());
+        }
+        let started = Instant::now();
+        let back = tx.push(Box::new(ClientPlan::new())).unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(50));
+        drop(back);
+        for mark in 0..FANOUT_DEPTH {
+            assert_eq!(rx.pop().unwrap().parts[0], mark as u64);
+        }
+        assert!(rx.pop().is_none());
+        // A ring dropped with plans in it frees them.
+        assert!(tx.push(Box::new(ClientPlan::new())).is_ok());
+        drop((tx, rx));
+
+        let (mut work_tx, mut work_rx) = plan_ring(FANOUT_DEPTH);
+        let (mut free_tx, mut free_rx) = plan_ring(FANOUT_DEPTH);
+        for _ in 0..FANOUT_DEPTH {
+            assert!(free_tx.push(Box::new(ClientPlan::new())).is_ok());
+        }
+        const HANDOFFS: u64 = 200_000;
+        let consumer = std::thread::spawn(move || {
+            let mut expected = 0;
+            while expected < HANDOFFS {
+                let Some(plan) = work_rx.pop() else {
+                    std::hint::spin_loop();
+                    continue;
+                };
+                assert_eq!(plan.parts[0], expected);
+                expected += 1;
+                assert!(free_tx.push(plan).is_ok(), "the free ring has room");
+            }
+        });
+        let mut sent = 0;
+        while sent < HANDOFFS {
+            let Some(mut plan) = free_rx.pop() else {
+                std::hint::spin_loop();
+                continue;
+            };
+            plan.parts[0] = sent;
+            assert!(work_tx.push(plan).is_ok(), "the work ring has room");
+            sent += 1;
+        }
+        consumer.join().unwrap();
     }
 
     /// 4K on the edge's fast lane: the plan interleaves the clients symbol

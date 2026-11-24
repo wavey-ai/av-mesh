@@ -1371,6 +1371,11 @@ impl ClassThread {
     }
 
     fn run(self) {
+        // The sends to the edge's clients: by this thread, or by fan-out
+        // threads (wave 7 item 10), started here, before this thread is made
+        // real-time and pinned, so that they inherit none of it and its
+        // first client finds them running (wave 9 first-session stall).
+        let mut client_sender = ClientSender::new(self.edge_clients.as_ref(), self.class);
         self.schedule();
         self.stats.threads.fetch_add(1, Ordering::Relaxed);
         let fds: Vec<_> = self
@@ -1419,9 +1424,6 @@ impl ClassThread {
         let mut clients = ClientPlan::new()
             .with_gso(gso)
             .with_video(self.class == TrafficClass::Video);
-        // The sends to the edge's clients: by this thread, or by fan-out
-        // threads (wave 7 item 10).
-        let mut client_sender = ClientSender::default();
         let mut kernel_dropped = vec![0_u32; self.sockets.len()];
         // Burst copies of the audio sources for the compiled children.
         let mut copies = (self.class == TrafficClass::Audio && self.forwarder.is_some())
