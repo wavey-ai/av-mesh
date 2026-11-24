@@ -11272,8 +11272,8 @@ impl LiveTsCache {
         // large is refused: by its size, whatever it carries. A stream of
         // small parts (1 ms audio) is always taken.
         if let Some(guard) = self.memory_guard.get() {
-            if !guard.takes_new_video() && first_bytes >= NEW_LARGE_PLAYLIST_BYTES {
-                guard.note_refused_video_playlist();
+            if !guard.takes_new_large_playlist() && first_bytes >= NEW_LARGE_PLAYLIST_BYTES {
+                guard.note_refused_large_playlist();
                 bail!(
                     "the node's memory is above its soft limit: no new playlist of large parts (stream {stream_id}, {first_bytes} bytes)"
                 );

@@ -280,7 +280,7 @@ pub struct Guard {
     soft_entries: AtomicU64,
     hard_entries: AtomicU64,
     shed_bytes: AtomicU64,
-    refused_video_playlists: AtomicU64,
+    refused_large_playlists: AtomicU64,
     idle_releases: AtomicU64,
     trims: AtomicU64,
     trimmed_bytes: AtomicU64,
@@ -305,12 +305,12 @@ impl Guard {
     }
 
     /// Whether a new video playlist may be taken.
-    pub fn takes_new_video(&self) -> bool {
+    pub fn takes_new_large_playlist(&self) -> bool {
         self.state() == GuardState::Ok
     }
 
-    pub fn note_refused_video_playlist(&self) {
-        self.refused_video_playlists.fetch_add(1, Ordering::Relaxed);
+    pub fn note_refused_large_playlist(&self) {
+        self.refused_large_playlists.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn note_shed(&self, bytes: u64) {
@@ -400,7 +400,7 @@ impl Guard {
             soft_entries: self.soft_entries.load(Ordering::Relaxed),
             hard_entries: self.hard_entries.load(Ordering::Relaxed),
             shed_bytes: self.shed_bytes.load(Ordering::Relaxed),
-            refused_video_playlists: self.refused_video_playlists.load(Ordering::Relaxed),
+            refused_large_playlists: self.refused_large_playlists.load(Ordering::Relaxed),
             idle_releases: self.idle_releases.load(Ordering::Relaxed),
             trims: self.trims.load(Ordering::Relaxed),
             trimmed_bytes: self.trimmed_bytes.load(Ordering::Relaxed),
@@ -429,7 +429,7 @@ pub struct MemorySnapshot {
     pub hard_entries: u64,
     /// Cache bytes released by sheds.
     pub shed_bytes: u64,
-    pub refused_video_playlists: u64,
+    pub refused_large_playlists: u64,
     /// Video streams quiet long enough that their parts were released.
     pub idle_releases: u64,
     pub trims: u64,
@@ -655,7 +655,7 @@ mod tests {
         let soft = guard.tick(2 * GB + MB, 300 * MB);
         assert_eq!(soft.state, GuardState::Soft);
         assert!(soft.changed && soft.trim);
-        assert!(!guard.takes_new_video());
+        assert!(!guard.takes_new_large_playlist());
         // Between 90% and 100% of the soft limit it stays.
         assert_eq!(guard.tick(2 * GB - 100 * MB, 200 * MB).state, GuardState::Soft);
         let hard = guard.tick(3 * GB, 200 * MB);
@@ -664,7 +664,7 @@ mod tests {
         assert_eq!(guard.tick(2 * GB, 0).state, GuardState::Soft);
         let back = guard.tick(GB, 0);
         assert_eq!(back.state, GuardState::Ok);
-        assert!(guard.takes_new_video());
+        assert!(guard.takes_new_large_playlist());
         let snapshot = guard.snapshot(&Budgets::default(), &SocketBudget::default());
         assert_eq!((snapshot.soft_entries, snapshot.hard_entries), (1, 1));
         // A release of 64 MB or more asks for a trim once.

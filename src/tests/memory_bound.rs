@@ -323,7 +323,7 @@ async fn the_guard_sheds_the_largest_stores_and_audio_keeps_every_part() {
         .await;
     assert!(refused.is_err());
     let snapshot = guard.snapshot(&Default::default(), &Default::default());
-    assert_eq!(snapshot.refused_video_playlists, 1);
+    assert_eq!(snapshot.refused_large_playlists, 1);
     assert!(cache
         .commit_stream_payload(79, encode_sized_part(79, 5, 0, 1_000))
         .await
@@ -351,7 +351,7 @@ async fn the_guard_sheds_the_largest_stores_and_audio_keeps_every_part() {
     assert!(cache.state.read().await.stream_parts[&77].len() > 100);
     // A playlist of large parts is taken again (here every slot is in use,
     // so the guard's word is checked).
-    assert!(guard.takes_new_video());
+    assert!(guard.takes_new_large_playlist());
 }
 
 fn mallinfo() -> (u64, u64, u64) {
