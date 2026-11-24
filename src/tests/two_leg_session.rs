@@ -302,7 +302,7 @@ async fn one_leg_moves_off_a_draining_edge_as_the_wave_9_client_did() {
     .await;
     feed(&edges, 20..150, deadline_us).await;
     let moves_before = edge_a.stats.moves.load(Ordering::Relaxed);
-    edge_a.router.lifecycle.set_draining(true).await;
+    edge_a.router.lifecycle.drain(node_status::DrainReason::Operator);
     feed(&edges, 150..PARTS, deadline_us).await;
     last.store(PARTS - 1, Ordering::Relaxed);
     let (session, run) = client.await.unwrap();

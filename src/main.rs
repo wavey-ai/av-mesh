@@ -8,6 +8,7 @@ mod fast_control;
 mod fast_path;
 mod fast_plane;
 mod hop_journal;
+mod lifecycle;
 mod memory;
 mod link_telemetry;
 mod node_status;
@@ -54,6 +55,7 @@ use frame_header::FrameHeaderV2;
 use futures_util::{future::join_all, SinkExt, StreamExt};
 use h3_webtransport::server::{AcceptedBi, WebTransportSession};
 use hop_journal::{HopEvent, HopJournal, HopQuery, HopStage, DEFAULT_HOP_JOURNAL_CAPACITY};
+use lifecycle::{LifecycleConfig, NodeLifecycle};
 use http::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use link_telemetry::{LinkObservation, LinkTelemetry};
@@ -3095,6 +3097,53 @@ struct Args {
     )]
     cache_mesh_test_receive_loss_ppm: u32,
 
+    /// For the proof that two builds interoperate (C 2.1): this node speaks
+    /// as a later build might. Its cache-mesh frames carry the next version,
+    /// an unknown hello extension and longer subscribes, with a frame of an
+    /// unknown kind each second; its telemetry snapshots and the control
+    /// envelopes it publishes carry a field `x_future`.
+    #[arg(
+        long,
+        hide = true,
+        env = "NEEDLETAIL_CACHE_MESH_TEST_FUTURE_FRAMES",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    cache_mesh_test_future_frames: bool,
+
+    /// C 3.1: the node starts with the drain reason `start` and drops it by
+    /// itself once warm: an edge takes no listener and a forwarder's hellos
+    /// say draining until then. `false`: it serves from its start.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_START_DRAINED",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    start_drained: bool,
+
+    /// C 3.1: the longest an edge's start waits for its copies to be warm
+    /// before it drops `start` anyway, and says so (`ready_forced`).
+    #[arg(long, env = "NEEDLETAIL_START_WARM_MS", default_value_t = 4_000)]
+    start_warm_ms: u64,
+
+    /// C 3.2, B 3.12: the longest an edge waits on SIGTERM for its listeners
+    /// and readers to leave. 0: --client-udp-drain-spread-ms +
+    /// --client-udp-move-grace-ms + 2,000 (14,000 with their defaults).
+    #[arg(long, env = "NEEDLETAIL_STOP_DRAIN_MS", default_value_t = 0)]
+    stop_drain_ms: u64,
+
+    /// C 3.2: how long a forwarder keeps forwarding after SIGTERM while its
+    /// hellos say it is leaving (three hellos).
+    #[arg(long, env = "NEEDLETAIL_STOP_LINGER_MS", default_value_t = 300)]
+    stop_linger_ms: u64,
+
+    /// C 2.2: where an operator's drain (`drain-node`, `close-node`) is kept
+    /// until `resume-node`, so that it holds across a restart. None: it
+    /// ends with the process.
+    #[arg(long, env = "NEEDLETAIL_DRAIN_STATE_FILE")]
+    drain_state_file: Option<PathBuf>,
+
     /// Most playback sessions that this node serves at one time. Zero sets
     /// no limit. A node at the limit rejects a new session and names other
     /// caches of the region.
@@ -3513,6 +3562,8 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse().normalized()?;
+    // From here on SIGTERM and SIGINT are a stop the node makes itself.
+    let mut stop = lifecycle::stop_signal().context("failed to listen for SIGTERM and SIGINT")?;
     // Wave 9 (cold start): memory before the first session, not in it.
     hop_journal::PREFAULT.store(args.prefault, std::sync::atomic::Ordering::Relaxed);
     match memory::tune_allocator(args.malloc_tune) {
@@ -3557,9 +3608,11 @@ async fn main() -> Result<()> {
         ..ReplicationPolicy::default()
     };
     let control_plane = ControlPlane::default();
-    let control_dispatch = ControlDispatch::default();
+    let control_dispatch = ControlDispatch {
+        future_fields: args.cache_mesh_test_future_frames,
+        ..ControlDispatch::default()
+    };
     let demand_tracker = DemandTracker::default();
-    let lifecycle = NodeLifecycle::default();
     let telemetry_aggregator = TelemetryAggregator::new(args.telemetry_stale_ms);
     let telemetry_peer_monitor = TelemetryPeerMonitor::new(&telemetry_peers);
     let telemetry_fec_queue =
@@ -3702,6 +3755,13 @@ async fn main() -> Result<()> {
         .cache_mesh_region
         .clone()
         .unwrap_or_else(|| args.region.clone());
+    // C 3.1: the drain reasons, an operator's from the drain-state file;
+    // the hello says draining from the mesh's start while any holds.
+    let lifecycle = NodeLifecycle::new(LifecycleConfig {
+        edge: CacheMeshRole::from(args.cache_mesh_role) == CacheMeshRole::Edge,
+        start_drained: args.start_drained,
+        state_file: args.drain_state_file.clone(),
+    });
     let mut mesh_config = CacheMeshConfig::new(node_id.clone(), cache_mesh_region, args.mesh_bind)
         .with_peers(mesh_peers)
         .with_same_region_only(true)
@@ -3741,6 +3801,10 @@ async fn main() -> Result<()> {
         // that `GET /api/node` shows.
         .with_parent_release_after(cache_mesh_parent_release_after(args.cache_mesh_lease_ms))
         .with_boot_id(cache.started_unix_us)
+        // C CR6: the hello gives this node's build and state.
+        .with_build(av_mesh::build::GIT.to_owned())
+        .with_hello_state(lifecycle.hello())
+        .with_test_future_frames(args.cache_mesh_test_future_frames)
         // A PL1 (A 2.7): a part from a parent keeps the first copy of its
         // epoch (two contributors publish the same parts).
         .with_slot_epoch(mesh_slot_epoch);
@@ -3847,6 +3911,7 @@ async fn main() -> Result<()> {
         .await?
         .context("failed to start cache mesh")?,
     );
+    lifecycle.attach_mesh(&mesh_handle);
     fast_path_report.tune_receive_socket_at(mesh_handle.local_addr(), "cache mesh");
     if let Some(class_addr) = mesh_handle.class_local_addr() {
         info!(bind = %class_addr, "cache mesh video class socket listening");
@@ -4352,6 +4417,21 @@ async fn main() -> Result<()> {
                 to_mean: args.client_udp_rebalance_to_mean,
             }),
     );
+    // C 3.1: a node that starts drained takes its place once warm.
+    let start_task = if cache_mesh_role == CacheMeshRole::Edge {
+        tokio::spawn(lifecycle::start_edge(
+            router.clone(),
+            Duration::from_millis(args.start_warm_ms),
+            ingest_shutdown_rx.clone(),
+        ))
+    } else {
+        tokio::spawn(lifecycle::start_forwarder(
+            router.clone(),
+            ingest_shutdown_rx.clone(),
+        ))
+    };
+    // The stop (C 3.2) drives the node through its router.
+    let stop_router = router.clone();
     let telemetry_fec_sender = if let Some(queue) = telemetry_fec_queue.clone() {
         Some(
             start_telemetry_fec_sender(
@@ -4383,6 +4463,7 @@ async fn main() -> Result<()> {
     let telemetry_publisher_task = start_telemetry_publisher(
         router.clone(),
         args.telemetry_interval_ms,
+        args.cache_mesh_test_future_frames,
         if args.telemetry_snapshots_fec_only {
             None
         } else {
@@ -4597,10 +4678,12 @@ async fn main() -> Result<()> {
     // The relay ingest ends only at shutdown. If it ends before (an error,
     // or a fast-plane tee that failed), the node no longer takes or commits
     // media: it shuts down with the error, so that its supervisor restarts it.
+    // SIGTERM and SIGINT are a graceful stop (C 3.2): an edge drains first, a
+    // forwarder says it is leaving; a second signal skips what is left.
     let mut fec_ingest_task = fec_ingest_task;
     let ingest_failure = tokio::select! {
-        signal = tokio::signal::ctrl_c() => {
-            signal?;
+        signal = stop.recv() => {
+            info!(signal, "stopping");
             None
         }
         ended = &mut fec_ingest_task => Some(match ended {
@@ -4611,6 +4694,29 @@ async fn main() -> Result<()> {
     };
     if let Some(error) = &ingest_failure {
         error!(error = %format!("{error:#}"), "shutting down");
+    } else {
+        let second = async {
+            let signal = stop.recv().await;
+            warn!(signal, "a second signal: the stop skips what is left of its waits");
+        };
+        let stopped = if cache_mesh_role == CacheMeshRole::Edge {
+            lifecycle::stop_edge(&stop_router, args.stop_drain(), second).await
+        } else {
+            lifecycle::stop_forwarder(
+                &stop_router,
+                Duration::from_millis(args.stop_linger_ms),
+                upstream_demand,
+                second,
+            )
+            .await
+        };
+        info!(
+            drained = stopped.drained,
+            skipped = stopped.skipped,
+            waited_ms = stopped.waited.as_millis() as u64,
+            released = stopped.released,
+            "stopped taking part: shutting down"
+        );
     }
     mesh_handle.shutdown();
     let _ = ingest_shutdown_tx.send(());
@@ -4636,6 +4742,7 @@ async fn main() -> Result<()> {
     let _ = replication_planner_task.await;
     let _ = node_cpu_task.await;
     let _ = parent_release_task.await;
+    let _ = start_task.await;
     if let Some(task) = edge_udp_task {
         let _ = task.await;
     }
@@ -4682,6 +4789,18 @@ impl Args {
     /// clocks and the hold of its warm sources.
     fn relay_media_deadline_us(&self) -> u64 {
         self.relay_media_deadline_ms.saturating_mul(1_000)
+    }
+
+    /// An edge's stop bound (C 3.2, B 3.12): `--stop-drain-ms`, or B's drain
+    /// spread and move grace and 2 s.
+    fn stop_drain(&self) -> Duration {
+        Duration::from_millis(if self.stop_drain_ms > 0 {
+            self.stop_drain_ms
+        } else {
+            self.client_udp_drain_spread_ms
+                .saturating_add(self.client_udp_move_grace_ms)
+                .saturating_add(lifecycle::STOP_DRAIN_SPARE_MS)
+        })
     }
 
     /// Threads that serve readers: the configured number, or as many as the
@@ -15270,42 +15389,6 @@ struct ControlEnvelope {
 }
 
 #[derive(Debug, Clone, Default)]
-struct NodeLifecycle {
-    draining: Arc<RwLock<bool>>,
-    /// When the node last began to drain (`None` while it serves).
-    draining_since: Arc<StdMutex<Option<Instant>>>,
-    /// Woken when the node begins or stops draining: the telemetry
-    /// publisher advertises the change at once instead of at its next tick.
-    changed: Arc<tokio::sync::Notify>,
-}
-
-impl NodeLifecycle {
-    async fn is_draining(&self) -> bool {
-        *self.draining.read().await
-    }
-
-    async fn set_draining(&self, draining: bool) {
-        let was = std::mem::replace(&mut *self.draining.write().await, draining);
-        if was != draining {
-            *self.draining_since.lock().unwrap() = draining.then(Instant::now);
-            // A stored permit when the publisher is not waiting yet.
-            self.changed.notify_one();
-        }
-    }
-
-    /// How much longer a draining node waits before its first moves, so
-    /// that the advertisement saying it drains (sent at once on the change)
-    /// reaches the entry points first: otherwise the movers of an edge
-    /// drained at the same moment are sent to this one, and moved again.
-    fn drain_advert_wait(&self, now: Instant, grace: Duration) -> Option<Duration> {
-        let since = (*self.draining_since.lock().unwrap())?;
-        grace
-            .checked_sub(now.saturating_duration_since(since))
-            .filter(|wait| !wait.is_zero())
-    }
-}
-
-#[derive(Debug, Clone, Default)]
 struct DemandTracker {
     last_replica_request_unix_ms: Arc<DashMap<u64, AtomicU64>>,
     last_hole_repair_unix_us: Arc<DashMap<u64, AtomicU64>>,
@@ -18838,6 +18921,9 @@ impl ControlPlane {
 #[derive(Debug, Clone, Default)]
 struct ControlDispatch {
     tx: Arc<RwLock<Option<mpsc::Sender<TcpChangesMessage>>>>,
+    /// `--cache-mesh-test-future-frames`: envelopes carry a field no build
+    /// knows.
+    future_fields: bool,
 }
 
 impl ControlDispatch {
@@ -18853,7 +18939,8 @@ impl ControlDispatch {
         let Some(tx) = self.tx.read().await.clone() else {
             return Ok(false);
         };
-        let json = serde_json::to_vec(envelope).context("failed to encode control envelope")?;
+        let json = json_with_future_field(envelope, self.future_fields)
+            .context("failed to encode control envelope")?;
         tx.send(TcpChangesMessage::new(CONTROL_TAG, vec![Bytes::from(json)]))
             .await
             .map_err(|_| anyhow!("tcp changes control feed is closed"))?;
@@ -19491,9 +19578,63 @@ impl TelemetryFecPublisher {
     }
 }
 
+/// `--cache-mesh-test-future-frames` (C 2.1): the field that a node
+/// speaking as a later build adds to its telemetry snapshots and control
+/// envelopes, which no struct of this build knows.
+const FUTURE_FIELD: &str = "x_future";
+
+/// `value` as JSON, with [`FUTURE_FIELD`] when `future` is set.
+fn json_with_future_field<T: Serialize>(value: &T, future: bool) -> serde_json::Result<Vec<u8>> {
+    if !future {
+        return serde_json::to_vec(value);
+    }
+    let mut json = serde_json::to_value(value)?;
+    if let Some(object) = json.as_object_mut() {
+        object.insert(FUTURE_FIELD.to_owned(), serde_json::Value::from(1));
+    }
+    serde_json::to_vec(&json)
+}
+
+/// A MessagePack map (a snapshot as `rmp_serde::to_vec_named` writes it)
+/// with one more entry, [`FUTURE_FIELD`]: 1. Anything else comes back as
+/// it was.
+fn msgpack_with_future_field(payload: Vec<u8>) -> Vec<u8> {
+    let Some(&first) = payload.first() else {
+        return payload;
+    };
+    let (entries, header) = match first {
+        0x80..=0x8f => (u32::from(first & 0x0f), 1),
+        0xde if payload.len() >= 3 => (u32::from(u16::from_be_bytes([payload[1], payload[2]])), 3),
+        0xdf if payload.len() >= 5 => (
+            u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]),
+            5,
+        ),
+        _ => return payload,
+    };
+    let Some(entries) = entries.checked_add(1) else {
+        return payload;
+    };
+    let mut out = Vec::with_capacity(payload.len() + 16);
+    if entries <= 15 {
+        out.push(0x80 | entries as u8);
+    } else if let Ok(entries) = u16::try_from(entries) {
+        out.push(0xde);
+        out.extend_from_slice(&entries.to_be_bytes());
+    } else {
+        out.push(0xdf);
+        out.extend_from_slice(&entries.to_be_bytes());
+    }
+    out.extend_from_slice(&payload[header..]);
+    out.push(0xa0 | FUTURE_FIELD.len() as u8);
+    out.extend_from_slice(FUTURE_FIELD.as_bytes());
+    out.push(0x01);
+    out
+}
+
 fn start_telemetry_publisher(
     router: AppRouter,
     interval_ms: u64,
+    future_fields: bool,
     tcp_tx: Option<mpsc::Sender<TcpChangesMessage>>,
     fec: Option<TelemetryFecPublisher>,
     mut shutdown_rx: watch::Receiver<()>,
@@ -19504,25 +19645,29 @@ fn start_telemetry_publisher(
     Some(tokio::spawn(async move {
         let mut ticker = interval(Duration::from_millis(interval_ms));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let lifecycle_changed = Arc::clone(&router.lifecycle.changed);
+        let lifecycle_changed = router.lifecycle.changed();
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => return,
                 _ = ticker.tick() => {}
-                // A drain or resume is advertised at once (the entry points
-                // stop sending readers to a draining node before it moves
-                // its own); the ticks go on as before.
+                // A drain, a resume or the end of a start is advertised at
+                // once (the entry points stop sending readers to a draining
+                // node before it moves its own, and learn a warm one at
+                // once); the ticks go on as before.
                 _ = lifecycle_changed.notified() => {}
             }
             let snapshot = router.local_mesh_snapshot().await;
             if let Some(fec) = &fec {
                 match encode_mesh_telemetry_binary(&snapshot) {
+                    Ok(payload) if future_fields => {
+                        fec.submit(&snapshot, msgpack_with_future_field(payload), interval_ms)
+                    }
                     Ok(payload) => fec.submit(&snapshot, payload, interval_ms),
                     Err(_) => fec.monitor.record_encode_error(),
                 }
             }
             if let Some(tx) = &tcp_tx {
-                let Ok(json) = serde_json::to_vec(&snapshot) else {
+                let Ok(json) = json_with_future_field(&snapshot, future_fields) else {
                     continue;
                 };
                 let message = TcpChangesMessage::new(TELEMETRY_TAG, vec![Bytes::from(json)]);
@@ -20244,6 +20389,8 @@ impl AppRouter {
         private_discovery: PrivateDiscoveryStatus,
         operations_snapshot_file: Option<PathBuf>,
     ) -> Self {
+        // The router's mesh is the one whose hello says this node drains.
+        lifecycle.attach_mesh(&mesh);
         Self {
             cache,
             llhls_default_tail_parts,
@@ -20891,7 +21038,7 @@ impl AppRouter {
     /// telemetry merge, no replica plan) and kept for 100 ms.
     async fn node_status(&self) -> Arc<node_status::NodeStatus> {
         use node_status::{
-            CacheMeshStatus, ClientUdpStatus, DrainReasons, FastPlaneStatus, IngestStatus,
+            CacheMeshStatus, ClientUdpStatus, FastPlaneStatus, IngestStatus,
             LeasePair, LeaseStatus, LeaseStream, NodeStatus, ParentStatus, ParentStreamStatus,
             ProcessStatus, Readiness, ReadinessInputs, StreamStatus,
         };
@@ -21122,10 +21269,7 @@ impl AppRouter {
             .telemetry
             .region_entry(&self.node, self.assignment_fresh_ms, now_us / 1_000)
             .await;
-        let drain = DrainReasons {
-            operator: self.lifecycle.is_draining().await,
-            ..DrainReasons::default()
-        };
+        let drain = self.lifecycle.reasons();
 
         let mut memory = lock_memory();
         // F5: a pair served now that was not at the last look opened a
@@ -21161,11 +21305,10 @@ impl AppRouter {
             }),
             drain,
             // E5's warm copies and F7's start demand come with the warm
-            // pass of the lifecycle (CR8), `start`, `stopping` and the
-            // forced start with its start and stop (CR6).
+            // pass of the lifecycle (CR8).
             warm_copies: Vec::new(),
             slot_streams: Vec::new(),
-            ready_forced: false,
+            ready_forced: self.lifecycle.ready_forced(),
         };
         let readiness = if edge {
             Readiness::edge(&inputs, memory.warm)
@@ -21173,6 +21316,7 @@ impl AppRouter {
             Readiness::forwarder(&inputs, memory.warm)
         };
         memory.warm = readiness.warm;
+        self.lifecycle.set_hello_state(readiness.state);
         if readiness.ready() && memory.ready_unix_ms.is_none() {
             memory.ready_unix_ms = Some(now_us / 1_000);
         }
@@ -23195,20 +23339,20 @@ impl AppRouter {
                 .await;
                 "local warm requested".into()
             }
+            // C 2.4: the operator's reason, kept in the drain-state file; the
+            // hello says draining with it (a distributor's children move
+            // their leases away, AM 12).
             ControlKind::CloseNode => {
-                self.lifecycle.set_draining(true).await;
-                self.mesh.set_draining(true);
+                self.lifecycle.drain(node_status::DrainReason::Operator);
                 "local close requested: draining".into()
             }
             ControlKind::DrainNode => {
-                self.lifecycle.set_draining(true).await;
-                // A distributor's children move their leases away (AM 12).
-                self.mesh.set_draining(true);
+                self.lifecycle.drain(node_status::DrainReason::Operator);
                 "local drain requested: readers move to other caches".into()
             }
+            // Only the operator's reason goes: a start or a stop holds.
             ControlKind::ResumeNode => {
-                self.lifecycle.set_draining(false).await;
-                self.mesh.set_draining(false);
+                self.lifecycle.resume(node_status::DrainReason::Operator);
                 "local resume requested: taking readers".into()
             }
             ControlKind::ProvisionNode => {
@@ -29724,7 +29868,7 @@ mod tests {
         assert_eq!(local["status"]["schema"], node_status::SCHEMA);
         assert_eq!(local["status"]["process"]["boot_id"], cache.started_unix_us);
 
-        router.lifecycle.set_draining(true).await;
+        router.lifecycle.drain(node_status::DrainReason::Operator);
         tokio::time::sleep(NODE_STATUS_CACHE + Duration::from_millis(20)).await;
         let response = get_for_tests(&router, "/api/node").await;
         let drained: serde_json::Value = serde_json::from_slice(&response.body.unwrap()).unwrap();
@@ -32180,7 +32324,8 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         // A tick a minute: only the first snapshot comes from the ticker.
         let task =
-            start_telemetry_publisher(router.clone(), 60_000, Some(tx), None, shutdown_rx).unwrap();
+            start_telemetry_publisher(router.clone(), 60_000, false, Some(tx), None, shutdown_rx)
+                .unwrap();
         let draining_of = |message: TcpChangesMessage| {
             let snapshot: MeshSnapshot = serde_json::from_slice(&message.data()[0]).unwrap();
             snapshot.node.draining
@@ -32227,7 +32372,7 @@ mod tests {
             None
         );
         // Draining again changes nothing and is not advertised again.
-        router.lifecycle.set_draining(true).await;
+        router.lifecycle.drain(node_status::DrainReason::Operator);
         assert!(timeout(Duration::from_millis(200), rx.recv())
             .await
             .is_err());
@@ -32293,6 +32438,7 @@ mod tests {
         let publisher_task = start_telemetry_publisher(
             source_router.clone(),
             50,
+            false,
             Some(telemetry_runtime.tx.clone()),
             None,
             publisher_shutdown_rx,
@@ -39607,7 +39753,7 @@ mod tests {
         );
 
         // A draining edge sends its clients to the next cache.
-        router.lifecycle.set_draining(true).await;
+        router.lifecycle.drain(node_status::DrainReason::Operator);
         let moved = timeout(Duration::from_secs(5), async {
             loop {
                 let (len, _) = client.recv_from(&mut buf).await.unwrap();
@@ -39806,7 +39952,7 @@ mod tests {
         assert!(matches!(answer, Control::Subscribed { .. }), "{answer:?}");
         assert_eq!(stats.live_subscribers(), Some(4));
         // Draining shows on the gauges.
-        router.lifecycle.set_draining(true).await;
+        router.lifecycle.drain(node_status::DrainReason::Operator);
         let api: serde_json::Value = serde_json::from_slice(
             get_for_tests(&router, "/api/assignment?stream=77")
                 .await
@@ -40041,7 +40187,7 @@ mod tests {
         // The cached parts arrive.
         udp_receive_for_tests(&leaver, Duration::from_millis(300)).await;
         udp_receive_for_tests(&stayer, Duration::from_millis(300)).await;
-        edge.router.lifecycle.set_draining(true).await;
+        edge.router.lifecycle.drain(node_status::DrainReason::Operator);
         let marked_by = Instant::now();
         for client in [&leaver, &stayer] {
             assert!(
@@ -40119,7 +40265,7 @@ mod tests {
         config.move_grace = Duration::from_millis(4_000);
         let edge = UdpEdgeForTests::start(config).await;
         let (client, _) = edge.client().await;
-        edge.router.lifecycle.set_draining(true).await;
+        edge.router.lifecycle.drain(node_status::DrainReason::Operator);
         // The first within a housekeeping second, then one every 250 ms
         // (the sender looks at least every keepalive, 80 ms).
         assert!(
@@ -40212,7 +40358,7 @@ mod tests {
             edge_udp::insert_test_subscribers(&stats.table.get().unwrap().0, 77, &crowd, 4);
             assert_eq!(stats.live_subscribers(), Some(1_000));
             let moves_before = stats.moves.load(Ordering::Relaxed);
-            edge.router.lifecycle.set_draining(true).await;
+            edge.router.lifecycle.drain(node_status::DrainReason::Operator);
             let started = Instant::now();
             let (mut first_mark, mut last_mark, mut first_gone) = (None, None, None);
             let (mut leaving_seen, mut unsubscribed) = (0, false);
@@ -40350,7 +40496,7 @@ mod tests {
         let block = gauges().await;
         assert_eq!(block["leaving"], 0, "{block:#}");
         assert_eq!(block["move_grace_ms"], 1_500, "{block:#}");
-        edge.router.lifecycle.set_draining(true).await;
+        edge.router.lifecycle.drain(node_status::DrainReason::Operator);
         tokio::time::timeout(Duration::from_secs(3), async {
             while edge.stats().legs().unwrap().leaving != 4 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -45341,4 +45487,7 @@ mod tests {
     /// first integration): one leg as the wave 9 client, two legs on two
     /// edges.
     mod two_leg_session;
+    /// The node's lifecycle (C CR6): SIGTERM as a graceful stop, the drain
+    /// reasons and the start that waits until the node is warm.
+    mod node_lifecycle;
 }
