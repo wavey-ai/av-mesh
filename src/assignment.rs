@@ -170,6 +170,10 @@ pub struct AssignmentRequest<'a> {
     pub pin: Option<&'a str>,
     /// Cache that the reader uses now, for example `_HLS_pathway`.
     pub current: Option<&'a str>,
+    /// Caches this entry point gave the session lately, that it has neither
+    /// left nor kept (B 3.6): a repeat is given them again, each only where
+    /// the rule of its place in the answer would still take it.
+    pub remembered: &'a [String],
     /// Bit rate of the playlist that the reader asks for, when a cache of the
     /// region has measured it. A new reader is assigned only to a cache that
     /// has this much room.
@@ -210,6 +214,7 @@ impl Default for AssignmentRequest<'_> {
             session: None,
             pin: None,
             current: None,
+            remembered: &[],
             playlist_bps: None,
             moving: false,
             recent_moves: &[],
@@ -424,15 +429,41 @@ pub fn assign(
         )
     };
 
+    // A redundant leg's gate: the cache admits (and, in a rebalance, is a
+    // receiver under the level) and stays under the gate with the
+    // listener counted.
+    let passes_gate = |ranked: &[(u8, f64, &CacheCandidate)], cache: &CacheCandidate| {
+        ranked.iter().any(|(_, _, other)| other.node_id == cache.node_id)
+            && f64::from(cache.effective_load_permille()) + listener_permille < f64::from(gate)
+    };
+    // The caches the reader uses or was given lately keep it, each only
+    // where the rule of its place would take it now (review of B Z3): the
+    // leg it depends on while the cache is healthy, as before, and in a
+    // rebalance only on a receiver under the level; a redundant leg only
+    // through the gate. A memory of a cache the listener has since left
+    // gave it a leg over the level.
+    let mut stickies: Vec<&CacheCandidate> = Vec::new();
+    for name in request
+        .current
+        .into_iter()
+        .chain(request.remembered.iter().map(String::as_str))
+    {
+        if let Some(cache) = regional.iter().copied().find(|cache| cache.node_id == name) {
+            if !stickies.iter().any(|sticky| sticky.node_id == cache.node_id) {
+                stickies.push(cache);
+            }
+        }
+    }
     let mut caches: Vec<AssignedCache> = Vec::new();
-    let sticky = request.current.and_then(|current| {
-        regional
-            .iter()
-            .copied()
-            .find(|cache| cache.node_id == current && healthy(cache))
-    });
-    if let (Some(cache), true) = (sticky, wanted > 0) {
-        caches.push(assigned(cache, AssignmentReason::Sticky));
+    if wanted > 0 && !request.redundant {
+        let sticky = stickies.iter().copied().find(|cache| {
+            healthy(cache)
+                && (!rebalancing
+                    || ranked.iter().any(|(_, _, other)| other.node_id == cache.node_id))
+        });
+        if let Some(cache) = sticky {
+            caches.push(assigned(cache, AssignmentReason::Sticky));
+        }
     }
     if wanted > 0 && caches.is_empty() && !request.redundant {
         // The leg the listener depends on: a new reader by the tiers, a
@@ -479,14 +510,18 @@ pub fn assign(
     // listener counted, and never a spill.
     while caches.len() < usize::from(wanted) {
         let taken = |cache: &CacheCandidate| caches.iter().any(|leg| leg.node_id == cache.node_id);
+        if let Some(cache) = stickies
+            .iter()
+            .copied()
+            .find(|cache| !taken(cache) && passes_gate(&ranked, cache))
+        {
+            caches.push(assigned(cache, AssignmentReason::Sticky));
+            continue;
+        }
         let pool = ranked
             .iter()
             .enumerate()
-            .filter(|(_, (_, _, cache))| {
-                !taken(cache)
-                    && f64::from(cache.effective_load_permille()) + listener_permille
-                        < f64::from(gate)
-            })
+            .filter(|(_, (_, _, cache))| !taken(cache) && passes_gate(&ranked, cache))
             .map(|(index, (_, _, cache))| (index, *cache))
             .collect::<Vec<_>>();
         let chosen = if moving {
@@ -532,8 +567,9 @@ pub fn assign(
         caches.push(assigned(cache, AssignmentReason::SecondPath));
     }
     let legs = u8::try_from(caches.len()).unwrap_or(MAX_PATHS);
-    if rebalancing && legs == 0 {
+    if rebalancing && legs == 0 && wanted > 0 {
         // No receiver under the level: no cache of the region is named.
+        // A request for a spare alone is answered as any.
         return Err(AssignmentError::NoCacheAvailable);
     }
     // The spare: a holder of the playlist by the session's weighted
@@ -1326,6 +1362,78 @@ mod tests {
                 .legs,
             1
         );
+        // A request for a spare alone is answered as any (review of B Z3).
+        let spare_only = AssignmentRequest {
+            paths: 0,
+            redundant: true,
+            ..rebalanced("rebalanced-1")
+        };
+        let assignment = assign(spare_only, AssignmentPolicy::default(), &full).unwrap();
+        assert_eq!((assignment.legs, assignment.spare), (0, true));
+    }
+
+    /// Review of B Z3: a cache the reader uses or was given lately keeps it
+    /// only where the rule of its place would take it now. In a rebalance,
+    /// a sticky over the receiver level is no leg; a redundant leg passes
+    /// the gate, sticky or not; the leg a reader depends on stays while its
+    /// cache is healthy, as before.
+    #[test]
+    fn a_sticky_cache_is_kept_only_where_its_place_would_take_it() {
+        let caches = [cache("edge-2", 720, Some(9)), cache("edge-3", 300, Some(9))];
+        let remembered = vec!["edge-2".to_owned()];
+        let rebalanced = AssignmentRequest {
+            moving: true,
+            rebalancing: true,
+            listener_permille: Some(16.0),
+            ..request("give-up")
+        };
+        // 720 + 16 is over the receiver level, 725.
+        for request in [
+            AssignmentRequest {
+                current: Some("edge-2"),
+                ..rebalanced
+            },
+            AssignmentRequest {
+                remembered: &remembered,
+                ..rebalanced
+            },
+        ] {
+            let assignment = assign(request, AssignmentPolicy::default(), &caches).unwrap();
+            assert_eq!(first(&assignment), ("edge-3", AssignmentReason::HoldsPlaylist));
+            // With no receiver at all, no leg rather than the sticky.
+            let assignment = assign(request, AssignmentPolicy::default(), &caches[..1]);
+            assert_eq!(assignment, Err(AssignmentError::NoCacheAvailable));
+        }
+        // A redundant leg: the remembered cache under the gate is kept, the
+        // one over it is not.
+        let held = AssignmentRequest {
+            redundant: true,
+            listener_permille: Some(16.0),
+            remembered: &remembered,
+            ..request("held")
+        };
+        let assignment = assign(held, AssignmentPolicy::default(), &caches).unwrap();
+        assert_eq!(first(&assignment), ("edge-2", AssignmentReason::Sticky));
+        let over = [cache("edge-2", 790, Some(9)), cache("edge-3", 300, Some(9))];
+        let assignment = assign(held, AssignmentPolicy::default(), &over).unwrap();
+        assert_eq!(first(&assignment), ("edge-3", AssignmentReason::SecondPath));
+        // Two remembered legs are the two legs of a repeat.
+        let both = vec!["edge-3".to_owned(), "edge-2".to_owned()];
+        let repeat = AssignmentRequest {
+            paths: 2,
+            remembered: &both,
+            ..request("repeat")
+        };
+        let assignment = assign(repeat, AssignmentPolicy::default(), &caches).unwrap();
+        assert_eq!(assignment.legs, 2);
+        assert_eq!(
+            [&assignment.caches[0], &assignment.caches[1]]
+                .map(|leg| (leg.node_id.as_str(), leg.reason)),
+            [
+                ("edge-3", AssignmentReason::Sticky),
+                ("edge-2", AssignmentReason::Sticky)
+            ]
+        );
     }
 
     /// B 3.6: a mover that asks for two legs gets two edges, and the legs
@@ -1591,6 +1699,7 @@ mod tests {
             session: Some(session),
             pin: None,
             current: None,
+            remembered: &[],
             playlist_bps: None,
             moving: false,
             recent_moves: &[],

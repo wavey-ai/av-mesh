@@ -27,8 +27,8 @@ use crate::{AppRouter, ParentsLost};
 use av_mesh::client_compact as compact;
 use av_mesh::client_udp::{
     block_id, cut_through_block_id, cut_through_symbol_size, encode_block, encode_object, geometry,
-    source_datagram, CompactPlan, Control, ObjectKind, PartObject, RepairPolicy, KEEPALIVE,
-    MIN_ASSIGN_REQUEST_BYTES, MIN_FIRST_REQUEST_BYTES, SUBSCRIPTION_TTL,
+    source_datagram, AssignedCache, CompactPlan, Control, ObjectKind, PartObject, RepairPolicy,
+    KEEPALIVE, MIN_ASSIGN_REQUEST_BYTES, MIN_FIRST_REQUEST_BYTES, SUBSCRIPTION_TTL,
 };
 use bytes::Bytes;
 use playlists::mesh::{chunk_frame_slot, CacheMeshReceiveObserver};
@@ -1974,7 +1974,7 @@ impl EdgeControl {
             Arc::clone(&self.assigning),
         );
         tokio::spawn(async move {
-            let (port, mut caches, legs, spare) = router
+            let (port, caches, legs, spare) = router
                 .udp_assignment(
                     stream_id,
                     &session,
@@ -1985,34 +1985,9 @@ impl EdgeControl {
                     spare,
                 )
                 .await;
-            // The legs and the spare are never cut (B 2.1).
-            let kept = usize::from(legs) + usize::from(spare);
-            let answer = loop {
-                let answer = Control::Assigned {
-                    stream_id,
-                    nonce,
-                    port,
-                    caches: caches.clone(),
-                    paths: legs,
-                    spare,
-                }
-                .encode();
-                if answer.len() <= budget || caches.len() <= kept {
-                    break answer;
-                }
-                // The last cache that fits: the failover order is
-                // cut from its end (the legs and the spare first).
-                let failover_at = caches.iter().position(|cache| cache.failover);
-                match failover_at {
-                    Some(at) if at > kept => {
-                        caches.remove(at - 1);
-                    }
-                    _ => {
-                        caches.pop();
-                    }
-                }
-            };
-            if answer.len() <= budget {
+            if let Some(answer) =
+                assigned_within(stream_id, nonce, port, caches, legs, spare, budget)
+            {
                 stats.assignments.fetch_add(1, Ordering::Relaxed);
                 stats.tokens_sent.fetch_add(1, Ordering::Relaxed);
                 // The token first: the client confirms as soon as
@@ -2028,6 +2003,49 @@ impl EdgeControl {
             }
             assigning.fetch_sub(1, Ordering::Relaxed);
         });
+    }
+}
+
+/// The `ASSIGNED` answer in at most `budget` bytes: the alternates are cut
+/// from the end of the region's list, then the failover entries from
+/// theirs; the legs and the spare never (B 2.1). `None` when the legs and
+/// the spare alone do not fit.
+fn assigned_within(
+    stream_id: u64,
+    nonce: u64,
+    port: Option<u16>,
+    mut caches: Vec<AssignedCache>,
+    legs: u8,
+    spare: bool,
+    budget: usize,
+) -> Option<Vec<u8>> {
+    let kept = usize::from(legs) + usize::from(spare);
+    loop {
+        let answer = Control::Assigned {
+            stream_id,
+            nonce,
+            port,
+            caches: caches.clone(),
+            paths: legs,
+            spare,
+        }
+        .encode();
+        if answer.len() <= budget {
+            return Some(answer);
+        }
+        if caches.len() <= kept {
+            return None;
+        }
+        // The last cache of the region after the legs and the spare while
+        // there is one, then the last failover entry.
+        match caches.iter().position(|cache| cache.failover) {
+            Some(at) if at > kept => {
+                caches.remove(at - 1);
+            }
+            _ => {
+                caches.pop();
+            }
+        }
     }
 }
 
@@ -5687,5 +5705,84 @@ mod tests {
                 .is_err(),
             "a dropped datagram is not sent"
         );
+    }
+
+    /// B 2.1: the cut that keeps an `ASSIGNED` no longer than its request
+    /// takes the alternates from the end of the region's list, then the
+    /// failover entries, and never the legs or the spare; an answer whose
+    /// legs and spare do not fit is not sent.
+    #[test]
+    fn the_assigned_cut_never_removes_the_legs_or_the_spare() {
+        let cache = |name: &str, failover: bool| AssignedCache {
+            node_id: name.to_owned(),
+            playback_base_url: format!("https://{name}.example/live/with/a/long/path"),
+            failover,
+        };
+        let caches = vec![
+            cache("leg-one", false),
+            cache("leg-two", false),
+            cache("spare", false),
+            cache("alternate-one", false),
+            cache("alternate-two", false),
+            cache("failover-entry-one", true),
+            cache("failover-entry-two", true),
+        ];
+        let names = |answer: &[u8]| match Control::decode(answer) {
+            Some(Control::Assigned {
+                caches,
+                paths,
+                spare,
+                ..
+            }) => (
+                caches
+                    .into_iter()
+                    .map(|cache| cache.node_id)
+                    .collect::<Vec<_>>(),
+                paths,
+                spare,
+            ),
+            other => panic!("{other:?}"),
+        };
+        let encoded = |indices: &[usize]| {
+            Control::Assigned {
+                stream_id: 801,
+                nonce: 7,
+                port: Some(19_446),
+                caches: indices.iter().map(|index| caches[*index].clone()).collect(),
+                paths: 2,
+                spare: true,
+            }
+            .encode()
+            .len()
+        };
+        let within = |budget: usize| {
+            assigned_within(801, 7, Some(19_446), caches.clone(), 2, true, budget)
+        };
+        // Room for all.
+        let (all, paths, spare) = names(&within(encoded(&[0, 1, 2, 3, 4, 5, 6])).unwrap());
+        assert_eq!((all.len(), paths, spare), (7, 2, true));
+        // One byte short: the last alternate of the region goes first.
+        let (cut, _, _) = names(&within(encoded(&[0, 1, 2, 3, 4, 5, 6]) - 1).unwrap());
+        assert_eq!(
+            cut,
+            [
+                "leg-one",
+                "leg-two",
+                "spare",
+                "alternate-one",
+                "failover-entry-one",
+                "failover-entry-two"
+            ]
+        );
+        // Room for the legs, the spare and one more: the alternates went,
+        // then the last failover entry.
+        let (cut, paths, spare) = names(&within(encoded(&[0, 1, 2, 5])).unwrap());
+        assert_eq!(cut, ["leg-one", "leg-two", "spare", "failover-entry-one"]);
+        assert_eq!((paths, spare), (2, true));
+        // The legs and the spare exactly.
+        let (cut, _, _) = names(&within(encoded(&[0, 1, 2])).unwrap());
+        assert_eq!(cut, ["leg-one", "leg-two", "spare"]);
+        // They do not fit: nothing is sent, rather than a shorter answer.
+        assert!(within(encoded(&[0, 1, 2]) - 1).is_none());
     }
 }
