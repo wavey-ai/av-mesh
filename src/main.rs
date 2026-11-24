@@ -2603,6 +2603,13 @@ struct Args {
     #[arg(long)]
     playback_base_url: Option<String>,
 
+    /// The physical host this node runs on (the deploy renders the first 12
+    /// hex of the Linode instance's host_uuid). An edge advertises it, and
+    /// an entry point gives a listener's second leg to an edge on another
+    /// host when one is eligible: two instances on one host stop together.
+    #[arg(long)]
+    host_tag: Option<String>,
+
     /// Peak bandwidth for each duplicate stream in the failover playlist.
     #[arg(
         long,
@@ -4326,6 +4333,7 @@ async fn main() -> Result<()> {
     .with_node_status(node_status_source)
     .with_playlist_demand(playlist_demand)
     .with_client_udp_port(args.client_udp_bind.map(|bind| bind.port()))
+    .with_host_tag(args.host_tag.clone())
     .with_assignment(
         AssignmentPolicy {
             spread_permille: u32::from(args.assignment_spread_percent.min(100)) * 10,
@@ -14491,6 +14499,9 @@ struct EdgeServiceSnapshot {
     /// on a node that serves no UDP client.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     udp_subscribers: Option<u64>,
+    /// The physical host of the node (`--host-tag`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host: Option<String>,
 }
 
 /// The live gauges of a node's client UDP lane, on /api/mesh/local and
@@ -14656,6 +14667,7 @@ impl EdgeServiceSnapshot {
             draining: node.draining,
             parents_silent_ms: None,
             udp_subscribers: None,
+            host: None,
         }
     }
 
@@ -19908,6 +19920,11 @@ struct AppRouter {
     /// when the session asks again without naming the cache that it uses,
     /// and charges a cache once for a session.
     remembered_assignments: Arc<DashMap<String, (Vec<String>, u64)>>,
+    /// The physical host of this node (`--host-tag`), in its advertisement.
+    host_tag: Option<String>,
+    /// Answers to a listener whose redundant leg shares a host with its
+    /// other leg: no edge on another host was eligible (cumulative).
+    second_leg_same_host: Arc<AtomicU64>,
     /// Capacity that this entry point has given away at each cache since
     /// the advertisement of the cache that it last read: the time of that
     /// advertisement, and the bits per second.
@@ -20292,6 +20309,8 @@ impl AppRouter {
             steering_ttl_seconds: 5,
             assignment_fresh_ms: DEFAULT_TELEMETRY_INTERVAL_MS.saturating_mul(3),
             remembered_assignments: Arc::new(DashMap::new()),
+            host_tag: None,
+            second_leg_same_host: Arc::default(),
             pending_assignments: Arc::new(DashMap::new()),
             regional_view: Arc::new(tokio::sync::Mutex::new(None)),
             // A router reads the region afresh for each request unless it is
@@ -20591,6 +20610,11 @@ impl AppRouter {
         self
     }
 
+    fn with_host_tag(mut self, host_tag: Option<String>) -> Self {
+        self.host_tag = host_tag;
+        self
+    }
+
     fn with_playlist_demand(mut self, playlist_demand: PlaylistDemand) -> Self {
         self.playlist_demand = playlist_demand;
         self
@@ -20720,6 +20744,7 @@ impl AppRouter {
             cache_mesh_role_label(self.cache_mesh_role),
         );
         edge_service.egress_request_capacity = self.edge_load.egress.request_capacity_per_sec();
+        edge_service.host = self.host_tag.clone();
         if self.client_udp_port.is_some() {
             edge_service.udp_subscribers = self.edge_udp_stats.live_subscribers();
         }
@@ -21180,6 +21205,7 @@ impl AppRouter {
             schema: node_status::SCHEMA.to_owned(),
             node_id: self.node.node_id.clone(),
             region: self.node.region.clone(),
+            host: self.host_tag.clone(),
             role: cache_mesh_role_label(self.cache_mesh_role).to_owned(),
             build: node_status::BuildStatus::of_this_binary(),
             process: ProcessStatus {
@@ -21621,6 +21647,7 @@ impl AppRouter {
                     });
                 Some(CacheCandidate {
                     failover_rank: Some(standby_rank(&snapshot.node.node_id, stream_id)),
+                    host: edge.host.clone(),
                     node_id: snapshot.node.node_id.clone(),
                     region: snapshot.node.region.clone(),
                     // This node can always name itself with a relative URI.
@@ -21802,6 +21829,12 @@ impl AppRouter {
         let candidates_all = self.cache_candidates(reader.stream_id).await;
         let skipped = |node_id: &str| reader.skip.iter().any(|name| name == node_id);
         let held = |node_id: &str| reader.hold.iter().any(|name| name == node_id);
+        // The hosts of the legs it holds: a new leg goes to another host.
+        let held_hosts = candidates_all
+            .iter()
+            .filter(|cache| held(&cache.node_id))
+            .filter_map(|cache| cache.host.clone())
+            .collect::<Vec<_>>();
         // B 2.5: a cache the client names as current and has left is not
         // its current one, and a UDP client that names caches it has left
         // is a mover whatever else it names.
@@ -21924,6 +21957,7 @@ impl AppRouter {
             paths: reader.paths,
             spare: reader.spare,
             redundant: !reader.hold.is_empty(),
+            held_hosts: &held_hosts,
         };
         // A rebalanced listener goes only to a cache heard of lately: an
         // edge that has just died still looks fresh, and empty, for a few
@@ -21973,6 +22007,13 @@ impl AppRouter {
             && matches!(assignment, Err(AssignmentError::NoCacheAvailable))
         {
             assignment = assign_udp_in_region(request, self.assignment_policy, &candidates);
+        }
+        if reader.udp
+            && assignment
+                .as_ref()
+                .is_ok_and(|assignment| assignment.second_leg_same_host)
+        {
+            self.second_leg_same_host.fetch_add(1, Ordering::Relaxed);
         }
         // A reader that is placed now takes capacity that the cache has not
         // advertised as taken. Count it until the cache advertises again, so
@@ -22776,6 +22817,7 @@ impl AppRouter {
                     "load_permille": cache.load_permille,
                     "free_bps": cache.free_bps,
                     "head_part": cache.head_part,
+                    "host": cache.host,
                 })
             })
             .collect::<Vec<_>>();
@@ -22861,6 +22903,7 @@ impl AppRouter {
         // AM 12, 13: the forwarder's lease children and cache-mesh children.
         body["fast_plane"] = serde_json::to_value(self.fast_plane_gauges()).unwrap_or_default();
         body["cache_mesh"] = serde_json::to_value(self.cache_mesh_gauges()).unwrap_or_default();
+        body["second_leg_same_host"] = self.second_leg_same_host.load(Ordering::Relaxed).into();
         if let Some(block) = body["client_udp"].as_object_mut() {
             // Wave 9 B: the UDP ASSIGN requests answered and dropped.
             let stats = &self.edge_udp_stats;
@@ -29660,6 +29703,52 @@ mod tests {
         );
     }
 
+    /// D 5 (seam to B): `--host-tag` is carried in the edge's
+    /// advertisement, survives a peer's reading of it, and shows as
+    /// `host` in `/api/node` and as `caches[].host` in `/api/assignment`,
+    /// beside the `second_leg_same_host` counter. Without the flag the
+    /// advertisement names no host.
+    #[tokio::test]
+    async fn the_advertisement_carries_the_host_tag() {
+        let args = Args::try_parse_from(["av-mesh", "--host-tag", "4f1c2a9e07b3"]).unwrap();
+        let cache = LiveTsCache::new(1, Duration::from_millis(250), 4, 32, 64).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let plain = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
+        assert_eq!(
+            plain.local_mesh_snapshot().await.edge_service.unwrap().host,
+            None
+        );
+        let router = plain.with_host_tag(args.host_tag);
+        let advertised = router.local_mesh_snapshot().await;
+        let edge = advertised.edge_service.clone().unwrap();
+        assert_eq!(edge.host.as_deref(), Some("4f1c2a9e07b3"));
+        // As a peer reads it off the wire.
+        let heard: EdgeServiceSnapshot =
+            serde_json::from_str(&serde_json::to_string(&edge).unwrap()).unwrap();
+        assert_eq!(heard.host.as_deref(), Some("4f1c2a9e07b3"));
+        let candidates = router.cache_candidates(router.cache.stream_id).await;
+        let own = candidates
+            .iter()
+            .find(|cache| cache.node_id == router.node.node_id)
+            .unwrap();
+        assert_eq!(own.host.as_deref(), Some("4f1c2a9e07b3"));
+
+        let node = get_for_tests(&router, "/api/node").await;
+        let node: serde_json::Value = serde_json::from_slice(&node.body.unwrap()).unwrap();
+        assert_eq!(node["host"], "4f1c2a9e07b3");
+        let api = get_for_tests(&router, "/api/assignment").await;
+        let api: serde_json::Value = serde_json::from_str(&body_text(api)).unwrap();
+        let own = api["caches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|cache| cache["node_id"] == router.node.node_id.as_str())
+            .unwrap();
+        assert_eq!(own["host"], "4f1c2a9e07b3");
+        assert_eq!(api["second_leg_same_host"], 0);
+        mesh.shutdown();
+    }
+
     /// CR5: `GET /api/node` answers with the build, the process and the
     /// readiness, `/api/mesh/local` carries the same object, and an
     /// operator's drain shows as a reason.
@@ -30358,6 +30447,7 @@ mod tests {
             draining: false,
             parents_silent_ms: None,
             udp_subscribers: None,
+            host: None,
         });
         let mut snapshot = TelemetryAggregator::default().snapshot(local).await;
         assert!(!snapshot
