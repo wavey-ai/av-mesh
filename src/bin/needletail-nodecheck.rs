@@ -124,13 +124,19 @@ struct WarmArgs {
     /// A write that takes this long is listed in `stalls`.
     #[arg(long, default_value_t = 100)]
     stall_ms: u64,
-    /// The host is `slow_host` when one page write takes this long.
-    #[arg(long, default_value_t = 1_000)]
+    /// The host is `slow_host` when one page write takes this long (the
+    /// lead's rule of 24 Nov: the hunt's warmed edges had single writes of
+    /// up to 1.93 s in their pass and then ran clean for an hour).
+    #[arg(long, default_value_t = 5_000)]
     slow_write_ms: u64,
     /// ... or when the pass takes more than this many seconds per 4 GiB of
     /// the node's memory (MemTotal).
     #[arg(long, default_value_t = 180)]
     slow_seconds_per_4gb: u64,
+    /// ... or when more than this share (per mille) of the pass's thread
+    /// time (seconds times threads) went in writes of `stall_ms` or more.
+    #[arg(long, default_value_t = 500)]
+    slow_stall_share_permille: u64,
 }
 
 const DEFAULT_LEAVE_MB: u64 = 300;
@@ -143,8 +149,9 @@ impl Default for WarmArgs {
             max_seconds: None,
             max_seconds_per_4gb: 300,
             stall_ms: 100,
-            slow_write_ms: 1_000,
+            slow_write_ms: 5_000,
             slow_seconds_per_4gb: 180,
+            slow_stall_share_permille: 500,
         }
     }
 }
@@ -230,11 +237,14 @@ struct BootArgs {
     #[arg(long, default_value_t = 300)]
     warm_max_seconds_per_4gb: u64,
     /// The warm pass's `--slow-write-ms`.
-    #[arg(long, default_value_t = 1_000)]
+    #[arg(long, default_value_t = 5_000)]
     slow_write_ms: u64,
     /// The warm pass's `--slow-seconds-per-4gb`.
     #[arg(long, default_value_t = 180)]
     slow_seconds_per_4gb: u64,
+    /// The warm pass's `--slow-stall-share-permille`.
+    #[arg(long, default_value_t = 500)]
+    slow_stall_share_permille: u64,
 }
 
 impl BootArgs {
@@ -245,6 +255,7 @@ impl BootArgs {
             max_seconds_per_4gb: self.warm_max_seconds_per_4gb,
             slow_write_ms: self.slow_write_ms,
             slow_seconds_per_4gb: self.slow_seconds_per_4gb,
+            slow_stall_share_permille: self.slow_stall_share_permille,
             ..WarmArgs::default()
         }
     }
@@ -426,6 +437,19 @@ struct WarmReport {
     stall_ms: u64,
     stalls: Vec<WarmStall>,
     stalls_dropped: u64,
+    /// Time in writes of `stall_ms` or more, every one of them (the list
+    /// stops at MAX_STALLS), summed over the threads.
+    stalled_us: u64,
+    /// Threads of the pass (one pinned to each CPU).
+    threads: u64,
+    /// The proof that the pass touched what it says (lead, 24 Nov: a pass
+    /// of 0.4 s over 3.3 GB is a host that had the memory backed already,
+    /// or one that touched nothing): the bytes it mapped, the pages it
+    /// wrote, and the process's peak resident set (VmHWM of
+    /// /proc/self/status) read before the memory is given back.
+    mapped_mb: u64,
+    pages_written: u64,
+    vm_hwm_mb: u64,
     /// `/sys/kernel/mm/transparent_hugepage/enabled` as the pass saw it.
     thp: String,
 }
@@ -443,11 +467,18 @@ struct WarmStall {
 /// Stalls listed at most in a warm record.
 const MAX_STALLS: usize = 512;
 
-/// The `slow_host` judgement of a warm pass (integration 4, after the hunt
-/// lab): a page write of `slow_write_ms` or more, a pass longer than its
-/// `slow_bound_seconds` (180 s per 4 GiB of memory by default), or one
-/// that ran out of time.
-fn slow_reasons(warm: &WarmReport, slow_write_ms: u64) -> Vec<&'static str> {
+/// The `slow_host` judgement of a warm pass (the lead's rule of 24 Nov,
+/// after the hunt lab): a page write of `slow_write_ms` or more (5 s by
+/// default), a pass longer than its `slow_bound_seconds` (180 s per 4 GiB
+/// of memory by default), more than `stall_share_permille` of its thread
+/// time in writes of `stall_ms` or more (half by default: the lead, 24
+/// Nov; at a quarter it flagged ten fast first-touch hosts on the
+/// referee's table, at half none), or one that ran out of time.
+fn slow_reasons(
+    warm: &WarmReport,
+    slow_write_ms: u64,
+    stall_share_permille: u64,
+) -> Vec<&'static str> {
     let mut reasons = Vec::new();
     if !warm.ran {
         return reasons;
@@ -457,6 +488,12 @@ fn slow_reasons(warm: &WarmReport, slow_write_ms: u64) -> Vec<&'static str> {
     }
     if warm.slow_bound_seconds > 0 && warm.seconds > warm.slow_bound_seconds as f64 {
         reasons.push("slow-pass");
+    }
+    let thread_us = warm.seconds * 1e6 * warm.threads.max(1) as f64;
+    if warm.seconds > 0.0
+        && warm.stalled_us as f64 * 1_000.0 > stall_share_permille as f64 * thread_us
+    {
+        reasons.push("stall-share");
     }
     if !warm.finished {
         reasons.push("warm-timeout");
@@ -475,7 +512,7 @@ struct WarmLine {
 
 impl WarmLine {
     fn of(warm: WarmReport, args: &WarmArgs) -> Self {
-        let slow_reasons = slow_reasons(&warm, args.slow_write_ms);
+        let slow_reasons = slow_reasons(&warm, args.slow_write_ms, args.slow_stall_share_permille);
         Self {
             warm,
             slow_host: !slow_reasons.is_empty(),
@@ -599,6 +636,7 @@ struct PageTimes {
     worst_us: u64,
     over_1ms: u64,
     over_100ms: u64,
+    stalled_us: u64,
     stalls: Vec<WarmStall>,
     stalls_dropped: u64,
 }
@@ -612,6 +650,7 @@ impl PageTimes {
         self.over_1ms += u64::from(us >= 1_000);
         self.over_100ms += u64::from(us >= 100_000);
         if us >= stall_us {
+            self.stalled_us += us;
             if self.stalls.len() < MAX_STALLS {
                 self.stalls.push(WarmStall {
                     at_unix: round(stall_journal::realtime_us() as f64 / 1e6, 3),
@@ -629,6 +668,7 @@ impl PageTimes {
         self.worst_us = self.worst_us.max(other.worst_us);
         self.over_1ms += other.over_1ms;
         self.over_100ms += other.over_100ms;
+        self.stalled_us += other.stalled_us;
         self.stalls_dropped += other.stalls_dropped;
         for stall in other.stalls.drain(..) {
             if self.stalls.len() < MAX_STALLS {
@@ -688,8 +728,12 @@ fn warm(bytes: u64, chunk: u64, cpus: &[u16], max: Duration, stall_ms: u64) -> W
         }
     });
     let seconds = began.elapsed().as_secs_f64();
+    let held = held.into_inner().unwrap();
+    let mapped: u64 = held.iter().map(|mapping| mapping.len as u64).sum();
+    // The peak resident set while every page is still held.
+    let vm_hwm_kb = vm_hwm_kb(&std::fs::read_to_string("/proc/self/status").unwrap_or_default());
     // Every page given back at once.
-    drop(held.into_inner().unwrap());
+    drop(held);
     let mut total = total.into_inner().unwrap();
     let touched = total.pages * PAGE as u64;
     total
@@ -708,8 +752,24 @@ fn warm(bytes: u64, chunk: u64, cpus: &[u16], max: Duration, stall_ms: u64) -> W
         stall_ms,
         stalls: total.stalls,
         stalls_dropped: total.stalls_dropped,
+        stalled_us: total.stalled_us,
+        threads: cpus.len() as u64,
+        mapped_mb: mapped / MB,
+        pages_written: total.pages,
+        vm_hwm_mb: vm_hwm_kb / 1_024,
         ..WarmReport::default()
     }
+}
+
+/// `VmHWM` of a `/proc/<pid>/status`, in kB (0 when absent).
+fn vm_hwm_kb(status: &str) -> u64 {
+    status
+        .lines()
+        .find_map(|line| {
+            let rest = line.strip_prefix("VmHWM:")?;
+            rest.trim().trim_end_matches("kB").trim().parse().ok()
+        })
+        .unwrap_or(0)
 }
 
 fn round(value: f64, places: i32) -> f64 {
@@ -1471,7 +1531,7 @@ fn boot(args: &BootArgs, started: impl FnOnce(&TickThreads)) -> BootRecord {
     };
     let check = check(args.check_seconds, started);
     let verdict = verdict(&warm, &check, args);
-    let slow_reasons = slow_reasons(&warm, args.slow_write_ms);
+    let slow_reasons = slow_reasons(&warm, args.slow_write_ms, args.slow_stall_share_permille);
     BootRecord {
         schema: BOOT_SCHEMA,
         complete: verdict == "ok",
@@ -1692,6 +1752,7 @@ mod tests {
             warm_max_seconds_per_4gb: 300,
             slow_write_ms: 1_000,
             slow_seconds_per_4gb: 180,
+            slow_stall_share_permille: 500,
         };
         assert_eq!(
             verdict(&stopped, &CheckReport::default(), &args),
@@ -1699,7 +1760,7 @@ mod tests {
         );
         assert_eq!(verdict(&report, &CheckReport::default(), &args), "ok");
         // slow_host (integration 4): a pass out of time is one.
-        assert_eq!(slow_reasons(&stopped, 1_000), ["warm-timeout"]);
+        assert_eq!(slow_reasons(&stopped, 5_000, 500), ["warm-timeout"]);
     }
 
     /// Integration 4: the warm pass touches what the referee's
@@ -1757,6 +1818,12 @@ mod tests {
         assert!(pass.finished, "{pass:?}");
         assert_eq!(pass.touched_mb, 4);
         assert_eq!(pass.stalls.len(), MAX_STALLS);
+        // The proof of the touch: what was mapped, the pages written and
+        // the peak resident set at least that.
+        assert_eq!((pass.mapped_mb, pass.pages_written), (4, 1_024));
+        assert!(pass.vm_hwm_mb >= 4, "{pass:?}");
+        assert_eq!(vm_hwm_kb("Name:\tx\nVmHWM:\t  123456 kB\nVmRSS:\t1 kB\n"), 123_456);
+        assert_eq!(vm_hwm_kb("Name:\tx\n"), 0);
         assert_eq!(pass.stalls_dropped, 1_024 - MAX_STALLS as u64);
 
         // The judgement.
@@ -1769,18 +1836,46 @@ mod tests {
             slow_bound_seconds: 180,
             ..WarmReport::default()
         };
-        assert!(slow_reasons(&fine, 1_000).is_empty(), "95 s on a 4 GB guest is not slow");
-        let stalled = WarmReport {
+        assert!(
+            slow_reasons(&fine, 5_000, 500).is_empty(),
+            "95 s on a 4 GB guest is not slow"
+        );
+        // The hunt's warmed edges: writes of up to 1.93 s, then an hour clean.
+        let hunt = WarmReport {
             worst_page_us: 1_930_000,
+            stalled_us: 2_690_000,
+            threads: 2,
             ..fine.clone()
         };
-        assert_eq!(slow_reasons(&stalled, 1_000), ["page-stall"]);
+        assert!(
+            slow_reasons(&hunt, 5_000, 500).is_empty(),
+            "the hunt's touched edges"
+        );
+        let stalled = WarmReport {
+            worst_page_us: 5_000_000,
+            ..fine.clone()
+        };
+        assert_eq!(slow_reasons(&stalled, 5_000, 500), ["page-stall"]);
         let slow = WarmReport {
             seconds: 241.0,
             ..fine.clone()
         };
-        assert_eq!(slow_reasons(&slow, 1_000), ["slow-pass"]);
-        assert!(slow_reasons(&WarmReport::default(), 1_000).is_empty(), "no pass");
+        assert_eq!(slow_reasons(&slow, 5_000, 500), ["slow-pass"]);
+        // 95 s on two threads is 190 thread-s: half is 95 s.
+        let share = |stalled_us| WarmReport {
+            stalled_us,
+            threads: 2,
+            ..fine.clone()
+        };
+        assert!(slow_reasons(&share(94_000_000), 5_000, 500).is_empty());
+        assert_eq!(
+            slow_reasons(&share(96_000_000), 5_000, 500),
+            ["stall-share"]
+        );
+        assert!(
+            slow_reasons(&WarmReport::default(), 5_000, 500).is_empty(),
+            "no pass"
+        );
         let line = serde_json::to_value(WarmLine::of(stalled, &WarmArgs::default())).unwrap();
         assert_eq!(line["slow_host"], true);
         assert_eq!(line["slow_reasons"][0], "page-stall");
@@ -2137,6 +2232,7 @@ mod tests {
             warm_max_seconds_per_4gb: 300,
             slow_write_ms: 1_000,
             slow_seconds_per_4gb: 180,
+            slow_stall_share_permille: 500,
         };
         // On a busy machine a held thread may also wait for its CPU once it
         // wakes (`starved`, not a stop): the check is given three tries.
