@@ -112,21 +112,25 @@ struct WarmArgs {
     /// (eligible for transparent huge pages as the system allows).
     #[arg(long, default_value_t = 64)]
     chunk_mb: u64,
-    /// The pass stops here, finished or not. Default: 60 s per GiB to
-    /// touch, at least 120 s (the hunt lab took 43 to 79 s for 2.3 to 2.5
-    /// GB on a 4 GB guest).
+    /// The pass stops here, finished or not. Default: `max_seconds_per_4gb`
+    /// for every 4 GiB of the node's memory (MemTotal), at least that.
     #[arg(long)]
     max_seconds: Option<u64>,
+    /// The default limit per 4 GiB of memory: the hunt lab took 43 to 79 s
+    /// on 4 GB guests, another lab of 24 Nov 83 to 95 s, and one Tokyo edge
+    /// over 240 s.
+    #[arg(long, default_value_t = 300)]
+    max_seconds_per_4gb: u64,
     /// A write that takes this long is listed in `stalls`.
     #[arg(long, default_value_t = 100)]
     stall_ms: u64,
     /// The host is `slow_host` when one page write takes this long.
     #[arg(long, default_value_t = 1_000)]
     slow_write_ms: u64,
-    /// ... or when the pass takes more than this many seconds a GiB
-    /// touched.
-    #[arg(long, default_value_t = 40)]
-    slow_seconds_per_gib: u64,
+    /// ... or when the pass takes more than this many seconds per 4 GiB of
+    /// the node's memory (MemTotal).
+    #[arg(long, default_value_t = 180)]
+    slow_seconds_per_4gb: u64,
 }
 
 const DEFAULT_LEAVE_MB: u64 = 300;
@@ -137,9 +141,10 @@ impl Default for WarmArgs {
             leave_mb: DEFAULT_LEAVE_MB,
             chunk_mb: 64,
             max_seconds: None,
+            max_seconds_per_4gb: 300,
             stall_ms: 100,
             slow_write_ms: 1_000,
-            slow_seconds_per_gib: 40,
+            slow_seconds_per_4gb: 180,
         }
     }
 }
@@ -218,15 +223,18 @@ struct BootArgs {
     /// The warm pass's `--leave-mb`.
     #[arg(long, default_value_t = DEFAULT_LEAVE_MB)]
     warm_leave_mb: u64,
-    /// The warm pass's `--max-seconds` (default: 60 s a GiB, at least 120).
+    /// The warm pass's `--max-seconds` (default: 300 s per 4 GiB of memory).
     #[arg(long)]
     warm_max_seconds: Option<u64>,
+    /// The warm pass's `--max-seconds-per-4gb`.
+    #[arg(long, default_value_t = 300)]
+    warm_max_seconds_per_4gb: u64,
     /// The warm pass's `--slow-write-ms`.
     #[arg(long, default_value_t = 1_000)]
     slow_write_ms: u64,
-    /// The warm pass's `--slow-seconds-per-gib`.
-    #[arg(long, default_value_t = 40)]
-    slow_seconds_per_gib: u64,
+    /// The warm pass's `--slow-seconds-per-4gb`.
+    #[arg(long, default_value_t = 180)]
+    slow_seconds_per_4gb: u64,
 }
 
 impl BootArgs {
@@ -234,8 +242,9 @@ impl BootArgs {
         WarmArgs {
             leave_mb: self.warm_leave_mb,
             max_seconds: self.warm_max_seconds,
+            max_seconds_per_4gb: self.warm_max_seconds_per_4gb,
             slow_write_ms: self.slow_write_ms,
-            slow_seconds_per_gib: self.slow_seconds_per_gib,
+            slow_seconds_per_4gb: self.slow_seconds_per_4gb,
             ..WarmArgs::default()
         }
     }
@@ -409,6 +418,9 @@ struct WarmReport {
     touched_mb: u64,
     leave_mb: u64,
     max_seconds: u64,
+    /// MemTotal, and the time past which the pass marks the host slow.
+    mem_total_mb: u64,
+    slow_bound_seconds: u64,
     /// Every write of `stall_ms` or more (at most MAX_STALLS; the rest
     /// counted in `stalls_dropped`).
     stall_ms: u64,
@@ -432,9 +444,10 @@ struct WarmStall {
 const MAX_STALLS: usize = 512;
 
 /// The `slow_host` judgement of a warm pass (integration 4, after the hunt
-/// lab): a page write of `slow_write_ms` or more, a pass slower than
-/// `slow_seconds_per_gib` a GiB touched, or one that ran out of time.
-fn slow_reasons(warm: &WarmReport, slow_write_ms: u64, slow_seconds_per_gib: u64) -> Vec<&'static str> {
+/// lab): a page write of `slow_write_ms` or more, a pass longer than its
+/// `slow_bound_seconds` (180 s per 4 GiB of memory by default), or one
+/// that ran out of time.
+fn slow_reasons(warm: &WarmReport, slow_write_ms: u64) -> Vec<&'static str> {
     let mut reasons = Vec::new();
     if !warm.ran {
         return reasons;
@@ -442,7 +455,7 @@ fn slow_reasons(warm: &WarmReport, slow_write_ms: u64, slow_seconds_per_gib: u64
     if warm.worst_page_us >= slow_write_ms * 1_000 {
         reasons.push("page-stall");
     }
-    if warm.gib > 0.0 && warm.seconds > warm.gib * slow_seconds_per_gib as f64 {
+    if warm.slow_bound_seconds > 0 && warm.seconds > warm.slow_bound_seconds as f64 {
         reasons.push("slow-pass");
     }
     if !warm.finished {
@@ -462,7 +475,7 @@ struct WarmLine {
 
 impl WarmLine {
     fn of(warm: WarmReport, args: &WarmArgs) -> Self {
-        let slow_reasons = slow_reasons(&warm, args.slow_write_ms, args.slow_seconds_per_gib);
+        let slow_reasons = slow_reasons(&warm, args.slow_write_ms);
         Self {
             warm,
             slow_host: !slow_reasons.is_empty(),
@@ -485,21 +498,32 @@ fn warm_bytes(available: u64, leave_mb: u64) -> u64 {
     available.saturating_sub(leave_mb * MB)
 }
 
-/// The default time limit of a pass of `bytes`: 60 s a GiB, at least 120.
-fn default_max_seconds(bytes: u64) -> u64 {
-    (bytes as f64 / GIB * 60.0).ceil().max(120.0) as u64
+/// `per_4gb` seconds for every 4 GiB of `total` memory, at least `per_4gb`.
+fn per_4gb_seconds(total: u64, per_4gb: u64) -> u64 {
+    ((total as f64 / (4.0 * GIB)) * per_4gb as f64)
+        .ceil()
+        .max(per_4gb as f64) as u64
+}
+
+/// `MemTotal` of `/proc/meminfo`, in bytes.
+fn mem_total_bytes(meminfo: &str) -> Option<u64> {
+    meminfo.lines().find_map(|line| {
+        let rest = line.strip_prefix("MemTotal:")?;
+        let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+        Some(kb * 1_024)
+    })
 }
 
 /// The warm pass of `warm` and `boot`, sized from `/proc/meminfo`.
 fn warm_node(args: WarmArgs) -> WarmReport {
-    let available = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .as_deref()
-        .and_then(mem_available_bytes)
-        .unwrap_or(0);
+    let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let available = mem_available_bytes(&meminfo).unwrap_or(0);
+    let total = mem_total_bytes(&meminfo).unwrap_or(available);
     let cpus = stall_journal::allowed_cpus();
     let bytes = warm_bytes(available, args.leave_mb);
-    let max_seconds = args.max_seconds.unwrap_or_else(|| default_max_seconds(bytes));
+    let max_seconds = args
+        .max_seconds
+        .unwrap_or_else(|| per_4gb_seconds(total, args.max_seconds_per_4gb));
     let mut report = warm(
         bytes,
         args.chunk_mb.max(1) * MB,
@@ -510,6 +534,8 @@ fn warm_node(args: WarmArgs) -> WarmReport {
     report.mem_available_before_mb = available / MB;
     report.leave_mb = args.leave_mb;
     report.max_seconds = max_seconds;
+    report.mem_total_mb = total / MB;
+    report.slow_bound_seconds = per_4gb_seconds(total, args.slow_seconds_per_4gb);
     report.thp = std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled")
         .map(|text| text.trim().to_owned())
         .unwrap_or_default();
@@ -1445,7 +1471,7 @@ fn boot(args: &BootArgs, started: impl FnOnce(&TickThreads)) -> BootRecord {
     };
     let check = check(args.check_seconds, started);
     let verdict = verdict(&warm, &check, args);
-    let slow_reasons = slow_reasons(&warm, args.slow_write_ms, args.slow_seconds_per_gib);
+    let slow_reasons = slow_reasons(&warm, args.slow_write_ms);
     BootRecord {
         schema: BOOT_SCHEMA,
         complete: verdict == "ok",
@@ -1663,8 +1689,9 @@ mod tests {
             max_steal_permille: 10,
             warm_leave_mb: DEFAULT_LEAVE_MB,
             warm_max_seconds: None,
+            warm_max_seconds_per_4gb: 300,
             slow_write_ms: 1_000,
-            slow_seconds_per_gib: 40,
+            slow_seconds_per_4gb: 180,
         };
         assert_eq!(
             verdict(&stopped, &CheckReport::default(), &args),
@@ -1672,7 +1699,7 @@ mod tests {
         );
         assert_eq!(verdict(&report, &CheckReport::default(), &args), "ok");
         // slow_host (integration 4): a pass out of time is one.
-        assert_eq!(slow_reasons(&stopped, 1_000, 40), ["warm-timeout"]);
+        assert_eq!(slow_reasons(&stopped, 1_000), ["warm-timeout"]);
     }
 
     /// Integration 4: the warm pass touches what the referee's
@@ -1690,17 +1717,24 @@ mod tests {
         };
         assert_eq!((parsed.leave_mb, parsed.max_seconds), (300, None));
         let Command::Boot(boot) = parse(
-            "nodecheck boot --out o --warm --warm-max-seconds 240 --slow-write-ms 500",
+            "nodecheck boot --out o --warm --warm-max-seconds 240 --slow-write-ms 500 --slow-seconds-per-4gb 200",
         ) else {
             panic!("boot");
         };
         let warm_args = boot.warm_args();
         assert_eq!(warm_args.max_seconds, Some(240));
         assert_eq!((warm_args.slow_write_ms, warm_args.leave_mb), (500, 300));
-        // 60 s a GiB, at least 120: a 4 GB guest's 3.4 GiB is 205 s.
-        assert_eq!(default_max_seconds(GIB as u64), 120);
-        assert_eq!(default_max_seconds((3.4 * GIB) as u64), 204);
-        assert_eq!(default_max_seconds(16 * GIB as u64), 960);
+        assert_eq!((warm_args.slow_seconds_per_4gb, warm_args.max_seconds_per_4gb), (200, 300));
+        // 300 s per 4 GiB of memory, at least 300: a 4 GB guest (3.8 GiB
+        // MemTotal) 300 s, a 16 GB one 1,200 s; the slow bound 180 s per
+        // 4 GiB.
+        assert_eq!(per_4gb_seconds((3.8 * GIB) as u64, 300), 300);
+        assert_eq!(per_4gb_seconds(16 * GIB as u64, 300), 1_200);
+        assert_eq!(per_4gb_seconds(8 * GIB as u64, 180), 360);
+        assert_eq!(
+            mem_total_bytes("MemTotal:        4005060 kB\nMemAvailable: 1 kB\n"),
+            Some(4_005_060 * 1_024)
+        );
 
         // Every write of `stall_ms` or more is listed with where it was.
         let mut times = PageTimes::default();
@@ -1729,27 +1763,28 @@ mod tests {
         let fine = WarmReport {
             ran: true,
             finished: true,
-            gib: 2.4,
-            seconds: 79.0,
+            gib: 3.4,
+            seconds: 95.0,
             worst_page_us: 900_000,
+            slow_bound_seconds: 180,
             ..WarmReport::default()
         };
-        assert!(slow_reasons(&fine, 1_000, 40).is_empty(), "79 s for 2.4 GiB is 33 s a GiB");
+        assert!(slow_reasons(&fine, 1_000).is_empty(), "95 s on a 4 GB guest is not slow");
         let stalled = WarmReport {
             worst_page_us: 1_930_000,
             ..fine.clone()
         };
-        assert_eq!(slow_reasons(&stalled, 1_000, 40), ["page-stall"]);
+        assert_eq!(slow_reasons(&stalled, 1_000), ["page-stall"]);
         let slow = WarmReport {
-            seconds: 97.0,
+            seconds: 241.0,
             ..fine.clone()
         };
-        assert_eq!(slow_reasons(&slow, 1_000, 40), ["slow-pass"]);
-        assert!(slow_reasons(&WarmReport::default(), 1_000, 40).is_empty(), "no pass");
+        assert_eq!(slow_reasons(&slow, 1_000), ["slow-pass"]);
+        assert!(slow_reasons(&WarmReport::default(), 1_000).is_empty(), "no pass");
         let line = serde_json::to_value(WarmLine::of(stalled, &WarmArgs::default())).unwrap();
         assert_eq!(line["slow_host"], true);
         assert_eq!(line["slow_reasons"][0], "page-stall");
-        assert_eq!(line["gib"], 2.4, "the pass's fields at the top level");
+        assert_eq!(line["gib"], 3.4, "the pass's fields at the top level");
     }
 
     #[test]
@@ -2099,8 +2134,9 @@ mod tests {
             max_steal_permille: 1_000,
             warm_leave_mb: DEFAULT_LEAVE_MB,
             warm_max_seconds: None,
+            warm_max_seconds_per_4gb: 300,
             slow_write_ms: 1_000,
-            slow_seconds_per_gib: 40,
+            slow_seconds_per_4gb: 180,
         };
         // On a busy machine a held thread may also wait for its CPU once it
         // wakes (`starved`, not a stop): the check is given three tries.
