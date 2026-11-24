@@ -4456,19 +4456,22 @@ async fn main() -> Result<()> {
         args.steering_ttl_seconds.max(1),
         args.telemetry_interval_ms,
     )
-    .with_assignment_udp_in_region(args.assignment_udp_in_region)
-    .with_rebalance(
-        (args.client_udp_rebalance
-            && args.client_udp_bind.is_some()
-            && cache_mesh_role == CacheMeshRole::Edge)
-            .then(|| RebalanceConfig {
-                target_permille: args.rebalance_target_permille,
-                margin_permille: args.client_udp_rebalance_margin_permille,
-                interval: Duration::from_millis(args.client_udp_rebalance_interval_ms.max(500)),
-                spread: Duration::from_millis(args.client_udp_drain_spread_ms),
-                to_mean: args.client_udp_rebalance_to_mean,
-            }),
-    );
+    .with_assignment_udp_in_region(args.assignment_udp_in_region);
+    let rebalance_config = RebalanceConfig {
+        target_permille: args.rebalance_target_permille,
+        margin_permille: args.client_udp_rebalance_margin_permille,
+        interval: Duration::from_millis(args.client_udp_rebalance_interval_ms.max(500)),
+        spread: Duration::from_millis(args.client_udp_drain_spread_ms),
+        to_mean: args.client_udp_rebalance_to_mean,
+    };
+    let router = router
+        .with_region_rebalance(args.client_udp_rebalance.then_some(rebalance_config))
+        .with_rebalance(
+            (args.client_udp_rebalance
+                && args.client_udp_bind.is_some()
+                && cache_mesh_role == CacheMeshRole::Edge)
+                .then_some(rebalance_config),
+        );
     // C 3.1: a node that starts drained takes its place once warm.
     let start_task = if cache_mesh_role == CacheMeshRole::Edge {
         tokio::spawn(lifecycle::start_edge(
@@ -20562,6 +20565,10 @@ struct AppRouter {
     /// Wave 9 C1: this edge's rebalance of its UDP listeners (`None`: off)
     /// and its rounds.
     rebalance: Option<RebalanceConfig>,
+    /// The region's rebalance rules as an entry point judges a mover by
+    /// them (fix 4, F6b): set on every node, entry points included, where
+    /// `rebalance` is set on edges alone.
+    region_rebalance: Option<RebalanceConfig>,
     rebalance_state: Arc<StdMutex<edge_udp::RebalanceState>>,
     /// Wave 9 C4: the movers this entry point placed lately (when, where,
     /// the session's key: a session is logged once per cache).
@@ -21031,6 +21038,7 @@ impl AppRouter {
             assignment_policy: AssignmentPolicy::default(),
             assignment_udp_in_region: true,
             rebalance: None,
+            region_rebalance: None,
             rebalance_state: Arc::default(),
             recent_mover_log: Arc::default(),
             pending_load: Arc::default(),
@@ -21168,6 +21176,14 @@ impl AppRouter {
     /// Wave 9 C1: rebalance this edge's UDP listeners (`None`: never).
     fn with_rebalance(mut self, rebalance: Option<RebalanceConfig>) -> Self {
         self.rebalance = rebalance;
+        self.region_rebalance = self.region_rebalance.or(rebalance);
+        self
+    }
+
+    /// The region's rebalance rules for this node's assignments (an entry
+    /// point's too): see [`Self::region_rebalance`].
+    fn with_region_rebalance(mut self, rebalance: Option<RebalanceConfig>) -> Self {
+        self.region_rebalance = rebalance;
         self
     }
 
@@ -22675,7 +22691,11 @@ impl AppRouter {
         // included, as the edge plans over them) plus half the margin.
         let shed_level = {
             let target = self.assignment_policy.rebalance_target_permille;
-            let region_mean = self.rebalance.filter(|config| config.to_mean).and_then(|config| {
+            // The region's rules, not this node's own rebalance (fix 4,
+            // F6b): an entry point does not rebalance, and judged every
+            // R3 shed (an edge under the target, over the mean) a drain's
+            // mover, apportioned over the drain's movers of before.
+            let region_mean = self.region_rebalance.filter(|config| config.to_mean).and_then(|config| {
                 let loads = candidates_all
                     .iter()
                     .filter(|cache| {
@@ -22706,9 +22726,21 @@ impl AppRouter {
         // strictly, otherwise unless that leaves none of the region's live
         // caches (its held legs count as live). The legs it holds never.
         let mut candidates = if rebalancing {
+            // Strictly without the edges it left, but for one that has
+            // since come back (fix 4, F6b): live, not draining, under the
+            // shed level. A listener skips an edge it moved off for 3 s
+            // after the move (B 3.5); an edge drained, restarted and given
+            // its share back by R3 in that time was its only receiver, and
+            // every such listener was taken back at once.
             candidates_all
                 .into_iter()
-                .filter(|cache| !skipped(&cache.node_id))
+                .filter(|cache| {
+                    !skipped(&cache.node_id)
+                        || (cache.fresh
+                            && !cache.draining
+                            && f64::from(cache.load_permille) < shed_level
+                            && heard_lately(&cache.node_id))
+                })
                 .collect()
         } else if reader.skip.is_empty() {
             candidates_all

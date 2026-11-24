@@ -272,7 +272,16 @@ impl Region {
                 Arc::clone(&mesh),
                 TelemetryAggregator::default(),
             )
-            .with_client_udp_port(Some(port));
+            .with_client_udp_port(Some(port))
+            // The region's rebalance rules, as a deploy's entry points
+            // have them (their own flags; fix 4, F6b).
+            .with_region_rebalance(shape.rebalance.then_some(RebalanceConfig {
+                target_permille: 800,
+                margin_permille: 150,
+                interval: Duration::from_secs(3),
+                spread: Duration::from_millis(500),
+                to_mean: true,
+            }));
             router.cache_mesh_role = CacheMeshRole::Distributor;
             let socket = UdpSocket::bind((ip, port)).await.unwrap();
             let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, 16);
@@ -933,7 +942,7 @@ async fn listen(
                 config.sid,
                 director.spare(),
                 director.want(),
-                director.skipped(now)
+                director.skip_detail(now)
             );
         }
         let wake = session
@@ -1576,12 +1585,12 @@ fn assert_kill_replaced(name: &str, runs: &[ListenerRun], killed: &str, marks: M
 
 /// A drain when no other edge has room for a redundant leg (fix 4, F6a,
 /// lp2c10-a-drain): the entry grants the drained legs no replacement and
-/// names only a spare. Each drained leg is released at that answer beside
-/// the leg that delivers (B 3.5 step 5), so the drain ends within its
-/// bound, nothing is cut at the edge's grace and nothing is missing; the
-/// listeners are on one path until room comes (not claimed, B 3.11).
+/// names only a spare. Each drained leg is kept, served by its draining
+/// edge (nobody on one path), its replacement asked for again at 250 ms,
+/// 500 ms, 1 s, 2 s; once room comes the legs are handed over and the
+/// drain ends within [`DRAIN_BOUND`] of the room, nothing cut at the grace.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_drain_with_no_room_elsewhere_ends_in_its_bound() {
+async fn a_drain_with_no_room_elsewhere_waits_for_room_on_two_paths() {
     let _serial = SERIAL.lock().await;
     let region = Region::start(232, Payload::Pcm, [100; 4]).await;
     let crowd = Crowd::join(&region, listeners("no-room", 8)).await;
@@ -1593,28 +1602,45 @@ async fn a_drain_with_no_room_elsewhere_ends_in_its_bound() {
     }
     tokio::time::sleep(ADVERTISE_EVERY * 3).await;
     let edge = region.edge(0);
-    assert!(region.legs_at(0) > 0, "{} holds legs", region.node(0));
-    let took = drain_timed(&region, &crowd, 0).await;
-    eprintln!("a_drain_with_no_room_elsewhere: drained in {took:?}");
+    let held = region.legs_at(0);
+    assert!(held > 0, "{} holds legs", region.node(0));
+    let start = now_us();
+    region.set_draining(0, true).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(region.legs_at(0), held, "kept while no edge has room");
+    for index in 1..4 {
+        region.set_base(index, 100);
+    }
+    let room = Instant::now();
+    drain_watched(&region, &crowd, 0, DRAIN_BOUND).await;
+    let took = room.elapsed();
+    eprintln!("a_drain_with_no_room_elsewhere: drained {took:?} after room came");
+    assert!(took <= DRAIN_BOUND, "{took:?}");
+    let marks = Marks {
+        start,
+        end: now_us(),
+    };
+    region.set_draining(0, false).await;
+    let (runs, _last, _sent) = finish(&region, crowd, marks).await;
     assert_eq!(
         edge.stats.moves_expired.load(Ordering::Relaxed),
         0,
         "nothing cut at the grace"
     );
     drop(edge);
-    region.set_draining(0, false).await;
-    for live in &crowd.lives {
-        live.stop.store(true, Ordering::Relaxed);
-    }
-    let runs = crowd.finish().await;
     region.shutdown().await;
     for run in &runs {
-        assert!(
-            !run.replacements.iter().any(|replacement| replacement.kind == ReplacementKind::Interrupt),
+        assert_eq!(
+            single_path_in(run, marks).0,
+            0,
             "{}: {:?}",
             run.sid,
-            run.replacements
+            run.single_spans_us
         );
+        // Hand-overs, each as long as the wait for room and a level leg.
+        for replacement in &run.replacements {
+            assert_eq!(replacement.kind, ReplacementKind::Handover, "{}: {replacement:?}", run.sid);
+        }
     }
 }
 
@@ -1683,17 +1709,33 @@ async fn two_drains() {
     );
 }
 
-/// A roll of three of the four edges (B 3.11 "Edge roll"): each drained,
-/// stopped, started again and back in the region before the next. Before
-/// each drain no listener is without a leg or on one path; nothing missing
-/// over the whole roll.
+/// A roll of three of the four edges (B 3.11 "Edge roll"), the edges
+/// rebalancing to the region's mean (rule R3) as a deploy's do: each
+/// drained, stopped, started again empty, and given its share back by the
+/// others before the next is drained. Nothing missing over the whole roll,
+/// every drain within [`DRAIN_BOUND`], every replacement a hand-over (no
+/// take-back: fix 4, F6b, lp2c10-a-drain took a resumed edge's moves back 7
+/// times in 190 s), and no listener on one path longer than
+/// [`ROLL_SINGLE_PATH_BOUND`] (lp2c6-g-edges: 4.1 s).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn roll_of_three_edges() {
     let _serial = SERIAL.lock().await;
-    let region = Region::start(152, Payload::Pcm, [100; 4]).await;
-    let crowd = Crowd::join(&region, listeners("roll", 8)).await;
+    let region = Region::start_shaped(
+        152,
+        // 24 legs at 60 permille: three edges hold them all at 480 (the
+        // redundant gate at 800 leaves room for a drain's movers), and a
+        // restarted edge is 120 under the mean, so R3 gives it its share.
+        Shape {
+            leg_permille: 60,
+            ..rebalancing(4)
+        },
+    )
+    .await;
+    let region_started = Instant::now();
+    let crowd = Crowd::join(&region, listeners("roll", 12)).await;
     steady(STEADY_BEFORE).await;
     let start = now_us();
+    let mut shares = Vec::new();
     for index in 0..3 {
         until(
             "every listener on two paths before the drain",
@@ -1705,11 +1747,16 @@ async fn roll_of_three_edges() {
             .lives
             .iter()
             .all(|live| live.held.load(Ordering::Relaxed) >= 1));
-        drain_watched(&region, &crowd, index, Duration::from_secs(6)).await;
+        drain_timed(&region, &crowd, index).await;
         region.stop(index).await;
         region.start_edge(index).await;
-        // Advertised again, warm: the next step waits for two paths.
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Back in the region, empty: the others shed to the mean (R3) once
+        // their legs are past the rebalance's 10 s.
+        let began = Instant::now();
+        while region.legs_at(index) < 2 && began.elapsed() < Duration::from_secs(25) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        shares.push((region.node(index), region.legs_at(index), began.elapsed()));
     }
     let marks = Marks {
         start,
@@ -1717,6 +1764,22 @@ async fn roll_of_three_edges() {
     };
     let (runs, last, sent) = finish(&region, crowd, marks).await;
     region.shutdown().await;
+    eprintln!("roll_of_three_edges: shares taken back {shares:?}");
+    for run in &runs {
+        for replacement in &run.replacements {
+            eprintln!(
+                "roll_of_three_edges: {} {:>8} ms {} -> {} {} {:?} {:?}",
+                run.sid,
+                replacement.at.saturating_duration_since(region_started).as_millis(),
+                replacement.from,
+                replacement.to,
+                replacement.reason,
+                replacement.kind,
+                replacement.handover
+            );
+        }
+        eprintln!("roll_of_three_edges: {} stats {:?}", run.sid, run.stats);
+    }
     assert_the_rule(
         "roll_of_three_edges",
         &runs,
@@ -1725,17 +1788,27 @@ async fn roll_of_three_edges() {
         &sent,
         Payload::Pcm.part_us(),
     );
+    for (node, legs, _) in &shares {
+        assert!(*legs >= 2, "{node} took its share back: {shares:?}");
+    }
     for run in &runs {
-        assert_eq!(
-            single_path_in(run, marks).0,
-            0,
-            "{}: {:?}",
+        let (_, longest) = single_path_in(run, marks);
+        assert!(
+            longest <= ROLL_SINGLE_PATH_BOUND.as_micros() as u64,
+            "{}: {longest} us on one path: {:?} {:?}",
             run.sid,
-            run.single_spans_us
+            run.single_spans_us,
+            run.replacements
         );
         assert_handovers(run, &run.replacements);
     }
 }
+
+/// The longest a listener is on one path in a roll (fix 4, F6b): none, by
+/// design, for a planned move (make before break); a leg that its edge
+/// stops while its replacement joins (B rule 6's last `MOVE`) is replaced
+/// as a kill is, 70 ms + r. Asserted at the kill's bound.
+const ROLL_SINGLE_PATH_BOUND: Duration = Duration::from_micros(KILL_BOUND_US);
 
 /// C 3.2 against B 3.12 (integration 2): SIGTERM on an edge that holds legs
 /// of two-path listeners, and a moved LL-HLS reader that still fetches, is
