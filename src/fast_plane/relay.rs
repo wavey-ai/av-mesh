@@ -1195,11 +1195,22 @@ impl RelayDownstreamForwarder {
             stats.forwarded[class.index()].fetch_add(sent as u64, Ordering::Relaxed);
             retry.extend(sends[sent..].iter().map(|send| (group, *send)));
         }
+        // A socket that refused one datagram (its send buffer is full) is not
+        // tried again in this window: one more failing syscall per symbol,
+        // up to 64 for each child, is kernel time on the video thread while
+        // the queue drains (the lease path's `send_rest` stops the same way).
+        let mut full: Option<std::os::fd::RawFd> = None;
         for (group, send) in retry.drain(..) {
             let data = batch.data(usize::from(send.message));
             let target = self.class_target(class, usize::from(send.path));
+            let fd = self.class_fd(class, group);
+            if full == Some(fd) {
+                self.errors.fetch_add(1, Ordering::Relaxed);
+                stats.would_block.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             let started = Instant::now();
-            match sys::send_batch(self.class_fd(class, group), 1, |_| (data, target)) {
+            match sys::send_batch(fd, 1, |_| (data, target)) {
                 Ok(1) => {
                     self.record_forward_success(send.role, data.len(), started.elapsed());
                     stats.forwarded[class.index()].fetch_add(1, Ordering::Relaxed);
@@ -1214,6 +1225,7 @@ impl RelayDownstreamForwarder {
                     // other parent covers the symbol.
                     self.errors.fetch_add(1, Ordering::Relaxed);
                     stats.would_block.fetch_add(1, Ordering::Relaxed);
+                    full = Some(fd);
                 }
             }
         }
