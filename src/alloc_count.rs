@@ -111,6 +111,39 @@ fn note(free: bool) {
     let _ = NOTING.try_with(|noting| noting.set(false));
 }
 
+/// Live bytes by size class (memory round): under 4 KiB, under 64 KiB,
+/// under 1 MiB, and 1 MiB or more (a 4K part).
+static LIVE_BYTES: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+fn size_class(size: usize) -> usize {
+    match size {
+        0..4_096 => 0,
+        4_096..65_536 => 1,
+        65_536..1_048_576 => 2,
+        _ => 3,
+    }
+}
+
+fn live(size: usize, add: bool) {
+    let class = &LIVE_BYTES[size_class(size)];
+    if add {
+        class.fetch_add(size as u64, Ordering::Relaxed);
+    } else {
+        class.fetch_sub(size as u64, Ordering::Relaxed);
+    }
+}
+
+/// The bytes allocated and not yet freed, by size class: under 4 KiB,
+/// under 64 KiB, under 1 MiB, 1 MiB or more.
+pub fn live_bytes_by_class() -> [u64; 4] {
+    std::array::from_fn(|class| LIVE_BYTES[class].load(Ordering::Relaxed))
+}
+
 struct Counting;
 
 // SAFETY: every call is passed on to the system allocator unchanged.
@@ -118,17 +151,26 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         note(false);
         // SAFETY: as the caller's.
-        unsafe { System.alloc(layout) }
+        let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            live(layout.size(), true);
+        }
+        ptr
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         note(false);
         // SAFETY: as the caller's.
-        unsafe { System.alloc_zeroed(layout) }
+        let ptr = unsafe { System.alloc_zeroed(layout) };
+        if !ptr.is_null() {
+            live(layout.size(), true);
+        }
+        ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         note(true);
+        live(layout.size(), false);
         // SAFETY: as the caller's.
         unsafe { System.dealloc(ptr, layout) }
     }
@@ -136,7 +178,12 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         note(false);
         // SAFETY: as the caller's.
-        unsafe { System.realloc(ptr, layout, new_size) }
+        let new = unsafe { System.realloc(ptr, layout, new_size) };
+        if !new.is_null() {
+            live(layout.size(), false);
+            live(new_size, true);
+        }
+        new
     }
 }
 
