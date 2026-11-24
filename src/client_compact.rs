@@ -1172,6 +1172,10 @@ struct Hole {
     /// It is waiting for the rate cap's tokens, and has been counted in
     /// `nacks_capped` for that wait (once a wait, not once a poll).
     capped: bool,
+    /// It was due when no leg could be asked for it: it waits
+    /// [`SLOW_NACK`], or until a leg can be asked
+    /// ([`CompactReceiver::set_leg_nack`]).
+    waiting: bool,
 }
 
 #[derive(Debug)]
@@ -1420,7 +1424,21 @@ impl CompactReceiver {
 
     /// Whether the session NACKs on `leg` (a leg is open with it on).
     pub fn set_leg_nack(&mut self, leg: LegId, nack: bool) {
-        self.legs[leg.index()].nack = nack;
+        let rx = &mut self.legs[leg.index()];
+        let now_asked = nack && rx.open && !rx.nack;
+        rx.nack = nack;
+        if now_asked {
+            self.rearm_waiting();
+        }
+    }
+
+    /// The holes that were due when no leg could be asked for them are due
+    /// now: a leg can be.
+    fn rearm_waiting(&mut self) {
+        for hole in self.holes.values_mut().filter(|hole| hole.waiting) {
+            hole.waiting = false;
+            hole.next_nack = hole.next_nack.min(hole.since);
+        }
     }
 
     /// The wait before the first NACK of a hole that a later part showed:
@@ -1453,6 +1471,7 @@ impl CompactReceiver {
             nack: true,
             ..LegRx::default()
         };
+        self.rearm_waiting();
         Some(LegId(index as u8))
     }
 
@@ -1573,6 +1592,7 @@ impl CompactReceiver {
                 gap: false,
                 silence_nacks: 0,
                 capped: false,
+                waiting: false,
             });
             self.joint.entry(hole).or_insert(Joint {
                 came: false,
@@ -1775,6 +1795,7 @@ impl CompactReceiver {
                 gap: false,
                 silence_nacks: 0,
                 capped: false,
+                waiting: false,
             });
         }
     }
@@ -1823,6 +1844,7 @@ impl CompactReceiver {
                     gap: true,
                     silence_nacks: 0,
                     capped: false,
+                    waiting: false,
                 },
             );
         }
@@ -2021,6 +2043,7 @@ impl CompactReceiver {
                                 gap: false,
                                 silence_nacks: 0,
                                 capped: false,
+                                waiting: false,
                             });
                             // Asked for during the silence that this part
                             // ends: the answers went into the burst, so it
@@ -2524,10 +2547,14 @@ impl CompactReceiver {
                 continue;
             }
             let Some(nearest) = nearest else {
-                // No edge would answer it now: asked again a retry later.
-                hole.next_nack = now + retry;
+                // No edge would answer it now (a leg not yet live, or every
+                // leg's edge started after it): it waits for a leg that can
+                // be asked, or the slow NACK's time, not every retry.
+                hole.next_nack = now + SLOW_NACK;
+                hole.waiting = true;
                 continue;
             };
+            hole.waiting = false;
             let first = hole.nacks == 0 && hole.silence_nacks == 0;
             hole.capped = false;
             if silent.is_some() && budget > 0 {
@@ -4415,6 +4442,42 @@ mod tests {
         let third = receiver.nacks_due(first + Duration::from_millis(9), 64);
         assert_eq!(third.leg(b), [40]);
         assert!(third.leg(L).is_empty());
+    }
+
+    /// B X3 review: a hole that no leg can be asked for (no leg NACKs yet,
+    /// or every leg's edge started after it) waits the slow NACK, not one
+    /// retry, and is asked at once when a leg can be.
+    #[test]
+    fn a_hole_no_leg_can_be_asked_for_waits_for_a_leg() {
+        let (mut receiver, b) = two_legs(0);
+        receiver.set_nack_timing(NackTiming {
+            silence: false,
+            ..NackTiming::default()
+        });
+        receiver.set_leg_nack(L, false);
+        receiver.set_leg_nack(b, false);
+        let start = Instant::now();
+        let ms = Duration::from_millis(1);
+        for part in [0_u64, 1, 3] {
+            let datagram = encode_part(part, 0, &payload(part, 10)).unwrap();
+            receiver.push(L, &datagram, start + ms * part as u32, 0);
+        }
+        let due = start + ms * 4;
+        assert!(receiver.nacks_due(due, 64).is_empty());
+        assert_eq!(receiver.next_nack_at(), Some(due + SLOW_NACK));
+        assert!(receiver
+            .nacks_due(due + receiver.nack_retry(), 64)
+            .is_empty());
+        assert_eq!(receiver.stats.nacked, 0);
+        // The leg's edge answers: the hole is asked at once.
+        let later = due + ms * 10;
+        receiver.set_leg_nack(b, true);
+        assert!(receiver.next_nack_at().is_some_and(|at| at <= later));
+        assert_eq!(receiver.nacks_due(later, 64).leg(b), [2]);
+        // Asked once, it follows the ordinary retries again.
+        assert!(receiver
+            .next_nack_at()
+            .is_some_and(|at| at < later + SLOW_NACK));
     }
 
     fn leg(loss: f64) -> LegLoss {
