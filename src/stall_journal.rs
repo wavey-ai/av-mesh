@@ -2,9 +2,10 @@
 //!
 //! A counter such as "the longest loop gap since start" cannot say when a
 //! node stopped, for how long, on which CPU, or whether the node was not run
-//! at all or was busy with work of its own. The journal can. It has no
-//! dependency on the rest of av-mesh: `needletail-nodecheck` runs it in a
-//! process of its own, and av-contrib keeps a copy.
+//! at all or was busy with work of its own. The journal can. Its one
+//! dependency in av-mesh is `memory` (its rings are pinned there, D 2.3):
+//! `needletail-nodecheck` runs it in a process of its own, and av-contrib
+//! keeps a copy.
 //!
 //! **Events.** A ring of fixed-size events, allocated, faulted in and locked
 //! at start. A hot path holds one line ([`note`]): a comparison of a duration
@@ -508,28 +509,19 @@ impl Ring {
 /// The journal of one process.
 #[derive(Debug)]
 pub struct StallJournal {
+    /// The rings' pins (`memory::pin_region`, D 2.3), first so that they
+    /// unlock before the rings are freed.
+    pins: [crate::memory::Pinned; 3],
     node: String,
     capacity: usize,
     ring: Mutex<Ring>,
-    /// Whether the rings are locked in memory (`mlock`).
-    locked: bool,
     counters: Counters,
 }
 
-/// A slice of `len` copies of `value`, every page of it written.
-fn faulted<T: Copy>(value: T, len: usize) -> Box<[T]> {
-    let mut slice = vec![value; len].into_boxed_slice();
-    for slot in slice.iter_mut() {
-        // SAFETY: `slot` is a valid, exclusive reference. The volatile
-        // write cannot be elided, whatever the allocator handed out.
-        unsafe { std::ptr::write_volatile(slot, value) };
-    }
-    slice
-}
-
 impl StallJournal {
-    /// A journal that keeps the newest `capacity` events, its memory
-    /// faulted in and locked now. Zero keeps none: every record is a no-op.
+    /// A journal that keeps the newest `capacity` events, its rings faulted
+    /// in and locked now (`--prefault`, `--mlock`; a refused lock leaves
+    /// them faulted in). Zero keeps none: every record is a no-op.
     pub fn new(node: impl Into<String>, capacity: usize) -> Self {
         let (sec_lines, newest_slots) = if capacity == 0 {
             (0, 0)
@@ -539,12 +531,16 @@ impl StallJournal {
                 NEWEST_SLOTS,
             )
         };
-        let events = faulted(StallEvent::EMPTY, capacity);
-        let newest = faulted(0_u64, newest_slots);
-        let secs = faulted(SecLine::default(), sec_lines);
-        let locked =
-            capacity > 0 && os::lock(&events[..]) && os::lock(&newest[..]) && os::lock(&secs[..]);
+        let mut events = vec![StallEvent::EMPTY; capacity].into_boxed_slice();
+        let mut newest = vec![0_u64; newest_slots].into_boxed_slice();
+        let mut secs = vec![SecLine::default(); sec_lines].into_boxed_slice();
+        let pins = [
+            crate::memory::pin_slice("stall journal events", &mut events),
+            crate::memory::pin_slice("stall journal newest", &mut newest),
+            crate::memory::pin_slice("stall journal seconds", &mut secs),
+        ];
         Self {
+            pins,
             node: node.into(),
             capacity,
             ring: Mutex::new(Ring {
@@ -557,7 +553,6 @@ impl StallJournal {
                 event_cpus: [0; MAX_CPUS / 64],
                 tick_cpus: Vec::new(),
             }),
-            locked,
             counters: Counters::default(),
         }
     }
@@ -569,7 +564,7 @@ impl StallJournal {
     /// Whether the rings are locked in memory. A refusal (a memlock limit
     /// below the rings) changes nothing else: they stay faulted in.
     pub fn ring_locked(&self) -> bool {
-        self.locked
+        self.capacity > 0 && self.pins.iter().all(crate::memory::Pinned::is_locked)
     }
 
     fn lock(&self) -> MutexGuard<'_, Ring> {
@@ -833,17 +828,6 @@ impl StallJournal {
             starved_ms: per_cpu_ms(&counters.starved_us),
             rx_late_max_us: load(&counters.rx_late_max_us),
         }
-    }
-}
-
-impl Drop for StallJournal {
-    fn drop(&mut self) {
-        // Whatever part of them was locked: the allocator gets plain pages
-        // back.
-        let ring = self.ring.get_mut().unwrap_or_else(PoisonError::into_inner);
-        os::unlock(&ring.events[..]);
-        os::unlock(&ring.newest[..]);
-        os::unlock(&ring.secs[..]);
     }
 }
 
@@ -1639,20 +1623,6 @@ mod os {
         )
     }
 
-    /// Lock a slice's pages in memory.
-    pub fn lock<T>(slice: &[T]) -> bool {
-        // SAFETY: the range is the slice's own memory.
-        slice.is_empty()
-            || unsafe { libc::mlock(slice.as_ptr().cast(), std::mem::size_of_val(slice)) } == 0
-    }
-
-    pub fn unlock<T>(slice: &[T]) {
-        if !slice.is_empty() {
-            // SAFETY: as above.
-            unsafe { libc::munlock(slice.as_ptr().cast(), std::mem::size_of_val(slice)) };
-        }
-    }
-
     /// A small `/proc` file, opened once and read whole at each call into
     /// a buffer of its own.
     pub struct ProcFile {
@@ -1741,12 +1711,6 @@ mod os {
     pub fn thread_faults() -> (u64, u64) {
         (0, 0)
     }
-
-    pub fn lock<T>(_slice: &[T]) -> bool {
-        false
-    }
-
-    pub fn unlock<T>(_slice: &[T]) {}
 
     pub struct ProcFile;
 

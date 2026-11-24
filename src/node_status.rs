@@ -318,6 +318,9 @@ pub struct NodeStatus {
     /// Edges that serve UDP clients.
     pub client_udp: Option<ClientUdpStatus>,
     pub entry: EntryStatus,
+    /// D 2.4: the boot check's record (`--node-warm-file`); null when no
+    /// check is configured.
+    pub node_warm: Option<crate::node_warm::NodeWarmStatus>,
 }
 
 /// The reasons a node drains, as `ReadinessInputs` takes them.
@@ -396,6 +399,10 @@ pub struct ReadinessInputs {
     /// An edge dropped `start` after `--start-warm-ms` without its warm-up
     /// (CR6).
     pub ready_forced: bool,
+    /// D 2.4: whether the boot check came out complete (`None`: no check
+    /// configured). Configured and not complete is not ready, for as long
+    /// as the process runs: the record is read once, at start.
+    pub node_warm_complete: Option<bool>,
 }
 
 /// What the readiness evaluator decided.
@@ -423,6 +430,7 @@ impl Readiness {
     pub fn edge(inputs: &ReadinessInputs, was_warm: bool) -> Self {
         let mut conditions = Conditions::default();
         threads_condition(inputs, &mut conditions);
+        node_warm_condition(inputs, &mut conditions);
         if !inputs.client_udp_running {
             conditions.level.push("client_udp not running".to_owned());
         }
@@ -466,6 +474,7 @@ impl Readiness {
     pub fn forwarder(inputs: &ReadinessInputs, was_warm: bool) -> Self {
         let mut conditions = Conditions::default();
         threads_condition(inputs, &mut conditions);
+        node_warm_condition(inputs, &mut conditions);
         let plane = &inputs.fast_plane;
         // F2: datagrams arrive and none of them is admitted.
         if plane.received_1s > 0 && plane.admitted_1s == 0 {
@@ -589,6 +598,16 @@ fn threads_condition(inputs: &ReadinessInputs, conditions: &mut Conditions) {
             "class_threads {}/{}",
             inputs.threads, inputs.threads_expected
         ));
+    }
+}
+
+/// D 2.4: a node whose boot check is configured and not complete is not
+/// ready (a level condition: an edge's forced start does not pass it).
+fn node_warm_condition(inputs: &ReadinessInputs, conditions: &mut Conditions) {
+    if inputs.node_warm_complete == Some(false) {
+        conditions
+            .level
+            .push("node warm check not complete".to_owned());
     }
 }
 
@@ -847,6 +866,29 @@ mod tests {
         // An idle region has no copy to warm: met at once.
         edge.warm_copies.clear();
         ready(&Readiness::edge(&edge, false));
+    }
+
+    #[test]
+    fn a_boot_check_not_complete_is_a_level_condition() {
+        let nodes: [(fn(&ReadinessInputs, bool) -> Readiness, ReadinessInputs); 2] = [
+            (Readiness::edge, serving_edge()),
+            (Readiness::forwarder, fed_forwarder()),
+        ];
+        for (evaluate, mut healthy) in nodes {
+            level(
+                evaluate,
+                &healthy,
+                |inputs| inputs.node_warm_complete = Some(false),
+                "node warm check not complete",
+            );
+            healthy.node_warm_complete = Some(true);
+            ready(&evaluate(&healthy, false));
+        }
+        // A forced edge serves cold, never past a failed check.
+        let mut edge = serving_edge();
+        edge.ready_forced = true;
+        edge.node_warm_complete = Some(false);
+        assert!(!Readiness::edge(&edge, false).ready());
     }
 
     #[test]
@@ -1205,6 +1247,13 @@ mod tests {
                 caches_fresh: 3,
                 caches_draining: 0,
             },
+            node_warm: Some(crate::node_warm::NodeWarmStatus {
+                configured: true,
+                complete: true,
+                verdict: "ok".to_owned(),
+                warm: Some(serde_json::json!({"ran": true, "finished": true, "gib": 3.31})),
+                check: Some(serde_json::json!({"seconds": 60, "stops_over_20ms": 0})),
+            }),
         };
         let json = serde_json::to_string_pretty(&status).unwrap() + "\n";
         let golden = include_str!("tests/node_status.json");

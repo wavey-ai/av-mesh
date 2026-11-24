@@ -11,6 +11,7 @@ pub mod load_assign;
 /// them too.
 #[path = "fast_plane/media_clock.rs"]
 pub mod media_clock;
+pub mod memory;
 pub mod relay_ingress;
 pub mod replication;
 pub mod stall_journal;

@@ -87,6 +87,9 @@ impl Slot {
 
 /// A fixed-size table of the symbols seen.
 pub struct FirstArrival {
+    /// The table's pin (D 2.3), first so that it unlocks before the table
+    /// is freed.
+    _pin: crate::memory::Pinned,
     slots: Box<[Slot]>,
     mask: usize,
     clock: u64,
@@ -94,11 +97,16 @@ pub struct FirstArrival {
 }
 
 impl FirstArrival {
-    /// A table of about `capacity` symbols (rounded up to a power of two).
+    /// A table of about `capacity` symbols (rounded up to a power of two),
+    /// faulted in and locked now (`memory::pin_region`): `vec!` of zeroes
+    /// comes from untouched pages, which the class thread would otherwise
+    /// fault in one by one as new symbols land in them.
     pub fn new(capacity: usize) -> Self {
         let buckets = (capacity / WAYS).max(1).next_power_of_two();
+        let mut slots = vec![Slot::default(); buckets * WAYS].into_boxed_slice();
         Self {
-            slots: vec![Slot::default(); buckets * WAYS].into_boxed_slice(),
+            _pin: crate::memory::pin_slice("first-arrival table", &mut slots),
+            slots,
             mask: buckets - 1,
             clock: 0,
             hasher: std::collections::hash_map::RandomState::new(),
@@ -307,6 +315,30 @@ mod tests {
         assert_eq!(lag(table.first(second, 1, wrap + 100, 1)), 100);
         // A copy more than 35 minutes late has no lag to show.
         assert_eq!(lag(table.first(second, 1, wrap + 2_200_000_000, 1)), 0);
+    }
+
+    #[test]
+    fn the_first_arrival_table_takes_no_fault_on_first_use() {
+        // D 2.3: the table is faulted in when it is made, so the symbols that
+        // land in its 768 pages for the first time cost the class thread no
+        // fault. Every bucket is written once, in a spread order.
+        let mut table = FirstArrival::new(65_536);
+        let buckets = table.mask + 1;
+        let (before, _) = crate::memory::faults(true);
+        for index in 0..buckets as u64 {
+            let bucket = (index.wrapping_mul(0x9E37_79B9) as usize) & table.mask;
+            table.slots[bucket * WAYS] = Slot {
+                names: index + 1,
+                ..Slot::default()
+            };
+        }
+        let (after, _) = crate::memory::faults(true);
+        assert!(
+            after - before <= 2,
+            "first use of the table faulted {} pages in",
+            after - before
+        );
+        assert!(table.slots.iter().any(|slot| slot.names != 0));
     }
 
     #[test]

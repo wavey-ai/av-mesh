@@ -13,7 +13,9 @@
 //!   page from one thread per CPU, gives it back, and says how long the
 //!   slowest page took.
 //! - `touch`: touches fresh memory at a fixed rate with or without huge
-//!   pages and times every page.
+//!   pages and times every page; with `--hold` it keeps the memory until
+//!   it is sent SIGTERM or SIGINT, so that a second `touch` started
+//!   meanwhile takes memory the guest has not handed out before.
 //! - `echo-serve`, `echo-send`: numbered datagrams echoed with the server's
 //!   kernel receive stamp. A run of datagrams the kernel stamped late,
 //!   together at their release, beside a run of lost ones is the signature
@@ -75,7 +77,8 @@ enum Command {
     /// Write a byte in every page of the memory the node can spare, then
     /// give it back; prints the `warm` object.
     Warm(WarmArgs),
-    /// Touch fresh memory page by page at a fixed rate and time every page.
+    /// Touch fresh memory page by page at a fixed rate and time every page;
+    /// SIGTERM or SIGINT ends it early, with what it has written.
     Touch(TouchArgs),
     /// Echo every numbered datagram with its kernel receive stamp, until
     /// SIGTERM or SIGINT.
@@ -150,6 +153,10 @@ struct TouchArgs {
     thp: Option<Thp>,
     #[arg(long)]
     out: PathBuf,
+    /// After the last page, keep the memory mapped until SIGTERM or SIGINT,
+    /// then release it (a `release` line says how long it was held).
+    #[arg(long)]
+    hold: bool,
 }
 
 #[derive(Debug, Args)]
@@ -222,14 +229,17 @@ fn run(command: Command) -> Result<ExitCode> {
             println!("{}", serde_json::to_string(&report)?);
         }
         Command::Touch(args) => {
+            let stop = stop_on_signals();
             let mut out = create(&args.out)?;
             let done = touch(
                 TouchPlan {
                     mb: args.mb,
                     rate_mb_s: args.rate_mb_s,
                     thp: args.thp,
+                    hold: args.hold,
                 },
                 &mut out,
+                stop,
                 |_| {},
             )?;
             println!("{}", serde_json::to_string(&done)?);
@@ -529,21 +539,37 @@ struct TouchPlan {
     mb: u64,
     rate_mb_s: f64,
     thp: Option<Thp>,
+    /// Keep the memory after the last page until stopped.
+    hold: bool,
 }
 
-/// The last line of `touch`.
+/// The line of `touch` after its last page.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 struct TouchDone {
     kind: &'static str,
     mb: u64,
     rate_mb_s: f64,
     thp: &'static str,
+    /// Pages touched: all of `mb`, unless a signal ended the touch first.
     pages: u64,
+    /// A signal ended the touch before its last page.
+    stopped: bool,
     seconds: f64,
     slow: u64,
     max_us: u64,
     /// The process's memory in huge pages at the end (`AnonHugePages`).
     anon_huge_kb: Option<u64>,
+    /// The memory is held until a signal (`--hold`).
+    hold: bool,
+}
+
+/// The last line of `touch --hold`: the memory is given back.
+#[derive(Debug, Serialize)]
+struct TouchRelease {
+    kind: &'static str,
+    t_us: u64,
+    /// From the last page to the release.
+    held_s: f64,
 }
 
 /// One second of `touch`.
@@ -569,11 +595,14 @@ struct SlowTouch {
 /// Map `plan.mb` of fresh memory (aligned to 2 MB, so that a huge page can
 /// back it), ask for or refuse huge pages, and touch it page by page at
 /// the plan's rate, timing every touch: a line for each touch of 200 us or
-/// more and one a second. `before_touch` runs inside each timed touch (a
-/// test's delay).
+/// more and one a second, then the `touch_done` line. With `plan.hold` the
+/// memory stays mapped until `stop`, and a `release` line follows. `stop`
+/// also ends the touch itself early. `before_touch` runs inside each timed
+/// touch (a test's delay).
 fn touch(
     plan: TouchPlan,
     out: &mut dyn Write,
+    stop: &AtomicBool,
     mut before_touch: impl FnMut(usize),
 ) -> Result<TouchDone> {
     const HUGE: usize = 2 << 20;
@@ -605,10 +634,17 @@ fn touch(
     };
     let mut second_due_ns = began_ns + 1_000_000_000;
     let (mut slow, mut max_us) = (0_u64, 0_u64);
+    let mut touched = 0_usize;
     for page in 0..pages {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         let due_ns = began_ns + (page as f64 / rate_pages * 1e9) as u64;
         if due_ns > stall_journal::monotonic_ns() {
-            stall_journal::sleep_until(due_ns);
+            sleep_until_unless(stop, due_ns);
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
         }
         let began = stall_journal::monotonic_ns();
         before_touch(page);
@@ -617,6 +653,7 @@ fn touch(
         unsafe { std::ptr::write_volatile(mapping.ptr.add((skip + page) * PAGE), 1) };
         let now = stall_journal::monotonic_ns();
         let us = now.saturating_sub(began) / 1_000;
+        touched = page + 1;
         second.pages += 1;
         second.sum_us += us;
         second.max_us = second.max_us.max(us);
@@ -650,12 +687,20 @@ fn touch(
             second_due_ns = now + 1_000_000_000;
         }
     }
+    if second.pages > 0 {
+        // A touch that a signal ended keeps its last second's line.
+        second.t_us = stall_journal::realtime_us();
+        serde_json::to_writer(&mut *out, &second)?;
+        out.write_all(b"\n")?;
+    }
+    let stopped = touched < pages;
     let done = TouchDone {
         kind: "touch_done",
         mb: plan.mb,
         rate_mb_s: plan.rate_mb_s,
         thp: plan.thp.map_or("system", Thp::as_str),
-        pages: pages as u64,
+        pages: touched as u64,
+        stopped,
         seconds: round(
             stall_journal::monotonic_ns().saturating_sub(began_ns) as f64 / 1e9,
             3,
@@ -663,12 +708,41 @@ fn touch(
         slow,
         max_us,
         anon_huge_kb: anon_huge_kb(),
+        hold: plan.hold,
     };
     serde_json::to_writer(&mut *out, &done)?;
     out.write_all(b"\n")?;
     out.flush()?;
+    if plan.hold && !stopped {
+        let held_from = Instant::now();
+        while !stop.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        serde_json::to_writer(
+            &mut *out,
+            &TouchRelease {
+                kind: "release",
+                t_us: stall_journal::realtime_us(),
+                held_s: round(held_from.elapsed().as_secs_f64(), 3),
+            },
+        )?;
+        out.write_all(b"\n")?;
+        out.flush()?;
+    }
     drop(mapping);
     Ok(done)
+}
+
+/// Sleep until CLOCK_MONOTONIC `due_ns`, or less once `stop` is set.
+fn sleep_until_unless(stop: &AtomicBool, due_ns: u64) {
+    const STEP_NS: u64 = 50_000_000;
+    loop {
+        let now = stall_journal::monotonic_ns();
+        if now >= due_ns || stop.load(Ordering::Relaxed) {
+            return;
+        }
+        stall_journal::sleep_until(due_ns.min(now + STEP_NS));
+    }
 }
 
 /// `AnonHugePages` of `/proc/self/smaps_rollup`, in kB.
@@ -1515,8 +1589,10 @@ mod tests {
                 mb: 4,
                 rate_mb_s: 64.0,
                 thp: Some(Thp::Never),
+                hold: false,
             },
             &mut out,
+            &AtomicBool::new(false),
             |page| {
                 if page == 100 {
                     std::thread::sleep(Duration::from_millis(2));
@@ -1547,6 +1623,112 @@ mod tests {
             .sum();
         assert_eq!(counted, 1_024, "every page in a second's line");
         assert_eq!(lines.last().unwrap()["kind"], "touch_done");
+        assert!(!done.stopped && !done.hold);
+    }
+
+    #[test]
+    fn touch_holds_its_memory_until_stopped_then_releases_it() {
+        // The hunt driver's call (linode-stall-hunt.py `touch_body`):
+        // `touch --mb 400 --rate-mb-s 2 --hold --thp always --out F`, ended
+        // by `kill` (SIGTERM). Here 2 MB at 256 MB/s, held, then stopped.
+        let cli = Cli::try_parse_from([
+            "needletail-nodecheck",
+            "touch",
+            "--mb",
+            "400",
+            "--rate-mb-s",
+            "2",
+            "--hold",
+            "--thp",
+            "always",
+            "--out",
+            "touch-fresh.ndjson",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Touch(TouchArgs {
+                hold: true,
+                mb: 400,
+                ..
+            })
+        ));
+        let stop = AtomicBool::new(false);
+        let mut out = Vec::new();
+        let done = std::thread::scope(|scope| {
+            let toucher = scope.spawn(|| {
+                touch(
+                    TouchPlan {
+                        mb: 2,
+                        rate_mb_s: 256.0,
+                        thp: Some(Thp::Never),
+                        hold: true,
+                    },
+                    &mut out,
+                    &stop,
+                    |_| {},
+                )
+                .unwrap()
+            });
+            // Touching takes about 8 ms; the memory is then held.
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(!toucher.is_finished(), "a held touch waits for its signal");
+            stop.store(true, Ordering::Relaxed);
+            toucher.join().unwrap()
+        });
+        assert_eq!(done.pages, 512);
+        assert!(done.hold && !done.stopped, "{done:?}");
+        let lines = json_lines(&out);
+        let kinds: Vec<&str> = lines
+            .iter()
+            .map(|line| line["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            &kinds[kinds.len() - 2..],
+            ["touch_done", "release"],
+            "{kinds:?}"
+        );
+        let held = lines.last().unwrap()["held_s"].as_f64().unwrap();
+        assert!((0.2..5.0).contains(&held), "held {held} s");
+
+        // A signal during the touch ends it at once, with what it has.
+        let stop = AtomicBool::new(false);
+        let mut out = Vec::new();
+        let done = std::thread::scope(|scope| {
+            let toucher = scope.spawn(|| {
+                touch(
+                    TouchPlan {
+                        mb: 64,
+                        rate_mb_s: 16.0,
+                        thp: Some(Thp::Never),
+                        hold: true,
+                    },
+                    &mut out,
+                    &stop,
+                    |_| {},
+                )
+                .unwrap()
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            stop.store(true, Ordering::Relaxed);
+            toucher.join().unwrap()
+        });
+        assert!(
+            done.stopped && done.pages > 0 && done.pages < 16_384,
+            "{done:?}"
+        );
+        let lines = json_lines(&out);
+        assert_eq!(
+            lines.last().unwrap()["kind"],
+            "touch_done",
+            "no hold after a stop"
+        );
+        let counted: u64 = lines
+            .iter()
+            .filter(|line| line["kind"] == "sec")
+            .map(|line| line["pages"].as_u64().unwrap())
+            .sum();
+        assert_eq!(counted, done.pages);
     }
 
     #[test]

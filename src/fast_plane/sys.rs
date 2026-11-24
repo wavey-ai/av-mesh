@@ -183,6 +183,9 @@ pub struct Received<'a> {
 /// messages of a plain receive are, so a reader of the batch does not see
 /// the difference.
 pub struct RecvBatch {
+    /// The receive buffers' pin (D 2.3), first so that it unlocks before
+    /// they are freed.
+    _pin: crate::memory::Pinned,
     data: Vec<u8>,
     slot_bytes: usize,
     #[cfg(target_os = "linux")]
@@ -227,9 +230,13 @@ impl RecvBatch {
         Self::with_slots(GRO_SLOT_BYTES, true)
     }
 
+    /// The receive buffers are faulted in and locked now (D 2.3), before
+    /// the class thread that owns the batch is made real-time.
     fn with_slots(slot_bytes: usize, gro: bool) -> Self {
+        let mut data = vec![0_u8; RECV_BATCH * slot_bytes];
         Self {
-            data: vec![0_u8; RECV_BATCH * slot_bytes],
+            _pin: crate::memory::pin_slice("receive batch", &mut data),
+            data,
             slot_bytes,
             #[cfg(target_os = "linux")]
             // SAFETY: all-zero sockaddr_storage, iovec and mmsghdr are valid.

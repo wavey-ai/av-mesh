@@ -135,5 +135,19 @@
   "entry": {
     "caches_fresh": 3,
     "caches_draining": 0
+  },
+  "node_warm": {
+    "configured": true,
+    "complete": true,
+    "verdict": "ok",
+    "warm": {
+      "ran": true,
+      "finished": true,
+      "gib": 3.31
+    },
+    "check": {
+      "seconds": 60,
+      "stops_over_20ms": 0
+    }
   }
 }
