@@ -1,3 +1,4 @@
+pub mod build;
 pub mod canonical_slot;
 pub mod client_compact;
 pub mod client_director;

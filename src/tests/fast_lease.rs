@@ -51,9 +51,15 @@ async fn bind_lease_children(ips: &[Ipv4Addr]) -> ([u16; 2], Vec<[UdpSocket; 4]>
 }
 
 fn lease_children(ports: [u16; 2], primary: &[Ipv4Addr]) -> Arc<LeaseChildren> {
+    lease_children_at(Ipv4Addr::LOCALHOST, ports, primary)
+}
+
+/// Lease children whose symbols leave from `bind`: a forwarder at an
+/// address of its own.
+fn lease_children_at(bind: Ipv4Addr, ports: [u16; 2], primary: &[Ipv4Addr]) -> Arc<LeaseChildren> {
     LeaseChildren::bind(
         LeaseChildConfig {
-            bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            bind: SocketAddr::from((bind, 0)),
             child_ports: ports,
             class_port_offset: OFFSET,
             primary_children: primary.iter().map(|ip| IpAddr::V4(*ip)).collect(),
@@ -1118,4 +1124,311 @@ fn the_fast_plane_edge_flags_default_on_and_can_be_turned_off() {
             .map(|args| !args.relay_lease_children)
             .unwrap()
     );
+}
+
+/// An edge at 127.0.0.2 on the fast plane and its two parents at addresses
+/// of their own: forwarder 1's lease socket at 127.0.0.1 and forwarder 2's
+/// at 127.0.0.3, as two nodes of a region's VLAN.
+struct FedEdge {
+    cache: Arc<LiveTsCache>,
+    shutdown_tx: watch::Sender<()>,
+    task: tokio::task::JoinHandle<Result<()>>,
+    forwarders: [Option<FastRelay>; 2],
+    parents: [IpAddr; 2],
+}
+
+impl FedEdge {
+    async fn start(streams: &[u64]) -> Self {
+        let edge_ip = loopback(2);
+        let parents = [loopback(1), loopback(3)];
+        let (ports, sockets) = bind_edge_class_ports(edge_ip);
+        let leases = [
+            lease_children_at(parents[0], ports, &[edge_ip]),
+            lease_children_at(parents[1], ports, &[]),
+        ];
+        let leased: Vec<ServedSubscription> = streams
+            .iter()
+            .map(|stream_id| served(edge_ip, *stream_id))
+            .collect();
+        let mut forwarders = Vec::new();
+        for lease in &leases {
+            lease.rebuild(&leased);
+            forwarders.push(Some(
+                start_fast_relay_with(ParentPath::Secondary, &[], lease_config(lease)).await,
+            ));
+        }
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 64, 64).await;
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let task = tokio::spawn(fast_plane::relay::run_relay_class_ingest(
+            sockets,
+            Arc::clone(&cache),
+            shutdown_rx,
+            RelayIngestRuntime {
+                dispatch: edge_dispatch(leases[0].local_addr(), leases[1].local_addr()),
+                secondary_socket: None,
+                class_twins: Vec::new(),
+                forwarder: None,
+                audio_epochs: None,
+                failover_controller: None,
+                failover_heartbeat: Duration::from_millis(100),
+                link_telemetry: None,
+            },
+            RelayClassConfig {
+                port_offset: OFFSET,
+                cpus: [None, None],
+                realtime: false,
+                tee_capacity: 4_096,
+                ..Default::default()
+            },
+        ));
+        wait_until("the edge's threads start", || {
+            cache.relay_ingress_snapshot().fast_plane.threads == 2
+        })
+        .await;
+        Self {
+            cache,
+            shutdown_tx,
+            task,
+            forwarders: forwarders.try_into().ok().unwrap(),
+            parents: parents.map(IpAddr::V4),
+        }
+    }
+
+    /// The contributor sends a part of `stream_id` to every forwarder that
+    /// still runs.
+    async fn send_part(&self, stream_id: u64, sequence: u64, deadline_us: u64) {
+        for symbol in fast_audio_symbols(stream_id, sequence, deadline_us) {
+            for forwarder in self.forwarders.iter().flatten() {
+                forwarder
+                    .primary_sender
+                    .send_to(&symbol, forwarder.primary_audio)
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    fn feeds(&self) -> Vec<fast_plane::parent_feeds::ParentFeed> {
+        self.cache
+            .parent_feeds()
+            .expect("the edge's class ingest keeps the feeds")
+            .snapshot(now_unix_us())
+    }
+
+    async fn stop(self) {
+        let _ = self.shutdown_tx.send(());
+        self.task.await.unwrap().unwrap();
+        for forwarder in self.forwarders.into_iter().flatten() {
+            forwarder.stop().await;
+        }
+    }
+}
+
+/// The sampler publishes once a second: wait for figures over several of
+/// its passes.
+async fn wait_for_figures(what: &str, mut done: impl FnMut() -> bool) {
+    timeout(Duration::from_secs(10), async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting until {what}"));
+}
+
+/// CR4: an edge fed two streams by two forwarders keeps a record per parent
+/// and stream, and each is complete: the second copy of a part is dropped
+/// at the first-arrival test, after its parent's record took it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_edge_reports_each_parent_feeding_each_stream() {
+    let edge = FedEdge::start(&[4001, 4002]).await;
+    let parts = 50_u64;
+    let deadline = now_unix_us() + 20_000_000;
+    for sequence in 0..parts {
+        for stream_id in [4001, 4002] {
+            edge.send_part(stream_id, sequence, deadline).await;
+        }
+    }
+    for stream_id in [4001, 4002] {
+        wait_for_part(&edge.cache, stream_id, parts - 1).await;
+    }
+    wait_for_figures("every feed shows its objects", || {
+        let feeds = edge.feeds();
+        feeds.len() == 4 && feeds.iter().all(|feed| feed.objects_10s == parts)
+    })
+    .await;
+    let feeds = edge.feeds();
+    assert_eq!(
+        feeds
+            .iter()
+            .map(|feed| (feed.address, feed.stream_id))
+            .collect::<Vec<_>>(),
+        vec![
+            (edge.parents[0], Some(4001)),
+            (edge.parents[0], Some(4002)),
+            (edge.parents[1], Some(4001)),
+            (edge.parents[1], Some(4002)),
+        ]
+    );
+    for feed in &feeds {
+        assert_eq!(feed.head_object, Some(parts - 1), "{feed:?}");
+        assert_eq!(
+            (feed.skipped_10s, feed.resets_10s, feed.multi_symbol_10s),
+            (0, 0, 0),
+            "{feed:?}"
+        );
+        assert!(feed.source_age_ms.is_some() && feed.repair_age_ms.is_none());
+        // Every object arrived with most of its 20 s left.
+        let slack = feed.slack_mean_us_10s.expect("objects have slack");
+        assert!((10_000_000..=20_000_000).contains(&slack), "{feed:?}");
+        assert!(feed.slack_min_us_10s.is_some_and(|least| least <= slack));
+    }
+    // Half of what arrived was the second parent's copy, dropped after its
+    // record.
+    wait_until("the tee publishes the duplicates", || {
+        edge.cache.relay_ingress_snapshot().fast_plane.duplicates == 2 * parts
+    })
+    .await;
+    assert_eq!(edge.cache.relay_ingress_snapshot().fast_plane.not_admitted, 0);
+    edge.stop().await;
+}
+
+/// CR4: two parents send an edge the same parts, the second 4 ms after the
+/// first. Both carry the same deadline for the same object, so the second
+/// parent's objects have 4 ms less slack, which is what a gate compares: no
+/// clock is involved but this node's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_parent_delayed_by_4_ms_shows_4_ms_less_slack() {
+    let edge_ip = loopback(2);
+    let (ports, sockets) = bind_edge_class_ports(edge_ip);
+    let prompt = UdpSocket::bind((loopback(1), 0)).await.unwrap();
+    let late = UdpSocket::bind((loopback(3), 0)).await.unwrap();
+    let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 64, 64).await;
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    let task = tokio::spawn(fast_plane::relay::run_relay_class_ingest(
+        sockets,
+        Arc::clone(&cache),
+        shutdown_rx,
+        RelayIngestRuntime {
+            dispatch: edge_dispatch(prompt.local_addr().unwrap(), late.local_addr().unwrap()),
+            secondary_socket: None,
+            class_twins: Vec::new(),
+            forwarder: None,
+            audio_epochs: None,
+            failover_controller: None,
+            failover_heartbeat: Duration::from_millis(100),
+            link_telemetry: None,
+        },
+        RelayClassConfig {
+            port_offset: OFFSET,
+            cpus: [None, None],
+            realtime: false,
+            tee_capacity: 4_096,
+            ..Default::default()
+        },
+    ));
+    wait_until("the edge's threads start", || {
+        cache.relay_ingress_snapshot().fast_plane.threads == 2
+    })
+    .await;
+
+    let parts = 120_u64;
+    let deadline = now_unix_us() + 20_000_000;
+    // What the second parent's copies were really behind by, in all: a
+    // sleep of 4 ms is never shorter and often a little longer, and the
+    // runtime can hold either send. An object's slack is taken when its
+    // first symbol arrives, so each parent's time is stamped as soon as its
+    // first symbol has left.
+    let mut behind_us = 0_u64;
+    async fn send_all(socket: &UdpSocket, to: SocketAddr, symbols: &[Vec<u8>]) -> u64 {
+        let mut first_sent_us = 0;
+        for symbol in symbols {
+            socket.send_to(symbol, to).await.unwrap();
+            if first_sent_us == 0 {
+                first_sent_us = now_unix_us();
+            }
+        }
+        first_sent_us
+    }
+    for sequence in 0..parts {
+        let symbols = fast_audio_symbols(4001, sequence, deadline);
+        let prompt_us = send_all(&prompt, SocketAddr::from((edge_ip, ports[0])), &symbols).await;
+        tokio::time::sleep(Duration::from_millis(4)).await;
+        let late_us = send_all(&late, SocketAddr::from((edge_ip, ports[1])), &symbols).await;
+        behind_us += late_us - prompt_us;
+    }
+    let behind_us = i64::try_from(behind_us / parts).unwrap();
+    assert!(behind_us >= 4_000, "{behind_us}");
+
+    let feeds = cache.parent_feeds().expect("the edge keeps the feeds");
+    wait_for_figures("both feeds show their objects", || {
+        let rows = feeds.snapshot(now_unix_us());
+        rows.len() == 2 && rows.iter().all(|row| row.objects_10s == parts)
+    })
+    .await;
+    let rows = feeds.snapshot(now_unix_us());
+    let slack = |ip: Ipv4Addr| {
+        rows.iter()
+            .find(|row| row.address == IpAddr::V4(ip))
+            .and_then(|row| row.slack_mean_us_10s)
+            .expect("the parent's objects have slack")
+    };
+    let less = slack(loopback(1)) - slack(loopback(3));
+    assert!(
+        (less - behind_us).abs() <= 1_000,
+        "the late parent has {less} us less slack; its copies were {behind_us} us behind"
+    );
+    assert!(less >= 3_500, "{less}");
+    // The late parent delivers every object all the same: only its slack
+    // tells the two apart.
+    assert!(rows.iter().all(|row| row.skipped_10s == 0));
+
+    let _ = shutdown_tx.send(());
+    task.await.unwrap().unwrap();
+}
+
+/// CR4: a parent that stops is seen by the age of its last source on the
+/// child, while the other parent's stays near zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_killed_parent_s_age_grows_and_the_other_s_does_not() {
+    let mut edge = FedEdge::start(&[4001]).await;
+    let deadline = now_unix_us() + 20_000_000;
+    for sequence in 0..30_u64 {
+        edge.send_part(4001, sequence, deadline).await;
+    }
+    wait_for_part(&edge.cache, 4001, 29).await;
+    let feeds = Arc::clone(edge.cache.parent_feeds().expect("the edge keeps the feeds"));
+    wait_until("both parents deliver", || {
+        edge.parents
+            .iter()
+            .all(|parent| feeds.delivering(*parent, 4001, now_unix_us(), 2_000_000))
+    })
+    .await;
+
+    edge.forwarders[0].take().unwrap().stop().await;
+    for sequence in 30..100_u64 {
+        edge.send_part(4001, sequence, deadline).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    wait_for_part(&edge.cache, 4001, 99).await;
+    let now_us = now_unix_us();
+    let rows = feeds.snapshot(now_us);
+    let age = |parent: IpAddr| {
+        rows.iter()
+            .find(|row| row.address == parent)
+            .and_then(|row| row.source_age_ms)
+            .expect("the parent delivered once")
+    };
+    let (killed, live) = (age(edge.parents[0]), age(edge.parents[1]));
+    assert!(killed >= 600, "the killed parent's age is {killed} ms");
+    assert!(live < 400, "the live parent's age is {live} ms");
+    assert!(!feeds.delivering(edge.parents[0], 4001, now_us, 500_000));
+    assert!(feeds.delivering(edge.parents[1], 4001, now_us, 500_000));
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.head_object)
+            .collect::<Vec<_>>(),
+        vec![Some(29), Some(99)]
+    );
+    edge.stop().await;
 }

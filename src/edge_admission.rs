@@ -607,6 +607,26 @@ impl EdgeAdmission {
         }
     }
 
+    /// Sessions already sent to another cache that made a request here in
+    /// the last `within_ms`: readers that still fetch the parts they were
+    /// told about. A draining edge waits for them, as the session gauge no
+    /// longer counts them.
+    pub fn moved_seen_within(&self, within_ms: u64) -> u64 {
+        self.moved_seen_within_at(within_ms, self.elapsed_ms())
+    }
+
+    fn moved_seen_within_at(&self, within_ms: u64, elapsed_ms: u64) -> u64 {
+        self.inner
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .filter(|session| {
+                session.moved && elapsed_ms.saturating_sub(session.last_seen_ms) <= within_ms
+            })
+            .count() as u64
+    }
+
     /// Active sessions of each playlist.
     pub fn sessions_by_playlist(&self) -> HashMap<u64, u64> {
         let elapsed_ms = self.elapsed_ms();
@@ -1242,6 +1262,33 @@ mod tests {
             PlaybackAdmission::Rejected
         );
         assert_eq!(admission.active_sessions_at(7_000), 0);
+    }
+
+    #[test]
+    fn a_moved_session_that_still_fetches_is_counted() {
+        let admission = admission();
+        assert_eq!(
+            admission.admit_playback_at(session("one"), false, 1_000),
+            PlaybackAdmission::Admitted
+        );
+        assert_eq!(
+            admission.admit_playback_at(session("two"), false, 1_000),
+            PlaybackAdmission::Admitted
+        );
+        assert_eq!(admission.moved_seen_within_at(1_000, 1_000), 0);
+        // Both are sent away: the session gauge no longer counts them.
+        assert!(admission.release_session("one"));
+        assert!(admission.release_session("two"));
+        assert_eq!(admission.active_sessions_at(1_000), 0);
+        assert_eq!(admission.moved_seen_within_at(1_000, 1_500), 2);
+        // One still fetches a part it was told about.
+        assert_eq!(
+            admission.admit_playback_at(session("one"), false, 2_400),
+            PlaybackAdmission::Existing
+        );
+        assert_eq!(admission.moved_seen_within_at(1_000, 2_500), 1);
+        assert_eq!(admission.moved_seen_within_at(1_000, 3_401), 0);
+        assert_eq!(admission.moved_seen_within(60_000), 2);
     }
 
     #[test]

@@ -11,10 +11,13 @@
 //! - the relay failover controller, which reads the threads' atomics;
 //! - the lease children: their snapshot's backstop rebuild, their failover
 //!   listener (whose promotions lapse), and the replay of a promoted
-//!   child's warm sources, which waits for a full socket.
+//!   child's warm sources, which waits for a full socket;
+//! - the sampler of the parent feeds: once a second, the figures of what
+//!   each parent delivered in the last second and the last ten.
 
 use crate::fast_plane::lease::{LeaseChild, LeaseChildren};
-use crate::fast_plane::relay::FailoverInputs;
+use crate::fast_plane::parent_feeds::ParentFeeds;
+use crate::fast_plane::relay::{FailoverInputs, FastPlaneStats};
 use crate::fast_plane::{sys, TrafficClass};
 use crate::{
     LiveTsCache, RelayDatagramObservation, RelayFailoverController, RelayIngressParentPath,
@@ -46,6 +49,43 @@ const EXPIRE_EVERY: Duration = Duration::from_secs(1);
 /// How often holes past the repair horizon that no commit released are
 /// released (`--canonical-repair-horizon`, at least 10 ms).
 const HORIZON_EVERY: Duration = Duration::from_millis(5);
+
+/// How often the parent feeds are sampled.
+const FEEDS_SAMPLE_EVERY: Duration = Duration::from_secs(1);
+
+/// The sampler of the parent feeds: once a second it copies every entry's
+/// counters and publishes the figures of the last second and the last ten,
+/// with the plane's own counts of datagrams received and not admitted.
+pub(crate) async fn run_parent_feeds_sampler(
+    feeds: Arc<ParentFeeds>,
+    stats: Arc<FastPlaneStats>,
+    mut shutdown_rx: watch::Receiver<()>,
+) {
+    // No tick is shorter than a second: the figures are of whole seconds.
+    let mut tick = interval(FEEDS_SAMPLE_EVERY);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut untracked = 0;
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => return,
+            _ = tick.tick() => {
+                feeds.sample(
+                    stats.received.iter().map(|class| class.load(Ordering::Relaxed)).sum(),
+                    stats.not_admitted.load(Ordering::Relaxed),
+                    crate::now_unix_us(),
+                );
+                let now = feeds.untracked();
+                if now != untracked {
+                    warn!(
+                        datagrams = now - untracked,
+                        "the parent feed table is full: datagrams of further streams are not recorded"
+                    );
+                    untracked = now;
+                }
+            }
+        }
+    }
+}
 
 /// The tees' housekeeping, on its own task: the cache's rotation (when
 /// `rotate`), and a nudge to each tee to expire its receive state. A tee
