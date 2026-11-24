@@ -602,7 +602,9 @@ pub struct EdgeFastLane {
     /// admission, NACK answers, the cache-fed lane), so the real-time
     /// thread would wait behind them.
     repair_thread: AtomicBool,
-    repair_jobs: OnceLock<std::sync::mpsc::SyncSender<RepairJob>>,
+    /// The jobs to the repair thread (made, touched and the thread started
+    /// when the lane is armed).
+    repair_jobs: OnceLock<Arc<RepairRing>>,
     pub stats: FastLaneStats,
 }
 
@@ -619,12 +621,144 @@ struct RepairJob {
     len: u16,
 }
 
+impl RepairJob {
+    const EMPTY: Self = Self {
+        stream_id: 0,
+        part: 0,
+        windows: [0; REPAIR_JOB_WINDOWS],
+        count: 0,
+        canonical: [0; compact::MAX_DATAGRAM],
+        len: 0,
+    };
+}
+
 /// The plans' windows a job carries (distinct windows of one part: the
 /// plans in use have one or two).
 const REPAIR_JOB_WINDOWS: usize = 8;
 /// Jobs that wait for the repair thread, at most: a window completes once
-/// in 8-64 parts of a stream, so this is seconds of jobs.
+/// in 8-64 parts of a stream, so this is seconds of jobs. A power of two.
 const REPAIR_QUEUE: usize = 4_096;
+/// The repair thread looks at its ring this often when no class thread
+/// wakes it (and sees then that the lane is gone).
+const REPAIR_IDLE_WAKE: Duration = Duration::from_millis(100);
+
+/// The window-repair jobs from the class threads to the repair thread: a
+/// bounded ring of [`REPAIR_QUEUE`] jobs made (and its pages touched) when
+/// the lane is armed, each slot with its own sequence number (D. Vyukov's
+/// bounded queue). It replaces `std::sync::mpsc::sync_channel` (the
+/// fan-out stall's item 5, d3tee's open item): that channel takes its
+/// receiver-waker mutex on each send while the receiver is parked, which is
+/// nearly always, and spins while the receiver is between claiming a slot
+/// and marking it read. Here a push claims a slot whose sequence says it is
+/// free, or finds the ring full and gives the job up (counted): it never
+/// waits for the repair thread, and one class thread never retries. The
+/// repair thread is woken once per batch that pushed (a futex wake only
+/// when it sleeps), as a fan-out thread is.
+struct RepairRing {
+    slots: Box<[RepairSlot]>,
+    /// The next place a producer claims, and the next the consumer reads.
+    tail: AtomicUsize,
+    head: AtomicUsize,
+    /// The repair thread, to wake.
+    thread: OnceLock<std::thread::Thread>,
+}
+
+struct RepairSlot {
+    /// `place` when free for the push of that place, `place + 1` when it
+    /// holds that place's job.
+    sequence: AtomicUsize,
+    job: std::cell::UnsafeCell<RepairJob>,
+}
+
+// SAFETY: a slot's job is written only by the producer that claimed its
+// place (by the tail's compare-exchange) before the release store of its
+// sequence, and read only by the one consumer after the acquire load of it.
+unsafe impl Sync for RepairRing {}
+unsafe impl Send for RepairRing {}
+
+impl RepairRing {
+    fn new(capacity: usize) -> Arc<Self> {
+        let capacity = capacity.next_power_of_two().max(2);
+        let mut slots: Vec<RepairSlot> = Vec::with_capacity(capacity);
+        for place in 0..capacity {
+            slots.push(RepairSlot {
+                sequence: AtomicUsize::new(place),
+                job: std::cell::UnsafeCell::new(RepairJob::EMPTY),
+            });
+        }
+        let mut slots = slots.into_boxed_slice();
+        // The class threads write the jobs: their pages are faulted in here.
+        crate::memory::touch_owned(&mut *slots);
+        Arc::new(Self {
+            slots,
+            tail: AtomicUsize::new(0),
+            head: AtomicUsize::new(0),
+            thread: OnceLock::new(),
+        })
+    }
+
+    fn mask(&self) -> usize {
+        self.slots.len() - 1
+    }
+
+    /// Fill a free slot with `fill`; `false` when the ring is full. Never
+    /// waits on the consumer.
+    fn push(&self, fill: impl FnOnce(&mut RepairJob)) -> bool {
+        let mut place = self.tail.load(Ordering::Relaxed);
+        loop {
+            let slot = &self.slots[place & self.mask()];
+            let sequence = slot.sequence.load(Ordering::Acquire);
+            match sequence.cmp(&place) {
+                std::cmp::Ordering::Equal => {
+                    match self.tail.compare_exchange(
+                        place,
+                        place.wrapping_add(1),
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => {
+                            // SAFETY: this producer claimed the place.
+                            fill(unsafe { &mut *slot.job.get() });
+                            slot.sequence
+                                .store(place.wrapping_add(1), Ordering::Release);
+                            return true;
+                        }
+                        // Another producer claimed it first (a second class
+                        // thread): the next place.
+                        Err(now) => place = now,
+                    }
+                }
+                // Not read since the last lap: full.
+                std::cmp::Ordering::Less => return false,
+                std::cmp::Ordering::Greater => place = self.tail.load(Ordering::Relaxed),
+            }
+        }
+    }
+
+    /// The oldest job, copied out, if one is ready. One consumer.
+    fn pop(&self) -> Option<RepairJob> {
+        let place = self.head.load(Ordering::Relaxed);
+        let slot = &self.slots[place & self.mask()];
+        if slot.sequence.load(Ordering::Acquire) != place.wrapping_add(1) {
+            return None;
+        }
+        // SAFETY: the producer released the slot with its job written.
+        let job = unsafe { *slot.job.get() };
+        slot.sequence.store(
+            place.wrapping_add(self.slots.len()),
+            Ordering::Release,
+        );
+        self.head.store(place.wrapping_add(1), Ordering::Relaxed);
+        Some(job)
+    }
+
+    /// Wake the repair thread (a futex wake only when it sleeps).
+    fn wake(&self) {
+        if let Some(thread) = self.thread.get() {
+            thread.unpark();
+        }
+    }
+}
 
 const TXTIME_UNSET: u8 = 0;
 const TXTIME_ON: u8 = 1;
@@ -685,8 +819,10 @@ impl EdgeFastLane {
     /// The window repair of `part` for the plans' `windows`, from the class
     /// thread: handed to the repair thread (started when the lane was armed),
     /// or, with `--client-udp-repair-thread false` (or a repair thread that
-    /// did not start), run here. Never waits on a lock when handed off; a
-    /// full queue drops the job (counted): the part's clients then have NACK.
+    /// did not start), run here. Never waits when handed off, and allocates
+    /// nothing: a full ring drops the job (counted), and the part's clients
+    /// then have NACK. The caller wakes the repair thread once for its
+    /// batch ([`Self::wake_repair`]).
     fn class_window_repair(
         self: &EdgeFastLane,
         stream_id: u64,
@@ -731,33 +867,41 @@ impl EdgeFastLane {
             }
             return;
         };
-        let mut job = RepairJob {
-            stream_id,
-            part,
-            windows: [0; REPAIR_JOB_WINDOWS],
-            count: 0,
-            canonical: [0; compact::MAX_DATAGRAM],
-            len: 0,
-        };
-        if canonical.len() <= compact::MAX_DATAGRAM {
-            job.canonical[..canonical.len()].copy_from_slice(canonical);
-            // The canonical form: no copies, no mark.
-            compact::set_flags(&mut job.canonical[..canonical.len()], 0, false);
-            job.len = canonical.len() as u16;
-        }
-        for window in windows {
-            if usize::from(job.count) == REPAIR_JOB_WINDOWS {
-                break;
+        // Written in the ring's slot itself: no job is built on the stack
+        // and copied.
+        let pushed = jobs.push(|job| {
+            job.stream_id = stream_id;
+            job.part = part;
+            job.count = 0;
+            job.len = 0;
+            if canonical.len() <= compact::MAX_DATAGRAM {
+                job.canonical[..canonical.len()].copy_from_slice(canonical);
+                // The canonical form: no copies, no mark.
+                compact::set_flags(&mut job.canonical[..canonical.len()], 0, false);
+                job.len = canonical.len() as u16;
             }
-            if !job.windows[..usize::from(job.count)].contains(window) {
-                job.windows[usize::from(job.count)] = *window;
-                job.count += 1;
+            for window in windows {
+                if usize::from(job.count) == REPAIR_JOB_WINDOWS {
+                    break;
+                }
+                if !job.windows[..usize::from(job.count)].contains(window) {
+                    job.windows[usize::from(job.count)] = *window;
+                    job.count += 1;
+                }
             }
+        });
+        if pushed {
+            self.stats.repair_handoffs.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.stats.repair_dropped.fetch_add(1, Ordering::Relaxed);
         }
-        match jobs.try_send(job) {
-            Ok(()) => self.stats.repair_handoffs.fetch_add(1, Ordering::Relaxed),
-            Err(_) => self.stats.repair_dropped.fetch_add(1, Ordering::Relaxed),
-        };
+    }
+
+    /// Wake the repair thread for the jobs a batch handed it.
+    fn wake_repair(&self) {
+        if let Some(jobs) = self.repair_jobs.get() {
+            jobs.wake();
+        }
     }
 
     /// Start the repair thread (at ordinary priority, on any of the
@@ -773,7 +917,8 @@ impl EdgeFastLane {
         let Some(armed) = self.armed.get() else {
             return;
         };
-        let (tx, rx) = std::sync::mpsc::sync_channel::<RepairJob>(REPAIR_QUEUE);
+        let ring = RepairRing::new(REPAIR_QUEUE);
+        let jobs = Arc::clone(&ring);
         let sockets = armed.sockets.clone();
         let table = Arc::clone(&armed.table);
         let stats = Arc::clone(&armed.stats);
@@ -790,7 +935,16 @@ impl EdgeFastLane {
                         "the repair thread keeps the class thread's scheduling"
                     );
                 }
-                while let Ok(job) = rx.recv() {
+                // Until the lane is gone (the ring is then this thread's
+                // alone).
+                loop {
+                    let Some(job) = jobs.pop() else {
+                        if Arc::strong_count(&jobs) == 1 {
+                            break;
+                        }
+                        std::thread::park_timeout(REPAIR_IDLE_WAKE);
+                        continue;
+                    };
                     let started = Instant::now();
                     if job.len > 0 {
                         sockets.compact().ring(job.stream_id).put(
@@ -814,14 +968,18 @@ impl EdgeFastLane {
                     }
                 }
             });
-        if let Err(error) = spawned {
-            tracing::warn!(error = %error, "the repair thread did not start: window repair runs on the class thread");
-            self.repair_thread.store(false, Ordering::Relaxed);
-            return;
-        }
-        // Another thread may have set it first: its sender is used, and
-        // this thread's ends with its channel.
-        let _ = self.repair_jobs.set(tx);
+        let thread = match spawned {
+            Ok(handle) => handle.thread().clone(),
+            Err(error) => {
+                tracing::warn!(error = %error, "the repair thread did not start: window repair runs on the class thread");
+                self.repair_thread.store(false, Ordering::Relaxed);
+                return;
+            }
+        };
+        let _ = ring.thread.set(thread);
+        // Another thread may have set it first: its ring is used, and this
+        // thread ends when it sees that its ring is its own.
+        let _ = self.repair_jobs.set(ring);
     }
 
     /// The audio class thread hands batches of more than `inline_sends`
@@ -2278,6 +2436,8 @@ impl ClientPlan {
             lane.class_window_repair(*stream_id, *part, &windows[..count], canonical);
         }
         self.compact_sent.clear();
+        // One wake for the batch's jobs.
+        lane.wake_repair();
     }
 
     /// The window repair of the windows that the batch's compact parts
@@ -3402,6 +3562,69 @@ mod tests {
         assert!(warmed >= 8 << 20);
         // 4 MB is 1,024 pages of 4 KB cold.
         assert!(faults <= 64, "{faults} faults after the warm-up");
+    }
+
+    /// The window-repair ring (fan-out stall item 5): jobs come out in the
+    /// order they went in, a full ring refuses a job at once (the job is
+    /// written in the slot itself), and with two producers and the consumer
+    /// on threads of their own nothing is lost, repeated or reordered per
+    /// producer.
+    #[test]
+    fn the_repair_ring_hands_jobs_over_in_order_and_never_waits() {
+        let ring = RepairRing::new(8);
+        assert!(ring.pop().is_none());
+        for part in 0..8 {
+            assert!(ring.push(|job| {
+                job.part = part;
+                job.len = 3;
+                job.canonical[..3].copy_from_slice(&[1, 2, 3]);
+            }));
+        }
+        assert!(!ring.push(|_| unreachable!("a full ring fills no slot")));
+        for part in 0..8 {
+            let job = ring.pop().unwrap();
+            assert_eq!((job.part, job.len, &job.canonical[..3]), (part, 3, &[1, 2, 3][..]));
+        }
+        assert!(ring.pop().is_none());
+        // Laps: free again.
+        assert!(ring.push(|job| job.part = 99));
+        assert_eq!(ring.pop().unwrap().part, 99);
+
+        let ring = RepairRing::new(64);
+        let per = 100_000_u64;
+        let producers: Vec<_> = (0..2_u64)
+            .map(|producer| {
+                let ring = Arc::clone(&ring);
+                std::thread::spawn(move || {
+                    let mut refused = 0_u64;
+                    for sequence in 0..per {
+                        while !ring.push(|job| {
+                            job.stream_id = producer;
+                            job.part = sequence;
+                        }) {
+                            refused += 1;
+                            std::thread::yield_now();
+                        }
+                    }
+                    refused
+                })
+            })
+            .collect();
+        let mut next = [0_u64; 2];
+        while next.iter().any(|next| *next < per) {
+            match ring.pop() {
+                Some(job) => {
+                    let producer = job.stream_id as usize;
+                    assert_eq!(job.part, next[producer], "producer {producer}");
+                    next[producer] += 1;
+                }
+                None => std::thread::yield_now(),
+            }
+        }
+        for producer in producers {
+            producer.join().unwrap();
+        }
+        assert!(ring.pop().is_none());
     }
 
     /// The ring between the class thread and a fan-out thread: plans come

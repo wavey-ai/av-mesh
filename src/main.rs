@@ -5928,6 +5928,7 @@ struct RelayForwardSnapshot {
     warm_source_expired_datagrams: u64,
     warm_source_retired_datagrams: u64,
     warm_source_evicted_datagrams: u64,
+    warm_source_refused_datagrams: u64,
     duration_count: u64,
     duration_sum_us: u64,
     duration_max_us: u64,
@@ -5988,6 +5989,9 @@ fn warm_object_id_of_key(key: &media_object::ObjectKey) -> u64 {
 /// The capacity a warm-source buffer is given when first used: a whole RLS1
 /// datagram, so that a reused buffer never grows.
 const WARM_SOURCE_SLOT_BYTES: usize = 1_536;
+/// Buffers a warm-source buffer keeps for its next pushes, at most: one
+/// more than the datagrams it holds.
+const WARM_SOURCE_SPARE_BUFFERS: usize = RELAY_WARM_SOURCE_REPLAY_MAX_DATAGRAMS_PER_CHILD + 1;
 
 #[derive(Debug)]
 struct WarmSourceDatagram {
@@ -6003,6 +6007,11 @@ struct WarmSourceDatagram {
 /// wire deadline is on the stream's timeline and says nothing here).
 /// Datagram buffers are reused, and expiry and the bounds work from the
 /// front, so a push costs O(1) amortised and, once warm, allocates nothing.
+/// A buffer made [`Self::preallocated`] (the audio class's, read by the
+/// real-time class thread) allocates nothing from its first push: its
+/// queues have their whole room and its spare holds a buffer for every
+/// datagram it may keep, each faulted in; a datagram longer than a slot is
+/// refused (counted), not given a larger buffer.
 #[derive(Debug, Default)]
 struct WarmSourceReplayBuffer {
     datagrams: VecDeque<WarmSourceDatagram>,
@@ -6011,10 +6020,14 @@ struct WarmSourceReplayBuffer {
     bytes: usize,
     /// Buffers of datagrams that left, for the next pushes.
     spare: Vec<Vec<u8>>,
+    /// Made with all its room: a push never allocates.
+    fixed: bool,
 }
 
 #[derive(Debug, Default)]
 struct WarmSourceBufferMutation {
+    /// Not kept: longer than a preallocated slot, or no room left.
+    refused_datagrams: usize,
     added_datagrams: usize,
     added_bytes: usize,
     expired_datagrams: usize,
@@ -6059,6 +6072,44 @@ impl WarmSourceReplayBuffer {
         self.push(warm_object_id_of_key(object_key), hold_us, wire, now_us)
     }
 
+    /// A buffer with the room of its bounds made now, and its pages
+    /// faulted in: about 3 MB, made off the class thread (with the path,
+    /// or before a replay swaps it in).
+    fn preallocated() -> Self {
+        let mut datagrams = VecDeque::with_capacity(RELAY_WARM_SOURCE_REPLAY_MAX_DATAGRAMS_PER_CHILD + 1);
+        let mut object_order =
+            VecDeque::with_capacity(RELAY_WARM_SOURCE_REPLAY_MAX_OBJECTS_PER_CHILD + 1);
+        // Each queue's room, written once.
+        for _ in 0..datagrams.capacity() {
+            datagrams.push_back(WarmSourceDatagram {
+                object: 0,
+                expires_at_us: 0,
+                wire: Vec::new(),
+            });
+        }
+        datagrams.clear();
+        for _ in 0..object_order.capacity() {
+            object_order.push_back((0, 0));
+        }
+        object_order.clear();
+        // One buffer more than it keeps: a push takes one before the bound
+        // gives the oldest back.
+        let spare = (0..WARM_SOURCE_SPARE_BUFFERS)
+            .map(|_| {
+                let mut buffer = Vec::with_capacity(WARM_SOURCE_SLOT_BYTES);
+                memory::touch_spare(&mut buffer);
+                buffer
+            })
+            .collect();
+        Self {
+            datagrams,
+            object_order,
+            bytes: 0,
+            spare,
+            fixed: true,
+        }
+    }
+
     /// Keep `wire` for `hold_us` from `now_us`, this node's clock.
     fn push(
         &mut self,
@@ -6070,6 +6121,10 @@ impl WarmSourceReplayBuffer {
         let mut mutation = WarmSourceBufferMutation::default();
         self.remove_expired(now_us, &mut mutation);
         if hold_us == 0 || wire.len() > RELAY_WARM_SOURCE_REPLAY_MAX_BYTES_PER_CHILD {
+            return mutation;
+        }
+        if self.fixed && (wire.len() > WARM_SOURCE_SLOT_BYTES || self.spare.is_empty()) {
+            mutation.refused_datagrams = 1;
             return mutation;
         }
         let expires_at_us = now_us.saturating_add(hold_us);
@@ -6164,7 +6219,7 @@ impl WarmSourceReplayBuffer {
                 self.object_order.remove(index);
             }
         }
-        if self.spare.len() < RELAY_WARM_SOURCE_REPLAY_MAX_DATAGRAMS_PER_CHILD {
+        if self.spare.len() < WARM_SOURCE_SPARE_BUFFERS {
             self.spare.push(datagram.wire);
         }
     }
@@ -6181,7 +6236,7 @@ impl WarmSourceReplayBuffer {
             buffer.bytes = buffer.bytes.saturating_sub(datagram.wire.len());
             mutation.retired_datagrams = mutation.retired_datagrams.saturating_add(1);
             mutation.retired_bytes = mutation.retired_bytes.saturating_add(datagram.wire.len());
-            if buffer.spare.len() < RELAY_WARM_SOURCE_REPLAY_MAX_DATAGRAMS_PER_CHILD {
+            if buffer.spare.len() < WARM_SOURCE_SPARE_BUFFERS {
                 buffer.spare.push(datagram.wire);
             }
         };
@@ -6254,6 +6309,9 @@ struct RelayDownstreamForwarder {
     warm_source_expired_datagrams: AtomicU64,
     warm_source_retired_datagrams: AtomicU64,
     warm_source_evicted_datagrams: AtomicU64,
+    /// Sources not kept for a repair-only child: its buffer's lock was held
+    /// by a replay, or the datagram was longer than a preallocated slot.
+    warm_source_refused_datagrams: AtomicU64,
     duration_count: AtomicU64,
     duration_sum_us: AtomicU64,
     duration_max_us: AtomicU64,
@@ -6412,7 +6470,16 @@ impl RelayDownstreamForwarder {
                 video_target,
                 role: endpoint.role,
                 promoted: AtomicBool::new(false),
-                warm_sources: Default::default(),
+                // A repair-only child's audio sources are kept by the
+                // real-time audio thread: in a buffer made whole here.
+                warm_sources: [
+                    StdMutex::new(if endpoint.role == RelayForwardRole::Repair {
+                        WarmSourceReplayBuffer::preallocated()
+                    } else {
+                        WarmSourceReplayBuffer::default()
+                    }),
+                    StdMutex::default(),
+                ],
                 demand: Default::default(),
             });
         }
@@ -6432,6 +6499,7 @@ impl RelayDownstreamForwarder {
             warm_source_expired_datagrams: AtomicU64::new(0),
             warm_source_retired_datagrams: AtomicU64::new(0),
             warm_source_evicted_datagrams: AtomicU64::new(0),
+            warm_source_refused_datagrams: AtomicU64::new(0),
             duration_count: AtomicU64::new(0),
             duration_sum_us: AtomicU64::new(0),
             duration_max_us: AtomicU64::new(0),
@@ -6879,14 +6947,27 @@ impl RelayDownstreamForwarder {
         now_us: u64,
     ) {
         let hold_us = self.warm_hold_us.load(Ordering::Relaxed);
-        let mutation = path.warm_sources[class.index()]
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(object, hold_us, datagram, now_us);
+        // Never waits: a replay holds the lock only to swap the buffer, and
+        // a datagram that meets it then is not kept (counted).
+        let mut buffer = match path.warm_sources[class.index()].try_lock() {
+            Ok(buffer) => buffer,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.warm_source_refused_datagrams
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+        let mutation = buffer.push(object, hold_us, datagram, now_us);
+        drop(buffer);
         self.record_warm_source_mutation(&mutation);
     }
 
     fn record_warm_source_mutation(&self, mutation: &WarmSourceBufferMutation) {
+        if mutation.refused_datagrams > 0 {
+            self.warm_source_refused_datagrams
+                .fetch_add(mutation.refused_datagrams as u64, Ordering::Relaxed);
+        }
         if mutation.added_datagrams > 0 {
             self.warm_source_buffered_datagrams
                 .fetch_add(mutation.added_datagrams as u64, Ordering::Relaxed);
@@ -6921,10 +7002,29 @@ impl RelayDownstreamForwarder {
             return;
         };
         for class in fast_plane::TrafficClass::ALL {
-            let batch = path.warm_sources[class.index()]
+            let slot = &path.warm_sources[class.index()];
+            let fixed = slot
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take_live(now_unix_us());
+                .fixed;
+            // A preallocated buffer's datagrams leave with the replay, and
+            // with them its buffers: a new one, made here, takes its place in
+            // one swap under the lock, so the class thread never allocates
+            // (nor finds the lock held for more than the swap).
+            let batch = if fixed {
+                let mut fresh = WarmSourceReplayBuffer::preallocated();
+                std::mem::swap(
+                    &mut *slot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    &mut fresh,
+                );
+                fresh.take_live(now_unix_us())
+            } else {
+                slot.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take_live(now_unix_us())
+            };
             let removed_datagrams = batch
                 .datagrams
                 .len()
@@ -7128,6 +7228,9 @@ impl RelayDownstreamForwarder {
                 .load(Ordering::Relaxed),
             warm_source_evicted_datagrams: self
                 .warm_source_evicted_datagrams
+                .load(Ordering::Relaxed),
+            warm_source_refused_datagrams: self
+                .warm_source_refused_datagrams
                 .load(Ordering::Relaxed),
             duration_count: self.duration_count.load(Ordering::Relaxed),
             duration_sum_us: self.duration_sum_us.load(Ordering::Relaxed),
@@ -13831,6 +13934,7 @@ struct RelaySessionIngressSnapshot {
     warm_source_expired_datagrams: u64,
     warm_source_retired_datagrams: u64,
     warm_source_evicted_datagrams: u64,
+    warm_source_refused_datagrams: u64,
     processing_duration_count: u64,
     processing_duration_sum_us: u64,
     processing_duration_max_us: u64,
@@ -13888,6 +13992,7 @@ impl RelaySessionIngressSnapshot {
             warm_source_expired_datagrams: self.warm_source_expired_datagrams,
             warm_source_retired_datagrams: self.warm_source_retired_datagrams,
             warm_source_evicted_datagrams: self.warm_source_evicted_datagrams,
+            warm_source_refused_datagrams: self.warm_source_refused_datagrams,
             duration_count: self.forward_duration_count,
             duration_sum_us: self.forward_duration_sum_us,
             duration_max_us: self.forward_duration_max_us,
@@ -13917,6 +14022,7 @@ impl RelaySessionIngressSnapshot {
         self.warm_source_expired_datagrams = snapshot.warm_source_expired_datagrams;
         self.warm_source_retired_datagrams = snapshot.warm_source_retired_datagrams;
         self.warm_source_evicted_datagrams = snapshot.warm_source_evicted_datagrams;
+        self.warm_source_refused_datagrams = snapshot.warm_source_refused_datagrams;
         self.forward_duration_count = snapshot.duration_count;
         self.forward_duration_sum_us = snapshot.duration_sum_us;
         self.forward_duration_max_us = snapshot.duration_max_us;

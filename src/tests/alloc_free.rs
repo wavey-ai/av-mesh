@@ -143,6 +143,22 @@ async fn the_audio_class_thread_allocates_and_frees_nothing_once_it_runs() {
     // dedup of the second forwarder's copies, the tee's commits.
     let fast_plane = edge.cache.relay_ingress_snapshot().fast_plane;
     assert!(edge.lane.stats.compact_parts.load(Ordering::Relaxed) > 0);
+    // Passes that made window repair: each part's job handed to the repair
+    // thread through its ring (av-mesh-fix-3), none dropped, and the rows
+    // sent.
+    assert!(
+        edge.lane.stats.repair_handoffs.load(Ordering::Relaxed) > 0,
+        "the class thread handed window repair over"
+    );
+    assert_eq!(edge.lane.stats.repair_dropped.load(Ordering::Relaxed), 0);
+    assert!(
+        edge.router
+            .edge_udp_stats
+            .compact_window_repair
+            .load(Ordering::Relaxed)
+            > 0,
+        "window repair rows were sent"
+    );
     assert!(fast_plane.lease_children.audio_sent > 0, "{fast_plane:?}");
     assert!(fast_plane.duplicates > 0);
     assert_eq!(fast_plane.tee_dropped, 0);
@@ -237,6 +253,9 @@ async fn a_forwarder_s_audio_thread_allocates_frees_and_faults_nothing_once_it_r
     let offset = 1_000;
     let (all_child, _all_video) = bind_class_pair(offset).await;
     let (source_child, _source_video) = bind_class_pair(offset).await;
+    // A repair-only child: the audio thread keeps the sources held back from
+    // it (its warm buffer, made whole with the path; av-mesh-fix-3).
+    let (repair_child, _repair_video) = bind_class_pair(offset).await;
     let lease_ip = loopback(74);
     let lease_child = UdpSocket::bind((lease_ip, 0)).await.unwrap();
     let lease_port = lease_child.local_addr().unwrap().port();
@@ -262,6 +281,7 @@ async fn a_forwarder_s_audio_thread_allocates_frees_and_faults_nothing_once_it_r
         &[
             (all_child.local_addr().unwrap(), RelayForwardRole::All),
             (source_child.local_addr().unwrap(), RelayForwardRole::Source),
+            (repair_child.local_addr().unwrap(), RelayForwardRole::Repair),
         ],
         fast_plane::relay::RelayClassConfig {
             port_offset: offset,
@@ -276,6 +296,14 @@ async fn a_forwarder_s_audio_thread_allocates_frees_and_faults_nothing_once_it_r
         },
     )
     .await;
+    // The repair-only child's sources are held back (warm), not sent as a
+    // one-symbol object's repair lane would take them.
+    relay
+        .forwarder
+        .as_ref()
+        .expect("a forwarder")
+        .repair_lane_single_symbol
+        .store(false, Ordering::Relaxed);
     let arrivals = [
         count_arrivals(all_child),
         count_arrivals(source_child),
@@ -329,6 +357,17 @@ async fn a_forwarder_s_audio_thread_allocates_frees_and_faults_nothing_once_it_r
     tokio::time::sleep(Duration::from_millis(500)).await;
     let watched = Watched::read(counter);
     let stats = relay.stats();
+    let forwarder = relay.forwarder.clone().expect("a forwarder");
+    let warm_buffered = forwarder
+        .warm_source_buffered_datagrams
+        .load(Ordering::Relaxed)
+        + forwarder.warm_source_evicted_datagrams.load(Ordering::Relaxed)
+        + forwarder.warm_source_expired_datagrams.load(Ordering::Relaxed)
+        + forwarder.warm_source_retired_datagrams.load(Ordering::Relaxed);
+    let warm_refused = forwarder
+        .warm_source_refused_datagrams
+        .load(Ordering::Relaxed);
+    drop(forwarder);
     relay.stop().await;
     let [all, sources, leased] = arrivals;
     let (all, sources, leased) = (
@@ -353,5 +392,7 @@ async fn a_forwarder_s_audio_thread_allocates_frees_and_faults_nothing_once_it_r
     assert!(stats.lease_children.audio_sent > 0, "{stats:?}");
     assert!(stats.duplicates > 0, "{stats:?}");
     assert_eq!(stats.tee_dropped, 0);
+    assert!(warm_buffered > 0, "the repair-only child's sources were kept");
+    assert_eq!(warm_refused, 0, "no warm source refused (lock or room)");
     watched.assert_nothing(parts);
 }
