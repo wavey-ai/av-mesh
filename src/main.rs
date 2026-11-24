@@ -19535,15 +19535,15 @@ impl AppRouter {
         (due, state.active(), receivers)
     }
 
-    /// B rule R2: a listener sent away by a rebalance was taken back. A
-    /// round of which more than half came back pauses, as an ineffective
-    /// one does.
-    fn rebalance_returned(&self, now: Instant) {
+    /// B rule R2: a listener that a rebalance marked at `since` was taken
+    /// back. A round of which more than half came back pauses, as an
+    /// ineffective one does.
+    fn rebalance_returned(&self, now: Instant, since: Instant) {
         let paused = self
             .rebalance_state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .returned(now);
+            .returned(now, since);
         if paused {
             self.edge_udp_stats
                 .rebalance_ineffective
@@ -19639,7 +19639,7 @@ impl AppRouter {
         );
         if plan.quota > 0 {
             if let Some(cost) = edge_udp::rebalance_cost(&own, &others) {
-                state.begin_check(own.load_permille, own.subscribers, cost);
+                state.begin_check(now, own.load_permille, own.subscribers, cost);
             }
         }
         let receivers = plan
@@ -37486,6 +37486,82 @@ mod tests {
             block["legs_by_other"],
             serde_json::json!({"edge-b": 1}),
             "{block:#}"
+        );
+        edge.stop().await;
+    }
+
+    /// B rules 5 and R2 on a running edge: a subscriber that a rebalance
+    /// marked is answered `MOVE` to a plain refresh; when it asks again
+    /// with a part (its client gave up on a replacement that was not level)
+    /// it is taken back: answered `OK`, no longer leaving nor reminded,
+    /// counted in `moves_taken_back`, and its share goes back to the round
+    /// that sent it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rebalanced_subscriber_that_asks_with_a_part_is_taken_back_and_its_share_returned()
+    {
+        use av_mesh::client_udp::Control;
+
+        let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, 16);
+        config.playout = Duration::ZERO;
+        let edge = UdpEdgeForTests::start(config).await;
+        let (client, token) = edge.client().await;
+        udp_receive_for_tests(&client, Duration::from_millis(200)).await;
+        // A round of four, sent now: to this client and three more that
+        // stay where they went.
+        let since = Instant::now();
+        {
+            let mut state = edge.router.rebalance_state.lock().unwrap();
+            state.start_round(since, 4, Vec::new());
+            let due = state.reserve(since, Duration::ZERO);
+            state.settle(since, due, 4);
+            assert!(!state.active());
+        }
+        let table = &edge.stats().table.get().unwrap().0;
+        assert_eq!(
+            edge_udp::mark_test_subscribers(table, 77, "rebalance", since, config.move_grace),
+            1
+        );
+        assert_eq!(edge.stats().live_leaving(), Some(1));
+        // A plain refresh: MOVE.
+        client
+            .send_to(&udp_subscribe_for_tests(Some(token), None), edge.edge)
+            .await
+            .unwrap();
+        assert!(
+            udp_wait_for_move_for_tests(&client, "rebalance", Duration::from_secs(2)).await
+        );
+        assert_eq!(edge.stats().live_leaving(), Some(1));
+        // With a part: taken back (a reminder may come before the answer).
+        client
+            .send_to(&udp_subscribe_for_tests(Some(token), Some(3)), edge.edge)
+            .await
+            .unwrap();
+        let mut buf = vec![0_u8; 65_536];
+        loop {
+            let (len, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+                .await
+                .expect("an answer")
+                .unwrap();
+            if let Some(Control::Subscribed { .. }) = Control::decode(&buf[..len]) {
+                break;
+            }
+        }
+        assert_eq!(edge.stats().moves_taken_back.load(Ordering::Relaxed), 1);
+        assert_eq!(edge.stats().live_leaving(), Some(0));
+        assert_eq!(edge.stats().live_subscribers(), Some(1));
+        assert!(
+            edge.router.rebalance_state.lock().unwrap().active(),
+            "its share is the round's again"
+        );
+        // No reminder after the take-back (they come every 250 ms; one
+        // collected just before it may still be on its way).
+        udp_receive_for_tests(&client, Duration::from_millis(300)).await;
+        let (controls, _) = udp_receive_for_tests(&client, Duration::from_millis(600)).await;
+        assert!(
+            !controls
+                .iter()
+                .any(|(_, control)| is_move_for_tests(control, "rebalance")),
+            "{controls:?}"
         );
         edge.stop().await;
     }

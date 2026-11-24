@@ -1888,9 +1888,9 @@ impl EdgeControl {
         if let Some(refreshed) = refreshed {
             if let Some(reason) = refreshed.taken_back {
                 self.stats.moves_taken_back.fetch_add(1, Ordering::Relaxed);
-                if reason == "rebalance" {
-                    // B rule R2: its share goes back to the round.
-                    self.router.rebalance_returned(Instant::now());
+                if let (Some(since), "rebalance") = (take_back, reason) {
+                    // B rule R2: booked to the round that sent it.
+                    self.router.rebalance_returned(Instant::now(), since);
                 }
                 if reason == "parents-lost" && reason_now == Some("parents-lost") {
                     // Taken back within the hold-down, as `admit` takes a
@@ -4061,6 +4061,22 @@ pub(crate) fn insert_test_subscribers(
     }
 }
 
+/// Mark every subscriber of `stream_id` leaving for `reason` at `now`, as a
+/// drain or a rebalance does (a test of what follows a mark); how many.
+#[cfg(test)]
+pub(crate) fn mark_test_subscribers(
+    table: &Table,
+    stream_id: u64,
+    reason: &'static str,
+    now: Instant,
+    grace: Duration,
+) -> usize {
+    let mut guard = table.lock().unwrap();
+    guard.get_mut(&stream_id).map_or(0, |entry| {
+        mark_movable(entry, Duration::ZERO, now, None, reason, grace).len()
+    })
+}
+
 /// How often a paced drain sends its next share (Phase AM item 9).
 const DRAIN_TICK: Duration = Duration::from_millis(50);
 
@@ -4222,9 +4238,13 @@ pub(crate) fn rebalance_cost(own: &RebalanceEdge, others: &[RebalanceEdge]) -> O
 pub(crate) struct RebalanceState {
     planned_at: Option<Instant>,
     round: Option<DrainPace>,
-    /// B rule R2: listeners of the round that came back (taken back by
-    /// this edge), and the tags of the round's receivers (R1).
-    round_returned: usize,
+    /// B rule R2: the last two rounds that had a quota, newest first, each
+    /// with the listeners of it that came back. A listener comes back at
+    /// its client's give-up (3 s after its `MOVE`), mostly after the next
+    /// plan has replaced its round, so a return is booked by its mark's
+    /// time to the round that sent it.
+    books: [Option<RoundBook>; 2],
+    /// The tags of the round's receivers (B rule R1).
     receivers: Vec<u64>,
     shed: VecDeque<(Instant, usize)>,
     check: Option<RebalanceCheck>,
@@ -4236,11 +4256,22 @@ pub(crate) struct RebalanceState {
 /// since (wave 9 review).
 #[derive(Debug, Clone, Copy)]
 struct RebalanceCheck {
+    /// When the check began: sends from then on are in `sent`.
+    opened: Instant,
     load_permille: u32,
     subscribers: u64,
     cost: f64,
     sent: usize,
     last_sent: Option<Instant>,
+}
+
+/// A rebalance round with a quota, for B rule R2: when it started, its
+/// quota, and how many of the listeners it sent came back.
+#[derive(Debug, Clone, Copy)]
+struct RoundBook {
+    started: Instant,
+    initial: usize,
+    returned: usize,
 }
 
 /// How a rebalance's sends showed in the edge's load
@@ -4273,13 +4304,24 @@ impl RebalanceState {
     }
 
     /// A round of `total` listeners, into the edges tagged `receivers`.
+    /// One of none ends the round in progress; the returns of the rounds
+    /// before are still booked to them.
     pub(crate) fn start_round(&mut self, now: Instant, total: usize, receivers: Vec<u64>) {
         self.round = (total > 0).then_some(DrainPace {
             started: now,
             initial: total,
             sent: 0,
         });
-        self.round_returned = 0;
+        if total > 0 {
+            self.books = [
+                Some(RoundBook {
+                    started: now,
+                    initial: total,
+                    returned: 0,
+                }),
+                self.books[0],
+            ];
+        }
         self.receivers = receivers;
     }
 
@@ -4288,32 +4330,48 @@ impl RebalanceState {
         &self.receivers
     }
 
-    /// A listener sent away came back (B rule R2): it is no longer what the
-    /// edge shed (the newest send, and the open check), and its share goes
-    /// back to the round, to be offered to another subscriber. A round of
+    /// A listener that this edge marked at `since` came back (B rule R2):
+    /// it is no longer what the edge shed (the send made at `since`, and
+    /// the open check if that send is in it), and it is booked to the round
+    /// that sent it. While that round is still the one sending, its share
+    /// goes back to it, to be offered to another subscriber. A round of
     /// which more than half came back pauses rebalancing, as an ineffective
     /// one does: `true` then.
-    pub(crate) fn returned(&mut self, now: Instant) -> bool {
-        if let Some((_, count)) = self.shed.back_mut() {
-            *count -= 1;
-            if *count == 0 {
-                self.shed.pop_back();
+    pub(crate) fn returned(&mut self, now: Instant, since: Instant) -> bool {
+        if let Some(at) = self.shed.iter().position(|(at, _)| *at == since) {
+            self.shed[at].1 -= 1;
+            if self.shed[at].1 == 0 {
+                self.shed.remove(at);
             }
         }
-        if let Some(check) = self.check.as_mut() {
+        if let Some(check) = self.check.as_mut().filter(|check| check.opened <= since) {
             check.sent = check.sent.saturating_sub(1);
         }
-        let Some(round) = self.round.as_mut() else {
+        let Some(book) = self
+            .books
+            .iter_mut()
+            .flatten()
+            .find(|book| book.started <= since)
+        else {
             return false;
         };
-        round.sent = round.sent.saturating_sub(1);
-        self.round_returned += 1;
-        if self.round_returned * 2 <= round.initial {
-            return false;
+        book.returned += 1;
+        if book.returned * 2 > book.initial {
+            self.pause(now);
+            return true;
         }
+        let started = book.started;
+        if let Some(round) = self.round.as_mut().filter(|round| round.started == started) {
+            round.sent = round.sent.saturating_sub(1);
+        }
+        false
+    }
+
+    /// No round for [`REBALANCE_PAUSE`]; the rounds so far are judged.
+    fn pause(&mut self, now: Instant) {
         self.paused_until = Some(now + REBALANCE_PAUSE);
         self.round = None;
-        true
+        self.books = [None, None];
     }
 
     /// Listeners to send away now: the round's share due by the next tick
@@ -4359,12 +4417,19 @@ impl RebalanceState {
         }
     }
 
-    /// A round was planned at `load_permille` with `subscribers`, one
-    /// listener costing `cost`: the first since the last judgement starts
-    /// a check of what the sends do to the load.
-    pub(crate) fn begin_check(&mut self, load_permille: u32, subscribers: u64, cost: f64) {
+    /// A round was planned at `now` at `load_permille` with `subscribers`,
+    /// one listener costing `cost`: the first since the last judgement
+    /// starts a check of what the sends do to the load.
+    pub(crate) fn begin_check(
+        &mut self,
+        now: Instant,
+        load_permille: u32,
+        subscribers: u64,
+        cost: f64,
+    ) {
         if self.check.is_none() {
             self.check = Some(RebalanceCheck {
+                opened: now,
                 load_permille,
                 subscribers,
                 cost,
@@ -4405,8 +4470,7 @@ impl RebalanceState {
         let expected = f64::from(check.load_permille)
             + (subscribers as f64 - check.subscribers as f64) * check.cost;
         if f64::from(load_permille) > expected + check.sent as f64 * check.cost / 2.0 {
-            self.paused_until = Some(now + REBALANCE_PAUSE);
-            self.round = None;
+            self.pause(now);
             RebalanceVerdict::Ineffective
         } else {
             RebalanceVerdict::Lowered
@@ -5791,7 +5855,7 @@ mod tests {
         // A check: 900 permille with 40 listeners at 15 each; 6 sent.
         let window = Duration::from_secs(10);
         let mut state = RebalanceState::default();
-        state.begin_check(900, 40, 15.0);
+        state.begin_check(start, 900, 40, 15.0);
         state.start_round(start, 6, Vec::new());
         let due = state.reserve(start + spread, spread);
         assert_eq!(due, 6);
@@ -6403,7 +6467,7 @@ mod tests {
         let spread = Duration::from_millis(2_000);
         let window = Duration::from_secs(10);
         let mut state = RebalanceState::default();
-        state.begin_check(900, 40, 15.0);
+        state.begin_check(start, 900, 40, 15.0);
         state.start_round(start, 10, vec![7]);
         assert_eq!(state.receivers(), &[7]);
         let end = start + spread;
@@ -6412,16 +6476,17 @@ mod tests {
         state.settle(end, due, 10);
         assert!(!state.active());
         let shed = state.recent_shed(end, window);
-        assert!(!state.returned(end), "one of ten is no pause");
+        let back = end + Duration::from_millis(300);
+        assert!(!state.returned(back, end), "one of ten is no pause");
         assert!(state.active(), "its share is due again");
-        assert_eq!(state.reserve(end, spread), 1);
-        assert!((state.recent_shed(end, window) - (shed - 1.0)).abs() < 1e-9);
+        assert_eq!(state.reserve(back, spread), 1);
+        assert!((state.recent_shed(back, window) - (shed - 1.0) * 0.97).abs() < 1e-9);
         assert_eq!(state.check.unwrap().sent, 9);
-        // Without a round (the edge planned nothing since) only what it
+        // Without a round (the edge planned nothing ever) only what it
         // shed is booked.
         let mut idle = RebalanceState::default();
         idle.start_round(start, 0, Vec::new());
-        assert!(!idle.returned(start));
+        assert!(!idle.returned(start, start));
         assert!(!idle.active());
     }
 
@@ -6435,15 +6500,92 @@ mod tests {
         let mut state = RebalanceState::default();
         assert!(state.take_plan_turn(start, interval));
         state.start_round(start, 3, Vec::new());
-        let due = state.reserve(start + spread, spread);
-        state.settle(start + spread, due, due);
-        let back = start + spread + Duration::from_millis(100);
-        assert!(!state.returned(back), "one of three");
-        assert!(state.returned(back), "two of three");
+        let sent_at = start + spread;
+        let due = state.reserve(sent_at, spread);
+        state.settle(sent_at, due, due);
+        let back = sent_at + Duration::from_millis(100);
+        assert!(!state.returned(back, sent_at), "one of three");
+        assert!(state.returned(back, sent_at), "two of three");
         assert!(!state.active());
         assert_eq!(state.due(back, spread), 0);
+        assert!(!state.returned(back, sent_at), "paused once");
         assert!(!state.take_plan_turn(back + interval, interval));
         assert!(state.take_plan_turn(back + REBALANCE_PAUSE, interval));
+    }
+
+    /// B rule R2: a listener that is not level at its new edge comes back
+    /// at its client's give-up, 3 s after its `MOVE`, when the next plan
+    /// has replaced the round that sent it. It is booked to that round all
+    /// the same: a next plan with no quota does not lose it, and one with a
+    /// quota neither gets its share nor pauses for it.
+    #[test]
+    fn a_return_after_the_next_plan_is_booked_to_the_round_that_sent_it() {
+        let start = Instant::now();
+        let spread = Duration::from_millis(2_000);
+        let interval = Duration::from_millis(3_000);
+        let giveup = Duration::from_millis(3_000);
+        let window = Duration::from_secs(10);
+        // A round of 10 sent at 0.5 s; the plan at 3 s has no quota (what
+        // was shed still shows in the load). Back at 3.5 s and on: the
+        // sixth pauses.
+        let mut state = RebalanceState::default();
+        state.begin_check(start, 900, 40, 15.0);
+        state.start_round(start, 10, Vec::new());
+        let sent_at = start + Duration::from_millis(500);
+        let due = state.reserve(sent_at, Duration::ZERO);
+        assert_eq!(due, 10);
+        state.settle(sent_at, due, due);
+        assert!(state.take_plan_turn(start, interval));
+        assert!(state.take_plan_turn(start + interval, interval));
+        state.start_round(start + interval, 0, Vec::new());
+        let back = sent_at + giveup;
+        let shed = state.recent_shed(back, window);
+        for returned in 1..=5 {
+            assert!(!state.returned(back, sent_at), "{returned} of ten");
+        }
+        assert!((state.recent_shed(back, window) - (shed - 5.0 * 0.7)).abs() < 1e-9);
+        assert_eq!(state.check.unwrap().sent, 5);
+        assert!(state.returned(back, sent_at), "six of ten");
+        assert!(!state.active());
+        assert!(!state.take_plan_turn(back + interval, interval));
+        assert!(state.take_plan_turn(back + REBALANCE_PAUSE, interval));
+
+        // The plan at 3 s has a quota of 4, sent at 3.2 s. Four of the
+        // first round come back: the second round's share is not touched
+        // and nothing pauses. One of the second round comes back: its share
+        // is due again. Two more of the first: six of ten, a pause.
+        let mut state = RebalanceState::default();
+        state.start_round(start, 10, Vec::new());
+        let due = state.reserve(sent_at, Duration::ZERO);
+        state.settle(sent_at, due, 10);
+        let second = start + interval;
+        state.start_round(second, 4, Vec::new());
+        let second_sent = second + Duration::from_millis(200);
+        let due = state.reserve(second_sent, Duration::ZERO);
+        state.settle(second_sent, due, 4);
+        assert!(!state.active());
+        for _ in 0..4 {
+            assert!(!state.returned(back, sent_at));
+        }
+        assert!(!state.active(), "the first round's returns are not the second's share");
+        assert!(!state.returned(back, second_sent), "one of four");
+        assert!(state.active());
+        assert_eq!(state.reserve(second + spread, spread), 1);
+        assert!(!state.returned(back, sent_at), "five of ten");
+        assert!(state.returned(back, sent_at), "six of ten");
+        assert!(!state.active());
+        assert_eq!(state.due(back, spread), 0);
+        // A return of a send older than the check is not taken out of it.
+        let mut state = RebalanceState::default();
+        state.start_round(start, 10, Vec::new());
+        let due = state.reserve(sent_at, Duration::ZERO);
+        state.settle(sent_at, due, 10);
+        state.begin_check(second, 800, 30, 15.0);
+        state.start_round(second, 4, Vec::new());
+        let due = state.reserve(second_sent, Duration::ZERO);
+        state.settle(second_sent, due, 4);
+        assert!(!state.returned(back, sent_at));
+        assert_eq!(state.check.unwrap().sent, 4);
     }
 
     /// B rule R3: three edges at 720 / 720 / 0 (a listener at 15 permille)
