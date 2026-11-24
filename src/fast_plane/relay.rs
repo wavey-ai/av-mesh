@@ -50,21 +50,27 @@ use tracing::{debug, info, warn};
 /// ring also holds `tee_ring::BYTES_PER_ENTRY` bytes for each: 16 MB at
 /// this, pinned at start).
 pub const DEFAULT_TEE_CAPACITY: usize = 65_536;
-/// Bytes of the video class's tee ring (`--relay-video-tee-mb`): 192 MiB,
-/// about 5 s of a 300 Mbit/s 4K stream's symbols with their repair. The
-/// ring of [`DEFAULT_TEE_CAPACITY`] entries at 256 B each (16 MB) holds
-/// 12,000 symbols, half a second at 247 Mbit/s: a tee behind by that much
-/// (a busy worker) dropped its copies, and a dropped copy is a part missing
-/// from that node's cache. Local lab, 24 Nov, the referee's 247 Mbit/s
-/// clip, 40 s: 16 MB 1,875 to 110,868 tee_dropped at the distributors in
-/// every run; 48 MiB 31,591 to 178,300; 192 MiB none (one run). The old
-/// channel (65,536 entries of any size, unpinned) held as much. Only the
-/// first 16 MB is faulted in and locked at start; the rest when a video
-/// datagram first comes (`tee_ring::tee_ring_growing`). With the default
-/// 65,536 entries the entries bind first, at about 88 MB of 1,350-byte
-/// symbols, but the ring's bytes are written in turn, so all of them are
-/// resident once grown.
-pub const DEFAULT_VIDEO_TEE_BYTES: usize = 192 << 20;
+/// Bytes of the video class's tee ring (`--relay-video-tee-mb`): 96 MiB,
+/// as many bytes as its [`DEFAULT_TEE_CAPACITY`] entries take of 4K
+/// symbols (1,316 bytes and RLS1's header: 65,536 x about 1,390 = 91 MB).
+/// That is 2.56 s at 247 Mbit/s of media (25,600 datagrams a second, the
+/// entries bind first; the bytes would last 2.8 s) and 2.1 s at 300 Mbit/s
+/// of 50 frames a second (31,150 a second). fix4-video measured the tee at
+/// 2.7 to 3.3 times those rates on one CPU, and its longest single stall
+/// in the local gate at 0.9 s: the ring covers that twice, and a longer lag
+/// loses whole parts (`TeeParts`). It was 192 MiB (rm/4k): its entries ran
+/// out at about 89 MB, but the ring writes its bytes in turn, so all 192
+/// MiB became resident and locked for nothing. The ring of 256 B an entry
+/// (16 MB, 12,000 symbols, half a second at 247) dropped copies in every
+/// lab run. Only the first 16 MB is faulted in and locked at start; the
+/// rest when a video datagram first comes (`tee_ring::tee_ring_growing`).
+pub const DEFAULT_VIDEO_TEE_BYTES: usize = 96 << 20;
+/// `--relay-video-socket-buffer-ms`: a video socket holds two seconds of
+/// its stream's busiest second (`VideoSocketBuffers`).
+pub const DEFAULT_VIDEO_SOCKET_BUFFER_MS: u64 = 2_000;
+/// `--relay-video-socket-buffer-max-mb`: 128 MiB asked (the kernel books
+/// twice that in buffer memory: about 2.7 s at 300 Mbit/s of 4K).
+pub const DEFAULT_VIDEO_SOCKET_BUFFER_MAX_BYTES: usize = 128 << 20;
 /// Symbols the first-arrival table remembers per class.
 const DEDUP_CAPACITY: usize = 65_536;
 /// How often an idle class thread looks at the stop flag.
@@ -140,13 +146,29 @@ pub struct RelayClassConfig {
     /// `--relay-media-deadline-ms` in µs (A 2.5): a datagram whose deadline
     /// is this far behind the head of its stream's timeline here is stale.
     pub media_deadline_us: u64,
+    /// The receive buffer the class sockets were made with
+    /// (`--udp-socket-buffer-bytes`): the least a video socket keeps.
+    pub socket_buffer_bytes: usize,
+    /// `--relay-video-socket-buffer-ms` (fix4-video): a video socket's
+    /// receive buffer grows to hold this long of the most its stream
+    /// brought in a second, up to `video_socket_buffer_max_bytes`; 0 leaves
+    /// it as made.
+    pub video_socket_buffer_ms: u64,
+    pub video_socket_buffer_max_bytes: usize,
     /// Tests: the tee of this class panics on its first datagram.
     #[cfg(test)]
     pub test_tee_panic: Option<TrafficClass>,
+    /// Tests: the video tee spends this much more processor time on each
+    /// datagram (a tee short of processor time).
+    #[cfg(test)]
+    pub test_video_tee_spin_ns: u64,
     /// Tests: the audio thread counts its allocations and frees here once
     /// it runs (`alloc_count`).
     #[cfg(test)]
     pub test_alloc_counter: Option<&'static crate::alloc_count::AllocCounter>,
+    /// Tests: the same for the video thread.
+    #[cfg(test)]
+    pub test_video_alloc_counter: Option<&'static crate::alloc_count::AllocCounter>,
 }
 
 impl Default for RelayClassConfig {
@@ -168,10 +190,17 @@ impl Default for RelayClassConfig {
             lease_descriptors: true,
             video_gro: true,
             media_deadline_us: DEFAULT_MEDIA_DEADLINE_US,
+            socket_buffer_bytes: 8 << 20,
+            video_socket_buffer_ms: DEFAULT_VIDEO_SOCKET_BUFFER_MS,
+            video_socket_buffer_max_bytes: DEFAULT_VIDEO_SOCKET_BUFFER_MAX_BYTES,
             #[cfg(test)]
             test_tee_panic: None,
             #[cfg(test)]
+            test_video_tee_spin_ns: 0,
+            #[cfg(test)]
             test_alloc_counter: None,
+            #[cfg(test)]
+            test_video_alloc_counter: None,
         }
     }
 }
@@ -320,6 +349,26 @@ pub struct FastPlaneStats {
     pub stale_media: AtomicU64,
     /// Datagrams of streams that found no media clock, per class.
     pub media_clock_overflow: [AtomicU64; 2],
+    /// Each class's tee (fix4-video): the wakes that took datagrams, its
+    /// processor time over them (µs, its thread's clock), and the longest
+    /// it took a datagram after the class thread read it (µs).
+    pub tee_batches: [AtomicU64; 2],
+    pub tee_cpu_us: [AtomicU64; 2],
+    pub tee_lag_max_us: [AtomicU64; 2],
+    /// Video parts the video thread did not tee because the ring had no
+    /// room for the whole part when its first symbol came (`TeeParts`);
+    /// their symbols count in `tee_dropped`.
+    pub tee_parts_shed: AtomicU64,
+    /// Tee copies refused while the class's ring was not yet at its full
+    /// size (they count in `tee_dropped` too), and the bytes of each
+    /// class's ring in use.
+    pub tee_dropped_growing: AtomicU64,
+    pub tee_ring_bytes: [AtomicU64; 2],
+    /// Bytes the video sockets received, by `lane_index` (primary,
+    /// secondary), and their receive buffers as the kernel reports them
+    /// (twice what was asked: its booking of buffer memory).
+    pub video_rx_bytes: [AtomicU64; 2],
+    pub video_socket_buffer_bytes: [AtomicU64; 2],
     /// Validated epochs that found no slot in the class threads' table
     /// (`ValidatedEpochs::unrecorded`): their streams are never stale.
     pub media_clock_unrecorded: AtomicU64,
@@ -640,6 +689,21 @@ pub struct FastPlaneSnapshot {
     /// The audio class's parent lanes (A 2.7).
     pub parent_lanes: [ParentLaneSnapshot; 2],
     pub media_clock: MediaClockSnapshot,
+    /// The tees (fix4-video): processor time (µs), the video tee's wakes,
+    /// its longest lag behind its thread (µs), and the video parts not
+    /// teed for want of room in the ring.
+    pub audio_tee_cpu_us: u64,
+    pub video_tee_cpu_us: u64,
+    pub video_tee_batches: u64,
+    pub video_tee_lag_max_us: u64,
+    pub video_tee_parts_shed: u64,
+    /// Tee copies refused while a ring was growing (in `tee_dropped` too),
+    /// and the bytes of the video tee ring in use.
+    pub tee_dropped_growing: u64,
+    pub video_tee_ring_bytes: u64,
+    /// The video sockets' receive buffers as the kernel reports them, the
+    /// larger of the two (fix4-video: sized to two seconds of the stream).
+    pub video_socket_buffer_bytes: u64,
 }
 
 impl FastPlaneStats {
@@ -713,6 +777,19 @@ impl FastPlaneStats {
                 overflow: self.media_clock_overflow.iter().map(load).sum(),
                 unrecorded_streams: load(&self.media_clock_unrecorded),
             },
+            audio_tee_cpu_us: load(&self.tee_cpu_us[0]),
+            video_tee_cpu_us: load(&self.tee_cpu_us[1]),
+            video_tee_batches: load(&self.tee_batches[1]),
+            video_tee_lag_max_us: load(&self.tee_lag_max_us[1]),
+            video_tee_parts_shed: load(&self.tee_parts_shed),
+            tee_dropped_growing: load(&self.tee_dropped_growing),
+            video_tee_ring_bytes: load(&self.tee_ring_bytes[1]),
+            video_socket_buffer_bytes: self
+                .video_socket_buffer_bytes
+                .iter()
+                .map(load)
+                .max()
+                .unwrap_or(0),
         }
     }
 }
@@ -825,6 +902,9 @@ pub(crate) struct ForwardPlan {
     /// the child's index in the snapshot.
     lease_warm: Vec<PlannedWarm>,
     first: [Option<(SocketAddr, u64)>; RECV_BATCH],
+    /// The UDP GSO runs of a send, worked out in place (fix4-video: a
+    /// list made per send was the video thread's allocation per batch).
+    runs: Vec<(usize, usize)>,
 }
 
 impl ForwardPlan {
@@ -842,6 +922,8 @@ impl ForwardPlan {
             lease: Vec::with_capacity(RECV_BATCH * lease_children),
             lease_warm: Vec::with_capacity(RECV_BATCH * lease_children),
             first: [None; RECV_BATCH],
+            // A run per send at most: the largest list of sends.
+            runs: Vec::with_capacity(RECV_BATCH * paths.max(lease_children).max(1)),
         }
     }
 
@@ -856,6 +938,7 @@ impl ForwardPlan {
         crate::memory::touch_spare(&mut self.warm);
         crate::memory::touch_spare(&mut self.lease);
         crate::memory::touch_spare(&mut self.lease_warm);
+        crate::memory::touch_spare(&mut self.runs);
     }
 
     fn clear(&mut self) {
@@ -922,6 +1005,7 @@ fn send_lease_plan(
         lease: sends,
         lease_warm,
         first,
+        runs,
         ..
     } = plan;
     if !sends.is_empty() {
@@ -942,7 +1026,7 @@ fn send_lease_plan(
         let started = Instant::now();
         let mut sent = None;
         if use_gso {
-            match sys::send_gso_batch(fd, sends.len(), message) {
+            match sys::send_gso_batch_with(fd, runs, sends.len(), message) {
                 Ok(gso_sent) => {
                     stats
                         .gso_datagrams
@@ -1145,6 +1229,7 @@ impl RelayDownstreamForwarder {
             groups,
             retry,
             first,
+            runs,
             ..
         } = plan;
         let use_gso = *gso && class == TrafficClass::Video;
@@ -1171,7 +1256,7 @@ impl RelayDownstreamForwarder {
             };
             let mut sent = None;
             if use_gso && *gso {
-                match sys::send_gso_batch(fd, sends.len(), message) {
+                match sys::send_gso_batch_with(fd, runs, sends.len(), message) {
                     Ok(gso_sent) => {
                         stats
                             .gso_datagrams
@@ -1471,12 +1556,98 @@ impl LeaseDescriptors {
 /// How often the audio thread looks at its loss meters.
 const LOSS_POLL: Duration = Duration::from_millis(100);
 
+/// Video parts under way that [`TeeParts`] remembers its verdict for.
+const TEE_PARTS: usize = 64;
+
+/// Tests: the video thread tees symbol by symbol, as before `TeeParts`
+/// (a measurement's baseline).
+#[cfg(test)]
+pub(crate) static TEE_PARTS_OFF: AtomicBool = AtomicBool::new(false);
+
+/// The video thread tees a part whole or not at all (fix4-video).
+///
+/// A full ring refused whichever symbol came, and took the next as soon as
+/// the tee released an entry: while the tee was behind, each part lost
+/// symbols here and there, more than its repair covers, so every part of
+/// the episode was lost (and the tee still spent its time on all of them).
+/// Now the verdict is made at a part's first symbol: the part is teed when
+/// the ring has room for all its symbols and as many again (the part before
+/// may still be arriving), else none of it is, and the parts after it find
+/// the room the tee frees. A tee short of processor time by a tenth loses
+/// about a tenth of the parts, not all of them.
+///
+/// A fixed table made before the thread runs: a verdict per (stream,
+/// part), the oldest replaced by a new part.
+struct TeeParts {
+    parts: [TeePart; TEE_PARTS],
+    next: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+struct TeePart {
+    stream: u64,
+    object: u64,
+    used: bool,
+    teed: bool,
+}
+
+/// What the tee needs of the ring for a part of `source_symbols` symbols
+/// of `len` bytes: its sources, an eighth more for repair, and a few more.
+fn tee_part_need(source_symbols: u64, len: u64) -> (u64, u64) {
+    let entries = source_symbols + source_symbols / 8 + 8;
+    (entries, entries.saturating_mul(len))
+}
+
+impl TeeParts {
+    fn new() -> Self {
+        Self {
+            parts: [TeePart::default(); TEE_PARTS],
+            next: 0,
+        }
+    }
+
+    /// Whether this symbol of part `object` of `stream` goes to the tee,
+    /// and whether the call shed a new part. `room` is the ring's
+    /// ([`TeeSender::room`]), read only for a part's first symbol.
+    fn admit(
+        &mut self,
+        stream: u64,
+        object: u64,
+        source_symbols: u64,
+        len: u64,
+        room: impl FnOnce() -> (u64, u64),
+    ) -> (bool, bool) {
+        if let Some(part) = self
+            .parts
+            .iter()
+            .find(|part| part.used && part.object == object && part.stream == stream)
+        {
+            return (part.teed, false);
+        }
+        let (entries, bytes) = tee_part_need(source_symbols, len);
+        let (free_entries, free_bytes) = room();
+        let teed =
+            free_entries >= entries.saturating_mul(2) && free_bytes >= bytes.saturating_mul(2);
+        self.parts[self.next] = TeePart {
+            stream,
+            object,
+            used: true,
+            teed,
+        };
+        self.next = (self.next + 1) % TEE_PARTS;
+        (teed, !teed)
+    }
+}
+
 struct Pending {
     message: usize,
     peer: SocketAddr,
     path: RelayIngressParentPath,
     rx_us: u64,
     admitted: Option<bool>,
+    /// A video part's symbol on the video thread: (stream key, part,
+    /// source symbols), for [`TeeParts`].
+    part: Option<(u64, u64, u64)>,
 }
 
 impl ClassThread {
@@ -1607,6 +1778,7 @@ impl ClassThread {
             && self.lease.is_some())
         .then(LeaseDescriptors::new);
         let mut feed_misses = FeedMisses::new();
+        let mut tee_parts = TeeParts::new();
         let mut last_loss_poll = Instant::now();
         let mut last_demand_report: Option<Instant> = None;
         // Loop lag (wave 9): the last wait's return that brought datagrams.
@@ -1694,6 +1866,7 @@ impl ClassThread {
                             meters.get_mut(index),
                             descriptors.as_mut(),
                             &mut tee,
+                            &mut tee_parts,
                             &mut feed_misses,
                         );
                         if !batch.next_window() {
@@ -1857,6 +2030,7 @@ impl ClassThread {
         mut meter: Option<&mut LossMeter>,
         mut descriptors: Option<&mut LeaseDescriptors>,
         tee: &mut TeeSender<TeeMeta>,
+        tee_parts: &mut TeeParts,
         feed_misses: &mut FeedMisses,
     ) {
         let now_us = now_unix_us();
@@ -1890,6 +2064,11 @@ impl ClassThread {
                 .received
                 .fetch_add(batch.len() as u64, Ordering::Relaxed);
         }
+        if class == TrafficClass::Video {
+            // What `VideoSocketBuffers` sizes the socket's buffer to.
+            let bytes: usize = (0..batch.len()).map(|message| batch.data(message).len()).sum();
+            self.stats.video_rx_bytes[lane_index(path)].fetch_add(bytes as u64, Ordering::Relaxed);
+        }
         for message in 0..batch.len() {
             let received = batch.get(message);
             if let Some(dropped) = received.dropped {
@@ -1920,6 +2099,7 @@ impl ClassThread {
                 path,
                 rx_us,
                 admitted: None,
+                part: None,
             };
             if !is_relay_datagram(received.data) {
                 // A parent's ledger (RLL1) for the loss meter of this lane.
@@ -2030,8 +2210,16 @@ impl ClassThread {
             if let Some((lane, snapshot)) = &edge_clients {
                 clients.plan(lane, snapshot, message, &view);
             }
+            let video_part = class == TrafficClass::Video && view.is_video_kind();
             pending.push(Pending {
                 admitted: Some(view.is_video_kind()),
+                part: video_part.then(|| {
+                    (
+                        MediaClocks::key(view.tenant, view.stream).hash(),
+                        view.object,
+                        u64::from(view.source_symbols),
+                    )
+                }),
                 ..unchecked
             });
         }
@@ -2099,16 +2287,46 @@ impl ClassThread {
                 client_sent: clients.sent_to(entry.message),
                 kind,
             };
+            let data = batch.data(entry.message);
+            // A video part goes whole or not at all (`TeeParts`).
+            #[cfg(test)]
+            let part = entry
+                .part
+                .filter(|_| !TEE_PARTS_OFF.load(Ordering::Relaxed));
+            #[cfg(not(test))]
+            let part = entry.part;
+            let teed = match part {
+                Some((stream, object, source_symbols)) => {
+                    let (teed, shed) = tee_parts.admit(
+                        stream,
+                        object,
+                        source_symbols,
+                        data.len() as u64,
+                        || tee.room(),
+                    );
+                    if shed {
+                        self.stats.tee_parts_shed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    teed
+                }
+                None => true,
+            };
             // Into the pinned ring: no allocation, and nothing for the
             // class thread to free (stall follow-up). A full ring drops
             // the copy, as a full channel did.
-            if !tee.push(meta, batch.data(entry.message)) {
+            if !teed || !tee.push(meta, data) {
                 self.stats.tee_dropped.fetch_add(1, Ordering::Relaxed);
+                if tee.growing() {
+                    self.stats
+                        .tee_dropped_growing
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         // The tee also makes the feed entries asked for in the batch: a
         // key is asked for at a datagram that is teed with it.
         tee.wake();
+        self.stats.tee_ring_bytes[class.index()].store(tee.capacity(), Ordering::Relaxed);
     }
 }
 
@@ -2212,7 +2430,16 @@ struct Tee {
     /// Tests: the tee panics on its first datagram.
     #[cfg(test)]
     panic_on_item: bool,
+    /// Tests: processor time spent on each datagram besides its work.
+    #[cfg(test)]
+    spin_ns: u64,
 }
+
+/// Entries the tee takes in one wake before it publishes its snapshot and
+/// looks at its other work (fix4-video: was a receive batch, 65, so a tee
+/// behind by a second published and went round its loop 400 times a
+/// second more than it needed to).
+const TEE_WAKE_ENTRIES: usize = 1_024;
 
 impl Tee {
     /// Runs until the thread's channel closes. It waits on nothing but its
@@ -2232,13 +2459,18 @@ impl Tee {
                     // leaves it out (edge_admission::PLAYLIST_CPU_US).
                     let cpu_before = crate::edge_admission::thread_cpu_us();
                     let wall_before = Instant::now();
-                    for _ in 0..=RECV_BATCH {
+                    let mut lag_max_us = 0;
+                    for _ in 0..TEE_WAKE_ENTRIES {
                         let Some((meta, bytes)) = items.peek() else {
                             break;
                         };
+                        lag_max_us = lag_max_us.max(now_unix_us().saturating_sub(meta.woken_us));
                         self.process(meta, bytes).await;
                         items.release();
                     }
+                    let class = self.class.index();
+                    self.stats.tee_batches[class].fetch_add(1, Ordering::Relaxed);
+                    self.stats.tee_lag_max_us[class].fetch_max(lag_max_us, Ordering::Relaxed);
                     self.feeds.make_requested();
                     self.publish();
                     // The batch ran on one worker thread unless `process`
@@ -2251,6 +2483,7 @@ impl Tee {
                         let wall_us = wall_before.elapsed().as_micros() as u64;
                         let used = after.saturating_sub(before).min(wall_us);
                         crate::edge_admission::PLAYLIST_CPU_US.fetch_add(used, Ordering::Relaxed);
+                        self.stats.tee_cpu_us[class].fetch_add(used, Ordering::Relaxed);
                     }
                 }
                 () = expire.notified() => {
@@ -2335,6 +2568,10 @@ impl Tee {
         #[cfg(test)]
         assert!(!self.panic_on_item, "test: the tee panics");
         let started = Instant::now();
+        #[cfg(test)]
+        while (started.elapsed().as_nanos() as u64) < self.spin_ns {
+            std::hint::spin_loop();
+        }
         stall_tee(self.class, now_unix_us().saturating_sub(item.woken_us));
         match item.kind {
             TeeKind::Admitted {
@@ -2554,6 +2791,82 @@ impl Tee {
     }
 }
 
+/// The video sockets' receive buffers, sized to their stream (fix4-video,
+/// task 4). A video socket was made with `--udp-socket-buffer-bytes` (8 MiB
+/// asked; the kernel books 16 MiB of buffer memory against it, which holds
+/// 10-12 MB of 1,390-byte datagrams at their skb truesize): 0.3 s at 247
+/// Mbit/s of 4K (37 MB/s on the wire), 0.8-1.1 s at 80. A class thread
+/// that does not run longer than that (a node stopped 1.6-8.5 s, Linode
+/// wave 9) loses what overflows. Once a second this asks the kernel for
+/// `ms` of the busiest second the socket has had, if that is more than it
+/// has, up to `max` (the kernel books twice what is asked, so the buffer
+/// holds about 1.3 times `ms` of that second at a truesize of 1.5 times the
+/// datagram). It never shrinks: a buffer is a bound, not memory, until a
+/// stall fills it. Past `net.core.rmem_max` it needs CAP_NET_ADMIN
+/// (SO_RCVBUFFORCE), which the deploy gives. Off the class thread, on a
+/// timer (`fast_control::run_video_socket_buffers`).
+pub(crate) struct VideoSocketBuffers {
+    sockets: Vec<(usize, std::net::UdpSocket)>,
+    ms: u64,
+    floor: usize,
+    max: usize,
+    asked: [usize; 2],
+    last_bytes: [u64; 2],
+}
+
+/// What a video socket's receive buffer is asked for: `ms` of
+/// `bytes_per_second`, at least `floor` and at most `max` (all as asked of
+/// `SO_RCVBUF`, which the kernel doubles).
+pub(crate) fn video_socket_buffer_target(
+    bytes_per_second: u64,
+    ms: u64,
+    floor: usize,
+    max: usize,
+) -> usize {
+    let wanted = bytes_per_second.saturating_mul(ms) / 1_000;
+    (usize::try_from(wanted).unwrap_or(usize::MAX))
+        .clamp(floor.min(max), max.max(floor))
+}
+
+impl VideoSocketBuffers {
+    fn new(sockets: Vec<(usize, std::net::UdpSocket)>, config: &RelayClassConfig) -> Self {
+        Self {
+            sockets,
+            ms: config.video_socket_buffer_ms,
+            floor: config.socket_buffer_bytes,
+            max: config.video_socket_buffer_max_bytes,
+            asked: [config.socket_buffer_bytes; 2],
+            last_bytes: [0; 2],
+        }
+    }
+
+    /// One second's look: grow each socket whose stream asks for more.
+    pub(crate) fn turn(&mut self, stats: &FastPlaneStats, elapsed: Duration) {
+        for (lane, socket) in &self.sockets {
+            let lane = *lane;
+            let bytes = stats.video_rx_bytes[lane].load(Ordering::Relaxed);
+            let delta = bytes.saturating_sub(self.last_bytes[lane]);
+            self.last_bytes[lane] = bytes;
+            let per_second = (delta as f64 / elapsed.as_secs_f64().max(1e-3)) as u64;
+            let target = video_socket_buffer_target(per_second, self.ms, self.floor, self.max);
+            if self.ms > 0 && target > self.asked[lane] {
+                let granted = sys::grow_receive_buffer(socket, target);
+                info!(
+                    lane,
+                    bytes_per_second = per_second,
+                    asked_bytes = target,
+                    granted_bytes = granted,
+                    "a video socket's receive buffer grows to its stream"
+                );
+                self.asked[lane] = target;
+            }
+            if let Some(granted) = sys::receive_buffer(socket) {
+                stats.video_socket_buffer_bytes[lane].store(granted as u64, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// The relay ingest on the fast plane. Takes the place of
 /// `run_udp_fec_ingest`; `runtime.secondary_socket` is unused (the
 /// secondary port's sockets are among `sockets`).
@@ -2618,9 +2931,16 @@ pub async fn run_relay_class_ingest(
         None => None,
     };
     let mut by_class: [Vec<(RelayIngressParentPath, std::net::UdpSocket)>; 2] = Default::default();
+    // The video sockets again (the same sockets), for their buffers.
+    let mut video_sockets = Vec::new();
     for socket in sockets {
+        if socket.class == TrafficClass::Video {
+            video_sockets.push((lane_index(socket.path), socket.socket.try_clone()?));
+        }
         by_class[socket.class.index()].push((socket.path, socket.socket));
     }
+    let video_buffers = (!video_sockets.is_empty())
+        .then(|| VideoSocketBuffers::new(video_sockets, &config));
     let mut dispatches = [Some(dispatch), Some(video_dispatch)];
     let mut threads = Vec::new();
     let mut tees = tokio::task::JoinSet::new();
@@ -2676,9 +2996,10 @@ pub async fn run_relay_class_ingest(
             media_deadline_us: config.media_deadline_us,
             epochs: Arc::clone(&epochs),
             #[cfg(test)]
-            test_alloc_counter: config
-                .test_alloc_counter
-                .filter(|_| class == TrafficClass::Audio),
+            test_alloc_counter: match class {
+                TrafficClass::Audio => config.test_alloc_counter,
+                TrafficClass::Video => config.test_video_alloc_counter,
+            },
         };
         match std::thread::Builder::new()
             .name(format!("needletail-fast-{}", class.as_str()))
@@ -2719,6 +3040,12 @@ pub async fn run_relay_class_ingest(
             feeds: Arc::clone(&feeds),
             #[cfg(test)]
             panic_on_item: config.test_tee_panic == Some(class),
+            #[cfg(test)]
+            spin_ns: if class == TrafficClass::Video {
+                config.test_video_tee_spin_ns
+            } else {
+                0
+            },
         };
         audio_tee |= class == TrafficClass::Audio;
         let nudge = Arc::new(Notify::new());
@@ -2736,6 +3063,13 @@ pub async fn run_relay_class_ingest(
         Arc::clone(&stats),
         shutdown_rx.clone(),
     ));
+    let video_buffers = video_buffers.map(|buffers| {
+        tokio::spawn(crate::fast_control::run_video_socket_buffers(
+            buffers,
+            Arc::clone(&stats),
+            shutdown_rx.clone(),
+        ))
+    });
     let controller = failover_controller.map(|controller| {
         tokio::spawn(crate::fast_control::run_failover_controller(
             controller,
@@ -2775,6 +3109,9 @@ pub async fn run_relay_class_ingest(
     }
     housekeeping.abort();
     sampler.abort();
+    if let Some(video_buffers) = &video_buffers {
+        video_buffers.abort();
+    }
     stop.store(true, Ordering::Relaxed);
     join_threads(threads).await;
     // With the threads gone the tees' channels close and they end.
@@ -2819,6 +3156,81 @@ mod two_contributors;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_video_socket_buffer_is_asked_for_seconds_of_its_stream() {
+        let (floor, max) = (8 << 20, 128 << 20);
+        // 247 Mbit/s of 4K: 37 MB/s on the wire, two seconds of it.
+        assert_eq!(video_socket_buffer_target(37_000_000, 2_000, floor, max), 74_000_000);
+        // A quiet socket keeps what it was made with.
+        assert_eq!(video_socket_buffer_target(1_000_000, 2_000, floor, max), floor);
+        // 1 Gbit/s is capped.
+        assert_eq!(video_socket_buffer_target(125_000_000, 2_000, floor, max), max);
+        assert_eq!(video_socket_buffer_target(u64::MAX, 2_000, floor, max), max);
+    }
+
+    /// A turn grows a socket whose stream asks for more, never shrinks it,
+    /// and reports what the kernel gave (here within net.core.rmem_max: no
+    /// CAP_NET_ADMIN).
+    #[test]
+    fn a_video_socket_s_buffer_grows_to_its_stream_and_never_shrinks() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let small = 64 * 1024;
+        socket2::SockRef::from(&socket)
+            .set_recv_buffer_size(small)
+            .unwrap();
+        let made = sys::receive_buffer(&socket).unwrap();
+        let stats = FastPlaneStats::default();
+        let config = RelayClassConfig {
+            socket_buffer_bytes: small,
+            video_socket_buffer_ms: 2_000,
+            video_socket_buffer_max_bytes: 1 << 20,
+            ..Default::default()
+        };
+        let mut buffers = VideoSocketBuffers::new(vec![(1, socket.try_clone().unwrap())], &config);
+        // 400 kB in a second: 800 kB asked.
+        stats.video_rx_bytes[1].store(400_000, Ordering::Relaxed);
+        buffers.turn(&stats, Duration::from_secs(1));
+        let grown = sys::receive_buffer(&socket).unwrap();
+        assert!(grown > made, "{made} -> {grown}");
+        assert_eq!(buffers.asked[1], 800_000);
+        assert_eq!(
+            stats.video_socket_buffer_bytes[1].load(Ordering::Relaxed),
+            grown as u64
+        );
+        // A quiet second asks for nothing less; a busier one for no more
+        // than the cap.
+        buffers.turn(&stats, Duration::from_secs(1));
+        assert_eq!(sys::receive_buffer(&socket).unwrap(), grown);
+        stats.video_rx_bytes[1].store(400_000 + 10_000_000, Ordering::Relaxed);
+        buffers.turn(&stats, Duration::from_secs(1));
+        assert_eq!(buffers.asked[1], 1 << 20);
+    }
+
+    #[test]
+    fn a_video_part_is_teed_whole_or_not_at_all() {
+        let mut parts = TeeParts::new();
+        let len = 1_400;
+        let (entries, bytes) = tee_part_need(1_000, len);
+        let roomy = || (2 * entries, 2 * bytes);
+        let tight = || (2 * entries - 1, 2 * bytes);
+        // A part's verdict is made at its first symbol and kept.
+        assert_eq!(parts.admit(7, 1, 1_000, len, roomy), (true, false));
+        assert_eq!(parts.admit(7, 1, 1_000, len, tight), (true, false));
+        // A part that finds too little room is not teed, nor are its later
+        // symbols when the room comes back.
+        assert_eq!(parts.admit(7, 2, 1_000, len, tight), (false, true));
+        assert_eq!(parts.admit(7, 2, 1_000, len, roomy), (false, false));
+        // Bytes count as entries do; other streams have verdicts of their own.
+        assert_eq!(parts.admit(8, 2, 1_000, len, || (2 * entries, bytes)), (false, true));
+        assert_eq!(parts.admit(9, 2, 1_000, len, roomy), (true, false));
+        // The table holds the last TEE_PARTS parts: the oldest is judged
+        // again (as a new part) once that many came after it.
+        for object in 100..100 + TEE_PARTS as u64 {
+            parts.admit(7, object, 10, len, roomy);
+        }
+        assert_eq!(parts.admit(7, 2, 1_000, len, roomy), (true, false));
+    }
 
     #[test]
     fn a_lease_descriptor_takes_the_longest_admitted_stream_id() {

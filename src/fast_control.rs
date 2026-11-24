@@ -330,3 +330,25 @@ pub(crate) fn spawn_lease_inbound_drain(
         })
         .collect()
 }
+
+/// The video sockets' receive buffers sized to their streams once a second
+/// until shutdown (`fast_plane::relay::VideoSocketBuffers`, fix4-video).
+pub(crate) async fn run_video_socket_buffers(
+    mut buffers: crate::fast_plane::relay::VideoSocketBuffers,
+    stats: Arc<crate::fast_plane::relay::FastPlaneStats>,
+    mut shutdown_rx: watch::Receiver<()>,
+) {
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last = Instant::now();
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => return,
+            _ = tick.tick() => {
+                let now = Instant::now();
+                buffers.turn(&stats, now.duration_since(last));
+                last = now;
+            }
+        }
+    }
+}

@@ -790,6 +790,71 @@ pub fn send_gso_batch<'a>(
     send_gso_runs(socket, &runs, message, None)
 }
 
+/// The receive buffer of `socket` as the kernel reports it (`SO_RCVBUF`:
+/// twice what was asked, its booking of buffer memory).
+pub fn receive_buffer(socket: &impl AsRawFd) -> Option<usize> {
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: getsockopt writes a c_int into `value`, of the size given.
+    let result = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            std::ptr::from_mut(&mut value).cast(),
+            &mut len,
+        )
+    };
+    (result == 0).then(|| usize::try_from(value).unwrap_or(0))
+}
+
+/// Ask for a receive buffer of `bytes` on `socket`: `SO_RCVBUF` (up to
+/// `net.core.rmem_max`), then `SO_RCVBUFFORCE` (CAP_NET_ADMIN) if the
+/// kernel gave less. The buffer as the kernel then reports it.
+pub fn grow_receive_buffer(socket: &impl AsRawFd, bytes: usize) -> usize {
+    let Ok(value) = libc::c_int::try_from(bytes) else {
+        return receive_buffer(socket).unwrap_or(0);
+    };
+    let set = |option| {
+        // SAFETY: a plain setsockopt with a c_int value on a live socket.
+        unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                std::ptr::from_ref(&value).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        }
+    };
+    set(libc::SO_RCVBUF);
+    if receive_buffer(socket).unwrap_or(0) < bytes.saturating_mul(2) {
+        set(libc::SO_RCVBUFFORCE);
+    }
+    receive_buffer(socket).unwrap_or(0)
+}
+
+/// [`send_gso_batch`] with the runs worked out in `runs` (cleared first),
+/// a list of the caller's: a class thread keeps one with room for its
+/// largest batch, so a send allocates nothing (fix4-video).
+pub fn send_gso_batch_with<'a>(
+    socket: RawFd,
+    runs: &mut Vec<(usize, usize)>,
+    count: usize,
+    message: impl Fn(usize) -> (&'a [u8], SocketAddr),
+) -> io::Result<GsoSent> {
+    gso_runs_into(
+        runs,
+        count,
+        |index| {
+            let (data, target) = message(index);
+            (data.len(), target)
+        },
+        |_| GSO_MAX_SEGMENTS,
+    );
+    send_gso_runs(socket, runs, message, None)
+}
+
 /// Send `runs` (from [`gso_runs_into`]) of the messages, each run one UDP
 /// GSO message, as [`send_gso_batch`] does. With `departures`, run `i`
 /// carries an earliest departure time (`SCM_TXTIME`, CLOCK_MONOTONIC ns,

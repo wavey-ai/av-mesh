@@ -1576,6 +1576,29 @@ struct Args {
     )]
     relay_video_tee_mb: usize,
 
+    /// Milliseconds of its stream that a video RelaySession socket of the
+    /// fast plane holds: once a second its receive buffer grows to this
+    /// long of the busiest second it has had, from --udp-socket-buffer-bytes
+    /// up to --relay-video-socket-buffer-max-mb, and never shrinks. The 8
+    /// MiB default held 0.3 s at 247 Mbit/s of 4K, less than a stalled
+    /// node's class thread is away. Past net.core.rmem_max it needs
+    /// CAP_NET_ADMIN. 0 leaves the sockets as made.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_VIDEO_SOCKET_BUFFER_MS",
+        default_value_t = fast_plane::relay::DEFAULT_VIDEO_SOCKET_BUFFER_MS
+    )]
+    relay_video_socket_buffer_ms: u64,
+
+    /// MiB a video socket's receive buffer may be asked for at most (the
+    /// kernel books twice that in buffer memory while it is full).
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_VIDEO_SOCKET_BUFFER_MAX_MB",
+        default_value_t = fast_plane::relay::DEFAULT_VIDEO_SOCKET_BUFFER_MAX_BYTES >> 20
+    )]
+    relay_video_socket_buffer_max_mb: usize,
+
     /// Feed every cache-mesh playlist lease that this node serves on the
     /// fast plane as well: a forwarder with --relay-class-threads sends the
     /// contributor's RLS1 symbols of a leased stream to the child (an edge)
@@ -4329,6 +4352,9 @@ async fn main() -> Result<()> {
         // A 2.5: the class threads' media clocks take the budget that the
         // receiver and the warm holds take (join J2 of the A reports).
         media_deadline_us: args.relay_media_deadline_us(),
+        socket_buffer_bytes: args.udp_socket_buffer_bytes,
+        video_socket_buffer_ms: args.relay_video_socket_buffer_ms,
+        video_socket_buffer_max_bytes: args.relay_video_socket_buffer_max_mb.saturating_mul(1 << 20),
         ..Default::default()
     };
     let fec_ingest_task = match (fec_socket, class_sockets) {
@@ -6145,6 +6171,12 @@ impl WarmSourceReplayBuffer {
         }
     }
 
+    /// Made with all its room ([`Self::preallocated`]): a push never
+    /// allocates.
+    const fn is_fixed(&self) -> bool {
+        self.fixed
+    }
+
     /// Keep `wire` for `hold_us` from `now_us`, this node's clock.
     fn push(
         &mut self,
@@ -6505,16 +6537,16 @@ impl RelayDownstreamForwarder {
                 video_target,
                 role: endpoint.role,
                 promoted: AtomicBool::new(false),
-                // A repair-only child's audio sources are kept by the
-                // real-time audio thread: in a buffer made whole here.
-                warm_sources: [
+                // A repair-only child's sources are kept by the class
+                // threads (audio real-time, video too since fix4-video):
+                // in buffers made whole here.
+                warm_sources: [(); 2].map(|()| {
                     StdMutex::new(if endpoint.role == RelayForwardRole::Repair {
                         WarmSourceReplayBuffer::preallocated()
                     } else {
                         WarmSourceReplayBuffer::default()
-                    }),
-                    StdMutex::default(),
-                ],
+                    })
+                }),
                 demand: Default::default(),
             });
         }
@@ -6993,6 +7025,14 @@ impl RelayDownstreamForwarder {
                 return;
             }
         };
+        // A class thread keeps a datagram only in a buffer made whole
+        // before it ran (a repair-only path's): any other would grow here.
+        if !buffer.fixed {
+            drop(buffer);
+            self.warm_source_refused_datagrams
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let mutation = buffer.push(object, hold_us, datagram, now_us);
         drop(buffer);
         self.record_warm_source_mutation(&mutation);
@@ -44801,6 +44841,20 @@ mod tests {
         endpoints: &[RelayForwardEndpoint],
         config: fast_plane::relay::RelayClassConfig,
     ) -> FastRelay {
+        // Slots that hold the tests' 4K parts (up to 400 KB): the cache
+        // refuses a part larger than its slot.
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 512).await;
+        start_fast_relay_in(secondary_path, endpoints, config, cache).await
+    }
+
+    /// [`start_fast_relay_endpoints`] with a cache of the caller's (a 4K
+    /// part at the node's 2 MiB slots).
+    async fn start_fast_relay_in(
+        secondary_path: ParentPath,
+        endpoints: &[RelayForwardEndpoint],
+        config: fast_plane::relay::RelayClassConfig,
+        cache: Arc<LiveTsCache>,
+    ) -> FastRelay {
         let offset = config.port_offset;
         let primary_sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let secondary_sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -44847,9 +44901,6 @@ mod tests {
             fast_plane::TrafficClass::Video,
             RelayIngressParentPath::Secondary,
         );
-        // Slots that hold the tests' 4K parts (up to 400 KB): the cache
-        // refuses a part larger than its slot.
-        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 512).await;
         cache.set_hop_journal(Arc::new(HopJournal::new("relay-london", 4_096)));
         if let Some(forwarder) = &forwarder {
             forwarder.set_hop_journal(Arc::new(HopJournal::new("relay-london", 4_096)));
@@ -46010,8 +46061,13 @@ mod tests {
                 lease_descriptors: true,
                 video_gro: true,
                 media_deadline_us: fast_plane::relay::DEFAULT_MEDIA_DEADLINE_US,
+                socket_buffer_bytes: 4 << 20,
+                video_socket_buffer_ms: 0,
+                video_socket_buffer_max_bytes: 0,
                 test_tee_panic: Some(fast_plane::TrafficClass::Audio),
+                test_video_tee_spin_ns: 0,
                 test_alloc_counter: None,
+                test_video_alloc_counter: None,
             },
         )
         .await;
@@ -46483,6 +46539,10 @@ mod tests {
     /// 4K past 164 Mbit/s: a forwarder's video thread and an edge's video
     /// clients, at 200 Mbit/s, and their processor time per Mbit/s.
     mod video_throughput;
+
+    /// The video tee at 247 and 300 Mbit/s of 4K (fix4-video): what it
+    /// drops, what it commits and its processor time.
+    mod video_tee;
 
     /// Edge capacity (wave 7, item 10): listeners of 1 ms parts per edge,
     /// and an ingest that never drops for the fan-out.

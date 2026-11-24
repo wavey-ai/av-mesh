@@ -71,6 +71,14 @@ pub struct ClockKey<'a> {
     stream: &'a str,
 }
 
+impl ClockKey<'_> {
+    /// The stream's hash (never zero): the video thread's key of a stream
+    /// in its tee's part table.
+    pub const fn hash(&self) -> u64 {
+        self.hash
+    }
+}
+
 #[derive(Debug, Default)]
 struct Clock {
     /// Zero: the slot has never held a clock.

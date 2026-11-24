@@ -19,24 +19,29 @@
 //! byte ring starts again at its beginning, and the bytes skipped are
 //! released with the entry.
 //!
-//! A ring that grows ([`tee_ring_growing`], the video class's 192 MiB) has
+//! A ring that grows ([`tee_ring_growing`], the video class's 96 MiB) has
 //! all its bytes reserved as address space at start, but only the first
 //! part faulted in and locked (16 MB at the defaults, what every node
 //! pinned for video before the 4K round): a node that carries no video
 //! never has the rest resident or locked. The class thread's first push
 //! asks for the rest (one atomic, nothing else); the tee's next wait starts
-//! a helper thread that faults the rest in and locks it, then says so
-//! (Release); the class thread takes the larger size at the end of a lap,
-//! once it sees that (Acquire) and no byte of the lap before is still held.
-//! Until then the first part serves the stream (half a second of 247
-//! Mbit/s), so the class thread never touches a page that is not faulted
-//! in and locked, never allocates and never waits for the growth.
+//! a helper thread that faults the rest in and locks it [`GROW_STEP`] bytes
+//! at a time, publishing how far it has got after each step (Release); at
+//! the end of a lap the class thread takes all that is ready, once it sees
+//! it (Acquire) and no byte of the lap before is still held. So the first
+//! lap (half a second of 247 Mbit/s) is the only one at the first part's
+//! size, however long the whole growth takes; the class thread never
+//! touches a page that is not faulted in and locked, never allocates and
+//! never waits for the growth. Once the rest is ready the size is taken at
+//! the next lap's end: a lap ends either in the larger size or in a refused
+//! push, never in a wrap (a wrap would need the lap before released, which
+//! is the condition of the larger size).
 
 use futures_util::task::AtomicWaker;
 use std::cell::UnsafeCell;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -44,6 +49,9 @@ use std::task::{Context, Poll};
 pub const BYTES_PER_ENTRY: usize = 256;
 /// The fewest bytes a byte ring has.
 const MIN_BYTES: usize = 64 * 1024;
+/// Bytes a growing ring's helper faults in and locks before it publishes
+/// them (about 5 ms of faults each).
+pub const GROW_STEP: usize = 8 << 20;
 
 /// `Shared::grow`: the ring has all its bytes from the start.
 const FIXED: u8 = 0;
@@ -125,12 +133,15 @@ impl Drop for RingBytes {
 struct Shared<M> {
     /// The pins, first so that they unlock before the buffers are freed.
     _pins: [crate::memory::Pinned; 2],
-    /// The pin of the bytes past `initial`, once grown.
-    grown_pin: Mutex<Option<crate::memory::Pinned>>,
+    /// The pins of the bytes past `initial`, a step each, as grown.
+    grown_pins: Mutex<Vec<crate::memory::Pinned>>,
+    /// Bytes faulted in (and locked, where allowed) from the start: the
+    /// most the producer may use.
+    ready: AtomicUsize,
     entries: Box<[UnsafeCell<Entry<M>>]>,
     bytes: RingBytes,
     /// Bytes faulted in and locked at start; the ring may use only these
-    /// until `grow` is GROWN.
+    /// until `ready` passes them.
     initial: usize,
     grow: AtomicU8,
     /// Entries published by the producer, and released by the consumer.
@@ -146,9 +157,9 @@ struct Shared<M> {
 // publishes them (`head`, Release) and read only by the consumer after it
 // sees them (Acquire), until it releases them (`tail`, `released`,
 // Release), after which only the producer touches them again (Acquire).
-// The bytes past `initial` are touched by the helper thread alone until it
-// stores GROWN (Release), and by the producer only after it loads that
-// (Acquire).
+// The bytes past `ready` are touched by the helper thread alone until it
+// stores a `ready` past them (Release), and by the producer only after it
+// loads that (Acquire).
 unsafe impl<M: Send> Send for Shared<M> {}
 // SAFETY: as above.
 unsafe impl<M: Send> Sync for Shared<M> {}
@@ -237,7 +248,8 @@ pub fn tee_ring_growing<M: Copy + Send>(
     ];
     let shared = Arc::new(Shared {
         _pins: pins,
-        grown_pin: Mutex::new(None),
+        grown_pins: Mutex::new(Vec::new()),
+        ready: AtomicUsize::new(initial),
         entries: entry_cells,
         bytes: byte_cells,
         initial,
@@ -272,28 +284,47 @@ impl<M> Shared<M> {
         &self.entries[(index % self.entries.len() as u64) as usize]
     }
 
-    /// Fault in and lock the bytes past `initial`, then say so. Off the
-    /// class thread (a helper thread, or the tee).
+    /// Fault in and lock the bytes past `initial` a step at a time, saying
+    /// how far after each, then that all are. Off the class thread (a
+    /// helper thread, or the tee).
     fn grow_now(&self) {
-        let rest = self.bytes.len() - self.initial;
-        // SAFETY: the bytes past `initial` belong to the ring, and nobody
-        // reads or writes them until `grow` is GROWN, which is stored
-        // after this.
-        let pin = unsafe {
-            crate::memory::pin_region("tee ring bytes (grown)", self.byte_ptr(self.initial), rest)
-        };
-        let locked = pin.is_locked();
-        *self
-            .grown_pin
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pin);
+        let started = std::time::Instant::now();
+        let mut locked = true;
+        let mut end = self.ready.load(Ordering::Relaxed);
+        while end < self.bytes.len() {
+            end = (end + GROW_STEP).min(self.bytes.len());
+            locked &= self.grow_to(end);
+        }
         self.grow.store(GROWN, Ordering::Release);
         tracing::info!(
             initial_bytes = self.initial,
             bytes = self.bytes.len(),
             locked,
+            took_ms = started.elapsed().as_millis() as u64,
             "tee ring grown: a stream arrived on its class"
         );
+    }
+
+    /// Fault in and lock the bytes up to `end`, then publish them
+    /// (Release). Whether they are locked.
+    fn grow_to(&self, end: usize) -> bool {
+        let from = self.ready.load(Ordering::Relaxed);
+        if end <= from {
+            return true;
+        }
+        // SAFETY: the bytes from `ready` on belong to the ring, and nobody
+        // reads or writes them until `ready` passes them, which is stored
+        // after this.
+        let pin = unsafe {
+            crate::memory::pin_region("tee ring bytes (grown)", self.byte_ptr(from), end - from)
+        };
+        let locked = pin.is_locked();
+        self.grown_pins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(pin);
+        self.ready.store(end, Ordering::Release);
+        locked
     }
 }
 
@@ -323,11 +354,9 @@ impl<M: Copy> TeeSender<M> {
             // here, if no byte of the lap before (all past `offset`) is
             // still held: from the lap's start on, the bytes are those of
             // a ring of the new size.
-            if self.capacity < shared.bytes.len() as u64
-                && shared.grow.load(Ordering::Acquire) == GROWN
-                && shared.released.load(Ordering::Acquire) >= start - offset
-            {
-                self.capacity = shared.bytes.len() as u64;
+            let ready = shared.ready.load(Ordering::Acquire) as u64;
+            if self.capacity < ready && shared.released.load(Ordering::Acquire) >= start - offset {
+                self.capacity = ready;
             }
             if offset + len > self.capacity {
                 if len > self.capacity {
@@ -365,6 +394,31 @@ impl<M: Copy> TeeSender<M> {
         self.offset = offset + len;
         self.unwoken = true;
         true
+    }
+
+    /// What the ring could take now: free entries, and free bytes of the
+    /// part of the ring in use (its first part until it grows). A datagram
+    /// that would cross the end skips the bytes left there, so a run of
+    /// datagrams finds up to one datagram's bytes fewer.
+    pub fn room(&self) -> (u64, u64) {
+        let shared = &*self.shared;
+        let held = shared.head.load(Ordering::Relaxed) - shared.tail.load(Ordering::Acquire);
+        let entries = (shared.entries.len() as u64).saturating_sub(held);
+        let bytes = self
+            .capacity
+            .saturating_sub(self.at - shared.released.load(Ordering::Acquire));
+        (entries, bytes)
+    }
+
+    /// Bytes of the ring in use now.
+    pub const fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
+    /// The ring is not yet at its full size (its first lap, or the laps
+    /// before the rest is ready): a refused push then counts apart.
+    pub fn growing(&self) -> bool {
+        self.capacity < self.shared.bytes.len() as u64
     }
 
     /// Wake the tee if anything was pushed since the last wake.
@@ -437,10 +491,7 @@ impl<M: Copy + Send + 'static> TeeReceiver<M> {
     /// `/api/mesh/local` `memory.locked_bytes`, and logs the growth.)
     #[cfg(test)]
     pub fn pinned_bytes(&self) -> usize {
-        match self.shared.grow.load(Ordering::Acquire) {
-            FIXED | GROWN => self.shared.bytes.len(),
-            _ => self.shared.initial,
-        }
+        self.shared.ready.load(Ordering::Acquire)
     }
 
     /// The class thread asked for the rest of the ring: fault it in on a
@@ -683,6 +734,40 @@ mod tests {
         assert!(push(&mut tx, 1_000));
         assert_eq!(tx.capacity, 4 * SMALL as u64, "grown at the lap's end");
         assert_eq!(tx.offset, SMALL as u64 - 536 + 1_000, "on past the old end");
+    }
+
+    /// The helper publishes the rest a step at a time: a lap that ends with
+    /// part of it ready takes that part (fix4-video), and the next lap's
+    /// end the rest.
+    #[test]
+    fn a_lap_takes_what_is_ready_of_the_rest() {
+        const SMALL: usize = 64 * 1024;
+        let (mut tx, rx) = tee_ring_growing::<u64>(1_024, SMALL, 4 * SMALL);
+        let mut index = 0_u64;
+        let mut push = |tx: &mut TeeSender<u64>| {
+            index += 1;
+            let pushed = tx.push(index, &[1; 1_000]);
+            rx.release();
+            pushed
+        };
+        assert!(tx.growing());
+        // Half of the rest ready during the first lap.
+        rx.shared.grow_to(SMALL + SMALL / 2);
+        assert_eq!(rx.pinned_bytes(), SMALL + SMALL / 2);
+        while tx.capacity() == SMALL as u64 {
+            assert!(push(&mut tx));
+        }
+        assert_eq!(tx.capacity(), (SMALL + SMALL / 2) as u64, "what was ready");
+        assert!(tx.growing());
+        rx.shared.grow_to(4 * SMALL);
+        while tx.capacity() == (SMALL + SMALL / 2) as u64 {
+            assert!(push(&mut tx));
+        }
+        assert_eq!(tx.capacity(), 4 * SMALL as u64);
+        assert!(!tx.growing());
+        // A growth asked for later finds nothing left to do.
+        rx.shared.grow_now();
+        assert_eq!(rx.pinned_bytes(), 4 * SMALL);
     }
 
     #[test]
