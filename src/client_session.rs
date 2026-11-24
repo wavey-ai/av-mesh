@@ -26,7 +26,10 @@
 //! unanswered requests and 1.5 s ([`falls_back_from_compact`]), and
 //! [`UdpSession::hold`] for the end-of-run drain.
 
-use crate::client_compact::{smoothed_loss, CompactPlan, LegId, NackTiming};
+use crate::client_compact::{
+    smoothed_loss, CompactPlan, LegId, LegLoss, NackTiming, PathPlans, BURSTY, HOLE_GIVE_UP,
+    RESIDUAL_TARGET,
+};
 use crate::client_udp::{
     Control, ObjectReceiver, PartObject, RepairPolicy, REFRESH, UNMEASURED_LOSS,
 };
@@ -67,6 +70,12 @@ pub fn drops_short_header(compact: bool, compact_asked: bool, plan: CompactPlan)
     !compact && compact_asked && plan.short_header
 }
 
+/// Datagrams a part that a compact plan asks the edge for: the part, its
+/// copies and its share of the window's rows.
+fn plan_cost(plan: CompactPlan) -> f64 {
+    1.0 + f64::from(plan.copies) + f64::from(plan.window_repair) / f64::from(plan.window.max(1))
+}
+
 /// The silence after which a client moves (wave 8 S2; 1,000 before).
 pub const DEFAULT_SILENCE_MS: u64 = 200;
 /// See [`SessionConfig::silence_repeat`].
@@ -74,6 +83,18 @@ pub const DEFAULT_SILENCE_REPEAT_MS: u64 = 1_000;
 /// Times a client asks an edge for the compact lane again after falling
 /// back from it (see [`SessionConfig::compact_retry`]).
 pub const COMPACT_RETRIES: u32 = 2;
+
+/// A plan that asks for less (fewer copies or rows) is asked for only
+/// after the estimate has wanted it this long; one that asks for more goes
+/// at once (B X3: the plan flapped under burst loss, hundreds of changes in
+/// 200 s, each a `SUB` and a regroup of the edge's fast lane).
+pub const PLAN_HOLD: Duration = Duration::from_secs(1);
+/// A path counted bursty stops being so below this mean burst (it becomes
+/// so at [`BURSTY`]).
+pub const BURSTY_UNTIL: f64 = 1.5;
+/// Loss samples a new session waits for before its plan follows the
+/// measured loss: until then it plans for [`UNMEASURED_LOSS`].
+pub const PLAN_SAMPLES: u32 = 2;
 
 /// What a client asks for, as `needletail-udp-client`'s flags say.
 #[derive(Debug, Clone, Copy)]
@@ -134,6 +155,11 @@ pub struct SessionConfig {
     /// lost request or answer costs a few round trips, not 300 ms. Zero:
     /// every [`UNANSWERED_REFRESH`], as before.
     pub first_retry: Duration,
+    /// The share of parts that may need a NACK after the copies
+    /// (`--compact-residual-ppm`, [`RESIDUAL_TARGET`] by default).
+    pub residual_target: f64,
+    /// When a hole is given up (`--hole-give-up-ms`, [`HOLE_GIVE_UP`]).
+    pub hole_give_up: Duration,
 }
 
 /// A move asks for a hole at most this many parts before the newest part
@@ -162,6 +188,8 @@ impl SessionConfig {
             nack_timing: NackTiming::default(),
             known_parts: 0,
             first_retry: Duration::from_millis(DEFAULT_FIRST_RETRY_MS),
+            residual_target: RESIDUAL_TARGET,
+            hole_give_up: HOLE_GIVE_UP,
         }
     }
 
@@ -201,6 +229,13 @@ pub struct UdpSession {
     pub plan_changes: u64,
     pub burst_estimate: Option<f64>,
     compact_estimate: Option<f64>,
+    /// Loss samples taken (the plan follows them from [`PLAN_SAMPLES`]).
+    loss_samples: u32,
+    /// The path counts as bursty (from [`BURSTY`] until under
+    /// [`BURSTY_UNTIL`]).
+    bursty: bool,
+    /// Since when the estimate has wanted a plan that asks for less.
+    lower_since: Option<Instant>,
     /// The edge in use was asked for the compact lane; edges that did not
     /// answer a request for it and were asked without it.
     pub compact_asked: bool,
@@ -282,6 +317,7 @@ impl UdpSession {
         }
         receiver.compact.set_nack_timing(config.nack_timing);
         receiver.compact.drop_early = config.drop_early_parts;
+        receiver.compact.set_hole_give_up(config.hole_give_up);
         Self {
             config,
             receiver,
@@ -291,12 +327,22 @@ impl UdpSession {
             loss_max: None,
             burst_max: None,
             repair_changes: 0,
-            // The compact lane's plan: window repair alone until the path
-            // shows loss; the short form until an edge refuses it.
-            plan: CompactPlan::CLEAN.with_short_header(config.compact_short_header),
+            // The compact lane's plan: for an unmeasured path, which may
+            // already be lossy (as the RaptorQ repair), until its second
+            // loss sample; the short form until an edge refuses it.
+            plan: CompactPlan::for_measured_with(
+                UNMEASURED_LOSS,
+                1.0,
+                config.compact_burst_rows,
+                config.residual_target,
+            )
+            .with_short_header(config.compact_short_header),
             plan_changes: 0,
             burst_estimate: None,
             compact_estimate: None,
+            loss_samples: 0,
+            bursty: false,
+            lower_since: None,
             compact_asked: config.compact,
             compact_fallbacks: 0,
             short_header: config.compact_short_header,
@@ -503,6 +549,7 @@ impl UdpSession {
                         None => burst,
                     });
                 }
+                self.loss_samples = self.loss_samples.saturating_add(1);
                 if !self.config.fixed_repair {
                     let wanted = RepairPolicy::for_loss(estimate, self.base_repair);
                     if wanted != self.repair {
@@ -510,17 +557,7 @@ impl UdpSession {
                         self.repair_changes += 1;
                         self.next_refresh = now;
                     }
-                    let wanted = CompactPlan::for_measured_with(
-                        smooth,
-                        self.burst_estimate.unwrap_or(1.0),
-                        self.config.compact_burst_rows,
-                    )
-                    .with_short_header(self.short_header);
-                    if wanted != self.plan {
-                        self.plan = wanted;
-                        self.plan_changes += 1;
-                        self.next_refresh = now;
-                    }
+                    self.plan_legs(now);
                 }
             }
         }
@@ -539,7 +576,7 @@ impl UdpSession {
         };
         if self.compact_confirmed && drained {
             if let Some(token) = self.token {
-                let parts = self.receiver.nacks_due(now);
+                let parts = self.receiver.nacks_due(now).take(LegId::FIRST);
                 if !parts.is_empty() {
                     self.nack_datagrams += 1;
                     send(
@@ -606,6 +643,58 @@ impl UdpSession {
                 };
         }
         None
+    }
+
+    /// The compact plan from the estimates (B X3): the burst band, the
+    /// plan of an unmeasured path until [`PLAN_SAMPLES`] samples, and a
+    /// plan that asks for less only after [`PLAN_HOLD`].
+    fn plan_legs(&mut self, now: Instant) {
+        if self.loss_samples < PLAN_SAMPLES {
+            return;
+        }
+        let burst = self.burst_estimate.unwrap_or(1.0);
+        self.bursty = if self.bursty {
+            burst >= BURSTY_UNTIL
+        } else {
+            burst >= BURSTY
+        };
+        let burst = if self.bursty {
+            burst.max(BURSTY)
+        } else {
+            burst.min(BURSTY_UNTIL)
+        };
+        let plans = PathPlans::for_legs(
+            LegLoss {
+                loss: self.compact_estimate.unwrap_or(0.0),
+                burst,
+                rtt: self.rtt,
+            },
+            None,
+            None,
+            self.receiver.compact.part_interval(),
+            self.config.residual_target,
+            self.config.compact_burst_rows,
+        );
+        self.offer_plan(plans.repair.with_short_header(self.short_header), now);
+    }
+
+    /// Take `wanted` as the plan: at once if it asks for as much or more,
+    /// after [`PLAN_HOLD`] of wanting less if it asks for less.
+    fn offer_plan(&mut self, wanted: CompactPlan, now: Instant) {
+        if wanted == self.plan {
+            self.lower_since = None;
+            return;
+        }
+        if plan_cost(wanted) < plan_cost(self.plan) {
+            let since = *self.lower_since.get_or_insert(now);
+            if now.saturating_duration_since(since) < PLAN_HOLD {
+                return;
+            }
+        }
+        self.lower_since = None;
+        self.plan = wanted;
+        self.plan_changes += 1;
+        self.next_refresh = now;
     }
 
     /// The silence that moves the client now (see
@@ -1551,5 +1640,78 @@ mod tests {
             parts,
             elapsed
         );
+    }
+
+    /// B X3: a new one-leg session plans for 2 % loss (`C1.16.2`, as the
+    /// RaptorQ repair plans for an unmeasured path) until its second loss
+    /// sample, and then follows the measure.
+    #[test]
+    fn a_new_one_leg_session_plans_for_two_percent() {
+        let now = Instant::now();
+        let mut session = UdpSession::new(SessionConfig::new(1), now);
+        assert_eq!(session.plan.word(), "C1.16.2.7");
+        session.compact_estimate = Some(0.0);
+        session.loss_samples = 1;
+        session.plan_legs(now);
+        assert_eq!(session.plan.word(), "C1.16.2.7");
+        session.loss_samples = 2;
+        session.plan_legs(now);
+        // Less: after the hold.
+        assert_eq!(session.plan.word(), "C1.16.2.7");
+        session.plan_legs(now + PLAN_HOLD);
+        assert_eq!(session.plan.word(), "C0.32.1.7");
+        assert_eq!(session.plan_changes, 1);
+        // The long form when the short form is off.
+        let config = SessionConfig {
+            compact_short_header: false,
+            ..SessionConfig::new(1)
+        };
+        assert_eq!(UdpSession::new(config, now).plan.word(), "C1.16.2");
+    }
+
+    /// B X3: a plan that asks for more goes at once; one that asks for less
+    /// only once the estimate has wanted less for a second; a path counts as
+    /// bursty from a mean burst of 2.0 until it falls below 1.5.
+    #[test]
+    fn a_plan_that_asks_for_less_waits_a_second() {
+        let now = Instant::now();
+        let mut session = UdpSession::new(SessionConfig::new(1), now);
+        session.loss_samples = 2;
+        let ms = |ms: u64| now + Duration::from_millis(ms);
+        session.compact_estimate = Some(0.05);
+        session.plan_legs(ms(0));
+        assert_eq!(session.plan.word(), "C1.16.2.7");
+        session.compact_estimate = Some(0.10);
+        session.plan_legs(ms(150));
+        assert_eq!(session.plan.word(), "C2.16.2.7", "more goes at once");
+        assert_eq!(session.next_refresh, ms(150));
+        session.compact_estimate = Some(0.05);
+        session.plan_legs(ms(300));
+        session.plan_legs(ms(800));
+        assert_eq!(session.plan.word(), "C2.16.2.7");
+        // The estimate wants the plan again: the hold starts over.
+        session.compact_estimate = Some(0.10);
+        session.plan_legs(ms(900));
+        session.compact_estimate = Some(0.05);
+        session.plan_legs(ms(1_050));
+        session.plan_legs(ms(1_900));
+        assert_eq!(session.plan.word(), "C2.16.2.7");
+        session.plan_legs(ms(2_050));
+        assert_eq!(session.plan.word(), "C1.16.2.7");
+        assert_eq!(session.plan_changes, 2);
+        // The burst band: bursty at 2.0 (rows instead of a copy, which
+        // asks for less: after the hold), still at 1.7, not at 1.4 (a copy
+        // again, more: at once).
+        session.burst_estimate = Some(2.0);
+        session.plan_legs(ms(2_200));
+        assert_eq!(session.plan.word(), "C1.16.2.7");
+        session.plan_legs(ms(3_200));
+        assert_eq!(session.plan.word(), "C0.16.4.7");
+        session.burst_estimate = Some(1.7);
+        session.plan_legs(ms(4_000));
+        assert_eq!(session.plan.word(), "C0.16.4.7");
+        session.burst_estimate = Some(1.4);
+        session.plan_legs(ms(4_200));
+        assert_eq!(session.plan.word(), "C1.16.2.7");
     }
 }

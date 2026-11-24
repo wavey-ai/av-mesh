@@ -1197,7 +1197,7 @@ impl ObjectReceiver {
 
     /// Parts to ask the edge for again now (compact lane), at most
     /// [`MAX_NACK_PARTS`].
-    pub fn nacks_due(&mut self, now: Instant) -> Vec<u64> {
+    pub fn nacks_due(&mut self, now: Instant) -> compact::NacksDue {
         self.compact.nacks_due(now, MAX_NACK_PARTS)
     }
 

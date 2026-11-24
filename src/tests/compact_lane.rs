@@ -483,7 +483,7 @@ pub(super) async fn listen(
                 .await;
         }
         if run.compact_confirmed {
-            let parts = receiver.nacks_due(now);
+            let parts = receiver.nacks_due(now).take(LegId::FIRST);
             if !parts.is_empty() {
                 run.nack_parts += parts.len() as u64;
                 let _ = socket

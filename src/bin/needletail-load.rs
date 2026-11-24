@@ -286,6 +286,8 @@ fn config(args: &Args) -> Result<LoadConfig> {
         },
         known_parts: args.known_parts,
         first_retry: Duration::from_millis(args.first_retry_ms),
+        residual_target: av_mesh::client_compact::RESIDUAL_TARGET,
+        hole_give_up: av_mesh::client_compact::HOLE_GIVE_UP,
     };
     let mut config = LoadConfig::new(session, edges, args.listeners);
     if let Some(text) = &args.ramp {

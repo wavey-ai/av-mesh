@@ -1060,6 +1060,8 @@ async fn main() -> Result<()> {
             },
             known_parts: 0,
             first_retry: Duration::from_millis(args.first_retry_ms),
+            residual_target: av_mesh::client_compact::RESIDUAL_TARGET,
+            hole_give_up: av_mesh::client_compact::HOLE_GIVE_UP,
         },
         Instant::now(),
     );
