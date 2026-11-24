@@ -497,7 +497,7 @@ pub(super) fn tee_4k(options: TeeOptions) -> TeeRun {
         tee_batches: stats.video_tee_batches,
         tee_lag_max_us: stats.video_tee_lag_max_us,
         parts_shed: stats.video_tee_parts_shed,
-        grow_lost: 0,
+        grow_lost: stats.tee_dropped_growing,
     };
     rt.block_on(relay.stop());
     drop(keep_audio);

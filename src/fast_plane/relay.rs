@@ -50,21 +50,21 @@ use tracing::{debug, info, warn};
 /// ring also holds `tee_ring::BYTES_PER_ENTRY` bytes for each: 16 MB at
 /// this, pinned at start).
 pub const DEFAULT_TEE_CAPACITY: usize = 65_536;
-/// Bytes of the video class's tee ring (`--relay-video-tee-mb`): 192 MiB,
-/// about 5 s of a 300 Mbit/s 4K stream's symbols with their repair. The
-/// ring of [`DEFAULT_TEE_CAPACITY`] entries at 256 B each (16 MB) holds
-/// 12,000 symbols, half a second at 247 Mbit/s: a tee behind by that much
-/// (a busy worker) dropped its copies, and a dropped copy is a part missing
-/// from that node's cache. Local lab, 24 Nov, the referee's 247 Mbit/s
-/// clip, 40 s: 16 MB 1,875 to 110,868 tee_dropped at the distributors in
-/// every run; 48 MiB 31,591 to 178,300; 192 MiB none (one run). The old
-/// channel (65,536 entries of any size, unpinned) held as much. Only the
-/// first 16 MB is faulted in and locked at start; the rest when a video
-/// datagram first comes (`tee_ring::tee_ring_growing`). With the default
-/// 65,536 entries the entries bind first, at about 88 MB of 1,350-byte
-/// symbols, but the ring's bytes are written in turn, so all of them are
-/// resident once grown.
-pub const DEFAULT_VIDEO_TEE_BYTES: usize = 192 << 20;
+/// Bytes of the video class's tee ring (`--relay-video-tee-mb`): 96 MiB,
+/// as many bytes as its [`DEFAULT_TEE_CAPACITY`] entries take of 4K
+/// symbols (1,316 bytes and RLS1's header: 65,536 x about 1,390 = 91 MB).
+/// That is 2.56 s at 247 Mbit/s of media (25,600 datagrams a second, the
+/// entries bind first; the bytes would last 2.8 s) and 2.1 s at 300 Mbit/s
+/// of 50 frames a second (31,150 a second). fix4-video measured the tee at
+/// 2.7 to 3.3 times those rates on one CPU, and its longest single stall
+/// in the local gate at 0.9 s: the ring covers that twice, and a longer lag
+/// loses whole parts (`TeeParts`). It was 192 MiB (rm/4k): its entries ran
+/// out at about 89 MB, but the ring writes its bytes in turn, so all 192
+/// MiB became resident and locked for nothing. The ring of 256 B an entry
+/// (16 MB, 12,000 symbols, half a second at 247) dropped copies in every
+/// lab run. Only the first 16 MB is faulted in and locked at start; the
+/// rest when a video datagram first comes (`tee_ring::tee_ring_growing`).
+pub const DEFAULT_VIDEO_TEE_BYTES: usize = 96 << 20;
 /// Symbols the first-arrival table remembers per class.
 const DEDUP_CAPACITY: usize = 65_536;
 /// How often an idle class thread looks at the stop flag.
@@ -341,6 +341,11 @@ pub struct FastPlaneStats {
     /// room for the whole part when its first symbol came (`TeeParts`);
     /// their symbols count in `tee_dropped`.
     pub tee_parts_shed: AtomicU64,
+    /// Tee copies refused while the class's ring was not yet at its full
+    /// size (they count in `tee_dropped` too), and the bytes of each
+    /// class's ring in use.
+    pub tee_dropped_growing: AtomicU64,
+    pub tee_ring_bytes: [AtomicU64; 2],
     /// Validated epochs that found no slot in the class threads' table
     /// (`ValidatedEpochs::unrecorded`): their streams are never stale.
     pub media_clock_unrecorded: AtomicU64,
@@ -669,6 +674,10 @@ pub struct FastPlaneSnapshot {
     pub video_tee_batches: u64,
     pub video_tee_lag_max_us: u64,
     pub video_tee_parts_shed: u64,
+    /// Tee copies refused while a ring was growing (in `tee_dropped` too),
+    /// and the bytes of the video tee ring in use.
+    pub tee_dropped_growing: u64,
+    pub video_tee_ring_bytes: u64,
 }
 
 impl FastPlaneStats {
@@ -747,6 +756,8 @@ impl FastPlaneStats {
             video_tee_batches: load(&self.tee_batches[1]),
             video_tee_lag_max_us: load(&self.tee_lag_max_us[1]),
             video_tee_parts_shed: load(&self.tee_parts_shed),
+            tee_dropped_growing: load(&self.tee_dropped_growing),
+            video_tee_ring_bytes: load(&self.tee_ring_bytes[1]),
         }
     }
 }
@@ -2260,11 +2271,17 @@ impl ClassThread {
             // the copy, as a full channel did.
             if !teed || !tee.push(meta, data) {
                 self.stats.tee_dropped.fetch_add(1, Ordering::Relaxed);
+                if tee.growing() {
+                    self.stats
+                        .tee_dropped_growing
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         // The tee also makes the feed entries asked for in the batch: a
         // key is asked for at a datagram that is teed with it.
         tee.wake();
+        self.stats.tee_ring_bytes[class.index()].store(tee.capacity(), Ordering::Relaxed);
     }
 }
 
