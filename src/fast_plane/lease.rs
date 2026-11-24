@@ -307,6 +307,9 @@ pub struct LeaseStats {
     pub warm_buffered: AtomicU64,
     pub warm_replayed: AtomicU64,
     pub warm_dropped: AtomicU64,
+    /// Video sources not kept warm because a replay held the ring's lock
+    /// at that moment (the class thread never waits for it).
+    pub warm_refused: AtomicU64,
     pub promotions: AtomicU64,
     pub demotions: AtomicU64,
     pub commands_rejected: AtomicU64,
@@ -463,7 +466,14 @@ impl LeaseChildren {
             primary,
             targets: [audio, video],
             promoted: AtomicBool::new(false),
-            warm: StdMutex::new(WarmSourceReplayBuffer::default()),
+            // A repair-only child's video sources are kept warm by the
+            // video thread: in a buffer made whole here, off that thread
+            // (fix4-video). A primary child takes them all and keeps none.
+            warm: StdMutex::new(if primary {
+                WarmSourceReplayBuffer::default()
+            } else {
+                WarmSourceReplayBuffer::preallocated()
+            }),
         }))
     }
 
@@ -590,12 +600,27 @@ impl LeaseChildren {
 
     /// Keep a video source held back from a repair-only child, for the
     /// media budget from `now_us`.
+    ///
+    /// On the video thread: it never waits for the lock (a replay holds it
+    /// for a swap) and keeps the datagram only in a buffer made whole
+    /// before (fix4-video); else the datagram is counted in
+    /// `warm_refused`.
     pub fn buffer_warm(&self, child: &LeaseChild, object: u64, datagram: &[u8], now_us: u64) {
-        let mutation = child
-            .warm
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(object, self.config.warm_hold_us, datagram, now_us);
+        let mut warm = match child.warm.try_lock() {
+            Ok(warm) => warm,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.stats.warm_refused.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+        if !warm.is_fixed() {
+            drop(warm);
+            self.stats.warm_refused.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let mutation = warm.push(object, self.config.warm_hold_us, datagram, now_us);
+        drop(warm);
         self.stats
             .warm_buffered
             .fetch_add(mutation.added_datagrams as u64, Ordering::Relaxed);
@@ -623,12 +648,29 @@ impl LeaseChildren {
 
     /// Take a promoted child's warm video sources that are still live, for
     /// a replay (`fast_control::replay_warm`), and count the expired ones.
+    ///
+    /// A buffer made whole leaves with its datagrams: a new one, made here
+    /// before the lock, takes its place in one swap, so the video thread
+    /// never allocates nor finds the lock held for more than the swap.
     pub fn take_warm(&self, child: &LeaseChild) -> Vec<Vec<u8>> {
-        let batch = child
+        let fixed = child
             .warm
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take_live(now_unix_us());
+            .is_fixed();
+        let mut taken = if fixed {
+            WarmSourceReplayBuffer::preallocated()
+        } else {
+            WarmSourceReplayBuffer::default()
+        };
+        std::mem::swap(
+            &mut *child
+                .warm
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            &mut taken,
+        );
+        let batch = taken.take_live(now_unix_us());
         self.stats
             .warm_dropped
             .fetch_add(batch.expired_datagrams as u64, Ordering::Relaxed);
@@ -654,6 +696,7 @@ pub struct LeaseSnapshotStats {
     pub warm_buffered: u64,
     pub warm_replayed: u64,
     pub warm_dropped: u64,
+    pub warm_refused: u64,
     pub promotions: u64,
     pub demotions: u64,
     pub commands_rejected: u64,
@@ -678,6 +721,7 @@ impl LeaseStats {
             warm_buffered: load(&self.warm_buffered),
             warm_replayed: load(&self.warm_replayed),
             warm_dropped: load(&self.warm_dropped),
+            warm_refused: load(&self.warm_refused),
             promotions: load(&self.promotions),
             demotions: load(&self.demotions),
             commands_rejected: load(&self.commands_rejected),

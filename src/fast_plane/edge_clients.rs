@@ -1767,8 +1767,10 @@ impl ClientPlan {
             streams: [0; sys::RECV_BATCH],
             parts: [0; sys::RECV_BATCH],
             pacer: Pacer::default(),
-            runs: Vec::with_capacity(sys::RECV_BATCH),
-            departures: Vec::with_capacity(sys::RECV_BATCH),
+            // A run per send at most (fix4-video: the unpaced GSO send
+            // made its list per send on the video thread).
+            runs: Vec::with_capacity(sys::RECV_BATCH * 8),
+            departures: Vec::with_capacity(sys::RECV_BATCH * 8),
             first_sent: [None; sys::RECV_BATCH],
             sent_us: 0,
             compact_sent: Vec::with_capacity(sys::RECV_BATCH),
@@ -2206,7 +2208,7 @@ impl ClientPlan {
             let result = if pacing.is_some() {
                 sys::send_gso_runs(fd, &self.runs, message, Some(&self.departures))
             } else {
-                sys::send_gso_batch(fd, self.sends.len(), message)
+                sys::send_gso_batch_with(fd, &mut self.runs, self.sends.len(), message)
             };
             match result {
                 Ok(gso_sent) => {

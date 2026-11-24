@@ -790,6 +790,27 @@ pub fn send_gso_batch<'a>(
     send_gso_runs(socket, &runs, message, None)
 }
 
+/// [`send_gso_batch`] with the runs worked out in `runs` (cleared first),
+/// a list of the caller's: a class thread keeps one with room for its
+/// largest batch, so a send allocates nothing (fix4-video).
+pub fn send_gso_batch_with<'a>(
+    socket: RawFd,
+    runs: &mut Vec<(usize, usize)>,
+    count: usize,
+    message: impl Fn(usize) -> (&'a [u8], SocketAddr),
+) -> io::Result<GsoSent> {
+    gso_runs_into(
+        runs,
+        count,
+        |index| {
+            let (data, target) = message(index);
+            (data.len(), target)
+        },
+        |_| GSO_MAX_SEGMENTS,
+    );
+    send_gso_runs(socket, runs, message, None)
+}
+
 /// Send `runs` (from [`gso_runs_into`]) of the messages, each run one UDP
 /// GSO message, as [`send_gso_batch`] does. With `departures`, run `i`
 /// carries an earliest departure time (`SCM_TXTIME`, CLOCK_MONOTONIC ns,

@@ -6145,6 +6145,12 @@ impl WarmSourceReplayBuffer {
         }
     }
 
+    /// Made with all its room ([`Self::preallocated`]): a push never
+    /// allocates.
+    const fn is_fixed(&self) -> bool {
+        self.fixed
+    }
+
     /// Keep `wire` for `hold_us` from `now_us`, this node's clock.
     fn push(
         &mut self,
@@ -6505,16 +6511,16 @@ impl RelayDownstreamForwarder {
                 video_target,
                 role: endpoint.role,
                 promoted: AtomicBool::new(false),
-                // A repair-only child's audio sources are kept by the
-                // real-time audio thread: in a buffer made whole here.
-                warm_sources: [
+                // A repair-only child's sources are kept by the class
+                // threads (audio real-time, video too since fix4-video):
+                // in buffers made whole here.
+                warm_sources: [(); 2].map(|()| {
                     StdMutex::new(if endpoint.role == RelayForwardRole::Repair {
                         WarmSourceReplayBuffer::preallocated()
                     } else {
                         WarmSourceReplayBuffer::default()
-                    }),
-                    StdMutex::default(),
-                ],
+                    })
+                }),
                 demand: Default::default(),
             });
         }
@@ -6993,6 +6999,14 @@ impl RelayDownstreamForwarder {
                 return;
             }
         };
+        // A class thread keeps a datagram only in a buffer made whole
+        // before it ran (a repair-only path's): any other would grow here.
+        if !buffer.fixed {
+            drop(buffer);
+            self.warm_source_refused_datagrams
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let mutation = buffer.push(object, hold_us, datagram, now_us);
         drop(buffer);
         self.record_warm_source_mutation(&mutation);

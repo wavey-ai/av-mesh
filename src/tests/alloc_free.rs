@@ -14,6 +14,7 @@ use super::*;
 use fast_plane::lease::{LeaseChildConfig, LeaseChildren};
 use playlists::mesh::ServedSubscription;
 use std::net::IpAddr;
+use std::os::fd::AsRawFd;
 use tokio::time::timeout;
 
 /// The process's memory is no longer collapsed into huge pages from now
@@ -211,7 +212,7 @@ impl Watched {
     /// batches, give or take) and allocated, freed and first touched
     /// nothing in it.
     fn assert_nothing(&self, parts: u64) {
-        assert!(self.installed, "the audio thread installed the counter");
+        assert!(self.installed, "the class thread installed the counter");
         assert!(
             self.passes >= parts / 4,
             "{self:?}: the loop's passes were counted"
@@ -219,12 +220,12 @@ impl Watched {
         assert_eq!(
             (self.allocs, self.frees),
             (0, 0),
-            "allocations and frees on the audio class thread once it ran \
+            "allocations and frees on the class thread once it ran \
              (NEEDLETAIL_ALLOC_TRACE=1 prints where)"
         );
         assert_eq!(
             self.faults, 0,
-            "{self:?}: minor faults on the audio class thread once it ran"
+            "{self:?}: minor faults on the class thread once it ran"
         );
     }
 }
@@ -395,4 +396,309 @@ async fn a_forwarder_s_audio_thread_allocates_frees_and_faults_nothing_once_it_r
     assert!(warm_buffered > 0, "the repair-only child's sources were kept");
     assert_eq!(warm_refused, 0, "no warm source refused (lock or room)");
     watched.assert_nothing(parts);
+}
+
+// ------------------------------------------------------------------ video
+
+/// 4K frames of `stream_id` (40 Mbit/s at 24 frames a second, the deploy's
+/// 1,316-byte symbols, a twentieth of repair: about 170 symbols a part).
+fn video_frames(stream_id: u64, count: usize) -> Vec<super::video_throughput::Frame> {
+    super::video_throughput::make_frames_shaped(
+        stream_id,
+        0,
+        count,
+        40_000_000,
+        super::video_throughput::FrameShape {
+            fps: 24,
+            symbol_bytes: super::video_tee::SYMBOL_BYTES,
+            repair_per_sources: 20,
+        },
+    )
+}
+
+/// Send every datagram to `target` from `fd`, never waiting on a full
+/// socket for long.
+async fn send_all(fd: std::os::fd::RawFd, target: SocketAddr, datagrams: &[Vec<u8>]) {
+    let mut sent = 0;
+    while sent < datagrams.len() {
+        match fast_plane::sys::send_batch(fd, datagrams.len() - sent, |index| {
+            (&datagrams[sent + index][..], target)
+        }) {
+            Ok(0) | Err(_) => tokio::time::sleep(Duration::from_micros(200)).await,
+            Ok(taken) => sent += taken,
+        }
+    }
+}
+
+/// A video socket at `ip` whose audio port (its port less `offset`) a
+/// lease child config can name.
+async fn video_child(ip: Ipv4Addr, offset: u16) -> (UdpSocket, u16) {
+    loop {
+        let socket = UdpSocket::bind((ip, 0)).await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        if port > offset {
+            let _ = socket2::SockRef::from(&socket).set_recv_buffer_size(8 << 20);
+            return (socket, port - offset);
+        }
+    }
+}
+
+/// Count what arrives at `socket` until it is quiet for 300 ms (after a
+/// first datagram, or 10 s).
+fn count_video(socket: UdpSocket) -> tokio::task::JoinHandle<u64> {
+    tokio::spawn(async move {
+        let mut buf = vec![0_u8; 65_536];
+        let mut count = 0;
+        let mut quiet = Duration::from_secs(10);
+        while let Ok(Ok(_)) = timeout(quiet, socket.recv_from(&mut buf)).await {
+            count += 1;
+            quiet = Duration::from_millis(300);
+        }
+        count
+    })
+}
+
+/// A forwarder's video thread (fix4-video, task 3) allocates, frees and
+/// first touches nothing once it runs: 4K from both parents (the second
+/// copy a duplicate) to a compiled child of every symbol and a repair-only
+/// one (its sources kept warm), to a primary lease child and, from the
+/// twelfth part, a repair-only lease child (its sources kept warm); at the
+/// 48th the secondary children are promoted and their warm rings replayed
+/// (as the failover listeners do), and from the 36th a second stream
+/// arrives, new to the thread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forwarder_s_video_thread_allocates_frees_and_faults_nothing_once_it_runs() {
+    no_huge_page_collapse();
+    let counter = crate::alloc_count::AllocCounter::leaked();
+    let offset = 1_000;
+    let (all_child, all_video) = bind_class_pair(offset).await;
+    let (repair_child, repair_video) = bind_class_pair(offset).await;
+    for socket in [&all_video, &repair_video] {
+        let _ = socket2::SockRef::from(socket).set_recv_buffer_size(8 << 20);
+    }
+    let (primary_ip, warm_ip) = (loopback(81), loopback(82));
+    let (primary_lease, primary_port) = video_child(primary_ip, offset).await;
+    let (warm_lease, warm_port) = video_child(warm_ip, offset).await;
+    let lease = LeaseChildren::bind(
+        LeaseChildConfig {
+            bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            child_ports: [primary_port, warm_port],
+            class_port_offset: offset,
+            primary_children: vec![IpAddr::V4(primary_ip)],
+            max_children: 16,
+            ranked: true,
+            warm_hold_us: 1_000_000,
+        },
+        8 << 20,
+    )
+    .unwrap();
+    let (stream_a, stream_b) = (1_u64, 2_u64);
+    lease.rebuild(&[served(primary_ip, stream_a)]);
+    let cache = LiveTsCache::new(1, Duration::from_millis(42), 2, 96, 2_048).await;
+    let relay = start_fast_relay_in(
+        ParentPath::PromotedSecondary,
+        &[
+            RelayForwardEndpoint {
+                bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                target: all_child.local_addr().unwrap(),
+                role: RelayForwardRole::All,
+            },
+            RelayForwardEndpoint {
+                bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                target: repair_child.local_addr().unwrap(),
+                role: RelayForwardRole::Repair,
+            },
+        ],
+        fast_plane::relay::RelayClassConfig {
+            port_offset: offset,
+            cpus: [None, None],
+            realtime: false,
+            lease: Some(Arc::clone(&lease)),
+            test_video_alloc_counter: Some(counter),
+            ..Default::default()
+        },
+        cache,
+    )
+    .await;
+    let forwarder = relay.forwarder.clone().expect("a forwarder");
+    forwarder.configure_buffers(8 << 20);
+    let arrivals = [
+        count_video(all_video),
+        count_video(repair_video),
+        count_video(primary_lease),
+        count_video(warm_lease),
+    ];
+    let (frames_a, frames_b) = (video_frames(stream_a, 72), video_frames(stream_b, 36));
+    let (primary_fd, secondary_fd) = (
+        relay.primary_sender.as_raw_fd(),
+        relay.secondary_sender.as_raw_fd(),
+    );
+    let (primary_video, secondary_video) =
+        (relay.primary_video.unwrap(), relay.secondary_video.unwrap());
+    let repair_target = repair_child.local_addr().unwrap();
+    let start = Instant::now();
+    let interval = Duration::from_micros(41_667);
+    for (index, frame) in frames_a.iter().enumerate() {
+        tokio::time::sleep_until((start + interval * index as u32).into()).await;
+        // The primary lane takes the sources, the promoted secondary all.
+        send_all(primary_fd, primary_video, &frame.datagrams[..frame.sources]).await;
+        send_all(secondary_fd, secondary_video, &frame.datagrams).await;
+        if index >= 36 {
+            send_all(secondary_fd, secondary_video, &frames_b[index - 36].datagrams).await;
+        }
+        match index {
+            12 => lease.rebuild(&[served(primary_ip, stream_a), served(warm_ip, stream_a)]),
+            30 => lease.rebuild(&[
+                served(primary_ip, stream_a),
+                served(warm_ip, stream_a),
+                served(primary_ip, stream_b),
+                served(warm_ip, stream_b),
+            ]),
+            48 => {
+                assert_eq!(
+                    forwarder.apply_failover_mode(
+                        repair_target,
+                        FailoverForwardMode::SourceAndRepair,
+                        false
+                    ),
+                    Some(true)
+                );
+                forwarder.replay_warm_sources(repair_target).await;
+                assert_eq!(
+                    lease.apply_failover(IpAddr::V4(warm_ip), FailoverForwardMode::SourceAndRepair),
+                    Some(true)
+                );
+                let child = lease.child(IpAddr::V4(warm_ip)).expect("the warm child");
+                crate::fast_control::replay_warm(&lease, &child).await;
+            }
+            _ => {}
+        }
+    }
+    wait_for_part(&relay.cache, stream_b, 35).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let watched = Watched::read(counter);
+    let stats = relay.stats();
+    let snapshot = forwarder.snapshot();
+    drop(forwarder);
+    relay.stop().await;
+    let [all, repair, primary, warm] = arrivals;
+    let (all, repair, primary, warm) = (
+        all.await.unwrap(),
+        repair.await.unwrap(),
+        primary.await.unwrap(),
+        warm.await.unwrap(),
+    );
+    let symbols: u64 = frames_a
+        .iter()
+        .chain(&frames_b)
+        .map(|frame| frame.datagrams.len() as u64)
+        .sum();
+    assert!(all >= symbols, "{all} of {symbols} at the child of every symbol");
+    assert!(repair > 0 && primary > 0 && warm > 0, "{repair} {primary} {warm}");
+    assert!(stats.duplicates > 0, "{stats:?}");
+    assert_eq!(stats.tee_dropped, 0, "{stats:?}");
+    assert!(stats.lease_children.video_sent > 0, "{stats:?}");
+    assert!(stats.lease_children.warm_buffered > 0, "{stats:?}");
+    assert!(stats.lease_children.warm_replayed > 0, "{stats:?}");
+    assert_eq!(stats.lease_children.warm_refused, 0, "{stats:?}");
+    assert!(snapshot.warm_source_replayed_datagrams > 0, "{snapshot:?}");
+    assert_eq!(snapshot.warm_source_refused_datagrams, 0, "{snapshot:?}");
+    watched.assert_nothing(72);
+}
+
+/// An edge's video thread (fix4-video, task 3) allocates, frees and first
+/// touches nothing once it runs: 4K to a fast-lane client of one stream,
+/// then a second stream arrives (new to the thread) and a client joins it.
+#[test]
+fn an_edge_s_video_thread_allocates_frees_and_faults_nothing_once_it_runs() {
+    no_huge_page_collapse();
+    let counter = crate::alloc_count::AllocCounter::leaked();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let edge = rt.block_on(async {
+        tokio::spawn(LaneEdge::start_configured(
+            loopback(83),
+            Duration::ZERO,
+            64,
+            true,
+            move |config| config.test_video_alloc_counter = Some(counter),
+        ))
+        .await
+        .unwrap()
+    });
+    let (stream_a, stream_b) = (1_u64, 2_u64);
+    let (frames_a, frames_b) = (video_frames(stream_a, 72), video_frames(stream_b, 36));
+    let fd = edge.forwarder_fd(0);
+    let target = edge.relay_port(0, true);
+    let _ = socket2::SockRef::from(edge.forwarder_socket(0)).set_send_buffer_size(8 << 20);
+    let send = |frame: &super::video_throughput::Frame| {
+        rt.block_on(send_all(fd, target, &frame.datagrams));
+    };
+    send(&frames_a[0]);
+    rt.block_on(wait_for_part(&edge.cache, stream_a, 0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let measuring = Arc::new(AtomicBool::new(true));
+    let client = |stream_id: u64| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (port, stop, measuring) = (edge.client_port, Arc::clone(&stop), Arc::clone(&measuring));
+        let reader = std::thread::spawn(move || {
+            super::video_throughput::run_client(port, stream_id, stop, measuring, tx)
+        });
+        let first = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the edge subscribes the client");
+        (reader, first)
+    };
+    let (reader_a, first_a) = client(stream_a);
+    let mut reader_b = None;
+    let start = Instant::now();
+    let interval = Duration::from_micros(41_667);
+    for (index, frame) in frames_a.iter().enumerate().skip(1) {
+        std::thread::sleep((start + interval * index as u32).saturating_duration_since(Instant::now()));
+        send(frame);
+        if index >= 36 {
+            send(&frames_b[index - 36]);
+        }
+        if index == 48 {
+            reader_b = Some(client(stream_b));
+        }
+    }
+    rt.block_on(wait_for_part(&edge.cache, stream_b, 35));
+    std::thread::sleep(Duration::from_millis(300));
+    let watched = Watched::read(counter);
+    stop.store(true, Ordering::Relaxed);
+    let received_a = reader_a.join().unwrap();
+    let (reader_b, first_b) = reader_b.unwrap();
+    let received_b = reader_b.join().unwrap();
+    let missing = |received: &super::video_throughput::Received, first: u64, last: u64| {
+        (first..=last)
+            .filter(|part| !received.complete.contains_key(part))
+            .count()
+    };
+    let parts = |received: &super::video_throughput::Received| {
+        let mut parts: Vec<u64> = received.complete.keys().copied().collect();
+        parts.sort_unstable();
+        parts
+    };
+    assert_eq!(
+        missing(&received_a, first_a.max(1), 71),
+        0,
+        "stream A whole from {first_a}: {:?}",
+        parts(&received_a)
+    );
+    assert_eq!(
+        // A client that joins mid-stream may wait for a part or two
+        // (the listener side's); the thread's work is what is measured.
+        missing(&received_b, first_b + 2, 35),
+        0,
+        "stream B whole from {first_b}: {:?}",
+        parts(&received_b)
+    );
+    let stats = edge.cache.relay_ingress_snapshot().fast_plane;
+    assert_eq!(stats.tee_dropped, 0, "{stats:?}");
+    rt.block_on(edge.stop());
+    watched.assert_nothing(72);
 }

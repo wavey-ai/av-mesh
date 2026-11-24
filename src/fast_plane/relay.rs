@@ -870,6 +870,9 @@ pub(crate) struct ForwardPlan {
     /// the child's index in the snapshot.
     lease_warm: Vec<PlannedWarm>,
     first: [Option<(SocketAddr, u64)>; RECV_BATCH],
+    /// The UDP GSO runs of a send, worked out in place (fix4-video: a
+    /// list made per send was the video thread's allocation per batch).
+    runs: Vec<(usize, usize)>,
 }
 
 impl ForwardPlan {
@@ -887,6 +890,8 @@ impl ForwardPlan {
             lease: Vec::with_capacity(RECV_BATCH * lease_children),
             lease_warm: Vec::with_capacity(RECV_BATCH * lease_children),
             first: [None; RECV_BATCH],
+            // A run per send at most: the largest list of sends.
+            runs: Vec::with_capacity(RECV_BATCH * paths.max(lease_children).max(1)),
         }
     }
 
@@ -901,6 +906,7 @@ impl ForwardPlan {
         crate::memory::touch_spare(&mut self.warm);
         crate::memory::touch_spare(&mut self.lease);
         crate::memory::touch_spare(&mut self.lease_warm);
+        crate::memory::touch_spare(&mut self.runs);
     }
 
     fn clear(&mut self) {
@@ -967,6 +973,7 @@ fn send_lease_plan(
         lease: sends,
         lease_warm,
         first,
+        runs,
         ..
     } = plan;
     if !sends.is_empty() {
@@ -987,7 +994,7 @@ fn send_lease_plan(
         let started = Instant::now();
         let mut sent = None;
         if use_gso {
-            match sys::send_gso_batch(fd, sends.len(), message) {
+            match sys::send_gso_batch_with(fd, runs, sends.len(), message) {
                 Ok(gso_sent) => {
                     stats
                         .gso_datagrams
@@ -1190,6 +1197,7 @@ impl RelayDownstreamForwarder {
             groups,
             retry,
             first,
+            runs,
             ..
         } = plan;
         let use_gso = *gso && class == TrafficClass::Video;
@@ -1216,7 +1224,7 @@ impl RelayDownstreamForwarder {
             };
             let mut sent = None;
             if use_gso && *gso {
-                match sys::send_gso_batch(fd, sends.len(), message) {
+                match sys::send_gso_batch_with(fd, runs, sends.len(), message) {
                     Ok(gso_sent) => {
                         stats
                             .gso_datagrams
