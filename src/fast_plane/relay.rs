@@ -181,6 +181,10 @@ pub struct RelayClassConfig {
     /// Tests: the tee of this class panics on its first datagram.
     #[cfg(test)]
     pub test_tee_panic: Option<TrafficClass>,
+    /// Tests: both tees on the caller's runtime, as before each had a
+    /// thread (the baseline of the isolation test).
+    #[cfg(test)]
+    pub test_tees_on_caller_runtime: bool,
     /// Tests: the video tee spends this much more processor time on each
     /// datagram (a tee short of processor time).
     #[cfg(test)]
@@ -222,6 +226,8 @@ impl Default for RelayClassConfig {
             trim_forwarded_repair: true,
             #[cfg(test)]
             test_tee_panic: None,
+            #[cfg(test)]
+            test_tees_on_caller_runtime: false,
             #[cfg(test)]
             test_video_tee_spin_ns: 0,
             #[cfg(test)]
@@ -2694,6 +2700,15 @@ struct Tee {
     spin_ns: u64,
 }
 
+/// The nice value of a lane's tee thread: the small-part lane's (audio)
+/// first.
+const fn tee_nice(class: TrafficClass) -> i32 {
+    match class {
+        TrafficClass::Audio => 0,
+        TrafficClass::Video => 10,
+    }
+}
+
 /// Entries the tee takes in one wake before it publishes its snapshot and
 /// looks at its other work (fix4-video: was a receive batch, 65, so a tee
 /// behind by a second published and went round its loop 400 times a
@@ -3589,7 +3604,43 @@ pub async fn run_relay_class_ingest(
         audio_tee |= class == TrafficClass::Audio;
         let nudge = Arc::new(Notify::new());
         expire.push(Arc::clone(&nudge));
-        tees.spawn(async move { (class, tee.run(rx, nudge).await) });
+        // Each lane's tee on a thread of its own, with its own runtime
+        // (hls-beside-4k): on one runtime (one thread with --media-cpu) a
+        // large-part lane's backlog held the small-part lane's commits back
+        // by seconds. The small-part lane's tee (audio) runs at nice 0, the
+        // large-part lane's at +10: the CPU goes to the small parts first.
+        #[cfg(test)]
+        if config.test_tees_on_caller_runtime {
+            tees.spawn(async move { (class, tee.run(rx, nudge).await) });
+            continue;
+        }
+        let (ended_tx, ended_rx) = tokio::sync::oneshot::channel();
+        let nice = tee_nice(class);
+        let started = std::thread::Builder::new()
+            .name(format!("nt-tee-{}", class.as_str()))
+            .spawn(move || {
+                let _ = sys::set_nice(nice);
+                let result = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime.block_on(tee.run(rx, nudge)),
+                    Err(error) => Err(anyhow::Error::new(error).context("no tee runtime")),
+                };
+                let _ = ended_tx.send(result);
+            });
+        if let Err(error) = started {
+            stop.store(true, Ordering::Relaxed);
+            join_threads(threads).await;
+            tees.shutdown().await;
+            return Err(error).context("failed to start a tee thread");
+        }
+        tees.spawn(async move {
+            let result = ended_rx
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("the tee thread ended")));
+            (class, result)
+        });
     }
     let housekeeping = tokio::spawn(crate::fast_control::run_tee_housekeeping(
         Arc::clone(&cache),

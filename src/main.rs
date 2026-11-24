@@ -46414,6 +46414,7 @@ mod tests {
                 trim_to_margin: false,
                 trim_forwarded_repair: true,
                 test_tee_panic: Some(fast_plane::TrafficClass::Audio),
+                test_tees_on_caller_runtime: false,
                 test_video_tee_spin_ns: 0,
                 test_alloc_counter: None,
                 test_video_alloc_counter: None,

@@ -641,3 +641,118 @@ fn a_tee_short_of_processor_time_loses_whole_parts_not_all_of_them() {
     );
     assert_eq!(run.children_whole, run.children_expected, "{}", run.line());
 }
+
+
+/// hls-beside-4k: a large-part lane's tee that falls behind (it sheds parts)
+/// must not hold the small-part lane's commits back. The node runs on one
+/// thread, as with --media-cpu; 1 ms audio parts on the audio lane, and
+/// (loaded) video parts on the video lane at more than its slowed tee
+/// takes. Published-to-commit of the audio parts, p99 (ms), and the video
+/// tee's drops.
+fn small_lane_commit_p99(heavy: bool, shared_runtime: bool) -> (f64, u64, usize) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let relay = start_fast_relay_with(
+            ParentPath::PromotedSecondary,
+            &[],
+            fast_plane::relay::RelayClassConfig {
+                port_offset: OFFSET,
+                cpus: [None, None],
+                realtime: false,
+                tee_capacity: 4_096,
+                test_video_tee_spin_ns: if heavy { 500_000 } else { 0 },
+                test_tees_on_caller_runtime: shared_runtime,
+                ..Default::default()
+            },
+        )
+        .await;
+        let stop = Arc::new(AtomicBool::new(false));
+        let video = heavy.then(|| {
+            let fd = relay.secondary_sender.as_raw_fd();
+            let target = relay.secondary_video.unwrap();
+            let stop = Arc::clone(&stop);
+            let deadline = now_unix_us() + 600_000_000;
+            std::thread::spawn(move || {
+                let mut part = 0_u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let envelope = super::video_throughput::frame_envelope(9, part, 60_000, 50);
+                    let (sources, _) = fast_test_symbols(
+                        &envelope,
+                        relay_session::MediaPriority::VideoDelta,
+                        1_200,
+                        400,
+                        1,
+                        deadline,
+                    );
+                    let _ = fast_plane::sys::send_batch(fd, sources.len(), |index| {
+                        (&sources[index][..], target)
+                    });
+                    part += 1;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })
+        });
+        // Let the video tee fall behind first.
+        tokio::time::sleep(Duration::from_millis(if heavy { 500 } else { 0 })).await;
+        let stream = 4_001_u64;
+        let deadline = now_unix_us() + 600_000_000;
+        let mut sent = HashMap::new();
+        let began = Instant::now();
+        for sequence in 0..700_u64 {
+            // A starved runtime sends fewer parts, not for minutes.
+            if began.elapsed() > Duration::from_secs(3) {
+                break;
+            }
+            let symbols = fast_audio_symbols(stream, sequence, deadline);
+            sent.insert(sequence, now_unix_us());
+            for symbol in &symbols {
+                relay
+                    .primary_sender
+                    .send_to(symbol, relay.primary_audio)
+                    .await
+                    .unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        stop.store(true, Ordering::Relaxed);
+        if let Some(video) = video {
+            video.join().unwrap();
+        }
+        let mut late: Vec<f64> = hop_events(&relay.cache, HopStage::RelayDecoded, stream)
+            .iter()
+            .filter_map(|event| {
+                sent.get(&event.seq)
+                    .map(|at| event.t_us.saturating_sub(*at) as f64 / 1_000.0)
+            })
+            .collect();
+        late.sort_by(f64::total_cmp);
+        // The harness's journal keeps 4,096 events: about the last 800
+        // parts' worth.
+        if !shared_runtime {
+            assert!(late.len() > 650, "{} of 700 audio parts committed", late.len());
+        }
+        assert!(!late.is_empty(), "no audio part committed");
+        let p99 = late[(late.len() - 1) * 99 / 100];
+        let dropped = relay.stats().tee_dropped;
+        relay.stop().await;
+        (p99, dropped, late.len())
+    })
+}
+
+#[test]
+fn a_large_part_lane_behind_does_not_delay_the_small_part_lanes_commits() {
+    let (idle, _, _) = small_lane_commit_p99(false, false);
+    let (loaded, dropped, _) = small_lane_commit_p99(true, false);
+    let (shared, shared_dropped, shared_parts) = small_lane_commit_p99(true, true);
+    println!(
+        "small-part lane published-to-commit p99: idle {idle:.2} ms; large lane saturated \
+         {loaded:.2} ms ({dropped} dropped); both tees on one runtime {shared:.2} ms \
+         ({shared_dropped} dropped, {shared_parts} parts committed)"
+    );
+    assert!(dropped > 0, "the large-part lane's tee fell behind");
+    assert!(loaded <= idle + 5.0, "idle {idle:.2} ms, loaded {loaded:.2} ms");
+}
