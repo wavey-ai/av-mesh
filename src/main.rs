@@ -17142,6 +17142,93 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
             "av_mesh_relay_session_rejected_total{{kind=\"{kind}\"}} {value}\n"
         ));
     }
+    // A 2.7: the audio class's parent lanes (one a contributor each at a
+    // first forwarder) and the class threads' media clocks (A 2.5).
+    let fast = &snapshot.relay_session.fast_plane;
+    for (name, help, metric_type, value) in [
+        (
+            "av_mesh_fast_plane_parent_lane_received_total",
+            "Datagrams the audio class received on each parent lane.",
+            "counter",
+            (|lane| lane.received) as fn(&fast_plane::relay::ParentLaneSnapshot) -> u64,
+        ),
+        (
+            "av_mesh_fast_plane_parent_lane_first_arrivals_total",
+            "Symbols whose first copy came on each parent lane.",
+            "counter",
+            |lane| lane.first_arrivals,
+        ),
+        (
+            "av_mesh_fast_plane_parent_lane_duplicates_total",
+            "Further copies of a symbol that came on each parent lane.",
+            "counter",
+            |lane| lane.duplicates,
+        ),
+        (
+            "av_mesh_fast_plane_duplicate_mismatch_total",
+            "Copies on each parent lane whose bytes differ from the first copy's.",
+            "counter",
+            |lane| lane.duplicate_mismatch,
+        ),
+        (
+            "av_mesh_fast_plane_parent_lane_not_admitted_total",
+            "Datagrams on each parent lane that no session admitted.",
+            "counter",
+            |lane| lane.not_admitted,
+        ),
+        (
+            "av_mesh_fast_plane_parent_lane_kernel_dropped_total",
+            "Datagrams each parent lane's receive queue dropped.",
+            "counter",
+            |lane| lane.kernel_dropped,
+        ),
+        (
+            "av_mesh_fast_plane_parent_lane_duplicate_lag_max_us",
+            "The largest lag of a duplicate behind its first copy, last whole second or the one under way.",
+            "gauge",
+            |lane| lane.duplicate_lag_max_us,
+        ),
+    ] {
+        push_prometheus_metric_header(&mut output, name, help, metric_type);
+        for lane in &fast.parent_lanes {
+            let label = match lane.lane {
+                fast_plane::relay::ParentLane::Primary => "primary",
+                fast_plane::relay::ParentLane::Secondary => "secondary",
+            };
+            output.push_str(&format!("{name}{{lane=\"{label}\"}} {}\n", value(lane)));
+        }
+    }
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_media_clock_stale_total",
+        "Admitted datagrams the class threads' media clocks held stale, by kind.",
+        "counter",
+    );
+    for (kind, value) in [
+        ("epoch", fast.media_clock.stale_epoch),
+        ("media", fast.media_clock.stale_media),
+    ] {
+        output.push_str(&format!(
+            "av_mesh_media_clock_stale_total{{kind=\"{kind}\"}} {value}\n"
+        ));
+    }
+    for (name, help, metric_type, value) in [
+        (
+            "av_mesh_media_clock_overflow_total",
+            "Datagrams of streams that found no media clock (never stale).",
+            "counter",
+            fast.media_clock.overflow,
+        ),
+        (
+            "av_mesh_media_clock_unrecorded_streams",
+            "Validated epochs the class threads' table had no slot for.",
+            "gauge",
+            fast.media_clock.unrecorded_streams,
+        ),
+    ] {
+        push_prometheus_metric_header(&mut output, name, help, metric_type);
+        output.push_str(&format!("{name} {value}\n"));
+    }
     for (name, help, value) in [
         (
             "av_mesh_relay_session_wall_late_parts_total",
@@ -30355,8 +30442,17 @@ mod tests {
             failover_listener_last_transition_unix_ms: 1_784_102_400_456,
             ..RelaySessionIngressSnapshot::default()
         };
+        snapshot.relay_session.fast_plane.parent_lanes[1].lane =
+            fast_plane::relay::ParentLane::Secondary;
+        snapshot.relay_session.fast_plane.parent_lanes[1].duplicate_mismatch = 3;
+        snapshot.relay_session.fast_plane.media_clock.stale_media = 9;
 
         let metrics = render_mesh_prometheus_metrics(&snapshot);
+        // A 2.7's lines (integration join of the A units).
+        assert!(metrics.contains("av_mesh_fast_plane_duplicate_mismatch_total{lane=\"secondary\"} 3\n"));
+        assert!(metrics.contains("av_mesh_fast_plane_duplicate_mismatch_total{lane=\"primary\"} 0\n"));
+        assert!(metrics.contains("av_mesh_media_clock_stale_total{kind=\"media\"} 9\n"));
+        assert!(metrics.contains("# TYPE av_mesh_fast_plane_parent_lane_duplicate_lag_max_us gauge\n"));
 
         assert!(metrics.contains("# TYPE av_mesh_nodes gauge\n"));
         assert!(metrics.contains("av_mesh_nodes 1\n"));
