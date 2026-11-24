@@ -399,9 +399,14 @@ pub struct ReadinessInputs {
     pub parent_heard_age_ms: Option<u64>,
     /// E3: `parents_are_lost`.
     pub parents_lost: bool,
-    /// E4: a telemetry snapshot of the region was received, and the
-    /// region's moving heads are known (two advertisements of each holder).
+    /// E4: a telemetry snapshot of the region was received.
     pub regional_view: bool,
+    /// E5, F7: the region's moving heads are known (every fresh node of the
+    /// region and every playlist of every fresh holder seen in two
+    /// advertisements; latched), or this node opens nothing at its start
+    /// (`WarmPass::judged`). An empty view is not an idle region: once the
+    /// region has been heard, E4's two seconds do not stand in for it.
+    pub region_heads_known: bool,
     /// E5: the warm copies (the start's warm pass, `warm_playlists`; empty
     /// in an idle region).
     pub warm_copies: Vec<WarmCopy>,
@@ -464,6 +469,7 @@ impl Readiness {
         if !inputs.regional_view && inputs.uptime_ms < REGIONAL_VIEW_WAIT_MS {
             conditions.warm_up.push("no regional view".to_owned());
         }
+        region_heads_condition(inputs, &mut conditions);
         for copy in &inputs.warm_copies {
             let stream = copy.stream_id;
             if !copy.opened || !copy.decoded {
@@ -542,7 +548,8 @@ impl Readiness {
         {
             conditions.warm_up.push("leases settling".to_owned());
         }
-        // F7: a slot's start demand, decoded and windowed.
+        // F7: a slot's start demand, decoded and windowed, once it is known.
+        region_heads_condition(inputs, &mut conditions);
         for stream_id in &inputs.slot_streams {
             match inputs
                 .streams
@@ -618,6 +625,18 @@ fn threads_condition(inputs: &ReadinessInputs, conditions: &mut Conditions) {
     }
 }
 
+/// E5, F7: what must be warm is known only once the region's moving heads
+/// are. A region never heard (an edge alone, or no telemetry) goes without
+/// after E4's wait; a region heard waits for its heads, at most an edge's
+/// start timeout.
+fn region_heads_condition(inputs: &ReadinessInputs, conditions: &mut Conditions) {
+    if !inputs.region_heads_known
+        && (inputs.regional_view || inputs.uptime_ms < REGIONAL_VIEW_WAIT_MS)
+    {
+        conditions.warm_up.push("region heads not known".to_owned());
+    }
+}
+
 /// F4, F6 of one stream.
 fn stream_warm_up(stream: &StreamStatus, conditions: &mut Conditions) {
     let stream_id = stream.stream_id;
@@ -658,6 +677,8 @@ mod tests {
             streams: vec![stream(3001)],
             lease_renewal_ms: 2_200,
             lease_opened_age_ms: Some(30_000),
+            regional_view: true,
+            region_heads_known: true,
             ..ReadinessInputs::default()
         }
     }
@@ -672,6 +693,7 @@ mod tests {
             client_udp_running: true,
             parent_heard_age_ms: Some(40),
             regional_view: true,
+            region_heads_known: true,
             ..ReadinessInputs::default()
         }
     }
@@ -873,6 +895,53 @@ mod tests {
         // An idle region has no copy to warm: met at once.
         edge.warm_copies.clear();
         ready(&Readiness::edge(&edge, false));
+    }
+
+    /// E5 and F7 are judged only once the region's moving heads are known:
+    /// a region that has been heard waits for them whatever the uptime (E4's
+    /// two seconds do not stand in for them); a region never heard goes
+    /// without after E4's wait.
+    #[test]
+    fn region_heads_are_a_warm_up_condition_of_their_own() {
+        for (evaluate, healthy) in [
+            (
+                Readiness::edge as fn(&ReadinessInputs, bool) -> Readiness,
+                serving_edge(),
+            ),
+            (Readiness::forwarder, fed_forwarder()),
+        ] {
+            warm_up(
+                evaluate,
+                &healthy,
+                |inputs| inputs.region_heads_known = false,
+                "region heads not known",
+            );
+            let mut heard_early = healthy.clone();
+            heard_early.uptime_ms = 1_500;
+            // A forwarder's leases settle in a shorter renewal here (F5).
+            heard_early.lease_renewal_ms = 1_000;
+            warm_up(
+                evaluate,
+                &heard_early,
+                |inputs| inputs.region_heads_known = false,
+                "region heads not known",
+            );
+            // Never heard: two seconds after the start the node goes
+            // without; before them it waits.
+            let mut unheard = healthy.clone();
+            unheard.regional_view = false;
+            unheard.region_heads_known = false;
+            ready(&evaluate(&unheard, false));
+            unheard.uptime_ms = 1_999;
+            let readiness = evaluate(&unheard, false);
+            assert_eq!(readiness.state, NodeState::Starting, "{readiness:?}");
+            assert!(
+                readiness
+                    .not_ready
+                    .contains(&"region heads not known".to_owned()),
+                "{readiness:?}"
+            );
+        }
     }
 
     #[test]

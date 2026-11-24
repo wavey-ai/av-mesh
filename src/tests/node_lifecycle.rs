@@ -615,6 +615,7 @@ async fn an_edge_resumes_after_start_warm_ms_and_says_forced() {
         edge: true,
         start_drained: true,
         state_file: None,
+        warm_pass: false,
     });
     let router = router_with("edge", cache, mesh, CacheMeshRole::Edge, lifecycle, 0);
     let (_shutdown_tx, shutdown_rx) = watch::channel(());
@@ -647,6 +648,7 @@ async fn a_drain_during_start_survives_the_warm_up() {
         edge: true,
         start_drained: true,
         state_file: None,
+        warm_pass: false,
     });
     let router = router_with(
         "edge",
@@ -696,6 +698,7 @@ async fn a_resume_does_not_end_a_start() {
             edge,
             start_drained: true,
             state_file: None,
+            warm_pass: false,
         });
         let router = router_with("node", cache, Arc::clone(&mesh), role, lifecycle, 0);
         router
@@ -750,6 +753,7 @@ async fn an_operator_drain_survives_a_restart() {
         edge: true,
         start_drained: true,
         state_file: Some(file.clone()),
+        warm_pass: false,
     };
     let node = |lifecycle: NodeLifecycle| async move {
         let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
@@ -831,6 +835,7 @@ async fn a_starting_forwarder_is_ranked_last_until_its_window_is_full() {
         edge: false,
         start_drained: true,
         state_file: None,
+        warm_pass: false,
     });
     let b_mesh = start_mesh(
         &b_cache,
@@ -1158,6 +1163,15 @@ fn holder_snapshot(
         })
         .collect();
     snapshot.edge_service = Some(edge);
+    snapshot
+}
+
+/// A distributor of region `uk` (no edge service) that advertises at
+/// `updated_unix_ms`.
+fn forwarder_snapshot(node_id: &str, updated_unix_ms: u64) -> MeshSnapshot {
+    let mut snapshot =
+        telemetry_snapshot_for_tests(node_id, "uk", "europe", 51.5, -0.1, Vec::new(), 1);
+    snapshot.updated_unix_ms = updated_unix_ms;
     snapshot
 }
 
@@ -1524,6 +1538,7 @@ async fn only_playlists_whose_heads_move_are_warmed_and_never_video() {
         edge: true,
         start_drained: true,
         state_file: None,
+        warm_pass: true,
     });
     let router = router_with(
         "uk-edge-1",
@@ -1550,17 +1565,22 @@ async fn only_playlists_whose_heads_move_are_warmed_and_never_video() {
     assert!(pass.copies.is_empty() && !pass.judged, "{pass:?}");
     let status = router.node_status().await;
     assert!(
-        status.not_ready.contains(&"no regional view".to_owned()),
+        status
+            .not_ready
+            .contains(&"region heads not known".to_owned()),
         "{status:?}"
     );
     tokio::time::sleep(NODE_STATUS_CACHE).await;
 
-    // Its next: 7 and 9 moved, 8 did not.
+    // Its next, 200 ms on (advertisements this close make the region's
+    // interval short), once the region has been heard for one and a half
+    // of them: 7 and 9 moved, 8 did not.
+    tokio::time::sleep(Duration::from_millis(300)).await;
     router
         .telemetry
         .ingest_snapshot(holder_snapshot(
             "uk-edge-2",
-            at + 1_000,
+            at + 200,
             &[(7, 40, false), (8, 50, false), (9, 230, true)],
         ))
         .await;
@@ -1611,9 +1631,120 @@ async fn only_playlists_whose_heads_move_are_warmed_and_never_video() {
     assert!(router.lifecycle.reasons().list().is_empty());
 }
 
+/// An edge that starts drained with no advertisement of its region (a new
+/// process holds none, and peers publish once a second with no replay):
+/// its first look at an empty view, a distributor heard first, and a
+/// holder whose first advertisement comes 1.5 s into its uptime do not make
+/// it warm. It is warm only once the holder's second advertisement showed
+/// the head moving, the copy was opened, and the copy decoded to the head
+/// advertised then; E4's two seconds do not stand in for the heads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_edge_waits_for_the_heads_of_its_region() {
+    let cache = canonical_gap_test_cache().await;
+    let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+    let lifecycle = NodeLifecycle::new(LifecycleConfig {
+        edge: true,
+        start_drained: true,
+        state_file: None,
+        warm_pass: true,
+    });
+    let router = router_with(
+        "uk-edge-1",
+        Arc::clone(&cache),
+        mesh,
+        CacheMeshRole::Edge,
+        lifecycle,
+        0,
+    )
+    .with_playlist_demand(demand_config(Duration::from_secs(5), 0));
+    let uptime = || Duration::from_micros(now_unix_us().saturating_sub(cache.started_unix_us));
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    // A generous start timeout: this test is about the heads, not about
+    // the forced start.
+    let start = tokio::spawn(start_edge(
+        router.clone(),
+        Duration::from_secs(8),
+        shutdown_rx,
+    ));
+    let at = now_unix_ms();
+    tokio::time::sleep(Duration::from_millis(300).saturating_sub(uptime())).await;
+    router
+        .telemetry
+        .ingest_snapshot(forwarder_snapshot("uk-dist-a", at))
+        .await;
+    tokio::time::sleep(Duration::from_millis(1_300).saturating_sub(uptime())).await;
+    router
+        .telemetry
+        .ingest_snapshot(forwarder_snapshot("uk-dist-a", at + 1_000))
+        .await;
+    tokio::time::sleep(Duration::from_millis(1_500).saturating_sub(uptime())).await;
+    router
+        .telemetry
+        .ingest_snapshot(holder_snapshot("uk-edge-2", at + 1_200, &[(7, 30, false)]))
+        .await;
+    tokio::time::sleep(Duration::from_millis(2_400).saturating_sub(uptime())).await;
+    assert!(
+        router.lifecycle.holds(DrainReason::Start),
+        "{:?} {:?}",
+        router.lifecycle.warm_pass(),
+        router.node_status().await
+    );
+    assert!(router.lifecycle.warm_pass().copies.is_empty());
+    assert!(router.playlist_demand.streams.is_empty());
+    tokio::time::sleep(NODE_STATUS_CACHE).await;
+    let status = router.node_status().await;
+    assert_eq!(status.state, NodeState::Starting);
+    assert!(!status.warm);
+    assert!(
+        status
+            .not_ready
+            .contains(&"region heads not known".to_owned()),
+        "{status:?}"
+    );
+
+    // The holder's second advertisement: the head moved.
+    router
+        .telemetry
+        .ingest_snapshot(holder_snapshot("uk-edge-2", at + 2_200, &[(7, 40, false)]))
+        .await;
+    within("the copy is opened", Duration::from_secs(2), || {
+        router.playlist_demand.streams.contains_key(&7)
+    })
+    .await;
+    assert_eq!(router.lifecycle.warm_pass().copies, vec![(7, 40)]);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(router.lifecycle.holds(DrainReason::Start));
+    tokio::time::sleep(NODE_STATUS_CACHE).await;
+    let status = router.node_status().await;
+    assert!(
+        status
+            .not_ready
+            .contains(&"stream 7 not decoded".to_owned()),
+        "{status:?}"
+    );
+    // Decoded, but short of the head advertised when it was opened.
+    for sequence in 0..=20 {
+        commit_canonical_gap_test_part(&cache, 7, sequence).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(router.lifecycle.holds(DrainReason::Start));
+    for sequence in 21..=40 {
+        commit_canonical_gap_test_part(&cache, 7, sequence).await;
+    }
+    tokio::time::timeout(Duration::from_secs(2), start)
+        .await
+        .expect("warm once the copy reached its head")
+        .unwrap();
+    assert!(!router.lifecycle.ready_forced());
+    assert!(router.lifecycle.reasons().list().is_empty());
+}
+
 /// F7: a slot that starts drained holds the playlists its region's edges
 /// hold with a moving head, subscribes to them at its parent, and clears
-/// its hello's bit only once its window is full.
+/// its hello's bit only once its window is full. It starts with no
+/// advertisement of its region, and the holder's second one comes after
+/// the slot's leases have settled (F5) and E4's two seconds: the empty
+/// cache of a slot that does not yet know what moves is not warm.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_slot_fills_its_window_before_it_clears_its_bit() {
     let lease = Duration::from_millis(900);
@@ -1630,6 +1761,7 @@ async fn a_slot_fills_its_window_before_it_clears_its_bit() {
         edge: false,
         start_drained: true,
         state_file: None,
+        warm_pass: true,
     });
     let slot = start_mesh(
         &slot_cache,
@@ -1673,12 +1805,6 @@ async fn a_slot_fills_its_window_before_it_clears_its_bit() {
             }
         })
     };
-    // An edge of the region holds playlist 7, its head moving.
-    let at = now_unix_ms();
-    router
-        .telemetry
-        .ingest_snapshot(holder_snapshot("uk-edge-1", at, &[(7, 9, false)]))
-        .await;
     tokio::time::timeout(Duration::from_secs(3), async {
         while slot.parents_for(7).await != vec![parent_addr]
             || !parent
@@ -1695,7 +1821,35 @@ async fn a_slot_fills_its_window_before_it_clears_its_bit() {
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let upstream = tokio::spawn(run_upstream_demand(router.clone(), shutdown_rx.clone()));
     let start = tokio::spawn(start_forwarder(router.clone(), shutdown_rx));
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // An edge of the region holds playlist 7, its head moving: its first
+    // advertisement.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let at = now_unix_ms();
+    router
+        .telemetry
+        .ingest_snapshot(holder_snapshot("uk-edge-1", at, &[(7, 9, false)]))
+        .await;
+    let lease_settled = node_status::REGIONAL_VIEW_WAIT_MS
+        .max(u64::try_from((lease / 3).as_millis()).unwrap() + PLAYLIST_DEMAND_SWEEP_MS)
+        + 400;
+    loop {
+        tokio::time::sleep(NODE_STATUS_CACHE).await;
+        if router.node_status().await.process.uptime_ms >= lease_settled {
+            break;
+        }
+    }
+    tokio::time::sleep(NODE_STATUS_CACHE).await;
+    let status = router.node_status().await;
+    assert!(slot.is_draining(), "{status:?}");
+    assert_eq!(status.state, NodeState::Starting);
+    assert!(
+        status
+            .not_ready
+            .contains(&"region heads not known".to_owned()),
+        "{status:?}"
+    );
+    assert!(router.lifecycle.warm_pass().slot_streams.is_empty());
+    // Its next.
     router
         .telemetry
         .ingest_snapshot(holder_snapshot("uk-edge-1", at + 1_000, &[(7, 12, false)]))
@@ -1764,6 +1918,7 @@ async fn the_node_status_shows_the_cache_mesh_peers() {
         edge: false,
         start_drained: true,
         state_file: None,
+        warm_pass: false,
     });
     let parent = start_mesh(
         &parent_cache,
@@ -1821,8 +1976,8 @@ async fn region_heads_move_between_two_advertisements() {
     let mut heads = RegionHeads::default();
     let at = now_unix_ms();
     assert!(
-        heads.observe(&telemetry, &node, 3_000, at).await,
-        "an idle region is known"
+        !heads.observe(&telemetry, &node, 3_000, at).await,
+        "an empty view is not an idle region"
     );
     telemetry
         .ingest_snapshot(holder_snapshot("uk-edge-2", at, &[(7, 10, false)]))
@@ -1848,7 +2003,11 @@ async fn region_heads_move_between_two_advertisements() {
             &[(7, 20, false), (9, 9, true)],
         ))
         .await;
-    assert!(heads.observe(&telemetry, &node, 3_000, at + 1_000).await);
+    // Each was seen twice, but the region was first heard one interval
+    // ago: a node whose first advertisement is half an interval late may
+    // still come.
+    assert!(!heads.observe(&telemetry, &node, 3_000, at + 1_000).await);
+    assert!(heads.observe(&telemetry, &node, 3_000, at + 1_500).await);
     assert_eq!(
         heads.moving(),
         BTreeMap::from([(7, (20, false)), (9, (9, true))])
@@ -1859,4 +2018,43 @@ async fn region_heads_move_between_two_advertisements() {
     telemetry.ingest_snapshot(draining).await;
     assert!(heads.observe(&telemetry, &node, 3_000, at + 2_000).await);
     assert!(heads.moving().is_empty(), "uk-edge-2's head stands");
+    // A node of the region heard for the first time: unknown again until
+    // its second advertisement (it may be a holder whose playlists come
+    // next).
+    telemetry
+        .ingest_snapshot(forwarder_snapshot("uk-dist-a", at + 2_000))
+        .await;
+    assert!(!heads.observe(&telemetry, &node, 3_000, at + 2_000).await);
+    telemetry
+        .ingest_snapshot(forwarder_snapshot("uk-dist-a", at + 3_000))
+        .await;
+    assert!(heads.observe(&telemetry, &node, 3_000, at + 3_000).await);
+}
+
+/// A region heard only from nodes that hold nothing is idle once each of
+/// them has been seen twice, and not before: its first advertisement may
+/// have come before any holder's.
+#[tokio::test]
+async fn an_idle_region_is_known_after_two_advertisements_of_its_nodes() {
+    let telemetry = TelemetryAggregator::default();
+    let node = mesh_node_for_tests("uk-edge-1", "uk", "europe", 51.5, -0.1);
+    let mut heads = RegionHeads::default();
+    let at = now_unix_ms();
+    telemetry
+        .ingest_snapshot(forwarder_snapshot("uk-dist-a", at))
+        .await;
+    assert!(!heads.observe(&telemetry, &node, 3_000, at).await);
+    telemetry
+        .ingest_snapshot(forwarder_snapshot("uk-dist-a", at + 1_000))
+        .await;
+    assert!(!heads.observe(&telemetry, &node, 3_000, at + 1_000).await);
+    assert!(heads.observe(&telemetry, &node, 3_000, at + 1_500).await);
+    assert!(heads.moving().is_empty());
+    // Another region's nodes are not this region's.
+    let mut heads = RegionHeads::default();
+    let mut far = forwarder_snapshot("fr-dist-a", at);
+    far.node.region = "fr".to_owned();
+    let telemetry = TelemetryAggregator::default();
+    telemetry.ingest_snapshot(far).await;
+    assert!(!heads.observe(&telemetry, &node, 3_000, at).await);
 }

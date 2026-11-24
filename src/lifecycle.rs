@@ -90,6 +90,10 @@ pub(crate) struct LifecycleConfig {
     pub(crate) start_drained: bool,
     /// `--drain-state-file`: where an operator's drain is kept.
     pub(crate) state_file: Option<PathBuf>,
+    /// The start opens what must be warm (an edge that replicates on
+    /// demand: E5; a slot: F7), and so waits until the region's moving heads
+    /// are known. Otherwise there is nothing to judge.
+    pub(crate) warm_pass: bool,
 }
 
 /// The node's drain reasons and what follows from them. Clones share one
@@ -128,8 +132,10 @@ pub(crate) struct WarmPass {
     pub(crate) copies: Vec<(u64, u64)>,
     /// A slot's start demand: the playlists it subscribed to at its start.
     pub(crate) slot_streams: Vec<u64>,
-    /// The region's moving heads were known once: every fresh holder was
-    /// seen in two advertisements (kept, as a regional view is).
+    /// The region's moving heads were known once: every fresh node of the
+    /// region and every playlist of every fresh holder was seen in two
+    /// advertisements (kept, as a regional view is). True from the start of
+    /// a node that opens nothing at its start.
     pub(crate) judged: bool,
 }
 
@@ -180,7 +186,10 @@ impl NodeLifecycle {
                 state_file: config.state_file,
                 draining_since: StdMutex::new(draining.then(Instant::now)),
                 changed: Arc::new(Notify::new()),
-                warm: StdMutex::new(WarmPass::default()),
+                warm: StdMutex::new(WarmPass {
+                    judged: !(config.start_drained && config.warm_pass),
+                    ..WarmPass::default()
+                }),
             }),
         }
     }

@@ -3755,12 +3755,24 @@ async fn main() -> Result<()> {
         .cache_mesh_region
         .clone()
         .unwrap_or_else(|| args.region.clone());
+    let cache_mesh_role: CacheMeshRole = args.cache_mesh_role.into();
+    let replication = effective_replication(args.cache_mesh_replication, cache_mesh_role);
+    // A forwarder slot (--cache-mesh-upstream-demand) holds the playlists
+    // that its children lease from it as an edge holds those its readers
+    // ask for: by subscribing at its parent distributors (AM 12).
+    let upstream_demand = args.cache_mesh_upstream_demand
+        && replication == ReplicationMode::Demand
+        && cache_mesh_role == CacheMeshRole::Distributor;
+    let demand_enabled = replication == ReplicationMode::Demand
+        && (cache_mesh_role == CacheMeshRole::Edge || upstream_demand);
     // C 3.1: the drain reasons, an operator's from the drain-state file;
-    // the hello says draining from the mesh's start while any holds.
+    // the hello says draining from the mesh's start while any holds. A node
+    // that replicates on demand opens at its start what must be warm.
     let lifecycle = NodeLifecycle::new(LifecycleConfig {
-        edge: CacheMeshRole::from(args.cache_mesh_role) == CacheMeshRole::Edge,
+        edge: cache_mesh_role == CacheMeshRole::Edge,
         start_drained: args.start_drained,
         state_file: args.drain_state_file.clone(),
+        warm_pass: demand_enabled,
     });
     let mut mesh_config = CacheMeshConfig::new(node_id.clone(), cache_mesh_region, args.mesh_bind)
         .with_peers(mesh_peers)
@@ -3774,8 +3786,6 @@ async fn main() -> Result<()> {
     mesh_config.repair_ratio = args.mesh_repair_ratio;
     mesh_config.max_repair_symbols = args.mesh_max_repair_symbols;
     mesh_config.symbol_size = args.mesh_symbol_size;
-    let cache_mesh_role: CacheMeshRole = args.cache_mesh_role.into();
-    let replication = effective_replication(args.cache_mesh_replication, cache_mesh_role);
     let (mesh_applied_tx, mesh_applied_rx) = mpsc::unbounded_channel();
     let mesh_config = mesh_config
         .with_receive_loss_ppm(args.cache_mesh_test_receive_loss_ppm)
@@ -3917,15 +3927,8 @@ async fn main() -> Result<()> {
         info!(bind = %class_addr, "cache mesh video class socket listening");
         fast_path_report.tune_receive_socket_at(class_addr, "cache mesh video");
     }
-    // A forwarder slot (--cache-mesh-upstream-demand) holds the playlists
-    // that its children lease from it as an edge holds those its readers
-    // ask for: by subscribing at its parent distributors (AM 12).
-    let upstream_demand = args.cache_mesh_upstream_demand
-        && replication == ReplicationMode::Demand
-        && cache_mesh_role == CacheMeshRole::Distributor;
     let playlist_demand = PlaylistDemand::new(PlaylistDemandConfig {
-        enabled: replication == ReplicationMode::Demand
-            && (cache_mesh_role == CacheMeshRole::Edge || upstream_demand),
+        enabled: demand_enabled,
         lease: Duration::from_millis(args.cache_mesh_lease_ms.max(100)),
         idle: Duration::from_millis(args.cache_mesh_demand_idle_ms.max(1_000)),
         warm_parts: if args.cache_mesh_warm_parts > 0 {
@@ -15980,15 +15983,41 @@ struct HeadSeen {
 /// holder's last two advertisements has a live source. A held playlist
 /// with none never decodes, and a copy outlives its readers by the demand
 /// idle time, so only moving heads count.
+///
+/// A node advertises once each telemetry interval, a new process holds no
+/// advertisement and peers do not replay theirs: an empty view, or one in
+/// which a holder's first advertisement has not arrived yet, is not an idle
+/// region. So the heads are known only once the region has been heard for
+/// one and a half of its advertisement intervals (as its nodes' own
+/// advertisements space them: every node whose link was up when the first
+/// was heard has advertised by then, whatever its phase), every fresh node
+/// of it has been seen in two of its advertisements, and every playlist of
+/// every fresh holder in two of that holder's.
 #[derive(Debug, Default)]
 struct RegionHeads {
+    /// When a node of the region was first heard.
+    heard_ms: Option<u64>,
+    /// The region's fresh nodes (any role), by node id.
+    nodes: HashMap<String, NodeAdverts>,
     seen: HashMap<(String, u64), HeadSeen>,
 }
 
+/// The advertisements seen of one node of the region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NodeAdverts {
+    /// The last advertisement's own time.
+    advert_ms: u64,
+    adverts: u8,
+    /// The time between its last two advertisements (0 until two).
+    spacing_ms: u64,
+}
+
 impl RegionHeads {
-    /// Read the region's advertisements now. True when every playlist of
-    /// every fresh holder has been seen in two of them: the moving heads
-    /// are known (at once in a region where no edge holds anything).
+    /// Read the region's advertisements now. True when the region has been
+    /// heard, every fresh node of it has been seen in two advertisements,
+    /// and every playlist of every fresh holder in two of that holder's:
+    /// the moving heads are known (none in a region where no edge holds
+    /// anything).
     async fn observe(
         &mut self,
         telemetry: &TelemetryAggregator,
@@ -15996,18 +16025,34 @@ impl RegionHeads {
         fresh_ms: u64,
         now_ms: u64,
     ) -> bool {
+        let mut nodes = HashMap::new();
         let mut seen = HashMap::new();
         for snapshot in telemetry.snapshots.read().await.values() {
+            if snapshot.node.node_id == node.node_id
+                || snapshot.node.region != node.region
+                || telemetry.advertisement_age_ms(snapshot, now_ms) > fresh_ms
+            {
+                continue;
+            }
+            let advert_ms = snapshot.updated_unix_ms;
+            let advert = match self.nodes.get(&snapshot.node.node_id) {
+                Some(before) if before.advert_ms == advert_ms => *before,
+                Some(before) => NodeAdverts {
+                    advert_ms,
+                    adverts: before.adverts.saturating_add(1),
+                    spacing_ms: advert_ms.saturating_sub(before.advert_ms),
+                },
+                None => NodeAdverts {
+                    advert_ms,
+                    adverts: 1,
+                    spacing_ms: 0,
+                },
+            };
+            nodes.insert(snapshot.node.node_id.clone(), advert);
             let Some(edge) = snapshot.edge_service.as_ref() else {
                 continue;
             };
-            if snapshot.node.node_id == node.node_id
-                || snapshot.node.region != node.region
-                || edge.cache_mesh_role != "edge"
-                || edge.draining
-                || snapshot.node.draining
-                || telemetry.advertisement_age_ms(snapshot, now_ms) > fresh_ms
-            {
+            if edge.cache_mesh_role != "edge" || edge.draining || snapshot.node.draining {
                 continue;
             }
             for playlist in &edge.playlists {
@@ -16032,8 +16077,21 @@ impl RegionHeads {
                 seen.insert(key, next);
             }
         }
+        self.nodes = nodes;
         self.seen = seen;
-        self.seen.values().all(|head| head.adverts >= 2)
+        if self.nodes.is_empty() {
+            return false;
+        }
+        let heard_ms = *self.heard_ms.get_or_insert(now_ms);
+        let interval_ms = self
+            .nodes
+            .values()
+            .map(|node| node.spacing_ms)
+            .max()
+            .unwrap_or(0);
+        self.nodes.values().all(|node| node.adverts >= 2)
+            && self.seen.values().all(|head| head.adverts >= 2)
+            && now_ms.saturating_sub(heard_ms) >= interval_ms.saturating_mul(3) / 2
     }
 
     /// The playlists whose head moves at some holder, each with the highest
@@ -16061,8 +16119,8 @@ impl RegionHeads {
 /// its processor for the idle time.
 async fn warm_playlists(router: &AppRouter, heads: &mut RegionHeads) {
     if !router.playlist_demand.config.enabled {
-        // A node that holds every playlist has none to open.
-        router.lifecycle.set_warm_copies(Vec::new(), true);
+        // A node that holds every playlist has none to open (its lifecycle
+        // has no warm pass to judge).
         return;
     }
     let judged = heads
@@ -21633,9 +21691,10 @@ impl AppRouter {
             client_udp_running: client_udp.is_none_or(|udp| udp.subscribers.is_some()),
             parent_heard_age_ms,
             parents_lost,
-            // E4 also waits until the region's moving heads are known, so
-            // that E5 has its copies.
-            regional_view: regional_view && warm.judged,
+            regional_view,
+            // E5 and F7 have their playlists once the region's moving heads
+            // are known.
+            region_heads_known: warm.judged,
             fast_plane,
             parents: parents.clone(),
             streams: streams.clone(),
