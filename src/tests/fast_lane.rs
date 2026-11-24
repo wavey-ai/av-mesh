@@ -19,7 +19,7 @@ const OFFSET: u16 = 1_000;
 
 /// The packagings that av-contrib publishes, as it builds them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Packaging {
+pub(super) enum Packaging {
     /// 2.5 ms Opus: an fMP4 slot without init.
     Opus,
     /// 1 ms PCM: an opaque part.
@@ -53,7 +53,7 @@ fn media_bytes(sequence: u64, len: usize) -> Vec<u8> {
 
 /// A canonical envelope as av-contrib builds it for `packaging`, and the
 /// LL-HLS part bytes it should become.
-fn packaged_envelope(
+pub(super) fn packaged_envelope(
     packaging: Packaging,
     stream_id: u64,
     epoch: u64,
@@ -256,6 +256,8 @@ pub(super) struct LaneEdge {
     relay_ports: [SocketAddr; 2],
     forwarders: [UdpSocket; 2],
     pub(super) stats: Arc<edge_udp::EdgeUdpStats>,
+    /// The edge's router, for its lifecycle (a drain).
+    pub(super) router: AppRouter,
     holes: Option<Arc<edge_holes::HoleTrigger>>,
     shutdown_tx: watch::Sender<()>,
     ingest: tokio::task::JoinHandle<Result<()>>,
@@ -357,7 +359,7 @@ impl LaneEdge {
         config.playout = Duration::from_secs(5);
         let udp = tokio::spawn(edge_udp::run_edge_udp(
             client_sockets,
-            router,
+            router.clone(),
             config,
             Arc::clone(&stats),
             Vec::new(),
@@ -374,6 +376,7 @@ impl LaneEdge {
             ],
             forwarders,
             stats,
+            router,
             holes,
             shutdown_tx,
             ingest,

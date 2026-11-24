@@ -45241,4 +45241,8 @@ mod tests {
     /// The load mode: thousands of simulated UDP listeners against an edge
     /// in this process, and their cost per listener.
     mod load_mode;
+    /// The two-path session against edges in this process (resilient mesh,
+    /// first integration): one leg as the wave 9 client, two legs on two
+    /// edges.
+    mod two_leg_session;
 }
