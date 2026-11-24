@@ -278,6 +278,9 @@ pub(super) fn tee_4k(options: TeeOptions) -> TeeRun {
                 ParentPath::PromotedSecondary,
                 &endpoints,
                 fast_plane::relay::RelayClassConfig {
+                    // Every symbol to the children, as before 4k-repair's trim: these
+                    // measure forwarding and the tee, and count each repair symbol.
+                    trim_forwarded_repair: false,
                     port_offset: OFFSET,
                     cpus: node_cpus.map_or([None, None], |cpus| [Some(cpus[0]), Some(cpus[1])]),
                     realtime: false,

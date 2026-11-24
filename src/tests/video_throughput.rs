@@ -665,6 +665,9 @@ pub(super) fn forward_4k(mbps: u64, seconds: u64, children: usize, gso: bool) ->
             ParentPath::PromotedSecondary,
             &targets,
             fast_plane::relay::RelayClassConfig {
+                // Every symbol to the children, as before 4k-repair's trim: these
+                // measure forwarding and the tee, and count each repair symbol.
+                trim_forwarded_repair: false,
                 port_offset: OFFSET,
                 cpus: [None, None],
                 realtime: false,
@@ -1173,6 +1176,9 @@ async fn children_of_a_shared_socket_take_4k_as_gso_messages() {
         ParentPath::PromotedSecondary,
         &endpoints,
         fast_plane::relay::RelayClassConfig {
+            // Every symbol to the children, as before 4k-repair's trim: these
+            // measure forwarding and the tee, and count each repair symbol.
+            trim_forwarded_repair: false,
             port_offset: OFFSET,
             cpus: [None, None],
             realtime: false,
