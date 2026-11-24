@@ -223,6 +223,14 @@ pub struct Counters {
     /// A listener's part numbers jumped (a contributor restart): its
     /// accounting began again.
     pub resets: u64,
+    /// Fix 4 (F2): datagrams received and not taken, by reason (an old or
+    /// held-off source generation, a part before the session's start; the
+    /// duplicates are `duplicates`); generations taken again after they
+    /// were refused; legs failed for refusing everything for a second.
+    pub refused_stale_generation: u64,
+    pub refused_before_start: u64,
+    pub generation_returns: u64,
+    pub refusing_legs: u64,
     pub first_parts: u64,
     /// Edges that did not answer a listener's compact `SUB` in 1.5 s and
     /// were asked without the compact lane (the RaptorQ lane from then on),
@@ -345,6 +353,10 @@ impl Counters {
         self.socket_drops += other.socket_drops;
         self.truncated += other.truncated;
         self.resets += other.resets;
+        self.refused_stale_generation += other.refused_stale_generation;
+        self.refused_before_start += other.refused_before_start;
+        self.generation_returns += other.generation_returns;
+        self.refusing_legs += other.refusing_legs;
         self.first_parts += other.first_parts;
         self.compact_fallbacks += other.compact_fallbacks;
         self.short_header_dropped += other.short_header_dropped;
@@ -434,6 +446,13 @@ impl Counters {
             "socket_drops": self.socket_drops,
             "truncated": self.truncated,
             "resets": self.resets,
+            "refused": {
+                "stale_generation": self.refused_stale_generation,
+                "before_start": self.refused_before_start,
+                "duplicate": self.duplicates,
+            },
+            "generation_returns": self.generation_returns,
+            "refusing_legs": self.refusing_legs,
             "first_parts": self.first_parts,
             "compact_fallbacks": self.compact_fallbacks,
             "short_header_dropped": self.short_header_dropped,
@@ -1886,6 +1905,10 @@ fn handle_datagram(
         .kernel_us
         .map_or(0, |kernel_us| now_us.saturating_sub(kernel_us));
     let duplicates = listener.session.receiver.duplicate_parts;
+    let refused = {
+        let stats = &listener.session.receiver.compact.stats;
+        (stats.stale_generation, stats.before_start, stats.generation_returns)
+    };
     let socket = &listener.socket;
     let mut send = |to: SocketAddr, bytes: &[u8]| {
         // A full socket loses a request: the next refresh repeats it.
@@ -1921,6 +1944,13 @@ fn handle_datagram(
             }
         }
         Received::Move(_) | Received::Control | Received::Ignored => return,
+    }
+    {
+        let stats = &listener.session.receiver.compact.stats;
+        let sender = &mut counters[edge];
+        sender.refused_stale_generation += stats.stale_generation.saturating_sub(refused.0);
+        sender.refused_before_start += stats.before_start.saturating_sub(refused.1);
+        sender.generation_returns += stats.generation_returns.saturating_sub(refused.2);
     }
     counters[edge].duplicates += listener
         .session
@@ -2066,9 +2096,14 @@ fn service(
 ) {
     if now >= listener.session.next_wake() {
         let socket = &listener.socket;
+        let refusing = listener.session.refusing_legs;
         listener.session.poll_legs(now, &mut |to, bytes| {
             let _ = socket.send_to(bytes, to);
         });
+        if listener.session.refusing_legs > refusing {
+            ensure(counters, listener.home);
+            counters[listener.home].refusing_legs += listener.session.refusing_legs - refusing;
+        }
     }
     if !draining {
         listener
@@ -3429,6 +3464,13 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
             "socket_drops": counters.socket_drops,
             "truncated": counters.truncated,
             "resets": counters.resets,
+            "refused": {
+                "stale_generation": counters.refused_stale_generation,
+                "before_start": counters.refused_before_start,
+                "duplicate": counters.duplicates,
+            },
+            "generation_returns": counters.generation_returns,
+            "refusing_legs": counters.refusing_legs,
             "listeners_with_parts": counters.first_parts,
             "compact_fallbacks": counters.compact_fallbacks,
             "short_header_dropped": counters.short_header_dropped,

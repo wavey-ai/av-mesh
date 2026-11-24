@@ -746,6 +746,8 @@ struct LegFigures {
     longest_gap_ms: f64,
     plan: Option<String>,
     before_start: u64,
+    /// Its datagrams of a generation that the receiver refused.
+    stale_generation: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -802,6 +804,7 @@ fn leg_figures(logs: &[LegLog], nodes: &Nodes) -> BTreeMap<String, LegFigures> {
         entry.parts_first += report.stats.parts_first;
         entry.duplicates += report.stats.duplicates;
         entry.before_start += report.stats.before_start;
+        entry.stale_generation += report.stats.stale_generation;
         entry.datagrams += report.datagrams;
         entry.wire_bytes += report.wire_bytes;
         entry.loss = report.loss.or(entry.loss);
@@ -979,6 +982,26 @@ struct Report {
     stale_start: u64,
     cross_leg_mismatch: u64,
     short_grants: ShortGrantCounts,
+    /// Fix 4 (F2): datagrams received and not taken, by reason, so that a
+    /// receiver that takes nothing is never silent about it; the source
+    /// generations taken (a generation taken again after it was refused is
+    /// a return); and the legs failed for refusing everything for a second.
+    refused: RefusedCounts,
+    generation_changes: u64,
+    generation_returns: u64,
+    refusing_legs: u64,
+}
+
+/// Datagrams received and not taken, by reason.
+#[derive(Debug, Default, Serialize)]
+struct RefusedCounts {
+    /// Of a source generation that the receiver refused (an old one, or a
+    /// stale stamp held off).
+    stale_generation: u64,
+    /// Of parts below the session's first part.
+    before_start: u64,
+    /// Of parts delivered already (the other leg's copy, a copy, a repeat).
+    duplicate: u64,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -1926,6 +1949,14 @@ async fn main() -> Result<()> {
         stale_start: session.stale_starts,
         cross_leg_mismatch: stats.cross_leg_mismatch,
         short_grants: director.stats.short_grants.into(),
+        refused: RefusedCounts {
+            stale_generation: stats.stale_generation,
+            before_start: stats.before_start,
+            duplicate: stats.duplicates,
+        },
+        generation_changes: stats.generation_changes,
+        generation_returns: stats.generation_returns,
+        refusing_legs: session.refusing_legs,
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
@@ -2071,6 +2102,7 @@ mod tests {
                 parts_first: datagrams / 2,
                 duplicates: datagrams / 2,
                 before_start: 1,
+                stale_generation: 0,
             },
         }
     }

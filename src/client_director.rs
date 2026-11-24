@@ -175,6 +175,9 @@ pub enum LegFailure {
     /// The leg's `OK` named a part more than 4,096 behind the session's
     /// newest, or its parts were shown that far behind (`stale_start`).
     Stale,
+    /// The receiver refused every datagram of the leg for a second, at the
+    /// stream's rate (an old generation, parts before the session's start).
+    Refusing,
 }
 
 impl LegFailure {
@@ -183,6 +186,7 @@ impl LegFailure {
             Self::Dead => "silence",
             Self::NoAnswer => "no-answer",
             Self::Stale => "stale-start",
+            Self::Refusing => "refused-1s",
         }
     }
 }
