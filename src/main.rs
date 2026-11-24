@@ -6490,9 +6490,9 @@ struct RelayForwardPath {
     warm_sources: [StdMutex<WarmSourceReplayBuffer>; 2],
     /// The child's last demand report (`RLD1`, wave 7 item 5).
     demand: fast_plane::demand::DemandSlot,
-    /// Video datagrams the class thread handed the kernel for this child:
-    /// the count of its ledger (`RLL1`, 4k-repair link repair).
-    video_sent: AtomicU64,
+    /// Datagrams each class thread handed the kernel for this child, by
+    /// class: the counts of its ledgers (`RLL1`, 4k-repair link repair).
+    sent: [AtomicU64; 2],
 }
 
 struct RelayDownstreamForwarder {
@@ -6690,7 +6690,7 @@ impl RelayDownstreamForwarder {
                     })
                 }),
                 demand: Default::default(),
-                video_sent: AtomicU64::new(0),
+                sent: [AtomicU64::new(0), AtomicU64::new(0)],
             });
         }
         Ok(Some(Arc::new(Self {

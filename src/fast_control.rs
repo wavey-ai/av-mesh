@@ -528,7 +528,7 @@ pub(crate) async fn run_part_repair_tick(
 /// How often each child gets its ledger.
 const CHILD_LEDGER_EVERY: Duration = Duration::from_millis(250);
 
-/// Send each fast-plane child its video-lane ledger (`RLL1`, 4k-repair): the
+/// Send each fast-plane child its ledger on each lane (`RLL1`, 4k-repair): the
 /// datagrams handed to the kernel for it so far (forwarded, and the repair
 /// thread's), from the socket they leave from, four times a second. The
 /// child's video thread measures the lane's loss against it and reports it
@@ -548,7 +548,7 @@ pub(crate) async fn run_child_ledgers(
         }
         let mut sent = 0_u64;
         if let Some(forwarder) = &forwarder {
-            for (fd, target, count) in forwarder.video_ledgers() {
+            for (fd, target, count) in forwarder.ledgers() {
                 let count = count + repair.extra_sent(target);
                 let ledger = crate::fast_plane::loss_report::encode_ledger(count);
                 if sys::send_batch(fd, 1, |_| (&ledger[..], target)).unwrap_or(0) == 1 {
@@ -558,18 +558,21 @@ pub(crate) async fn run_child_ledgers(
         }
         if let Some(lease) = &lease {
             let snapshot = lease.load();
-            let fd = lease.fd(TrafficClass::Video);
             let mut done: Vec<std::net::SocketAddr> = Vec::new();
-            for child in snapshot.children.iter() {
-                let target = child.targets[TrafficClass::Video.index()];
-                if done.contains(&target) {
-                    continue;
-                }
-                done.push(target);
-                let count = child.video_sent.load(Ordering::Relaxed) + repair.extra_sent(target);
-                let ledger = crate::fast_plane::loss_report::encode_ledger(count);
-                if sys::send_batch(fd, 1, |_| (&ledger[..], target)).unwrap_or(0) == 1 {
-                    sent += 1;
+            for class in TrafficClass::ALL {
+                let fd = lease.fd(class);
+                for child in snapshot.children.iter() {
+                    let target = child.targets[class.index()];
+                    if done.contains(&target) {
+                        continue;
+                    }
+                    done.push(target);
+                    let count = child.sent[class.index()].load(Ordering::Relaxed)
+                        + repair.extra_sent(target);
+                    let ledger = crate::fast_plane::loss_report::encode_ledger(count);
+                    if sys::send_batch(fd, 1, |_| (&ledger[..], target)).unwrap_or(0) == 1 {
+                        sent += 1;
+                    }
                 }
             }
         }

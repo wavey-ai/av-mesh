@@ -1135,11 +1135,8 @@ fn send_lease_plan(
         let sent_us = now_unix_us();
         for send in &sends[..sent] {
             first[usize::from(send.message)].get_or_insert((target(send), sent_us));
-            if class == TrafficClass::Video {
-                snapshot.children[usize::from(send.child)]
-                    .video_sent
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+            snapshot.children[usize::from(send.child)].sent[class.index()]
+                .fetch_add(1, Ordering::Relaxed);
         }
         let mut delivered = sent as u64;
         let (mut would_block, mut errors) = (0_u64, 0_u64);
@@ -1159,11 +1156,8 @@ fn send_lease_plan(
                 sys::RestOutcome::Sent => {
                     delivered += 1;
                     let send = &sends[index];
-                    if class == TrafficClass::Video {
-                        snapshot.children[usize::from(send.child)]
-                            .video_sent
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
+                    snapshot.children[usize::from(send.child)].sent[class.index()]
+                        .fetch_add(1, Ordering::Relaxed);
                     first[usize::from(send.message)].get_or_insert((target(send), now_unix_us()));
                 }
                 sys::RestOutcome::WouldBlock => would_block += 1,
@@ -1300,19 +1294,21 @@ impl RelayDownstreamForwarder {
             .count()
     }
 
-    /// Each child's video ledger: the socket its video leaves from, where
-    /// it takes video, and the datagrams sent it so far (4k-repair).
-    pub(crate) fn video_ledgers(&self) -> Vec<(std::os::fd::RawFd, SocketAddr, u64)> {
-        self.paths
-            .iter()
-            .map(|path| {
-                (
-                    self.class_fd(TrafficClass::Video, path.group),
-                    path.video_target,
-                    path.video_sent.load(Ordering::Relaxed),
-                )
-            })
-            .collect()
+    /// Each child's ledger on each lane: the socket its datagrams of the
+    /// lane leave from, where it takes them, and how many were sent it so
+    /// far (4k-repair).
+    pub(crate) fn ledgers(&self) -> Vec<(std::os::fd::RawFd, SocketAddr, u64)> {
+        let mut out = Vec::with_capacity(2 * self.paths.len());
+        for class in TrafficClass::ALL {
+            for (index, path) in self.paths.iter().enumerate() {
+                out.push((
+                    self.class_fd(class, path.group),
+                    self.class_target(class, index),
+                    path.sent[class.index()].load(Ordering::Relaxed),
+                ));
+            }
+        }
+        out
     }
 
     fn class_fd(&self, class: TrafficClass, group: usize) -> std::os::fd::RawFd {
@@ -1402,12 +1398,9 @@ impl RelayDownstreamForwarder {
             stall_send(stats, class, elapsed.as_micros() as u64);
             let (mut sources, mut repairs, mut bytes) = (0_u64, 0_u64, 0_u64);
             for send in &sends[..sent] {
-                if class == TrafficClass::Video {
-                    // The child's ledger (4k-repair link repair).
-                    self.paths[usize::from(send.path)]
-                        .video_sent
-                        .fetch_add(1, Ordering::Relaxed);
-                }
+                // The child's ledger of the lane (4k-repair link repair).
+                self.paths[usize::from(send.path)].sent[class.index()]
+                    .fetch_add(1, Ordering::Relaxed);
                 bytes += batch.data(usize::from(send.message)).len() as u64;
                 match send.role {
                     MediaDatagramRole::Source => sources += 1,
@@ -1437,11 +1430,8 @@ impl RelayDownstreamForwarder {
             let started = Instant::now();
             match sys::send_batch(fd, 1, |_| (data, target)) {
                 Ok(1) => {
-                    if class == TrafficClass::Video {
-                        self.paths[usize::from(send.path)]
-                            .video_sent
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
+                    self.paths[usize::from(send.path)].sent[class.index()]
+                        .fetch_add(1, Ordering::Relaxed);
                     self.record_forward_success(send.role, data.len(), started.elapsed());
                     stats.forwarded[class.index()].fetch_add(1, Ordering::Relaxed);
                     first[usize::from(send.message)].get_or_insert((target, now_unix_us()));

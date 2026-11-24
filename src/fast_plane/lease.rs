@@ -105,9 +105,10 @@ pub struct LeaseChild {
     pub targets: [SocketAddr; 2],
     promoted: AtomicBool,
     warm: StdMutex<WarmSourceReplayBuffer>,
-    /// Video datagrams the class thread handed the kernel for this child:
-    /// the count of its ledger (`RLL1`, 4k-repair link repair).
-    pub video_sent: AtomicU64,
+    /// Datagrams each class thread handed the kernel for this child, by
+    /// [`TrafficClass::index`]: the counts of its ledgers (`RLL1`, 4k-repair
+    /// link repair, on each lane).
+    pub sent: [AtomicU64; 2],
 }
 
 impl LeaseChild {
@@ -481,7 +482,7 @@ impl LeaseChildren {
             } else {
                 WarmSourceReplayBuffer::preallocated()
             }),
-            video_sent: AtomicU64::new(0),
+            sent: [AtomicU64::new(0), AtomicU64::new(0)],
         }))
     }
 
