@@ -4150,6 +4150,9 @@ async fn main() -> Result<()> {
         edge_clients: fast_lane.clone(),
         holes: hole_trigger.clone(),
         lease_descriptors: args.relay_lease_descriptors,
+        // A 2.5: the class threads' media clocks take the budget that the
+        // receiver and the warm holds take (join J2 of the A reports).
+        media_deadline_us: args.relay_media_deadline_us(),
         ..Default::default()
     };
     let fec_ingest_task = match (fec_socket, class_sockets) {

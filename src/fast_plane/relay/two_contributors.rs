@@ -185,6 +185,8 @@ struct Ingress {
     epochs: Arc<ValidatedEpochs>,
     /// What the failover controller reads of the parents' arrivals.
     failover: Arc<FailoverInputs>,
+    /// What `GET /api/node` reports of each parent's feed (C CR4).
+    feeds: Arc<ParentFeeds>,
     tee: mpsc::Receiver<TeeItem>,
     stop: Arc<AtomicBool>,
     thread: Option<ClassThread>,
@@ -244,6 +246,7 @@ impl Ingress {
         let stats = Arc::new(FastPlaneStats::default());
         let epochs = Arc::new(ValidatedEpochs::new(64));
         let failover = Arc::new(FailoverInputs::new());
+        let feeds = Arc::new(ParentFeeds::default());
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, tee) = mpsc::channel(65_536);
         let thread = ClassThread {
@@ -273,7 +276,7 @@ impl Ingress {
             video_gro: false,
             media_deadline_us: BUDGET,
             epochs: Arc::clone(&epochs),
-            feeds: Arc::new(ParentFeeds::default()),
+            feeds: Arc::clone(&feeds),
         };
         Self {
             senders,
@@ -282,6 +285,7 @@ impl Ingress {
             stats,
             epochs,
             failover,
+            feeds,
             tee,
             stop,
             thread: Some(thread),
@@ -623,6 +627,24 @@ async fn a_burst_of_old_datagrams_on_one_lane_is_stale_and_does_not_hold_the_oth
     // put it (A 4, "does not stamp the parent feeds").
     let stamped = ingress.failover.primary_source.load(Ordering::Relaxed);
     assert_ne!(stamped, 0, "the live parts stamped the primary");
+    // The same holds for the parent feeds of `GET /api/node` (C CR4,
+    // stamped after the media clock's verdict): the entry's last source
+    // arrival, as now minus its age, does not move. Both senders share the
+    // loopback address, so they are one parent (`two_senders_of_one_address_
+    // are_one_parent`), and only the stale sends below reach it.
+    let last_source = |feeds: &ParentFeeds| {
+        let now_us = now_unix_us();
+        let feed = feeds
+            .snapshot(now_us)
+            .into_iter()
+            .find(|feed| feed.stream_id == Some(STREAM))
+            .expect("the live parts made a feed of the stream");
+        (
+            now_us.saturating_sub(feed.source_age_ms.expect("a source arrived") * 1_000),
+            feed.head_object,
+        )
+    };
+    let (fed_at, fed_head) = last_source(&ingress.feeds);
     std::thread::sleep(Duration::from_millis(5));
     for index in 0..100 {
         ingress.send(0, &stale(index));
@@ -634,6 +656,13 @@ async fn a_burst_of_old_datagrams_on_one_lane_is_stale_and_does_not_hold_the_oth
     let after = ingress.stats.snapshot();
     assert_eq!(judged(&after), BURST + 100, "{:?}", after.media_clock);
     assert_eq!(ingress.failover.primary_source.load(Ordering::Relaxed), stamped);
+    let (fed_at_after, fed_head_after) = last_source(&ingress.feeds);
+    assert_eq!(fed_head_after, fed_head, "a stale burst moved the feed's head");
+    // Ages are whole milliseconds: the same arrival reads within 1 ms.
+    assert!(
+        fed_at_after.abs_diff(fed_at) <= 1_000,
+        "a stale burst stamped the parent feed: {fed_at} then {fed_at_after}"
+    );
     ingress.assert_nothing_more();
     assert_eq!(ingress.teed(), 0);
     // What a live part of the other lane waited at most: one turn of the
@@ -734,7 +763,8 @@ async fn the_epoch_that_the_cache_takes_up_reaches_the_class_threads() {
     ));
     let stats = || cache.relay_ingress_snapshot().fast_plane;
     until(|| stats().threads == 1).await;
-    // The tee still judges deadlines by the wall clock (until AM4).
+    // Deadlines near the wall clock: the tee's receiver (AM4) judges them
+    // on the stream's own timeline, and these are fresh on either.
     let deadline_us = now_unix_us() + 5_000_000;
     let session = |epoch: u64, object: u64| {
         rls1_part(
