@@ -226,6 +226,12 @@ pub struct AssignmentRequest<'a> {
     /// place while its share of the movers is not yet taken, so that only
     /// the hedges over their share move again.
     pub place_at: Option<&'a str>,
+    /// The host tags of the caches the listener has just left (`skip`):
+    /// a redundant leg and the spare go elsewhere where they can, as they
+    /// do for the hosts of its legs, but this never shares a host as
+    /// `second_leg_same_host` counts it (hosttag review, finding 5: the
+    /// dead leg's sibling on its stopped host still looks fresh).
+    pub left_hosts: &'a [String],
 }
 
 impl Default for AssignmentRequest<'_> {
@@ -249,6 +255,7 @@ impl Default for AssignmentRequest<'_> {
             held_hosts: &[],
             spare_held: None,
             place_at: None,
+            left_hosts: &[],
         }
     }
 }
@@ -569,7 +576,9 @@ pub fn assign(
             let eligible = |cache: &CacheCandidate| {
                 !caches.iter().any(|leg| leg.node_id == cache.node_id)
                     && passes_gate(&ranked, cache)
-                    && (!apart || !shares_host(cache, &caches, request.held_hosts))
+                    && (!apart
+                        || !shares_host(cache, &caches, request.held_hosts)
+                            && !on_left_host(cache, request.left_hosts))
             };
             if let Some(cache) = stickies.iter().copied().find(|cache| eligible(cache)) {
                 second_leg_same_host |= shares_host(cache, &caches, request.held_hosts);
@@ -697,10 +706,13 @@ pub fn assign(
                     && ((cache.holds_playlist() && healthy(cache)) || admits(cache))
             })
         });
-        // A third host first, under the gate before over it: a holder
-        // there, else a cache there that admits; then the same on any host.
-        // A held spare under the gate is kept; over it, the passes under
-        // the gate look for another, and it is kept when none is.
+        // Under the gate before over it; a holder (a warm copy) before a
+        // cache that admits and must take a copy first, whatever the host
+        // (hosttag review, finding 4: a hedge to a cold edge waits about a
+        // second for its copy, longer than a sibling's stop costs); among
+        // either, a host that no leg is on (nor the caches it left) first.
+        // A held spare under the gate is kept; over it, the passes under the
+        // gate look for another, and it is kept when none is.
         let unders: &[bool] = if held_spare.is_some() {
             &[true]
         } else {
@@ -712,33 +724,29 @@ pub fn assign(
         let kept = held_spare.filter(|cache| room(cache) > 0.0);
         let chosen = kept
             .or_else(|| {
-                [true, false].into_iter().find_map(|apart| {
-                    let on_its_own_host = |cache: &&CacheCandidate| {
-                        !apart || !shares_host(cache, &caches, request.held_hosts)
-                    };
-                    let holders = || {
-                        regional
-                            .iter()
-                            .copied()
-                            .filter(free)
-                            .filter(not_held)
-                            .filter(on_its_own_host)
-                            .filter(|cache| cache.holds_playlist() && healthy(cache))
-                            .collect::<Vec<_>>()
-                    };
-                    let admitting = || {
-                        regional
-                            .iter()
-                            .copied()
-                            .filter(free)
-                            .filter(not_held)
-                            .filter(on_its_own_host)
-                            .filter(|cache| admits(cache))
-                            .collect::<Vec<_>>()
-                    };
-                    unders.iter().find_map(|under| {
-                        best(session, holders(), *under, &room)
-                            .or_else(|| best(session, admitting(), *under, &room))
+                unders.iter().find_map(|under| {
+                    [true, false].into_iter().find_map(|holders| {
+                        [true, false].into_iter().find_map(|apart| {
+                            let pool = regional
+                                .iter()
+                                .copied()
+                                .filter(free)
+                                .filter(not_held)
+                                .filter(|cache| {
+                                    !apart
+                                        || !shares_host(cache, &caches, request.held_hosts)
+                                            && !on_left_host(cache, request.left_hosts)
+                                })
+                                .filter(|cache| {
+                                    if holders {
+                                        cache.holds_playlist() && healthy(cache)
+                                    } else {
+                                        admits(cache)
+                                    }
+                                })
+                                .collect::<Vec<_>>();
+                            best(session, pool, *under, &room)
+                        })
                     })
                 })
             })
@@ -908,6 +916,14 @@ fn assigned(cache: &CacheCandidate, reason: AssignmentReason) -> AssignedCache {
         holds_playlist: cache.holds_playlist(),
         host: cache.host.clone(),
     }
+}
+
+/// Whether a cache is on the host of a cache the listener has just left.
+fn on_left_host(cache: &CacheCandidate, left_hosts: &[String]) -> bool {
+    cache
+        .host
+        .as_deref()
+        .is_some_and(|host| left_hosts.iter().any(|left| left == host))
 }
 
 /// Whether a cache shares a physical host with a leg already chosen or
@@ -1866,6 +1882,98 @@ mod tests {
         assert_eq!(legs(&assignment), ["edge-1"]);
     }
 
+    /// Hosttag review, finding 4: a warm holder on a leg's host is the
+    /// spare before a cold edge (one that must take a copy first) on a
+    /// third host; among holders a third host still comes first.
+    #[test]
+    fn the_spare_is_a_warm_holder_before_a_cold_edge_on_a_third_host() {
+        let caches = [
+            on_host("host-a", cache("holder", 100, Some(9))),
+            on_host("host-a", cache("standby", 100, Some(9))),
+            on_host("host-b", cache("cold", 100, None)),
+        ];
+        for index in 0..200 {
+            let session = format!("one-path-{index}");
+            let ask = AssignmentRequest {
+                paths: 1,
+                spare: true,
+                ..request(&session)
+            };
+            let assignment = assign(ask, AssignmentPolicy::default(), &caches).unwrap();
+            let spare = &assignment.caches[usize::from(assignment.legs)];
+            assert_eq!(spare.reason, AssignmentReason::Spare);
+            assert!(spare.holds_playlist, "{session}: {assignment:?}");
+        }
+        // A holder on a third host is still first among holders.
+        let mut three = caches.to_vec();
+        three.push(on_host("host-c", cache("far-holder", 100, Some(9))));
+        three.push(on_host("host-d", cache("farther-holder", 100, Some(9))));
+        for index in 0..200 {
+            let session = format!("two-path-{index}");
+            let ask = AssignmentRequest {
+                paths: 2,
+                spare: true,
+                ..request(&session)
+            };
+            let assignment = assign(ask, AssignmentPolicy::default(), &three).unwrap();
+            let leg_hosts = legs(&assignment)
+                .iter()
+                .map(|leg| host_of(&three, leg))
+                .collect::<Vec<_>>();
+            let spare = &assignment.caches[usize::from(assignment.legs)];
+            assert!(spare.holds_playlist, "{session}: {assignment:?}");
+            assert!(
+                !leg_hosts.contains(&host_of(&three, &spare.node_id)),
+                "{session}: {assignment:?}"
+            );
+        }
+    }
+
+    /// Hosttag review, finding 5: a replacement leg (and the spare) avoid
+    /// the host of the edge the listener left where another is eligible: a
+    /// stopped host's other edge still looks fresh. With none eligible the
+    /// choice is as before, and it is not counted as a second leg on the
+    /// host of a leg.
+    #[test]
+    fn a_replacement_leg_avoids_the_host_of_the_edge_it_left() {
+        let caches = [
+            on_host("host-a", cache("a2", 100, Some(9))),
+            on_host("host-b", cache("b1", 100, Some(9))),
+            on_host("host-c", cache("c1", 100, Some(9))),
+        ];
+        let held = ["host-b".to_owned()];
+        let left = ["host-a".to_owned()];
+        let free = [caches[0].clone(), caches[2].clone()];
+        for index in 0..200 {
+            let session = format!("replace-{index}");
+            let ask = AssignmentRequest {
+                paths: 1,
+                redundant: true,
+                moving: true,
+                held_hosts: &held,
+                left_hosts: &left,
+                ..request(&session)
+            };
+            let assignment = assign(ask, AssignmentPolicy::default(), &free).unwrap();
+            assert_eq!(legs(&assignment), ["c1"], "{session}: {assignment:?}");
+            assert!(!assignment.second_leg_same_host);
+        }
+        // c1 over the gate: a2, the dead edge's sibling, as before.
+        let mut full = free.clone();
+        full[1].load_permille = 900;
+        let ask = AssignmentRequest {
+            paths: 1,
+            redundant: true,
+            moving: true,
+            held_hosts: &held,
+            left_hosts: &left,
+            ..request("replace-full")
+        };
+        let assignment = assign(ask, AssignmentPolicy::default(), &full).unwrap();
+        assert_eq!(legs(&assignment), ["a2"]);
+        assert!(!assignment.second_leg_same_host);
+    }
+
     /// B 3.6: a region with one serving edge gives one leg and no spare.
     #[test]
     fn one_serving_edge_gives_one_path_and_no_spare() {
@@ -2398,6 +2506,7 @@ mod tests {
             held_hosts: &[],
             spare_held: None,
             place_at: None,
+            left_hosts: &[],
         }
     }
 

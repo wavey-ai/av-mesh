@@ -22587,6 +22587,13 @@ impl AppRouter {
             .filter(|cache| held(&cache.node_id))
             .filter_map(|cache| cache.host.clone())
             .collect::<Vec<_>>();
+        // And the hosts of the caches it left, where it can (hosttag review,
+        // finding 5).
+        let left_hosts = candidates_all
+            .iter()
+            .filter(|cache| skipped(&cache.node_id))
+            .filter_map(|cache| cache.host.clone())
+            .collect::<Vec<_>>();
         // B 2.5: a cache the client names as current and has left is not
         // its current one, and a UDP client that names caches it has left
         // is a mover whatever else it names.
@@ -22712,6 +22719,7 @@ impl AppRouter {
             held_hosts: &held_hosts,
             spare_held: reader.spare_held,
             place_at: reader.place_at,
+            left_hosts: &left_hosts,
         };
         // A rebalanced listener goes only to a cache heard of lately: an
         // edge that has just died still looks fresh, and empty, for a few
