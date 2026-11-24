@@ -296,6 +296,9 @@ pub struct NodeStatus {
     pub schema: String,
     pub node_id: String,
     pub region: String,
+    /// The physical host the node runs on (`--host-tag`), when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     pub role: String,
     pub build: BuildStatus,
     pub process: ProcessStatus,
@@ -1117,6 +1120,7 @@ mod tests {
             schema: SCHEMA.to_owned(),
             node_id: "tok-dist-a".to_owned(),
             region: "tokyo".to_owned(),
+            host: Some("4f1c2a9e07b3".to_owned()),
             role: "distributor".to_owned(),
             build: BuildStatus {
                 git: "3f2a9c1d77e0".to_owned(),

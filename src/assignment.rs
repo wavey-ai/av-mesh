@@ -34,6 +34,13 @@
 //! that holds one already) goes only to a cache that stays under the
 //! rebalance target with it, and never spills. The spare is a cache that
 //! holds the playlist, with no load gate: it carries nothing until a hedge.
+//!
+//! Two instances on one physical host stop together (measured on 23 Nov), so
+//! two legs on one host are not two paths. A redundant leg goes to an edge
+//! whose host tag (`--host-tag`) differs from those of the listener's other
+//! legs when both are set, and the spare prefers a third host. When no edge
+//! on another host is eligible the choice is made as if no tag were set, and
+//! the answer says so (`second_leg_same_host`).
 
 use av_mesh::client_udp::MAX_PATHS;
 use serde::Serialize;
@@ -81,6 +88,9 @@ pub struct CacheCandidate {
     /// (a drained edge's movers) are not all weighed against the same
     /// stale advertisement.
     pub pending_permille: u32,
+    /// The physical host the cache runs on, as its advertisement names it
+    /// (`--host-tag`); `None` when it names none.
+    pub host: Option<String>,
 }
 
 impl CacheCandidate {
@@ -204,6 +214,9 @@ pub struct AssignmentRequest<'a> {
     /// The listener holds a leg already (`h=` not empty): every leg of the
     /// answer is redundant.
     pub redundant: bool,
+    /// The host tags of the legs the listener holds: a leg of the answer
+    /// goes to another host where one is eligible.
+    pub held_hosts: &'a [String],
 }
 
 impl Default for AssignmentRequest<'_> {
@@ -224,6 +237,7 @@ impl Default for AssignmentRequest<'_> {
             paths: 1,
             spare: false,
             redundant: false,
+            held_hosts: &[],
         }
     }
 }
@@ -256,6 +270,8 @@ pub struct AssignedCache {
     pub reason: AssignmentReason,
     pub load_permille: u32,
     pub holds_playlist: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -267,6 +283,9 @@ pub struct Assignment {
     pub legs: u8,
     /// The cache after the legs is the spare.
     pub spare: bool,
+    /// A redundant leg shares its host with another leg of the listener:
+    /// no edge on another host was eligible.
+    pub second_leg_same_host: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -318,6 +337,7 @@ pub fn assign(
             pinned: true,
             legs: 1,
             spare: false,
+            second_leg_same_host: false,
         });
     }
 
@@ -513,64 +533,78 @@ pub fn assign(
         caches.push(assigned(cache, reason));
     }
     // Redundant legs: only where the cache stays under the gate with the
-    // listener counted, and never a spill.
-    while caches.len() < usize::from(wanted) {
-        let taken = |cache: &CacheCandidate| caches.iter().any(|leg| leg.node_id == cache.node_id);
-        if let Some(cache) = stickies
-            .iter()
-            .copied()
-            .find(|cache| !taken(cache) && passes_gate(&ranked, cache))
-        {
-            caches.push(assigned(cache, AssignmentReason::Sticky));
-            continue;
-        }
-        let pool = ranked
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, _, cache))| !taken(cache) && passes_gate(&ranked, cache))
-            .map(|(index, (_, _, cache))| (index, *cache))
-            .collect::<Vec<_>>();
-        let chosen = if moving {
-            // The legs of this answer count as movers placed already, so
-            // that two replacements follow the shares as two movers do.
-            let mut moves = request.recent_moves.to_vec();
-            for leg in &caches {
-                match moves.iter_mut().find(|(node_id, _)| *node_id == leg.node_id) {
-                    Some(entry) => entry.1 += 1,
-                    None => moves.push((leg.node_id.clone(), 1)),
-                }
+    // listener counted, and never a spill. An edge on a host that no leg of
+    // the listener is on first; when none is eligible, the same choice
+    // among them all. The host ranks above a remembered leg: a repeat of an
+    // answer that put both legs on one host moves its second leg once an
+    // edge on another host passes the gate, and the remembered leg's
+    // pending charge lapses at its next advertisement.
+    let mut second_leg_same_host = false;
+    'legs: while caches.len() < usize::from(wanted) {
+        for apart in [true, false] {
+            let eligible = |cache: &CacheCandidate| {
+                !caches.iter().any(|leg| leg.node_id == cache.node_id)
+                    && passes_gate(&ranked, cache)
+                    && (!apart || !shares_host(cache, &caches, request.held_hosts))
+            };
+            if let Some(cache) = stickies.iter().copied().find(|cache| eligible(cache)) {
+                second_leg_same_host |= shares_host(cache, &caches, request.held_hosts);
+                caches.push(assigned(cache, AssignmentReason::Sticky));
+                continue 'legs;
             }
-            apportion(&pool, &moves, level)
-        } else {
-            // Another holder by the session's weighted rendezvous, else the
-            // edge first in line for the standby copy: a small stream is
-            // then held on two edges, its holder and its standby.
-            pool.iter()
-                .filter(|(_, cache)| cache.holds_playlist())
-                .max_by(|left, right| {
-                    rendezvous_score(session, left.1)
-                        .total_cmp(&rendezvous_score(session, right.1))
-                        .then_with(|| right.1.node_id.cmp(&left.1.node_id))
-                })
-                .or_else(|| {
-                    pool.iter().max_by(|left, right| {
-                        left.1
-                            .failover_rank
-                            .cmp(&right.1.failover_rank)
-                            .then_with(|| {
-                                rendezvous_score(session, left.1)
-                                    .total_cmp(&rendezvous_score(session, right.1))
-                            })
+            let pool = ranked
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, _, cache))| eligible(cache))
+                .map(|(index, (_, _, cache))| (index, *cache))
+                .collect::<Vec<_>>();
+            let chosen = if moving {
+                // The legs of this answer count as movers placed already, so
+                // that two replacements follow the shares as two movers do.
+                let mut moves = request.recent_moves.to_vec();
+                for leg in &caches {
+                    match moves
+                        .iter_mut()
+                        .find(|(node_id, _)| *node_id == leg.node_id)
+                    {
+                        Some(entry) => entry.1 += 1,
+                        None => moves.push((leg.node_id.clone(), 1)),
+                    }
+                }
+                apportion(&pool, &moves, level)
+            } else {
+                // Another holder by the session's weighted rendezvous, else the
+                // edge first in line for the standby copy: a small stream is
+                // then held on two edges, its holder and its standby.
+                pool.iter()
+                    .filter(|(_, cache)| cache.holds_playlist())
+                    .max_by(|left, right| {
+                        rendezvous_score(session, left.1)
+                            .total_cmp(&rendezvous_score(session, right.1))
                             .then_with(|| right.1.node_id.cmp(&left.1.node_id))
                     })
-                })
-                .map(|(index, _)| *index)
-        };
-        let Some(index) = chosen else {
-            break;
-        };
-        let (_, _, cache) = ranked.remove(index);
-        caches.push(assigned(cache, AssignmentReason::SecondPath));
+                    .or_else(|| {
+                        pool.iter().max_by(|left, right| {
+                            left.1
+                                .failover_rank
+                                .cmp(&right.1.failover_rank)
+                                .then_with(|| {
+                                    rendezvous_score(session, left.1)
+                                        .total_cmp(&rendezvous_score(session, right.1))
+                                })
+                                .then_with(|| right.1.node_id.cmp(&left.1.node_id))
+                        })
+                    })
+                    .map(|(index, _)| *index)
+            };
+            if let Some(index) = chosen {
+                let (_, _, cache) = ranked.remove(index);
+                second_leg_same_host |= shares_host(cache, &caches, request.held_hosts);
+                caches.push(assigned(cache, AssignmentReason::SecondPath));
+                continue 'legs;
+            }
+        }
+        break;
     }
     let legs = u8::try_from(caches.len()).unwrap_or(MAX_PATHS);
     if rebalancing && legs == 0 && wanted > 0 {
@@ -593,25 +627,34 @@ pub fn assign(
                     .then_with(|| right.node_id.cmp(&left.node_id))
             })
         }
-        let holder = best(
-            session,
-            regional
-                .iter()
-                .copied()
-                .filter(free)
-                .filter(|cache| cache.holds_playlist() && healthy(cache))
-                .collect(),
-        );
-        let chosen = holder.or_else(|| {
+        // A third host first: a holder there, else a cache there that
+        // admits; then the same on any host.
+        let chosen = [true, false].into_iter().find_map(|apart| {
+            let on_its_own_host = |cache: &&CacheCandidate| {
+                !apart || !shares_host(cache, &caches, request.held_hosts)
+            };
             best(
                 session,
                 regional
                     .iter()
                     .copied()
                     .filter(free)
-                    .filter(|cache| admits(cache))
+                    .filter(on_its_own_host)
+                    .filter(|cache| cache.holds_playlist() && healthy(cache))
                     .collect(),
             )
+            .or_else(|| {
+                best(
+                    session,
+                    regional
+                        .iter()
+                        .copied()
+                        .filter(free)
+                        .filter(on_its_own_host)
+                        .filter(|cache| admits(cache))
+                        .collect(),
+                )
+            })
         });
         if let Some(cache) = chosen {
             ranked.retain(|(_, _, other)| other.node_id != cache.node_id);
@@ -650,6 +693,7 @@ pub fn assign(
         pinned: false,
         legs,
         spare,
+        second_leg_same_host,
     })
 }
 
@@ -730,6 +774,7 @@ pub fn assign_udp_in_region(
         pinned: false,
         legs: 1,
         spare: false,
+        second_leg_same_host: false,
     })
 }
 
@@ -740,7 +785,18 @@ fn assigned(cache: &CacheCandidate, reason: AssignmentReason) -> AssignedCache {
         reason,
         load_permille: cache.load_permille,
         holds_playlist: cache.holds_playlist(),
+        host: cache.host.clone(),
     }
+}
+
+/// Whether a cache shares a physical host with a leg already chosen or
+/// held: both name a host and it is the same. A cache or a leg without a
+/// tag shares nothing.
+fn shares_host(cache: &CacheCandidate, legs: &[AssignedCache], held_hosts: &[String]) -> bool {
+    cache.host.as_deref().is_some_and(|host| {
+        held_hosts.iter().any(|held| held == host)
+            || legs.iter().any(|leg| leg.host.as_deref() == Some(host))
+    })
 }
 
 /// The load that movers fill the survivors up to (see [`apportion`]).
@@ -932,6 +988,7 @@ mod tests {
             updated_unix_ms: 0,
             failover_rank: None,
             pending_permille: 0,
+            host: None,
         }
     }
 
@@ -1146,6 +1203,168 @@ mod tests {
         busy[2].load_permille = 810;
         let assignment = assign(two("listener-1"), AssignmentPolicy::default(), &busy).unwrap();
         assert_eq!(legs(&assignment), ["edge-1", "edge-4"]);
+    }
+
+    fn on_host(host: &str, cache: CacheCandidate) -> CacheCandidate {
+        CacheCandidate {
+            host: Some(host.into()),
+            ..cache
+        }
+    }
+
+    /// The host of a cache of an answer.
+    fn host_of<'a>(caches: &'a [CacheCandidate], node_id: &str) -> Option<&'a str> {
+        caches
+            .iter()
+            .find(|cache| cache.node_id == node_id)
+            .and_then(|cache| cache.host.as_deref())
+    }
+
+    /// D 5 (seam to B): of three edges two share a host; a listener's two
+    /// legs are on two hosts, a redundant leg avoids the host of the leg it
+    /// holds, the spare prefers a third host, and an edge on another host
+    /// over the gate leaves the same-host choice standing, said so.
+    #[test]
+    fn the_second_path_is_on_another_host_when_one_is_eligible() {
+        fn two(session: &str) -> AssignmentRequest<'_> {
+            AssignmentRequest {
+                paths: 2,
+                ..request(session)
+            }
+        }
+        let caches = [
+            on_host("host-a", cache("edge-1", 100, Some(9))),
+            on_host("host-a", cache("edge-2", 100, Some(9))),
+            on_host("host-b", cache("edge-3", 100, Some(9))),
+        ];
+        let mut first = HashMap::<String, usize>::new();
+        for index in 0..600 {
+            let session = format!("listener-{index}");
+            let assignment = assign(two(&session), AssignmentPolicy::default(), &caches).unwrap();
+            let legs = legs(&assignment);
+            assert_eq!(legs.len(), 2);
+            assert!(legs.contains(&"edge-3"), "{session}: {assignment:?}");
+            assert!(!assignment.second_leg_same_host);
+            assert_eq!(assignment.caches[0].host, host_of(&caches, legs[0]).map(str::to_owned));
+            *first.entry(legs[0].to_owned()).or_default() += 1;
+        }
+        // The first leg is chosen as before: the host rule moves only the
+        // second.
+        assert_eq!(first.len(), 3, "{first:?}");
+        // A listener that holds a leg on host-a: its new leg is edge-3.
+        let held = ["host-a".to_owned()];
+        let only_free = [caches[1].clone(), caches[2].clone()];
+        for index in 0..100 {
+            let session = format!("listener-{index}");
+            let redundant = AssignmentRequest {
+                paths: 1,
+                redundant: true,
+                held_hosts: &held,
+                ..request(&session)
+            };
+            let assignment = assign(redundant, AssignmentPolicy::default(), &only_free).unwrap();
+            assert_eq!(legs(&assignment), ["edge-3"], "{session}");
+            assert!(!assignment.second_leg_same_host);
+        }
+        // The spare: a third host when there is one.
+        let mut spread = caches.to_vec();
+        spread.push(on_host("host-c", cache("edge-4", 100, Some(9))));
+        for index in 0..600 {
+            let session = format!("listener-{index}");
+            let ask = AssignmentRequest {
+                spare: true,
+                ..two(&session)
+            };
+            let assignment = assign(ask, AssignmentPolicy::default(), &spread).unwrap();
+            assert!(assignment.spare);
+            let leg_hosts = legs(&assignment)
+                .iter()
+                .map(|leg| host_of(&spread, leg))
+                .collect::<Vec<_>>();
+            assert_ne!(leg_hosts[0], leg_hosts[1], "{session}: {assignment:?}");
+            let spare = &assignment.caches[2];
+            assert!(
+                !leg_hosts.contains(&host_of(&spread, &spare.node_id)),
+                "{session}: {assignment:?}"
+            );
+        }
+        // The edge on the other host over the gate: the second leg shares
+        // a host, and the answer says so.
+        let mut busy = caches.clone();
+        busy[2].load_permille = 810;
+        let assignment = assign(two("listener-1"), AssignmentPolicy::default(), &busy).unwrap();
+        let mut legs_busy = legs(&assignment);
+        legs_busy.sort_unstable();
+        assert_eq!(legs_busy, ["edge-1", "edge-2"]);
+        assert!(assignment.second_leg_same_host);
+    }
+
+    /// D 5: every edge on one host gives the choice made without tags, and
+    /// says that the second leg shares the host; tags absent (or on one
+    /// side only) change nothing.
+    #[test]
+    fn the_second_path_without_another_host_is_the_present_choice() {
+        let untagged = [
+            cache("edge-1", 100, Some(9)),
+            cache("edge-2", 200, Some(9)),
+            CacheCandidate {
+                failover_rank: Some(40),
+                ..cache("edge-3", 0, None)
+            },
+        ];
+        let tagged = |hosts: [Option<&str>; 3]| {
+            untagged
+                .iter()
+                .zip(hosts)
+                .map(|(cache, host)| CacheCandidate {
+                    host: host.map(str::to_owned),
+                    ..cache.clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        let one_host = tagged([Some("host-a"); 3]);
+        let distinct = tagged([Some("host-a"), Some("host-b"), Some("host-c")]);
+        let one_side = tagged([Some("host-a"), None, None]);
+        for index in 0..300 {
+            let session = format!("listener-{index}");
+            let ask = AssignmentRequest {
+                paths: 2,
+                spare: true,
+                ..request(&session)
+            };
+            let plain = assign(ask, AssignmentPolicy::default(), &untagged).unwrap();
+            assert_eq!(plain.legs, 2);
+            assert!(!plain.second_leg_same_host);
+            let names = |assignment: &Assignment| {
+                assignment
+                    .caches
+                    .iter()
+                    .map(|cache| (cache.node_id.clone(), cache.reason))
+                    .collect::<Vec<_>>()
+            };
+            let same = assign(ask, AssignmentPolicy::default(), &one_host).unwrap();
+            assert_eq!(names(&same), names(&plain), "{session}");
+            assert!(same.second_leg_same_host, "{session}");
+            for caches in [&distinct, &one_side] {
+                let assignment = assign(ask, AssignmentPolicy::default(), caches).unwrap();
+                assert_eq!(names(&assignment), names(&plain), "{session}");
+                assert!(!assignment.second_leg_same_host, "{session}");
+            }
+        }
+        // A held leg on that one host: the new leg stands, said so.
+        let held = ["host-a".to_owned()];
+        let redundant = AssignmentRequest {
+            redundant: true,
+            held_hosts: &held,
+            ..request("listener-1")
+        };
+        let assignment = assign(redundant, AssignmentPolicy::default(), &one_host).unwrap();
+        assert_eq!(assignment.legs, 1);
+        assert!(assignment.second_leg_same_host);
+        // Without a tag on the candidates a held host restricts nothing.
+        let assignment = assign(redundant, AssignmentPolicy::default(), &untagged).unwrap();
+        assert_eq!(assignment.legs, 1);
+        assert!(!assignment.second_leg_same_host);
     }
 
     /// B 3.6: a redundant leg only where its cache stays under the
@@ -1728,6 +1947,7 @@ mod tests {
             paths: 1,
             spare: false,
             redundant: false,
+            held_hosts: &[],
         }
     }
 
