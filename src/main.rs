@@ -46851,4 +46851,7 @@ mod tests {
     /// edges and two entry points in this process, through the referee's
     /// changes (B Y5).
     mod two_paths;
+    /// A 4K viewer at an edge whose source session restarts, with a late
+    /// copy of the old session in its cache (stuck4k).
+    mod stuck_4k;
 }
