@@ -395,8 +395,9 @@ pub fn touched_arc<T>(value: T) -> std::sync::Arc<T> {
 /// before the first class thread is made real-time: the code (and the
 /// shared libraries') pages are mapped on their first run, so a path that a
 /// class thread takes for the first time (its first send, its first client)
-/// took a page fault for each new page of code; and the writable data of
-/// the binary (`.data`, `.got`, and `.bss` after it) on its first write.
+/// took a page fault for each new page of code, and of constant data (a
+/// hash's tables) on its first read; and the writable data of the binary
+/// (`.data`, `.got`, and `.bss` after it) on its first write.
 /// `MADV_POPULATE_READ` and `_WRITE` (Linux 5.14) map them without changing
 /// a byte. Unlike a lock, a page of code can still be reclaimed under
 /// memory pressure. Returns the bytes mapped (by the call that did it).
@@ -407,15 +408,19 @@ pub fn populate_mappings() -> u64 {
             return;
         }
         let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
-        populated = populate(&maps);
+        let exe = std::env::current_exe().unwrap_or_default();
+        let exe = exe.to_string_lossy();
+        // A binary replaced on disk while it runs (a deploy) reads so.
+        populated = populate(&maps, exe.strip_suffix(" (deleted)").unwrap_or(&exe));
         MAPPINGS_POPULATED.store(populated, Ordering::Relaxed);
     });
     populated
 }
 
-/// The mappings of `/proc/self/maps` text to populate: (start, length,
-/// writable).
-fn mappings_to_populate(maps: &str) -> Vec<(usize, usize, bool)> {
+/// The mappings of `/proc/self/maps` text to populate, (start, length,
+/// writable): those of the binary (`exe`) and of the shared libraries, not
+/// any other file the process maps (populating it would read it all).
+fn mappings_to_populate(maps: &str, exe: &str) -> Vec<(usize, usize, bool)> {
     let mut wanted = Vec::new();
     // The binary's or a library's writable data: its `.bss` is the
     // anonymous mapping just after it.
@@ -437,29 +442,31 @@ fn mappings_to_populate(maps: &str) -> Vec<(usize, usize, bool)> {
         let perms = perms.as_bytes();
         let readable = perms.first() == Some(&b'r');
         let writable = perms.get(1) == Some(&b'w');
-        let executable = perms.get(2) == Some(&b'x');
         let private = perms.get(3) == Some(&b'p');
-        let file = path.starts_with('/');
+        let file = path.starts_with('/') && (path == exe || path.contains(".so"));
         let bss = path.is_empty() && after_data == Some(start);
         after_data = None;
         if !readable || !(file || bss) {
             continue;
         }
-        if executable {
-            wanted.push((start, end - start, false));
-        } else if writable && private {
-            wanted.push((start, end - start, true));
-            if file {
-                after_data = Some(end);
+        if writable {
+            if private {
+                wanted.push((start, end - start, true));
+                if file {
+                    after_data = Some(end);
+                }
             }
+        } else if file {
+            // Code, and read-only data (`.rodata`: constant tables).
+            wanted.push((start, end - start, false));
         }
     }
     wanted
 }
 
-fn populate(maps: &str) -> u64 {
+fn populate(maps: &str, exe: &str) -> u64 {
     let mut populated = 0;
-    for (start, len, writable) in mappings_to_populate(maps) {
+    for (start, len, writable) in mappings_to_populate(maps, exe) {
         #[cfg(target_os = "linux")]
         {
             let advice = if writable {
@@ -730,13 +737,16 @@ mod tests {
 7f0000000000-7f0000021000 rw-p 00000000 00:00 0
 7f1000000000-7f1000001000 r-xp 00000000 fd:01 456 /usr/lib/libc.so.6
 7f1000001000-7f1000002000 rw-s 00000000 00:05 789 /dev/shm/x
+7f2000000000-7f2040000000 r--p 00000000 fd:01 999 /var/lib/needletail/big.db
 7ffd0000-7ffd2000 r--p 00000000 00:00 0 [vvar]
 7ffd2000-7ffd4000 r-xp 00000000 00:00 0 [vdso]
 ";
         assert_eq!(
-            mappings_to_populate(maps),
+            mappings_to_populate(maps, "/usr/bin/av-mesh"),
             vec![
+                (0x55d0a000, 0x1000, false),
                 (0x55d0b000, 0x4000, false),
+                (0x55d0f000, 0x1000, false),
                 (0x55d10000, 0x1000, true),
                 (0x55d11000, 0x2000, true),
                 (0x7f1000000000, 0x1000, false),

@@ -234,7 +234,7 @@ impl RecvBatch {
     /// the class thread that owns the batch is made real-time.
     fn with_slots(slot_bytes: usize, gro: bool) -> Self {
         let mut data = vec![0_u8; RECV_BATCH * slot_bytes];
-        Self {
+        let mut batch = Self {
             _pin: crate::memory::pin_slice("receive batch", &mut data),
             data,
             slot_bytes,
@@ -257,7 +257,20 @@ impl RecvBatch {
             window: (0, 0),
             gro_messages: 0,
             gro_datagrams: 0,
+        };
+        // The headers, addresses and controls that the kernel writes, and
+        // the GRO lists: zeroed allocations whose pages are not mapped until
+        // written, which would be by the class thread's first receive.
+        #[cfg(target_os = "linux")]
+        {
+            crate::memory::touch_owned(batch.addresses.as_mut_slice());
+            crate::memory::touch_owned(batch.iovecs.as_mut_slice());
+            crate::memory::touch_owned(batch.headers.as_mut_slice());
         }
+        crate::memory::touch_owned(batch.control.as_mut_slice());
+        crate::memory::touch_owned(batch.metas.as_mut_slice());
+        crate::memory::touch_spare(&mut batch.segments);
+        batch
     }
 
     pub const fn is_gro(&self) -> bool {
