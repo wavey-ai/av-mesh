@@ -27,8 +27,8 @@ use crate::{AppRouter, ParentsLost};
 use av_mesh::client_compact as compact;
 use av_mesh::client_udp::{
     block_id, cut_through_block_id, cut_through_symbol_size, encode_block, encode_object, geometry,
-    source_datagram, AssignedCache, CompactPlan, Control, ObjectKind, PartObject, RepairPolicy,
-    KEEPALIVE, MIN_ASSIGN_REQUEST_BYTES, MIN_FIRST_REQUEST_BYTES, SUBSCRIPTION_TTL,
+    source_datagram, CompactPlan, Control, ObjectKind, PartObject, RepairPolicy, KEEPALIVE,
+    MIN_ASSIGN_REQUEST_BYTES, MIN_FIRST_REQUEST_BYTES, SUBSCRIPTION_TTL,
 };
 use bytes::Bytes;
 use playlists::mesh::{chunk_frame_slot, CacheMeshReceiveObserver};
@@ -40,7 +40,7 @@ use std::hash::BuildHasher;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
@@ -356,7 +356,10 @@ pub(crate) struct EdgeUdpStats {
     /// parents was region-wide.
     pub region_silence_held: AtomicU64,
     /// The fast client lane, once armed, whose counters the API reports.
-    pub fast_lane: OnceLock<Arc<EdgeFastLane>>,
+    /// Weak: the armed lane holds these counters, and a strong reference
+    /// back kept the lane, its client sockets and its repair thread alive
+    /// after the edge stopped (review of B Y5, finding 3).
+    pub fast_lane: OnceLock<Weak<EdgeFastLane>>,
     /// The compact lane: parts sent as compact datagrams (one per part and
     /// client, copies apart), their copies, window repair datagrams, parts
     /// asked for again (NACK) and sent again, and those refused (over the
@@ -478,7 +481,7 @@ impl EdgeUdpStats {
     pub(crate) fn egress_wire_bytes(&self) -> u64 {
         let mut bytes = self.bytes.load(Ordering::Relaxed)
             + self.datagrams.load(Ordering::Relaxed) * UDP_IP_HEADER_BYTES;
-        if let Some(lane) = self.fast_lane.get() {
+        if let Some(lane) = self.fast_lane.get().and_then(Weak::upgrade) {
             bytes += lane.stats.bytes.load(Ordering::Relaxed)
                 + lane.stats.datagrams.load(Ordering::Relaxed) * UDP_IP_HEADER_BYTES;
         }
@@ -488,7 +491,7 @@ impl EdgeUdpStats {
     /// The client datagrams sent so far, every lane (the fast lane's too).
     pub(crate) fn egress_datagrams(&self) -> u64 {
         let mut datagrams = self.datagrams.load(Ordering::Relaxed);
-        if let Some(lane) = self.fast_lane.get() {
+        if let Some(lane) = self.fast_lane.get().and_then(Weak::upgrade) {
             datagrams += lane.stats.datagrams.load(Ordering::Relaxed);
         }
         datagrams
@@ -1611,7 +1614,7 @@ pub(crate) async fn run_edge_udp(
         Ordering::Relaxed,
     );
     if let Some(lane) = sockets.fast_lane() {
-        let _ = stats.fast_lane.set(Arc::clone(lane));
+        let _ = stats.fast_lane.set(Arc::downgrade(lane));
         // The lane's own copy of the sockets does not hold the lane.
         lane.arm(
             sockets.clone().with_fast_lane(None),
@@ -2168,7 +2171,7 @@ impl EdgeControl {
             Arc::clone(&self.assigning),
         );
         tokio::spawn(async move {
-            let (port, caches, legs, spare) = router
+            let answer = router
                 .udp_assignment(
                     stream_id,
                     &session,
@@ -2179,9 +2182,7 @@ impl EdgeControl {
                     spare,
                 )
                 .await;
-            if let Some(answer) =
-                assigned_within(stream_id, nonce, port, caches, legs, spare, budget)
-            {
+            if let Some(answer) = assigned_within(stream_id, nonce, answer, budget) {
                 stats.assignments.fetch_add(1, Ordering::Relaxed);
                 stats.tokens_sent.fetch_add(1, Ordering::Relaxed);
                 // The token first: the client confirms as soon as
@@ -2207,12 +2208,16 @@ impl EdgeControl {
 fn assigned_within(
     stream_id: u64,
     nonce: u64,
-    port: Option<u16>,
-    mut caches: Vec<AssignedCache>,
-    legs: u8,
-    spare: bool,
+    answer: crate::UdpAssignment,
     budget: usize,
 ) -> Option<Vec<u8>> {
+    let crate::UdpAssignment {
+        port,
+        mut caches,
+        legs,
+        spare,
+        why,
+    } = answer;
     let kept = usize::from(legs) + usize::from(spare);
     loop {
         let answer = Control::Assigned {
@@ -2222,6 +2227,7 @@ fn assigned_within(
             caches: caches.clone(),
             paths: legs,
             spare,
+            why,
         }
         .encode();
         if answer.len() <= budget {
@@ -5533,6 +5539,7 @@ fn new_route(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use av_mesh::client_udp::AssignedCache;
 
     #[test]
     fn a_gap_in_the_compact_ring_gives_way_to_the_part() {
@@ -7156,12 +7163,20 @@ mod tests {
                 caches: indices.iter().map(|index| caches[*index].clone()).collect(),
                 paths: 2,
                 spare: true,
+                why: None,
             }
             .encode()
             .len()
         };
         let within = |budget: usize| {
-            assigned_within(801, 7, Some(19_446), caches.clone(), 2, true, budget)
+            let answer = crate::UdpAssignment {
+                port: Some(19_446),
+                caches: caches.clone(),
+                legs: 2,
+                spare: true,
+                why: None,
+            };
+            assigned_within(801, 7, answer, budget)
         };
         // Room for all.
         let (all, paths, spare) = names(&within(encoded(&[0, 1, 2, 3, 4, 5, 6])).unwrap());

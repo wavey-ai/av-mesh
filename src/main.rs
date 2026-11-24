@@ -20601,6 +20601,29 @@ struct RebalanceConfig {
     to_mean: bool,
 }
 
+/// The answer to a UDP `ASSIGN` ([`AppRouter::udp_assignment`]): the
+/// fields of `ASSIGNED`.
+#[derive(Debug)]
+pub(crate) struct UdpAssignment {
+    pub(crate) port: Option<u16>,
+    pub(crate) caches: Vec<av_mesh::client_udp::AssignedCache>,
+    pub(crate) legs: u8,
+    pub(crate) spare: bool,
+    pub(crate) why: Option<av_mesh::client_udp::ShortGrant>,
+}
+
+/// Why an answer granted fewer legs than asked (B Y2): the assignment's
+/// reason, or the one given with no leg at all to a listener that holds one.
+fn short_grant_of(
+    assignment: &Result<Assignment, AssignmentError>,
+) -> Option<av_mesh::client_udp::ShortGrant> {
+    match assignment {
+        Ok(assignment) => assignment.short,
+        Err(AssignmentError::NoLegGranted(why)) => Some(*why),
+        Err(_) => None,
+    }
+}
+
 /// A request that the entry point answers for a reader.
 #[derive(Debug, Clone, Copy)]
 struct ReaderRequest<'a> {
@@ -22888,7 +22911,7 @@ impl AppRouter {
                 )
                 .with_no_store();
             }
-            Err(AssignmentError::NoCacheAvailable) => Vec::new(),
+            Err(AssignmentError::NoCacheAvailable | AssignmentError::NoLegGranted(_)) => Vec::new(),
         };
         let alternatives = caches
             .iter()
@@ -23180,7 +23203,9 @@ impl AppRouter {
                 return response(StatusCode::NOT_FOUND, None, None).with_no_store();
             }
             // No cache admits a reader now. The player keeps its pathway.
-            Err(AssignmentError::NoCacheAvailable) => current.clone().into_iter().collect(),
+            Err(AssignmentError::NoCacheAvailable | AssignmentError::NoLegGranted(_)) => {
+                current.clone().into_iter().collect()
+            }
         };
         // The neighbouring regions stay last in every list, so that a reader
         // has somewhere to go when this region does not answer at all.
@@ -23260,8 +23285,9 @@ impl AppRouter {
     /// the client's confirmation does that
     /// ([`Self::confirm_udp_assignment`]).
     ///
-    /// Also returns the legs granted and whether the cache after them is
-    /// the spare (`p=`, `s=` of `ASSIGNED`, B 2.1).
+    /// Also returns the legs granted, whether the cache after them is the
+    /// spare (`p=`, `s=` of `ASSIGNED`, B 2.1), and why fewer legs than
+    /// asked were granted (`why=`, B Y2).
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn udp_assignment(
         &self,
@@ -23272,7 +23298,7 @@ impl AppRouter {
         hold: &[String],
         paths: u8,
         spare: bool,
-    ) -> (Option<u16>, Vec<av_mesh::client_udp::AssignedCache>, u8, bool) {
+    ) -> UdpAssignment {
         let (assignment, _, assigned) = self
             .client_assignment(
                 ReaderRequest {
@@ -23292,6 +23318,7 @@ impl AppRouter {
         let (legs, spare) = assignment
             .as_ref()
             .map_or((0, false), |assignment| (assignment.legs, assignment.spare));
+        let why = short_grant_of(&assignment);
         let caches = assigned
             .as_array()
             .map(|list| {
@@ -23306,7 +23333,13 @@ impl AppRouter {
                     .collect()
             })
             .unwrap_or_default();
-        (self.client_udp_port, caches, legs, spare)
+        UdpAssignment {
+            port: self.client_udp_port,
+            caches,
+            legs,
+            spare,
+            why,
+        }
     }
 
     async fn assignment_api_response(
@@ -23380,12 +23413,13 @@ impl AppRouter {
                 })
             })
             .collect::<Vec<_>>();
+        let why = short_grant_of(&assignment);
         let (status, assignment, error) = match assignment {
             Ok(assignment) => (StatusCode::OK, Some(assignment), None),
             Err(error @ AssignmentError::UnknownPinnedCache) => {
                 (StatusCode::NOT_FOUND, None, Some(error))
             }
-            Err(error @ AssignmentError::NoCacheAvailable) => {
+            Err(error @ (AssignmentError::NoCacheAvailable | AssignmentError::NoLegGranted(_))) => {
                 (StatusCode::SERVICE_UNAVAILABLE, None, Some(error))
             }
         };
@@ -23440,7 +23474,11 @@ impl AppRouter {
                     "nack_resent": stats.nack_resent.load(Ordering::Relaxed),
                     "nack_refused": stats.nack_refused.load(Ordering::Relaxed),
                     "nack_edge_capped": stats.nack_edge_capped.load(Ordering::Relaxed),
-                    "fast_lane": stats.fast_lane.get().map(|lane| lane.snapshot_stats()),
+                    "fast_lane": stats
+                        .fast_lane
+                        .get()
+                        .and_then(std::sync::Weak::upgrade)
+                        .map(|lane| lane.snapshot_stats()),
                 })
             }),
         });
@@ -23458,6 +23496,8 @@ impl AppRouter {
             .and_then(|assignment| assignment.caches.get(usize::from(assignment.legs)))
             .map(|cache| cache.node_id.clone())
             .into();
+        // B Y2: why fewer legs than asked were granted.
+        body["why"] = why.map(|why| why.word()).into();
         body["failover_entries"] = serde_json::Value::Array(failover_entries);
         // AM 12, 13: the forwarder's lease children and cache-mesh children.
         body["fast_plane"] = serde_json::to_value(self.fast_plane_gauges()).unwrap_or_default();
@@ -38503,6 +38543,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(api["paths"], 1, "{api:#}");
+        assert_eq!(api["why"], "bitrate", "B Y2: the reason of a short grant");
         assert_eq!(api["assigned"][1]["reason"], "spare");
         assert_eq!(api["spare"], api["assigned"][1]["node_id"]);
         // A listener that holds a leg of it is granted none more (B 3.9;
@@ -38517,6 +38558,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(api["paths"], 0, "{api:#}");
+        assert_eq!(api["why"], "bitrate");
         let (edge, _shutdown) =
             start_edge_udp_for_tests(&router, edge_udp::EdgeUdpConfig::with_defaults(1_200, 16))
                 .await;
@@ -38529,6 +38571,7 @@ mod tests {
                 Control::Assigned {
                     paths: 1,
                     spare: true,
+                    why: Some(av_mesh::client_udp::ShortGrant::Bitrate),
                     ..
                 }
             ),
@@ -38542,7 +38585,51 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(api["paths"], 2, "{api:#}");
+        assert!(api["why"].is_null(), "a full grant gives no reason");
         mesh.shutdown();
+    }
+
+    /// Review of B Y2, finding 1: a listener that holds a leg and asks for
+    /// one more is told why none is granted, over UDP and HTTPS alike: the
+    /// region's other edge drains (`one-edge`), or serves at full load
+    /// (`gate`). The entry is itself the edge the listener holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_listener_granted_no_second_leg_hears_why() {
+        use av_mesh::client_udp::{Control, ShortGrant};
+        let mut draining = audio_cache_snapshot_for_tests("edge-c", 100, Some(500));
+        draining.node.draining = true;
+        if let Some(edge) = draining.edge_service.as_mut() {
+            edge.draining = true;
+        }
+        let at_full = audio_cache_snapshot_for_tests("edge-c", 1_000, Some(500));
+        for (other, why) in [(draining, ShortGrant::OneEdge), (at_full, ShortGrant::Gate)] {
+            let (router, mesh) = entry_point_for_tests(vec![other]).await;
+            let router = router.with_client_udp_port(Some(19_446));
+            let (edge, _shutdown) = start_edge_udp_for_tests(
+                &router,
+                edge_udp::EdgeUdpConfig::with_defaults(1_200, 16),
+            )
+            .await;
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let (_, answer) =
+                udp_assign_for_tests(&client, edge, "held-1", &[], &[], &["test-node"], 1, false)
+                    .await;
+            assert!(
+                matches!(answer, Control::Assigned { paths: 0, why: Some(given), .. } if given == why),
+                "{answer:?}"
+            );
+            let api: serde_json::Value = serde_json::from_str(&body_text(
+                get_for_tests(
+                    &router,
+                    "/api/assignment?stream=801&sid=held-2&paths=1&hold=test-node",
+                )
+                .await,
+            ))
+            .unwrap();
+            assert_eq!(api["paths"], 0, "{api:#}");
+            assert_eq!(api["why"], why.word(), "{api:#}");
+            mesh.shutdown();
+        }
     }
 
     /// B 2.5: a UDP client that names the edge it left as `current` (the
@@ -46138,4 +46225,8 @@ mod tests {
     /// drain reasons, the start that waits until the node is warm, and the
     /// make-before-break release of parents.
     mod node_lifecycle;
+    /// Two-path listeners (the director over the session) against four
+    /// edges and two entry points in this process, through the referee's
+    /// changes (B Y5).
+    mod two_paths;
 }

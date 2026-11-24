@@ -803,7 +803,7 @@ impl EdgeFastLane {
                         job.part,
                         Some(&job.windows[..usize::from(job.count)]),
                     );
-                    if let Some(lane) = stats.fast_lane.get() {
+                    if let Some(lane) = stats.fast_lane.get().and_then(std::sync::Weak::upgrade) {
                         lane.stats
                             .repair_thread_max_us
                             .fetch_max(started.elapsed().as_micros() as u64, Ordering::Relaxed);
