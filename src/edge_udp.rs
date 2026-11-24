@@ -185,6 +185,10 @@ pub(crate) struct EdgeUdpConfig {
     /// Answer a client's `ASSIGN` (`--client-udp-assign`, wave 9 B) with the
     /// assignment that `/api/assignment` gives over HTTPS.
     pub assign: bool,
+    /// Assignment confirmations taken from one address a second at most
+    /// (`--client-udp-assign-confirms-per-source`, B 2.3): a load host
+    /// confirms for every listener it runs from one address.
+    pub assign_confirms_per_source: u32,
 }
 
 impl EdgeUdpConfig {
@@ -214,6 +218,7 @@ impl EdgeUdpConfig {
             keepalive: Duration::from_millis(DEFAULT_KEEPALIVE_MS),
             prompt_sender: true,
             assign: true,
+            assign_confirms_per_source: DEFAULT_ASSIGN_CONFIRMS_PER_SOURCE,
         }
     }
 }
@@ -307,6 +312,10 @@ pub(crate) struct EdgeUdpStats {
     /// rate, or the session already charged there).
     pub assignment_confirms: AtomicU64,
     pub assignment_confirms_refused: AtomicU64,
+    /// B 2.3: confirmations turned away by the per-source limit
+    /// (`--client-udp-assign-confirms-per-source`) or by the assignments in
+    /// flight, not counted as refused.
+    pub assignment_confirms_limited: AtomicU64,
     /// Parts forwarded cut-through, and their datagrams.
     pub cut_through_parts: AtomicU64,
     pub cut_through_datagrams: AtomicU64,
@@ -388,6 +397,22 @@ impl EdgeUdpStats {
     pub(crate) fn live_subscribers(&self) -> Option<u64> {
         let table = self.table.get()?;
         Some(subscriber_count(&table.0) as u64)
+    }
+
+    /// Subscribers now of each stream that has any (B 3.6: a stream's UDP
+    /// legs count as its sessions where the edge advertises its playlists).
+    pub(crate) fn live_subscribers_by_stream(&self) -> HashMap<u64, u64> {
+        let Some(table) = self.table.get() else {
+            return HashMap::new();
+        };
+        table
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, entry)| !entry.subscribers.is_empty())
+            .map(|(stream_id, entry)| (*stream_id, entry.subscribers.len() as u64))
+            .collect()
     }
 
     /// Bytes that the client lanes sent, every lane (cache-fed,
@@ -1608,11 +1633,26 @@ pub(crate) async fn run_edge_udp(
                 session,
                 skip,
                 current,
+                paths,
+                spare,
+                hold,
                 token,
-                ..
             } => {
                 edge.on_assign(
-                    socket, peer, len, stream_id, nonce, session, skip, current, token,
+                    socket,
+                    peer,
+                    len,
+                    AssignRequest {
+                        stream_id,
+                        nonce,
+                        session,
+                        skip,
+                        current,
+                        paths,
+                        spare,
+                        hold,
+                        token,
+                    },
                 );
             }
             _ => {}
@@ -1839,18 +1879,12 @@ impl EdgeControl {
 
     /// `ASSIGN`: a client's confirmation of the assignment it took (with
     /// this node's token), or a padded request for one.
-    #[allow(clippy::too_many_arguments)]
     fn on_assign(
         &mut self,
         socket: Arc<UdpSocket>,
         peer: SocketAddr,
         len: usize,
-        stream_id: u64,
-        nonce: u64,
-        session: String,
-        skip: Vec<String>,
-        current: Vec<String>,
-        token: Option<u64>,
+        request: AssignRequest,
     ) {
         if !self.config.assign {
             self.stats
@@ -1858,28 +1892,39 @@ impl EdgeControl {
                 .fetch_add(1, Ordering::Relaxed);
             return;
         }
+        let AssignRequest {
+            stream_id,
+            nonce,
+            session,
+            skip,
+            current,
+            paths,
+            spare,
+            hold,
+            token,
+        } = request;
         // Wave 9 review: the client's confirmation of the answer
         // it took, with this node's token for its address (so its
-        // source is proven): the cache is charged and the session
-        // remembered, at most CONFIRMS_PER_SOURCE a second from one
-        // address. Not answered.
+        // source is proven): the legs it names are remembered and
+        // the new ones charged, at most
+        // `assign_confirms_per_source` a second from one address.
+        // Not answered.
         if let Some(token) = token {
-            let Some(cache) = current
-                .into_iter()
-                .next()
-                .filter(|_| self.tokens.valid(peer, token))
-            else {
+            if current.is_empty() || !self.tokens.valid(peer, token) {
                 self.stats.bad_tokens.fetch_add(1, Ordering::Relaxed);
                 self.stats
                     .assignment_confirms_refused
                     .fetch_add(1, Ordering::Relaxed);
                 return;
-            };
-            if !self.confirms.allow(peer.ip(), Instant::now())
-                || self.assigning.load(Ordering::Relaxed) >= MAX_ASSIGNMENTS_IN_FLIGHT
+            }
+            if !self.confirms.allow(
+                peer.ip(),
+                Instant::now(),
+                self.config.assign_confirms_per_source,
+            ) || self.assigning.load(Ordering::Relaxed) >= MAX_ASSIGNMENTS_IN_FLIGHT
             {
                 self.stats
-                    .assignment_confirms_refused
+                    .assignment_confirms_limited
                     .fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -1891,7 +1936,7 @@ impl EdgeControl {
             );
             tokio::spawn(async move {
                 let counter = if router
-                    .confirm_udp_assignment(stream_id, &session, &skip, &cache)
+                    .confirm_udp_assignment(stream_id, &session, &skip, &current, &hold)
                     .await
                 {
                     &stats.assignment_confirms
@@ -1929,32 +1974,37 @@ impl EdgeControl {
             Arc::clone(&self.assigning),
         );
         tokio::spawn(async move {
-            let (port, mut caches) = router
+            let (port, mut caches, legs, spare) = router
                 .udp_assignment(
                     stream_id,
                     &session,
                     &skip,
                     current.first().map(String::as_str),
+                    &hold,
+                    paths,
+                    spare,
                 )
                 .await;
+            // The legs and the spare are never cut (B 2.1).
+            let kept = usize::from(legs) + usize::from(spare);
             let answer = loop {
                 let answer = Control::Assigned {
                     stream_id,
                     nonce,
                     port,
                     caches: caches.clone(),
-                    paths: 1,
-                    spare: false,
+                    paths: legs,
+                    spare,
                 }
                 .encode();
-                if answer.len() <= budget || caches.is_empty() {
+                if answer.len() <= budget || caches.len() <= kept {
                     break answer;
                 }
                 // The last cache that fits: the failover order is
-                // cut from its end (the assigned cache first).
+                // cut from its end (the legs and the spare first).
                 let failover_at = caches.iter().position(|cache| cache.failover);
                 match failover_at {
-                    Some(at) if at > 1 => {
+                    Some(at) if at > kept => {
                         caches.remove(at - 1);
                     }
                     _ => {
@@ -1981,14 +2031,29 @@ impl EdgeControl {
     }
 }
 
+/// The fields of an `ASSIGN` ([`Control::Assign`]), for
+/// [`EdgeControl::on_assign`].
+struct AssignRequest {
+    stream_id: u64,
+    nonce: u64,
+    session: String,
+    skip: Vec<String>,
+    current: Vec<String>,
+    paths: u8,
+    spare: bool,
+    hold: Vec<String>,
+    token: Option<u64>,
+}
+
 /// Wave 9 B: `ASSIGN` requests answered at once at most; more are dropped
 /// (the client repeats its request).
 const MAX_ASSIGNMENTS_IN_FLIGHT: usize = 256;
 
-/// Wave 9 review: assignment confirmations taken from one address a second
-/// at most (a host behind one address may run a few dozen clients; a
-/// proven source that confirms many sessions charges no more).
-const CONFIRMS_PER_SOURCE: u32 = 64;
+/// Default of `--client-udp-assign-confirms-per-source` (wave 9 review):
+/// assignment confirmations taken from one address a second at most (a host
+/// behind one address may run a few dozen clients; a proven source that
+/// confirms many sessions charges no more).
+pub(crate) const DEFAULT_ASSIGN_CONFIRMS_PER_SOURCE: u32 = 64;
 /// Addresses the confirmation limit remembers at most (beyond, the window
 /// starts again for all).
 const CONFIRM_SOURCES: usize = 4_096;
@@ -2002,7 +2067,7 @@ struct ConfirmLimit {
 }
 
 impl ConfirmLimit {
-    fn allow(&mut self, source: std::net::IpAddr, now: Instant) -> bool {
+    fn allow(&mut self, source: std::net::IpAddr, now: Instant, limit: u32) -> bool {
         if self
             .window
             .is_none_or(|start| now.saturating_duration_since(start) >= Duration::from_secs(1))
@@ -2012,7 +2077,7 @@ impl ConfirmLimit {
             self.counts.clear();
         }
         let count = self.counts.entry(source).or_default();
-        if *count >= CONFIRMS_PER_SOURCE {
+        if *count >= limit {
             return false;
         }
         *count += 1;
