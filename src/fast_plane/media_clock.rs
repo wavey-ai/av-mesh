@@ -358,9 +358,13 @@ impl ValidatedEpochs {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         let slots = capacity.max(1).next_power_of_two();
+        let mut slots: Box<[EpochSlot]> = (0..slots).map(|_| EpochSlot::default()).collect();
+        // Faulted in by the maker: the class threads read the slots (a
+        // zeroed allocation is not written, and a read maps its page then).
+        crate::memory::touch_owned(&mut *slots);
         Self {
-            slots: (0..slots).map(|_| EpochSlot::default()).collect(),
-            mask: slots - 1,
+            mask: slots.len() - 1,
+            slots,
             version: AtomicU64::new(0),
             unrecorded: AtomicU64::new(0),
         }

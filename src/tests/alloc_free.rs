@@ -16,6 +16,16 @@ use playlists::mesh::ServedSubscription;
 use std::net::IpAddr;
 use tokio::time::timeout;
 
+/// The process's memory is no longer collapsed into huge pages from now
+/// (`PR_SET_THP_DISABLE`): khugepaged's collapse of a range unmaps it for a
+/// moment, and a thread that touches it then takes a fault that no code of
+/// the thread caused (this box runs THP `always`). What is left to count is
+/// the thread's own first touches.
+fn no_huge_page_collapse() {
+    // SAFETY: prctl with integer arguments; a refusal leaves THP as it was.
+    unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0) };
+}
+
 fn served(child: Ipv4Addr, stream_id: u64) -> ServedSubscription {
     ServedSubscription {
         child: SocketAddr::from((child, 9_101)),
@@ -52,6 +62,7 @@ async fn listener(
 /// one change, and a second stream arrives, all while the thread runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_audio_class_thread_allocates_and_frees_nothing_once_it_runs() {
+    no_huge_page_collapse();
     let counter = crate::alloc_count::AllocCounter::leaked();
     let children = [loopback(72), loopback(73)];
     let lease = LeaseChildren::bind(
@@ -142,10 +153,7 @@ async fn the_audio_class_thread_allocates_and_frees_nothing_once_it_runs() {
     );
     // The thread's last passes of the run (and idle ones after them).
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let (allocs, frees) = (
-        counter.allocs.load(Ordering::Relaxed),
-        counter.frees.load(Ordering::Relaxed),
-    );
+    let watched = Watched::read(counter);
     edge.stop().await;
     for (run, (_, first, last)) in [listener_a, task_b, task_a2].into_iter().zip(runs) {
         let run = run.await.unwrap();
@@ -159,10 +167,191 @@ async fn the_audio_class_thread_allocates_and_frees_nothing_once_it_runs() {
             "the class thread's lane carried parts"
         );
     }
-    assert_eq!(
-        (allocs, frees),
-        (0, 0),
-        "allocations and frees on the audio class thread once it ran \
-         (NEEDLETAIL_ALLOC_TRACE=1 prints where)"
+    watched.assert_nothing(parts);
+}
+
+/// What the watched audio thread did once it ran.
+#[derive(Debug)]
+struct Watched {
+    installed: bool,
+    passes: u64,
+    allocs: u64,
+    frees: u64,
+    faults: u64,
+}
+
+impl Watched {
+    fn read(counter: &crate::alloc_count::AllocCounter) -> Self {
+        Self {
+            installed: counter.installed.load(Ordering::Acquire),
+            passes: counter.passes.load(Ordering::Relaxed),
+            allocs: counter.allocs.load(Ordering::Relaxed),
+            frees: counter.frees.load(Ordering::Relaxed),
+            faults: counter.faults(),
+        }
+    }
+
+    /// The thread ran its loop (at least a pass for each of `parts`'
+    /// batches, give or take) and allocated, freed and first touched
+    /// nothing in it.
+    fn assert_nothing(&self, parts: u64) {
+        assert!(self.installed, "the audio thread installed the counter");
+        assert!(
+            self.passes >= parts / 4,
+            "{self:?}: the loop's passes were counted"
+        );
+        assert_eq!(
+            (self.allocs, self.frees),
+            (0, 0),
+            "allocations and frees on the audio class thread once it ran \
+             (NEEDLETAIL_ALLOC_TRACE=1 prints where)"
+        );
+        assert_eq!(
+            self.faults, 0,
+            "{self:?}: minor faults on the audio class thread once it ran"
+        );
+    }
+}
+
+/// Count what arrives at `socket` until it is quiet for 300 ms.
+fn count_arrivals(socket: UdpSocket) -> tokio::task::JoinHandle<u64> {
+    tokio::spawn(async move {
+        let mut buf = [0_u8; 2_048];
+        let mut count = 0;
+        while let Ok(Ok(_)) = timeout(Duration::from_millis(300), socket.recv_from(&mut buf)).await
+        {
+            count += 1;
+        }
+        count
+    })
+}
+
+/// A forwarder's audio thread (D3 review 3): two compiled children (one of
+/// every symbol, one of sources), burst copies, loss reports to its
+/// parents, and lease children, with both parents sending every symbol.
+/// The lease children change and a new stream arrives while it runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forwarder_s_audio_thread_allocates_frees_and_faults_nothing_once_it_runs() {
+    no_huge_page_collapse();
+    let counter = crate::alloc_count::AllocCounter::leaked();
+    let offset = 1_000;
+    let (all_child, _all_video) = bind_class_pair(offset).await;
+    let (source_child, _source_video) = bind_class_pair(offset).await;
+    let lease_ip = loopback(74);
+    let lease_child = UdpSocket::bind((lease_ip, 0)).await.unwrap();
+    let lease_port = lease_child.local_addr().unwrap().port();
+    let lease = LeaseChildren::bind(
+        LeaseChildConfig {
+            bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            child_ports: [lease_port, unused_loopback_addr().port()],
+            class_port_offset: offset,
+            primary_children: vec![IpAddr::V4(lease_ip)],
+            max_children: 16,
+            ranked: true,
+            warm_hold_us: 1_000_000,
+        },
+        4 << 20,
+    )
+    .unwrap();
+    let (stream_a, stream_b) = (4_201_u64, 4_202_u64);
+    lease.rebuild(&[served(lease_ip, stream_a)]);
+    // A promoted secondary takes sources as the primary does: both
+    // parents send every symbol, and the second copy is a duplicate.
+    let relay = start_fast_relay_with(
+        ParentPath::PromotedSecondary,
+        &[
+            (all_child.local_addr().unwrap(), RelayForwardRole::All),
+            (source_child.local_addr().unwrap(), RelayForwardRole::Source),
+        ],
+        fast_plane::relay::RelayClassConfig {
+            port_offset: offset,
+            cpus: [None, None],
+            realtime: false,
+            tee_capacity: 8_192,
+            burst_copy_ms: 5,
+            loss_report: true,
+            lease: Some(Arc::clone(&lease)),
+            test_alloc_counter: Some(counter),
+            ..Default::default()
+        },
+    )
+    .await;
+    let arrivals = [
+        count_arrivals(all_child),
+        count_arrivals(source_child),
+        count_arrivals(lease_child),
+    ];
+    let deadline = now_unix_us() + 30_000_000;
+    let symbols = |stream_id: u64, sequence: u64| {
+        let envelope =
+            encode_test_canonical_opaque_object(stream_id, sequence, &[sequence as u8; 120]);
+        let (mut sources, repairs) = fast_test_symbols(
+            &envelope,
+            relay_session::MediaPriority::Audio,
+            400,
+            48,
+            1,
+            deadline,
+        );
+        sources.extend(repairs);
+        sources
+    };
+    // 1 ms parts of stream A from both parents; at part 100 the lease
+    // children change (B leased before it exists); from part 150 stream B
+    // arrives, new to the thread.
+    let parts = 400_u64;
+    let b_from = 150_u64;
+    let start = Instant::now();
+    for sequence in 0..parts {
+        tokio::time::sleep_until((start + Duration::from_millis(sequence)).into()).await;
+        let mut batch = symbols(stream_a, sequence);
+        if sequence >= b_from {
+            batch.extend(symbols(stream_b, sequence - b_from));
+        }
+        for symbol in &batch {
+            relay
+                .primary_sender
+                .send_to(symbol, relay.primary_audio)
+                .await
+                .unwrap();
+            relay
+                .secondary_sender
+                .send_to(symbol, relay.secondary_audio)
+                .await
+                .unwrap();
+        }
+        if sequence == 100 {
+            lease.rebuild(&[served(lease_ip, stream_a), served(lease_ip, stream_b)]);
+        }
+    }
+    wait_for_part(&relay.cache, stream_b, parts - 1 - b_from).await;
+    // The burst copies' last ones, and idle passes after them.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let watched = Watched::read(counter);
+    let stats = relay.stats();
+    relay.stop().await;
+    let [all, sources, leased] = arrivals;
+    let (all, sources, leased) = (
+        all.await.unwrap(),
+        sources.await.unwrap(),
+        leased.await.unwrap(),
     );
+    // The paths ran: both compiled children (the source child took no
+    // repair), the burst copies, the lease child, the second parent's
+    // duplicates, the tee's commits.
+    let symbols_sent = (parts + (parts - b_from)) * 2;
+    assert!(
+        all >= symbols_sent,
+        "{all} of {symbols_sent} symbols at the child of every symbol"
+    );
+    assert!(
+        sources >= symbols_sent / 2 && sources < all,
+        "{sources} at the source child"
+    );
+    assert!(leased > 0, "the lease child took its streams");
+    assert!(stats.burst_copies > 0, "{stats:?}");
+    assert!(stats.lease_children.audio_sent > 0, "{stats:?}");
+    assert!(stats.duplicates > 0, "{stats:?}");
+    assert_eq!(stats.tee_dropped, 0);
+    watched.assert_nothing(parts);
 }

@@ -15,6 +15,12 @@
 //!   unit's finite LimitMEMLOCK it could not lock the process, and with an
 //!   unlimited one it would hold every mapping resident (D's review 8).
 //!   Not covered: the cache's parts, which fill on the tee's thread.
+//! - Before a class thread is made real-time it maps what its loop will
+//!   touch, so that nothing is first touched once it runs (stall
+//!   follow-up): `touch_spare` (a list's reserved room), `touch_owned` and
+//!   `touched_arc` (a zeroed value that another thread made and the class
+//!   thread writes), `touch_stack` (its stack) and `populate_mappings` (the
+//!   process's code and data, mapped page by page on first use).
 //! - `tune_allocator`: a fixed trim threshold and mmap threshold, so that
 //!   freed memory stays in the heaps for the next allocation instead of
 //!   going back to the kernel and coming back as page faults.
@@ -40,6 +46,9 @@ static LOCKED: AtomicU64 = AtomicU64::new(0);
 static REFUSED: AtomicU64 = AtomicU64::new(0);
 /// The regions whose refusal was logged already.
 static REFUSALS_LOGGED: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+/// Bytes of the process's file mappings that `populate_mappings` mapped.
+static MAPPINGS_POPULATED: AtomicU64 = AtomicU64::new(0);
+static POPULATE: std::sync::Once = std::sync::Once::new();
 
 /// The heap trim threshold set by `tune_allocator`: a heap's top is given
 /// back to the kernel only past this.
@@ -254,6 +263,9 @@ pub fn tuned() -> bool {
 pub struct MemoryReport {
     pub mode: LockMode,
     pub prefaulted_bytes: u64,
+    /// The process's file mappings (code, data) mapped at start
+    /// (`populate_mappings`).
+    pub mappings_populated_bytes: u64,
     pub locked_bytes: u64,
     pub lock_refused_bytes: u64,
     pub vm_size_kb: u64,
@@ -273,6 +285,7 @@ pub fn report() -> MemoryReport {
     MemoryReport {
         mode: mode(),
         prefaulted_bytes: PREFAULTED.load(Ordering::Relaxed),
+        mappings_populated_bytes: MAPPINGS_POPULATED.load(Ordering::Relaxed),
         locked_bytes: LOCKED.load(Ordering::Relaxed),
         lock_refused_bytes: REFUSED.load(Ordering::Relaxed),
         vm_size_kb: status_kb(&status, "VmSize:"),
@@ -340,6 +353,9 @@ pub fn faults(thread: bool) -> (u64, u64) {
 /// thread may write it during the call.
 pub unsafe fn prefault(ptr: *mut u8, bytes: usize) {
     let ptr = ptr.cast::<std::mem::MaybeUninit<u8>>();
+    // The range's first byte, then the first byte of each page it reaches
+    // (stepping from the start would miss the last page of a range that
+    // does not start on a page).
     let mut offset = 0;
     while offset < bytes {
         // SAFETY: within the range the caller vouches for; a MaybeUninit
@@ -348,8 +364,148 @@ pub unsafe fn prefault(ptr: *mut u8, bytes: usize) {
             let byte = std::ptr::read_volatile(ptr.add(offset));
             std::ptr::write_volatile(ptr.add(offset), byte);
         }
-        offset += PAGE;
+        offset = (ptr as usize + offset) / PAGE * PAGE + PAGE - ptr as usize;
     }
+}
+
+/// Fault in the bytes of a value the caller holds alone (not what it
+/// points to), so that a class thread that later writes it takes no first
+/// touch: a zeroed allocation (`calloc`, which `Default` of atomics often
+/// becomes) is not written by the allocating thread, and its fresh pages
+/// stay unmapped until someone writes them.
+pub fn touch_owned<T: ?Sized>(value: &mut T) {
+    let bytes = std::mem::size_of_val(value);
+    // SAFETY: an exclusive borrow of the value's own bytes; prefault
+    // writes each byte back as it was.
+    unsafe { prefault((value as *mut T).cast::<u8>(), bytes) };
+}
+
+/// `Arc::new(value)`, its bytes faulted in ([`touch_owned`]) by the calling
+/// thread before anyone else holds it: for a value that a class thread
+/// writes (its counters).
+pub fn touched_arc<T>(value: T) -> std::sync::Arc<T> {
+    let mut arc = std::sync::Arc::new(value);
+    if let Some(value) = std::sync::Arc::get_mut(&mut arc) {
+        touch_owned(value);
+    }
+    arc
+}
+
+/// Map every page of the process's file mappings (with `--prefault`), once,
+/// before the first class thread is made real-time: the code (and the
+/// shared libraries') pages are mapped on their first run, so a path that a
+/// class thread takes for the first time (its first send, its first client)
+/// took a page fault for each new page of code; and the writable data of
+/// the binary (`.data`, `.got`, and `.bss` after it) on its first write.
+/// `MADV_POPULATE_READ` and `_WRITE` (Linux 5.14) map them without changing
+/// a byte. Unlike a lock, a page of code can still be reclaimed under
+/// memory pressure. Returns the bytes mapped (by the call that did it).
+pub fn populate_mappings() -> u64 {
+    let mut populated = 0;
+    POPULATE.call_once(|| {
+        if !PREFAULT.load(Ordering::Relaxed) {
+            return;
+        }
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+        populated = populate(&maps);
+        MAPPINGS_POPULATED.store(populated, Ordering::Relaxed);
+    });
+    populated
+}
+
+/// The mappings of `/proc/self/maps` text to populate: (start, length,
+/// writable).
+fn mappings_to_populate(maps: &str) -> Vec<(usize, usize, bool)> {
+    let mut wanted = Vec::new();
+    // The binary's or a library's writable data: its `.bss` is the
+    // anonymous mapping just after it.
+    let mut after_data: Option<usize> = None;
+    for line in maps.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(range), Some(perms)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let path = fields.nth(3).unwrap_or("");
+        let Some((start, end)) = range.split_once('-').and_then(|(start, end)| {
+            Some((
+                usize::from_str_radix(start, 16).ok()?,
+                usize::from_str_radix(end, 16).ok()?,
+            ))
+        }) else {
+            continue;
+        };
+        let perms = perms.as_bytes();
+        let readable = perms.first() == Some(&b'r');
+        let writable = perms.get(1) == Some(&b'w');
+        let executable = perms.get(2) == Some(&b'x');
+        let private = perms.get(3) == Some(&b'p');
+        let file = path.starts_with('/');
+        let bss = path.is_empty() && after_data == Some(start);
+        after_data = None;
+        if !readable || !(file || bss) {
+            continue;
+        }
+        if executable {
+            wanted.push((start, end - start, false));
+        } else if writable && private {
+            wanted.push((start, end - start, true));
+            if file {
+                after_data = Some(end);
+            }
+        }
+    }
+    wanted
+}
+
+fn populate(maps: &str) -> u64 {
+    let mut populated = 0;
+    for (start, len, writable) in mappings_to_populate(maps) {
+        #[cfg(target_os = "linux")]
+        {
+            let advice = if writable {
+                libc::MADV_POPULATE_WRITE
+            } else {
+                libc::MADV_POPULATE_READ
+            };
+            // SAFETY: a range the process has mapped, as /proc/self/maps
+            // lists it; populating maps pages and changes no byte (an error,
+            // such as a mapping gone meanwhile or an older kernel, is
+            // skipped).
+            if unsafe { libc::madvise(start as *mut libc::c_void, len, advice) } == 0 {
+                populated += len as u64;
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (start, len, writable);
+    }
+    populated
+}
+
+/// Fault in the pages of a list's spare room (its capacity past its
+/// length), whose bytes nobody needs: the thread that makes a list for a
+/// class thread takes its faults, not the class thread when it fills it.
+pub fn touch_spare<T>(list: &mut Vec<T>) {
+    let spare = list.spare_capacity_mut();
+    let bytes = std::mem::size_of_val(spare);
+    // SAFETY: the spare capacity is owned, writable and uninitialized: no
+    // byte of it is needed.
+    unsafe { prefault(spare.as_mut_ptr().cast::<u8>(), bytes) };
+}
+
+/// How much of its stack a class thread touches before it is made
+/// real-time ([`touch_stack`]): well beyond the deepest path of its loop.
+pub const STACK_TOUCH_BYTES: usize = 256 << 10;
+
+/// Fault in the next [`STACK_TOUCH_BYTES`] of the calling thread's stack,
+/// below the caller's frame: a thread's stack pages are mapped at their
+/// first touch, and the deepest call of a real-time loop (a rare path, a
+/// first send) would otherwise take that fault on the real-time thread.
+#[inline(never)]
+pub fn touch_stack() {
+    let mut stack = std::mem::MaybeUninit::<[u8; STACK_TOUCH_BYTES]>::uninit();
+    // SAFETY: the array is this frame's own, writable, and nothing reads it.
+    unsafe { prefault(stack.as_mut_ptr().cast::<u8>(), STACK_TOUCH_BYTES) };
+    std::hint::black_box(&mut stack);
 }
 
 #[cfg(test)]
@@ -408,6 +564,26 @@ mod tests {
             "a prefaulted block faulted again: {} faults",
             last - again
         );
+    }
+
+    #[test]
+    fn a_touched_stack_takes_no_fault_in_a_deep_call() {
+        #[inline(never)]
+        fn deep() -> u8 {
+            let mut frame = [0_u8; 128 << 10];
+            std::hint::black_box(&mut frame);
+            frame[1000]
+        }
+        let faults = std::thread::spawn(|| {
+            touch_stack();
+            let (before, _) = faults(true);
+            std::hint::black_box(deep());
+            let (after, _) = faults(true);
+            after - before
+        })
+        .join()
+        .unwrap();
+        assert_eq!(faults, 0);
     }
 
     #[test]
@@ -540,6 +716,37 @@ mod tests {
         // The memory is the region's to use.
         // SAFETY: inside the mapping.
         unsafe { block.0.add(len - 1).write(7) };
+    }
+
+    #[test]
+    fn the_code_and_writable_data_of_files_are_populated() {
+        let maps = "\
+55d0a000-55d0b000 r--p 00000000 fd:01 123 /usr/bin/av-mesh
+55d0b000-55d0f000 r-xp 00001000 fd:01 123 /usr/bin/av-mesh
+55d0f000-55d10000 r--p 00005000 fd:01 123 /usr/bin/av-mesh
+55d10000-55d11000 rw-p 00006000 fd:01 123 /usr/bin/av-mesh
+55d11000-55d13000 rw-p 00000000 00:00 0
+55d20000-55d40000 rw-p 00000000 00:00 0 [heap]
+7f0000000000-7f0000021000 rw-p 00000000 00:00 0
+7f1000000000-7f1000001000 r-xp 00000000 fd:01 456 /usr/lib/libc.so.6
+7f1000001000-7f1000002000 rw-s 00000000 00:05 789 /dev/shm/x
+7ffd0000-7ffd2000 r--p 00000000 00:00 0 [vvar]
+7ffd2000-7ffd4000 r-xp 00000000 00:00 0 [vdso]
+";
+        assert_eq!(
+            mappings_to_populate(maps),
+            vec![
+                (0x55d0b000, 0x4000, false),
+                (0x55d10000, 0x1000, true),
+                (0x55d11000, 0x2000, true),
+                (0x7f1000000000, 0x1000, false),
+            ]
+        );
+        // On this process: something is mapped, once.
+        configure(mode(), true);
+        let populated = populate_mappings();
+        assert!(populated > 0 || report().mappings_populated_bytes > 0);
+        assert_eq!(populate_mappings(), 0, "once per process");
     }
 
     #[test]

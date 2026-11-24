@@ -516,8 +516,13 @@ pub(crate) struct CompactRing {
 
 impl CompactRing {
     fn new(epoch: u64) -> Self {
+        let mut slots: Box<[Mutex<Option<(u64, Bytes)>>]> =
+            (0..COMPACT_RING).map(|_| Mutex::new(None)).collect();
+        // Faulted in by the maker (a rebuild): the class thread locks the
+        // slots, and a zeroed allocation's pages are not mapped until written.
+        crate::memory::touch_owned(&mut *slots);
         Self {
-            slots: (0..COMPACT_RING).map(|_| Mutex::new(None)).collect(),
+            slots,
             epoch: AtomicU64::new(epoch),
         }
     }

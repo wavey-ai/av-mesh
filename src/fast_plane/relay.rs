@@ -827,6 +827,19 @@ impl ForwardPlan {
         }
     }
 
+    /// Fault in every list's room, on the thread that makes the plan: a
+    /// reserved list's pages are untouched until a batch first fills it,
+    /// which would be on the real-time thread (D3 review 3).
+    fn touch(&mut self) {
+        for group in &mut self.groups {
+            crate::memory::touch_spare(group);
+        }
+        crate::memory::touch_spare(&mut self.retry);
+        crate::memory::touch_spare(&mut self.warm);
+        crate::memory::touch_spare(&mut self.lease);
+        crate::memory::touch_spare(&mut self.lease_warm);
+    }
+
     fn clear(&mut self) {
         for group in &mut self.groups {
             group.clear();
@@ -1539,7 +1552,9 @@ impl ClassThread {
                 )
             },
         );
+        plan.touch();
         let mut pending = Vec::with_capacity(RECV_BATCH);
+        crate::memory::touch_spare(&mut pending);
         // UDP GSO for video until the host refuses it once (the edge's
         // clients and the children apart).
         let mut gso = self.video_gso && self.class == TrafficClass::Video;
@@ -1576,6 +1591,10 @@ impl ClassThread {
             drop(lane.load());
         }
         self.feeds.warm_up();
+        // The loop's deepest calls find their stack pages, and every path
+        // its code, mapped.
+        crate::memory::touch_stack();
+        crate::memory::populate_mappings();
         self.schedule();
         self.stats.threads.fetch_add(1, Ordering::Relaxed);
         #[cfg(test)]
@@ -1695,6 +1714,8 @@ impl ClassThread {
                 slot[0].store(minor, Ordering::Relaxed);
                 slot[1].store(major, Ordering::Relaxed);
             }
+            #[cfg(test)]
+            crate::alloc_count::pass_done();
         }
     }
 
@@ -2508,12 +2529,13 @@ pub async fn run_relay_class_ingest(
         failover_heartbeat,
         link_telemetry,
     } = runtime;
-    let stats = Arc::new(FastPlaneStats::default());
+    // Faulted in here: the class threads write their counters.
+    let stats = crate::memory::touched_arc(FastPlaneStats::default());
     if let Some(lease) = &config.lease {
         let _ = stats.lease.set(Arc::clone(lease));
     }
     cache.set_fast_plane_stats(Arc::clone(&stats));
-    let feeds = Arc::new(ParentFeeds::default());
+    let feeds = crate::memory::touched_arc(ParentFeeds::default());
     cache.set_parent_feeds(Arc::clone(&feeds));
     let admissions = Arc::new(dispatch.peer_admissions());
     let mut demand_peers: Vec<SocketAddr> = admissions
@@ -2532,7 +2554,7 @@ pub async fn run_relay_class_ingest(
         video_dispatch.receiver().snapshot(),
     ]));
     cache.update_relay_ingress(dispatch.receiver().snapshot());
-    let failover = Arc::new(FailoverInputs::new());
+    let failover = crate::memory::touched_arc(FailoverInputs::new());
     // The epochs that the cache takes up, for the threads' media clocks.
     let epochs = Arc::new(ValidatedEpochs::new(VALIDATED_EPOCH_STREAMS));
     {

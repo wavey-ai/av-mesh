@@ -511,14 +511,19 @@ struct Miss {
 /// the key, so the record is the same as if the entry had been there.
 /// Fixed size, made before the thread runs.
 pub struct FeedMisses {
+    /// The slots' pin, first so that it unlocks before they are freed.
+    _pin: crate::memory::Pinned,
     misses: Box<[Option<Miss>]>,
     held: usize,
 }
 
 impl FeedMisses {
+    /// The slots, faulted in and locked now, before the thread runs.
     pub fn new() -> Self {
+        let mut misses = vec![None; MISSES].into_boxed_slice();
         Self {
-            misses: vec![None; MISSES].into_boxed_slice(),
+            _pin: crate::memory::pin_slice("feed misses", &mut misses),
+            misses,
             held: 0,
         }
     }
@@ -799,7 +804,8 @@ impl ParentFeeds {
     /// Make the entry of a new (address, stream, track), unless it exists
     /// or the table is full: the table is copied with it.
     fn insert(&self, hash: u64, ip: IpAddr, stream: &str, track: &str) {
-        let made = Arc::new(Feed::new(ip, stream, track));
+        // Faulted in here: the class thread writes its counters.
+        let made = crate::memory::touched_arc(Feed::new(ip, stream, track));
         // Whether the closure's last run replaced the table (rcu may run it
         // again after a race): one that kept it has nothing to retire.
         let replaced = std::cell::Cell::new(false);

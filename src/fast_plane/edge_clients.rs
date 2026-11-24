@@ -64,6 +64,7 @@ use super::sys;
 use super::view::RlsView;
 use super::TrafficClass;
 use crate::edge_udp::{EdgeSockets, EdgeUdpStats, Table};
+use crate::memory::touch_spare;
 use arc_swap::ArcSwap;
 use av_mesh::client_compact as compact;
 use av_mesh::client_udp::{fast_block_id, rewrap_fast, CompactPlan, RepairPolicy};
@@ -250,11 +251,13 @@ pub struct FastClient {
 }
 
 impl FastClient {
+    /// Made by the thread that takes the client's SUB, which faults its
+    /// ring in: the class thread writes it at the client's first part (a
+    /// zeroed allocation's pages are not mapped until written).
     pub fn new(fast_from: u64) -> Arc<Self> {
-        Arc::new(Self {
-            fast_from,
-            ring: (0..CLAIM_RING).map(|_| AtomicU64::new(0)).collect(),
-        })
+        let mut ring: Box<[AtomicU64]> = (0..CLAIM_RING).map(|_| AtomicU64::new(0)).collect();
+        crate::memory::touch_owned(&mut *ring);
+        Arc::new(Self { fast_from, ring })
     }
 
     fn slot(&self, part: u64) -> &AtomicU64 {
@@ -637,7 +640,8 @@ impl std::fmt::Debug for EdgeFastLane {
 impl EdgeFastLane {
     /// `rank` (`--client-udp-edge-rank`) keeps the repair of edges apart.
     pub fn new(rank: u32) -> Arc<Self> {
-        Arc::new(Self {
+        // Faulted in here: the class threads write its counters.
+        crate::memory::touched_arc(Self {
             snapshot: ArcSwap::from_pointee(FastSnapshot::default()),
             retired: super::retired::Retired::default(),
             gone: super::retired::Retired::default(),
@@ -1557,13 +1561,22 @@ fn touch_pages(bytes: &mut [u8]) {
     }
 }
 
-/// Fault in the pages of a list's spare room.
-fn touch_spare<T>(list: &mut Vec<T>) {
-    let spare = list.spare_capacity_mut();
-    let bytes = std::mem::size_of_val(spare);
-    // SAFETY: the spare capacity is owned, writable and uninitialized: no
-    // byte of it is needed.
-    unsafe { crate::memory::prefault(spare.as_mut_ptr().cast::<u8>(), bytes) };
+/// Fault in a map's whole table (its buckets are untouched until an
+/// insert writes them): fill it to its capacity with keys made by `key`,
+/// then empty it, which keeps the table.
+fn touch_map<K: std::hash::Hash + Eq, V: Default>(
+    map: &mut HashMap<K, V>,
+    key: impl Fn(usize) -> K,
+) {
+    for index in 0..map.capacity() {
+        map.insert(key(index), V::default());
+    }
+    map.clear();
+}
+
+/// A distinct address for each index, for [`touch_map`].
+fn touch_peer(index: usize) -> SocketAddr {
+    SocketAddr::from((std::net::Ipv4Addr::from(index as u32), 0))
 }
 
 impl ClientPlan {
@@ -1611,6 +1624,9 @@ impl ClientPlan {
         touch_spare(&mut self.runs);
         touch_spare(&mut self.departures);
         touch_spare(&mut self.compact_sent);
+        touch_map(&mut self.turns, touch_peer);
+        touch_map(&mut self.pacer.next, touch_peer);
+        touch_map(&mut self.pacer.rates, |index| index as u64);
     }
 
     /// The bytes that the plan holds (its buffers and its lists' room).

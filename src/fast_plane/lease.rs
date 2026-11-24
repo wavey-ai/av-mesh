@@ -381,7 +381,8 @@ impl LeaseChildren {
             max_children = config.max_children,
             "fast-plane lease children ready"
         );
-        Ok(Arc::new(Self {
+        // Faulted in here: the class threads write its counters.
+        Ok(crate::memory::touched_arc(Self {
             config: LeaseChildConfig {
                 bind: local,
                 ..config

@@ -42341,6 +42341,7 @@ mod tests {
         assert_eq!(memory["mode"], "rings", "{memory:#}");
         for field in [
             "prefaulted_bytes",
+            "mappings_populated_bytes",
             "locked_bytes",
             "lock_refused_bytes",
             "vm_size_kb",

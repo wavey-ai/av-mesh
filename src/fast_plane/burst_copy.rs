@@ -60,15 +60,39 @@ pub struct BurstCopies {
 
 impl BurstCopies {
     /// Copies sent `delay_us` after their original; `None` for no copies.
+    /// Made, with every buffer and the queue's room touched, by the class
+    /// thread before it is made real-time: the copies take no first touch
+    /// on it (D3 review 3).
     pub fn new(delay_us: u64) -> Option<Self> {
-        (delay_us > 0).then(|| Self {
+        if delay_us == 0 {
+            return None;
+        }
+        let mut copies = Self {
             delay_us,
             waiting: VecDeque::with_capacity(CAPACITY),
             free: (0..CAPACITY)
-                .map(|_| Vec::with_capacity(MAX_COPY_BYTES))
+                .map(|_| {
+                    let mut buffer = Vec::with_capacity(MAX_COPY_BYTES);
+                    crate::memory::touch_spare(&mut buffer);
+                    buffer
+                })
                 .collect(),
             dropped: 0,
-        })
+        };
+        // Every slot of the queue written once, and the free list's own.
+        while let Some(buffer) = copies.free.pop() {
+            copies.waiting.push_back(Copy {
+                due_us: 0,
+                group: 0,
+                target: SocketAddr::from(([0, 0, 0, 0], 0)),
+                len: 0,
+                buffer,
+            });
+        }
+        while let Some(copy) = copies.waiting.pop_front() {
+            copies.free.push(copy.buffer);
+        }
+        Some(copies)
     }
 
     #[cfg(test)]
