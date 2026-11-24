@@ -2849,6 +2849,12 @@ impl VideoSocketBuffers {
             self.last_bytes[lane] = bytes;
             let per_second = (delta as f64 / elapsed.as_secs_f64().max(1e-3)) as u64;
             let target = video_socket_buffer_target(per_second, self.ms, self.floor, self.max);
+            // The node's sockets share one budget (memory round).
+            let target = if self.ms > 0 && target > self.asked[lane] {
+                av_mesh::mem_guard::SOCKETS.grow(self.asked[lane], target)
+            } else {
+                target
+            };
             if self.ms > 0 && target > self.asked[lane] {
                 let granted = sys::grow_receive_buffer(socket, target);
                 info!(
