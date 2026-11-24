@@ -570,6 +570,13 @@ fn parse_media(body: &str) -> MediaPlaylist {
             let Some((sequence, extension)) = attribute(line, "URI").and_then(part_sequence) else {
                 continue;
             };
+            // A released hole (`GAP=YES`): the cache never had the part,
+            // and a player goes on past it (fix 4, 5b: a reader that took a
+            // gap for a listed part waited for it).
+            if attribute(line, "GAP") == Some("YES") {
+                playlist.extension = extension.to_owned();
+                continue;
+            }
             let duration_us = attribute(line, "DURATION")
                 .and_then(parse_seconds_us)
                 .unwrap_or(playlist.part_target_us);
@@ -2091,6 +2098,14 @@ enum WaitStep {
     TimedOut,
 }
 
+/// How often a reader asks a live cache for its playlist while it waits for
+/// a part that does not come (fix 4, 5b): a source outage ends with the
+/// next part a hole wide, and the playlist shows it a repair horizon (at
+/// most 250 ms) after the first part after it is committed; with this poll
+/// the reader asks for that part within 0.35 s and two round trips of its
+/// commit (A 6: within 0.5 s).
+const RESUME_POLL: Duration = Duration::from_millis(100);
+
 /// The wait for one part (B 3.10). Before the cache has sent the reader a
 /// part the request timeout alone bounds it. After, a silence of half the
 /// stall time sends one playlist question to the cache (again after each
@@ -2122,7 +2137,27 @@ impl PartWait {
     /// The next step at `now`, `since` being the later of the start of the
     /// wait and the last byte from any connection.
     fn step(&mut self, since: Instant, now: Instant) -> WaitStep {
-        let Some(stall) = self.stall.filter(|_| !self.alive) else {
+        if let (Some(stall), true) = (self.stall, self.alive) {
+            // A cache that answered its playlist (the stream stopped, or
+            // the part is listed and slow) is asked again every
+            // RESUME_POLL until the request timeout: the first part after
+            // an outage, or the hole before it, is seen within that of its
+            // listing, not at the timeout (fix 4, 5b: readers resumed about
+            // 3 s after the UDP lane).
+            let limit = since + self.timeout;
+            if now >= limit {
+                return WaitStep::TimedOut;
+            }
+            let ask_at = self.asked.map_or(now, |asked| asked + RESUME_POLL);
+            if now >= ask_at {
+                self.asked = Some(now);
+                return WaitStep::AskPlaylist {
+                    by: (now + stall / 2).min(limit),
+                };
+            }
+            return WaitStep::Until(ask_at.min(limit));
+        }
+        let Some(stall) = self.stall else {
             let limit = since + self.timeout;
             return if now >= limit {
                 WaitStep::TimedOut
@@ -2159,9 +2194,12 @@ impl PartWait {
     }
 
     /// The question asked to be answered `by` failed: no sign of life,
-    /// whatever bytes its answer carried.
+    /// whatever bytes its answer carried. (A cache that answered once is
+    /// judged by the request timeout from then on.)
     fn unanswered(&mut self, by: Instant) {
-        self.unanswered_by = Some(by);
+        if !self.alive {
+            self.unanswered_by = Some(by);
+        }
     }
 }
 
@@ -2284,14 +2322,26 @@ mod tests {
         let answered_at = t0 + ms(210);
         assert_eq!(wait.step(answered_at, t0 + ms(300)), WaitStep::Until(by));
         assert_eq!(wait.step(answered_at, by), WaitStep::Stalled);
-        // An answer: the request timeout alone from then on.
+        // An answer: the request timeout bounds the wait from then on, and
+        // the playlist is asked again every RESUME_POLL (fix 4, 5b); a
+        // question that fails no longer makes a stall.
         let mut wait = PartWait::new(Some(stall), ms(1_508));
         assert!(matches!(
             wait.step(t0, t0 + ms(204)),
             WaitStep::AskPlaylist { .. }
         ));
         wait.answered();
-        assert_eq!(wait.step(t0, t0 + ms(408)), WaitStep::Until(t0 + ms(1_508)));
+        assert_eq!(wait.step(t0, t0 + ms(250)), WaitStep::Until(t0 + ms(304)));
+        assert_eq!(
+            wait.step(t0, t0 + ms(304)),
+            WaitStep::AskPlaylist { by: t0 + ms(508) }
+        );
+        wait.unanswered(t0 + ms(508));
+        assert_eq!(wait.step(t0, t0 + ms(350)), WaitStep::Until(t0 + ms(404)));
+        assert_eq!(
+            wait.step(t0, t0 + ms(1_450)),
+            WaitStep::AskPlaylist { by: t0 + ms(1_508) }
+        );
         assert_eq!(wait.step(t0, t0 + ms(1_508)), WaitStep::TimedOut);
         // Before the cache has sent a part, the request timeout alone.
         let mut first = PartWait::new(None, ms(1_508));
@@ -2325,6 +2375,25 @@ mod tests {
         Listing,
         /// The playlist is refused with a 503 and a body.
         Refusing,
+        /// A source outage (both contributors down, the source running):
+        /// nothing newer than the part before it until [`TestCache::resume`];
+        /// then parts at the true numbers, listed once the hole is
+        /// released (a repair horizon after the first part after it),
+        /// the hole's parts in the window as `GAP=YES`; a request for a
+        /// part in the hole is never answered (the worst a cache does).
+        Outage,
+    }
+
+    /// The test cache's repair horizon: an edge measures its own, 60 ms
+    /// before any repair, at most 250 ms.
+    const TEST_HORIZON: Duration = Duration::from_millis(100);
+
+    /// An outage: the last part before it, and when it ended with which
+    /// part.
+    #[derive(Debug, Clone, Copy)]
+    struct Outage {
+        last: u64,
+        resumed: Option<(Instant, u64)>,
     }
 
     const TEST_PART_MS: u64 = 10;
@@ -2337,6 +2406,7 @@ mod tests {
         authority: String,
         /// The mode, and the newest part when it was set.
         mode: Arc<std::sync::Mutex<(CacheMode, u64)>>,
+        outage: Arc<std::sync::Mutex<Option<Outage>>>,
         accepted: Arc<std::sync::Mutex<Vec<Instant>>>,
         epoch: Instant,
     }
@@ -2348,6 +2418,23 @@ mod tests {
 
         fn set(&self, mode: CacheMode) {
             *self.mode.lock().unwrap() = (mode, self.head());
+            if mode == CacheMode::Outage {
+                *self.outage.lock().unwrap() = Some(Outage {
+                    last: self.head(),
+                    resumed: None,
+                });
+            }
+        }
+
+        /// The outage ends: the part due now is the first after it (its
+        /// commit, now). Returns it and when.
+        fn resume(&self) -> (u64, Instant) {
+            let at = Instant::now();
+            let first = self.head();
+            if let Some(outage) = self.outage.lock().unwrap().as_mut() {
+                outage.resumed = Some((at, first));
+            }
+            (first, at)
         }
 
         fn accepted(&self) -> Vec<Instant> {
@@ -2390,15 +2477,54 @@ mod tests {
         mode: CacheMode,
         head: u64,
     ) -> Option<(StatusCode, String)> {
+        test_answer_in(path, master, mode, head, None)
+    }
+
+    /// [`test_answer`] with an outage: `outage` and the newest part on the
+    /// stream's own clock.
+    fn test_answer_in(
+        path: &str,
+        master: &str,
+        mode: CacheMode,
+        head: u64,
+        outage: Option<(Outage, u64)>,
+    ) -> Option<(StatusCode, String)> {
+        // Released: the parts after the outage are listed, the hole as gaps.
+        let released = outage.and_then(|(outage, now_head)| {
+            let (at, first) = outage.resumed?;
+            (at.elapsed() >= TEST_HORIZON).then_some((outage.last, first, now_head))
+        });
         let playlist = |newest: u64| {
             let mut body = String::from("#EXTM3U\n#EXT-X-PART-INF:PART-TARGET=0.010\n");
             for sequence in newest.saturating_sub(30)..=newest {
+                let gap = released
+                    .is_some_and(|(last, first, _)| sequence > last && sequence < first);
                 body.push_str(&format!(
-                    "#EXT-X-PART:DURATION=0.010,URI=\"part{sequence}.bin\"\n"
+                    "#EXT-X-PART:DURATION=0.010,URI=\"part{sequence}.bin\"{}\n",
+                    if gap { ",GAP=YES" } else { "" }
                 ));
             }
             body
         };
+        if mode == CacheMode::Outage {
+            let (outage, now_head) = outage?;
+            if path.ends_with("master.m3u8") {
+                return Some((StatusCode::OK, master.to_owned()));
+            }
+            if path.ends_with("stream.m3u8") {
+                let newest = released.map_or(outage.last, |(_, _, now_head)| now_head);
+                return Some((StatusCode::OK, playlist(newest)));
+            }
+            let (part, _) = part_sequence(path)?;
+            if part <= outage.last {
+                return Some((StatusCode::OK, format!("part {part} ").repeat(20)));
+            }
+            let (_, first, _) = released?;
+            if part < first || part > now_head {
+                return None;
+            }
+            return Some((StatusCode::OK, format!("part {part} ").repeat(20)));
+        }
         if path.ends_with("master.m3u8") {
             return Some((StatusCode::OK, master.to_owned()));
         }
@@ -2410,7 +2536,7 @@ mod tests {
                     StatusCode::SERVICE_UNAVAILABLE,
                     "the cache admits no request now\n".repeat(8),
                 )),
-                CacheMode::Silent => None,
+                CacheMode::Silent | CacheMode::Outage => None,
             };
         }
         let (part, _) = part_sequence(path)?;
@@ -2442,27 +2568,34 @@ mod tests {
             let cache = TestCache {
                 authority,
                 mode: Arc::new(std::sync::Mutex::new((CacheMode::Serving, 0))),
+                outage: Arc::new(std::sync::Mutex::new(None)),
                 accepted: Arc::new(std::sync::Mutex::new(Vec::new())),
                 epoch,
             };
-            let (mode, accepted, acceptor, master) = (
+            let (mode, accepted, acceptor, master, outage) = (
                 Arc::clone(&cache.mode),
                 Arc::clone(&cache.accepted),
                 acceptor.clone(),
                 Arc::clone(&master),
+                Arc::clone(&cache.outage),
             );
             tokio::spawn(async move {
                 while let Ok((tcp, _)) = listener.accept().await {
                     accepted.lock().unwrap().push(Instant::now());
-                    let (mode, acceptor, master) =
-                        (Arc::clone(&mode), acceptor.clone(), Arc::clone(&master));
+                    let (mode, acceptor, master, outage) = (
+                        Arc::clone(&mode),
+                        acceptor.clone(),
+                        Arc::clone(&master),
+                        Arc::clone(&outage),
+                    );
                     tokio::spawn(async move {
                         let Ok(tls) = acceptor.accept(tcp).await else {
                             return;
                         };
                         let service = hyper::service::service_fn(
                             move |request: Request<hyper::body::Incoming>| {
-                                let (mode, master) = (Arc::clone(&mode), Arc::clone(&master));
+                                let (mode, master, outage) =
+                                    (Arc::clone(&mode), Arc::clone(&master), Arc::clone(&outage));
                                 async move {
                                     let path = request.uri().path().to_owned();
                                     let (status, body) = loop {
@@ -2473,8 +2606,12 @@ mod tests {
                                             }
                                             _ => frozen,
                                         };
+                                        let now_head =
+                                            epoch.elapsed().as_millis() as u64 / TEST_PART_MS;
+                                        let outage =
+                                            (*outage.lock().unwrap()).map(|outage| (outage, now_head));
                                         if let Some(answer) =
-                                            test_answer(&path, &master, now_mode, head)
+                                            test_answer_in(&path, &master, now_mode, head, outage)
                                         {
                                             break answer;
                                         }
@@ -2629,6 +2766,38 @@ mod tests {
         // question all went on one connection.
         assert_eq!(a.accepted().len(), 1);
         assert!(b.accepted().is_empty());
+    }
+
+    /// Fix 4, 5b (A 6): both contributors down for 3 s with the source
+    /// running, then parts at the true numbers, the hole released a repair
+    /// horizon after the first of them and listed as gaps. The reader skips
+    /// the hole (the gaps are no parts), stays on its cache and gets the
+    /// first part after the outage within 0.5 s of its commit, where it
+    /// waited out its request timeout before (about 3 s late in lp2).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reader_resumes_within_half_a_second_of_an_outage() {
+        let (a, b, connector) = test_caches().await;
+        let reader = test_reader(&a, connector, "outage-1", 6);
+        let task = tokio::spawn(reader.run());
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        a.set(CacheMode::Outage);
+        let last = a.outage.lock().unwrap().unwrap().last;
+        tokio::time::sleep(Duration::from_millis(3_000)).await;
+        let (first, committed) = a.resume();
+        let report = task.await.unwrap();
+        assert!(report.ok, "{:?}", report.error);
+        assert!(report.moves.is_empty(), "{:?}", report.moves);
+        assert!(b.accepted().is_empty());
+        // The hole skipped whole, and nothing after it.
+        assert_eq!(report.parts_missing, first - last - 1, "{report:?}");
+        // The longest gap between arrivals is the outage and the resume:
+        // the last part before it came at its start at the latest.
+        let resume_ms = report.max_gap_ms.saturating_sub(3_000);
+        eprintln!(
+            "outage: first part after it {resume_ms} ms after its commit ({:?} ago)",
+            committed.elapsed()
+        );
+        assert!(resume_ms <= 500, "the first part after the outage came {resume_ms} ms after its commit: {report:?}");
     }
 
     /// Review of B Z4: a cache that refuses the playlist question with a
