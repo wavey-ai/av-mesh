@@ -258,11 +258,38 @@ pub struct ChildrenStatus {
 pub struct CacheMeshStatus {
     /// Since a cache-mesh parent was last heard; null before the first.
     pub parent_heard_age_ms: Option<u64>,
+    /// The peers this node may take playlists from that it heard within
+    /// the peer timeout, draining or not.
+    pub parents_live: u64,
+    /// Parents that left a playlist's ranked set and are not released yet
+    /// (make-before-break).
+    pub pending_release: u64,
+    /// Every peer as its newest hello described it.
+    pub peers: Vec<CacheMeshPeerStatus>,
     pub children: u64,
     pub pairs: u64,
     /// The streams this node subscribes to on the cache mesh.
     pub subscribed_playlists: Vec<u64>,
     pub warm_parts_pending: u64,
+    /// Frames of a kind, hellos of a role, and frames that this build
+    /// cannot read (a later build's are read as far as they are known).
+    pub rx_unknown_kinds: u64,
+    pub rx_unknown_roles: u64,
+    pub rx_invalid_frames: u64,
+}
+
+/// One cache-mesh peer, from its newest hello.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheMeshPeerStatus {
+    pub peer: String,
+    /// `peer`, `distributor` or `edge`; null before its first hello and for
+    /// a role this build does not know.
+    pub role: Option<String>,
+    pub boot_id: Option<u64>,
+    pub build: Option<String>,
+    /// `starting`, `ready`, `degraded`, `draining` or `stopping`.
+    pub state: Option<String>,
+    pub heard_age_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -372,10 +399,11 @@ pub struct ReadinessInputs {
     pub parent_heard_age_ms: Option<u64>,
     /// E3: `parents_are_lost`.
     pub parents_lost: bool,
-    /// E4: a telemetry snapshot of the region was received.
+    /// E4: a telemetry snapshot of the region was received, and the
+    /// region's moving heads are known (two advertisements of each holder).
     pub regional_view: bool,
-    /// E5: the warm copies (the lifecycle unit's warm pass, CR8; empty
-    /// until it runs, which an idle region also gives).
+    /// E5: the warm copies (the start's warm pass, `warm_playlists`; empty
+    /// in an idle region).
     pub warm_copies: Vec<WarmCopy>,
     /// F2, F3: the fast plane's figures.
     pub fast_plane: FastPlaneStatus,
@@ -388,13 +416,11 @@ pub struct ReadinessInputs {
     pub lease_renewal_ms: u64,
     pub lease_opened_age_ms: Option<u64>,
     /// F7: the playlists a slot opened upstream demand for at its start
-    /// (the lifecycle unit's slot start demand, CR8; empty until then).
+    /// (`run_upstream_demand`).
     pub slot_streams: Vec<u64>,
-    /// The drain reasons (`start` and `stopping` come with the lifecycle
-    /// unit, CR6; until then only `operator` is set).
+    /// The drain reasons (`NodeLifecycle`).
     pub drain: DrainReasons,
-    /// An edge dropped `start` after `--start-warm-ms` without its warm-up
-    /// (CR6).
+    /// An edge dropped `start` after `--start-warm-ms` without its warm-up.
     pub ready_forced: bool,
 }
 
@@ -1186,10 +1212,23 @@ mod tests {
             },
             cache_mesh: CacheMeshStatus {
                 parent_heard_age_ms: Some(40),
+                parents_live: 2,
+                pending_release: 0,
+                peers: vec![CacheMeshPeerStatus {
+                    peer: "10.80.3.12:29101".to_owned(),
+                    role: Some("distributor".to_owned()),
+                    boot_id: Some(1_763_923_000_000_000),
+                    build: Some("3f2a9c1d77e0".to_owned()),
+                    state: Some("ready".to_owned()),
+                    heard_age_ms: Some(40),
+                }],
                 children: 3,
                 pairs: 6,
                 subscribed_playlists: vec![3001],
                 warm_parts_pending: 0,
+                rx_unknown_kinds: 0,
+                rx_unknown_roles: 0,
+                rx_invalid_frames: 0,
             },
             client_udp: Some(ClientUdpStatus {
                 subscribers: Some(120),

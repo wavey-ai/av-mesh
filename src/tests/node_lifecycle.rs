@@ -1,7 +1,9 @@
-//! The node's lifecycle in this process (C CR6): SIGTERM and SIGINT as a
-//! graceful stop of an edge and of a forwarder, the drain reasons (a start,
-//! an operator's drain kept across a restart, a stop), and the start that
-//! takes a node's place only once it is warm.
+//! The node's lifecycle in this process (C CR6, CR8): SIGTERM and SIGINT as
+//! a graceful stop of an edge and of a forwarder, the drain reasons (a
+//! start, an operator's drain kept across a restart, a stop), the start
+//! that takes a node's place only once it is warm (an edge's warm copies, a
+//! slot's start demand), and the demand loops' reaction to a parent that
+//! changed with the make-before-break release of parents.
 
 use super::fast_lane::{packaged_envelope, LaneEdge, Packaging};
 use super::fast_lease::loopback;
@@ -14,6 +16,7 @@ use lifecycle::{
 use node_status::{DrainReason, NodeState};
 use playlists::mesh::{CacheMesh, CacheMeshConfig};
 use std::future::pending;
+use std::net::IpAddr;
 
 const STREAM: u64 = 4_301;
 
@@ -1125,4 +1128,735 @@ fn the_lifecycle_flags_and_the_stop_bound() {
     ])
     .unwrap();
     assert_eq!(args.stop_drain(), Duration::from_millis(8_000));
+}
+
+/// An edge of region `uk` that advertises `playlists` (stream, head,
+/// video) at `updated_unix_ms`.
+fn holder_snapshot(
+    node_id: &str,
+    updated_unix_ms: u64,
+    playlists: &[(u64, u64, bool)],
+) -> MeshSnapshot {
+    let mut snapshot =
+        telemetry_snapshot_for_tests(node_id, "uk", "europe", 51.5, -0.1, Vec::new(), 1);
+    snapshot.updated_unix_ms = updated_unix_ms;
+    let mut edge = EdgeServiceSnapshot::from_node(
+        &snapshot.node,
+        Some(format!("https://{node_id}.example/live")),
+        "edge",
+        EdgeLoadSnapshot::default(),
+    );
+    edge.playlists = playlists
+        .iter()
+        .map(|&(stream_id, head_part, video)| PlaylistHolding {
+            stream_id,
+            head_part,
+            bitrate_bps: None,
+            sessions: 1,
+            request_rate: None,
+            video,
+        })
+        .collect();
+    snapshot.edge_service = Some(edge);
+    snapshot
+}
+
+fn demand_config(lease: Duration, warm_parts: usize) -> PlaylistDemand {
+    PlaylistDemand::new(PlaylistDemandConfig {
+        enabled: true,
+        lease,
+        idle: Duration::from_secs(60),
+        warm_parts,
+        max_playlists: MAX_EDGE_PLAYLISTS,
+    })
+}
+
+/// A free UDP port at `ip`, and the next one (a class socket's).
+fn free_addr(ip: Ipv4Addr) -> SocketAddr {
+    loop {
+        let port = std::net::UdpSocket::bind((ip, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        if port < 64_000 && std::net::UdpSocket::bind((ip, port + 1_000)).is_ok() {
+            return SocketAddr::from((ip, port));
+        }
+    }
+}
+
+/// C 2.1 (b): a parent restarted with a new boot id is greeted and asked
+/// again at once by the edge's demand loop: its lease is back within
+/// 500 ms, where the next renewal of a 30 s lease is 10 s away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_parent_has_its_leases_back_within_500_ms() {
+    let lease = Duration::from_secs(30);
+    let (parent_addr, edge_addr) = (unused_loopback_addr(), unused_loopback_addr());
+    let parent_config = || {
+        mesh_config("dist-a", parent_addr, CacheMeshRole::Distributor, lease).with_peer(edge_addr)
+    };
+    let parent_cache = canonical_gap_test_cache().await;
+    commit_canonical_gap_test_part(&parent_cache, 7, 0).await;
+    let parent = start_mesh(&parent_cache, parent_config()).await;
+    let edge_cache = canonical_gap_test_cache().await;
+    let edge = start_mesh(
+        &edge_cache,
+        mesh_config("edge", edge_addr, CacheMeshRole::Edge, lease).with_peer(parent_addr),
+    )
+    .await;
+    let demand = demand_config(lease, 0);
+    let router = app_router_for_tests(Arc::clone(&edge_cache), Arc::clone(&edge))
+        .with_playlist_demand(demand.clone());
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    let demand_task = tokio::spawn(run_playlist_demand(
+        Arc::clone(&edge_cache),
+        Arc::clone(&edge),
+        router.edge_load.clone(),
+        demand,
+        shutdown_rx,
+    ));
+    let leased = |mesh: &CacheMeshHandle| {
+        mesh.served_subscriptions()
+            .iter()
+            .any(|served| served.child == edge_addr && served.stream_id == 7)
+    };
+    // Each has heard the other: a parent drops a subscribe from a peer of a
+    // region it does not know yet.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while edge.parents_for(7).await != vec![parent_addr]
+            || !parent
+                .peer_statuses()
+                .await
+                .iter()
+                .any(|peer| peer.peer == edge_addr && peer.role.is_some())
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the edge and its parent hear each other");
+    assert!(router.open_playlist_demand(7).await);
+    within(
+        "the parent leases the playlist",
+        Duration::from_secs(3),
+        || leased(&parent),
+    )
+    .await;
+
+    // The parent restarts on its address: a new process, a new boot id,
+    // no lease.
+    parent.shutdown();
+    drop(parent);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let restarted_cache = canonical_gap_test_cache().await;
+    commit_canonical_gap_test_part(&restarted_cache, 7, 0).await;
+    let restarted = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match CacheMesh::new(Arc::clone(&restarted_cache.chunk_cache), parent_config())
+                .start()
+                .await
+            {
+                Ok(mesh) => break Arc::new(mesh),
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await
+    .expect("the parent's address is free again");
+    let restarted_at = Instant::now();
+    within(
+        "the restarted parent has the lease again",
+        Duration::from_secs(3),
+        || leased(&restarted),
+    )
+    .await;
+    let back = restarted_at.elapsed();
+    assert!(
+        back <= Duration::from_millis(500),
+        "the lease came back after {back:?}"
+    );
+    shutdown_tx.send(()).unwrap();
+    demand_task.await.unwrap();
+    restarted.shutdown();
+    edge.shutdown();
+}
+
+/// The edge's fast plane at 127.0.0.30 and three parents at addresses of
+/// their own (cache mesh and fast plane alike), as nodes of a VLAN.
+const PARENT_IPS: [Ipv4Addr; 3] = [
+    Ipv4Addr::new(127, 0, 0, 31),
+    Ipv4Addr::new(127, 0, 0, 32),
+    Ipv4Addr::new(127, 0, 0, 33),
+];
+
+/// A dispatch that admits each of `peers` as a parent of the edge.
+fn dispatch_for(peers: &[SocketAddr]) -> RelayUdpDispatch {
+    let mut dispatch = empty_relay_udp_dispatch();
+    for (index, peer) in peers.iter().enumerate() {
+        dispatch
+            .bind_controlled_peer(
+                *peer,
+                ControlledRelayParentSession::new(
+                    index as u64 + 1,
+                    CarrierIdentity {
+                        local: NodeId::new("edge-london").unwrap(),
+                        peer: NodeId::new(format!("forwarder-{index}")).unwrap(),
+                        kind: CarrierKind::PrivateUdp,
+                        trust_mode: TrustMode::ControlledPrivateNetwork,
+                    },
+                    TopologyGeneration::new(FAST_GENERATION).unwrap(),
+                    SubscriptionId::new(FAST_SUBSCRIPTION).unwrap(),
+                    ParentPath::PromotedSecondary,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+    dispatch
+}
+
+/// C 2.1 (c, d): a parent that drains leaves the edge's ranked set and is
+/// renewed while its replacement is not seen delivering on the edge's fast
+/// plane; it is released, confirmed, within a few looks of the
+/// replacement's first sources, long before its timer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_parent_is_kept_until_the_fast_plane_sees_its_replacement() {
+    let lease = Duration::from_secs(5);
+    let release_after = Duration::from_secs(4);
+    let edge_ip = Ipv4Addr::new(127, 0, 0, 30);
+    let parent_addrs = PARENT_IPS.map(free_addr);
+    let edge_addr = free_addr(edge_ip);
+    let mut parents = Vec::new();
+    for (index, addr) in parent_addrs.iter().enumerate() {
+        let cache = canonical_gap_test_cache().await;
+        let mesh = start_mesh(
+            &cache,
+            mesh_config(
+                &format!("dist-{index}"),
+                *addr,
+                CacheMeshRole::Distributor,
+                lease,
+            )
+            .with_peer(edge_addr),
+        )
+        .await;
+        parents.push((mesh, cache));
+    }
+    // The fast plane's senders, one at each parent's address.
+    let mut senders = Vec::new();
+    for ip in PARENT_IPS {
+        senders.push(UdpSocket::bind((ip, 0)).await.unwrap());
+    }
+    let (ports, sockets) = super::fast_lease::bind_edge_class_ports(edge_ip);
+    let edge_cache = canonical_gap_test_cache().await;
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    let ingest = tokio::spawn(fast_plane::relay::run_relay_class_ingest(
+        sockets,
+        Arc::clone(&edge_cache),
+        shutdown_rx.clone(),
+        RelayIngestRuntime {
+            dispatch: dispatch_for(
+                &senders
+                    .iter()
+                    .map(|sender| sender.local_addr().unwrap())
+                    .collect::<Vec<_>>(),
+            ),
+            secondary_socket: None,
+            class_twins: Vec::new(),
+            forwarder: None,
+            audio_epochs: None,
+            failover_controller: None,
+            failover_heartbeat: Duration::from_millis(100),
+            link_telemetry: None,
+        },
+        fast_plane::relay::RelayClassConfig {
+            port_offset: 1_000,
+            cpus: [None, None],
+            realtime: false,
+            tee_capacity: 4_096,
+            ..Default::default()
+        },
+    ));
+    within(
+        "the edge's class threads start",
+        Duration::from_secs(3),
+        || edge_cache.relay_ingress_snapshot().fast_plane.threads == 2,
+    )
+    .await;
+    let edge = start_mesh(
+        &edge_cache,
+        mesh_config("edge", edge_addr, CacheMeshRole::Edge, lease)
+            .with_peers(parent_addrs)
+            .with_max_parents(2)
+            .with_parent_release_after(release_after),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while edge
+            .peer_statuses()
+            .await
+            .iter()
+            .filter(|peer| peer.parent && peer.role.is_some())
+            .count()
+            < 3
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the edge hears its three parents");
+    let ranked = edge.subscribe(7, 0, 0).await.unwrap();
+    assert_eq!(ranked.len(), 2);
+    let index_of = |addr: SocketAddr| {
+        parent_addrs
+            .iter()
+            .position(|parent| *parent == addr)
+            .unwrap()
+    };
+    let (leaving, staying) = (index_of(ranked[0]), index_of(ranked[1]));
+    let replacement = 3 - leaving - staying;
+
+    // The contributor's parts reach the edge from the parents that feed it.
+    let feeding: Arc<[AtomicBool; 3]> = Arc::new(std::array::from_fn(|index| {
+        AtomicBool::new(index == leaving || index == staying)
+    }));
+    let stop_feeding = Arc::new(AtomicBool::new(false));
+    let feeder = {
+        let (feeding, stop_feeding) = (Arc::clone(&feeding), Arc::clone(&stop_feeding));
+        let to = SocketAddr::from((edge_ip, ports[0]));
+        tokio::spawn(async move {
+            let deadline_us = now_unix_us() + 60_000_000;
+            let mut sequence = 1_000_u64;
+            while !stop_feeding.load(Ordering::Relaxed) {
+                for symbol in fast_audio_symbols(7, sequence, deadline_us) {
+                    for (index, sender) in senders.iter().enumerate() {
+                        if feeding[index].load(Ordering::Relaxed) {
+                            sender.send_to(&symbol, to).await.unwrap();
+                        }
+                    }
+                }
+                sequence += 1;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    };
+    let release = tokio::spawn(run_parent_release(
+        Arc::clone(&edge),
+        Arc::clone(&edge_cache),
+        shutdown_rx,
+    ));
+    let feeds = Arc::clone(edge_cache.parent_feeds().expect("the edge keeps the feeds"));
+    within(
+        "both ranked parents deliver",
+        Duration::from_secs(3),
+        || {
+            [leaving, staying].iter().all(|index| {
+                feeds.delivering(IpAddr::V4(PARENT_IPS[*index]), 7, now_unix_us(), 100_000)
+            })
+        },
+    )
+    .await;
+
+    // The first parent drains: the edge ranks the third in its place, and
+    // keeps the one that left while the third is not seen delivering.
+    parents[leaving].0.set_draining(true);
+    within("the edge hears the drain", Duration::from_secs(3), || {
+        edge.draining_peers() == vec![parent_addrs[leaving]]
+    })
+    .await;
+    let ranked = edge.subscribe(7, 0, 0).await.unwrap();
+    assert_eq!(
+        ranked
+            .iter()
+            .map(|addr| index_of(*addr))
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([staying, replacement])
+    );
+    assert_eq!(edge.pending_parents(), vec![(7, parent_addrs[leaving])]);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(
+        edge.pending_parents(),
+        vec![(7, parent_addrs[leaving])],
+        "the parent that left is kept while its replacement delivers nothing"
+    );
+    assert_eq!(edge.fec_stats().parents_released, 0);
+
+    // The replacement's sources arrive: the one that left is released,
+    // confirmed, within a few looks.
+    let seen = Instant::now();
+    feeding[replacement].store(true, Ordering::Relaxed);
+    within(
+        "the parent that left is released",
+        Duration::from_secs(2),
+        || edge.pending_parents().is_empty(),
+    )
+    .await;
+    let took = seen.elapsed();
+    assert!(
+        took < Duration::from_millis(500),
+        "released {took:?} after the replacement's first sources"
+    );
+    let stats = edge.fec_stats();
+    assert_eq!(
+        (stats.parents_released, stats.parents_released_unconfirmed),
+        (1, 0)
+    );
+    stop_feeding.store(true, Ordering::Relaxed);
+    feeder.await.unwrap();
+    shutdown_tx.send(()).unwrap();
+    release.await.unwrap();
+    ingest.await.unwrap().unwrap();
+    edge.shutdown();
+    for (mesh, _) in parents {
+        mesh.shutdown();
+    }
+}
+
+/// E5: a starting edge opens a copy of each audio playlist whose head moved
+/// between a holder's last two advertisements, and of nothing else: not of
+/// a held playlist whose head stands, never of video. It is not warm until
+/// the copy has decoded up to the head advertised when it was opened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_playlists_whose_heads_move_are_warmed_and_never_video() {
+    let cache = canonical_gap_test_cache().await;
+    let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+    let lifecycle = NodeLifecycle::new(LifecycleConfig {
+        edge: true,
+        start_drained: true,
+        state_file: None,
+    });
+    let router = router_with(
+        "uk-edge-1",
+        Arc::clone(&cache),
+        mesh,
+        CacheMeshRole::Edge,
+        lifecycle,
+        0,
+    )
+    .with_playlist_demand(demand_config(Duration::from_secs(5), 0));
+    let mut heads = RegionHeads::default();
+    let at = now_unix_ms();
+    // A holder's first advertisement: no head is known to move yet.
+    router
+        .telemetry
+        .ingest_snapshot(holder_snapshot(
+            "uk-edge-2",
+            at,
+            &[(7, 30, false), (8, 50, false), (9, 200, true)],
+        ))
+        .await;
+    warm_playlists(&router, &mut heads).await;
+    let pass = router.lifecycle.warm_pass();
+    assert!(pass.copies.is_empty() && !pass.judged, "{pass:?}");
+    let status = router.node_status().await;
+    assert!(
+        status.not_ready.contains(&"no regional view".to_owned()),
+        "{status:?}"
+    );
+    tokio::time::sleep(NODE_STATUS_CACHE).await;
+
+    // Its next: 7 and 9 moved, 8 did not.
+    router
+        .telemetry
+        .ingest_snapshot(holder_snapshot(
+            "uk-edge-2",
+            at + 1_000,
+            &[(7, 40, false), (8, 50, false), (9, 230, true)],
+        ))
+        .await;
+    warm_playlists(&router, &mut heads).await;
+    let pass = router.lifecycle.warm_pass();
+    assert!(pass.judged, "{pass:?}");
+    assert_eq!(pass.copies, vec![(7, 40)]);
+    let mut held: Vec<u64> = router
+        .playlist_demand
+        .streams
+        .iter()
+        .map(|entry| *entry.key())
+        .collect();
+    held.sort_unstable();
+    assert_eq!(held, vec![7], "only the moving audio playlist is opened");
+    let status = router.node_status().await;
+    assert_eq!(status.state, NodeState::Starting);
+    assert!(!status.warm);
+    assert!(
+        status
+            .not_ready
+            .contains(&"stream 7 not decoded".to_owned()),
+        "{status:?}"
+    );
+    assert!(
+        !status
+            .not_ready
+            .iter()
+            .any(|reason| reason.contains(" 8 ") || reason.contains(" 9 ")),
+        "{status:?}"
+    );
+    // A third pass opens nothing more.
+    warm_playlists(&router, &mut heads).await;
+    assert_eq!(router.lifecycle.warm_pass().copies, vec![(7, 40)]);
+
+    // The copy decodes up to part 40: warm, and the start ends.
+    for sequence in 0..=40 {
+        commit_canonical_gap_test_part(&cache, 7, sequence).await;
+    }
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        start_edge(router.clone(), Duration::from_secs(4), shutdown_rx),
+    )
+    .await
+    .expect("the copy is warm");
+    assert!(!router.lifecycle.ready_forced());
+    assert!(router.lifecycle.reasons().list().is_empty());
+}
+
+/// F7: a slot that starts drained holds the playlists its region's edges
+/// hold with a moving head, subscribes to them at its parent, and clears
+/// its hello's bit only once its window is full.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slot_fills_its_window_before_it_clears_its_bit() {
+    let lease = Duration::from_millis(900);
+    let warm_parts = 8;
+    let (parent_addr, slot_addr) = (unused_loopback_addr(), unused_loopback_addr());
+    let parent_cache = canonical_gap_test_cache().await;
+    let parent = start_mesh(
+        &parent_cache,
+        mesh_config("dist-a", parent_addr, CacheMeshRole::Distributor, lease).with_peer(slot_addr),
+    )
+    .await;
+    let slot_cache = canonical_gap_test_cache().await;
+    let lifecycle = NodeLifecycle::new(LifecycleConfig {
+        edge: false,
+        start_drained: true,
+        state_file: None,
+    });
+    let slot = start_mesh(
+        &slot_cache,
+        mesh_config("dist-c", slot_addr, CacheMeshRole::Distributor, lease)
+            .with_peer(parent_addr)
+            .with_hello_state(lifecycle.hello()),
+    )
+    .await;
+    let router = router_with(
+        "dist-c",
+        Arc::clone(&slot_cache),
+        Arc::clone(&slot),
+        CacheMeshRole::Distributor,
+        lifecycle,
+        warm_parts as u64,
+    )
+    .with_playlist_demand(demand_config(lease, warm_parts));
+    assert!(slot.is_draining());
+    // A distributor feeds a slot that leases from it on the fast plane (its
+    // lease children); here the parts its lease would carry are committed
+    // at the slot, one every 100 ms from the lease on.
+    let feeding = Arc::new(AtomicBool::new(true));
+    let feeder = {
+        let (parent, slot_cache, feeding) = (
+            Arc::clone(&parent),
+            Arc::clone(&slot_cache),
+            Arc::clone(&feeding),
+        );
+        tokio::spawn(async move {
+            let mut sequence = 0;
+            while feeding.load(Ordering::Relaxed) {
+                if parent
+                    .served_subscriptions()
+                    .iter()
+                    .any(|served| served.child == slot_addr && served.stream_id == 7)
+                {
+                    commit_canonical_gap_test_part(&slot_cache, 7, sequence).await;
+                    sequence += 1;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+    };
+    // An edge of the region holds playlist 7, its head moving.
+    let at = now_unix_ms();
+    router
+        .telemetry
+        .ingest_snapshot(holder_snapshot("uk-edge-1", at, &[(7, 9, false)]))
+        .await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while slot.parents_for(7).await != vec![parent_addr]
+            || !parent
+                .peer_statuses()
+                .await
+                .iter()
+                .any(|peer| peer.peer == slot_addr && peer.role.is_some())
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the slot and its parent hear each other");
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    let upstream = tokio::spawn(run_upstream_demand(router.clone(), shutdown_rx.clone()));
+    let start = tokio::spawn(start_forwarder(router.clone(), shutdown_rx));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    router
+        .telemetry
+        .ingest_snapshot(holder_snapshot("uk-edge-1", at + 1_000, &[(7, 12, false)]))
+        .await;
+
+    // Until the bit clears, watch the window: it is full first.
+    let window = |holdings: &[StreamHolding]| {
+        holdings
+            .iter()
+            .find(|holding| holding.stream_id == 7)
+            .map_or(0, |holding| holding.window_parts)
+    };
+    let mut full_at = None;
+    let mut draining_with = Vec::new();
+    let cleared_at = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let held = window(&slot_cache.stream_holdings().await);
+            if full_at.is_none() && held >= warm_parts as u64 {
+                full_at = Some(Instant::now());
+            }
+            if !slot.is_draining() {
+                break Instant::now();
+            }
+            draining_with.push(held);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    let Ok(cleared_at) = cleared_at else {
+        panic!(
+            "the slot did not clear its bit: {:?} {:?}",
+            router.node_status().await,
+            router.lifecycle.warm_pass(),
+        );
+    };
+    let full_at = full_at.expect("the window was full before the bit cleared");
+    assert!(full_at <= cleared_at);
+    assert!(
+        draining_with
+            .iter()
+            .any(|held| *held > 0 && *held < warm_parts as u64),
+        "the bit held while the window filled: {draining_with:?}"
+    );
+    assert_eq!(router.lifecycle.warm_pass().slot_streams, vec![7]);
+    start.await.unwrap();
+    tokio::time::sleep(NODE_STATUS_CACHE).await;
+    let status = router.node_status().await;
+    assert!(status.warm, "{status:?}");
+    assert!(status.drain_reasons.is_empty(), "{status:?}");
+    feeding.store(false, Ordering::Relaxed);
+    feeder.await.unwrap();
+    shutdown_tx.send(()).unwrap();
+    upstream.await.unwrap();
+    parent.shutdown();
+    slot.shutdown();
+}
+
+/// The cache-mesh part of `GET /api/node`: the live parents, the parents
+/// waiting to be released and each peer as its hello described it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_node_status_shows_the_cache_mesh_peers() {
+    let lease = Duration::from_secs(5);
+    let (parent_addr, edge_addr) = (unused_loopback_addr(), unused_loopback_addr());
+    let parent_cache = canonical_gap_test_cache().await;
+    let parent_lifecycle = NodeLifecycle::new(LifecycleConfig {
+        edge: false,
+        start_drained: true,
+        state_file: None,
+    });
+    let parent = start_mesh(
+        &parent_cache,
+        mesh_config("dist-a", parent_addr, CacheMeshRole::Distributor, lease)
+            .with_peer(edge_addr)
+            .with_build("3f2a9c1d77e0".to_owned())
+            .with_hello_state(parent_lifecycle.hello()),
+    )
+    .await;
+    let edge_cache = canonical_gap_test_cache().await;
+    let edge = start_mesh(
+        &edge_cache,
+        mesh_config("edge", edge_addr, CacheMeshRole::Edge, lease).with_peer(parent_addr),
+    )
+    .await;
+    let router = app_router_for_tests(edge_cache, Arc::clone(&edge));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let status = router.node_status().await;
+            if status.cache_mesh.parents_live == 1
+                && status
+                    .cache_mesh
+                    .peers
+                    .first()
+                    .is_some_and(|peer| peer.state.is_some())
+            {
+                break;
+            }
+            tokio::time::sleep(NODE_STATUS_CACHE).await;
+        }
+    })
+    .await
+    .expect("the edge hears its parent's hello");
+    let status = router.node_status().await;
+    let peer = &status.cache_mesh.peers[0];
+    assert_eq!(peer.peer, parent_addr.to_string());
+    assert_eq!(peer.role.as_deref(), Some("distributor"));
+    assert_eq!(peer.build.as_deref(), Some("3f2a9c1d77e0"));
+    assert_eq!(peer.state.as_deref(), Some("starting"));
+    assert!(peer.boot_id.is_some_and(|boot| boot > 0));
+    assert!(peer.heard_age_ms.is_some_and(|age| age <= 2_000));
+    assert_eq!(status.cache_mesh.pending_release, 0);
+    assert_eq!(status.cache_mesh.rx_unknown_kinds, 0);
+    parent.shutdown();
+    edge.shutdown();
+}
+
+/// What a holder advertises, read from advertisement to advertisement: a
+/// head moves when a new advertisement has a higher one, and a repeat of
+/// one advertisement tells nothing.
+#[tokio::test]
+async fn region_heads_move_between_two_advertisements() {
+    let telemetry = TelemetryAggregator::default();
+    let node = mesh_node_for_tests("uk-edge-1", "uk", "europe", 51.5, -0.1);
+    let mut heads = RegionHeads::default();
+    let at = now_unix_ms();
+    assert!(
+        heads.observe(&telemetry, &node, 3_000, at).await,
+        "an idle region is known"
+    );
+    telemetry
+        .ingest_snapshot(holder_snapshot("uk-edge-2", at, &[(7, 10, false)]))
+        .await;
+    telemetry
+        .ingest_snapshot(holder_snapshot(
+            "uk-edge-3",
+            at,
+            &[(7, 12, false), (9, 5, true)],
+        ))
+        .await;
+    assert!(!heads.observe(&telemetry, &node, 3_000, at).await);
+    // The same advertisement again: still unknown.
+    assert!(!heads.observe(&telemetry, &node, 3_000, at).await);
+    assert!(heads.moving().is_empty());
+    telemetry
+        .ingest_snapshot(holder_snapshot("uk-edge-2", at + 1_000, &[(7, 10, false)]))
+        .await;
+    telemetry
+        .ingest_snapshot(holder_snapshot(
+            "uk-edge-3",
+            at + 1_000,
+            &[(7, 20, false), (9, 9, true)],
+        ))
+        .await;
+    assert!(heads.observe(&telemetry, &node, 3_000, at + 1_000).await);
+    assert_eq!(
+        heads.moving(),
+        BTreeMap::from([(7, (20, false)), (9, (9, true))])
+    );
+    // A draining holder is not one.
+    let mut draining = holder_snapshot("uk-edge-3", at + 2_000, &[(7, 30, false)]);
+    draining.node.draining = true;
+    telemetry.ingest_snapshot(draining).await;
+    assert!(heads.observe(&telemetry, &node, 3_000, at + 2_000).await);
+    assert!(heads.moving().is_empty(), "uk-edge-2's head stands");
 }

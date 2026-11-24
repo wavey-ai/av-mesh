@@ -621,7 +621,6 @@ impl ParentFeeds {
     /// admitted source of it came from that address within `within_us`.
     /// The release of a parent that left a ranked set waits for this of its
     /// replacement (the lifecycle unit's parent release task).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn delivering(&self, ip: IpAddr, stream_id: u64, now_us: u64, within_us: u64) -> bool {
         self.table.load().feeds().any(|feed| {
             feed.ip == ip

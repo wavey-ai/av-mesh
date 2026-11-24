@@ -67,6 +67,19 @@ pub(crate) const fn hello_state(state: NodeState) -> u8 {
     }
 }
 
+/// A hello's state byte in words, as `/api/node` shows a peer's: the
+/// names of [`NodeState`], or `unknown` for a value a later build defines.
+pub(crate) const fn hello_state_name(state: u8) -> &'static str {
+    match state {
+        0 => "starting",
+        1 => "ready",
+        2 => "degraded",
+        3 => "draining",
+        4 => "stopping",
+        _ => "unknown",
+    }
+}
+
 /// How a node's lifecycle begins.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LifecycleConfig {
@@ -102,6 +115,22 @@ struct Inner {
     /// Woken when the node begins or stops draining: the telemetry
     /// publisher advertises the change at once instead of at its next tick.
     changed: Arc<Notify>,
+    /// What the start's warm pass opened (C CR8).
+    warm: StdMutex<WarmPass>,
+}
+
+/// What a start's warm pass opened (C 3.1 E5, F7), for the readiness
+/// evaluator.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct WarmPass {
+    /// An edge's warm copies: each audio playlist with a moving head in the
+    /// region that it opened, with the highest head advertised for it then.
+    pub(crate) copies: Vec<(u64, u64)>,
+    /// A slot's start demand: the playlists it subscribed to at its start.
+    pub(crate) slot_streams: Vec<u64>,
+    /// The region's moving heads were known once: every fresh holder was
+    /// seen in two advertisements (kept, as a regional view is).
+    pub(crate) judged: bool,
 }
 
 impl Default for NodeLifecycle {
@@ -151,6 +180,7 @@ impl NodeLifecycle {
                 state_file: config.state_file,
                 draining_since: StdMutex::new(draining.then(Instant::now)),
                 changed: Arc::new(Notify::new()),
+                warm: StdMutex::new(WarmPass::default()),
             }),
         }
     }
@@ -203,6 +233,32 @@ impl NodeLifecycle {
     /// Woken when [`Self::is_draining`] changes.
     pub(crate) fn changed(&self) -> Arc<Notify> {
         Arc::clone(&self.inner.changed)
+    }
+
+    pub(crate) fn warm_pass(&self) -> WarmPass {
+        self.lock_warm().clone()
+    }
+
+    /// An edge's warm pass: the copies it opened and whether the region's
+    /// heads are known.
+    pub(crate) fn set_warm_copies(&self, copies: Vec<(u64, u64)>, judged: bool) {
+        let mut warm = self.lock_warm();
+        warm.copies = copies;
+        warm.judged |= judged;
+    }
+
+    /// A slot's start demand and whether the region's heads are known.
+    pub(crate) fn set_slot_streams(&self, streams: Vec<u64>, judged: bool) {
+        let mut warm = self.lock_warm();
+        warm.slot_streams = streams;
+        warm.judged |= judged;
+    }
+
+    fn lock_warm(&self) -> std::sync::MutexGuard<'_, WarmPass> {
+        self.inner
+            .warm
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub(crate) fn drain(&self, reason: DrainReason) {
@@ -509,7 +565,8 @@ pub(crate) async fn stop_forwarder(
 /// An edge's start (C 3.1): it holds `start` until it is warm, or for
 /// `warm_bound` at most, and then serves cold and says so
 /// (`ready_forced`): a cold edge serves, an edge that never resumes does
-/// not.
+/// not. Meanwhile it opens a copy of each audio playlist whose head moves
+/// in its region (`warm_playlists`, E5).
 pub(crate) async fn start_edge(
     router: AppRouter,
     warm_bound: Duration,
@@ -533,10 +590,15 @@ async fn run_start(
     let lifecycle = router.lifecycle.clone();
     let mut tick = tokio::time::interval(START_POLL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut heads = crate::RegionHeads::default();
     while lifecycle.holds(DrainReason::Start) {
         tokio::select! {
             _ = shutdown_rx.changed() => return,
             _ = tick.tick() => {}
+        }
+        // E5: an edge opens the copies it must have warm before it serves.
+        if warm_bound.is_some() {
+            crate::warm_playlists(&router, &mut heads).await;
         }
         let status = router.node_status().await;
         if status.warm {
