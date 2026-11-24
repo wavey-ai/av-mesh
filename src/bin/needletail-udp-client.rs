@@ -1062,6 +1062,12 @@ async fn main() -> Result<()> {
             first_retry: Duration::from_millis(args.first_retry_ms),
             residual_target: av_mesh::client_compact::RESIDUAL_TARGET,
             hole_give_up: av_mesh::client_compact::HOLE_GIVE_UP,
+            token_wait: Duration::from_millis(av_mesh::client_session::DEFAULT_TOKEN_MS),
+            first_double: Duration::from_millis(av_mesh::client_session::DEFAULT_FIRST_DOUBLE_MS),
+            hedge_after: Duration::from_millis(av_mesh::client_session::DEFAULT_HEDGE_AFTER_MS),
+            lone_hedge_after: Duration::from_millis(
+                av_mesh::client_session::DEFAULT_LONE_HEDGE_AFTER_MS,
+            ),
         },
         Instant::now(),
     );
@@ -1557,16 +1563,16 @@ async fn main() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(600)).await;
     let _ = session
         .receiver
-        .take_loss(av_mesh::client_compact::LegId::FIRST, session.repair);
+        .take_loss(av_mesh::client_compact::LegId::FIRST, session.repair());
     let since = |at: Option<Instant>| {
         at.map(|at| at.saturating_duration_since(started).as_secs_f64() * 1_000.0)
     };
     startup.token_ms = since(session.first_token_at);
     startup.subscribed_ms = since(session.first_subscribed_at);
     let receiver = &session.receiver;
-    let repair = session.repair;
-    let plan = session.plan;
-    let compact_asked = session.compact_asked;
+    let repair = session.repair();
+    let plan = session.plan();
+    let compact_asked = session.compact_asked();
     drop(verify_tx);
     let verify = verifier.await.ok();
 
@@ -1664,7 +1670,7 @@ async fn main() -> Result<()> {
             .compact
             .leg_rtt(av_mesh::client_compact::LegId::FIRST)
             .map(|rtt| rtt.as_secs_f64() * 1_000.0),
-        compact_confirmed: session.compact_confirmed,
+        compact_confirmed: session.compact_confirmed(),
         final_compact_plan: compact_asked.then(|| plan.word()),
         compact_plan_changes: session.plan_changes,
         burst_estimate_max: session.burst_max,

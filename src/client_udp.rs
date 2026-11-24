@@ -1221,7 +1221,13 @@ impl ObjectReceiver {
     /// A leg's `OK`: the stream, the part that its edge sends first (the
     /// reference for the compact lane's 32-bit part numbers) and whether it
     /// sends the compact lane (holes are then asked for with NACK).
-    pub fn expect(&mut self, leg: LegId, stream_id: u64, next_part: u64, compact: bool) -> LegStart {
+    pub fn expect(
+        &mut self,
+        leg: LegId,
+        stream_id: u64,
+        next_part: u64,
+        compact: bool,
+    ) -> LegStart {
         self.stream_id = stream_id;
         let start = self.compact.leg_expect(leg, next_part, compact);
         if start == LegStart::Stale {
@@ -1402,10 +1408,7 @@ impl ObjectReceiver {
         if self.fast_epoch.is_some_and(|epoch| epoch != fast.epoch) {
             self.new_flow();
             let blocks = &mut self.legs[leg.index()];
-            blocks
-                .decoders
-                .get_or_insert_with(Default::default)[FAST_SPACE]
-                .expire_block(block);
+            blocks.decoders.get_or_insert_with(Default::default)[FAST_SPACE].expire_block(block);
             blocks.settle(block);
             self.fast_epoch_changes += 1;
         }
@@ -2813,7 +2816,9 @@ mod tests {
             }
         }
         std::thread::sleep(LOSS_SETTLE);
-        let loss = receiver.take_loss(LegId::FIRST, RepairPolicy::default()).unwrap();
+        let loss = receiver
+            .take_loss(LegId::FIRST, RepairPolicy::default())
+            .unwrap();
         assert!((0.08..0.12).contains(&loss), "{loss}");
         assert_eq!(receiver.objects, 200);
         // A late datagram of a counted block is not counted again.
@@ -2825,7 +2830,10 @@ mod tests {
         .unwrap();
         receiver.push(LegId::FIRST, &late[0]);
         std::thread::sleep(LOSS_SETTLE);
-        assert_eq!(receiver.take_loss(LegId::FIRST, RepairPolicy::default()), None);
+        assert_eq!(
+            receiver.take_loss(LegId::FIRST, RepairPolicy::default()),
+            None
+        );
         assert_eq!(receiver.lost_objects, 0);
     }
 

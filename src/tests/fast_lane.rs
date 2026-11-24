@@ -236,7 +236,12 @@ async fn a_soundkit_bundle_is_refused_on_the_fast_lane() {
     );
     let mut receiver = ObjectReceiver::new();
     for symbol in &sources {
-        assert!(receiver.push(av_mesh::client_compact::LegId::FIRST, &fast_datagram(symbol, 3)).is_none());
+        assert!(receiver
+            .push(
+                av_mesh::client_compact::LegId::FIRST,
+                &fast_datagram(symbol, 3)
+            )
+            .is_none());
     }
     assert_eq!(receiver.errors, 1);
     assert_eq!(receiver.fast_parts, 0);

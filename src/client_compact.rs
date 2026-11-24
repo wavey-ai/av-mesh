@@ -534,8 +534,7 @@ pub fn shorten(datagram: &[u8]) -> Option<Vec<u8>> {
 /// [`shorten`], into `out` (cleared first).
 pub fn shorten_into(datagram: &[u8], out: &mut Vec<u8>) -> Option<()> {
     let view = parse(datagram)?;
-    if view.kind != Kind::Part || keeps_long_form(u64::from(view.part_low)) || unknown_time(&view)
-    {
+    if view.kind != Kind::Part || keeps_long_form(u64::from(view.part_low)) || unknown_time(&view) {
         return None;
     }
     out.clear();
@@ -552,8 +551,7 @@ pub fn shorten_into(datagram: &[u8], out: &mut Vec<u8>) -> Option<()> {
 pub fn shorten_in_place(buffer: &mut [u8], len: usize) -> Option<usize> {
     let datagram = buffer.get(..len)?;
     let view = parse(datagram)?;
-    if view.kind != Kind::Part || keeps_long_form(u64::from(view.part_low)) || unknown_time(&view)
-    {
+    if view.kind != Kind::Part || keeps_long_form(u64::from(view.part_low)) || unknown_time(&view) {
         return None;
     }
     let flags = datagram[FLAGS_AT] & !SHORT_MAGIC_MASK;
@@ -1121,6 +1119,11 @@ impl LegId {
 
     pub const fn index(self) -> usize {
         self.0 as usize
+    }
+
+    /// The leg in slot `index` (below [`MAX_LEGS`]).
+    pub const fn from_index(index: usize) -> Self {
+        Self(index as u8)
     }
 }
 
@@ -1867,7 +1870,10 @@ impl CompactReceiver {
         let first = self.mark_delivered(leg, part, now);
         self.joint
             .entry(part)
-            .or_insert(Joint { came: true, at: now })
+            .or_insert(Joint {
+                came: true,
+                at: now,
+            })
             .came = true;
         first
     }
@@ -1944,10 +1950,7 @@ impl CompactReceiver {
         }
         let slot = &mut self.arrivals[(part % ARRIVALS as u64) as usize];
         if slot.part == u64::MAX || slot.part < part {
-            *slot = Arrival {
-                part,
-                ..NO_ARRIVAL
-            };
+            *slot = Arrival { part, ..NO_ARRIVAL };
         }
         (slot.part == part).then_some(slot)
     }
@@ -2459,9 +2462,9 @@ impl CompactReceiver {
             limit
         } else {
             let burst = f64::from(cap) / 4.0;
-            let since = self
-                .nack_tokens_at
-                .map_or(burst, |at| now.saturating_duration_since(at).as_secs_f64() * f64::from(cap));
+            let since = self.nack_tokens_at.map_or(burst, |at| {
+                now.saturating_duration_since(at).as_secs_f64() * f64::from(cap)
+            });
             self.nack_tokens = (self.nack_tokens + since).min(burst);
             self.nack_tokens_at = Some(now);
             let allowed = (self.nack_tokens + 1e-6).floor() as usize;
@@ -2588,11 +2591,13 @@ impl CompactReceiver {
         // Under the rate cap, not before a token is there (no spin).
         let cap = self.nack_timing().rate_cap;
         let holes = match (holes, self.nack_tokens_at) {
-            (Some(at), Some(filled)) if cap > 0 && self.nack_tokens < 1.0 => Some(at.max(
-                filled
-                    + Duration::from_secs_f64((1.0 - self.nack_tokens) / f64::from(cap))
-                        .max(MIN_CAPPED_WAIT),
-            )),
+            (Some(at), Some(filled)) if cap > 0 && self.nack_tokens < 1.0 => Some(
+                at.max(
+                    filled
+                        + Duration::from_secs_f64((1.0 - self.nack_tokens) / f64::from(cap))
+                            .max(MIN_CAPPED_WAIT),
+                ),
+            ),
             (holes, _) => holes,
         };
         let silence =
@@ -2701,7 +2706,8 @@ impl CompactReceiver {
         if parts == 0 {
             return None;
         }
-        let burst = (self.joint_runs > 0).then(|| self.joint_run_sum as f64 / self.joint_runs as f64);
+        let burst =
+            (self.joint_runs > 0).then(|| self.joint_run_sum as f64 / self.joint_runs as f64);
         self.joint_run_sum = 0;
         self.joint_runs = 0;
         Some((missed as f64 / parts as f64, burst))
@@ -2843,12 +2849,19 @@ mod tests {
         let at = last + ms * 2;
         receiver.push(L, &encode_part(21, 0, &payload(21, 10)).unwrap(), at, 0);
         assert!(receiver.nacks_due(at, 64).take(L).is_empty());
-        assert_eq!(receiver.nacks_due(at + FAST_NACK_DELAY, 64).take(L), vec![20]);
+        assert_eq!(
+            receiver.nacks_due(at + FAST_NACK_DELAY, 64).take(L),
+            vec![20]
+        );
         // Repeated after the 2 ms floor (no round trip measured), not before.
-        assert!(receiver.nacks_due(at + FAST_NACK_DELAY + ms, 64).take(L).is_empty());
+        assert!(receiver
+            .nacks_due(at + FAST_NACK_DELAY + ms, 64)
+            .take(L)
+            .is_empty());
         // (By then 22 is overdue too, and asked for as a silence.)
         assert!(receiver
-            .nacks_due(at + FAST_NACK_DELAY + FAST_NACK_RETRY, 64).take(L)
+            .nacks_due(at + FAST_NACK_DELAY + FAST_NACK_RETRY, 64)
+            .take(L)
             .contains(&20));
     }
 
@@ -2862,14 +2875,21 @@ mod tests {
         // last part (one interval and the margin), not sooner.
         assert_eq!(receiver.next_nack_at(), Some(last + ms * 2));
         assert!(receiver
-            .nacks_due(last + Duration::from_micros(1_900), 64).take(L)
+            .nacks_due(last + Duration::from_micros(1_900), 64)
+            .take(L)
             .is_empty());
         assert_eq!(receiver.nacks_due(last + ms * 2, 64).take(L), vec![120]);
         // A millisecond on: 120 again (its answer went into the burst) and
         // 121, now due; then 120 waits two intervals.
         assert!(receiver.next_nack_at().unwrap() <= last + ms * 3);
-        assert_eq!(receiver.nacks_due(last + ms * 3, 64).take(L), vec![120, 121]);
-        assert_eq!(receiver.nacks_due(last + ms * 4, 64).take(L), vec![121, 122]);
+        assert_eq!(
+            receiver.nacks_due(last + ms * 3, 64).take(L),
+            vec![120, 121]
+        );
+        assert_eq!(
+            receiver.nacks_due(last + ms * 4, 64).take(L),
+            vec![121, 122]
+        );
         // The burst ends: 123 comes; 120-122 are holes now, asked for
         // again after the delay of a new hole.
         let end = last + ms * 4 + Duration::from_micros(300);
@@ -2923,7 +2943,8 @@ mod tests {
             at += Duration::from_micros(250);
         }
         assert!(other.holes() > 0);
-        let quiet = other.nacks_due(at, 64).take(L).len() + other.nacks_due(at + ms, 64).take(L).len();
+        let quiet =
+            other.nacks_due(at, 64).take(L).len() + other.nacks_due(at + ms, 64).take(L).len();
         assert!(quiet <= 32, "{quiet} NACKs a millisecond after the silence");
     }
 
@@ -2977,11 +2998,21 @@ mod tests {
         let last = fed(&mut receiver, 0, 50, start, ms);
         // 300 ms of nothing, then the stream goes on.
         let resumed = last + ms * 300;
-        receiver.push(L, &encode_part(50, 0, &payload(50, 10)).unwrap(), resumed, 0);
+        receiver.push(
+            L,
+            &encode_part(50, 0, &payload(50, 10)).unwrap(),
+            resumed,
+            0,
+        );
         assert_eq!(receiver.part_interval(), Some(ms));
         let mut old = wave6();
         let last = fed(&mut old, 0, 50, start, ms);
-        old.push(L, &encode_part(50, 0, &payload(50, 10)).unwrap(), last + ms * 300, 0);
+        old.push(
+            L,
+            &encode_part(50, 0, &payload(50, 10)).unwrap(),
+            last + ms * 300,
+            0,
+        );
         assert!(old.part_interval().unwrap() > ms * 10);
     }
 
@@ -3021,7 +3052,10 @@ mod tests {
             at += ms;
             receiver.push(L, &encode_part(part, 0, &payload(part, 10)).unwrap(), at, 0);
             asked += receiver.nacks_due(at, 64).take(L).len();
-            asked += receiver.nacks_due(at + Duration::from_micros(990), 64).take(L).len();
+            asked += receiver
+                .nacks_due(at + Duration::from_micros(990), 64)
+                .take(L)
+                .len();
         }
         assert_eq!(asked, 0);
         assert_eq!(receiver.stats.nacked, 0);
@@ -3036,7 +3070,12 @@ mod tests {
         receiver.leg_expect(L, 0, true);
         receiver.push(L, &encode_part(0, 0, &payload(0, 10)).unwrap(), start, 0);
         // 100 parts lost at once.
-        receiver.push(L, &encode_part(101, 0, &payload(101, 10)).unwrap(), start, 0);
+        receiver.push(
+            L,
+            &encode_part(101, 0, &payload(101, 10)).unwrap(),
+            start,
+            0,
+        );
         let at = start + FAST_NACK_DELAY;
         let first = receiver.nacks_due(at, 256).take(L).len();
         assert_eq!(first, DEFAULT_NACK_RATE_CAP as usize / 4);
@@ -3085,7 +3124,10 @@ mod tests {
             total += old.nacks_due(at, 64).take(L).len();
             at += Duration::from_micros(250);
         }
-        assert!(total > 2 * usize::from(DEFAULT_SILENCE_NACK_BUDGET), "{total}");
+        assert!(
+            total > 2 * usize::from(DEFAULT_SILENCE_NACK_BUDGET),
+            "{total}"
+        );
     }
 
     /// Wave 8 (R6-2, R6-4): when a stall ends with a backlog, the holes past
@@ -3122,7 +3164,9 @@ mod tests {
         // due between the backlog's datagrams.
         let last_asked = asked[&50];
         let again = (at + FAST_NACK_DELAY).max(last_asked + receiver.nack_retry());
-        let before = receiver.nacks_due(again - Duration::from_micros(10), 64).take(L);
+        let before = receiver
+            .nacks_due(again - Duration::from_micros(10), 64)
+            .take(L);
         assert!(before.iter().all(|part| *part <= 52), "{before:?}");
         if again > at + FAST_NACK_DELAY {
             assert!(!before.contains(&50));
@@ -3157,7 +3201,10 @@ mod tests {
             }
         }
         let cap = DEFAULT_NACK_RATE_CAP as usize;
-        assert!(asked <= cap + cap / 4 + 1, "{asked} parts asked for in a second");
+        assert!(
+            asked <= cap + cap / 4 + 1,
+            "{asked} parts asked for in a second"
+        );
         assert!(receiver.nacks_capped > 0);
         let mut free = rx();
         free.set_nack_timing(NackTiming {
@@ -3302,7 +3349,9 @@ mod tests {
         let long = encode_part(70_000, 1_700_000_000_000_000, &bytes).unwrap();
         let short = shorten(&long).unwrap();
         let now = Instant::now();
-        assert!(receiver.push(L, &short, now, 1_700_000_000_001_000).is_empty());
+        assert!(receiver
+            .push(L, &short, now, 1_700_000_000_001_000)
+            .is_empty());
         receiver.leg_expect(L, 69_999, true);
         let parts = receiver.push(L, &short, now, 1_700_000_000_001_000);
         assert_eq!(parts.len(), 1);
@@ -3315,7 +3364,10 @@ mod tests {
         assert!(!receiver.known.contains_key(&70_000));
         // After one, the short form's time is read.
         let anchor = encode_part(70_144, 1_700_000_000_144_000, &bytes).unwrap();
-        assert_eq!(receiver.push(L, &anchor, now, 1_700_000_000_145_000).len(), 1);
+        assert_eq!(
+            receiver.push(L, &anchor, now, 1_700_000_000_145_000).len(),
+            1
+        );
         let next = shorten(&encode_part(70_145, 1_700_000_000_145_000, &bytes).unwrap()).unwrap();
         let parts = receiver.push(L, &next, now, 1_700_000_000_146_000);
         assert_eq!(parts[0].published_unix_us, 1_700_000_000_145_000);
@@ -3335,15 +3387,26 @@ mod tests {
         let mut receiver = rx();
         receiver.leg_expect(L, 700, true);
         let first = encode_part(703, 1_700_000_000_000_000, &bytes).unwrap();
-        assert_eq!(receiver.push(L, &first, start, 1_700_000_000_001_000).len(), 1);
-        assert_eq!(receiver.nacks_due(start + delay, 64).take(L), vec![700, 701, 702]);
+        assert_eq!(
+            receiver.push(L, &first, start, 1_700_000_000_001_000).len(),
+            1
+        );
+        assert_eq!(
+            receiver.nacks_due(start + delay, 64).take(L),
+            vec![700, 701, 702]
+        );
         // A part (long, as every 256th is) came before the OK, which names
         // an older part: the parts between are asked for.
         let mut receiver = rx();
         let anchor = encode_part(768, 1_700_000_000_000_000, &bytes).unwrap();
         assert!(shorten(&anchor).is_none());
         receiver.active = true;
-        assert_eq!(receiver.push(L, &anchor, start, 1_700_000_000_001_000).len(), 1);
+        assert_eq!(
+            receiver
+                .push(L, &anchor, start, 1_700_000_000_001_000)
+                .len(),
+            1
+        );
         receiver.leg_expect(L, 760, true);
         assert_eq!(
             receiver.nacks_due(start + delay, 64).take(L),
@@ -3380,8 +3443,7 @@ mod tests {
                 long
             );
             assert_eq!(
-                u32::from_be_bytes(receiver.known[&part].bytes[7..11].try_into().unwrap())
-                    as u64,
+                u32::from_be_bytes(receiver.known[&part].bytes[7..11].try_into().unwrap()) as u64,
                 published & 0xffff_ffff,
                 "part {part}"
             );
@@ -3661,28 +3723,45 @@ mod tests {
         receiver.leg_expect(L, 10, true);
         let start = Instant::now();
         for part in [10_u64, 11, 14] {
-            receiver.push(L, &encode_part(part, 0, &payload(part, 10)).unwrap(), start, 0);
+            receiver.push(
+                L,
+                &encode_part(part, 0, &payload(part, 10)).unwrap(),
+                start,
+                0,
+            );
         }
         assert!(
             receiver.nacks_due(start, 64).take(L).is_empty(),
             "not before the delay"
         );
-        assert_eq!(receiver.nacks_due(start + NACK_DELAY, 64).take(L), vec![12, 13]);
-        assert!(receiver.nacks_due(start + NACK_DELAY, 64).take(L).is_empty());
         assert_eq!(
-            receiver.nacks_due(start + NACK_DELAY + NACK_RETRY, 1).take(L),
+            receiver.nacks_due(start + NACK_DELAY, 64).take(L),
+            vec![12, 13]
+        );
+        assert!(receiver
+            .nacks_due(start + NACK_DELAY, 64)
+            .take(L)
+            .is_empty());
+        assert_eq!(
+            receiver
+                .nacks_due(start + NACK_DELAY + NACK_RETRY, 1)
+                .take(L),
             vec![12],
             "at most the limit"
         );
         // The next NACK of a part waits twice as long.
         assert!(receiver
-            .nacks_due(start + NACK_DELAY + NACK_RETRY * 2, 64).take(L)
+            .nacks_due(start + NACK_DELAY + NACK_RETRY * 2, 64)
+            .take(L)
             .contains(&13));
         assert!(receiver
-            .nacks_due(start + NACK_DELAY + NACK_RETRY * 2, 64).take(L)
+            .nacks_due(start + NACK_DELAY + NACK_RETRY * 2, 64)
+            .take(L)
             .is_empty());
         assert_eq!(
-            receiver.nacks_due(start + NACK_DELAY + NACK_RETRY * 3, 64).take(L),
+            receiver
+                .nacks_due(start + NACK_DELAY + NACK_RETRY * 3, 64)
+                .take(L),
             vec![12]
         );
         // A retransmission fills one hole.
@@ -3723,7 +3802,9 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].kind, Kind::Part);
         assert_eq!(parts[0].payload, payload(21, 10));
-        assert!(receiver.push(L, &late, start + NACK_RETRY * 2, 0).is_empty());
+        assert!(receiver
+            .push(L, &late, start + NACK_RETRY * 2, 0)
+            .is_empty());
         assert_eq!(receiver.holes(), 0);
         // A gap again for a part delivered is a duplicate.
         assert!(receiver.push(L, &encode_gap(20), start, 0).is_empty());
@@ -3745,17 +3826,25 @@ mod tests {
         assert_eq!(receiver.nack_retry(), Duration::from_millis(45));
         let start = Instant::now();
         for part in [10_u64, 12] {
-            receiver.push(L, &encode_part(part, 0, &payload(part, 10)).unwrap(), start, 0);
+            receiver.push(
+                L,
+                &encode_part(part, 0, &payload(part, 10)).unwrap(),
+                start,
+                0,
+            );
         }
         assert_eq!(receiver.nacks_due(start + NACK_DELAY, 64).take(L), vec![11]);
         // Not at 5 ms or 15 ms after it: a retransmission takes 30 ms.
         for after in [5, 15, 40] {
             assert!(receiver
-                .nacks_due(start + NACK_DELAY + Duration::from_millis(after), 64).take(L)
+                .nacks_due(start + NACK_DELAY + Duration::from_millis(after), 64)
+                .take(L)
                 .is_empty());
         }
         assert_eq!(
-            receiver.nacks_due(start + NACK_DELAY + Duration::from_millis(45), 64).take(L),
+            receiver
+                .nacks_due(start + NACK_DELAY + Duration::from_millis(45), 64)
+                .take(L),
             vec![11]
         );
         // A short path keeps the 5 ms floor.
@@ -3773,7 +3862,12 @@ mod tests {
         let mut measured = before();
         measured.leg_expect(L, 0, true);
         for part in [0_u64, 2] {
-            measured.push(L, &encode_part(part, 0, &payload(part, 10)).unwrap(), start, 0);
+            measured.push(
+                L,
+                &encode_part(part, 0, &payload(part, 10)).unwrap(),
+                start,
+                0,
+            );
         }
         assert_eq!(measured.nacks_due(start + NACK_DELAY, 64).take(L), vec![1]);
         let mut again = encode_part(1, 0, &payload(1, 10)).unwrap();
@@ -3938,7 +4032,12 @@ mod tests {
         receiver.leg_expect(L, 10_000, true);
         let now = Instant::now();
         for part in 10_000..10_010_u64 {
-            receiver.push(L, &encode_part(part, 0, &payload(part, 10)).unwrap(), now, 0);
+            receiver.push(
+                L,
+                &encode_part(part, 0, &payload(part, 10)).unwrap(),
+                now,
+                0,
+            );
         }
         let stale = receiver.open_leg().unwrap();
         assert_eq!(receiver.leg_expect(stale, 5_000, true), LegStart::Stale);
@@ -3947,11 +4046,19 @@ mod tests {
         receiver.close_leg(stale);
         // A head 4,096 ahead of the only leg that delivered.
         let ahead = receiver.open_leg().unwrap();
-        assert_eq!(receiver.leg_expect(ahead, 20_000, true), LegStart::Displaces(L));
+        assert_eq!(
+            receiver.leg_expect(ahead, 20_000, true),
+            LegStart::Displaces(L)
+        );
         assert_eq!(receiver.newest(), None);
         assert_eq!(receiver.floor(), None);
         receiver.close_leg(L);
-        let parts = receiver.push(ahead, &encode_part(20_000, 0, &payload(1, 10)).unwrap(), now, 0);
+        let parts = receiver.push(
+            ahead,
+            &encode_part(20_000, 0, &payload(1, 10)).unwrap(),
+            now,
+            0,
+        );
         assert_eq!(parts.len(), 1);
         assert_eq!(receiver.floor(), Some(20_000));
         assert_eq!(receiver.newest(), Some(20_000));
@@ -3975,9 +4082,8 @@ mod tests {
     fn short_parts_are_numbered_from_their_own_leg() {
         let bytes = payload(7, 56);
         let us = 1_700_000_000_000_000_u64;
-        let short = |part: u64| {
-            shorten(&encode_part(part, us + part * 1_000, &bytes).unwrap()).unwrap()
-        };
+        let short =
+            |part: u64| shorten(&encode_part(part, us + part * 1_000, &bytes).unwrap()).unwrap();
         let now = Instant::now();
         let mut receiver = rx();
         receiver.leg_expect(L, 70_142, true);
@@ -4109,10 +4215,10 @@ mod tests {
         let ms = Duration::from_millis(1);
         let us = Duration::from_micros(1);
         let feed = |receiver: &mut CompactReceiver,
-                        parts: std::ops::Range<u64>,
-                        lag: Duration,
-                        a: bool,
-                        b_brings: &dyn Fn(u64) -> bool| {
+                    parts: std::ops::Range<u64>,
+                    lag: Duration,
+                    a: bool,
+                    b_brings: &dyn Fn(u64) -> bool| {
             for part in parts {
                 let datagram = encode_part(part, 0, &payload(part, 10)).unwrap();
                 let at = start + ms * part as u32;
@@ -4137,7 +4243,9 @@ mod tests {
         assert!(!receiver.level(b, L));
         assert!(receiver.level(L, b));
         // Five of the last 32 missing: not steady.
-        feed(&mut receiver, 80..100, us * 100, true, &|part| part % 4 != 0);
+        feed(&mut receiver, 80..100, us * 100, true, &|part| {
+            part % 4 != 0
+        });
         assert!(!receiver.steady(b));
         assert!(!receiver.level(b, L));
         // The other leg silent: steady is enough.
@@ -4204,7 +4312,12 @@ mod tests {
         receiver.leg_expect(L, 10, true);
         let start = Instant::now();
         for part in [10_u64, 12] {
-            receiver.push(L, &encode_part(part, 0, &payload(part, 10)).unwrap(), start, 0);
+            receiver.push(
+                L,
+                &encode_part(part, 0, &payload(part, 10)).unwrap(),
+                start,
+                0,
+            );
         }
         let mut asked: Vec<Instant> = Vec::new();
         let mut at = start;
@@ -4214,7 +4327,11 @@ mod tests {
                 asked.push(at);
             }
         }
-        assert!(asked.len() > usize::from(MAX_NACKS_PER_HOLE) + 4, "{}", asked.len());
+        assert!(
+            asked.len() > usize::from(MAX_NACKS_PER_HOLE) + 4,
+            "{}",
+            asked.len()
+        );
         for pair in asked[usize::from(MAX_NACKS_PER_HOLE) - 1..].windows(2) {
             assert_eq!(pair[1] - pair[0], SLOW_NACK);
         }
@@ -4227,11 +4344,21 @@ mod tests {
         receiver.leg_expect(L, 0, true);
         receiver.push(L, &encode_part(0, 0, &payload(0, 10)).unwrap(), start, 0);
         for part in 2..3_073_u64 {
-            receiver.push(L, &encode_part(part, 0, &payload(part, 10)).unwrap(), start, 0);
+            receiver.push(
+                L,
+                &encode_part(part, 0, &payload(part, 10)).unwrap(),
+                start,
+                0,
+            );
         }
         receiver.nacks_due(start, 64);
         assert_eq!(receiver.lowest_hole(), Some(1));
-        receiver.push(L, &encode_part(3_073, 0, &payload(3, 10)).unwrap(), start, 0);
+        receiver.push(
+            L,
+            &encode_part(3_073, 0, &payload(3, 10)).unwrap(),
+            start,
+            0,
+        );
         receiver.nacks_due(start, 64);
         assert_eq!(receiver.holes(), 0);
         assert_eq!(receiver.stats.abandoned, 1);
@@ -4279,7 +4406,10 @@ mod tests {
         assert_eq!(again.leg(b), [40]);
         assert_eq!(again.leg(L), [40]);
         assert!(again.leg(late).is_empty());
-        assert_eq!(receiver.stats.nacked, 2, "a part asked of two legs counts once");
+        assert_eq!(
+            receiver.stats.nacked, 2,
+            "a part asked of two legs counts once"
+        );
         // A leg the session does not NACK on is not asked.
         receiver.set_leg_nack(L, false);
         let third = receiver.nacks_due(first + Duration::from_millis(9), 64);
@@ -4295,7 +4425,11 @@ mod tests {
         }
     }
 
-    fn plans(repair: LegLoss, other: LegLoss, joint: Option<(f64, f64)>) -> (CompactPlan, CompactPlan) {
+    fn plans(
+        repair: LegLoss,
+        other: LegLoss,
+        joint: Option<(f64, f64)>,
+    ) -> (CompactPlan, CompactPlan) {
         let plans = PathPlans::for_legs(
             repair,
             Some(other),
@@ -4315,10 +4449,16 @@ mod tests {
     #[test]
     fn two_legs_plan_parts_alone_when_clean() {
         let (repair, other) = plans(leg(0.0), leg(0.0019), Some((0.0, 1.0)));
-        assert_eq!((word(repair), word(other)), ("C0.32.0".into(), "C0.32.0".into()));
+        assert_eq!(
+            (word(repair), word(other)),
+            ("C0.32.0".into(), "C0.32.0".into())
+        );
         // Unmeasured joint loss changes nothing when clean.
         let (repair, other) = plans(leg(0.001), leg(0.001), None);
-        assert_eq!((word(repair), word(other)), ("C0.32.0".into(), "C0.32.0".into()));
+        assert_eq!(
+            (word(repair), word(other)),
+            ("C0.32.0".into(), "C0.32.0".into())
+        );
     }
 
     /// B X3: with random loss the second leg is the copy: no copy up to
@@ -4395,7 +4535,13 @@ mod tests {
     /// B X3: one counted leg plans as before.
     #[test]
     fn one_leg_plans_as_before() {
-        for (loss, burst) in [(0.0, 1.0), (0.01, 1.0), (0.05, 1.0), (0.048, 7.0 / 3.0), (0.2, 3.0)] {
+        for (loss, burst) in [
+            (0.0, 1.0),
+            (0.01, 1.0),
+            (0.05, 1.0),
+            (0.048, 7.0 / 3.0),
+            (0.2, 3.0),
+        ] {
             for burst_rows in [true, false] {
                 let plans = PathPlans::for_legs(
                     LegLoss {

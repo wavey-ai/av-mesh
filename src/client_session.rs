@@ -1,19 +1,25 @@
-//! One client's subscription to a stream at an edge, without its sockets:
-//! the protocol of `needletail-udp-client` as a state machine, so that the
+//! One listener's subscription to a stream, without its sockets: the
+//! protocol of `needletail-udp-client` as a state machine, so that the
 //! client and the load generator (`needletail-load`, thousands of them on
 //! one host) run the same code.
 //!
-//! The session holds what the client keeps across edges (the loss that it
-//! measured, the repair and the compact plan that it asks for, whether it
-//! asks for the compact lane) and what it keeps for the edge it uses now
-//! (the token, whether the edge answered, when it last heard from it).
-//! The caller owns the socket and the clock: it passes each datagram that
-//! arrived to [`UdpSession::on_datagram`], calls [`UdpSession::poll`] when
-//! [`UdpSession::next_wake`] comes, and sends the control datagrams that
-//! both hand to its `send` function. It chooses the edge: when `poll` or
-//! `on_datagram` says that the client must move (`MOVE`, `REFUSED`, no
-//! answer, silence), it picks the next edge and calls
-//! [`UdpSession::begin`] with it.
+//! The session holds the listener's legs (B, section 3.1): one subscription
+//! at one edge each, with that edge's token, round trip, timers, loss and
+//! plan. What arrives on any leg goes through one receiver, which delivers
+//! the first arrival of each part number. The caller owns the socket and
+//! the clock: it passes each datagram that arrived to
+//! [`UdpSession::on_datagram`], runs the timers when [`UdpSession::next_wake`]
+//! comes, and sends the control datagrams that both hand to its `send`
+//! function.
+//!
+//! Two ways to drive it. The edge-choosing director
+//! (`crate::client_director`) holds legs through [`SessionLegs`]: it adds
+//! and releases legs, and reads what happened to them as [`LegEvent`]s. A
+//! caller that holds one edge and moves itself (the client and the load
+//! generator until they run on the director) calls [`UdpSession::begin`]
+//! with the next edge when [`UdpSession::poll`] or
+//! [`UdpSession::on_datagram`] says that it must move (`MOVE`,
+//! `REFUSED`, no answer, silence).
 //!
 //! The parts come out of [`UdpSession::next_object`] after a datagram, with
 //! the lane that they came on in [`UdpSession::receiver`]
@@ -27,11 +33,12 @@
 //! [`UdpSession::hold`] for the end-of-run drain.
 
 use crate::client_compact::{
-    smoothed_loss, CompactPlan, LegId, LegLoss, NackTiming, PathPlans, BURSTY, HOLE_GIVE_UP,
-    RESIDUAL_TARGET,
+    smoothed_loss, CompactPlan, LegId, LegLoss, LegStart, NackTiming, PathPlans, BURSTY,
+    HOLE_GIVE_UP, IP_UDP_HEADER_BYTES, MAX_LEGS, RESIDUAL_TARGET,
 };
+use crate::client_director::{LegEvent, LegState, LegView, SessionLegs};
 use crate::client_udp::{
-    Control, ObjectReceiver, PartObject, RepairPolicy, REFRESH, UNMEASURED_LOSS,
+    Control, ObjectReceiver, PartObject, RepairPolicy, MAX_OTHER_LEGS, REFRESH, UNMEASURED_LOSS,
 };
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -80,6 +87,14 @@ fn plan_cost(plan: CompactPlan) -> f64 {
 pub const DEFAULT_SILENCE_MS: u64 = 200;
 /// See [`SessionConfig::silence_repeat`].
 pub const DEFAULT_SILENCE_REPEAT_MS: u64 = 1_000;
+/// See [`SessionConfig::token_wait`] (`--token-ms`).
+pub const DEFAULT_TOKEN_MS: u64 = 400;
+/// See [`SessionConfig::first_double`] (`--first-double-ms`).
+pub const DEFAULT_FIRST_DOUBLE_MS: u64 = 3;
+/// See [`SessionConfig::hedge_after`] (`--hedge-after-ms`).
+pub const DEFAULT_HEDGE_AFTER_MS: u64 = 50;
+/// See [`SessionConfig::lone_hedge_after`] (`--lone-hedge-after-ms`).
+pub const DEFAULT_LONE_HEDGE_AFTER_MS: u64 = 170;
 /// Times a client asks an edge for the compact lane again after falling
 /// back from it (see [`SessionConfig::compact_retry`]).
 pub const COMPACT_RETRIES: u32 = 2;
@@ -104,8 +119,9 @@ pub struct SessionConfig {
     /// (by default the lane's).
     pub repair_permille: Option<u32>,
     pub min_repair: Option<u32>,
-    /// Move after this long without a datagram from a subscribed edge
-    /// (wave 8 S2: 200 ms; 1 s before).
+    /// Every leg silent this long, or a leg silent this long beside one that
+    /// sends (dead), or without media beside one that delivers (wave 8 S2:
+    /// 200 ms; 1 s before).
     pub silence: Duration,
     /// After a move for silence, until the new edge sends a datagram, the
     /// silence that moves again (at least `silence`): a stall of the stream
@@ -160,6 +176,17 @@ pub struct SessionConfig {
     pub residual_target: f64,
     /// When a hole is given up (`--hole-give-up-ms`, [`HOLE_GIVE_UP`]).
     pub hole_give_up: Duration,
+    /// A leg with no `TOKEN` this long after its first request is passed
+    /// over (the director asks another edge; the leg goes on asking).
+    pub token_wait: Duration,
+    /// A leg's first tokenless `SUB` and its first `SUB` with the token
+    /// are each sent again this soon (zero: not).
+    pub first_double: Duration,
+    /// A leg with no media this long while another leg delivered a part
+    /// first in the last 20 ms is due a hedge at the spare.
+    pub hedge_after: Duration,
+    /// The only live leg, with no datagram this long, is due a hedge.
+    pub lone_hedge_after: Duration,
 }
 
 /// A move asks for a hole at most this many parts before the newest part
@@ -190,6 +217,10 @@ impl SessionConfig {
             first_retry: Duration::from_millis(DEFAULT_FIRST_RETRY_MS),
             residual_target: RESIDUAL_TARGET,
             hole_give_up: HOLE_GIVE_UP,
+            token_wait: Duration::from_millis(DEFAULT_TOKEN_MS),
+            first_double: Duration::from_millis(DEFAULT_FIRST_DOUBLE_MS),
+            hedge_after: Duration::from_millis(DEFAULT_HEDGE_AFTER_MS),
+            lone_hedge_after: Duration::from_millis(DEFAULT_LONE_HEDGE_AFTER_MS),
         }
     }
 
@@ -201,11 +232,11 @@ impl SessionConfig {
 /// What a datagram was.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Received {
-    /// Not from the edge in use, or before any edge.
+    /// Not from a leg's edge, or before any edge.
     Ignored,
     /// A control datagram that changes nothing for the caller.
     Control,
-    /// The edge's `OK`; `first` when it is the first at this edge.
+    /// A leg's `OK`; `first` when it is the first at that leg.
     Subscribed { next_part: u64, first: bool },
     /// A media datagram: take its objects with [`UdpSession::next_object`].
     Media,
@@ -213,60 +244,63 @@ pub enum Received {
     Move(String),
 }
 
+/// One leg: what the session keeps for its subscription at one edge.
 #[derive(Debug)]
-pub struct UdpSession {
-    pub config: SessionConfig,
-    pub receiver: ObjectReceiver,
-    // Across edges.
-    pub base_repair: RepairPolicy,
-    pub repair: RepairPolicy,
-    pub loss_estimate: Option<f64>,
-    /// The largest loss measured in one check, and the largest mean burst.
-    pub loss_max: Option<f64>,
-    pub burst_max: Option<f64>,
-    pub repair_changes: u64,
-    pub plan: CompactPlan,
-    pub plan_changes: u64,
-    pub burst_estimate: Option<f64>,
-    compact_estimate: Option<f64>,
-    /// Loss samples taken (the plan follows them from [`PLAN_SAMPLES`]).
-    loss_samples: u32,
-    /// The path counts as bursty (from [`BURSTY`] until under
-    /// [`BURSTY_UNTIL`]).
-    bursty: bool,
-    /// Since when the estimate has wanted a plan that asks for less.
-    lower_since: Option<Instant>,
-    /// The edge in use was asked for the compact lane; edges that did not
-    /// answer a request for it and were asked without it.
-    pub compact_asked: bool,
-    pub compact_fallbacks: u64,
-    /// The short form is asked for (until an edge refuses it), and the
-    /// edges that refused it and were asked again with the long form.
-    pub short_header: bool,
-    pub short_header_dropped: u64,
-    /// The last edge's `OK` said `C` (kept until the next edge's `OK`).
-    pub compact_confirmed: bool,
-    pub nack_datagrams: u64,
-    /// The part that the first edge said it would send first.
-    pub first_subscribed_part: Option<u64>,
-    /// Edges begun.
-    pub edges: u64,
-    /// When the first token and the first `OK` came (time to first audio,
-    /// step by step).
-    pub first_token_at: Option<Instant>,
-    pub first_subscribed_at: Option<Instant>,
-    /// While set, the session reports no failure (no answer, silence) and
-    /// keeps the edge: the end-of-run drain, which waits for NACK answers.
-    pub hold: bool,
-    /// Set by the caller before [`Self::poll`]: datagrams are queued on its
-    /// socket (NACKs wait for them, with `nack_after_drain`).
-    pub queued: bool,
-    /// Since when [`Self::queued`] has been set without a break: NACKs wait
-    /// for a queue at most one NACK retry (see [`Self::poll`]).
-    queued_since: Option<Instant>,
-    /// The compact lane asked for again after a fall-back (see
-    /// [`SessionConfig::compact_retry`]), over the run and at this edge.
-    pub compact_retries: u64,
+struct Leg {
+    id: LegId,
+    /// The edge's node id ("" for a leg begun without one).
+    node: String,
+    target: SocketAddr,
+    state: LegState,
+    /// The reason of the edge's `MOVE`, while leaving.
+    leaving: Option<String>,
+    added_at: Instant,
+    live_at: Option<Instant>,
+    token: Option<u64>,
+    token_at: Option<Instant>,
+    /// The part the first requests name (until the edge sends parts).
+    from_part: Option<u64>,
+    /// The edge has sent a part (or a repair datagram) since the request:
+    /// it serves this client, so a repeated request no longer names
+    /// `from_part` (an edge that has admitted the client would go back to
+    /// it and send those parts again; wave 9 review).
+    media_here: bool,
+    first_part: Option<u64>,
+    /// The first request, for the answer wait and the token wait.
+    asked_at: Instant,
+    /// The first copy of the request now unanswered (its answer measures a
+    /// round trip while only the double went), and the requests that the
+    /// edge has not answered.
+    request_sent_at: Instant,
+    unanswered: u32,
+    /// Repeats of the request now unanswered (the backoff of
+    /// [`SessionConfig::first_retry`]).
+    repeats: u32,
+    /// When the first request of its kind is sent again (the double).
+    double_at: Option<Instant>,
+    /// A refresh sent when no other request was outstanding: its `OK` or
+    /// `MOVE` measures a round trip.
+    refresh_sent_at: Option<Instant>,
+    /// When the edge was asked to take the leg back (a `MOVE` within a
+    /// round trip of it, before its `OK`, is ignored).
+    takeback_at: Option<Instant>,
+    rtt: Option<Duration>,
+    last_datagram: Instant,
+    last_media: Option<Instant>,
+    /// When a datagram of this leg last delivered a part first.
+    last_first: Option<Instant>,
+    next_refresh: Instant,
+    passed_over: bool,
+    hedge_due: bool,
+    suspect: bool,
+    steady: bool,
+    /// The legs it was reported level with (bits by slot).
+    level_with: u8,
+    /// The delivering legs that its last `SUB` named in `o=` (bits by slot).
+    others_sent: u8,
+    // The compact lane at this edge.
+    compact_asked: bool,
+    compact_confirmed: bool,
     compact_retries_here: u32,
     /// When the compact lane was asked for again while subscribed, until an
     /// `OK` with it comes: an edge that drops compact requests (one older
@@ -274,44 +308,183 @@ pub struct UdpSession {
     /// after [`COMPACT_FALLBACK_AFTER`] (wave 8 review: the retry undid the
     /// fall-back, every refresh was dropped and the subscription expired).
     compact_retry_at: Option<Instant>,
-    /// Retries given up that way.
-    pub compact_retries_unanswered: u64,
-    /// The last move was for silence and the edge in use has sent nothing
-    /// since: the longer silence applies.
-    moved_for_silence: bool,
-    // The edge in use.
-    target: Option<SocketAddr>,
-    from_part: Option<u64>,
-    /// The edge in use has sent a part (or a repair datagram) since the
-    /// request: it serves this client, so a repeated request no longer
-    /// names `from_part` (an edge that has admitted the client would go
-    /// back to it and send those parts again; wave 9 review).
-    media_here: bool,
-    token: Option<u64>,
-    subscribed: bool,
-    asked_at: Instant,
-    last_request_at: Instant,
-    unanswered: u32,
-    /// Repeats of the request now unanswered (the backoff of
-    /// [`SessionConfig::first_retry`]), and the round trip to the edge.
-    repeats: u32,
-    rtt: Option<Duration>,
-    last_datagram: Instant,
-    next_refresh: Instant,
-    next_loss_check: Instant,
-    pending: Option<PartObject>,
+    // The leg's loss and what it asks for.
+    base_repair: RepairPolicy,
+    repair: RepairPolicy,
+    loss_estimate: Option<f64>,
+    compact_estimate: Option<f64>,
+    burst_estimate: Option<f64>,
+    loss_samples: u32,
+    /// The path counts as bursty (from [`BURSTY`] until under
+    /// [`BURSTY_UNTIL`]).
+    bursty: bool,
+    /// Since when the estimate has wanted a plan that asks for less.
+    lower_since: Option<Instant>,
+    plan: CompactPlan,
+    datagrams: u64,
+    wire_bytes: u64,
+    longest_gap: Duration,
 }
+
+impl Leg {
+    fn is_live(&self) -> bool {
+        matches!(self.state, LegState::Live | LegState::Leaving)
+    }
+
+    /// Counted in the plans: live, not leaving, not suspect.
+    fn is_counted(&self) -> bool {
+        self.state == LegState::Live && !self.suspect
+    }
+
+    fn bit(&self) -> u8 {
+        1 << self.id.index()
+    }
+
+    /// Its last media, or when it went live (or was added) if none came.
+    fn media_since(&self) -> Instant {
+        self.last_media.or(self.live_at).unwrap_or(self.added_at)
+    }
+}
+
+/// How long a leg's unanswered request waits for its answer before it is
+/// repeated (see [`SessionConfig::first_retry`]).
+fn unanswered_wait(config: &SessionConfig, leg: &Leg) -> Duration {
+    let first = config.first_retry;
+    if first.is_zero() {
+        return UNANSWERED_REFRESH;
+    }
+    let first = first.max(leg.rtt.map_or(Duration::ZERO, |rtt| rtt * 3));
+    first
+        .saturating_mul(1 << leg.repeats.min(8))
+        .min(UNANSWERED_REFRESH)
+}
+
+/// The RaptorQ repair a leg asks for, from its loss.
+fn policy_for(config: &SessionConfig, leg: &Leg) -> RepairPolicy {
+    if config.fixed_repair {
+        leg.base_repair
+    } else {
+        RepairPolicy::for_loss(
+            leg.loss_estimate.unwrap_or(UNMEASURED_LOSS),
+            leg.base_repair,
+        )
+    }
+}
+
+/// What a leg measured of the client's path, carried to the next edge by
+/// [`UdpSession::begin`].
+#[derive(Debug, Clone, Copy)]
+struct PathMeasure {
+    loss_estimate: Option<f64>,
+    compact_estimate: Option<f64>,
+    burst_estimate: Option<f64>,
+    loss_samples: u32,
+    bursty: bool,
+    plan: CompactPlan,
+}
+
+/// A leg let go: its edge's datagrams are answered with `UNSUB` for a
+/// while, and its second `UNSUB` is due.
+#[derive(Debug)]
+struct Released {
+    target: SocketAddr,
+    token: Option<u64>,
+    until: Instant,
+    second_unsub: Option<Instant>,
+    answered_at: Option<Instant>,
+}
+
+/// One listener's subscription to a stream, held as one or more legs. See
+/// the module's documentation.
+#[derive(Debug)]
+pub struct UdpSession {
+    pub config: SessionConfig,
+    pub receiver: ObjectReceiver,
+    legs: [Option<Leg>; MAX_LEGS],
+    released: Vec<Released>,
+    events: Vec<LegEvent>,
+    /// The largest loss measured in one check, and the largest mean burst
+    /// (any leg).
+    pub loss_max: Option<f64>,
+    pub burst_max: Option<f64>,
+    pub repair_changes: u64,
+    pub plan_changes: u64,
+    /// Edges that did not answer a request for the compact lane and were
+    /// asked without it.
+    pub compact_fallbacks: u64,
+    /// The short form is asked for (until an edge refuses it), and the
+    /// edges that refused it and were asked again with the long form.
+    pub short_header: bool,
+    pub short_header_dropped: u64,
+    pub nack_datagrams: u64,
+    /// The part that the first edge said it would send first.
+    pub first_subscribed_part: Option<u64>,
+    /// Legs begun.
+    pub edges: u64,
+    /// When the first token and the first `OK` came (time to first audio,
+    /// step by step).
+    pub first_token_at: Option<Instant>,
+    pub first_subscribed_at: Option<Instant>,
+    /// While set, the session reports no failure (no answer, silence) and
+    /// keeps its legs: the end-of-run drain, which waits for NACK answers.
+    pub hold: bool,
+    /// Set by the caller before [`Self::poll`]: datagrams are queued on its
+    /// socket. NACKs wait for them (with `nack_after_drain`), and no leg is
+    /// judged silent, hedged or dead (B 3.1: a client host that stalls
+    /// would see every leg silent).
+    pub queued: bool,
+    /// Since when [`Self::queued`] has been set without a break: NACKs wait
+    /// for a queue at most one NACK retry (see [`Self::poll`]).
+    queued_since: Option<Instant>,
+    /// The compact lane asked for again after a fall-back (see
+    /// [`SessionConfig::compact_retry`]), and retries given up.
+    pub compact_retries: u64,
+    pub compact_retries_unanswered: u64,
+    /// Legs failed because their edge's first part was 4,096 behind.
+    pub stale_starts: u64,
+    /// The joint part loss of the legs (smoothed) and its mean run.
+    joint_estimate: Option<f64>,
+    joint_burst: Option<f64>,
+    /// Every leg went silent and no media came since: the longer silence
+    /// applies, and the next report is due then.
+    all_silent: bool,
+    next_all_silent: Option<Instant>,
+    next_loss_check: Instant,
+    next_judge: Instant,
+    /// When the timers last ran: a verdict whose time is not after it was
+    /// judged then, and [`Self::next_wake`] does not wake for it again.
+    polled_at: Instant,
+    pending: Option<PartObject>,
+    /// The lanes of the last 16 parts a datagram delivered (bit set: a
+    /// RaptorQ object).
+    raptorq_recent: u16,
+    delivered_recent: u8,
+}
+
+/// The legs judged steady or level this often while one awaits it.
+const JUDGE_EVERY: Duration = Duration::from_millis(4);
+/// A released leg's second `UNSUB` goes this long after the first.
+const SECOND_UNSUB_AFTER: Duration = Duration::from_millis(20);
+/// A datagram from a released edge is answered with `UNSUB` for this long,
+/// at most once each [`RELEASED_ANSWER_EVERY`].
+const RELEASED_FOR: Duration = Duration::from_secs(10);
+const RELEASED_ANSWER_EVERY: Duration = Duration::from_millis(100);
+/// A leg's token is renewed (a tokenless `SUB` beside its refresh) this
+/// long after the edge gave it: a token is valid at least 60 s.
+pub const TOKEN_RENEW_AFTER: Duration = Duration::from_secs(45);
+/// A leg is hedged only beside a leg that delivered a part first this
+/// recently.
+const FIRST_ARRIVAL_WINDOW: Duration = Duration::from_millis(20);
+/// A leg is suspect when another leg is this many parts ahead of it, and it
+/// has had no media for max([`SUSPECT_AFTER`], this many part intervals).
+const SUSPECT_PARTS: u64 = 8;
+const SUSPECT_AFTER: Duration = Duration::from_millis(20);
 
 impl UdpSession {
     pub fn new(config: SessionConfig, now: Instant) -> Self {
-        let base_repair = config.base_for(config.compact);
-        // Until the path is measured, plan for some loss.
-        let repair = if config.fixed_repair {
-            base_repair
-        } else {
-            RepairPolicy::for_loss(UNMEASURED_LOSS, base_repair)
-        };
         let mut receiver = ObjectReceiver::new();
+        // The session opens its legs itself.
+        receiver.close_leg(LegId::FIRST);
         if config.known_parts > 0 {
             receiver.compact.set_known_parts(config.known_parts);
         }
@@ -321,33 +494,16 @@ impl UdpSession {
         Self {
             config,
             receiver,
-            base_repair,
-            repair,
-            loss_estimate: None,
+            legs: Default::default(),
+            released: Vec::new(),
+            events: Vec::new(),
             loss_max: None,
             burst_max: None,
             repair_changes: 0,
-            // The compact lane's plan: for an unmeasured path, which may
-            // already be lossy (as the RaptorQ repair), until its second
-            // loss sample; the short form until an edge refuses it.
-            plan: CompactPlan::for_measured_with(
-                UNMEASURED_LOSS,
-                1.0,
-                config.compact_burst_rows,
-                config.residual_target,
-            )
-            .with_short_header(config.compact_short_header),
             plan_changes: 0,
-            burst_estimate: None,
-            compact_estimate: None,
-            loss_samples: 0,
-            bursty: false,
-            lower_since: None,
-            compact_asked: config.compact,
             compact_fallbacks: 0,
             short_header: config.compact_short_header,
             short_header_dropped: 0,
-            compact_confirmed: false,
             nack_datagrams: 0,
             first_subscribed_part: None,
             edges: 0,
@@ -357,82 +513,342 @@ impl UdpSession {
             queued: false,
             queued_since: None,
             compact_retries: 0,
-            compact_retries_here: 0,
-            compact_retry_at: None,
             compact_retries_unanswered: 0,
-            moved_for_silence: false,
-            target: None,
-            from_part: None,
-            media_here: false,
-            token: None,
-            subscribed: false,
-            asked_at: now,
-            last_request_at: now,
-            unanswered: 0,
-            repeats: 0,
-            rtt: None,
-            last_datagram: now,
-            next_refresh: now,
-            next_loss_check: now,
+            stale_starts: 0,
+            joint_estimate: None,
+            joint_burst: None,
+            all_silent: false,
+            next_all_silent: None,
+            next_loss_check: now + LOSS_CHECK,
+            next_judge: now,
+            polled_at: now,
             pending: None,
+            raptorq_recent: 0,
+            delivered_recent: 0,
         }
     }
 
-    /// The edge in use.
+    fn legs_iter(&self) -> impl Iterator<Item = &Leg> {
+        self.legs.iter().flatten()
+    }
+
+    fn leg(&self, leg: LegId) -> Option<&Leg> {
+        self.legs[leg.index()].as_ref()
+    }
+
+    /// The leg whose plan and repair the caller reports: the repair leg
+    /// (the counted leg live longest), else the first leg held.
+    fn main_leg(&self) -> Option<&Leg> {
+        self.repair_leg()
+            .and_then(|leg| self.leg(leg))
+            .or_else(|| self.legs_iter().next())
+    }
+
+    /// The counted leg that has been live longest: it alone is asked for
+    /// rows (B 3.3).
+    fn repair_leg(&self) -> Option<LegId> {
+        self.legs_iter()
+            .filter(|leg| leg.is_counted())
+            .min_by_key(|leg| (leg.live_at, leg.id))
+            .map(|leg| leg.id)
+    }
+
+    /// The edge of the main leg.
     pub fn target(&self) -> Option<SocketAddr> {
-        self.target
+        self.main_leg().map(|leg| leg.target)
     }
 
     pub fn token(&self) -> Option<u64> {
-        self.token
+        self.main_leg().and_then(|leg| leg.token)
     }
 
+    /// The RaptorQ repair that the main leg asks for.
+    pub fn repair(&self) -> RepairPolicy {
+        self.main_leg()
+            .map_or(self.config.base_for(self.config.compact), |leg| leg.repair)
+    }
+
+    /// The compact plan that the main leg asks for.
+    pub fn plan(&self) -> CompactPlan {
+        self.main_leg()
+            .map_or_else(|| self.start_plan(false), |leg| leg.plan)
+    }
+
+    /// Whether the main leg asks for the compact lane, and whether its edge
+    /// serves it.
+    pub fn compact_asked(&self) -> bool {
+        self.main_leg()
+            .map_or(self.config.compact, |leg| leg.compact_asked)
+    }
+
+    pub fn compact_confirmed(&self) -> bool {
+        self.main_leg().is_some_and(|leg| leg.compact_confirmed)
+    }
+
+    /// Some leg's edge answered `OK`.
     pub fn is_subscribed(&self) -> bool {
-        self.subscribed
+        self.legs_iter().any(Leg::is_live)
     }
 
-    /// How long an unanswered request waits for its answer before it is
-    /// repeated (see [`SessionConfig::first_retry`]).
-    fn unanswered_wait(&self) -> Duration {
-        let first = self.config.first_retry;
-        if first.is_zero() {
-            return UNANSWERED_REFRESH;
-        }
-        let first = first.max(self.rtt.map_or(Duration::ZERO, |rtt| rtt * 3));
-        first
-            .saturating_mul(1 << self.repeats.min(8))
-            .min(UNANSWERED_REFRESH)
-    }
-
-    fn policy_for_base(&self) -> RepairPolicy {
-        if self.config.fixed_repair {
-            self.base_repair
+    /// The plan a new leg starts on: beside another leg `C0.32.0`; alone,
+    /// the plan for an unmeasured path (B X3).
+    fn start_plan(&self, beside: bool) -> CompactPlan {
+        let plan = if beside {
+            CompactPlan {
+                copies: 0,
+                window: 32,
+                window_repair: 0,
+                short_header: false,
+            }
         } else {
-            RepairPolicy::for_loss(
-                self.loss_estimate.unwrap_or(UNMEASURED_LOSS),
-                self.base_repair,
+            CompactPlan::for_measured_with(
+                UNMEASURED_LOSS,
+                1.0,
+                self.config.compact_burst_rows,
+                self.config.residual_target,
             )
-        }
+        };
+        plan.with_short_header(self.short_header)
     }
 
-    fn subscribe_datagram(&self, from_part: Option<u64>) -> Vec<u8> {
-        Control::Subscribe {
+    /// The delivering legs (bits by slot): live or leaving, not suspect,
+    /// media within max(20 ms, 8 part intervals).
+    fn delivering_mask(&self, now: Instant) -> u8 {
+        let window = self.suspect_after();
+        self.legs_iter()
+            .filter(|leg| {
+                leg.is_live()
+                    && !leg.suspect
+                    && leg
+                        .last_media
+                        .is_some_and(|at| now.saturating_duration_since(at) <= window)
+            })
+            .fold(0, |mask, leg| mask | leg.bit())
+    }
+
+    /// The delivering legs other than `leg` that a `SUB` names in `o=`
+    /// (bits by slot): those with a node id, at most [`MAX_OTHER_LEGS`].
+    fn others_bits(&self, leg: LegId, delivering: u8) -> u8 {
+        let mask = delivering & !(1 << leg.index());
+        let mut bits = 0;
+        let mut named = 0;
+        for other in self.legs_iter() {
+            if mask & other.bit() != 0 && !other.node.is_empty() && named < MAX_OTHER_LEGS {
+                bits |= other.bit();
+                named += 1;
+            }
+        }
+        bits
+    }
+
+    /// Send a leg's `SUB`: with its token unless `tokenless`, from
+    /// `from_part`, with `r=1` if `resume`, and `o=` its delivering
+    /// siblings.
+    fn send_subscribe(
+        &mut self,
+        leg: LegId,
+        from_part: Option<u64>,
+        tokenless: bool,
+        resume: bool,
+        now: Instant,
+        send: &mut dyn FnMut(SocketAddr, &[u8]),
+    ) {
+        let bits = self.others_bits(leg, self.delivering_mask(now));
+        let others: Vec<String> = self
+            .legs_iter()
+            .filter(|other| bits & other.bit() != 0)
+            .map(|other| other.node.clone())
+            .collect();
+        let Some(state) = self.legs[leg.index()].as_mut() else {
+            return;
+        };
+        state.others_sent = bits;
+        let datagram = Control::Subscribe {
             stream_id: self.config.stream_id,
             from_part,
-            repair: self.repair,
-            token: self.token,
+            repair: state.repair,
+            token: if tokenless { None } else { state.token },
             fast_lane: self.config.fast_lane,
-            compact: self.compact_asked.then_some(self.plan),
-            others: Vec::new(),
-            resume: false,
+            compact: state.compact_asked.then_some(state.plan),
+            others,
+            resume,
         }
-        .encode()
+        .encode();
+        send(state.target, &datagram);
+    }
+
+    fn unsubscribe(
+        stream_id: u64,
+        target: SocketAddr,
+        token: u64,
+        send: &mut dyn FnMut(SocketAddr, &[u8]),
+    ) {
+        send(target, &Control::Unsubscribe { stream_id, token }.encode());
+    }
+
+    /// Open a leg at `target` and send its first request (see
+    /// [`SessionLegs::add_leg`]).
+    fn open_leg(
+        &mut self,
+        node: &str,
+        target: SocketAddr,
+        from_part: Option<u64>,
+        token: Option<u64>,
+        measured: Option<PathMeasure>,
+        now: Instant,
+        send: &mut dyn FnMut(SocketAddr, &[u8]),
+    ) -> Option<LegId> {
+        let beside = self.legs_iter().next().is_some();
+        let id = self.receiver.open_leg()?;
+        // A leg beside another starts on the plan of two legs; so do the
+        // legs that have not measured their path yet (a join adds two).
+        let start = self.start_plan(beside);
+        if beside {
+            for leg in self.legs.iter_mut().flatten() {
+                if leg.loss_samples < PLAN_SAMPLES && leg.plan != start {
+                    leg.plan = start;
+                    leg.next_refresh = now;
+                }
+            }
+        }
+        let compact_asked = self.config.compact;
+        let base_repair = self.config.base_for(compact_asked);
+        let repair = if self.config.fixed_repair {
+            base_repair
+        } else {
+            RepairPolicy::for_loss(UNMEASURED_LOSS, base_repair)
+        };
+        self.legs[id.index()] = Some(Leg {
+            id,
+            node: node.to_owned(),
+            target,
+            state: if token.is_some() {
+                LegState::Tokened
+            } else {
+                LegState::Asking
+            },
+            leaving: None,
+            added_at: now,
+            live_at: None,
+            token,
+            token_at: token.map(|_| now),
+            from_part,
+            media_here: false,
+            first_part: None,
+            asked_at: now,
+            request_sent_at: now,
+            unanswered: 1,
+            repeats: 0,
+            double_at: None,
+            refresh_sent_at: None,
+            takeback_at: None,
+            rtt: None,
+            last_datagram: now,
+            last_media: None,
+            last_first: None,
+            next_refresh: now,
+            passed_over: false,
+            hedge_due: false,
+            suspect: false,
+            steady: false,
+            level_with: 0,
+            others_sent: 0,
+            compact_asked,
+            compact_confirmed: false,
+            compact_retries_here: 0,
+            compact_retry_at: None,
+            base_repair,
+            repair,
+            loss_estimate: None,
+            compact_estimate: None,
+            burst_estimate: None,
+            loss_samples: 0,
+            bursty: false,
+            lower_since: None,
+            plan: start,
+            datagrams: 0,
+            wire_bytes: 0,
+            longest_gap: Duration::ZERO,
+        });
+        if let Some(measured) = measured {
+            let config = self.config;
+            let leg = self.legs[id.index()].as_mut().expect("the leg opened");
+            leg.loss_estimate = measured.loss_estimate;
+            leg.compact_estimate = measured.compact_estimate;
+            leg.burst_estimate = measured.burst_estimate;
+            leg.loss_samples = measured.loss_samples;
+            leg.bursty = measured.bursty;
+            leg.plan = measured.plan.with_short_header(self.short_header);
+            leg.repair = policy_for(&config, leg);
+        }
+        self.edges += 1;
+        self.send_subscribe(id, from_part, token.is_none(), false, now, send);
+        let double = self.config.first_double;
+        let wait = unanswered_wait(&self.config, self.leg(id).expect("the leg opened"));
+        let leg = self.legs[id.index()].as_mut().expect("the leg opened");
+        leg.double_at = (!double.is_zero()).then(|| now + double);
+        leg.next_refresh = now + wait;
+        self.sync_nack(id);
+        Some(id)
+    }
+
+    /// Let a leg go: `UNSUB` now (and again in 20 ms, when `twice`), and its
+    /// edge's datagrams answered with `UNSUB` for a while.
+    fn drop_leg(
+        &mut self,
+        leg: LegId,
+        twice: bool,
+        now: Instant,
+        send: &mut dyn FnMut(SocketAddr, &[u8]),
+    ) -> Option<Leg> {
+        let state = self.legs[leg.index()].take()?;
+        if let Some(token) = state.token {
+            Self::unsubscribe(self.config.stream_id, state.target, token, send);
+        }
+        self.receiver.close_leg(leg);
+        self.released
+            .retain(|released| released.target != state.target);
+        self.released.push(Released {
+            target: state.target,
+            token: state.token,
+            until: now + RELEASED_FOR,
+            second_unsub: (twice && state.token.is_some()).then(|| now + SECOND_UNSUB_AFTER),
+            answered_at: None,
+        });
+        Some(state)
+    }
+
+    /// A leg failed: it is let go and reported.
+    fn fail_leg(
+        &mut self,
+        leg: LegId,
+        reason: String,
+        now: Instant,
+        send: &mut dyn FnMut(SocketAddr, &[u8]),
+    ) {
+        if let Some(state) = self.drop_leg(leg, false, now, send) {
+            self.events.push(LegEvent::Failed {
+                leg,
+                node: state.node,
+                reason,
+            });
+        }
+    }
+
+    /// Whether the receiver NACKs on a leg: its edge gave the token and
+    /// serves it the compact lane.
+    fn sync_nack(&mut self, leg: LegId) {
+        let nack = self.leg(leg).is_some_and(|state| {
+            state.token.is_some() && state.compact_confirmed && state.is_live()
+        });
+        self.receiver.compact.set_leg_nack(leg, nack);
     }
 
     /// Subscribe at `target` from `from_part` (the part after the last one
-    /// received, if any): leave the edge in use first (`UNSUB`, so that it
-    /// stops sending at once) and decode the new edge's symbols apart from
-    /// the old edge's.
+    /// received, if any), as the one leg of the session: the legs held are
+    /// let go first (`UNSUB`, so that they stop sending at once). A move
+    /// asks the new edge for the oldest hole the old one left, at most
+    /// [`MOVE_HOLE_PARTS`] back (with [`SessionConfig::move_from_hole`]).
     pub fn begin(
         &mut self,
         target: SocketAddr,
@@ -440,11 +856,11 @@ impl UdpSession {
         now: Instant,
         send: &mut dyn FnMut(SocketAddr, &[u8]),
     ) {
-        // A move: from the oldest hole the old edge left unrepaired.
+        let moving = self.legs_iter().next().is_some();
         let from_part = match (from_part, self.receiver.compact.lowest_hole()) {
             (Some(from), Some(hole))
                 if self.config.move_from_hole
-                    && self.target.is_some()
+                    && moving
                     && hole < from
                     && from - hole <= MOVE_HOLE_PARTS =>
             {
@@ -452,120 +868,443 @@ impl UdpSession {
             }
             (from, _) => from,
         };
-        if let Some(old) = self.target {
-            if let Some(token) = self.token {
-                send(
-                    old,
-                    &Control::Unsubscribe {
-                        stream_id: self.config.stream_id,
-                        token,
-                    }
-                    .encode(),
-                );
+        // The new edge is on the same client path: it starts from what the
+        // last one measured, as before legs.
+        let measured = self.main_leg().map(|leg| PathMeasure {
+            loss_estimate: leg.loss_estimate,
+            compact_estimate: leg.compact_estimate,
+            burst_estimate: leg.burst_estimate,
+            loss_samples: leg.loss_samples,
+            bursty: leg.bursty,
+            plan: leg.plan,
+        });
+        for index in 0..MAX_LEGS {
+            if self.legs[index].is_some() {
+                self.drop_leg(LegId::from_index(index), false, now, send);
             }
-            self.receiver.new_flow();
         }
-        self.edges += 1;
-        self.compact_retries_here = 0;
-        self.compact_retry_at = None;
-        self.target = Some(target);
-        self.from_part = from_part;
-        self.media_here = false;
-        self.token = None;
+        // What the legs let go reported is the caller's to act on now.
+        self.events.clear();
         self.pending = None;
-        // Each edge is asked for the compact lane again, with its repair.
-        if self.compact_asked != self.config.compact {
-            self.compact_asked = self.config.compact;
-            self.base_repair = self.config.base_for(self.compact_asked);
-            self.repair = self.policy_for_base();
-        }
-        send(target, &self.subscribe_datagram(from_part));
-        self.asked_at = now;
-        // The last request sent, for the round trip that its answer
-        // measures, and the requests that this edge has not answered.
-        self.last_request_at = now;
-        self.unanswered = 1;
-        self.last_datagram = now;
-        // Until the edge answers, the request is repeated often.
-        self.repeats = 0;
-        self.rtt = None;
-        self.next_refresh = now + self.unanswered_wait();
-        self.next_loss_check = now + LOSS_CHECK;
-        self.subscribed = false;
+        self.open_leg("", target, from_part, None, measured, now, send);
     }
 
-    /// Leave the edge in use (`UNSUB`), at the end of a run.
+    /// Leave every leg's edge (`UNSUB`), at the end of a run. The legs are
+    /// kept for the report.
     pub fn leave(&mut self, send: &mut dyn FnMut(SocketAddr, &[u8])) {
-        if let (Some(target), Some(token)) = (self.target, self.token) {
-            send(
-                target,
-                &Control::Unsubscribe {
-                    stream_id: self.config.stream_id,
-                    token,
+        for index in 0..MAX_LEGS {
+            if let Some(leg) = self.legs[index].as_mut() {
+                if let Some(token) = leg.token.take() {
+                    Self::unsubscribe(self.config.stream_id, leg.target, token, send);
                 }
-                .encode(),
-            );
+                leg.state = LegState::Asking;
+            }
+            self.receiver
+                .compact
+                .set_leg_nack(LegId::from_index(index), false);
         }
-        self.token = None;
-        self.subscribed = false;
     }
 
-    /// The timers: whether the edge in use has failed (no answer, silence),
-    /// the loss check, the NACKs and the refresh. Returns the reason to
-    /// move, if the client must.
+    /// The timers, for a caller that holds one leg and moves itself: as
+    /// [`SessionLegs::poll_legs`], and the reason to move if its leg failed
+    /// or went silent.
     pub fn poll(
         &mut self,
         now: Instant,
         send: &mut dyn FnMut(SocketAddr, &[u8]),
     ) -> Option<String> {
-        let target = self.target?;
-        if !self.hold && !self.subscribed && now.duration_since(self.asked_at) > self.config.answer
-        {
-            return Some(format!("no-answer-{}ms", self.config.answer.as_millis()));
+        self.poll_legs(now, send);
+        let mut reason = None;
+        for event in self.events.drain(..) {
+            let found = match event {
+                LegEvent::Failed { reason, .. } => reason,
+                LegEvent::AllSilent { silence } => format!("silence-{}ms", silence.as_millis()),
+                _ => continue,
+            };
+            reason.get_or_insert(found);
         }
-        let silence = self.silence();
-        if !self.hold && self.subscribed && now.duration_since(self.last_datagram) > silence {
-            self.moved_for_silence = true;
-            return Some(format!("silence-{}ms", silence.as_millis()));
+        reason
+    }
+
+    /// The silence after which every leg counts as silent (see
+    /// [`SessionConfig::silence_repeat`]).
+    fn silence(&self) -> Duration {
+        if self.all_silent {
+            self.config.silence.max(self.config.silence_repeat)
+        } else {
+            self.config.silence
         }
-        if now >= self.next_loss_check {
-            self.next_loss_check = now + LOSS_CHECK;
-            if let Some(loss) = self.receiver.take_loss(LegId::FIRST, self.repair) {
-                self.loss_max = Some(self.loss_max.map_or(loss, |max| max.max(loss)));
-                // Rise at once, fall slowly.
-                let estimate = match self.loss_estimate {
-                    Some(previous) if loss < previous => previous * 0.8 + loss * 0.2,
-                    _ => loss,
+    }
+
+    /// max(20 ms, 8 part intervals): how long a leg goes without media
+    /// before it is suspect, or no longer delivering.
+    fn suspect_after(&self) -> Duration {
+        let interval = self
+            .receiver
+            .compact
+            .part_interval()
+            .unwrap_or(Duration::ZERO);
+        SUSPECT_AFTER.max(interval * SUSPECT_PARTS as u32)
+    }
+
+    /// The verdicts on each leg (B 3.2): the answer and token waits, and,
+    /// on an empty socket, suspect, hedged, dead and every leg silent.
+    fn judge_legs(&mut self, now: Instant, send: &mut dyn FnMut(SocketAddr, &[u8])) {
+        let config = self.config;
+        let mut failed: Vec<(LegId, String)> = Vec::new();
+        for leg in self.legs.iter_mut().flatten() {
+            if leg.is_live() {
+                continue;
+            }
+            let waited = now.saturating_duration_since(leg.asked_at);
+            if !self.hold && waited > config.answer {
+                failed.push((leg.id, format!("no-answer-{}ms", config.answer.as_millis())));
+            } else if leg.token.is_none() && !leg.passed_over && waited >= config.token_wait {
+                leg.passed_over = true;
+                self.events.push(LegEvent::PassedOver { leg: leg.id });
+            }
+        }
+        if !self.hold && !self.queued {
+            let suspect_after = self.suspect_after();
+            let live = self.legs_iter().filter(|leg| leg.is_live()).count();
+            for index in 0..MAX_LEGS {
+                let Some(leg) = self.legs[index].as_ref().filter(|leg| leg.is_live()) else {
+                    continue;
                 };
-                self.loss_estimate = Some(estimate);
-                // The compact plan follows a smoother estimate: NACK covers
-                // what a short rise of the loss leaves.
-                let smooth = smoothed_loss(self.compact_estimate, loss);
-                self.compact_estimate = Some(smooth);
-                if let Some(burst) = self.receiver.compact.take_burst(LegId::FIRST) {
-                    self.burst_max = Some(self.burst_max.map_or(burst, |max| max.max(burst)));
-                    self.burst_estimate = Some(match self.burst_estimate {
-                        Some(previous) => previous * 0.7 + burst * 0.3,
-                        None => burst,
+                let id = leg.id;
+                let quiet = now.saturating_duration_since(leg.last_datagram);
+                let no_media = now.saturating_duration_since(leg.media_since());
+                let here = self.receiver.compact.leg_highest(id);
+                let (mut other_datagram, mut other_delivers, mut other_first, mut ahead) =
+                    (false, false, false, false);
+                for other in self
+                    .legs_iter()
+                    .filter(|other| other.id != id && other.is_live())
+                {
+                    other_datagram |=
+                        now.saturating_duration_since(other.last_datagram) < config.silence;
+                    other_delivers |= !other.suspect
+                        && other
+                            .last_media
+                            .is_some_and(|at| now.saturating_duration_since(at) <= suspect_after);
+                    other_first |= other.last_first.is_some_and(|at| {
+                        now.saturating_duration_since(at) <= FIRST_ARRIVAL_WINDOW
                     });
+                    ahead |= match (self.receiver.compact.leg_highest(other.id), here) {
+                        (Some(theirs), Some(ours)) => theirs >= ours + SUSPECT_PARTS,
+                        (Some(_), None) => true,
+                        _ => false,
+                    };
                 }
-                self.loss_samples = self.loss_samples.saturating_add(1);
-                if !self.config.fixed_repair {
-                    let wanted = RepairPolicy::for_loss(estimate, self.base_repair);
-                    if wanted != self.repair {
-                        self.repair = wanted;
-                        self.repair_changes += 1;
-                        self.next_refresh = now;
-                    }
+                // Dead: silent while another leg sends, or without media
+                // while another delivers.
+                if quiet >= config.silence && other_datagram {
+                    failed.push((id, format!("silence-{}ms", config.silence.as_millis())));
+                    continue;
+                }
+                if no_media >= config.silence && other_delivers {
+                    failed.push((id, format!("behind-{}ms", config.silence.as_millis())));
+                    continue;
+                }
+                let suspect = !leg.suspect && ahead && no_media >= suspect_after;
+                let hedge = !leg.hedge_due
+                    && if live > 1 {
+                        no_media >= config.hedge_after && other_first
+                    } else {
+                        quiet >= config.lone_hedge_after
+                    };
+                let leg = self.legs[index].as_mut().expect("a live leg");
+                if suspect {
+                    leg.suspect = true;
+                    self.events.push(LegEvent::Suspect { leg: id });
+                }
+                if hedge {
+                    leg.hedge_due = true;
+                    self.events.push(LegEvent::HedgeDue { leg: id });
+                }
+                if suspect {
+                    // The plans without it, at once.
                     self.plan_legs(now);
                 }
             }
+            // Every leg silent: the silence says nothing about any one edge,
+            // and nobody is failed.
+            let silence = self.silence();
+            if live > 0
+                && self.next_all_silent.is_none_or(|at| now >= at)
+                && self
+                    .legs_iter()
+                    .filter(|leg| leg.is_live())
+                    .all(|leg| now.saturating_duration_since(leg.last_datagram) > silence)
+            {
+                self.all_silent = true;
+                self.next_all_silent = Some(now + config.silence.max(config.silence_repeat));
+                self.events.push(LegEvent::AllSilent { silence });
+            }
         }
-        // NACKs wait while datagrams are queued (they fill most holes), but
-        // no longer than one NACK retry (2 ms, or 1.5 round trips): a
-        // stream that keeps the socket busy (4K at 25k datagrams a second)
-        // never empties it, and its holes would wait until they were given
-        // up (wave 8 review).
+        for (leg, reason) in failed {
+            self.fail_leg(leg, reason, now, send);
+        }
+    }
+
+    /// The loss check of every leg: their repair, and the plans.
+    fn check_loss(&mut self, now: Instant) {
+        for index in 0..MAX_LEGS {
+            let Some(leg) = self.legs[index].as_ref() else {
+                continue;
+            };
+            let id = leg.id;
+            let policy = leg.repair;
+            let Some(loss) = self.receiver.take_loss(id, policy) else {
+                continue;
+            };
+            let burst = self.receiver.compact.take_burst(id);
+            self.loss_max = Some(self.loss_max.map_or(loss, |max| max.max(loss)));
+            if let Some(burst) = burst {
+                self.burst_max = Some(self.burst_max.map_or(burst, |max| max.max(burst)));
+            }
+            let leg = self.legs[index].as_mut().expect("the leg checked");
+            leg.loss_samples = leg.loss_samples.saturating_add(1);
+            // Rise at once, fall slowly.
+            leg.loss_estimate = Some(match leg.loss_estimate {
+                Some(previous) if loss < previous => previous * 0.8 + loss * 0.2,
+                _ => loss,
+            });
+            // The compact plan follows a smoother estimate: NACK covers
+            // what a short rise of the loss leaves.
+            leg.compact_estimate = Some(smoothed_loss(leg.compact_estimate, loss));
+            if let Some(burst) = burst {
+                leg.burst_estimate = Some(match leg.burst_estimate {
+                    Some(previous) => previous * 0.7 + burst * 0.3,
+                    None => burst,
+                });
+            }
+            if !self.config.fixed_repair {
+                let wanted = RepairPolicy::for_loss(
+                    leg.loss_estimate.unwrap_or(UNMEASURED_LOSS),
+                    leg.base_repair,
+                );
+                if wanted != leg.repair {
+                    leg.repair = wanted;
+                    self.repair_changes += 1;
+                    leg.next_refresh = now;
+                }
+            }
+        }
+        if let Some((loss, burst)) = self.receiver.compact.take_joint(now) {
+            self.joint_estimate = Some(smoothed_loss(self.joint_estimate, loss));
+            if let Some(burst) = burst {
+                self.joint_burst = Some(match self.joint_burst {
+                    Some(previous) => previous * 0.7 + burst * 0.3,
+                    None => burst,
+                });
+            }
+        }
+        if !self.config.fixed_repair {
+            self.plan_legs(now);
+        }
+    }
+
+    /// A leg's measures for its plan, with the burst band (B X3).
+    fn leg_loss(leg: &mut Leg) -> LegLoss {
+        let burst = leg.burst_estimate.unwrap_or(1.0);
+        leg.bursty = if leg.bursty {
+            burst >= BURSTY_UNTIL
+        } else {
+            burst >= BURSTY
+        };
+        LegLoss {
+            loss: leg.compact_estimate.unwrap_or(0.0),
+            burst: if leg.bursty {
+                burst.max(BURSTY)
+            } else {
+                burst.min(BURSTY_UNTIL)
+            },
+            rtt: leg.rtt,
+        }
+    }
+
+    /// The compact plans of the counted legs (B 3.3): one counted leg
+    /// plans for its own path once it has [`PLAN_SAMPLES`] samples; two
+    /// plan together once both have one. The repair leg's bytes of a part
+    /// are the ones the receiver keeps.
+    fn plan_legs(&mut self, now: Instant) {
+        let repair = self.repair_leg();
+        self.receiver.compact.set_prefer_leg(repair);
+        let Some(repair) = repair else {
+            return;
+        };
+        let mut counted: Vec<(Option<Instant>, LegId)> = self
+            .legs_iter()
+            .filter(|leg| leg.is_counted() && leg.id != repair)
+            .map(|leg| (leg.live_at, leg.id))
+            .collect();
+        counted.sort();
+        let interval = self.receiver.compact.part_interval();
+        let residual = self.config.residual_target;
+        let burst_rows = self.config.compact_burst_rows;
+        let short = self.short_header;
+        let repair_loss = {
+            let leg = self.legs[repair.index()].as_mut().expect("the repair leg");
+            if counted.is_empty() && leg.loss_samples < PLAN_SAMPLES {
+                return;
+            }
+            if leg.compact_estimate.is_none() {
+                return;
+            }
+            Self::leg_loss(leg)
+        };
+        let mut others = Vec::with_capacity(counted.len());
+        for (_, id) in &counted {
+            let leg = self.legs[id.index()].as_mut().expect("a counted leg");
+            if leg.compact_estimate.is_none() {
+                return;
+            }
+            others.push((*id, Self::leg_loss(leg)));
+        }
+        let joint = self
+            .joint_estimate
+            .map(|loss| (loss, self.joint_burst.unwrap_or(1.0)));
+        let plans = PathPlans::for_legs(
+            repair_loss,
+            others.first().map(|(_, loss)| *loss),
+            joint,
+            interval,
+            residual,
+            burst_rows,
+        );
+        self.offer_plan(repair, plans.repair.with_short_header(short), now);
+        if let Some(other) = plans.other {
+            for (id, _) in &others {
+                self.offer_plan(*id, other.with_short_header(short), now);
+            }
+        }
+    }
+
+    /// Take `wanted` as a leg's plan: at once if it asks for as much or
+    /// more, after [`PLAN_HOLD`] of wanting less if it asks for less.
+    fn offer_plan(&mut self, leg: LegId, wanted: CompactPlan, now: Instant) {
+        let Some(leg) = self.legs[leg.index()].as_mut() else {
+            return;
+        };
+        if wanted == leg.plan {
+            leg.lower_since = None;
+            return;
+        }
+        if plan_cost(wanted) < plan_cost(leg.plan) {
+            let since = *leg.lower_since.get_or_insert(now);
+            if now.saturating_duration_since(since) < PLAN_HOLD {
+                return;
+            }
+        }
+        leg.lower_since = None;
+        leg.plan = wanted;
+        leg.next_refresh = now;
+        self.plan_changes += 1;
+    }
+
+    /// Each leg's refresh, its first request's double, and its compact
+    /// lane's fall-back (B 3.1).
+    fn refresh_legs(&mut self, now: Instant, send: &mut dyn FnMut(SocketAddr, &[u8])) {
+        let config = self.config;
+        let delivering = self.delivering_mask(now);
+        for index in 0..MAX_LEGS {
+            let Some(leg) = self.legs[index].as_ref() else {
+                continue;
+            };
+            let id = leg.id;
+            let others = self.others_bits(id, delivering);
+            let leg = self.legs[index].as_mut().expect("a leg");
+            // `o=` follows the delivering legs at once.
+            if leg.is_live() && others != leg.others_sent {
+                leg.next_refresh = leg.next_refresh.min(now);
+            }
+            if leg.double_at.is_some_and(|at| now >= at) {
+                leg.double_at = None;
+                let from = leg.from_part.filter(|_| !leg.media_here);
+                let tokenless = leg.token.is_none();
+                self.send_subscribe(id, from, tokenless, false, now, send);
+            }
+            let leg = self.legs[index].as_mut().expect("a leg");
+            if leg
+                .compact_retry_at
+                .is_some_and(|at| now.saturating_duration_since(at) >= COMPACT_FALLBACK_AFTER)
+            {
+                // The retry went unanswered while the subscription without
+                // the lane stood: asked without it again, and not retried
+                // at this edge.
+                leg.compact_retry_at = None;
+                leg.compact_retries_here = COMPACT_RETRIES;
+                leg.compact_asked = false;
+                leg.base_repair = config.base_for(false);
+                leg.repair = policy_for(&config, leg);
+                leg.next_refresh = now;
+                self.compact_retries_unanswered += 1;
+            }
+            if now < leg.next_refresh {
+                continue;
+            }
+            // An edge that has not answered two requests for the compact
+            // lane (an edge older than the lane drops them) is asked
+            // without it, on the RaptorQ lane with its repair: for the rest
+            // of the run, so only after 1.5 s of silence (a lost ARP request
+            // alone holds a path's first datagrams for a second; wave 7
+            // review).
+            if falls_back_from_compact(
+                leg.compact_asked,
+                leg.token.is_some() || leg.is_live(),
+                leg.unanswered,
+                now.saturating_duration_since(leg.asked_at),
+            ) {
+                leg.compact_asked = false;
+                leg.base_repair = config.base_for(false);
+                leg.repair = policy_for(&config, leg);
+                self.compact_fallbacks += 1;
+            }
+            // Before the edge answers, keep asking from the same part
+            // (until it sends parts: it has admitted the client).
+            let live = leg.is_live();
+            let from = if live || leg.media_here {
+                None
+            } else {
+                leg.from_part
+            };
+            // A refresh with nothing else outstanding measures a round trip
+            // by its answer; one sent while another is unanswered gives none.
+            leg.refresh_sent_at = (live && leg.refresh_sent_at.is_none()).then_some(now);
+            if !live {
+                if leg.token.is_none() {
+                    leg.unanswered += 1;
+                }
+                leg.repeats = leg.repeats.saturating_add(1);
+            }
+            let renew = leg
+                .token_at
+                .is_some_and(|at| now.saturating_duration_since(at) >= TOKEN_RENEW_AFTER);
+            if renew {
+                leg.token_at = Some(now);
+            }
+            leg.next_refresh = now
+                + if live {
+                    REFRESH
+                } else {
+                    unanswered_wait(&config, leg)
+                };
+            self.send_subscribe(id, from, false, false, now, send);
+            if renew {
+                // The token is renewed before the edge forgets it: a
+                // tokenless SUB, which the edge answers with TOKEN and
+                // nothing else.
+                self.send_subscribe(id, None, true, false, now, send);
+            }
+        }
+    }
+
+    /// The NACKs due, each to its legs' edges, while the socket is empty
+    /// (or no longer than one NACK retry: a stream that keeps the socket
+    /// busy, 4K at 25k datagrams a second, never empties it; wave 8
+    /// review).
+    fn send_nacks(&mut self, now: Instant, send: &mut dyn FnMut(SocketAddr, &[u8])) {
         let queued = self.queued && self.config.nack_after_drain;
         let drained = if queued {
             let since = *self.queued_since.get_or_insert(now);
@@ -574,158 +1313,165 @@ impl UdpSession {
             self.queued_since = None;
             true
         };
-        if self.compact_confirmed && drained {
-            if let Some(token) = self.token {
-                let parts = self.receiver.nacks_due(now).take(LegId::FIRST);
-                if !parts.is_empty() {
-                    self.nack_datagrams += 1;
-                    send(
-                        target,
-                        &Control::Nack {
-                            stream_id: self.config.stream_id,
-                            token,
-                            parts,
-                        }
-                        .encode(),
-                    );
+        if !drained || !self.legs_iter().any(|leg| leg.compact_confirmed) {
+            return;
+        }
+        let mut due = self.receiver.nacks_due(now);
+        for leg in self.legs.iter().flatten() {
+            let parts = due.take(leg.id);
+            let Some(token) = leg.token.filter(|_| !parts.is_empty()) else {
+                continue;
+            };
+            self.nack_datagrams += 1;
+            send(
+                leg.target,
+                &Control::Nack {
+                    stream_id: self.config.stream_id,
+                    token,
+                    parts,
+                }
+                .encode(),
+            );
+        }
+    }
+
+    /// The legs' steadiness, and the new legs level with leaving ones.
+    fn judge_steady(&mut self, now: Instant) {
+        if now < self.next_judge {
+            return;
+        }
+        self.next_judge = now + JUDGE_EVERY;
+        for index in 0..MAX_LEGS {
+            let Some(leg) = self.legs[index].as_ref() else {
+                continue;
+            };
+            if !leg.is_live() {
+                continue;
+            }
+            let id = leg.id;
+            let steady = self.receiver.compact.steady(id);
+            let mut level = 0_u8;
+            if leg.leaving.is_none() && steady {
+                for old in self.legs_iter() {
+                    if old.leaving.is_some()
+                        && old.id != id
+                        && leg.level_with & old.bit() == 0
+                        && self.receiver.compact.level(id, old.id)
+                    {
+                        level |= old.bit();
+                    }
                 }
             }
-        }
-        if self
-            .compact_retry_at
-            .is_some_and(|at| now.saturating_duration_since(at) >= COMPACT_FALLBACK_AFTER)
-        {
-            // The retry went unanswered while the subscription without the
-            // lane stood: asked without it again, and not retried here.
-            self.compact_retry_at = None;
-            self.compact_retries_unanswered += 1;
-            self.compact_retries_here = COMPACT_RETRIES;
-            self.compact_asked = false;
-            self.base_repair = self.config.base_for(false);
-            self.repair = self.policy_for_base();
-            self.next_refresh = now;
-        }
-        if now >= self.next_refresh {
-            // An edge that has not answered two requests for the compact
-            // lane (an edge older than the lane drops them) is asked without
-            // it, on the RaptorQ lane with its repair: for the rest of the
-            // run, so only after 1.5 s of silence (a lost ARP request alone
-            // holds a path's first datagrams for a second; wave 7 review).
-            if falls_back_from_compact(
-                self.compact_asked,
-                self.token.is_some() || self.subscribed,
-                self.unanswered,
-                now.saturating_duration_since(self.asked_at),
-            ) {
-                self.compact_asked = false;
-                self.compact_fallbacks += 1;
-                self.base_repair = self.config.base_for(false);
-                self.repair = self.policy_for_base();
+            let leg = self.legs[index].as_mut().expect("a live leg");
+            if steady && !leg.steady {
+                self.events.push(LegEvent::Steady { leg: id });
             }
-            // Before the edge answers, keep asking from the same part
-            // (until it sends parts: it has admitted the client).
-            let from = if self.subscribed || self.media_here {
-                None
-            } else {
-                self.from_part
-            };
-            send(target, &self.subscribe_datagram(from));
-            self.last_request_at = now;
-            if self.token.is_none() && !self.subscribed {
-                self.unanswered += 1;
+            leg.steady = steady;
+            leg.level_with |= level;
+            for with in 0..MAX_LEGS {
+                if level & (1 << with) != 0 {
+                    self.events.push(LegEvent::Level {
+                        leg: id,
+                        with: LegId::from_index(with),
+                    });
+                }
             }
-            self.next_refresh = now
-                + if self.subscribed {
-                    REFRESH
-                } else {
-                    self.repeats = self.repeats.saturating_add(1);
-                    self.unanswered_wait()
-                };
-        }
-        None
-    }
-
-    /// The compact plan from the estimates (B X3): the burst band, the
-    /// plan of an unmeasured path until [`PLAN_SAMPLES`] samples, and a
-    /// plan that asks for less only after [`PLAN_HOLD`].
-    fn plan_legs(&mut self, now: Instant) {
-        if self.loss_samples < PLAN_SAMPLES {
-            return;
-        }
-        let burst = self.burst_estimate.unwrap_or(1.0);
-        self.bursty = if self.bursty {
-            burst >= BURSTY_UNTIL
-        } else {
-            burst >= BURSTY
-        };
-        let burst = if self.bursty {
-            burst.max(BURSTY)
-        } else {
-            burst.min(BURSTY_UNTIL)
-        };
-        let plans = PathPlans::for_legs(
-            LegLoss {
-                loss: self.compact_estimate.unwrap_or(0.0),
-                burst,
-                rtt: self.rtt,
-            },
-            None,
-            None,
-            self.receiver.compact.part_interval(),
-            self.config.residual_target,
-            self.config.compact_burst_rows,
-        );
-        self.offer_plan(plans.repair.with_short_header(self.short_header), now);
-    }
-
-    /// Take `wanted` as the plan: at once if it asks for as much or more,
-    /// after [`PLAN_HOLD`] of wanting less if it asks for less.
-    fn offer_plan(&mut self, wanted: CompactPlan, now: Instant) {
-        if wanted == self.plan {
-            self.lower_since = None;
-            return;
-        }
-        if plan_cost(wanted) < plan_cost(self.plan) {
-            let since = *self.lower_since.get_or_insert(now);
-            if now.saturating_duration_since(since) < PLAN_HOLD {
-                return;
-            }
-        }
-        self.lower_since = None;
-        self.plan = wanted;
-        self.plan_changes += 1;
-        self.next_refresh = now;
-    }
-
-    /// The silence that moves the client now (see
-    /// [`SessionConfig::silence_repeat`]).
-    fn silence(&self) -> Duration {
-        if self.moved_for_silence {
-            self.config.silence.max(self.config.silence_repeat)
-        } else {
-            self.config.silence
         }
     }
 
     /// When [`Self::poll`] wants to run next.
     pub fn next_wake(&self) -> Instant {
-        let silence_at = if self.subscribed {
-            self.last_datagram + self.silence()
-        } else {
-            self.asked_at + self.config.answer
+        let mut wake = self.next_loss_check;
+        // A verdict's time that the last poll judged already is not woken
+        // for again (no spin while, say, every leg stays silent).
+        let polled = self.polled_at;
+        let verdict = |wake: &mut Instant, at: Instant| {
+            if at > polled {
+                *wake = (*wake).min(at);
+            }
         };
-        let mut wake = self.next_refresh.min(self.next_loss_check);
-        // A held session reports no silence: no wake for it either (it
-        // would be due at once, every time).
-        if !self.hold {
-            wake = wake.min(silence_at + Duration::from_millis(1));
+        let ms = Duration::from_millis(1);
+        for released in &self.released {
+            if let Some(at) = released.second_unsub {
+                wake = wake.min(at);
+            }
         }
-        if self.compact_confirmed {
+        let judging = !self.hold && !self.queued;
+        let suspect_after = self.suspect_after();
+        let live = self.legs_iter().filter(|leg| leg.is_live()).count();
+        let mut last_datagram: Option<Instant> = None;
+        for leg in self.legs_iter() {
+            wake = wake.min(leg.next_refresh);
+            if let Some(at) = leg.double_at {
+                wake = wake.min(at);
+            }
+            if !leg.is_live() {
+                // A held session reports no failure: no wake for one.
+                if !self.hold {
+                    verdict(&mut wake, leg.asked_at + self.config.answer + ms);
+                }
+                if leg.token.is_none() && !leg.passed_over {
+                    verdict(&mut wake, leg.asked_at + self.config.token_wait);
+                }
+                continue;
+            }
+            last_datagram =
+                Some(last_datagram.map_or(leg.last_datagram, |at| at.max(leg.last_datagram)));
+            if !judging {
+                continue;
+            }
+            let media = leg.media_since();
+            if live > 1 {
+                verdict(&mut wake, leg.last_datagram + self.config.silence);
+                verdict(&mut wake, media + self.config.silence);
+                if !leg.hedge_due {
+                    verdict(&mut wake, media + self.config.hedge_after);
+                }
+                if !leg.suspect {
+                    verdict(&mut wake, media + suspect_after);
+                }
+            } else if !leg.hedge_due {
+                verdict(&mut wake, leg.last_datagram + self.config.lone_hedge_after);
+            }
+        }
+        if let Some(last) = last_datagram.filter(|_| judging) {
+            let at = (last + self.silence() + ms).max(self.next_all_silent.unwrap_or(last));
+            verdict(&mut wake, at);
+        }
+        if live > 1
+            && self
+                .legs_iter()
+                .any(|leg| leg.is_live() && (!leg.steady || leg.leaving.is_some()))
+        {
+            wake = wake.min(self.next_judge);
+        }
+        if self.legs_iter().any(|leg| leg.compact_confirmed) {
             if let Some(at) = self.receiver.compact.next_nack_at() {
                 wake = wake.min(at);
             }
         }
         wake
+    }
+
+    /// Which leg a datagram from `peer` is for: the leg whose edge is
+    /// exactly `peer`, else (unless `peer` is an edge let go) the only leg
+    /// at that address (B 3.1).
+    fn attribute(&self, peer: SocketAddr, now: Instant) -> Option<LegId> {
+        if let Some(leg) = self.legs_iter().find(|leg| leg.target == peer) {
+            return Some(leg.id);
+        }
+        if self
+            .released
+            .iter()
+            .any(|released| released.target == peer && now < released.until)
+        {
+            return None;
+        }
+        let mut same_ip = self.legs_iter().filter(|leg| leg.target.ip() == peer.ip());
+        match (same_ip.next(), same_ip.next()) {
+            (Some(leg), None) => Some(leg.id),
+            _ => None,
+        }
     }
 
     /// A datagram from `peer`, received at `now`.
@@ -736,112 +1482,267 @@ impl UdpSession {
         now: Instant,
         send: &mut dyn FnMut(SocketAddr, &[u8]),
     ) -> Received {
-        let Some(target) = self.target else {
+        let Some(id) = self.attribute(peer, now) else {
+            // An edge let go in the last 10 s that still sends: UNSUB again.
+            let exact = self.released.iter().any(|released| released.target == peer);
+            if let Some(released) = self.released.iter_mut().find(|released| {
+                (released.target == peer || (!exact && released.target.ip() == peer.ip()))
+                    && now < released.until
+            }) {
+                if let Some(token) = released.token.filter(|_| {
+                    released
+                        .answered_at
+                        .is_none_or(|at| now.saturating_duration_since(at) >= RELEASED_ANSWER_EVERY)
+                }) {
+                    released.answered_at = Some(now);
+                    Self::unsubscribe(self.config.stream_id, released.target, token, send);
+                }
+            }
             return Received::Ignored;
         };
-        if peer.ip() != target.ip() {
-            return Received::Ignored;
-        }
-        self.last_datagram = now;
-        if let Some(control) = Control::decode(datagram) {
-            match control {
-                Control::Token { token: given, .. } => {
-                    self.first_token_at.get_or_insert(now);
-                    if self.token != Some(given) {
-                        // A request and its answer: the round trip that
-                        // the NACKs wait for. Not when the request was
-                        // repeated (Karn): the answer may be to an earlier
-                        // copy, and the time since the last one is short
-                        // of the round trip (wave 9 review).
-                        if self.token.is_none() && self.repeats == 0 {
-                            let rtt = now.saturating_duration_since(self.last_request_at);
-                            self.receiver.compact.set_leg_rtt(LegId::FIRST, rtt);
-                            self.rtt = Some(rtt);
-                        }
-                        self.token = Some(given);
-                        let from = self.from_part.filter(|_| !self.media_here);
-                        send(target, &self.subscribe_datagram(from));
-                        self.last_request_at = now;
-                        // The request with the token is a new request: its
-                        // own repeats, from the first wait.
-                        if !self.subscribed && !self.config.first_retry.is_zero() {
-                            self.repeats = 0;
-                            self.next_refresh = now + self.unanswered_wait();
-                        }
-                    }
-                    Received::Control
+        let index = id.index();
+        let leg = self.legs[index].as_mut().expect("an attributed leg");
+        leg.last_datagram = now;
+        let Some(control) = Control::decode(datagram) else {
+            return self.on_media(id, datagram, now);
+        };
+        match control {
+            Control::Token { token: given, .. } => {
+                self.first_token_at.get_or_insert(now);
+                leg.token_at = Some(now);
+                if leg.token == Some(given) {
+                    return Received::Control;
                 }
-                Control::Subscribed {
-                    next_part, compact, ..
-                } => {
-                    // An edge older than the short form refuses a plan word
-                    // with it (C...7) and serves the RaptorQ lane: asked
-                    // again at once with the long form (wave 7 review). An
-                    // edge that refuses the lane for another reason refuses
-                    // that too.
-                    if drops_short_header(compact, self.compact_asked, self.plan) {
-                        self.short_header = false;
-                        self.short_header_dropped += 1;
-                        self.plan = self.plan.with_short_header(false);
-                        self.next_refresh = now;
-                        return Received::Control;
-                    }
-                    let first = !self.subscribed;
-                    if first {
-                        self.first_subscribed_at.get_or_insert(now);
-                        self.first_subscribed_part.get_or_insert(next_part);
-                        self.receiver.expect(
-                            LegId::FIRST,
-                            self.config.stream_id,
-                            next_part,
-                            compact,
-                        );
-                    }
-                    self.compact_confirmed = compact;
-                    if compact {
-                        self.compact_retry_at = None;
-                    }
-                    self.subscribed = true;
-                    self.next_refresh = now + REFRESH;
-                    // An edge that does not serve the compact lane (OK
-                    // without C): the RaptorQ lane's repair, at once.
-                    let wanted_base = self.config.base_for(compact);
-                    if wanted_base != self.base_repair {
-                        self.base_repair = wanted_base;
-                        self.repair = self.policy_for_base();
-                        self.next_refresh = now;
-                    }
-                    // Answered without the lane that the client gave up for
-                    // want of an answer: the edge hears it, so the lane is
-                    // asked for again (at most COMPACT_RETRIES times here).
-                    if !compact
-                        && !self.compact_asked
-                        && self.config.compact
-                        && self.config.compact_retry
-                        && self.compact_fallbacks > 0
-                        && self.compact_retries_here < COMPACT_RETRIES
-                    {
-                        self.compact_retries_here += 1;
-                        self.compact_retries += 1;
-                        self.compact_retry_at = Some(now);
-                        self.compact_asked = true;
-                        self.base_repair = self.config.base_for(true);
-                        self.repair = self.policy_for_base();
-                        self.next_refresh = now;
-                    }
-                    Received::Subscribed { next_part, first }
+                // A request and its answer: the round trip that the NACKs
+                // wait for, from the request's first copy. Not when the
+                // request was repeated (Karn): the answer may be to an
+                // earlier copy (wave 9 review).
+                if leg.token.is_none() && leg.repeats == 0 {
+                    let rtt = now.saturating_duration_since(leg.request_sent_at);
+                    leg.rtt = Some(rtt);
+                    self.receiver.compact.set_leg_rtt(id, rtt);
                 }
-                Control::Move { reason, .. } | Control::Refused { reason, .. } => {
-                    Received::Move(reason)
+                let first = leg.token.is_none();
+                leg.token = Some(given);
+                if leg.state == LegState::Asking {
+                    leg.state = LegState::Tokened;
                 }
-                _ => Received::Control,
+                self.events.push(LegEvent::Tokened {
+                    leg: id,
+                    token: given,
+                });
+                let leg = self.legs[index].as_mut().expect("an attributed leg");
+                let from = leg.from_part.filter(|_| !leg.media_here);
+                let live = leg.is_live();
+                self.send_subscribe(id, from, false, false, now, send);
+                // The request with the token is a new request: its own
+                // repeats, from the first wait, and its own double.
+                if !live {
+                    let leg = self.legs[index].as_mut().expect("an attributed leg");
+                    leg.request_sent_at = now;
+                    leg.repeats = 0;
+                    leg.double_at = (first && !self.config.first_double.is_zero())
+                        .then(|| now + self.config.first_double);
+                    if !self.config.first_retry.is_zero() {
+                        leg.next_refresh = now + unanswered_wait(&self.config, leg);
+                    }
+                }
+                self.sync_nack(id);
+                Received::Control
             }
-        } else {
-            self.moved_for_silence = false;
-            self.media_here = true;
-            self.pending = self.receiver.push(LegId::FIRST, datagram);
-            Received::Media
+            Control::Subscribed {
+                next_part, compact, ..
+            } => self.on_subscribed(id, next_part, compact, now, send),
+            Control::Move { reason, .. } => {
+                // A MOVE within a round trip of a take-back, before its OK,
+                // answers the SUB before it.
+                if leg.takeback_at.is_some_and(|at| {
+                    now.saturating_duration_since(at) <= leg.rtt.unwrap_or(Duration::ZERO)
+                }) {
+                    return Received::Control;
+                }
+                leg.takeback_at = None;
+                self.sample_refresh(id, now);
+                let leg = self.legs[index].as_mut().expect("an attributed leg");
+                if !leg.is_live() {
+                    // The edge refuses a leg it never served.
+                    self.fail_leg(id, reason.clone(), now, send);
+                    return Received::Move(reason);
+                }
+                if leg.leaving.as_deref() != Some(reason.as_str()) {
+                    leg.state = LegState::Leaving;
+                    leg.leaving = Some(reason.clone());
+                    self.events.push(LegEvent::Moved {
+                        leg: id,
+                        reason: reason.clone(),
+                    });
+                }
+                Received::Move(reason)
+            }
+            Control::Refused { reason, .. } => {
+                self.fail_leg(id, reason.clone(), now, send);
+                Received::Move(reason)
+            }
+            _ => Received::Control,
         }
+    }
+
+    /// A refresh answered: a round trip, if nothing else was outstanding.
+    fn sample_refresh(&mut self, leg: LegId, now: Instant) {
+        let Some(state) = self.legs[leg.index()].as_mut() else {
+            return;
+        };
+        if let Some(sent) = state.refresh_sent_at.take() {
+            let rtt = now.saturating_duration_since(sent);
+            state.rtt = Some(state.rtt.map_or(rtt, |previous| (previous * 7 + rtt) / 8));
+            self.receiver.compact.set_leg_rtt(leg, rtt);
+        }
+    }
+
+    fn on_subscribed(
+        &mut self,
+        id: LegId,
+        next_part: u64,
+        compact: bool,
+        now: Instant,
+        send: &mut dyn FnMut(SocketAddr, &[u8]),
+    ) -> Received {
+        let index = id.index();
+        let leg = self.legs[index].as_mut().expect("an attributed leg");
+        // An edge older than the short form refuses a plan word with it
+        // (C...7) and serves the RaptorQ lane: asked again at once with the
+        // long form (wave 7 review). An edge that refuses the lane for
+        // another reason refuses that too.
+        if drops_short_header(compact, leg.compact_asked, leg.plan) {
+            self.short_header = false;
+            self.short_header_dropped += 1;
+            for leg in self.legs.iter_mut().flatten() {
+                leg.plan = leg.plan.with_short_header(false);
+            }
+            let leg = self.legs[index].as_mut().expect("an attributed leg");
+            leg.next_refresh = now;
+            return Received::Control;
+        }
+        let first = !leg.is_live() && leg.first_part.is_none();
+        if leg.takeback_at.take().is_some() && leg.state == LegState::Leaving {
+            leg.state = LegState::Live;
+            leg.leaving = None;
+            leg.level_with = 0;
+            self.events.push(LegEvent::TakenBack { leg: id });
+        }
+        if !first {
+            self.sample_refresh(id, now);
+        }
+        let leg = self.legs[index].as_mut().expect("an attributed leg");
+        if first {
+            // The first answer to the SUB with the token: a round trip, if
+            // only the double went.
+            if leg.repeats == 0 && leg.token.is_some() {
+                let rtt = now.saturating_duration_since(leg.request_sent_at);
+                leg.rtt = Some(leg.rtt.map_or(rtt, |previous| (previous * 7 + rtt) / 8));
+                self.receiver.compact.set_leg_rtt(id, rtt);
+            }
+            let leg = self.legs[index].as_mut().expect("an attributed leg");
+            leg.double_at = None;
+            match self
+                .receiver
+                .expect(id, self.config.stream_id, next_part, compact)
+            {
+                LegStart::Started => {}
+                LegStart::Stale => {
+                    self.stale_starts += 1;
+                    self.fail_leg(id, "stale-start".to_owned(), now, send);
+                    return Received::Control;
+                }
+                LegStart::Displaces(stale) => {
+                    self.stale_starts += 1;
+                    self.fail_leg(stale, "stale-start".to_owned(), now, send);
+                }
+            }
+            self.first_subscribed_at.get_or_insert(now);
+            self.first_subscribed_part.get_or_insert(next_part);
+            let leg = self.legs[index].as_mut().expect("an attributed leg");
+            leg.first_part = Some(next_part);
+            leg.state = LegState::Live;
+            leg.live_at = Some(now);
+            self.events.push(LegEvent::Live {
+                leg: id,
+                first_part: next_part,
+            });
+        }
+        let leg = self.legs[index].as_mut().expect("an attributed leg");
+        if !leg.is_live() {
+            leg.state = LegState::Live;
+        }
+        leg.compact_confirmed = compact;
+        if compact {
+            leg.compact_retry_at = None;
+        }
+        leg.next_refresh = now + REFRESH;
+        // An edge that does not serve the compact lane (OK without C): the
+        // RaptorQ lane's repair, at once.
+        let wanted_base = self.config.base_for(compact);
+        if wanted_base != leg.base_repair {
+            leg.base_repair = wanted_base;
+            leg.repair = policy_for(&self.config, leg);
+            leg.next_refresh = now;
+        }
+        // Answered without the lane that the client gave up for want of an
+        // answer: the edge hears it, so the lane is asked for again (at
+        // most COMPACT_RETRIES times at this edge).
+        let leg = self.legs[index].as_mut().expect("an attributed leg");
+        if !compact
+            && !leg.compact_asked
+            && self.config.compact
+            && self.config.compact_retry
+            && self.compact_fallbacks > 0
+            && leg.compact_retries_here < COMPACT_RETRIES
+        {
+            leg.compact_retries_here += 1;
+            self.compact_retries += 1;
+            leg.compact_retry_at = Some(now);
+            leg.compact_asked = true;
+            leg.base_repair = self.config.base_for(true);
+            leg.repair = policy_for(&self.config, leg);
+            leg.next_refresh = now;
+        }
+        self.sync_nack(id);
+        Received::Subscribed { next_part, first }
+    }
+
+    fn on_media(&mut self, id: LegId, datagram: &[u8], now: Instant) -> Received {
+        let index = id.index();
+        let leg = self.legs[index].as_mut().expect("an attributed leg");
+        if let Some(last) = leg.last_media {
+            leg.longest_gap = leg.longest_gap.max(now.saturating_duration_since(last));
+        }
+        leg.last_media = Some(now);
+        leg.media_here = true;
+        leg.hedge_due = false;
+        leg.datagrams += 1;
+        leg.wire_bytes += (datagram.len() + IP_UDP_HEADER_BYTES) as u64;
+        self.all_silent = false;
+        self.next_all_silent = None;
+        let first_before = self.receiver.compact.leg_stats(id).parts_first;
+        let raptorq = !is_compact_datagram(datagram);
+        self.pending = self.receiver.push(id, datagram);
+        if self.pending.is_some() || self.receiver.compact.leg_stats(id).parts_first > first_before
+        {
+            let leg = self.legs[index].as_mut().expect("an attributed leg");
+            leg.last_first = Some(now);
+            self.raptorq_recent = (self.raptorq_recent << 1) | u16::from(raptorq);
+            self.delivered_recent = self.delivered_recent.saturating_add(1).min(16);
+        }
+        let leg = self.legs[index].as_mut().expect("an attributed leg");
+        if leg.suspect {
+            let newest = self.receiver.compact.newest();
+            let here = self.receiver.compact.leg_highest(id);
+            if here.is_some_and(|here| newest.is_none_or(|newest| here + SUSPECT_PARTS > newest)) {
+                leg.suspect = false;
+                self.plan_legs(now);
+            }
+        }
+        Received::Media
     }
 
     /// The objects that the last media datagram delivered, one at a time.
@@ -857,6 +1758,124 @@ impl UdpSession {
     }
 }
 
+/// A datagram of the compact lane (long or short form).
+fn is_compact_datagram(datagram: &[u8]) -> bool {
+    crate::client_compact::is_compact(datagram) || crate::client_compact::is_short(datagram)
+}
+
+impl SessionLegs for UdpSession {
+    fn add_leg(
+        &mut self,
+        node: &str,
+        target: SocketAddr,
+        from_part: Option<u64>,
+        token: Option<u64>,
+        now: Instant,
+        send: &mut dyn FnMut(SocketAddr, &[u8]),
+    ) -> Option<LegId> {
+        self.open_leg(node, target, from_part, token, None, now, send)
+    }
+
+    fn release_leg(&mut self, leg: LegId, now: Instant, send: &mut dyn FnMut(SocketAddr, &[u8])) {
+        self.drop_leg(leg, true, now, send);
+    }
+
+    fn takeback_leg(&mut self, leg: LegId, now: Instant, send: &mut dyn FnMut(SocketAddr, &[u8])) {
+        let from = self.receiver.compact.newest().map(|newest| newest + 1);
+        let Some(state) = self.legs[leg.index()].as_mut() else {
+            return;
+        };
+        state.takeback_at = Some(now);
+        state.refresh_sent_at = None;
+        self.send_subscribe(leg, from, false, false, now, send);
+    }
+
+    fn reask_leg(&mut self, leg: LegId, now: Instant, send: &mut dyn FnMut(SocketAddr, &[u8])) {
+        let from = self
+            .receiver
+            .compact
+            .lowest_hole()
+            .or_else(|| self.receiver.compact.newest().map(|newest| newest + 1));
+        if let Some(state) = self.legs[leg.index()].as_mut() {
+            state.refresh_sent_at = None;
+            self.send_subscribe(leg, from, false, from.is_some(), now, send);
+        }
+    }
+
+    fn poll_legs(&mut self, now: Instant, send: &mut dyn FnMut(SocketAddr, &[u8])) {
+        let stream_id = self.config.stream_id;
+        self.released.retain_mut(|released| {
+            if let (Some(at), Some(token)) = (released.second_unsub, released.token) {
+                if now >= at {
+                    released.second_unsub = None;
+                    Self::unsubscribe(stream_id, released.target, token, send);
+                }
+            }
+            now < released.until
+        });
+        self.judge_legs(now, send);
+        if now >= self.next_loss_check {
+            self.next_loss_check = now + LOSS_CHECK;
+            self.check_loss(now);
+        }
+        self.send_nacks(now, send);
+        self.refresh_legs(now, send);
+        self.judge_steady(now);
+        self.polled_at = now;
+    }
+
+    fn take_events(&mut self) -> Vec<LegEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    fn legs(&self) -> Vec<LegView> {
+        let now = Instant::now();
+        let delivering = self.delivering_mask(now);
+        self.legs_iter()
+            .map(|leg| LegView {
+                leg: leg.id,
+                node: leg.node.clone(),
+                target: leg.target,
+                state: leg.state,
+                token: leg.token,
+                first_part: leg.first_part,
+                leaving: leg.leaving.clone(),
+                delivering: delivering & leg.bit() != 0,
+                suspect: leg.suspect,
+                compact: leg.compact_confirmed,
+                rtt: leg.rtt,
+                datagrams: leg.datagrams,
+                wire_bytes: leg.wire_bytes,
+                longest_gap: leg.longest_gap,
+            })
+            .collect()
+    }
+
+    fn newest(&self) -> Option<u64> {
+        self.receiver.compact.newest()
+    }
+
+    fn oldest_hole(&self) -> Option<u64> {
+        self.receiver.compact.lowest_hole()
+    }
+
+    fn steady(&self, leg: LegId) -> bool {
+        self.receiver.compact.steady(leg)
+    }
+
+    fn level(&self, new: LegId, old: LegId) -> bool {
+        self.receiver.compact.level(new, old)
+    }
+
+    fn mostly_raptorq(&self) -> bool {
+        self.delivered_recent >= 16 && self.raptorq_recent.count_ones() >= 8
+    }
+
+    fn next_wake(&self) -> Instant {
+        UdpSession::next_wake(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -867,6 +1886,27 @@ mod tests {
         "127.0.0.1:19446".parse().unwrap()
     }
 
+    /// The session's only leg.
+    fn only(session: &UdpSession) -> &Leg {
+        let mut legs = session.legs.iter().flatten();
+        let leg = legs.next().expect("a leg");
+        assert!(legs.next().is_none(), "one leg");
+        leg
+    }
+
+    fn only_mut(session: &mut UdpSession) -> &mut Leg {
+        session.legs.iter_mut().flatten().next().expect("a leg")
+    }
+
+    /// The defaults without the doubled first requests (B X5), for the
+    /// tests of the repeats' schedule.
+    fn undoubled(stream_id: u64) -> SessionConfig {
+        SessionConfig {
+            first_double: Duration::ZERO,
+            ..SessionConfig::new(stream_id)
+        }
+    }
+
     /// Wave 9 B: an unanswered request is repeated after 25 ms, then after
     /// twice as long each time up to 300 ms; the request with the token
     /// starts its own repeats, after three round trips at least. With
@@ -874,7 +1914,7 @@ mod tests {
     #[test]
     fn an_unanswered_request_is_repeated_after_a_few_round_trips() {
         let now = Instant::now();
-        let mut session = UdpSession::new(SessionConfig::new(4001), now);
+        let mut session = UdpSession::new(undoubled(4001), now);
         let mut sent: Vec<(Instant, Vec<u8>)> = Vec::new();
         session.begin(edge(), None, now, &mut |_, datagram| {
             sent.push((now, datagram.to_vec()))
@@ -892,10 +1932,16 @@ mod tests {
         // The token comes 4 ms after the last request: the request with
         // it is repeated 25 ms later (three round trips are 12 ms), then 50.
         let last = sent.last().unwrap().0;
-        let token = Control::Token { stream_id: 4001, token: 77 }.encode();
+        let token = Control::Token {
+            stream_id: 4001,
+            token: 77,
+        }
+        .encode();
         let answered = last + Duration::from_millis(4);
         let mut with_token: Vec<Instant> = Vec::new();
-        session.on_datagram(edge(), &token, answered, &mut |_, _| with_token.push(answered));
+        session.on_datagram(edge(), &token, answered, &mut |_, _| {
+            with_token.push(answered)
+        });
         assert_eq!(with_token.len(), 1);
         while with_token.len() < 3 {
             let wake = session.next_wake();
@@ -903,7 +1949,10 @@ mod tests {
             session.poll(wake, &mut |_, datagram| {
                 assert!(matches!(
                     Control::decode(datagram),
-                    Some(Control::Subscribe { token: Some(77), .. })
+                    Some(Control::Subscribe {
+                        token: Some(77),
+                        ..
+                    })
                 ));
                 with_token.push(wake)
             });
@@ -911,21 +1960,24 @@ mod tests {
         assert_eq!(with_token[1] - with_token[0], Duration::from_millis(25));
         assert_eq!(with_token[2] - with_token[1], Duration::from_millis(50));
         // A slower edge: three round trips.
-        let mut session = UdpSession::new(SessionConfig::new(4001), now);
+        let mut session = UdpSession::new(undoubled(4001), now);
         session.begin(edge(), None, now, &mut |_, _| {});
         let answered = now + Duration::from_millis(40);
         session.on_datagram(edge(), &token, answered, &mut |_, _| {});
-        assert_eq!(session.next_refresh - answered, Duration::from_millis(120));
+        assert_eq!(
+            only(&session).next_refresh - answered,
+            Duration::from_millis(120)
+        );
         // Before wave 9: every 300 ms.
         let config = SessionConfig {
             first_retry: Duration::ZERO,
-            ..SessionConfig::new(4001)
+            ..undoubled(4001)
         };
         let mut session = UdpSession::new(config, now);
         session.begin(edge(), None, now, &mut |_, _| {});
-        assert_eq!(session.next_refresh - now, UNANSWERED_REFRESH);
+        assert_eq!(only(&session).next_refresh - now, UNANSWERED_REFRESH);
         session.poll(now + UNANSWERED_REFRESH, &mut |_, _| {});
-        assert_eq!(session.next_refresh - now, UNANSWERED_REFRESH * 2);
+        assert_eq!(only(&session).next_refresh - now, UNANSWERED_REFRESH * 2);
     }
 
     /// Wave 9 review: an answer to a repeated request gives no round trip
@@ -934,22 +1986,29 @@ mod tests {
     #[test]
     fn a_repeated_request_gives_no_round_trip_and_stops_naming_its_part() {
         let now = Instant::now();
-        let mut session = UdpSession::new(SessionConfig::new(4001), now);
+        let mut session = UdpSession::new(undoubled(4001), now);
         session.begin(edge(), Some(500), now, &mut |_, _| {});
         // The first request is repeated at 25 ms; the token comes at 45 ms
         // (an answer to either: 45 or 20 ms).
         let repeat = session.next_wake();
         assert_eq!(repeat - now, Duration::from_millis(25));
         session.poll(repeat, &mut |_, _| {});
-        let token = Control::Token { stream_id: 4001, token: 9 }.encode();
+        let token = Control::Token {
+            stream_id: 4001,
+            token: 9,
+        }
+        .encode();
         let answered = now + Duration::from_millis(45);
         let mut sent: Vec<Vec<u8>> = Vec::new();
         session.on_datagram(edge(), &token, answered, &mut |_, datagram| {
             sent.push(datagram.to_vec())
         });
-        assert_eq!(session.rtt, None);
+        assert_eq!(only(&session).rtt, None);
         // So the request with the token waits the first retry, not 3 x 20.
-        assert_eq!(session.next_refresh - answered, Duration::from_millis(25));
+        assert_eq!(
+            only(&session).next_refresh - answered,
+            Duration::from_millis(25)
+        );
         match Control::decode(&sent[0]) {
             Some(Control::Subscribe { from_part, .. }) => assert_eq!(from_part, Some(500)),
             other => panic!("{other:?}"),
@@ -958,7 +2017,7 @@ mod tests {
         let mut fresh = UdpSession::new(SessionConfig::new(4001), now);
         fresh.begin(edge(), None, now, &mut |_, _| {});
         fresh.on_datagram(edge(), &token, answered, &mut |_, _| {});
-        assert_eq!(fresh.rtt, Some(Duration::from_millis(45)));
+        assert_eq!(only(&fresh).rtt, Some(Duration::from_millis(45)));
         // A part comes before the OK (the OK is lost): the next repeat
         // names no part.
         let published = std::time::SystemTime::now()
@@ -971,13 +2030,15 @@ mod tests {
             session.on_datagram(edge(), &part, at, &mut |_, _| {}),
             Received::Media
         );
-        let wake = session.next_refresh;
+        let wake = only(&session).next_refresh;
         let mut repeated: Vec<Vec<u8>> = Vec::new();
         session.poll(wake, &mut |_, datagram| repeated.push(datagram.to_vec()));
         let sub = repeated
             .iter()
             .find_map(|datagram| match Control::decode(datagram) {
-                Some(Control::Subscribe { from_part, token, .. }) => Some((from_part, token)),
+                Some(Control::Subscribe {
+                    from_part, token, ..
+                }) => Some((from_part, token)),
                 _ => None,
             })
             .expect("a repeated SUB");
@@ -1014,7 +2075,7 @@ mod tests {
             }
         );
         assert!(session.is_subscribed());
-        assert!(session.compact_confirmed);
+        assert!(session.compact_confirmed());
         // The compact header carries the publication time relative to the
         // receiver's clock: a time of now.
         let published = std::time::SystemTime::now()
@@ -1094,7 +2155,9 @@ mod tests {
                 Some(Control::Unsubscribe { token: 9, .. })
             )));
         assert_eq!(session.edges, 3);
-        assert_eq!(session.receiver.flows, 3);
+        // Each edge is a leg of its own, with its own decoders: a move is
+        // no new flow (B X4, X5).
+        assert_eq!(session.receiver.flows, 1);
     }
 
     /// A session subscribed at `edge()` with a part received at `at`.
@@ -1130,7 +2193,9 @@ mod tests {
         assert_eq!(config.silence, Duration::from_millis(200));
         let mut session = subscribed(config, now);
         let mut send = |_: SocketAddr, _: &[u8]| {};
-        assert!(session.poll(now + Duration::from_millis(150), &mut send).is_none());
+        assert!(session
+            .poll(now + Duration::from_millis(150), &mut send)
+            .is_none());
         let reason = session
             .poll(now + Duration::from_millis(201), &mut send)
             .expect("move");
@@ -1139,9 +2204,18 @@ mod tests {
         let moved_at = now + Duration::from_millis(201);
         let next: SocketAddr = "127.0.0.3:19446".parse().unwrap();
         session.begin(next, Some(11), moved_at, &mut send);
-        let token = Control::Token { stream_id: 1, token: 6 }.encode();
+        let token = Control::Token {
+            stream_id: 1,
+            token: 6,
+        }
+        .encode();
         session.on_datagram(next, &token, moved_at, &mut send);
-        let ok = Control::Subscribed { stream_id: 1, next_part: 11, compact: true }.encode();
+        let ok = Control::Subscribed {
+            stream_id: 1,
+            next_part: 11,
+            compact: true,
+        }
+        .encode();
         session.on_datagram(next, &ok, moved_at, &mut send);
         assert!(session
             .poll(moved_at + Duration::from_millis(500), &mut send)
@@ -1182,7 +2256,11 @@ mod tests {
             let mut session = UdpSession::new(config, now);
             let mut send = |_: SocketAddr, _: &[u8]| {};
             session.begin(edge(), None, now, &mut send);
-            let token = Control::Token { stream_id: 3, token: 4 }.encode();
+            let token = Control::Token {
+                stream_id: 3,
+                token: 4,
+            }
+            .encode();
             session.on_datagram(edge(), &token, now, &mut send);
             // A known publication time: a part without one keeps the long
             // form (wave 9 review).
@@ -1194,7 +2272,12 @@ mod tests {
                 Received::Media
             );
             assert!(session.next_object().is_none());
-            let ok = Control::Subscribed { stream_id: 3, next_part: 70_000, compact: true }.encode();
+            let ok = Control::Subscribed {
+                stream_id: 3,
+                next_part: 70_000,
+                compact: true,
+            }
+            .encode();
             session.on_datagram(edge(), &ok, now, &mut send);
             let got = session.next_object().map(|object| object.part);
             if drop_early_parts {
@@ -1219,9 +2302,18 @@ mod tests {
             let mut session = UdpSession::new(config, now);
             let mut send = |_: SocketAddr, _: &[u8]| {};
             session.begin(edge(), None, now, &mut send);
-            let token = Control::Token { stream_id: 3, token: 4 }.encode();
+            let token = Control::Token {
+                stream_id: 3,
+                token: 4,
+            }
+            .encode();
             session.on_datagram(edge(), &token, now, &mut send);
-            let ok = Control::Subscribed { stream_id: 3, next_part: 100, compact: true }.encode();
+            let ok = Control::Subscribed {
+                stream_id: 3,
+                next_part: 100,
+                compact: true,
+            }
+            .encode();
             session.on_datagram(edge(), &ok, now, &mut send);
             for part in [100_u64, 101, 103, 104] {
                 let long = crate::client_compact::encode_part(part, 0, b"pcm").unwrap();
@@ -1232,11 +2324,15 @@ mod tests {
             let other: SocketAddr = "127.0.0.2:9000".parse().unwrap();
             session.begin(other, Some(105), now, &mut send);
             let expected = if move_from_hole { Some(102) } else { Some(105) };
-            assert_eq!(session.from_part, expected, "move_from_hole {move_from_hole}");
+            assert_eq!(
+                only(&session).from_part,
+                expected,
+                "move_from_hole {move_from_hole}"
+            );
             // A first subscription is not a move: the part asked is kept.
             let mut fresh = UdpSession::new(SessionConfig::new(3), now);
             fresh.begin(edge(), Some(105), now, &mut send);
-            assert_eq!(fresh.from_part, Some(105));
+            assert_eq!(only(&fresh).from_part, Some(105));
         }
     }
 
@@ -1248,7 +2344,11 @@ mod tests {
         let mut session = UdpSession::new(SessionConfig::new(3), now);
         let mut send = |_: SocketAddr, _: &[u8]| {};
         session.begin(edge(), None, now, &mut send);
-        let token = Control::Token { stream_id: 3, token: 4 }.encode();
+        let token = Control::Token {
+            stream_id: 3,
+            token: 4,
+        }
+        .encode();
         session.on_datagram(edge(), &token, now, &mut send);
         for part in 70_000..70_004_u64 {
             let long =
@@ -1257,7 +2357,12 @@ mod tests {
             session.on_datagram(edge(), &short, now, &mut send);
         }
         assert!(!session.has_objects());
-        let ok = Control::Subscribed { stream_id: 3, next_part: 70_000, compact: true }.encode();
+        let ok = Control::Subscribed {
+            stream_id: 3,
+            next_part: 70_000,
+            compact: true,
+        }
+        .encode();
         assert!(matches!(
             session.on_datagram(edge(), &ok, now, &mut send),
             Received::Subscribed { first: true, .. }
@@ -1271,7 +2376,10 @@ mod tests {
         // The next part follows them.
         let next = crate::client_compact::encode_part(70_004, 0, b"pcm").unwrap();
         session.on_datagram(edge(), &next, now, &mut send);
-        assert_eq!(session.next_object().map(|object| object.part), Some(70_004));
+        assert_eq!(
+            session.next_object().map(|object| object.part),
+            Some(70_004)
+        );
     }
 
     /// Wave 8 R6-2: no NACK while the caller says datagrams are queued.
@@ -1355,17 +2463,26 @@ mod tests {
         let mut send = |_: SocketAddr, datagram: &[u8]| sent.borrow_mut().push(datagram.to_vec());
         session.begin(edge(), None, now, &mut send);
         let mut at = now;
-        while session.compact_asked {
+        while session.compact_asked() {
             at += UNANSWERED_REFRESH;
             session.poll(at, &mut send);
         }
         assert_eq!(session.compact_fallbacks, 1);
         // The edge answers the request without the lane.
-        let token = Control::Token { stream_id: 1, token: 8 }.encode();
+        let token = Control::Token {
+            stream_id: 1,
+            token: 8,
+        }
+        .encode();
         session.on_datagram(edge(), &token, at, &mut send);
-        let ok = Control::Subscribed { stream_id: 1, next_part: 10, compact: false }.encode();
+        let ok = Control::Subscribed {
+            stream_id: 1,
+            next_part: 10,
+            compact: false,
+        }
+        .encode();
         session.on_datagram(edge(), &ok, at, &mut send);
-        assert!(session.compact_asked);
+        assert!(session.compact_asked());
         assert_eq!(session.compact_retries, 1);
         session.poll(at, &mut send);
         match Control::decode(sent.borrow().last().unwrap()) {
@@ -1376,8 +2493,12 @@ mod tests {
         // client asks without the lane again within 1.5 s, before its
         // subscription could expire, and does not retry at this edge.
         let mut later = at;
-        let wait = Control::Waiting { stream_id: 1, next_part: 10 }.encode();
-        while session.compact_asked {
+        let wait = Control::Waiting {
+            stream_id: 1,
+            next_part: 10,
+        }
+        .encode();
+        while session.compact_asked() {
             later += Duration::from_millis(100);
             session.on_datagram(edge(), &wait, later, &mut send);
             assert!(session.poll(later, &mut send).is_none());
@@ -1389,7 +2510,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         session.on_datagram(edge(), &ok, later, &mut send);
-        assert!(!session.compact_asked);
+        assert!(!session.compact_asked());
         assert_eq!(session.compact_retries, 1);
         // Without the retry, the RaptorQ lane stays.
         let config = SessionConfig {
@@ -1400,13 +2521,13 @@ mod tests {
         let mut send = |_: SocketAddr, _: &[u8]| {};
         session.begin(edge(), None, now, &mut send);
         let mut at = now;
-        while session.compact_asked {
+        while session.compact_asked() {
             at += UNANSWERED_REFRESH;
             session.poll(at, &mut send);
         }
         session.on_datagram(edge(), &token, at, &mut send);
         session.on_datagram(edge(), &ok, at, &mut send);
-        assert!(!session.compact_asked);
+        assert!(!session.compact_asked());
     }
 
     #[test]
@@ -1423,12 +2544,12 @@ mod tests {
             at += UNANSWERED_REFRESH;
             assert!(session.poll(at, &mut send).is_none());
         }
-        assert!(session.compact_asked);
+        assert!(session.compact_asked());
         while at < now + COMPACT_FALLBACK_AFTER {
             at += UNANSWERED_REFRESH;
             assert!(session.poll(at, &mut send).is_none());
         }
-        assert!(!session.compact_asked);
+        assert!(!session.compact_asked());
         assert_eq!(session.compact_fallbacks, 1);
         drop(send);
         match Control::decode(sent.last().unwrap()) {
@@ -1486,7 +2607,7 @@ mod tests {
     fn a_refused_short_form_is_asked_again_in_the_long_form() {
         let now = Instant::now();
         let mut session = UdpSession::new(SessionConfig::new(5), now);
-        assert!(session.plan.short_header);
+        assert!(session.plan().short_header);
         let mut sent: Vec<Vec<u8>> = Vec::new();
         let mut send = |_: SocketAddr, datagram: &[u8]| sent.push(datagram.to_vec());
         session.begin(edge(), Some(3), now, &mut send);
@@ -1529,7 +2650,7 @@ mod tests {
                 first: true
             }
         );
-        assert!(!session.compact_confirmed);
+        assert!(!session.compact_confirmed());
         assert_eq!(session.short_header_dropped, 1);
         assert_eq!(session.first_subscribed_at, Some(now));
     }
@@ -1652,25 +2773,26 @@ mod tests {
     #[test]
     fn a_new_one_leg_session_plans_for_two_percent() {
         let now = Instant::now();
-        let mut session = UdpSession::new(SessionConfig::new(1), now);
-        assert_eq!(session.plan.word(), "C1.16.2.7");
-        session.compact_estimate = Some(0.0);
-        session.loss_samples = 1;
+        let mut session = subscribed(SessionConfig::new(1), now);
+        assert_eq!(session.plan().word(), "C1.16.2.7");
+        let leg = only_mut(&mut session);
+        leg.compact_estimate = Some(0.0);
+        leg.loss_samples = 1;
         session.plan_legs(now);
-        assert_eq!(session.plan.word(), "C1.16.2.7");
-        session.loss_samples = 2;
+        assert_eq!(session.plan().word(), "C1.16.2.7");
+        only_mut(&mut session).loss_samples = 2;
         session.plan_legs(now);
         // Less: after the hold.
-        assert_eq!(session.plan.word(), "C1.16.2.7");
+        assert_eq!(session.plan().word(), "C1.16.2.7");
         session.plan_legs(now + PLAN_HOLD);
-        assert_eq!(session.plan.word(), "C0.32.1.7");
+        assert_eq!(session.plan().word(), "C0.32.1.7");
         assert_eq!(session.plan_changes, 1);
         // The long form when the short form is off.
         let config = SessionConfig {
             compact_short_header: false,
             ..SessionConfig::new(1)
         };
-        assert_eq!(UdpSession::new(config, now).plan.word(), "C1.16.2");
+        assert_eq!(UdpSession::new(config, now).plan().word(), "C1.16.2");
     }
 
     /// B X3: a plan that asks for more goes at once; one that asks for less
@@ -1679,43 +2801,821 @@ mod tests {
     #[test]
     fn a_plan_that_asks_for_less_waits_a_second() {
         let now = Instant::now();
-        let mut session = UdpSession::new(SessionConfig::new(1), now);
-        session.loss_samples = 2;
+        let mut session = subscribed(SessionConfig::new(1), now);
+        only_mut(&mut session).loss_samples = 2;
         let ms = |ms: u64| now + Duration::from_millis(ms);
-        session.compact_estimate = Some(0.05);
-        session.plan_legs(ms(0));
-        assert_eq!(session.plan.word(), "C1.16.2.7");
-        session.compact_estimate = Some(0.10);
-        session.plan_legs(ms(150));
-        assert_eq!(session.plan.word(), "C2.16.2.7", "more goes at once");
-        assert_eq!(session.next_refresh, ms(150));
-        session.compact_estimate = Some(0.05);
-        session.plan_legs(ms(300));
-        session.plan_legs(ms(800));
-        assert_eq!(session.plan.word(), "C2.16.2.7");
+        let plan = |session: &mut UdpSession, loss: f64, burst: Option<f64>, at: Instant| {
+            let leg = only_mut(session);
+            leg.compact_estimate = Some(loss);
+            leg.burst_estimate = burst;
+            session.plan_legs(at);
+            session.plan().word()
+        };
+        assert_eq!(plan(&mut session, 0.05, None, ms(0)), "C1.16.2.7");
+        assert_eq!(
+            plan(&mut session, 0.10, None, ms(150)),
+            "C2.16.2.7",
+            "more goes at once"
+        );
+        assert_eq!(only(&session).next_refresh, ms(150));
+        plan(&mut session, 0.05, None, ms(300));
+        assert_eq!(plan(&mut session, 0.05, None, ms(800)), "C2.16.2.7");
         // The estimate wants the plan again: the hold starts over.
-        session.compact_estimate = Some(0.10);
-        session.plan_legs(ms(900));
-        session.compact_estimate = Some(0.05);
-        session.plan_legs(ms(1_050));
-        session.plan_legs(ms(1_900));
-        assert_eq!(session.plan.word(), "C2.16.2.7");
-        session.plan_legs(ms(2_050));
-        assert_eq!(session.plan.word(), "C1.16.2.7");
+        plan(&mut session, 0.10, None, ms(900));
+        plan(&mut session, 0.05, None, ms(1_050));
+        assert_eq!(plan(&mut session, 0.05, None, ms(1_900)), "C2.16.2.7");
+        assert_eq!(plan(&mut session, 0.05, None, ms(2_050)), "C1.16.2.7");
         assert_eq!(session.plan_changes, 2);
-        // The burst band: bursty at 2.0 (rows instead of a copy, which
-        // asks for less: after the hold), still at 1.7, not at 1.4 (a copy
+        // The burst band: bursty at 2.0 (rows instead of a copy, which asks
+        // for less: after the hold), still at 1.7, not at 1.4 (a copy
         // again, more: at once).
-        session.burst_estimate = Some(2.0);
-        session.plan_legs(ms(2_200));
-        assert_eq!(session.plan.word(), "C1.16.2.7");
-        session.plan_legs(ms(3_200));
-        assert_eq!(session.plan.word(), "C0.16.4.7");
-        session.burst_estimate = Some(1.7);
-        session.plan_legs(ms(4_000));
-        assert_eq!(session.plan.word(), "C0.16.4.7");
-        session.burst_estimate = Some(1.4);
-        session.plan_legs(ms(4_200));
-        assert_eq!(session.plan.word(), "C1.16.2.7");
+        assert_eq!(plan(&mut session, 0.05, Some(2.0), ms(2_200)), "C1.16.2.7");
+        assert_eq!(plan(&mut session, 0.05, Some(2.0), ms(3_200)), "C0.16.4.7");
+        assert_eq!(plan(&mut session, 0.05, Some(1.7), ms(4_000)), "C0.16.4.7");
+        assert_eq!(plan(&mut session, 0.05, Some(1.4), ms(4_200)), "C1.16.2.7");
+    }
+
+    fn edge_b() -> SocketAddr {
+        "127.0.0.2:19446".parse().unwrap()
+    }
+
+    fn part(part: u64) -> Vec<u8> {
+        crate::client_compact::encode_part(part, 0, b"pcm").unwrap()
+    }
+
+    fn token(token: u64) -> Vec<u8> {
+        Control::Token {
+            stream_id: 1,
+            token,
+        }
+        .encode()
+    }
+
+    fn ok(next_part: u64) -> Vec<u8> {
+        Control::Subscribed {
+            stream_id: 1,
+            next_part,
+            compact: true,
+        }
+        .encode()
+    }
+
+    type Sent = Vec<(SocketAddr, Control)>;
+
+    fn sender(sent: &mut Sent) -> impl FnMut(SocketAddr, &[u8]) + '_ {
+        move |to, datagram| sent.push((to, Control::decode(datagram).expect("a control")))
+    }
+
+    /// A session whose legs `a` (node "a" at `edge()`, token 5) and `b`
+    /// (node "b" at `edge_b()`, token 6) are live from part `first`.
+    fn two_legs(config: SessionConfig, first: u64, now: Instant) -> (UdpSession, LegId, LegId) {
+        let mut session = UdpSession::new(config, now);
+        let mut send = |_: SocketAddr, _: &[u8]| {};
+        let a = session
+            .add_leg("a", edge(), None, None, now, &mut send)
+            .unwrap();
+        let b = session
+            .add_leg("b", edge_b(), None, None, now, &mut send)
+            .unwrap();
+        for (target, given) in [(edge(), 5), (edge_b(), 6)] {
+            session.on_datagram(target, &token(given), now, &mut send);
+            session.on_datagram(target, &ok(first), now, &mut send);
+        }
+        session.take_events();
+        (session, a, b)
+    }
+
+    fn view(session: &UdpSession, leg: LegId) -> LegView {
+        session
+            .legs()
+            .into_iter()
+            .find(|view| view.leg == leg)
+            .expect("the leg is held")
+    }
+
+    /// B X5: two legs are asked and subscribed each at its own edge, each
+    /// part comes out once whichever leg brings it first, and each leg's
+    /// refresh names the other delivering leg in `o=`.
+    #[test]
+    fn two_legs_subscribe_and_each_part_comes_out_once() {
+        let now = Instant::now();
+        let mut session = UdpSession::new(SessionConfig::new(1), now);
+        let mut sent = Sent::new();
+        let a = session
+            .add_leg("a", edge(), None, None, now, &mut sender(&mut sent))
+            .unwrap();
+        let b = session
+            .add_leg("b", edge_b(), None, None, now, &mut sender(&mut sent))
+            .unwrap();
+        assert_ne!(a, b);
+        assert!(matches!(
+            &sent[..],
+            [
+                (first, Control::Subscribe { token: None, .. }),
+                (second, Control::Subscribe { token: None, .. })
+            ] if *first == edge() && *second == edge_b()
+        ));
+        sent.clear();
+        for (target, given) in [(edge(), 5), (edge_b(), 6)] {
+            session.on_datagram(target, &token(given), now, &mut sender(&mut sent));
+            assert_eq!(
+                session.on_datagram(target, &ok(100), now, &mut sender(&mut sent)),
+                Received::Subscribed {
+                    next_part: 100,
+                    first: true
+                }
+            );
+        }
+        assert!(sent.iter().any(|(to, control)| *to == edge()
+            && matches!(control, Control::Subscribe { token: Some(5), .. })));
+        assert!(sent.iter().any(|(to, control)| *to == edge_b()
+            && matches!(control, Control::Subscribe { token: Some(6), .. })));
+        let events = session.take_events();
+        assert!(events.contains(&LegEvent::Live {
+            leg: a,
+            first_part: 100
+        }));
+        assert!(events.contains(&LegEvent::Live {
+            leg: b,
+            first_part: 100
+        }));
+        let mut delivered = Vec::new();
+        let ms = Duration::from_millis(1);
+        for number in 100..110_u64 {
+            let at = now + ms * (number - 99) as u32;
+            // a first on even parts, b first on odd ones.
+            let order = if number % 2 == 0 {
+                [edge(), edge_b()]
+            } else {
+                [edge_b(), edge()]
+            };
+            for target in order {
+                session.on_datagram(target, &part(number), at, &mut sender(&mut sent));
+                while let Some(object) = session.next_object() {
+                    delivered.push(object.part);
+                }
+            }
+        }
+        assert_eq!(delivered, (100..110).collect::<Vec<_>>());
+        assert_eq!(session.receiver.compact.leg_stats(a).parts_first, 5);
+        assert_eq!(session.receiver.compact.leg_stats(b).parts_first, 5);
+        assert_eq!(view(&session, a).datagrams, 10);
+        assert!(view(&session, a).delivering && view(&session, b).delivering);
+        // Each leg's next SUB names the other in o=, at once.
+        sent.clear();
+        let at = now + ms * 11;
+        session.poll_legs(at, &mut sender(&mut sent));
+        let others = |target: SocketAddr| {
+            sent.iter().find_map(|(to, control)| match control {
+                Control::Subscribe { others, token, .. } if *to == target && token.is_some() => {
+                    Some(others.clone())
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(others(edge()), Some(vec!["b".to_owned()]));
+        assert_eq!(others(edge_b()), Some(vec!["a".to_owned()]));
+        // And not again until something changes.
+        sent.clear();
+        session.poll_legs(at + ms, &mut sender(&mut sent));
+        assert!(sent.is_empty(), "{sent:?}");
+    }
+
+    /// B X5: a datagram goes to the leg whose edge is exactly its source,
+    /// else to the only leg at that address; one from an edge let go in the
+    /// last 10 s is answered with `UNSUB`, at most every 100 ms.
+    #[test]
+    fn a_datagram_is_attributed_by_address_and_port() {
+        let now = Instant::now();
+        let mut session = UdpSession::new(SessionConfig::new(1), now);
+        let mut send = |_: SocketAddr, _: &[u8]| {};
+        let first: SocketAddr = "127.0.0.1:19446".parse().unwrap();
+        let second: SocketAddr = "127.0.0.1:19447".parse().unwrap();
+        let a = session
+            .add_leg("a", first, None, None, now, &mut send)
+            .unwrap();
+        let b = session
+            .add_leg("b", second, None, None, now, &mut send)
+            .unwrap();
+        session.on_datagram(second, &token(6), now, &mut send);
+        assert_eq!(view(&session, b).token, Some(6));
+        assert_eq!(view(&session, a).token, None);
+        // Another port of that host: neither leg's.
+        let stranger: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        assert_eq!(
+            session.on_datagram(stranger, &token(9), now, &mut send),
+            Received::Ignored
+        );
+        // The only leg at an address takes its datagrams from any port.
+        let c = session
+            .add_leg(
+                "c",
+                "127.0.0.3:19446".parse().unwrap(),
+                None,
+                None,
+                now,
+                &mut send,
+            )
+            .unwrap();
+        session.on_datagram("127.0.0.3:5000".parse().unwrap(), &token(7), now, &mut send);
+        assert_eq!(view(&session, c).token, Some(7));
+        // b is let go: UNSUB twice, 20 ms apart; its edge's datagrams are
+        // answered with UNSUB, at most every 100 ms, for 10 s.
+        let mut sent = Sent::new();
+        let unsubs = |sent: &Sent| {
+            sent.iter()
+                .filter(|(to, control)| {
+                    *to == second && matches!(control, Control::Unsubscribe { token: 6, .. })
+                })
+                .count()
+        };
+        session.release_leg(b, now, &mut sender(&mut sent));
+        assert_eq!(unsubs(&sent), 1);
+        session.poll_legs(now + Duration::from_millis(19), &mut sender(&mut sent));
+        assert_eq!(unsubs(&sent), 1);
+        session.poll_legs(now + Duration::from_millis(20), &mut sender(&mut sent));
+        assert_eq!(unsubs(&sent), 2);
+        assert!(sent
+            .iter()
+            .all(|(to, _)| *to != second || unsubs(&sent) == 2));
+        sent.clear();
+        let later = now + Duration::from_millis(30);
+        for (offset, answered) in [(0, 1), (50, 1), (100, 2)] {
+            let at = later + Duration::from_millis(offset);
+            assert_eq!(
+                session.on_datagram(second, &part(100), at, &mut sender(&mut sent)),
+                Received::Ignored
+            );
+            assert_eq!(sent.len(), answered, "at {offset} ms");
+        }
+        sent.clear();
+        session.on_datagram(
+            second,
+            &part(100),
+            now + Duration::from_secs(11),
+            &mut sender(&mut sent),
+        );
+        assert!(sent.is_empty());
+        assert!(session.legs().iter().all(|view| view.leg != b));
+    }
+
+    /// B X5: a leg with no media beside a leg that delivers is suspect at
+    /// max(20 ms, 8 parts), due a hedge at 50 ms, and dead at 200 ms; the
+    /// other leg is never judged.
+    #[test]
+    fn a_leg_without_media_beside_a_delivering_leg_is_hedged_then_dead() {
+        let now = Instant::now();
+        let (mut session, a, b) = two_legs(SessionConfig::new(1), 100, now);
+        let ms = Duration::from_millis(1);
+        let mut sent = Sent::new();
+        for number in 100..120_u64 {
+            let at = now + ms * (number - 100) as u32;
+            session.on_datagram(edge(), &part(number), at, &mut sender(&mut sent));
+            session.on_datagram(edge_b(), &part(number), at, &mut sender(&mut sent));
+        }
+        // b stops at part 119 (t = 19 ms); a goes on, a part a ms.
+        let stopped = now + ms * 19;
+        let mut seen: Vec<(u32, LegEvent)> = Vec::new();
+        for step in 1..=200_u32 {
+            let at = stopped + ms * step;
+            session.on_datagram(
+                edge(),
+                &part(119 + u64::from(step)),
+                at,
+                &mut sender(&mut sent),
+            );
+            session.poll_legs(at, &mut sender(&mut sent));
+            seen.extend(session.take_events().into_iter().map(|event| (step, event)));
+            if seen
+                .iter()
+                .any(|(_, event)| matches!(event, LegEvent::Failed { .. }))
+            {
+                break;
+            }
+        }
+        seen.retain(|(_, event)| !matches!(event, LegEvent::Steady { .. }));
+        assert_eq!(
+            seen.iter()
+                .map(|(_, event)| event.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                LegEvent::Suspect { leg: b },
+                LegEvent::HedgeDue { leg: b },
+                LegEvent::Failed {
+                    leg: b,
+                    node: "b".to_owned(),
+                    reason: "silence-200ms".to_owned()
+                },
+            ]
+        );
+        assert_eq!(seen[0].0, 20);
+        assert_eq!(seen[1].0, 50);
+        assert_eq!(seen[2].0, 200);
+        assert!(sent.iter().any(|(to, control)| *to == edge_b()
+            && matches!(control, Control::Unsubscribe { token: 6, .. })));
+        assert_eq!(session.legs().len(), 1);
+        assert_eq!(view(&session, a).state, LegState::Live);
+    }
+
+    /// B X5: while the caller says datagrams are queued, no leg is judged
+    /// silent, hedged or dead: the backlog is read first.
+    #[test]
+    fn no_verdict_while_datagrams_are_queued() {
+        let now = Instant::now();
+        let (mut session, a, b) = two_legs(SessionConfig::new(1), 100, now);
+        let mut send = |_: SocketAddr, _: &[u8]| {};
+        for target in [edge(), edge_b()] {
+            session.on_datagram(target, &part(100), now, &mut send);
+        }
+        // The host stalls 300 ms with both legs' datagrams queued.
+        let stall = now + Duration::from_millis(300);
+        session.queued = true;
+        session.poll_legs(stall, &mut send);
+        assert_eq!(session.take_events(), vec![]);
+        // The backlog, read.
+        for number in 101..400_u64 {
+            for target in [edge(), edge_b()] {
+                session.on_datagram(target, &part(number), stall, &mut send);
+            }
+        }
+        session.queued = false;
+        session.poll_legs(stall, &mut send);
+        assert!(session
+            .take_events()
+            .iter()
+            .all(|event| matches!(event, LegEvent::Steady { .. })));
+        assert_eq!(session.legs().len(), 2);
+        assert!(view(&session, a).delivering && view(&session, b).delivering);
+        // One leg alone: no hedge while queued either.
+        let mut alone = subscribed(SessionConfig::new(1), now);
+        alone.take_events();
+        alone.queued = true;
+        alone.poll_legs(stall, &mut send);
+        assert_eq!(alone.take_events(), vec![]);
+    }
+
+    /// B X5: when no leg has sent a datagram for 200 ms nobody is failed
+    /// (the silence says nothing about any one edge); each leg is asked
+    /// again from the oldest hole with `r=1`; the next report comes a
+    /// second later.
+    #[test]
+    fn every_leg_silent_fails_nobody_and_asks_again_from_the_hole() {
+        let now = Instant::now();
+        let config = SessionConfig {
+            nack_timing: NackTiming::BEFORE,
+            ..SessionConfig::new(1)
+        };
+        let (mut session, a, b) = two_legs(config, 100, now);
+        let mut sent = Sent::new();
+        for number in [100_u64, 101, 102, 104, 105] {
+            for target in [edge(), edge_b()] {
+                session.on_datagram(target, &part(number), now, &mut sender(&mut sent));
+            }
+        }
+        assert_eq!(session.oldest_hole(), Some(103));
+        let mut events = Vec::new();
+        let mut at = now;
+        while at < now + Duration::from_millis(1_300) {
+            at = session.next_wake().max(at + Duration::from_micros(100));
+            session.poll_legs(at, &mut sender(&mut sent));
+            for event in session.take_events() {
+                if matches!(event, LegEvent::AllSilent { .. }) {
+                    events.push((at - now, event));
+                }
+            }
+        }
+        assert_eq!(session.legs().len(), 2, "nobody failed");
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(
+            events[0].0 > Duration::from_millis(200) && events[0].0 < Duration::from_millis(210)
+        );
+        assert_eq!(
+            events[0].1,
+            LegEvent::AllSilent {
+                silence: Duration::from_millis(200)
+            }
+        );
+        assert!(events[1].0 >= events[0].0 + Duration::from_millis(1_000));
+        assert!(session
+            .take_events()
+            .iter()
+            .all(|event| !matches!(event, LegEvent::Failed { .. })));
+        sent.clear();
+        for leg in [a, b] {
+            session.reask_leg(leg, at, &mut sender(&mut sent));
+        }
+        for (target, given) in [(edge(), 5), (edge_b(), 6)] {
+            assert!(sent.iter().any(|(to, control)| *to == target
+                && matches!(
+                    control,
+                    Control::Subscribe { from_part: Some(103), resume: true, token: Some(t), .. } if *t == given
+                )));
+        }
+        // A media datagram ends the silence: the short silence again.
+        session.on_datagram(edge(), &part(106), at, &mut sender(&mut sent));
+        session.poll_legs(at + Duration::from_millis(150), &mut sender(&mut sent));
+        assert!(!session
+            .take_events()
+            .iter()
+            .any(|event| matches!(event, LegEvent::AllSilent { .. })));
+    }
+
+    /// B X5: a leg with no `TOKEN` in the token wait is passed over (once)
+    /// and goes on asking; if its edge answers it is used; with no answer in
+    /// the answer wait it fails.
+    #[test]
+    fn a_leg_without_a_token_is_passed_over_and_used_if_it_answers() {
+        let now = Instant::now();
+        let mut session = UdpSession::new(SessionConfig::new(1), now);
+        let mut sent = Sent::new();
+        let a = session
+            .add_leg("a", edge(), Some(7), None, now, &mut sender(&mut sent))
+            .unwrap();
+        let b = session
+            .add_leg("b", edge_b(), Some(7), None, now, &mut sender(&mut sent))
+            .unwrap();
+        session.poll_legs(now + Duration::from_millis(399), &mut sender(&mut sent));
+        assert_eq!(session.take_events(), vec![]);
+        session.poll_legs(now + Duration::from_millis(400), &mut sender(&mut sent));
+        assert_eq!(
+            session.take_events(),
+            vec![
+                LegEvent::PassedOver { leg: a },
+                LegEvent::PassedOver { leg: b }
+            ]
+        );
+        sent.clear();
+        let mut at = now + Duration::from_millis(400);
+        while at < now + Duration::from_millis(900) {
+            at = session.next_wake();
+            session.poll_legs(at, &mut sender(&mut sent));
+        }
+        assert!(sent.iter().any(|(to, control)| *to == edge()
+            && matches!(
+                control,
+                Control::Subscribe {
+                    token: None,
+                    from_part: Some(7),
+                    ..
+                }
+            )));
+        assert!(session.take_events().is_empty(), "passed over once");
+        // a's edge answers late: the leg is used.
+        session.on_datagram(edge(), &token(5), at, &mut sender(&mut sent));
+        session.on_datagram(edge(), &ok(7), at, &mut sender(&mut sent));
+        assert_eq!(
+            session.take_events(),
+            vec![
+                LegEvent::Tokened { leg: a, token: 5 },
+                LegEvent::Live {
+                    leg: a,
+                    first_part: 7
+                }
+            ]
+        );
+        // b's never does: failed at the answer wait.
+        session.poll_legs(now + Duration::from_millis(5_001), &mut sender(&mut sent));
+        assert!(session.take_events().contains(&LegEvent::Failed {
+            leg: b,
+            node: "b".to_owned(),
+            reason: "no-answer-5000ms".to_owned()
+        }));
+        assert_eq!(session.legs().len(), 1);
+    }
+
+    /// B X5 (2.6): 45 s after its token a leg's refresh is joined by a
+    /// tokenless `SUB`; the edge's new token is taken and used, so that no
+    /// `NACK` or `UNSUB` goes with a token the edge forgot.
+    #[test]
+    fn a_token_is_renewed_before_the_edge_forgets_it() {
+        let now = Instant::now();
+        let mut session = subscribed(SessionConfig::new(1), now);
+        session.hold = true;
+        let mut sent: Vec<(Instant, Control)> = Vec::new();
+        let mut at = now;
+        while at < now + Duration::from_secs(50) {
+            at = session.next_wake();
+            session.poll(at, &mut |_, datagram| {
+                sent.push((at, Control::decode(datagram).unwrap()))
+            });
+        }
+        let tokenless: Vec<Instant> = sent
+            .iter()
+            .filter(|(_, control)| matches!(control, Control::Subscribe { token: None, .. }))
+            .map(|(at, _)| *at)
+            .collect();
+        assert_eq!(tokenless.len(), 1, "one renewal in 50 s");
+        assert!(tokenless[0] >= now + TOKEN_RENEW_AFTER);
+        assert!(tokenless[0] < now + TOKEN_RENEW_AFTER + REFRESH + Duration::from_millis(1));
+        assert!(sent.iter().any(|(when, control)| *when == tokenless[0]
+            && matches!(control, Control::Subscribe { token: Some(5), .. })));
+        // The edge's keys turned over: a new token, used at once, and for
+        // the NACKs and UNSUB that follow.
+        let mut answer: Vec<Control> = Vec::new();
+        session.on_datagram(edge(), &token(99), at, &mut |_, datagram| {
+            answer.push(Control::decode(datagram).unwrap())
+        });
+        assert!(matches!(
+            &answer[..],
+            [Control::Subscribe {
+                token: Some(99),
+                ..
+            }]
+        ));
+        assert_eq!(session.token(), Some(99));
+        let mut left: Vec<Control> = Vec::new();
+        session.leave(&mut |_, datagram| left.push(Control::decode(datagram).unwrap()));
+        assert!(matches!(
+            &left[..],
+            [Control::Unsubscribe { token: 99, .. }]
+        ));
+    }
+
+    /// B X5: the answer to a request sent again only by the 3 ms double
+    /// measures the round trip from the first copy; a request repeated by
+    /// the retry gives none (Karn), and the first refresh gives it then.
+    #[test]
+    fn a_doubled_request_still_gives_a_round_trip() {
+        for rtt_ms in [2_u64, 80, 500] {
+            let rtt = Duration::from_millis(rtt_ms);
+            let now = Instant::now();
+            let mut session = UdpSession::new(SessionConfig::new(1), now);
+            let mut send = |_: SocketAddr, _: &[u8]| {};
+            let leg = session
+                .add_leg("a", edge(), None, None, now, &mut send)
+                .unwrap();
+            // The edge answers each request one round trip after its first
+            // copy; the client runs its timers meanwhile.
+            let until = |session: &mut UdpSession, end: Instant| {
+                let mut at = now;
+                while session.next_wake() < end {
+                    at = session.next_wake().max(at);
+                    session.poll_legs(at, &mut |_, _| {});
+                }
+            };
+            until(&mut session, now + rtt);
+            session.on_datagram(edge(), &token(5), now + rtt, &mut send);
+            until(&mut session, now + rtt * 2);
+            session.on_datagram(edge(), &ok(10), now + rtt * 2, &mut send);
+            if rtt_ms < 25 {
+                // Only the double went: a sample of each exchange.
+                assert_eq!(view(&session, leg).rtt, Some(rtt), "{rtt_ms} ms");
+                continue;
+            }
+            assert_eq!(view(&session, leg).rtt, None, "{rtt_ms} ms: repeated");
+            // The first refresh, answered a round trip later.
+            let refresh = only(&session).next_refresh;
+            until(&mut session, refresh + Duration::from_micros(1));
+            session.on_datagram(edge(), &ok(10), refresh + rtt, &mut send);
+            assert_eq!(view(&session, leg).rtt, Some(rtt), "{rtt_ms} ms");
+        }
+    }
+
+    /// B X5: a refresh sent with no other request outstanding measures the
+    /// round trip by its `OK` (or `MOVE`); one sent while another is
+    /// unanswered gives none.
+    #[test]
+    fn a_refresh_gives_a_round_trip() {
+        let now = Instant::now();
+        let mut session = subscribed(SessionConfig::new(1), now);
+        session.hold = true;
+        let mut send = |_: SocketAddr, _: &[u8]| {};
+        only_mut(&mut session).rtt = None;
+        let refresh = only(&session).next_refresh;
+        session.poll_legs(refresh, &mut send);
+        session.on_datagram(
+            edge(),
+            &ok(10),
+            refresh + Duration::from_millis(30),
+            &mut send,
+        );
+        assert_eq!(only(&session).rtt, Some(Duration::from_millis(30)));
+        // A refresh unanswered, then another: no sample from the answer.
+        let first = only(&session).next_refresh;
+        session.poll_legs(first, &mut send);
+        let second = only(&session).next_refresh;
+        session.poll_legs(second, &mut send);
+        session.on_datagram(
+            edge(),
+            &ok(10),
+            second + Duration::from_millis(5),
+            &mut send,
+        );
+        assert_eq!(only(&session).rtt, Some(Duration::from_millis(30)));
+        // A MOVE answers a refresh too.
+        let third = only(&session).next_refresh;
+        session.poll_legs(third, &mut send);
+        let moved = Control::Move {
+            stream_id: 1,
+            reason: "draining".into(),
+        }
+        .encode();
+        session.on_datagram(edge(), &moved, third + Duration::from_millis(30), &mut send);
+        assert_eq!(only(&session).rtt, Some(Duration::from_millis(30)));
+        assert!(session
+            .receiver
+            .compact
+            .leg_rtt(only(&session).id)
+            .is_some());
+    }
+
+    /// B X5: a hole's first NACK goes to the leg with the shortest round
+    /// trip, each with its own token; its later NACKs to every leg that
+    /// brings the stream.
+    #[test]
+    fn a_nack_goes_to_every_leg_that_sent_the_part() {
+        let now = Instant::now();
+        let config = SessionConfig {
+            nack_timing: NackTiming {
+                silence: false,
+                ..NackTiming::default()
+            },
+            ..SessionConfig::new(1)
+        };
+        let (mut session, a, b) = two_legs(config, 100, now);
+        for (leg, rtt) in [(a, 10), (b, 2)] {
+            let rtt = Duration::from_millis(rtt);
+            session.legs[leg.index()].as_mut().unwrap().rtt = Some(rtt);
+            session.receiver.compact.set_leg_rtt(leg, rtt);
+        }
+        let mut send = |_: SocketAddr, _: &[u8]| {};
+        for number in [100_u64, 101, 103] {
+            for target in [edge(), edge_b()] {
+                session.on_datagram(target, &part(number), now, &mut send);
+            }
+        }
+        let mut sent = Sent::new();
+        let nacks = |sent: &Sent| -> Vec<(SocketAddr, u64, Vec<u64>)> {
+            sent.iter()
+                .filter_map(|(to, control)| match control {
+                    Control::Nack { token, parts, .. } => Some((*to, *token, parts.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        // (The receiver keeps its holes on the real clock: the test's
+        // times are a little ahead of it.)
+        let first = now + Duration::from_millis(1);
+        session.poll_legs(first, &mut sender(&mut sent));
+        assert_eq!(nacks(&sent), vec![(edge_b(), 6, vec![102])]);
+        sent.clear();
+        // The retry: 2 ms (the floor; b's round trip is well under it).
+        session.poll_legs(first + Duration::from_millis(1), &mut sender(&mut sent));
+        assert!(nacks(&sent).is_empty(), "not before the retry");
+        session.poll_legs(first + Duration::from_millis(2), &mut sender(&mut sent));
+        assert_eq!(
+            nacks(&sent),
+            vec![(edge(), 5, vec![102]), (edge_b(), 6, vec![102])]
+        );
+        assert_eq!(session.nack_datagrams, 3);
+    }
+
+    /// B X5: a leg that falls 8 parts behind with no media for 20 ms is
+    /// suspect, and the plans are made without it at once: the other leg,
+    /// alone, asks for its one-path plan in a SUB sent in the same poll.
+    #[test]
+    fn a_suspect_leg_changes_the_plan_at_once() {
+        let now = Instant::now();
+        let (mut session, a, b) = two_legs(SessionConfig::new(1), 100, now);
+        assert_eq!(only_plan(&session, a), "C0.32.0.7");
+        assert_eq!(only_plan(&session, b), "C0.32.0.7");
+        for leg in [a, b] {
+            let state = session.legs[leg.index()].as_mut().unwrap();
+            state.compact_estimate = Some(0.0);
+            state.loss_samples = PLAN_SAMPLES;
+        }
+        let ms = Duration::from_millis(1);
+        let mut sent = Sent::new();
+        for number in 100..110_u64 {
+            let at = now + ms * (number - 100) as u32;
+            for target in [edge(), edge_b()] {
+                session.on_datagram(target, &part(number), at, &mut sender(&mut sent));
+            }
+        }
+        session.plan_legs(now + ms * 9);
+        assert_eq!(only_plan(&session, a), "C0.32.0.7");
+        let mut suspect_at = None;
+        for step in 1..=30_u32 {
+            let at = now + ms * (9 + step);
+            sent.clear();
+            session.on_datagram(
+                edge(),
+                &part(109 + u64::from(step)),
+                at,
+                &mut sender(&mut sent),
+            );
+            session.poll_legs(at, &mut sender(&mut sent));
+            if session
+                .take_events()
+                .contains(&LegEvent::Suspect { leg: b })
+            {
+                suspect_at = Some(step);
+                break;
+            }
+        }
+        assert_eq!(suspect_at, Some(20));
+        assert_eq!(only_plan(&session, a), "C0.32.1.7");
+        assert!(sent.iter().any(|(to, control)| *to == edge()
+            && matches!(control, Control::Subscribe { compact: Some(plan), .. } if plan.word() == "C0.32.1.7")));
+        assert!(view(&session, b).suspect);
+    }
+
+    fn only_plan(session: &UdpSession, leg: LegId) -> String {
+        session.legs[leg.index()].as_ref().unwrap().plan.word()
+    }
+
+    /// B X5: a leg whose edge sent `MOVE` is leaving and still receives
+    /// (its parts delivered, its NACKs sent) until the director releases
+    /// it; a new leg level with it is reported; released, it gets `UNSUB`
+    /// twice and its datagrams are ignored. A take-back makes it live again.
+    #[test]
+    fn a_moved_leg_receives_until_it_is_released() {
+        let now = Instant::now();
+        let config = SessionConfig {
+            nack_timing: NackTiming {
+                silence: false,
+                ..NackTiming::default()
+            },
+            ..SessionConfig::new(1)
+        };
+        let (mut session, a, b) = two_legs(config, 100, now);
+        let mut sent = Sent::new();
+        let moved = Control::Move {
+            stream_id: 1,
+            reason: "draining".into(),
+        }
+        .encode();
+        assert_eq!(
+            session.on_datagram(edge(), &moved, now, &mut sender(&mut sent)),
+            Received::Move("draining".into())
+        );
+        assert_eq!(
+            session.take_events(),
+            vec![LegEvent::Moved {
+                leg: a,
+                reason: "draining".into()
+            }]
+        );
+        assert_eq!(view(&session, a).state, LegState::Leaving);
+        assert_eq!(view(&session, a).leaving.as_deref(), Some("draining"));
+        // It still delivers: a's parts come first, b's a little later.
+        let ms = Duration::from_millis(1);
+        let mut first_from_a = 0;
+        for number in 100..140_u64 {
+            let at = now + ms * (number - 99) as u32;
+            if number == 120 {
+                continue;
+            }
+            session.on_datagram(edge(), &part(number), at, &mut sender(&mut sent));
+            if session.next_object().is_some() {
+                first_from_a += 1;
+            }
+            session.on_datagram(
+                edge_b(),
+                &part(number),
+                at + Duration::from_micros(100),
+                &mut sender(&mut sent),
+            );
+            while session.next_object().is_some() {}
+            session.poll_legs(at + Duration::from_micros(100), &mut sender(&mut sent));
+        }
+        assert_eq!(first_from_a, 39);
+        let events = session.take_events();
+        assert!(
+            events.contains(&LegEvent::Level { leg: b, with: a }),
+            "{events:?}"
+        );
+        // Its NACKs still go (the hole of part 120, asked of both).
+        assert!(sent.iter().any(
+            |(to, control)| *to == edge() && matches!(control, Control::Nack { token: 5, .. })
+        ));
+        // A refresh still goes to it.
+        sent.clear();
+        let at = now + Duration::from_secs(2);
+        session.poll_legs(at, &mut sender(&mut sent));
+        assert!(sent.iter().any(|(to, control)| *to == edge()
+            && matches!(control, Control::Subscribe { token: Some(5), .. })));
+        // A take-back: the edge's OK makes it live again.
+        session.takeback_leg(a, at, &mut sender(&mut sent));
+        session.on_datagram(edge(), &ok(140), at + ms, &mut sender(&mut sent));
+        assert!(session
+            .take_events()
+            .contains(&LegEvent::TakenBack { leg: a }));
+        assert_eq!(view(&session, a).state, LegState::Live);
+        // Released: UNSUB now and 20 ms later; its datagrams no longer
+        // deliver.
+        sent.clear();
+        session.release_leg(a, at, &mut sender(&mut sent));
+        session.poll_legs(at + ms * 20, &mut sender(&mut sent));
+        let unsubs = sent
+            .iter()
+            .filter(|(to, control)| {
+                *to == edge() && matches!(control, Control::Unsubscribe { token: 5, .. })
+            })
+            .count();
+        assert_eq!(unsubs, 2);
+        session.on_datagram(edge(), &part(141), at + ms * 21, &mut sender(&mut sent));
+        assert!(session.next_object().is_none());
+        assert_eq!(session.legs().len(), 1);
     }
 }

@@ -288,6 +288,12 @@ fn config(args: &Args) -> Result<LoadConfig> {
         first_retry: Duration::from_millis(args.first_retry_ms),
         residual_target: av_mesh::client_compact::RESIDUAL_TARGET,
         hole_give_up: av_mesh::client_compact::HOLE_GIVE_UP,
+        token_wait: Duration::from_millis(av_mesh::client_session::DEFAULT_TOKEN_MS),
+        first_double: Duration::from_millis(av_mesh::client_session::DEFAULT_FIRST_DOUBLE_MS),
+        hedge_after: Duration::from_millis(av_mesh::client_session::DEFAULT_HEDGE_AFTER_MS),
+        lone_hedge_after: Duration::from_millis(
+            av_mesh::client_session::DEFAULT_LONE_HEDGE_AFTER_MS,
+        ),
     };
     let mut config = LoadConfig::new(session, edges, args.listeners);
     if let Some(text) = &args.ramp {

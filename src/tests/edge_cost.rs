@@ -423,7 +423,9 @@ fn run_bench(bench: &Bench) -> Measured {
                     else {
                         continue;
                     };
-                    if let Some(object) = receiver.push(av_mesh::client_compact::LegId::FIRST, &buf[..len]) {
+                    if let Some(object) =
+                        receiver.push(av_mesh::client_compact::LegId::FIRST, &buf[..len])
+                    {
                         if object.kind == UdpObjectKind::Part {
                             udp_parts.fetch_add(1, Ordering::Relaxed);
                         }
