@@ -16,7 +16,7 @@
 //!
 //!   | from   | text                                                          |
 //!   | ------ | ------------------------------------------------------------- |
-//!   | client | `SUB <stream> <from part or -> <repair ‰> <min repair> <loss ppm> <token or -> [F1] [C<copies>.<window>.<repair>]` |
+//!   | client | `SUB <stream> <from part or -> <repair ‰> <min repair> <loss ppm> <token or - padding> [F1] [C<copies>.<window>.<repair>] [o=<node>[,<node>]] [r=1]` |
 //!   | client | `UNSUB <stream> <token>`                                      |
 //!   | client | `NACK <stream> <token> <part> [<part> ...]`                   |
 //!   | edge   | `TOKEN <stream> <token>`                                      |
@@ -24,8 +24,31 @@
 //!   | edge   | `WAIT <stream> <next part>`                                   |
 //!   | edge   | `REFUSED <stream> <reason>`                                   |
 //!   | edge   | `MOVE <stream> <reason>`                                      |
-//!   | client | `ASSIGN <stream> <nonce> <session> <skip,... or -> <current or -> <padding>` |
-//!   | node   | `ASSIGNED <stream> <nonce> <client UDP port or -> [<node>\|<base URL>\|<0 or 1> ...]` |
+//!   | client | `ASSIGN <stream> <nonce> <session> <skip,... or -> <current,... or -> [p=<0, 1 or 2>] [s=<0 or 1>] [h=<node>,...] [t=<token>] [padding]` |
+//!   | node   | `ASSIGNED <stream> <nonce> <client UDP port or -> [<node>\|<base URL>\|<0 or 1> ...] [p=<legs>] [s=<0 or 1>]` |
+//!
+//!   An optional field added to a verb is a word `<key>=<value>` at the end
+//!   of the datagram, its key one to eight lowercase letters. A receiver
+//!   skips the keys it does not know, so that two builds understand each
+//!   other for the length of a roll; any other extra word still refuses the
+//!   datagram. A list that runs to the end (the parts of a `NACK`, the
+//!   caches of an `ASSIGNED`) ends at the first such word. A field is not
+//!   written at its default (`p=1`, `s=0`, an empty `h=` or `o=`, no `r=`).
+//!   A known key whose value is malformed, or that is given twice, refuses
+//!   the datagram, so the values of a key are fixed once a build ships it: a
+//!   new meaning takes a new key. The reason of a `REFUSED` or `MOVE` never
+//!   has the form of a field (`=` is written as `-`), so one there is a
+//!   field of a datagram that gives no reason.
+//!
+//!   A listener may hold a stream on two edges at once, one subscription
+//!   (a leg) at each. `o=` on a `SUB` names the nodes of its other legs
+//!   that deliver now, at most [`MAX_OTHER_LEGS`]: its presence marks a
+//!   redundant leg. `r=1` on a refresh that names a part asks the edge to
+//!   send again from that part. In an `ASSIGN`, `p=` is the number of legs
+//!   wanted, `s=1` asks for a spare (an edge at which the listener holds a
+//!   token and nothing else) and `h=` names the legs the listener holds and
+//!   keeps, which the answer never names. In the `ASSIGNED`, the first `p`
+//!   caches are the legs granted and the next is the spare when `s=1`.
 //!
 //!   `ASSIGN` (wave 9 B) asks any node's client UDP port for the assignment
 //!   that `/api/assignment` gives over HTTPS: one datagram each way, which a
@@ -112,6 +135,12 @@ pub const RAPTORQ_LANE_REPAIR_PERMILLE: u32 = 250;
 pub const RAPTORQ_LANE_MIN_REPAIR_SYMBOLS: u32 = 3;
 /// The most parts of one `NACK`.
 pub const MAX_NACK_PARTS: usize = 64;
+/// The most nodes that the `o=` of one `SUB` names: a listener's other legs.
+pub const MAX_OTHER_LEGS: usize = 2;
+/// The most legs that one `ASSIGN` asks for (`p=`).
+pub const MAX_PATHS: u8 = 2;
+/// The longest key of a `key=value` word.
+const MAX_FIELD_KEY: usize = 8;
 /// The most repair an edge sends for one subscriber.
 pub const MAX_REPAIR_PERMILLE: u32 = 1_000;
 pub const MAX_MIN_REPAIR_SYMBOLS: u32 = 16;
@@ -264,6 +293,13 @@ pub enum Control {
         fast_lane: bool,
         /// The client takes the compact lane, with this plan (`C...`).
         compact: Option<CompactPlan>,
+        /// The nodes of the listener's other legs that deliver now (`o=`),
+        /// at most [`MAX_OTHER_LEGS`]. Not empty: this leg is a redundant
+        /// one.
+        others: Vec<String>,
+        /// On a refresh that names a part: send again from that part
+        /// (`r=1`).
+        resume: bool,
     },
     Unsubscribe {
         stream_id: u64,
@@ -301,14 +337,23 @@ pub enum Control {
     /// is padded and answered (`ASSIGNED`, and a `TOKEN` for the client's
     /// address) but charges no cache: its source is not proven. With the
     /// node's token (wave 9 review) it is the client's confirmation of the
-    /// answer it took: `current` names the cache, which is charged for the
-    /// session and remembered; it is not padded and not answered.
+    /// answer it took: `current` names every cache the listener holds
+    /// after the change, which is charged for the session and remembered;
+    /// it is not padded and not answered.
     Assign {
         stream_id: u64,
         nonce: u64,
         session: String,
         skip: Vec<String>,
-        current: Option<String>,
+        current: Vec<String>,
+        /// Legs wanted (`p=`): 0 to [`MAX_PATHS`], 1 when the word is
+        /// absent.
+        paths: u8,
+        /// A spare is wanted (`s=1`).
+        spare: bool,
+        /// The legs the client holds and keeps (`h=`): never in the
+        /// answer, never counted as edges it left.
+        hold: Vec<String>,
         token: Option<u64>,
     },
     /// A node's answer to `ASSIGN`: the caches in assignment order (none
@@ -318,6 +363,12 @@ pub enum Control {
         nonce: u64,
         port: Option<u16>,
         caches: Vec<AssignedCache>,
+        /// The first `paths` caches are the legs granted (`p=`, 1 when the
+        /// word is absent); an answer that names fewer caches grants no
+        /// more legs than it names.
+        paths: u8,
+        /// The cache after the legs is the spare (`s=1`).
+        spare: bool,
     },
 }
 
@@ -346,21 +397,33 @@ impl Control {
                 token,
                 fast_lane,
                 compact,
-            } => format!(
-                "{CONTROL_PREFIX}SUB {stream_id} {} {} {} {} {}{}{}",
-                from_part.map_or_else(|| "-".to_owned(), |part| part.to_string()),
-                repair.permille,
-                repair.min_symbols,
-                repair.loss_ppm,
-                // A first request carries padding, so that the edge's answer
-                // (a TOKEN) is never larger than the request.
-                token.map_or_else(
-                    || format!("- {}", ".".repeat(48)),
-                    |token| format!("{token:016x}")
-                ),
-                if *fast_lane { " F1" } else { "" },
-                compact.map_or_else(String::new, |plan| format!(" {}", plan.word())),
-            ),
+                others,
+                resume,
+            } => {
+                let mut text = format!(
+                    "{CONTROL_PREFIX}SUB {stream_id} {} {} {} {} {}{}{}",
+                    from_part.map_or_else(|| "-".to_owned(), |part| part.to_string()),
+                    repair.permille,
+                    repair.min_symbols,
+                    repair.loss_ppm,
+                    // A first request carries padding, so that the edge's
+                    // answer (a TOKEN) is never larger than the request.
+                    token.map_or_else(
+                        || format!("- {}", ".".repeat(48)),
+                        |token| format!("{token:016x}")
+                    ),
+                    if *fast_lane { " F1" } else { "" },
+                    compact.map_or_else(String::new, |plan| format!(" {}", plan.word())),
+                );
+                if !others.is_empty() {
+                    text.push_str(" o=");
+                    text.push_str(&list(&others[..others.len().min(MAX_OTHER_LEGS)]));
+                }
+                if *resume {
+                    text.push_str(" r=1");
+                }
+                text
+            }
             Self::Unsubscribe { stream_id, token } => {
                 format!("{CONTROL_PREFIX}UNSUB {stream_id} {token:016x}")
             }
@@ -392,10 +455,13 @@ impl Control {
                 next_part,
             } => format!("{CONTROL_PREFIX}WAIT {stream_id} {next_part}"),
             Self::Refused { stream_id, reason } => {
-                format!("{CONTROL_PREFIX}REFUSED {stream_id} {}", word(reason))
+                format!(
+                    "{CONTROL_PREFIX}REFUSED {stream_id} {}",
+                    reason_word(reason)
+                )
             }
             Self::Move { stream_id, reason } => {
-                format!("{CONTROL_PREFIX}MOVE {stream_id} {}", word(reason))
+                format!("{CONTROL_PREFIX}MOVE {stream_id} {}", reason_word(reason))
             }
             Self::Assign {
                 stream_id,
@@ -403,19 +469,27 @@ impl Control {
                 session,
                 skip,
                 current,
+                paths,
+                spare,
+                hold,
                 token,
             } => {
-                let skip = skip
-                    .iter()
-                    .map(|name| word(name).replace(',', "-"))
-                    .collect::<Vec<_>>()
-                    .join(",");
                 let mut text = format!(
                     "{CONTROL_PREFIX}ASSIGN {stream_id} {nonce:016x} {} {} {}",
                     word(session),
-                    if skip.is_empty() { "-".to_owned() } else { skip },
-                    current.as_deref().map_or_else(|| "-".to_owned(), word),
+                    list(skip),
+                    list(current),
                 );
+                if *paths != 1 {
+                    text.push_str(&format!(" p={}", (*paths).min(MAX_PATHS)));
+                }
+                if *spare {
+                    text.push_str(" s=1");
+                }
+                if !hold.is_empty() {
+                    text.push_str(" h=");
+                    text.push_str(&list(hold));
+                }
                 match token {
                     // A confirmation: not answered, so not padded.
                     Some(token) => text.push_str(&format!(" t={token:016x}")),
@@ -434,6 +508,8 @@ impl Control {
                 nonce,
                 port,
                 caches,
+                paths,
+                spare,
             } => {
                 let mut text = format!(
                     "{CONTROL_PREFIX}ASSIGNED {stream_id} {nonce:016x} {}",
@@ -442,10 +518,18 @@ impl Control {
                 for cache in caches {
                     text.push_str(&format!(
                         " {}|{}|{}",
-                        word(&cache.node_id).replace('|', "-"),
+                        // No `=` in the node: a cache is never read as a
+                        // `key=value` word, which ends the list.
+                        word(&cache.node_id).replace(['|', '='], "-"),
                         word(&cache.playback_base_url).replace('|', "-"),
                         u8::from(cache.failover)
                     ));
+                }
+                if *paths != 1 {
+                    text.push_str(&format!(" p={paths}"));
+                }
+                if *spare {
+                    text.push_str(" s=1");
                 }
                 text
             }
@@ -495,6 +579,18 @@ impl Control {
                 if compact.is_some() {
                     words.next();
                 }
+                let (mut others, mut resume) = (None, None);
+                for word in words.by_ref() {
+                    match field(word)? {
+                        ("o", value) => {
+                            let mut nodes = names(value);
+                            nodes.truncate(MAX_OTHER_LEGS);
+                            once(&mut others, nodes)?;
+                        }
+                        ("r", value) => once(&mut resume, flag(value)?)?,
+                        _ => {}
+                    }
+                }
                 Self::Subscribe {
                     stream_id,
                     from_part,
@@ -506,6 +602,8 @@ impl Control {
                     token,
                     fast_lane,
                     compact,
+                    others: others.unwrap_or_default(),
+                    resume: resume.unwrap_or(false),
                 }
             }
             "UNSUB" => Self::Unsubscribe {
@@ -515,7 +613,7 @@ impl Control {
             "NACK" => {
                 let token = token(words.next()?)?;
                 let mut parts = Vec::new();
-                for word in words.by_ref() {
+                while let Some(word) = list_word(&mut words) {
                     if parts.len() == MAX_NACK_PARTS {
                         return None;
                     }
@@ -550,36 +648,38 @@ impl Control {
                 stream_id,
                 next_part: words.next()?.parse().ok()?,
             },
+            // A reason has no `=`, so a field after the stream is a later
+            // build's field on a datagram that gives no reason.
             "REFUSED" => Self::Refused {
                 stream_id,
-                reason: words.next().unwrap_or("refused").to_owned(),
+                reason: list_word(&mut words).unwrap_or("refused").to_owned(),
             },
             "MOVE" => Self::Move {
                 stream_id,
-                reason: words.next().unwrap_or("move").to_owned(),
+                reason: list_word(&mut words).unwrap_or("move").to_owned(),
             },
             "ASSIGN" => {
                 let nonce = token(words.next()?)?;
                 let session = words.next()?.to_owned();
-                let skip = match words.next()? {
-                    "-" => Vec::new(),
-                    list => list
-                        .split(',')
-                        .filter(|name| !name.is_empty())
-                        .map(str::to_owned)
-                        .collect(),
-                };
-                let current = match words.next()? {
-                    "-" => None,
-                    name => Some(name.to_owned()),
-                };
-                let mut token_word = None;
-                if let Some(word) = words.clone().next().and_then(|word| word.strip_prefix("t=")) {
-                    token_word = Some(token(word)?);
-                    words.next();
-                }
-                if words.clone().next().is_some_and(|pad| pad.bytes().all(|b| b == b'.')) {
-                    words.next();
+                let skip = names(words.next()?);
+                let current = names(words.next()?);
+                let (mut paths, mut spare, mut hold, mut token_word) = (None, None, None, None);
+                let mut padded = false;
+                for word in words.by_ref() {
+                    match field(word) {
+                        // More legs than this build gives are asked of it
+                        // as the most it gives.
+                        Some(("p", value)) => {
+                            once(&mut paths, value.parse::<u8>().ok()?.min(MAX_PATHS))?;
+                        }
+                        Some(("s", value)) => once(&mut spare, flag(value)?)?,
+                        Some(("h", value)) => once(&mut hold, names(value))?,
+                        Some(("t", value)) => once(&mut token_word, token(value)?)?,
+                        Some(_) => {}
+                        // The padding of a request.
+                        None if !padded && word.bytes().all(|b| b == b'.') => padded = true,
+                        None => return None,
+                    }
                 }
                 Self::Assign {
                     stream_id,
@@ -587,6 +687,9 @@ impl Control {
                     session,
                     skip,
                     current,
+                    paths: paths.unwrap_or(1),
+                    spare: spare.unwrap_or(false),
+                    hold: hold.unwrap_or_default(),
                     token: token_word,
                 }
             }
@@ -597,7 +700,7 @@ impl Control {
                     port => Some(port.parse().ok()?),
                 };
                 let mut caches = Vec::new();
-                for cache in words.by_ref() {
+                while let Some(cache) = list_word(&mut words) {
                     let mut fields = cache.split('|');
                     let node_id = fields.next()?.to_owned();
                     let playback_base_url = fields.next()?.to_owned();
@@ -615,20 +718,88 @@ impl Control {
                         failover,
                     });
                 }
+                let (mut paths, mut spare) = (None, None);
+                for word in words.by_ref() {
+                    match field(word)? {
+                        ("p", value) => once(&mut paths, value.parse().ok()?)?,
+                        ("s", value) => once(&mut spare, flag(value)?)?,
+                        _ => {}
+                    }
+                }
                 Self::Assigned {
                     stream_id,
                     nonce,
                     port,
                     caches,
+                    paths: paths.unwrap_or(1),
+                    spare: spare.unwrap_or(false),
                 }
             }
             _ => return None,
         };
-        if words.next().is_some() {
-            return None;
-        }
-        Some(control)
+        // What is left are fields that this build does not know: skipped. A
+        // word of any other form refuses the datagram.
+        words.all(|word| field(word).is_some()).then_some(control)
     }
+}
+
+/// A `key=value` word, the form of every optional field at the end of a
+/// control datagram: the key is one to [`MAX_FIELD_KEY`] lowercase letters.
+fn field(word: &str) -> Option<(&str, &str)> {
+    let (key, value) = word.split_once('=')?;
+    ((1..=MAX_FIELD_KEY).contains(&key.len()) && key.bytes().all(|b| b.is_ascii_lowercase()))
+        .then_some((key, value))
+}
+
+/// The next word of a list that runs to the end of a datagram; `None` where
+/// the list ends, which is at the first `key=value` word if there is one.
+fn list_word<'a>(words: &mut std::str::SplitAsciiWhitespace<'a>) -> Option<&'a str> {
+    let word = words.clone().next().filter(|word| field(word).is_none())?;
+    words.next();
+    Some(word)
+}
+
+/// Sets a field of a datagram; `None` when the datagram had it already.
+fn once<T>(slot: &mut Option<T>, value: T) -> Option<()> {
+    slot.replace(value).is_none().then_some(())
+}
+
+/// The value of a field that is on or off.
+fn flag(value: &str) -> Option<bool> {
+    match value {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    }
+}
+
+/// The names of a list word: `-` for none, else names with commas between.
+fn names(list: &str) -> Vec<String> {
+    if list == "-" {
+        return Vec::new();
+    }
+    list.split(',')
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `names` as one word: `-` for none, else the names with commas between.
+fn list(names: &[String]) -> String {
+    if names.is_empty() {
+        return "-".to_owned();
+    }
+    names
+        .iter()
+        .map(|name| word(name).replace(',', "-"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// A reason as its word, `=` written as `-` so that it never has the form of
+/// a field.
+fn reason_word(reason: &str) -> String {
+    word(reason).replace('=', "-")
 }
 
 fn word(reason: &str) -> String {
@@ -1395,6 +1566,8 @@ mod tests {
                 token: Some(0xdead_beef_0123_4567),
                 fast_lane: false,
                 compact: None,
+                others: Vec::new(),
+                resume: false,
             },
             Control::Subscribe {
                 stream_id: 1,
@@ -1407,6 +1580,8 @@ mod tests {
                 token: None,
                 fast_lane: false,
                 compact: None,
+                others: Vec::new(),
+                resume: false,
             },
             Control::Subscribe {
                 stream_id: 4001,
@@ -1415,6 +1590,8 @@ mod tests {
                 token: Some(3),
                 fast_lane: true,
                 compact: Some(CompactPlan::CLEAN),
+                others: Vec::new(),
+                resume: false,
             },
             Control::Subscribe {
                 stream_id: 4001,
@@ -1428,6 +1605,8 @@ mod tests {
                     window_repair: 2,
                     short_header: true,
                 }),
+                others: Vec::new(),
+                resume: false,
             },
             Control::Nack {
                 stream_id: 4001,
@@ -1508,7 +1687,10 @@ mod tests {
             nonce: 0x0123_4567_89ab_cdef,
             session: "bench-uc-0".into(),
             skip: vec!["lon-edge-1".into(), "lon-edge-2".into()],
-            current: Some("lon-edge-3".into()),
+            current: vec!["lon-edge-3".into()],
+            paths: 1,
+            spare: false,
+            hold: Vec::new(),
             token: None,
         };
         let bytes = request.encode();
@@ -1519,10 +1701,30 @@ mod tests {
             nonce: 9,
             session: "s".into(),
             skip: Vec::new(),
-            current: None,
+            current: Vec::new(),
+            paths: 1,
+            spare: false,
+            hold: Vec::new(),
             token: None,
         };
         assert_eq!(Control::decode(&bare.encode()), Some(bare));
+        // The fields of a request for two legs and a spare come out of its
+        // padding: the request is as long as before.
+        let two_paths = Control::Assign {
+            stream_id: 3001,
+            nonce: 0x0123_4567_89ab_cdef,
+            session: "bench-uc-0".into(),
+            skip: vec!["lon-edge-1".into()],
+            current: Vec::new(),
+            paths: 2,
+            spare: true,
+            hold: vec!["lon-edge-2".into()],
+            token: None,
+        };
+        let bytes = two_paths.encode();
+        assert_eq!(bytes.len(), ASSIGN_REQUEST_BYTES);
+        assert_eq!(bytes.last(), Some(&b'.'));
+        assert_eq!(Control::decode(&bytes), Some(two_paths));
         // The confirmation (wave 9 review): the node's token, the cache
         // taken, no padding.
         let confirm = Control::Assign {
@@ -1530,13 +1732,36 @@ mod tests {
             nonce: 9,
             session: "bench-uc-0".into(),
             skip: vec!["lon-edge-1".into()],
-            current: Some("lon-edge-3".into()),
+            current: vec!["lon-edge-3".into()],
+            paths: 1,
+            spare: false,
+            hold: Vec::new(),
+            token: Some(0xfeed_0000_0000_0001),
+        };
+        let bytes = confirm.encode();
+        assert!(bytes.len() < 128, "{}", bytes.len());
+        assert_eq!(Control::decode(&bytes), Some(confirm));
+        // The confirmation of a listener on two edges names both.
+        let confirm = Control::Assign {
+            stream_id: 3001,
+            nonce: 9,
+            session: "bench-uc-0".into(),
+            skip: vec!["lon-edge-1".into()],
+            current: vec!["lon-edge-3".into(), "lon-edge-4".into()],
+            paths: 1,
+            spare: false,
+            hold: Vec::new(),
             token: Some(0xfeed_0000_0000_0001),
         };
         let bytes = confirm.encode();
         assert!(bytes.len() < 128, "{}", bytes.len());
         assert_eq!(Control::decode(&bytes), Some(confirm));
         assert_eq!(Control::decode(b"NTU/1 ASSIGN 5 09 s - - t=zz"), None);
+        let cache = |node: &str, failover| AssignedCache {
+            node_id: node.into(),
+            playback_base_url: format!("https://{node}.example:19444/live"),
+            failover,
+        };
         for answer in [
             Control::Assigned {
                 stream_id: 3001,
@@ -1554,12 +1779,30 @@ mod tests {
                         failover: true,
                     },
                 ],
+                paths: 1,
+                spare: false,
             },
             Control::Assigned {
                 stream_id: 3001,
                 nonce: 9,
                 port: None,
                 caches: Vec::new(),
+                paths: 1,
+                spare: false,
+            },
+            Control::Assigned {
+                stream_id: 3001,
+                nonce: 9,
+                port: Some(19_446),
+                caches: vec![
+                    cache("lon-edge-1", false),
+                    cache("lon-edge-2", false),
+                    cache("lon-edge-3", false),
+                    cache("lon-edge-4", false),
+                    cache("new-dist-a", true),
+                ],
+                paths: 2,
+                spare: true,
             },
         ] {
             assert!(answer.encode().len() < ASSIGN_REQUEST_BYTES);
@@ -1568,6 +1811,500 @@ mod tests {
         assert_eq!(Control::decode(b"NTU/1 ASSIGNED 5 09 - a|b"), None);
         assert_eq!(Control::decode(b"NTU/1 ASSIGNED 5 09 - a|b|2"), None);
         assert_eq!(Control::decode(b"NTU/1 ASSIGN 5 09 s -"), None);
+    }
+
+    fn text(control: &Control) -> String {
+        String::from_utf8(control.encode()).unwrap()
+    }
+
+    /// An `ASSIGN` as its fields are after the session, the skip list and
+    /// the current list; `token` makes it a confirmation.
+    fn assign(
+        skip: &[&str],
+        current: &[&str],
+        paths: u8,
+        spare: bool,
+        hold: &[&str],
+        token: Option<u64>,
+    ) -> Control {
+        let owned = |names: &[&str]| names.iter().map(|name| (*name).to_owned()).collect();
+        Control::Assign {
+            stream_id: 3001,
+            nonce: 9,
+            session: "s-1".into(),
+            skip: owned(skip),
+            current: owned(current),
+            paths,
+            spare,
+            hold: owned(hold),
+            token,
+        }
+    }
+
+    /// The legs wanted, the spare and the legs kept of an `ASSIGN`: written
+    /// as `p=`, `s=1` and `h=` before the token or the padding, and only
+    /// when they are not the default.
+    #[test]
+    fn assign_with_paths_spare_and_hold_round_trips() {
+        const HEAD: &str = "NTU/1 ASSIGN 3001 0000000000000009 s-1";
+        // A join: two legs and a spare.
+        let join = assign(&[], &[], 2, true, &[], None);
+        let sent = text(&join);
+        assert!(
+            sent.starts_with(&format!("{HEAD} - - p=2 s=1 ...")),
+            "{sent}"
+        );
+        assert_eq!(sent.len(), ASSIGN_REQUEST_BYTES);
+        assert_eq!(Control::decode(sent.as_bytes()), Some(join));
+        // A leg is replaced beside the one that is kept: one leg (the
+        // default, not written), the edge left in `skip`, the other in `h=`.
+        let replace = assign(&["lon-edge-1"], &[], 1, false, &["lon-edge-2"], None);
+        let sent = text(&replace);
+        assert!(
+            sent.starts_with(&format!("{HEAD} lon-edge-1 - h=lon-edge-2 ...")),
+            "{sent}"
+        );
+        assert_eq!(Control::decode(sent.as_bytes()), Some(replace));
+        // Only a spare is missing: no leg is asked for.
+        let spare = assign(&[], &[], 0, true, &["lon-edge-1", "lon-edge-2"], None);
+        let sent = text(&spare);
+        assert!(
+            sent.starts_with(&format!("{HEAD} - - p=0 s=1 h=lon-edge-1,lon-edge-2 ...")),
+            "{sent}"
+        );
+        assert_eq!(Control::decode(sent.as_bytes()), Some(spare));
+        // The confirmation names every leg held after the change.
+        let confirm = assign(
+            &["lon-edge-1"],
+            &["lon-edge-2", "lon-edge-3"],
+            1,
+            false,
+            &[],
+            Some(0xfeed),
+        );
+        assert_eq!(
+            text(&confirm),
+            format!("{HEAD} lon-edge-1 lon-edge-2,lon-edge-3 t=000000000000feed")
+        );
+        assert_eq!(Control::decode(&confirm.encode()), Some(confirm));
+        // The fields are read in any order, with the padding or without.
+        let all = assign(&[], &["a", "b"], 2, true, &["c"], Some(0xff));
+        assert_eq!(
+            text(&all),
+            format!("{HEAD} - a,b p=2 s=1 h=c t=00000000000000ff")
+        );
+        for sent in [
+            format!("{HEAD} - a,b t=00ff h=c s=1 p=2"),
+            format!("{HEAD} - a,b h=c .... t=00ff p=2 s=1"),
+        ] {
+            assert_eq!(
+                Control::decode(sent.as_bytes()),
+                Some(all.clone()),
+                "{sent}"
+            );
+        }
+        // Absent, and written out at their defaults: one leg, no spare,
+        // nothing held.
+        let plain = assign(&[], &[], 1, false, &[], None);
+        assert!(text(&plain).starts_with(&format!("{HEAD} - - ...")));
+        for sent in [format!("{HEAD} - -"), format!("{HEAD} - - p=1 s=0 h=-")] {
+            assert_eq!(
+                Control::decode(sent.as_bytes()),
+                Some(plain.clone()),
+                "{sent}"
+            );
+        }
+        // More legs than a build gives are asked of it as the most it
+        // gives, and never written.
+        assert_eq!(
+            Control::decode(format!("{HEAD} - - p=3").as_bytes()),
+            Some(assign(&[], &[], MAX_PATHS, false, &[], None))
+        );
+        assert!(text(&assign(&[], &[], 9, false, &[], None)).contains(" p=2 "));
+        // A name is one word of its list.
+        assert!(text(&assign(&[], &[], 1, false, &["a,b", "c d"], None)).contains(" h=a-b,c-d "));
+        // A field of the verb that is malformed or given twice refuses the
+        // datagram, as does a second padding or any other word.
+        for tail in [
+            "p=",
+            "p=x",
+            "p=-1",
+            "p=256",
+            "s=",
+            "s=2",
+            "s=yes",
+            "t=",
+            "t=zz",
+            "p=1 p=2",
+            "s=1 s=1",
+            "h=a h=b",
+            "t=01 t=01",
+            ".... ....",
+            "x",
+            "p",
+            "P=2",
+        ] {
+            let sent = format!("{HEAD} - - {tail}");
+            assert_eq!(Control::decode(sent.as_bytes()), None, "{sent}");
+        }
+    }
+
+    /// The legs granted and the spare of an `ASSIGNED`: `p=` and `s=1` after
+    /// the caches, only when they are not the default.
+    #[test]
+    fn assigned_with_paths_and_spare_round_trips() {
+        const HEAD: &str = "NTU/1 ASSIGNED 3001 0000000000000009 19446";
+        let cache = |node: &str, failover| AssignedCache {
+            node_id: node.into(),
+            playback_base_url: format!("https://{node}:19444"),
+            failover,
+        };
+        let answer = |caches: Vec<AssignedCache>, paths, spare| Control::Assigned {
+            stream_id: 3001,
+            nonce: 9,
+            port: Some(19_446),
+            caches,
+            paths,
+            spare,
+        };
+        const LEG_A: &str = "lon-edge-1|https://lon-edge-1:19444|0";
+        const LEG_B: &str = "lon-edge-2|https://lon-edge-2:19444|0";
+        const SPARE: &str = "lon-edge-3|https://lon-edge-3:19444|0";
+        const FAILOVER: &str = "new-dist-a|https://new-dist-a:19444|1";
+        // Two legs, the spare, then the failover entry as before.
+        let two = answer(
+            vec![
+                cache("lon-edge-1", false),
+                cache("lon-edge-2", false),
+                cache("lon-edge-3", false),
+                cache("new-dist-a", true),
+            ],
+            2,
+            true,
+        );
+        assert_eq!(
+            text(&two),
+            format!("{HEAD} {LEG_A} {LEG_B} {SPARE} {FAILOVER} p=2 s=1")
+        );
+        assert_eq!(Control::decode(&two.encode()), Some(two.clone()));
+        assert_eq!(
+            Control::decode(
+                format!("{HEAD} {LEG_A} {LEG_B} {SPARE} {FAILOVER} s=1 p=2").as_bytes()
+            ),
+            Some(two)
+        );
+        // No leg granted, only the spare.
+        let spare = answer(vec![cache("lon-edge-3", false)], 0, true);
+        assert_eq!(text(&spare), format!("{HEAD} {SPARE} p=0 s=1"));
+        assert_eq!(Control::decode(&spare.encode()), Some(spare));
+        // One leg and no spare is the default: the answer of before, and
+        // what an answer without the words means.
+        let one = answer(
+            vec![cache("lon-edge-1", false), cache("new-dist-a", true)],
+            1,
+            false,
+        );
+        assert_eq!(text(&one), format!("{HEAD} {LEG_A} {FAILOVER}"));
+        for sent in [
+            format!("{HEAD} {LEG_A} {FAILOVER}"),
+            format!("{HEAD} {LEG_A} {FAILOVER} p=1 s=0"),
+        ] {
+            assert_eq!(
+                Control::decode(sent.as_bytes()),
+                Some(one.clone()),
+                "{sent}"
+            );
+        }
+        // No cache to give, and that said in so many words.
+        assert_eq!(
+            Control::decode(format!("{HEAD} p=0").as_bytes()),
+            Some(answer(Vec::new(), 0, false))
+        );
+        // A node whose name has the form of a field would end the list of
+        // caches: it is never written so.
+        let odd = answer(vec![cache("p=1", false)], 1, false);
+        assert_eq!(text(&odd), format!("{HEAD} p-1|https://p=1:19444|0"));
+        // A cache after a field, a malformed field and one given twice
+        // refuse the datagram.
+        for tail in [
+            format!("p=1 {LEG_A}"),
+            format!("{LEG_A} p=x"),
+            format!("{LEG_A} p="),
+            format!("{LEG_A} p=256"),
+            format!("{LEG_A} s=2"),
+            format!("{LEG_A} p=1 p=1"),
+            format!("{LEG_A} s=0 s=1"),
+        ] {
+            let sent = format!("{HEAD} {tail}");
+            assert_eq!(Control::decode(sent.as_bytes()), None, "{sent}");
+        }
+    }
+
+    /// `o=`, the listener's other legs, and `r=1` on a `SUB`: after the
+    /// words of the lanes, only when there is something to say.
+    #[test]
+    fn sub_with_others_round_trips() {
+        let sub = |token: Option<u64>, lanes: bool, others: &[&str], resume| Control::Subscribe {
+            stream_id: 3001,
+            from_part: token.map(|_| 100),
+            repair: RepairPolicy::default(),
+            token,
+            fast_lane: lanes,
+            compact: lanes.then_some(CompactPlan::CLEAN),
+            others: others.iter().map(|node| (*node).to_owned()).collect(),
+            resume,
+        };
+        const HEAD: &str = "NTU/1 SUB 3001 100 0 1 0 00000000000000aa";
+        // A redundant leg names the legs that deliver beside it, on every
+        // SUB.
+        let leg = sub(Some(0xaa), true, &["lon-edge-2"], false);
+        assert_eq!(text(&leg), format!("{HEAD} F1 C0.32.1 o=lon-edge-2"));
+        assert_eq!(Control::decode(&leg.encode()), Some(leg));
+        let third = sub(Some(0xaa), true, &["lon-edge-2", "lon-edge-3"], false);
+        assert_eq!(
+            text(&third),
+            format!("{HEAD} F1 C0.32.1 o=lon-edge-2,lon-edge-3")
+        );
+        assert_eq!(Control::decode(&third.encode()), Some(third.clone()));
+        // A client of neither lane.
+        let plain = sub(Some(0xaa), false, &["lon-edge-2"], false);
+        assert_eq!(text(&plain), format!("{HEAD} o=lon-edge-2"));
+        assert_eq!(Control::decode(&plain.encode()), Some(plain));
+        // The first request of a leg, without a token and padded.
+        let first = sub(None, true, &["lon-edge-2"], false);
+        assert_eq!(
+            text(&first),
+            format!(
+                "NTU/1 SUB 3001 - 0 1 0 - {} F1 C0.32.1 o=lon-edge-2",
+                ".".repeat(48)
+            )
+        );
+        assert_eq!(Control::decode(&first.encode()), Some(first));
+        // Every leg went silent: send again from the part, and no other leg
+        // delivers.
+        let resume = sub(Some(0xaa), true, &[], true);
+        assert_eq!(text(&resume), format!("{HEAD} F1 C0.32.1 r=1"));
+        assert_eq!(Control::decode(&resume.encode()), Some(resume));
+        let both = sub(Some(0xaa), true, &["lon-edge-2"], true);
+        assert_eq!(text(&both), format!("{HEAD} F1 C0.32.1 o=lon-edge-2 r=1"));
+        assert_eq!(Control::decode(&both.encode()), Some(both.clone()));
+        assert_eq!(
+            Control::decode(format!("{HEAD} F1 C0.32.1 r=1 o=lon-edge-2").as_bytes()),
+            Some(both)
+        );
+        // A leg with no other is the SUB of before; no other leg and no
+        // resume may also be said in so many words.
+        let lone = sub(Some(0xaa), true, &[], false);
+        assert_eq!(text(&lone), format!("{HEAD} F1 C0.32.1"));
+        for sent in [
+            format!("{HEAD} F1 C0.32.1"),
+            format!("{HEAD} F1 C0.32.1 o= r=0"),
+        ] {
+            assert_eq!(
+                Control::decode(sent.as_bytes()),
+                Some(lone.clone()),
+                "{sent}"
+            );
+        }
+        // No more than MAX_OTHER_LEGS, written or read.
+        let many = sub(
+            Some(0xaa),
+            true,
+            &["lon-edge-2", "lon-edge-3", "lon-edge-4"],
+            false,
+        );
+        assert_eq!(text(&many), text(&third));
+        assert_eq!(
+            Control::decode(
+                format!("{HEAD} F1 C0.32.1 o=lon-edge-2,lon-edge-3,lon-edge-4").as_bytes()
+            ),
+            Some(third)
+        );
+        // The fields come after the words of the lanes, each once and well
+        // formed.
+        for tail in [
+            "o=lon-edge-2 F1",
+            "o=lon-edge-2 C0.32.1",
+            "o=lon-edge-2 o=lon-edge-3",
+            "r=1 r=1",
+            "r=",
+            "r=2",
+            "o=lon-edge-2 lon-edge-3",
+        ] {
+            let sent = format!("{HEAD} {tail}");
+            assert_eq!(Control::decode(sent.as_bytes()), None, "{sent}");
+        }
+    }
+
+    /// The rule that lets two builds talk for the length of a roll: a
+    /// `key=value` word that a build does not know, at the end of any
+    /// datagram, is skipped.
+    #[test]
+    fn unknown_trailing_words_are_skipped_on_every_verb() {
+        let leg = Control::Subscribe {
+            stream_id: 3001,
+            from_part: Some(42),
+            repair: RepairPolicy::default(),
+            token: Some(0xaa),
+            fast_lane: true,
+            compact: Some(CompactPlan::CLEAN),
+            others: vec!["lon-edge-2".into()],
+            resume: true,
+        };
+        let request = assign(&["lon-edge-1"], &[], 2, true, &["lon-edge-2"], None);
+        let controls = [
+            leg.clone(),
+            // A first request: padded, with neither lane.
+            Control::Subscribe {
+                stream_id: 3001,
+                from_part: None,
+                repair: RepairPolicy::default(),
+                token: None,
+                fast_lane: false,
+                compact: None,
+                others: Vec::new(),
+                resume: false,
+            },
+            Control::Unsubscribe {
+                stream_id: 9,
+                token: 7,
+            },
+            Control::Nack {
+                stream_id: 9,
+                token: 7,
+                parts: vec![12, 13],
+            },
+            Control::Token {
+                stream_id: 9,
+                token: 7,
+            },
+            Control::Subscribed {
+                stream_id: 9,
+                next_part: 77,
+                compact: true,
+            },
+            Control::Subscribed {
+                stream_id: 9,
+                next_part: 77,
+                compact: false,
+            },
+            Control::Waiting {
+                stream_id: 9,
+                next_part: 78,
+            },
+            Control::Refused {
+                stream_id: 9,
+                reason: "edge-busy".into(),
+            },
+            Control::Move {
+                stream_id: 9,
+                reason: "rebalance".into(),
+            },
+            // A request, padded, and a confirmation.
+            request.clone(),
+            assign(
+                &[],
+                &["lon-edge-2", "lon-edge-3"],
+                1,
+                false,
+                &[],
+                Some(0xfeed),
+            ),
+            Control::Assigned {
+                stream_id: 9,
+                nonce: 9,
+                port: Some(19_446),
+                caches: vec![AssignedCache {
+                    node_id: "lon-edge-1".into(),
+                    playback_base_url: "https://10.90.0.21:19444/live?a=b".into(),
+                    failover: false,
+                }],
+                paths: 2,
+                spare: true,
+            },
+            Control::Assigned {
+                stream_id: 9,
+                nonce: 9,
+                port: None,
+                caches: Vec::new(),
+                paths: 1,
+                spare: false,
+            },
+        ];
+        let with = |control: &Control, tail: &str| {
+            Control::decode(format!("{} {tail}", text(control)).as_bytes())
+        };
+        for control in &controls {
+            // One field, several, an empty value, a value with any graphic
+            // character, the longest key.
+            for tail in ["z=1", "zz=1 future=a,b|c=d", "k=", "abcdefgh=-"] {
+                assert_eq!(
+                    with(control, tail).as_ref(),
+                    Some(control),
+                    "{control:?} {tail}"
+                );
+            }
+            // Not of the form (a key of nine letters, a capital, a digit, no
+            // key, no `=`), alone or after a field: refused as before.
+            for tail in ["abcdefghi=1", "K=1", "k2=1", "=1", "x", "z=1 x"] {
+                assert_eq!(with(control, tail), None, "{control:?} {tail}");
+            }
+        }
+        // A field ends a list that runs to the end of its datagram: what
+        // follows it is no part and no cache.
+        assert_eq!(Control::decode(b"NTU/1 NACK 9 07 12 z=1 13"), None);
+        assert_eq!(Control::decode(b"NTU/1 NACK 9 07 z=1"), None);
+        assert_eq!(
+            Control::decode(b"NTU/1 ASSIGNED 9 09 - a|b|0 z=1 c|d|0"),
+            None
+        );
+        // A datagram that gives no reason: the field is no reason.
+        assert_eq!(
+            Control::decode(b"NTU/1 MOVE 9 z=1"),
+            Some(Control::Move {
+                stream_id: 9,
+                reason: "move".into(),
+            })
+        );
+        assert_eq!(
+            Control::decode(b"NTU/1 REFUSED 9 z=1 y=2"),
+            Some(Control::Refused {
+                stream_id: 9,
+                reason: "refused".into(),
+            })
+        );
+        // A reason with `=` is sent as a reason, never as a field.
+        let odd = Control::Move {
+            stream_id: 9,
+            reason: "a=b".into(),
+        };
+        assert_eq!(text(&odd), "NTU/1 MOVE 9 a-b");
+        assert_eq!(
+            Control::decode(&odd.encode()),
+            Some(Control::Move {
+                stream_id: 9,
+                reason: "a-b".into(),
+            })
+        );
+        // A field of another verb is one more unknown word.
+        assert_eq!(
+            Control::decode(b"NTU/1 OK 9 77 C o=lon-edge-2 p=2 t=zz"),
+            Some(Control::Subscribed {
+                stream_id: 9,
+                next_part: 77,
+                compact: true,
+            })
+        );
+        // An unknown field stands among the known ones.
+        assert_eq!(
+            Control::decode(b"NTU/1 SUB 3001 42 0 1 0 00aa F1 C0.32.1 z=1 o=lon-edge-2 y=2 r=1"),
+            Some(leg)
+        );
+        // The padding of an ASSIGN may come after a field of a later build.
+        assert_eq!(
+            Control::decode(b"NTU/1 ASSIGN 3001 09 s-1 lon-edge-1 - p=2 s=1 h=lon-edge-2 z=1 ...."),
+            Some(request)
+        );
     }
 
     #[test]
@@ -1598,6 +2335,8 @@ mod tests {
                     token,
                     fast_lane,
                     compact: None,
+                    others: Vec::new(),
+                    resume: false,
                 };
                 let encoded = control.encode();
                 assert_eq!(encoded.ends_with(b" F1"), fast_lane);
@@ -1619,6 +2358,8 @@ mod tests {
                 token: Some(0xdead_beef),
                 fast_lane: false,
                 compact: None,
+                others: Vec::new(),
+                resume: false,
             })
         );
         let first = format!("NTU/1 SUB 4001 - 250 3 0 - {}", ".".repeat(48));
@@ -1801,6 +2542,8 @@ mod tests {
             token: None,
             fast_lane: true,
             compact: Some(CompactPlan::CLEAN),
+            others: Vec::new(),
+            resume: false,
         };
         let answer = Control::Token {
             stream_id: 1,

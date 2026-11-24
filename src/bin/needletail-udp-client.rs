@@ -506,7 +506,10 @@ async fn udp_assignment(
         nonce,
         session: args.session.clone(),
         skip: skip.clone(),
-        current: current.map(str::to_owned),
+        current: current.into_iter().map(str::to_owned).collect(),
+        paths: 1,
+        spare: false,
+        hold: Vec::new(),
         token: None,
     }
     .encode();
@@ -541,6 +544,7 @@ async fn udp_assignment(
                         nonce: answered,
                         port,
                         caches,
+                        ..
                     }) = control
                     {
                         if stream_id != args.stream || answered != nonce {
@@ -569,7 +573,10 @@ async fn udp_assignment(
                                 nonce,
                                 session: args.session.clone(),
                                 skip,
-                                current: Some(caches[0].node_id.clone()),
+                                current: vec![caches[0].node_id.clone()],
+                                paths: 1,
+                                spare: false,
+                                hold: Vec::new(),
                                 token: Some(token),
                             }
                             .encode();
@@ -1807,6 +1814,8 @@ mod tests {
                         playback_base_url: "https://127.0.0.1:19444/live".into(),
                         failover: false,
                     }],
+                    paths: 1,
+                    spare: false,
                 };
                 // The node's token, then the answers.
                 let token = Control::Token {
@@ -1825,7 +1834,7 @@ mod tests {
                         token, current, ..
                     }) => {
                         assert_eq!(token, Some(0xabc));
-                        assert_eq!(current.as_deref(), Some("lon-edge-2"));
+                        assert_eq!(current, ["lon-edge-2"]);
                     }
                     other => panic!("{other:?}"),
                 }

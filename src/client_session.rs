@@ -377,6 +377,8 @@ impl UdpSession {
             token: self.token,
             fast_lane: self.config.fast_lane,
             compact: self.compact_asked.then_some(self.plan),
+            others: Vec::new(),
+            resume: false,
         }
         .encode()
     }

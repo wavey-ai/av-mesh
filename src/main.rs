@@ -35369,7 +35369,10 @@ mod tests {
                 nonce: 0x5eed,
                 session: session.into(),
                 skip,
-                current: None,
+                current: Vec::new(),
+                paths: 1,
+                spare: false,
+                hold: Vec::new(),
                 token: None,
             }
             .encode()
@@ -35398,6 +35401,7 @@ mod tests {
             nonce,
             port: udp_port,
             caches,
+            ..
         }) = Control::decode(&buf[..len])
         else {
             panic!("{:?}", String::from_utf8_lossy(&buf[..len]));
@@ -35414,7 +35418,10 @@ mod tests {
                 nonce: 0x5eed,
                 session: "reader-u".into(),
                 skip: Vec::new(),
-                current: Some(cache.into()),
+                current: vec![cache.into()],
+                paths: 1,
+                spare: false,
+                hold: Vec::new(),
                 token: Some(token),
             }
             .encode()
@@ -36032,6 +36039,8 @@ mod tests {
                         token,
                         fast_lane: false,
                         compact: None,
+                        others: Vec::new(),
+                        resume: false,
                     }
                     .encode()
                 };
@@ -36330,6 +36339,8 @@ mod tests {
                         token,
                         fast_lane: false,
                         compact: None,
+                        others: Vec::new(),
+                        resume: false,
                     }
                     .encode()
                 };
@@ -36510,6 +36521,8 @@ mod tests {
             token,
             fast_lane: false,
             compact: None,
+            others: Vec::new(),
+            resume: false,
         };
         let mut buf = vec![0_u8; 65_536];
         // A first request gets a token and nothing else: an address that
@@ -36652,6 +36665,8 @@ mod tests {
                 token,
                 fast_lane: false,
                 compact: None,
+                others: Vec::new(),
+                resume: false,
             }
             .encode()
         };
@@ -37050,6 +37065,8 @@ mod tests {
                     token,
                     fast_lane: false,
                     compact: None,
+                    others: Vec::new(),
+                    resume: false,
                 }
                 .encode()
             };
@@ -37569,6 +37586,8 @@ mod tests {
                     token,
                     fast_lane: false,
                     compact: None,
+                    others: Vec::new(),
+                    resume: false,
                 }
                 .encode()
             };
