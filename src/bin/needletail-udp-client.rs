@@ -524,14 +524,6 @@ impl LagHistogram {
         self.max = self.max.max(lag);
     }
 
-    fn merge(&mut self, other: &Self) {
-        for (count, add) in self.counts.iter_mut().zip(other.counts.iter()) {
-            *count += add;
-        }
-        self.over += other.over;
-        self.max = self.max.max(other.max);
-    }
-
     fn total(&self) -> u64 {
         self.counts
             .iter()
@@ -559,6 +551,31 @@ impl LagHistogram {
     }
 }
 
+/// The nodes the client held legs at, each named once (the arrivals file
+/// and the report refer to them by index), each with one lag histogram for
+/// all its legs: a run with churn grows by a node, not by a leg (review of
+/// B Y2, finding 7).
+#[derive(Debug, Default)]
+struct Nodes {
+    names: Vec<String>,
+    lags: Vec<LagHistogram>,
+}
+
+impl Nodes {
+    fn position(&self, node: &str) -> Option<usize> {
+        self.names.iter().position(|known| known == node)
+    }
+
+    /// The index of `node`, named now if it is new.
+    fn index(&mut self, node: &str) -> usize {
+        self.position(node).unwrap_or_else(|| {
+            self.names.push(node.to_owned());
+            self.lags.push(LagHistogram::new());
+            self.names.len() - 1
+        })
+    }
+}
+
 /// One leg as the report keeps it: where and when it was added, what the
 /// client saw of it, and the session's figures read as the director
 /// releases it (a released leg's figures are gone from the session).
@@ -566,13 +583,12 @@ impl LagHistogram {
 struct LegLog {
     key: LegKey,
     node: String,
-    /// Its node, as an index into the client's node names.
+    /// Its node, as an index into [`Nodes`].
     edge: usize,
     added: Instant,
     /// Its last media datagram (the client's view: for the time on one
     /// path).
     last_media: Option<Instant>,
-    lags: LagHistogram,
     report: Option<LegReport>,
 }
 
@@ -582,7 +598,7 @@ struct LegLog {
 struct Recorded<'a> {
     session: &'a mut UdpSession,
     logs: &'a mut Vec<LegLog>,
-    nodes: &'a mut Vec<String>,
+    nodes: &'a mut Nodes,
 }
 
 impl SessionLegs for Recorded<'_> {
@@ -595,20 +611,13 @@ impl SessionLegs for Recorded<'_> {
         now: Instant,
         send: &mut dyn FnMut(SocketAddr, &[u8]),
     ) {
-        let edge = match self.nodes.iter().position(|known| known == node) {
-            Some(edge) => edge,
-            None => {
-                self.nodes.push(node.to_owned());
-                self.nodes.len() - 1
-            }
-        };
+        let edge = self.nodes.index(node);
         self.logs.push(LegLog {
             key: leg,
             node: node.to_owned(),
             edge,
             added: now,
             last_media: None,
-            lags: LagHistogram::new(),
             report: None,
         });
         self.session.add_leg(leg, node, addr, start, now, send);
@@ -774,16 +783,13 @@ fn ms_of(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
 }
 
-/// The report's `legs`: each node's legs, from their logs.
-fn leg_figures(logs: &[LegLog]) -> BTreeMap<String, LegFigures> {
+/// The report's `legs`: each node's legs, from their logs, and the node's
+/// lags.
+fn leg_figures(logs: &[LegLog], nodes: &Nodes) -> BTreeMap<String, LegFigures> {
     let mut figures: BTreeMap<String, LegFigures> = BTreeMap::new();
-    let mut lags: BTreeMap<&str, LagHistogram> = BTreeMap::new();
     for log in logs {
         let entry = figures.entry(log.node.clone()).or_default();
         entry.legs += 1;
-        lags.entry(log.node.as_str())
-            .and_modify(|merged| merged.merge(&log.lags))
-            .or_insert_with(|| log.lags.clone());
         let Some(report) = &log.report else {
             continue;
         };
@@ -801,7 +807,7 @@ fn leg_figures(logs: &[LegLog]) -> BTreeMap<String, LegFigures> {
         entry.longest_gap_ms = entry.longest_gap_ms.max(ms_of(report.longest_gap));
         entry.plan = Some(report.plan.word());
     }
-    for (node, histogram) in lags {
+    for (node, histogram) in nodes.names.iter().zip(&nodes.lags) {
         if let Some(entry) = figures.get_mut(node) {
             entry.lag_ms = LagFigures {
                 median: histogram.quantile_ms(0.5),
@@ -990,6 +996,10 @@ struct CompactReport {
 
 #[derive(Debug, Default, Serialize)]
 struct VerifyReport {
+    /// Parts delivered that were never asked for: the parts' extension was
+    /// never learnt (every playlist read failed), the edge's URL was
+    /// unknown, or more waited for the extension than are kept.
+    unverified: u64,
     checked: u64,
     identical: u64,
     different: u64,
@@ -1003,6 +1013,38 @@ struct VerifyJob {
     path: String,
     part: u64,
     payload: Bytes,
+}
+
+/// Parts kept waiting for the parts' extension at most; later ones are
+/// counted unverified.
+const VERIFY_WAITING_MAX: usize = 4_096;
+
+/// A failed playlist read is made again this often while the parts'
+/// extension is unknown.
+const PLAYLIST_RETRY: Duration = Duration::from_secs(1);
+
+/// Read `node`'s media playlist at `url` on a task (`--playlist-first`,
+/// `--verify-http`): its parts' extension, or why not, comes back on `done`.
+fn ask_playlist(
+    http: &Http,
+    done: &mpsc::UnboundedSender<Done>,
+    url: &str,
+    stream: u64,
+    node: &str,
+) {
+    let Ok(url) = Url::parse(url) else {
+        return;
+    };
+    let (http, done, node) = (http.clone(), done.clone(), node.to_owned());
+    let path = format!("{}/{stream}/stream.m3u8", url.path);
+    tokio::spawn(async move {
+        let answer = match http.get(&url.authority, &path).await {
+            Ok((StatusCode::OK, body)) => Ok(playlist_parts(&String::from_utf8_lossy(&body)).1),
+            Ok((status, _)) => Err(format!("playlist answered {status}")),
+            Err(error) => Err(format!("playlist failed: {error:#}")),
+        };
+        let _ = done.send(Done::Playlist { node, answer });
+    });
 }
 
 /// A part waiting for the parts' extension before it can be verified.
@@ -1335,7 +1377,7 @@ async fn main() -> Result<()> {
     let mut written_parts: BTreeMap<u64, Bytes> = BTreeMap::new();
     let mut arrivals: BTreeMap<u64, Arrival> = BTreeMap::new();
     // The node names the arrivals and the time on one path refer to.
-    let mut nodes: Vec<String> = Vec::new();
+    let mut nodes = Nodes::default();
     let mut single_path = SinglePath::new(Duration::from_millis(args.token_ms));
     // The last first arrival (kernel time where the host gives it), the
     // longest gap between two, and the gaps of INTERRUPTION or more.
@@ -1350,6 +1392,10 @@ async fn main() -> Result<()> {
     let mut playlists_asked: BTreeSet<String> = BTreeSet::new();
     let mut extension: Option<String> = None;
     let mut verify_waiting: Vec<VerifyWaiting> = Vec::new();
+    let mut unverified = 0_u64;
+    // Playlists to read again: a read failed while the extension was
+    // unknown.
+    let mut playlist_retry: Vec<(String, Instant)> = Vec::new();
     let mut logs_seen = 0_usize;
     let mut buf = vec![0_u8; 65_536];
     let mut first_published_us: Option<u64> = None;
@@ -1449,29 +1495,33 @@ async fn main() -> Result<()> {
                 .first_request_ms
                 .get_or_insert(ms_of(log.added.saturating_duration_since(started)));
             if read_playlists && playlists_asked.insert(log.node.clone()) {
-                if let Some(url) = director
-                    .cache_url(&log.node)
-                    .and_then(|url| Url::parse(url).ok())
-                {
-                    let (http, done, node) = (http.clone(), done_tx.clone(), log.node.clone());
-                    let path = format!("{}/{}/stream.m3u8", url.path, args.stream);
-                    tokio::spawn(async move {
-                        let answer = match http.get(&url.authority, &path).await {
-                            Ok((StatusCode::OK, body)) => {
-                                Ok(playlist_parts(&String::from_utf8_lossy(&body)).1)
-                            }
-                            Ok((status, _)) => Err(format!("playlist answered {status}")),
-                            Err(error) => Err(format!("playlist failed: {error:#}")),
-                        };
-                        let _ = done.send(Done::Playlist { node, answer });
-                    });
+                if let Some(url) = director.cache_url(&log.node) {
+                    ask_playlist(&http, &done_tx, url, args.stream, &log.node);
                 }
             }
         }
         logs_seen = logs.len();
+        // Playlists that failed, read again until the extension is known.
+        if extension.is_some() {
+            playlist_retry.clear();
+        }
+        playlist_retry.retain(|(node, at)| {
+            if *at > now {
+                return true;
+            }
+            if let Some(url) = director.cache_url(node) {
+                ask_playlist(&http, &done_tx, url, args.stream, node);
+            }
+            false
+        });
 
         let end = if draining { deadline + drain } else { deadline };
-        let wake = end.min(session.next_wake()).min(director.next_wake());
+        let wake = playlist_retry
+            .iter()
+            .map(|(_, at)| *at)
+            .fold(end, Instant::min)
+            .min(session.next_wake())
+            .min(director.next_wake());
         let (start, len, peer, kernel_us) =
             if let Some((next, end, size, peer, kernel)) = pending.take() {
                 let len = size.min(end - next);
@@ -1509,7 +1559,12 @@ async fn main() -> Result<()> {
                                     startup.playlist_ms.get_or_insert(since_start(started));
                                     extension.get_or_insert(found);
                                 }
-                                Err(failure) => eprintln!("{node}: {failure}"),
+                                Err(failure) => {
+                                    eprintln!("{node}: {failure}");
+                                    if extension.is_none() {
+                                        playlist_retry.push((node, now + PLAYLIST_RETRY));
+                                    }
+                                }
                             },
                         }
                         perform(&socket, &mut actions, &http, &done_tx).await;
@@ -1659,12 +1714,15 @@ async fn main() -> Result<()> {
                         written_parts.insert(part, payload.clone());
                     }
                     if args.verify_http {
-                        if let Some(node) = edge.map(|index| nodes[index].clone()) {
-                            verify_waiting.push(VerifyWaiting {
-                                node,
-                                part,
-                                payload,
-                            });
+                        match edge.map(|index| nodes.names[index].clone()) {
+                            Some(node) if verify_waiting.len() < VERIFY_WAITING_MAX => {
+                                verify_waiting.push(VerifyWaiting {
+                                    node,
+                                    part,
+                                    payload,
+                                });
+                            }
+                            _ => unverified += 1,
                         }
                     }
                 }
@@ -1682,8 +1740,8 @@ async fn main() -> Result<()> {
                 }
                 for leg in director.legs() {
                     if let Some(lag) = session.leg_lag_of(leg.key, part) {
-                        if let Some(log) = logs.iter_mut().rev().find(|log| log.key == leg.key) {
-                            log.lags.record(lag);
+                        if let Some(index) = nodes.position(&leg.node) {
+                            nodes.lags[index].record(lag);
                         }
                     }
                 }
@@ -1705,6 +1763,8 @@ async fn main() -> Result<()> {
                         part: waiting.part,
                         payload: waiting.payload,
                     });
+                } else {
+                    unverified += 1;
                 }
             }
         }
@@ -1725,10 +1785,13 @@ async fn main() -> Result<()> {
     }
     let receiver = &session.receiver;
     drop(verify_tx);
-    let verify = verifier.await.ok();
+    let verify = verifier.await.ok().map(|mut report| {
+        report.unverified = unverified + verify_waiting.len() as u64;
+        report
+    });
 
     if let Some(path) = &args.arrivals {
-        std::fs::write(path, arrivals_csv(&arrivals, &nodes))
+        std::fs::write(path, arrivals_csv(&arrivals, &nodes.names))
             .with_context(|| format!("write {}", path.display()))?;
     }
     if let Some(file) = parts_out.as_mut() {
@@ -1757,7 +1820,7 @@ async fn main() -> Result<()> {
         _ => None,
     };
     let stats = receiver.compact.stats;
-    let legs = leg_figures(&logs);
+    let legs = leg_figures(&logs, &nodes);
     let nack_rtt_ms = legs
         .values()
         .filter_map(|figures| figures.rtt_ms)
@@ -1995,35 +2058,38 @@ mod tests {
     fn the_report_names_each_leg_and_the_time_on_one_path() {
         let t0 = Instant::now();
         let ms = |n: u64| t0 + Duration::from_millis(n);
-        let log = |key: u32, node: &str, added: u64, lags_us: &[u64], report: LegReport| {
-            let mut lags = LagHistogram::new();
+        let mut nodes = Nodes::default();
+        let mut log = |key: u32, node: &str, added: u64, lags_us: &[u64], report: LegReport| {
+            let edge = nodes.index(node);
             for lag in lags_us {
-                lags.record(Duration::from_micros(*lag));
+                nodes.lags[edge].record(Duration::from_micros(*lag));
             }
             LegLog {
                 key: LegKey(key),
                 node: node.into(),
-                edge: key as usize,
+                edge,
                 added: ms(added),
                 last_media: None,
-                lags,
                 report: Some(report),
             }
         };
-        // e1 first on 99 parts and 1 ms behind on one; e2 always behind.
-        let mut e1_lags = vec![0; 99];
+        // e1 first on 99 parts and 1 ms behind on one; e2 always behind; a
+        // second leg at e1 later, whose lags join the first's.
+        let mut e1_lags = vec![0; 98];
         e1_lags.push(1_000);
         let logs = vec![
             log(0, "e1", 0, &e1_lags, report("e1", 1_000, 100)),
             log(1, "e2", 0, &[300; 100], report("e2", 1_000, 101)),
             log(2, "e3", 4_000, &[200; 10], report("e3", 400, 4_100)),
+            log(3, "e1", 5_000, &[0], report("e1", 10, 5_100)),
         ];
-        let figures = leg_figures(&logs);
+        assert_eq!(nodes.names, ["e1", "e2", "e3"], "one histogram a node");
+        let figures = leg_figures(&logs, &nodes);
         assert_eq!(figures.keys().collect::<Vec<_>>(), ["e1", "e2", "e3"]);
         let e1 = &figures["e1"];
         assert_eq!(
             (e1.legs, e1.first_part, e1.datagrams),
-            (1, Some(100), 1_000)
+            (2, Some(100), 1_010)
         );
         assert_eq!(e1.lag_ms.median, Some(0.01));
         assert_eq!(e1.lag_ms.p99, Some(0.01));
