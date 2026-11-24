@@ -187,10 +187,12 @@ struct Ingress {
     failover: Arc<FailoverInputs>,
     /// What `GET /api/node` reports of each parent's feed (C CR4).
     feeds: Arc<ParentFeeds>,
-    tee: mpsc::Receiver<TeeItem>,
+    tee: TeeReceiver<TeeMeta>,
     stop: Arc<AtomicBool>,
     thread: Option<ClassThread>,
     running: Option<JoinHandle<()>>,
+    /// Makes the feed entries the thread asks for, as the tee does.
+    feeder: Option<JoinHandle<()>>,
 }
 
 impl Ingress {
@@ -248,7 +250,7 @@ impl Ingress {
         let failover = Arc::new(FailoverInputs::new());
         let feeds = Arc::new(ParentFeeds::default());
         let stop = Arc::new(AtomicBool::new(false));
-        let (tx, tee) = mpsc::channel(65_536);
+        let (tx, tee) = tee_ring(65_536);
         let thread = ClassThread {
             class: TrafficClass::Audio,
             sockets: sockets
@@ -259,7 +261,7 @@ impl Ingress {
             limits: RelayLimits::default(),
             forwarder: Some(forwarder),
             link_telemetry: None,
-            tee: tx,
+            tee: Some(tx),
             stats: Arc::clone(&stats),
             failover: Arc::clone(&failover),
             stop: Arc::clone(&stop),
@@ -277,6 +279,7 @@ impl Ingress {
             media_deadline_us: BUDGET,
             epochs: Arc::clone(&epochs),
             feeds: Arc::clone(&feeds),
+            test_alloc_counter: None,
         };
         Self {
             senders,
@@ -290,6 +293,7 @@ impl Ingress {
             stop,
             thread: Some(thread),
             running: None,
+            feeder: None,
         }
     }
 
@@ -302,6 +306,14 @@ impl Ingress {
     fn run(&mut self) {
         let thread = self.thread.take().expect("started once");
         self.running = Some(std::thread::spawn(move || thread.run()));
+        // The tee's part in the feeds: the entries the thread asks for.
+        let (feeds, stop) = (Arc::clone(&self.feeds), Arc::clone(&self.stop));
+        self.feeder = Some(std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                feeds.make_requested();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }));
     }
 
     /// Contributor `sender` (0: primary lane, 1: secondary) sends `datagrams`.
@@ -370,7 +382,8 @@ impl Ingress {
     /// The datagrams the thread handed its tee so far.
     fn teed(&mut self) -> usize {
         let mut count = 0;
-        while self.tee.try_recv().is_ok() {
+        while self.tee.peek().is_some() {
+            self.tee.release();
             count += 1;
         }
         count
@@ -382,6 +395,9 @@ impl Drop for Ingress {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(running) = self.running.take() {
             let _ = running.join();
+        }
+        if let Some(feeder) = self.feeder.take() {
+            let _ = feeder.join();
         }
     }
 }
@@ -843,7 +859,7 @@ fn a_kept_whole_part_ages_from_its_receipt_not_its_wire_deadline() {
     };
     let sender = StdSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let stats = FastPlaneStats::default();
-    let mut descriptors = LeaseDescriptors::default();
+    let mut descriptors = LeaseDescriptors::new();
     let mut observe = |datagram: &[u8], now_us: u64| {
         let view = RlsView::parse(datagram, RelayLimits::default()).unwrap();
         descriptors.observe(

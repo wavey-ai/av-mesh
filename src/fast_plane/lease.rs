@@ -323,6 +323,8 @@ pub struct LeaseChildren {
     /// same address.
     sockets: [std::net::UdpSocket; 2],
     snapshot: ArcSwap<LeaseSnapshot>,
+    /// Snapshots replaced while a class thread read them (see `retired`).
+    retired: super::retired::Retired<LeaseSnapshot>,
     /// Every child fed, by address, kept across rebuilds while it has a
     /// lease (its promotion and warm ring), and the children refused.
     known: StdMutex<Known>,
@@ -386,6 +388,7 @@ impl LeaseChildren {
             },
             sockets: [audio, video],
             snapshot: ArcSwap::from_pointee(LeaseSnapshot::default()),
+            retired: super::retired::Retired::default(),
             known: StdMutex::new(Known::default()),
             stats: LeaseStats::default(),
         }))
@@ -393,6 +396,11 @@ impl LeaseChildren {
 
     pub fn local_addr(&self) -> SocketAddr {
         self.config.bind
+    }
+
+    /// Children (addresses) fed at most (`--relay-max-lease-children`).
+    pub fn max_children(&self) -> usize {
+        self.config.max_children
     }
 
     /// Copies of the lease sockets for a reader of what arrives on them
@@ -576,7 +584,7 @@ impl LeaseChildren {
             .pairs
             .store(snapshot.pairs() as u64, Ordering::Relaxed);
         self.stats.rebuilds.fetch_add(1, Ordering::Relaxed);
-        self.snapshot.store(Arc::new(snapshot));
+        self.retired.keep(self.snapshot.swap(Arc::new(snapshot)));
     }
 
     /// Keep a video source held back from a repair-only child, for the

@@ -11,9 +11,10 @@ use super::demand::{NodeDemand, DEMAND_REPORT_INTERVAL};
 use super::edge_clients::{ClientPlan, ClientSender, EdgeFastLane, UpstreamRepair};
 use super::lease::{LeaseChildren, LeaseSnapshot, LeaseSnapshotStats, LeaseTake};
 use super::loss_report::{decode_ledger, LossMeter};
-use super::parent_feeds::ParentFeeds;
 use super::media_clock::{MediaClocks, ValidatedEpochs, Verdict};
+use super::parent_feeds::{FeedMisses, ParentFeeds};
 use super::sys::{self, RecvBatch, RECV_BATCH};
+use super::tee_ring::{tee_ring, Ready, TeeReceiver, TeeSender};
 use super::view::RlsView;
 use super::{class_addr, StreamClasses, TrafficClass};
 use crate::link_telemetry::LinkTelemetry;
@@ -31,7 +32,6 @@ use av_mesh::relay_ingress::{
 };
 use av_mesh::stall_journal::{self, StallKind, StallThread};
 use av_mesh::udp_fec::UdpFecReceiver;
-use bytes::Bytes;
 use media_object::ObjectKey;
 use raptorq_datagram_fec::{MediaDatagramRole, MediaObjectKind};
 use relay_session::RelayLimits;
@@ -43,10 +43,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::{broadcast, mpsc, watch, Notify};
+use tokio::sync::{broadcast, watch, Notify};
 use tracing::{debug, info, warn};
 
-/// Datagrams a class's tee holds before the thread drops its tee copy.
+/// Datagrams a class's tee holds before the thread drops its tee copy (its
+/// ring also holds `tee_ring::BYTES_PER_ENTRY` bytes for each: 16 MB at
+/// this, pinned at start).
 pub const DEFAULT_TEE_CAPACITY: usize = 65_536;
 /// Symbols the first-arrival table remembers per class.
 const DEDUP_CAPACITY: usize = 65_536;
@@ -124,6 +126,10 @@ pub struct RelayClassConfig {
     /// Tests: the tee of this class panics on its first datagram.
     #[cfg(test)]
     pub test_tee_panic: Option<TrafficClass>,
+    /// Tests: the audio thread counts its allocations and frees here once
+    /// it runs (`alloc_count`).
+    #[cfg(test)]
+    pub test_alloc_counter: Option<&'static crate::alloc_count::AllocCounter>,
 }
 
 impl Default for RelayClassConfig {
@@ -146,6 +152,8 @@ impl Default for RelayClassConfig {
             media_deadline_us: DEFAULT_MEDIA_DEADLINE_US,
             #[cfg(test)]
             test_tee_panic: None,
+            #[cfg(test)]
+            test_alloc_counter: None,
         }
     }
 }
@@ -733,11 +741,12 @@ impl FailoverInputs {
     }
 }
 
-/// One datagram handed from a class thread to its tee.
-struct TeeItem {
+/// What a class thread hands its tee with a datagram (whose bytes go in
+/// the tee ring beside it).
+#[derive(Clone, Copy)]
+struct TeeMeta {
     peer: SocketAddr,
     path: RelayIngressParentPath,
-    bytes: Bytes,
     /// Arrival time: the kernel's when the socket reports it.
     rx_us: u64,
     /// When the thread read it off the socket (its batch's wake-up).
@@ -748,6 +757,7 @@ struct TeeItem {
     kind: TeeKind,
 }
 
+#[derive(Clone, Copy)]
 enum TeeKind {
     /// An RLS1 symbol that passed the session checks: forwarded (to the
     /// first child at that time, if any child took it).
@@ -800,15 +810,19 @@ pub(crate) struct ForwardPlan {
 }
 
 impl ForwardPlan {
-    fn new(groups: usize, warm_paths: usize) -> Self {
+    /// A plan with room for a batch to every child: `paths` compiled
+    /// children (in `groups` socket groups, `warm_paths` of them repair
+    /// only) and `lease_children` lease children, so that no list grows on
+    /// the class thread (stall follow-up).
+    fn new(groups: usize, paths: usize, warm_paths: usize, lease_children: usize) -> Self {
         Self {
             groups: (0..groups)
-                .map(|_| Vec::with_capacity(RECV_BATCH))
+                .map(|_| Vec::with_capacity(RECV_BATCH * paths.max(1)))
                 .collect(),
-            retry: Vec::with_capacity(RECV_BATCH),
+            retry: Vec::with_capacity(RECV_BATCH * paths.max(1)),
             warm: Vec::with_capacity(RECV_BATCH * warm_paths),
-            lease: Vec::with_capacity(RECV_BATCH * 4),
-            lease_warm: Vec::new(),
+            lease: Vec::with_capacity(RECV_BATCH * lease_children),
+            lease_warm: Vec::with_capacity(RECV_BATCH * lease_children),
             first: [None; RECV_BATCH],
         }
     }
@@ -886,8 +900,9 @@ fn send_lease_plan(
         let use_gso = *gso && class == TrafficClass::Video;
         if use_gso {
             // A child's symbols in a row make one GSO message; the order of
-            // a child's own symbols is kept.
-            sends.sort_by_key(|send| send.child);
+            // a child's own symbols is kept. In place: a stable sort takes
+            // a buffer.
+            sends.sort_unstable_by_key(|send| (send.child, send.message));
         }
         let message = |index: usize| {
             let send = &sends[index];
@@ -1200,7 +1215,8 @@ struct ClassThread {
     limits: RelayLimits,
     forwarder: Option<Arc<RelayDownstreamForwarder>>,
     link_telemetry: Option<Arc<LinkTelemetry>>,
-    tee: mpsc::Sender<TeeItem>,
+    /// The tee ring's producer end, which `run` takes.
+    tee: Option<TeeSender<TeeMeta>>,
     stats: Arc<FastPlaneStats>,
     failover: Arc<FailoverInputs>,
     stop: Arc<AtomicBool>,
@@ -1224,6 +1240,9 @@ struct ClassThread {
     /// The epoch that the cache validated for each stream, which the
     /// thread's media clocks follow.
     epochs: Arc<ValidatedEpochs>,
+    /// Tests: the counter of this thread's allocations once it runs.
+    #[cfg(test)]
+    test_alloc_counter: Option<&'static crate::alloc_count::AllocCounter>,
 }
 
 /// Wave 9 (cold start): each stream's last whole one-symbol audio part
@@ -1234,17 +1253,27 @@ struct ClassThread {
 /// compact part ("unknown descriptor") until the contributor's next whole
 /// part, up to --relay-compact-whole-ms (100 ms) later, and served its new
 /// listeners from the cache mesh meanwhile, 7-18 ms late (wave 9 trace).
-#[derive(Default)]
+///
+/// A fixed table made before the thread runs (stall follow-up): a new
+/// stream takes a free entry, not an insert and two buffers' allocations on
+/// the real-time thread.
 struct LeaseDescriptors {
-    streams: HashMap<Box<str>, LastWhole>,
+    /// The table's pin, first so that it unlocks before the table is freed.
+    _pin: crate::memory::Pinned,
+    streams: Box<[LastWhole]>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy)]
 struct LastWhole {
-    datagram: Vec<u8>,
+    /// The stream id's bytes as RLS1 carries them (`key_len` 0: free).
+    key: [u8; DESCRIPTOR_KEY_BYTES],
+    key_len: u8,
+    datagram: [u8; DESCRIPTOR_BYTES],
+    len: u16,
     /// When it arrived, on this node's clock.
     kept_us: u64,
-    had: Vec<SocketAddr>,
+    had: [SocketAddr; DESCRIPTOR_CHILDREN],
+    had_len: u8,
 }
 
 /// Streams whose last whole part the audio thread keeps, at most.
@@ -1252,8 +1281,87 @@ const MAX_DESCRIPTOR_STREAMS: usize = 1_024;
 /// How long a stream's last whole part is sent to a new child, from its
 /// receipt.
 const DESCRIPTOR_HOLD_US: u64 = 1_000_000;
+/// A whole part larger than this (an RLS1 datagram is at most 1,472 bytes)
+/// is not kept, nor a stream id longer than the key.
+const DESCRIPTOR_BYTES: usize = 1_472;
+const DESCRIPTOR_KEY_BYTES: usize = 40;
+/// The lease children of a stream that a part is remembered as sent to
+/// (twice `DEFAULT_MAX_LEASE_CHILDREN`: a child is one entry per role). A
+/// child beyond them gets no descriptor and reads the next whole part.
+const DESCRIPTOR_CHILDREN: usize = 32;
+
+impl LastWhole {
+    const FREE: Self = Self {
+        key: [0; DESCRIPTOR_KEY_BYTES],
+        key_len: 0,
+        datagram: [0; DESCRIPTOR_BYTES],
+        len: 0,
+        kept_us: 0,
+        had: [SocketAddr::V4(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::UNSPECIFIED,
+            0,
+        )); DESCRIPTOR_CHILDREN],
+        had_len: 0,
+    };
+
+    fn had(&self) -> &[SocketAddr] {
+        &self.had[..usize::from(self.had_len)]
+    }
+
+    /// Remember `peer` as sent the kept part; `false` when there is no room
+    /// (it is then treated as having had it).
+    fn mark(&mut self, peer: SocketAddr) -> bool {
+        let at = usize::from(self.had_len);
+        if at == DESCRIPTOR_CHILDREN {
+            return false;
+        }
+        self.had[at] = peer;
+        self.had_len += 1;
+        true
+    }
+}
 
 impl LeaseDescriptors {
+    fn new() -> Self {
+        let mut streams = vec![LastWhole::FREE; MAX_DESCRIPTOR_STREAMS].into_boxed_slice();
+        Self {
+            _pin: crate::memory::pin_slice("lease descriptors", &mut streams),
+            streams,
+        }
+    }
+
+    /// The entry of `stream`, taking a free one for a new stream when
+    /// `take`; `None` when the table is full or the id too long.
+    fn entry(&mut self, stream: &str, take: bool) -> Option<&mut LastWhole> {
+        let key = stream.as_bytes();
+        if key.is_empty() || key.len() > DESCRIPTOR_KEY_BYTES {
+            return None;
+        }
+        // FNV-1a: the table is this thread's, and its keys are its streams.
+        let hash = key.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+        let slots = self.streams.len();
+        let first = (hash as usize) % slots;
+        for probe in 0..slots {
+            let index = (first + probe) % slots;
+            let entry = &self.streams[index];
+            if entry.key_len == 0 {
+                if !take {
+                    return None;
+                }
+                let entry = &mut self.streams[index];
+                entry.key[..key.len()].copy_from_slice(key);
+                entry.key_len = key.len() as u8;
+                return Some(entry);
+            }
+            if &entry.key[..usize::from(entry.key_len)] == key {
+                return Some(&mut self.streams[index]);
+            }
+        }
+        None
+    }
+
     /// Look at one admitted audio datagram that goes to the stream's lease
     /// children: keep a whole one-symbol source part, or send the kept one
     /// to each child that has not had it before this compact part goes.
@@ -1275,42 +1383,41 @@ impl LeaseDescriptors {
         if view.slim.is_none() {
             // Kept whether or not the stream has lease children yet: the
             // first child comes between two whole parts.
-            if view.source_symbols != 1 || !matches!(view.role, MediaDatagramRole::Source) {
+            if view.source_symbols != 1
+                || !matches!(view.role, MediaDatagramRole::Source)
+                || datagram.len() > DESCRIPTOR_BYTES
+            {
                 return;
             }
-            if !self.streams.contains_key(view.stream) {
-                if self.streams.len() >= MAX_DESCRIPTOR_STREAMS {
-                    return;
-                }
-                self.streams.insert(view.stream.into(), LastWhole::default());
-            }
-            let Some(last) = self.streams.get_mut(view.stream) else {
+            let Some(last) = self.entry(view.stream, true) else {
                 return;
             };
-            last.datagram.clear();
-            last.datagram.extend_from_slice(datagram);
+            last.datagram[..datagram.len()].copy_from_slice(datagram);
+            last.len = datagram.len() as u16;
             last.kept_us = now_us;
             // Every child of the stream gets this one now.
-            last.had.clear();
-            last.had.extend(children.iter().map(target));
+            last.had_len = 0;
+            for child in children {
+                last.mark(target(child));
+            }
             return;
         }
         if children.is_empty() {
             return;
         }
-        let Some(last) = self.streams.get_mut(view.stream) else {
+        let Some(last) = self.entry(view.stream, false) else {
             return;
         };
-        if last.datagram.is_empty() || now_us.saturating_sub(last.kept_us) >= DESCRIPTOR_HOLD_US {
+        if last.len == 0 || now_us.saturating_sub(last.kept_us) >= DESCRIPTOR_HOLD_US {
             return;
         }
         for child in children {
             let peer = target(child);
-            if last.had.contains(&peer) {
+            if last.had().contains(&peer) || !last.mark(peer) {
                 continue;
             }
-            last.had.push(peer);
-            if sys::send_batch(fd, 1, |_| (last.datagram.as_slice(), peer)).unwrap_or(0) == 1 {
+            let kept = &last.datagram[..usize::from(last.len)];
+            if sys::send_batch(fd, 1, |_| (kept, peer)).unwrap_or(0) == 1 {
                 stats.lease_descriptors.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -1370,14 +1477,16 @@ impl ClassThread {
         }
     }
 
-    fn run(self) {
+    fn run(mut self) {
+        let mut tee = self.tee.take().expect("a class thread runs once");
         // The sends to the edge's clients: by this thread, or by fan-out
         // threads (wave 7 item 10), started here, before this thread is made
         // real-time and pinned, so that they inherit none of it and its
         // first client finds them running (wave 9 first-session stall).
         let mut client_sender = ClientSender::new(self.edge_clients.as_ref(), self.class);
-        self.schedule();
-        self.stats.threads.fetch_add(1, Ordering::Relaxed);
+        // Everything the loop uses is made (and touched) below, before the
+        // thread is made real-time: once it runs, the loop allocates, frees
+        // and first-touches nothing (stall follow-up; `alloc_free` tests).
         let fds: Vec<_> = self
             .sockets
             .iter()
@@ -1413,9 +1522,21 @@ impl ClassThread {
         // last followed them.
         let mut followed = None;
         let mut lag_second = 0;
+        // Room for every lease child: two entries (roles) per child.
+        let lease_children = self
+            .lease
+            .as_ref()
+            .map_or(0, |lease| 2 * lease.max_children());
         let mut plan = self.forwarder.as_ref().map_or_else(
-            || ForwardPlan::new(0, 0),
-            |forwarder| ForwardPlan::new(forwarder.socket_groups.len(), forwarder.warm_paths()),
+            || ForwardPlan::new(0, 0, 0, lease_children),
+            |forwarder| {
+                ForwardPlan::new(
+                    forwarder.socket_groups.len(),
+                    forwarder.paths.len(),
+                    forwarder.warm_paths(),
+                    lease_children,
+                )
+            },
         );
         let mut pending = Vec::with_capacity(RECV_BATCH);
         // UDP GSO for video until the host refuses it once (the edge's
@@ -1438,12 +1559,26 @@ impl ClassThread {
         let mut descriptors = (self.lease_descriptors
             && self.class == TrafficClass::Audio
             && self.lease.is_some())
-        .then(LeaseDescriptors::default);
+        .then(LeaseDescriptors::new);
+        let mut feed_misses = FeedMisses::new();
         let mut last_loss_poll = Instant::now();
         let mut last_demand_report: Option<Instant> = None;
         // Loop lag (wave 9): the last wait's return that brought datagrams.
         let mut last_ready_at: Option<Instant> = None;
         let mut faults_read_at = Instant::now();
+        // The lock-free snapshots' first load registers this thread with
+        // arc-swap (an allocation, once per thread): here, not in a pass.
+        if let Some(lease) = &self.lease {
+            drop(lease.load());
+        }
+        if let Some(lane) = &self.edge_clients {
+            drop(lane.load());
+        }
+        self.feeds.warm_up();
+        self.schedule();
+        self.stats.threads.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        crate::alloc_count::watch_this_thread(self.test_alloc_counter);
         while !self.stop.load(Ordering::Relaxed) {
             // No longer than the next copy's due time.
             let timeout = copies
@@ -1508,6 +1643,8 @@ impl ClassThread {
                             copies.as_mut(),
                             meters.get_mut(index),
                             descriptors.as_mut(),
+                            &mut tee,
+                            &mut feed_misses,
                         );
                         if !batch.next_window() {
                             break;
@@ -1518,6 +1655,8 @@ impl ClassThread {
                     }
                 }
             }
+            // What the feeds held of new keys, once the tee made them.
+            self.feeds.book_misses(&mut feed_misses);
             if let Some(copies) = copies.as_mut() {
                 self.send_copies(copies);
             }
@@ -1665,6 +1804,8 @@ impl ClassThread {
         copies: Option<&mut BurstCopies>,
         mut meter: Option<&mut LossMeter>,
         mut descriptors: Option<&mut LeaseDescriptors>,
+        tee: &mut TeeSender<TeeMeta>,
+        feed_misses: &mut FeedMisses,
     ) {
         let now_us = now_unix_us();
         let now = Instant::now();
@@ -1673,14 +1814,15 @@ impl ClassThread {
         let class = self.class;
         // The lease children as they are now, without a lock.
         let lease_now = self.lease.as_deref().map(|lease| (lease, lease.load()));
+        // Read through the guard, never cloned: a snapshot that a rebuild
+        // replaces is freed by the rebuild's thread, not this one.
+        let lease_snapshot: Option<(&LeaseChildren, &LeaseSnapshot)> =
+            lease_now.as_ref().map(|(lease, guard)| (*lease, &***guard));
         // The whole parts are kept for children to come (wave 9), so the
         // descriptors look at every batch; the lease plan only when there
         // are children.
-        let descriptor_lease = lease_now
-            .as_ref()
-            .filter(|_| descriptors.is_some())
-            .map(|(lease, snapshot)| (*lease, Arc::clone(&**snapshot)));
-        let lease = lease_now.filter(|(_, snapshot)| !snapshot.is_empty());
+        let descriptor_lease = lease_snapshot.filter(|_| descriptors.is_some());
+        let lease = lease_snapshot.filter(|(_, snapshot)| !snapshot.is_empty());
         // The edge's fast-lane clients as they are now, without a lock.
         let edge_clients = self
             .edge_clients
@@ -1785,7 +1927,7 @@ impl ClassThread {
                 }
             }
             self.failover.observe(path, view.role, now);
-            self.feeds.observe(peer.ip(), &view, rx_us);
+            self.feeds.observe(peer.ip(), &view, rx_us, feed_misses);
             let key = dedup.key(
                 view.tenant,
                 view.stream,
@@ -1897,19 +2039,26 @@ impl ClassThread {
                 },
                 None => TeeKind::Unchecked,
             };
-            let item = TeeItem {
+            let meta = TeeMeta {
                 peer: entry.peer,
                 path: entry.path,
-                bytes: Bytes::copy_from_slice(batch.data(entry.message)),
                 rx_us: entry.rx_us,
                 woken_us: now_us,
                 client_sent: clients.sent_to(entry.message),
                 kind,
             };
-            if self.tee.try_send(item).is_err() {
+            // Into the pinned ring: no allocation, and nothing for the
+            // class thread to free (stall follow-up). A full ring drops
+            // the copy, as a full channel did.
+            if !tee.push(meta, batch.data(entry.message)) {
                 self.stats.tee_dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
+        if feed_misses.held() > 0 {
+            // The tee makes the entries the misses asked for.
+            tee.want_wake();
+        }
+        tee.wake();
     }
 }
 
@@ -2007,6 +2156,9 @@ struct Tee {
     upstream_repair: UpstreamRepair,
     limits: RelayLimits,
     holes: Option<Arc<crate::edge_holes::HoleTrigger>>,
+    /// The parent feeds, whose new entries the class thread asks the tee
+    /// to make.
+    feeds: Arc<ParentFeeds>,
     /// Tests: the tee panics on its first datagram.
     #[cfg(test)]
     panic_on_item: bool,
@@ -2017,21 +2169,23 @@ impl Tee {
     /// datagrams and the housekeeping task's nudge to expire its state
     /// (`fast_control::run_tee_housekeeping`, which also rotates the cache):
     /// no timer of its own sits beside the datagrams.
-    async fn run(mut self, mut items: mpsc::Receiver<TeeItem>, expire: Arc<Notify>) -> Result<()> {
+    async fn run(mut self, items: TeeReceiver<TeeMeta>, expire: Arc<Notify>) -> Result<()> {
         loop {
             tokio::select! {
-                item = items.recv() => {
-                    let Some(item) = item else {
+                ready = items.ready() => {
+                    if ready == Ready::Closed {
                         return Ok(());
-                    };
-                    self.process(item).await;
-                    // Whatever else is queued, then one snapshot.
-                    for _ in 0..RECV_BATCH {
-                        let Ok(item) = items.try_recv() else {
+                    }
+                    // What is queued (a batch at most), each released once
+                    // processed, then one snapshot.
+                    for _ in 0..=RECV_BATCH {
+                        let Some((meta, bytes)) = items.peek() else {
                             break;
                         };
-                        self.process(item).await;
+                        self.process(meta, bytes).await;
+                        items.release();
                     }
+                    self.feeds.make_requested();
                     self.publish();
                 }
                 () = expire.notified() => {
@@ -2112,7 +2266,7 @@ impl Tee {
         }
     }
 
-    async fn process(&mut self, item: TeeItem) {
+    async fn process(&mut self, item: TeeMeta, bytes: &[u8]) {
         #[cfg(test)]
         assert!(!self.panic_on_item, "test: the tee panics");
         let started = Instant::now();
@@ -2122,21 +2276,22 @@ impl Tee {
                 forwarded,
                 video_kind,
             } => {
-                self.process_symbol(&item, forwarded, video_kind).await;
+                self.process_symbol(&item, bytes, forwarded, video_kind)
+                    .await;
             }
             TeeKind::Unchecked => {
-                self.process_unchecked(&item).await;
+                self.process_unchecked(&item, bytes).await;
             }
         }
         self.cache.record_relay_processing(started.elapsed());
     }
 
-    async fn process_unchecked(&mut self, item: &TeeItem) {
+    async fn process_unchecked(&mut self, item: &TeeMeta, bytes: &[u8]) {
         if item.path == RelayIngressParentPath::Primary {
             if let Some(socket) = self.reply_socket.as_deref() {
                 if self
                     .native_audio_relay
-                    .handle_control(socket, item.peer, &item.bytes)
+                    .handle_control(socket, item.peer, bytes)
                     .await
                 {
                     return;
@@ -2149,7 +2304,7 @@ impl Tee {
             .map(|socket| (socket, &self.native_audio_relay));
         if process_relay_audio_epoch_datagram(
             item.peer,
-            &item.bytes,
+            bytes,
             &mut self.audio_block_sessions,
             self.audio_epochs.as_ref(),
             self.forwarder.as_deref(),
@@ -2163,7 +2318,7 @@ impl Tee {
         // it). Nothing here forwards.
         let _ = process_udp_fec_ingest_datagram_inner(
             item.peer,
-            &item.bytes,
+            bytes,
             &self.cache,
             &mut self.receiver,
             &mut self.dispatch,
@@ -2174,7 +2329,8 @@ impl Tee {
 
     async fn process_symbol(
         &mut self,
-        item: &TeeItem,
+        item: &TeeMeta,
+        bytes: &[u8],
         forwarded: Option<(SocketAddr, u64)>,
         video_kind: bool,
     ) {
@@ -2183,12 +2339,15 @@ impl Tee {
         // top-up (the upstream repair of the stream's objects) and the hole
         // trigger.
         let fast_view = (self.edge_clients.is_some() || self.holes.is_some())
-            .then(|| RlsView::parse(&item.bytes, self.limits).ok())
+            .then(|| RlsView::parse(bytes, self.limits).ok())
             .flatten();
-        if let (Some(view), Some(_)) = (&fast_view, &self.edge_clients) {
+        if let (Some(view), Some(lane)) = (&fast_view, &self.edge_clients) {
             if let Some(stream_id) = view.stream_id() {
                 self.upstream_repair
                     .observe(stream_id, view.object, view.esi, view.source_symbols);
+                // The compact part that the class thread made (or would
+                // have) is kept in its stream's ring here, off that thread.
+                lane.keep_compact(stream_id, view);
             }
         }
         let journal_forward = |key: &ObjectKey| {
@@ -2198,7 +2357,7 @@ impl Tee {
         };
         // The receiver's clocks age on the arrival time: a symbol that
         // waited in the tee is not judged by the wait.
-        match self.dispatch.push(peer, &item.bytes, item.rx_us) {
+        match self.dispatch.push(peer, bytes, item.rx_us) {
             Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Buffered { key, .. })) => {
                 journal_relay_symbol(&self.cache, &key, peer, item.rx_us);
                 journal_woken(&self.cache, &key, peer, item.woken_us);
@@ -2296,7 +2455,7 @@ impl Tee {
                     &self.dispatch,
                     peer,
                     Some(self.class.as_str()),
-                    item.bytes.len(),
+                    bytes.len(),
                     &error,
                 );
             }
@@ -2407,7 +2566,8 @@ pub async fn run_relay_class_ingest(
         if class_sockets.is_empty() {
             continue;
         }
-        let (tx, rx) = mpsc::channel(config.tee_capacity.max(1));
+        // Made, faulted in and locked here, before the thread runs.
+        let (tx, rx) = tee_ring(config.tee_capacity);
         let thread = ClassThread {
             class,
             sockets: class_sockets,
@@ -2415,7 +2575,7 @@ pub async fn run_relay_class_ingest(
             limits,
             forwarder: forwarder.clone(),
             link_telemetry: link_telemetry.clone(),
-            tee: tx,
+            tee: Some(tx),
             stats: Arc::clone(&stats),
             failover: Arc::clone(&failover),
             stop: Arc::clone(&stop),
@@ -2435,6 +2595,10 @@ pub async fn run_relay_class_ingest(
             feeds: Arc::clone(&feeds),
             media_deadline_us: config.media_deadline_us,
             epochs: Arc::clone(&epochs),
+            #[cfg(test)]
+            test_alloc_counter: config
+                .test_alloc_counter
+                .filter(|_| class == TrafficClass::Audio),
         };
         match std::thread::Builder::new()
             .name(format!("needletail-fast-{}", class.as_str()))
@@ -2472,6 +2636,7 @@ pub async fn run_relay_class_ingest(
             upstream_repair: UpstreamRepair::default(),
             limits,
             holes: config.holes.clone(),
+            feeds: Arc::clone(&feeds),
             #[cfg(test)]
             panic_on_item: config.test_tee_panic == Some(class),
         };

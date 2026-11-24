@@ -594,6 +594,26 @@ impl CompactRing {
     pub(crate) fn get_part(&self, part: u64) -> Option<Bytes> {
         self.get(part).filter(|kept| !compact::is_gap(kept))
     }
+
+    /// [`Self::get_part`] copied into `out` (its length): for the class
+    /// thread, which must not hold the bytes (it would free them if the
+    /// slot moved on meanwhile).
+    pub(crate) fn copy_part(&self, part: u64, out: &mut [u8]) -> Option<usize> {
+        match &*self.slot(part).lock().unwrap() {
+            Some((held, kept))
+                if *held == part && !compact::is_gap(kept) && kept.len() <= out.len() =>
+            {
+                out[..kept.len()].copy_from_slice(kept);
+                Some(kept.len())
+            }
+            _ => None,
+        }
+    }
+
+    /// The source epoch of the parts kept (0: not known yet).
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
 }
 
 impl CompactStore {

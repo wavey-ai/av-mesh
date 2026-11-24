@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod alloc_count;
 mod assignment;
 mod control;
 mod edge_admission;
@@ -44961,6 +44963,7 @@ mod tests {
                 video_gro: true,
                 media_deadline_us: fast_plane::relay::DEFAULT_MEDIA_DEADLINE_US,
                 test_tee_panic: Some(fast_plane::TrafficClass::Audio),
+                test_alloc_counter: None,
             },
         )
         .await;
@@ -45404,6 +45407,10 @@ mod tests {
     /// The compact client lane: bytes per listener, zero loss through loss
     /// and bursts, the edge's cost per listener.
     mod compact_lane;
+
+    /// The audio class thread allocates and frees nothing once it runs
+    /// (stall follow-up to wave 9).
+    mod alloc_free;
 
     /// The repair horizon of the live path: holes hold the watermark only
     /// briefly, and are listed as gaps.

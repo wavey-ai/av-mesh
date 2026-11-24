@@ -85,6 +85,9 @@ struct Clock {
     followed: u64,
 }
 
+/// The room each clock's stream name is made with.
+const CLOCK_NAME_BYTES: usize = 40;
+
 /// A fixed-size table of media clocks, owned by one thread.
 pub struct MediaClocks {
     clocks: Box<[Clock]>,
@@ -100,7 +103,20 @@ impl MediaClocks {
     pub fn new(capacity: usize) -> Self {
         let slots = capacity.max(PROBE).next_power_of_two();
         Self {
-            clocks: (0..slots).map(|_| Clock::default()).collect(),
+            // Each name's room made and touched now: a new stream's clock
+            // takes its name without an allocation on the class thread
+            // (stall follow-up); a longer name than this grows it.
+            clocks: (0..slots)
+                .map(|_| {
+                    let mut stream = String::with_capacity(CLOCK_NAME_BYTES);
+                    stream.push('\0');
+                    stream.clear();
+                    Clock {
+                        stream,
+                        ..Clock::default()
+                    }
+                })
+                .collect(),
             mask: slots - 1,
             now_us: 0,
             overflow: 0,

@@ -23,7 +23,9 @@ pub mod parent_feeds;
 /// Compiled in the library, whose relay ingress keeps a table of them too.
 pub use av_mesh::media_clock;
 pub mod relay;
+pub mod retired;
 pub mod sys;
+pub mod tee_ring;
 pub mod view;
 
 use dashmap::DashMap;
