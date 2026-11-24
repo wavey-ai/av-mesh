@@ -608,6 +608,11 @@ struct Silence {
     check_at: Instant,
     legs: Vec<LegKey>,
     asked: bool,
+    /// Legs that took a silent leg's place (one record each).
+    placed: Vec<LegKey>,
+    /// When a silent leg first brought media again (as `check_legs` saw
+    /// it).
+    resumed: Option<Instant>,
 }
 
 /// The edge-choosing state of one listener. See the module documentation.
@@ -1415,6 +1420,8 @@ impl Director {
             check_at: now + self.token_wait(),
             legs: keys.clone(),
             asked: false,
+            placed: Vec::new(),
+            resumed: None,
         };
         if !hedged && spare_ready {
             if let Some(cover) = keys.first() {
@@ -1557,12 +1564,76 @@ impl Director {
         } else {
             ReplacementKind::Interrupt
         };
-        self.pending.push(Pending {
+        let record = Pending {
             from: leg.node,
             reason: reason.to_owned(),
             kind,
             last_media: view.last_media,
-        });
+        };
+        match self.silence.take_if(|silence| silence.legs.contains(&key)) {
+            Some(mut silence) => {
+                self.place_after_silence(legs, record, &mut silence, now);
+                self.silence = Some(silence);
+            }
+            None => self.pending.push(record),
+        }
+    }
+
+    /// A leg that went silent with every other was given up: a leg asked
+    /// for in the silence (not one of the silent legs, not a hedge, standing
+    /// for nothing, holding no record, and not given a record already in
+    /// this silence) took its place. Its record goes to that leg (booked now
+    /// if it is live) rather than wait for a place that no answer will
+    /// bring. The kind is `interrupt` when the taker brought media before
+    /// any silent leg came back (it ended the silence), else the one `fail`
+    /// gave.
+    fn place_after_silence<S: SessionLegs>(
+        &mut self,
+        legs: &S,
+        record: Pending,
+        silence: &mut Silence,
+        now: Instant,
+    ) {
+        let Some(index) = self.legs.iter().position(|leg| {
+            !silence.legs.contains(&leg.key)
+                && !silence.placed.contains(&leg.key)
+                && leg.hedge_for.is_none()
+                && leg.stands_for.is_none()
+                && leg.replaces.is_none()
+        }) else {
+            self.pending.push(record);
+            return;
+        };
+        let key = self.legs[index].key;
+        silence.placed.push(key);
+        let first = Self::view(legs, key, now).first_media;
+        let interrupt = silence
+            .resumed
+            .is_none_or(|back| first.is_some_and(|first| first <= back));
+        let record = Pending {
+            kind: if interrupt {
+                ReplacementKind::Interrupt
+            } else {
+                record.kind
+            },
+            ..record
+        };
+        let leg = &mut self.legs[index];
+        if leg.live {
+            self.replacements.push(Replacement {
+                at: now,
+                from: record.from,
+                to: leg.node.clone(),
+                reason: record.reason,
+                kind: record.kind,
+                handover: None,
+                exposure: first
+                    .zip(record.last_media)
+                    .map(|(first, last)| first.saturating_duration_since(last)),
+            });
+        } else {
+            leg.replaces = Some(record);
+        }
     }
 
     /// Release a leg for good (no skip of its own).
@@ -2348,7 +2419,7 @@ impl Director {
     }
 
     fn silence_check<S: SessionLegs>(&mut self, legs: &mut S, now: Instant, out: &mut Vec<Action>) {
-        let Some(silence) = self.silence.take_if(|silence| now >= silence.check_at) else {
+        let Some(mut silence) = self.silence.take_if(|silence| now >= silence.check_at) else {
             return;
         };
         // A leg that does not answer the question in the token wait failed.
@@ -2373,8 +2444,24 @@ impl Director {
                 hedge.hedge_for = Some(*failed);
             }
         }
+        // A hedge beside an unanswered leg takes that leg's place (`fail`),
+        // and no other.
+        for leg in &self.legs {
+            if leg
+                .hedge_for
+                .is_some_and(|cover| unanswered.contains(&cover))
+            {
+                silence.placed.push(leg.key);
+            }
+        }
+        // The records that failing the unanswered legs makes (the earlier
+        // ones wait as they did) go to the legs asked for in the silence.
+        let earlier = std::mem::take(&mut self.pending);
         for key in unanswered {
             self.fail(legs, key, "unanswered", SkipCause::Failed, now, out);
+        }
+        for record in std::mem::replace(&mut self.pending, earlier) {
+            self.place_after_silence(legs, record, &mut silence, now);
         }
         let delivered = self.legs.iter().any(|leg| {
             Self::view(legs, leg.key, now)
@@ -2392,11 +2479,17 @@ impl Director {
     fn check_legs<S: SessionLegs>(&mut self, legs: &mut S, now: Instant, out: &mut Vec<Action>) {
         for leg in self.legs.iter_mut() {
             let view = legs.leg(leg.key, now);
-            if leg.quiet_since.is_some_and(|quiet| {
-                view.and_then(|view| view.last_media)
-                    .is_some_and(|last| last > quiet)
-            }) {
+            let last = view.and_then(|view| view.last_media);
+            if leg
+                .quiet_since
+                .is_some_and(|quiet| last.is_some_and(|last| last > quiet))
+            {
                 leg.quiet_since = None;
+                if let (Some(silence), Some(last)) = (self.silence.as_mut(), last) {
+                    if silence.legs.contains(&leg.key) {
+                        silence.resumed.get_or_insert(last);
+                    }
+                }
             }
             if leg.live && leg.quiet_since.is_none() && view.is_some_and(|view| view.steady) {
                 leg.steady_since.get_or_insert(now);
@@ -4401,6 +4494,36 @@ mod tests {
         });
         w.run_to(silent + 400);
         assert_eq!(w.held(), ["e1", "e4", "e5"]);
+        // e2's place went to a leg asked for in the silence: no leg
+        // delivered meanwhile, an interruption (B 2.8).
+        let replaced: Vec<_> =
+            w.d.replacements
+                .iter()
+                .map(|r| (r.from.as_str(), r.to.as_str(), r.kind))
+                .collect();
+        assert_eq!(replaced, [("e2", "e4", ReplacementKind::Interrupt)]);
+        let mut lone = World::new("silent-3", 1, false);
+        lone.join(&[1], None);
+        lone.run_to(lone.ms() + 1_100);
+        lone.event(LegEvent::AllSilent);
+        let (to, nonce, _) = lone.requests().pop().expect("asked at once");
+        lone.answer(to, nonce, vec![cache(4)], 1, false, None);
+        lone.live("e4");
+        // The silent leg found dead beside the leg asked for in the silence
+        // (before the question's wait ends): the same record.
+        let e1 = lone.key("e1");
+        lone.event(LegEvent::Failed {
+            leg: e1,
+            cause: LegFailure::Dead,
+        });
+        assert_eq!(lone.held(), ["e4"]);
+        let replaced: Vec<_> = lone
+            .d
+            .replacements
+            .iter()
+            .map(|r| (r.from.as_str(), r.to.as_str(), r.kind, r.exposure.is_some()))
+            .collect();
+        assert_eq!(replaced, [("e1", "e4", ReplacementKind::Interrupt, true)]);
         // One leg more than wanted: the newest goes once the others are
         // steady for the level wait, counted from e1's media after the
         // silence.
@@ -4408,6 +4531,61 @@ mod tests {
         assert_eq!(w.held(), ["e1", "e4", "e5"]);
         w.run_to(silent + 1_100);
         assert_eq!(w.held(), ["e1", "e4"]);
+    }
+
+    /// The records of legs given up in a silence of every leg: one to a
+    /// leg, and `interrupt` only when the leg that took the place ended the
+    /// silence (B 2.8).
+    #[test]
+    fn a_silence_s_records_go_one_to_a_leg_and_name_who_ended_it() {
+        let replaced = |w: &World| -> Vec<(String, String, ReplacementKind)> {
+            w.d.replacements
+                .iter()
+                .map(|r| (r.from.clone(), r.to.clone(), r.kind))
+                .collect()
+        };
+        let record = |from: &str, to: &str, kind| (from.to_owned(), to.to_owned(), kind);
+        // Neither leg answers the question: the hedge takes the place of the
+        // leg it stood beside and no other; the second record waits.
+        let mut w = World::new("silent-4", 2, true);
+        w.join(&[1, 2], Some(3));
+        for node in ["e1", "e2"] {
+            w.view(node, |view| view.delivering = false);
+        }
+        w.run_to(w.ms() + 200);
+        let silent = w.ms();
+        w.event(LegEvent::AllSilent);
+        w.run_to(silent + 20);
+        w.live("e3");
+        w.run_to(silent + 400);
+        assert_eq!(w.held(), ["e3"]);
+        assert_eq!(replaced(&w), [record("e1", "e3", ReplacementKind::Hedge)]);
+        // No spare: the entry gives e4 and e5, e1 comes back before either
+        // brings media, and e2 is found dead beside it while the silence is
+        // open. A leg delivered: e4 replaced e2, it ended nothing.
+        let mut w = World::new("silent-5", 2, false);
+        w.join(&[1, 2], None);
+        w.run_to(w.ms() + 1_100);
+        let silent = w.ms();
+        w.event(LegEvent::AllSilent);
+        let (to, nonce, _) = w.requests().pop().expect("asked at once");
+        w.answer(to, nonce, vec![cache(4), cache(5)], 2, false, None);
+        w.run_to(silent + 20);
+        let now = w.now;
+        w.view("e1", |view| {
+            view.last_datagram = Some(now);
+            view.last_media = Some(now);
+            view.delivering = true;
+        });
+        w.run_to(silent + 30);
+        w.live("e4");
+        w.poll();
+        let e2 = w.key("e2");
+        w.event(LegEvent::Failed {
+            leg: e2,
+            cause: LegFailure::Dead,
+        });
+        assert_eq!(replaced(&w), [record("e2", "e4", ReplacementKind::Replace)]);
     }
 
     #[test]

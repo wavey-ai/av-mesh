@@ -283,7 +283,11 @@ impl LaneEdge {
         max_subscribers: usize,
         send_twins: bool,
     ) -> Self {
-        let client = "127.0.0.1:0".parse().unwrap();
+        // On the edge's own loopback address: the client sockets are
+        // SO_REUSEPORT, and a bind to port 0 with it may be given a port that
+        // another reuseport socket of this process holds, so two edges at
+        // 127.0.0.1 could share one address (and its datagrams).
+        let client = SocketAddr::from((ip, 0));
         Self::start_full(
             ip,
             client,
@@ -306,7 +310,11 @@ impl LaneEdge {
         send_twins: bool,
         configure: impl FnOnce(&mut RelayClassConfig),
     ) -> Self {
-        let client = "127.0.0.1:0".parse().unwrap();
+        // On the edge's own loopback address: the client sockets are
+        // SO_REUSEPORT, and a bind to port 0 with it may be given a port that
+        // another reuseport socket of this process holds, so two edges at
+        // 127.0.0.1 could share one address (and its datagrams).
+        let client = SocketAddr::from((ip, 0));
         Self::start_full(
             ip,
             client,

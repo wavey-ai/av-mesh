@@ -4,18 +4,27 @@
 //! a few worker threads for all of them. See `av_mesh::load`.
 //!
 //! ```text
-//! needletail-load --edges 10.0.0.21:19446,10.0.0.22:19446 --stream 4001 \
-//!     --ramp 100@0,1000@30,5000@60 --duration 120 --sample 20 --out target/load/run1
+//! needletail-load --entry https://lon-dist-a:19444,https://lon-dist-b:19444 --tls-ca ca.crt \
+//!     --stream 4001 --ramp 100@0,1000@30,5000@60 --duration 120 --sample 20 --out run1
 //! ```
+//!
+//! Each listener runs the session and the director of `needletail-udp-client`
+//! with its defaults and flags of the same names (B 2.4): two legs on two
+//! edges and a spare (`--paths 2 --spare true`), its legs asked of an entry
+//! point with `ASSIGN` from its own socket and HTTPS beside it.
 //!
 //! Writes `<out>/intervals.jsonl` (one line an interval: per edge and in
 //! total, listeners active and subscribed, parts, gaps, missing, recovered,
 //! duplicates, NACKs, bytes in, publication-to-arrival, time-to-first-part
 //! and receive-lag percentiles, and the load host's CPU, worker busy time,
 //! timer lateness, UDP receive buffer errors and socket drops, with
-//! `load_host_saturated` and its reasons), `<out>/summary.json` (the same
+//! `load_host_saturated` and its reasons; B Y4: the gap between parts
+//! delivered first at each listener, interruptions and the listeners
+//! interrupted, listeners with missing parts, time on one path, leg
+//! replacements by reason and kind, datagrams and bytes per listener and
+//! per leg), `<out>/summary.json` (the same
 //! over the run, each histogram with its buckets so that the summaries of
-//! several load hosts merge), and for `--sample K` listeners
+//! several load hosts merge, and the worst listeners), and for `--sample K` listeners
 //! `<out>/arrivals/listener-<i>.csv` (the `needletail-udp-client --arrivals`
 //! columns, in part order). The summary also goes to standard output.
 //! SIGINT or SIGTERM ends the run early, with its drain and summary.
@@ -23,7 +32,7 @@
 use anyhow::{bail, Context, Result};
 use av_mesh::client_compact::NackTiming;
 use av_mesh::client_session::SessionConfig;
-use av_mesh::load::{parse_ramp, run, LoadConfig};
+use av_mesh::load::{parse_range_ms, parse_ramp, run, Churn, IntervalBuckets, LoadConfig, Waves};
 use av_mesh::load_assign::AssignConfig;
 use clap::Parser;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
@@ -39,22 +48,16 @@ use std::time::Duration;
     about = "Simulated UDP listeners of a Needletail stream, thousands per host"
 )]
 struct Args {
-    /// The edges' client UDP ports, `host:port,...`. Without --entry,
-    /// listener i starts at edge i mod n; a listener that must move (its
-    /// edge says `MOVE` or `REFUSED`, does not answer, or goes silent) goes
-    /// to the edge that rendezvous of its session picks among those it has
-    /// not left in the last --skip-ms (--move-rule next: the next edge of
-    /// the list, as before). With --entry, the fallback when no entry point
-    /// answers.
+    /// The edges' client UDP ports, `host:port,...`, without --entry (the
+    /// in-process tests' mode): each listener's director is answered from
+    /// this list in the session's rendezvous order (legs on different edges,
+    /// no spare).
     #[arg(long, value_delimiter = ',')]
     edges: Vec<String>,
-    /// Phase AM item 10: entry points of the region, `https://host:port`,
-    /// any node of it (comma list): each listener asks one
-    /// (`/api/assignment`, its own session id) where to subscribe when it
-    /// starts and each time it moves, as needletail-udp-client does, and
-    /// takes the first cache of the answer that it has not left in the
-    /// last --skip-ms (a failover region's entry point, Phase AM item 11,
-    /// once its region is lost).
+    /// Entry points of the home region, `https://host:port` (comma list),
+    /// as needletail-udp-client takes them: each listener asks one
+    /// (`entries[hash of its session]`, the next too after --first-retry-ms)
+    /// for its legs and its spare.
     #[arg(long, value_delimiter = ',')]
     entry: Vec<String>,
     /// PEM file of the nodes' certificate authority (with --entry).
@@ -63,26 +66,59 @@ struct Args {
     /// TLS server name of the nodes, when it is not their address.
     #[arg(long)]
     server_name: Option<String>,
-    /// Client UDP port of the caches when the entry point names none.
+    /// The caches' client UDP port, over what an answer names.
     #[arg(long)]
     udp_port: Option<u16>,
-    /// Assignment requests in flight at most, and an entry point's time to
-    /// answer (ms) before the next is asked.
+    /// HTTPS requests to the entry points in flight at most.
     #[arg(long, default_value_t = 256)]
     assign_in_flight: usize,
-    #[arg(long, default_value_t = 500)]
-    assign_timeout_ms: u64,
-    /// A moving listener does not go back to an edge it left within this.
-    #[arg(long, default_value_t = 30_000)]
-    skip_ms: u64,
+    /// Legs held on a stream the entry grants two for (B 2.4).
+    #[arg(long, default_value_t = av_mesh::client_director::DEFAULT_PATHS)]
+    paths: u8,
+    /// Hold a spare and hedge to it; false: a dead leg is replaced through
+    /// the entry.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    spare: bool,
+    /// A leg with no TOKEN after this (or four round trips to its entry) is
+    /// passed over.
+    #[arg(long, default_value_t = av_mesh::client_session::DEFAULT_TOKEN_MS)]
+    token_ms: u64,
+    /// A leg with no media this long while another delivers is hedged at
+    /// the spare.
+    #[arg(long, default_value_t = av_mesh::client_session::DEFAULT_HEDGE_AFTER_MS)]
+    hedge_after_ms: u64,
+    /// The only leg with no datagram this long is hedged at the spare.
+    #[arg(long, default_value_t = av_mesh::client_session::DEFAULT_LONE_HEDGE_AFTER_MS)]
+    lone_hedge_after_ms: u64,
+    /// After MOVE rebalance: a replacement not level by then is released and
+    /// the old edge asked to keep the listener.
+    #[arg(long, default_value_t = av_mesh::client_director::DEFAULT_REBALANCE_GIVEUP_MS)]
+    rebalance_giveup_ms: u64,
+    /// After any other MOVE: a replacement steady this long takes over
+    /// though it is not level.
+    #[arg(long, default_value_t = av_mesh::client_director::DEFAULT_LEVEL_WAIT_MS)]
+    level_wait_ms: u64,
+    /// A leg's first SUBs are each sent again this soon (0: off).
+    #[arg(long, default_value_t = av_mesh::client_session::DEFAULT_FIRST_DOUBLE_MS)]
+    first_double_ms: u64,
+    /// The compact plan's residual loss target, parts per million.
+    #[arg(long, default_value_t = (av_mesh::client_compact::RESIDUAL_TARGET * 1e6).round() as u64)]
+    compact_residual_ppm: u64,
+    /// A hole is given up after this long.
+    #[arg(long, default_value_t = av_mesh::client_compact::HOLE_GIVE_UP.as_millis() as u64)]
+    hole_give_up_ms: u64,
+    /// The entry points' client UDP port for ASSIGN (0: HTTPS alone).
+    #[arg(long, default_value_t = av_mesh::client_udp::DEFAULT_CLIENT_UDP_PORT)]
+    assignment_udp_port: u16,
+    /// The HTTPS hedge of an assignment request goes after this long.
+    #[arg(long, default_value_t = av_mesh::client_director::DEFAULT_ASSIGNMENT_HTTPS_AFTER_MS)]
+    assignment_https_after_ms: u64,
+    /// The whole budget of one assignment request.
+    #[arg(long, default_value_t = av_mesh::client_director::DEFAULT_ASSIGNMENT_TIMEOUT_MS)]
+    assignment_timeout_ms: u64,
     /// A listener with no part for this long counts as stranded.
     #[arg(long, default_value_t = 5_000)]
     stranded_ms: u64,
-    /// Where a listener moves without an assignment: `rendezvous` (of its
-    /// session over the edges not left) or `next` (the next edge of
-    /// --edges, as before).
-    #[arg(long, default_value = "rendezvous")]
-    move_rule: String,
     /// Session ids are `<prefix>-<listener>` (by default the label, or
     /// `load-<pid>`).
     #[arg(long)]
@@ -96,6 +132,31 @@ struct Args {
     /// `100@0,1000@30,5000@60`): from each second on, that many listeners.
     #[arg(long)]
     ramp: Option<String>,
+    /// The listening party: this percentage of the listeners present leave
+    /// in a minute (at random times, in random order) and each comes back
+    /// as a new session after --churn-absence-ms (0: none).
+    #[arg(long, default_value_t = 0.0)]
+    churn_percent_per_min: f64,
+    /// The absence of a listener that left, drawn evenly from `MIN-MAX`
+    /// milliseconds.
+    #[arg(long, default_value = "10000-60000")]
+    churn_absence_ms: String,
+    /// Joins in waves: the target is reached --wave-size listeners at a
+    /// time, every --wave-every-ms (0: as --ramp and --start-rate say).
+    #[arg(long, default_value_t = 0)]
+    wave_size: usize,
+    #[arg(long, default_value_t = 10_000)]
+    wave_every_ms: u64,
+    /// Seed of the churn's draws (by default from the session-id prefix,
+    /// the process and the time: two hosts do not churn together).
+    #[arg(long)]
+    seed: Option<u64>,
+    /// One listener in this many writes every part it receives first to
+    /// <out>/raw/worker-<w>.csv (session id, part, arrival, bytes,
+    /// publication, availability, edge); the summary states the share (0:
+    /// none).
+    #[arg(long, default_value_t = 0)]
+    raw_sample: usize,
     /// Seconds of the run (a drain follows).
     #[arg(long, default_value_t = 30)]
     duration: u64,
@@ -132,11 +193,23 @@ struct Args {
     /// last parts are counted.
     #[arg(long, default_value_t = 600)]
     drain_ms: u64,
-    /// A part is counted missing once it is this many parts behind its
-    /// listener's newest part (at most 4,095; past the NACKs' give-up of a
-    /// second).
-    #[arg(long, default_value_t = 1_500)]
-    settle_parts: u64,
+    /// A part is counted missing once it is this long behind its listener's
+    /// newest part (in parts of the stream's interval; just past the 3 s
+    /// give-up of a hole). A listener that leaves has its parts not yet due
+    /// left unjudged.
+    #[arg(long, default_value_t = av_mesh::load::DEFAULT_SETTLE_MS)]
+    settle_ms: u64,
+    /// The same as a count of parts (1 to 4,095), over --settle-ms.
+    #[arg(long)]
+    settle_parts: Option<u64>,
+    /// A silence between two parts delivered first this long or longer
+    /// interrupts a listener (`interruptions`, `listeners_interrupted`).
+    #[arg(long, default_value_t = av_mesh::load::DEFAULT_INTERRUPT_MS)]
+    interrupt_ms: u64,
+    /// The latency histograms of an interval line that carry their buckets
+    /// (so a window's p99 merges across hosts): total, edges or off.
+    #[arg(long, default_value = "total")]
+    interval_buckets: IntervalBuckets,
     /// The load host counts as saturated in an interval whose timers or
     /// datagrams waited longer than this (p99) for the workers.
     #[arg(long, default_value_t = 5)]
@@ -245,16 +318,19 @@ fn config(args: &Args) -> Result<LoadConfig> {
         .map(|entry| entry.trim().trim_end_matches('/').to_owned())
         .filter(|entry| !entry.is_empty())
         .collect();
-    if edges.is_empty() && entries.is_empty() {
-        bail!("--edges or --entry must name the edges or an entry point");
+    match (edges.is_empty(), entries.is_empty()) {
+        (true, true) => bail!("--edges or --entry must name the edges or an entry point"),
+        (false, false) => bail!("--edges or --entry, not both"),
+        _ => {}
     }
-    let rendezvous_moves = match args.move_rule.as_str() {
-        "rendezvous" => true,
-        "next" => false,
-        other => bail!("--move-rule {other:?}: rendezvous or next"),
-    };
-    if args.settle_parts == 0 || args.settle_parts >= 4_096 {
+    if !(1..=2).contains(&args.paths) {
+        bail!("--paths must be 1 or 2");
+    }
+    if args.settle_parts.is_some_and(|parts| parts == 0 || parts >= 4_096) {
         bail!("--settle-parts must be 1 to 4095");
+    }
+    if args.settle_ms == 0 || args.interrupt_ms == 0 {
+        bail!("--settle-ms and --interrupt-ms must be above 0");
     }
     if !(args.interval_seconds > 0.0) {
         bail!("--interval-seconds must be above 0");
@@ -287,16 +363,26 @@ fn config(args: &Args) -> Result<LoadConfig> {
         },
         known_parts: args.known_parts,
         first_retry: Duration::from_millis(args.first_retry_ms),
-        residual_target: av_mesh::client_compact::RESIDUAL_TARGET,
-        hole_give_up: av_mesh::client_compact::HOLE_GIVE_UP,
-        token_wait: Duration::from_millis(av_mesh::client_session::DEFAULT_TOKEN_MS),
-        first_double: Duration::from_millis(av_mesh::client_session::DEFAULT_FIRST_DOUBLE_MS),
-        hedge_after: Duration::from_millis(av_mesh::client_session::DEFAULT_HEDGE_AFTER_MS),
-        lone_hedge_after: Duration::from_millis(
-            av_mesh::client_session::DEFAULT_LONE_HEDGE_AFTER_MS,
-        ),
+        residual_target: args.compact_residual_ppm as f64 / 1e6,
+        hole_give_up: Duration::from_millis(args.hole_give_up_ms),
+        token_wait: Duration::from_millis(args.token_ms),
+        first_double: Duration::from_millis(args.first_double_ms),
+        hedge_after: Duration::from_millis(args.hedge_after_ms),
+        lone_hedge_after: Duration::from_millis(args.lone_hedge_after_ms),
     };
     let mut config = LoadConfig::new(session, edges, args.listeners);
+    let director = &mut config.director;
+    director.entries = entries;
+    director.paths = args.paths;
+    director.spare = args.spare;
+    director.token_wait = Duration::from_millis(args.token_ms);
+    director.rebalance_giveup = Duration::from_millis(args.rebalance_giveup_ms);
+    director.level_wait = Duration::from_millis(args.level_wait_ms);
+    director.first_retry = Duration::from_millis(args.first_retry_ms);
+    director.assignment_udp_port = args.assignment_udp_port;
+    director.assignment_https_after = Duration::from_millis(args.assignment_https_after_ms);
+    director.assignment_timeout = Duration::from_millis(args.assignment_timeout_ms.max(1));
+    director.udp_port = args.udp_port;
     if let Some(text) = &args.ramp {
         config.ramp = parse_ramp(text).map_err(anyhow::Error::msg)?;
     }
@@ -312,31 +398,57 @@ fn config(args: &Args) -> Result<LoadConfig> {
     config.bind_ips = args.bind.clone();
     config.kernel_timestamps = args.kernel_timestamps;
     config.drain = Duration::from_millis(args.drain_ms);
+    config.settle = Duration::from_millis(args.settle_ms);
     config.settle_parts = args.settle_parts;
+    config.interrupt = Duration::from_millis(args.interrupt_ms);
+    config.interval_buckets = args.interval_buckets;
     config.lag_limit = Duration::from_millis(args.lag_limit_ms);
     config.progress = !args.quiet;
     config.label = args.label.clone();
     config.coalesce = Duration::from_micros(args.coalesce_us);
-    config.skip_for = Duration::from_millis(args.skip_ms);
     config.stranded_after = Duration::from_millis(args.stranded_ms);
-    config.rendezvous_moves = rendezvous_moves;
     config.sid_prefix = args.sid_prefix.clone().unwrap_or_else(|| {
         args.label
             .clone()
             .unwrap_or_else(|| format!("load-{}", std::process::id()))
     });
-    if !entries.is_empty() {
+    if !(0.0..=6_000.0).contains(&args.churn_percent_per_min) {
+        bail!("--churn-percent-per-min must be 0 to 6000");
+    }
+    if args.churn_percent_per_min > 0.0 {
+        let (absent_min, absent_max) =
+            parse_range_ms(&args.churn_absence_ms).map_err(anyhow::Error::msg)?;
+        config.churn = Some(Churn {
+            per_minute: args.churn_percent_per_min / 100.0,
+            absent_min,
+            absent_max,
+        });
+    }
+    if args.wave_size > 0 {
+        if args.wave_every_ms == 0 {
+            bail!("--wave-every-ms must be above 0");
+        }
+        config.waves = Some(Waves {
+            size: args.wave_size,
+            every: Duration::from_millis(args.wave_every_ms),
+        });
+    }
+    config.seed = args.seed.unwrap_or_else(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+        av_mesh::load_assign::rendezvous_score(&config.sid_prefix, &(std::process::id(), nanos))
+    });
+    config.raw_sample = args.raw_sample;
+    if !config.director.entries.is_empty() {
         let Some(tls_ca) = args.tls_ca.clone() else {
             bail!("--entry needs --tls-ca");
         };
         config.assign = Some(AssignConfig {
-            entries,
-            stream_id: args.stream,
             tls_ca,
             server_name: args.server_name.clone(),
-            udp_port: args.udp_port,
             in_flight: args.assign_in_flight.max(1),
-            timeout: Duration::from_millis(args.assign_timeout_ms.max(1)),
+            timeout: config.director.assignment_timeout,
         });
     }
     Ok(config)
@@ -477,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn the_phase_am_flags_ask_the_entry_points_and_move_by_rendezvous() {
+    fn the_entry_points_and_the_director_take_the_client_s_flags_and_defaults() {
         let args = Args::try_parse_from([
             "needletail-load",
             "--stream",
@@ -493,32 +605,115 @@ mod tests {
         ])
         .unwrap();
         let config = config(&args).unwrap();
-        let assign = config.assign.as_ref().expect("assignment");
+        let director = &config.director;
         assert_eq!(
-            assign.entries,
+            director.entries,
             vec!["https://10.80.1.1:19444", "https://10.80.1.2:19444"]
         );
+        let assign = config.assign.as_ref().expect("the HTTPS hedge");
         assert_eq!(assign.server_name.as_deref(), Some("local.wavey.ai"));
         assert!(config.edges.is_empty());
-        assert!(config.rendezvous_moves);
-        assert_eq!(config.skip_for, Duration::from_secs(30));
         assert_eq!(config.stranded_after, Duration::from_secs(5));
         assert_eq!(config.sid_prefix, "lon-1");
-        // --entry needs the CA; neither edges nor an entry is an error.
+        // The client's defaults (B 2.4): exactly the director and session
+        // that needletail-udp-client makes for the same stream.
+        let client = av_mesh::client_director::DirectorConfig::new(4001, "", Vec::new());
+        assert_eq!(director.paths, 2);
+        assert!(director.spare);
+        assert_eq!(director.paths, client.paths);
+        assert_eq!(director.spare, client.spare);
+        assert_eq!(director.token_wait, client.token_wait);
+        assert_eq!(director.rebalance_giveup, client.rebalance_giveup);
+        assert_eq!(director.level_wait, client.level_wait);
+        assert_eq!(director.first_retry, client.first_retry);
+        assert_eq!(director.assignment_udp_port, client.assignment_udp_port);
+        assert_eq!(director.assignment_https_after, client.assignment_https_after);
+        assert_eq!(director.assignment_timeout, client.assignment_timeout);
+        assert_eq!(director.udp_port, client.udp_port);
+        let session = SessionConfig {
+            known_parts: config.session.known_parts,
+            ..SessionConfig::new(4001)
+        };
+        assert_eq!(format!("{:?}", config.session), format!("{session:?}"));
+        assert_eq!(assign.timeout, client.assignment_timeout);
+        // --entry needs the CA; neither edges nor an entry, or both, is an
+        // error; so is a third path.
         assert!(config_of(&["needletail-load", "--stream", "1", "--entry", "https://a:1"]).is_err());
         assert!(config_of(&["needletail-load", "--stream", "1"]).is_err());
-        // The rule of before: the next edge of the list.
+        assert!(config_of(&[
+            "needletail-load", "--stream", "1", "--entry", "https://a:1", "--tls-ca", "ca",
+            "--edges", "127.0.0.1:1",
+        ])
+        .is_err());
+        assert!(config_of(&["needletail-load", "--stream", "1", "--edges", "127.0.0.1:1", "--paths", "3"]).is_err());
+        // One path and no spare, the control of B 2.4.
         let config = config_of(&[
             "needletail-load",
             "--stream",
             "1",
             "--edges",
             "127.0.0.1:1",
-            "--move-rule",
-            "next",
+            "--paths",
+            "1",
+            "--spare",
+            "false",
         ])
         .unwrap();
-        assert!(!config.rendezvous_moves && config.assign.is_none());
+        assert_eq!((config.director.paths, config.director.spare), (1, false));
+        assert!(config.director.entries.is_empty() && config.assign.is_none());
+    }
+
+    #[test]
+    fn the_party_flags_make_churn_waves_and_the_raw_sample() {
+        let config = config_of(&["needletail-load", "--stream", "1", "--edges", "127.0.0.1:1"]).unwrap();
+        assert!(config.churn.is_none() && config.waves.is_none());
+        assert_eq!(config.raw_sample, 0);
+        let config = config_of(&[
+            "needletail-load", "--stream", "1", "--edges", "127.0.0.1:1",
+            "--churn-percent-per-min", "5", "--churn-absence-ms", "2000-30000",
+            "--wave-size", "500", "--wave-every-ms", "15000", "--seed", "42", "--raw-sample", "50",
+        ])
+        .unwrap();
+        assert_eq!(
+            config.churn,
+            Some(Churn {
+                per_minute: 0.05,
+                absent_min: Duration::from_secs(2),
+                absent_max: Duration::from_secs(30),
+            })
+        );
+        assert_eq!(
+            config.waves,
+            Some(Waves {
+                size: 500,
+                every: Duration::from_secs(15),
+            })
+        );
+        assert_eq!((config.seed, config.raw_sample), (42, 50));
+        // Without --seed two hosts draw differently.
+        let a = config_of(&["needletail-load", "--stream", "1", "--edges", "127.0.0.1:1", "--label", "lon-1"]).unwrap();
+        let b = config_of(&["needletail-load", "--stream", "1", "--edges", "127.0.0.1:1", "--label", "lon-2"]).unwrap();
+        assert_ne!(a.seed, b.seed);
+        assert!(config_of(&["needletail-load", "--stream", "1", "--edges", "127.0.0.1:1", "--churn-percent-per-min", "5", "--churn-absence-ms", "9-3"]).is_err());
+    }
+
+    #[test]
+    fn the_accounting_flags_have_the_defaults_of_b_2_4() {
+        let config = config_of(&["needletail-load", "--stream", "1", "--edges", "127.0.0.1:1"]).unwrap();
+        assert_eq!(config.settle, Duration::from_millis(3_500));
+        assert_eq!(config.settle_parts, None);
+        assert_eq!(config.interrupt, Duration::from_millis(30));
+        assert_eq!(config.interval_buckets, IntervalBuckets::Total);
+        let config = config_of(&[
+            "needletail-load", "--stream", "1", "--edges", "127.0.0.1:1", "--settle-parts", "500",
+            "--interrupt-ms", "50", "--interval-buckets", "edges",
+        ])
+        .unwrap();
+        assert_eq!(config.settle_parts, Some(500));
+        assert_eq!(config.interrupt, Duration::from_millis(50));
+        assert_eq!(config.interval_buckets, IntervalBuckets::Edges);
+        assert!(config_of(&["needletail-load", "--stream", "1", "--edges", "127.0.0.1:1", "--settle-parts", "4096"]).is_err());
+        assert!(Args::try_parse_from(["needletail-load", "--stream", "1", "--interval-buckets", "x"]).is_err());
     }
 
     fn config_of(argv: &[&str]) -> Result<LoadConfig> {
