@@ -4528,7 +4528,10 @@ async fn main() -> Result<()> {
         // Wave 9 C2: the edge's CPU over its CPUs in its load.
         let cpus = edge_admission::available_cpus();
         router.edge_load.egress.set_cpu_counter(
-            Arc::new(edge_admission::process_cpu_us),
+            // Less the tees' decode and commit, which a playlist costs
+            // whatever its listeners (a 4K edge read as full and shed its
+            // audio listeners, wave 9 review).
+            Arc::new(edge_admission::process_cpu_us_for_listeners),
             cpus,
             args.cpu_load_full_percent,
             args.cpu_load_window_ms,

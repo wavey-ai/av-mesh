@@ -2197,7 +2197,11 @@ impl Tee {
                         return Ok(());
                     }
                     // What is queued (a batch at most), each released once
-                    // processed, then one snapshot.
+                    // processed, then one snapshot. Its CPU time is a
+                    // playlist's, not a listener's: the load's CPU term
+                    // leaves it out (edge_admission::PLAYLIST_CPU_US).
+                    let cpu_before = crate::edge_admission::thread_cpu_us();
+                    let wall_before = Instant::now();
                     for _ in 0..=RECV_BATCH {
                         let Some((meta, bytes)) = items.peek() else {
                             break;
@@ -2207,6 +2211,17 @@ impl Tee {
                     }
                     self.feeds.make_requested();
                     self.publish();
+                    // The batch ran on one worker thread unless `process`
+                    // was parked on a lock and woke on another: then the
+                    // difference of two threads' clocks is no measure, and
+                    // what is booked never exceeds the batch's wall time.
+                    if let (Some(before), Some(after)) =
+                        (cpu_before, crate::edge_admission::thread_cpu_us())
+                    {
+                        let wall_us = wall_before.elapsed().as_micros() as u64;
+                        let used = after.saturating_sub(before).min(wall_us);
+                        crate::edge_admission::PLAYLIST_CPU_US.fetch_add(used, Ordering::Relaxed);
+                    }
                 }
                 () = expire.notified() => {
                     self.expire().await;
