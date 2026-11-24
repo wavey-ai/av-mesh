@@ -635,49 +635,77 @@ pub fn assign(
         // A request for a spare alone is answered as any.
         return Err(none_named);
     }
-    // The spare: a holder of the playlist by the session's weighted
-    // rendezvous, else a cache that admits. No load gate: a spare carries
-    // nothing, and its edge refuses a hedge when it is overloaded.
+    // The spare (B 3.6, the lead's decision of 24 Nov): a holder of the
+    // playlist by the session's rendezvous weighted by its headroom under
+    // the redundant leg's gate (as a leg is placed), else a cache that
+    // admits. A spare carries nothing until a hedge, and a hedge is a leg,
+    // so an edge's share of a dead edge's hedges follows its headroom to the
+    // gate, not to full load (review of B Y5, finding 4: by `FULL_LOAD -
+    // load` the edge with least headroom took 1.65 times its share). Only
+    // when no cache of a pass is under the gate is one over it named, by
+    // its headroom to full load; its edge refuses a hedge when overloaded
+    // (edge rule 9) and counts one it takes over the gate.
     let mut spare = false;
     if request.spare {
         let free = |cache: &&CacheCandidate| {
             !caches.iter().any(|leg| leg.node_id == cache.node_id)
         };
-        fn best<'c>(session: &str, pool: Vec<&'c CacheCandidate>) -> Option<&'c CacheCandidate> {
-            pool.into_iter().max_by(|left, right| {
-                rendezvous_score(session, left)
-                    .total_cmp(&rendezvous_score(session, right))
-                    .then_with(|| right.node_id.cmp(&left.node_id))
-            })
+        let room = |cache: &CacheCandidate| {
+            f64::from(gate) - f64::from(cache.effective_load_permille()) - listener_permille
+        };
+        fn best<'c>(
+            session: &str,
+            pool: Vec<&'c CacheCandidate>,
+            under: bool,
+            room: &dyn Fn(&CacheCandidate) -> f64,
+        ) -> Option<&'c CacheCandidate> {
+            pool.into_iter()
+                .filter(|cache| (room(cache) > 0.0) == under)
+                .map(|cache| {
+                    let score = if under {
+                        weighted_rendezvous(session, cache, room(cache))
+                    } else {
+                        rendezvous_score(session, cache)
+                    };
+                    (score, cache)
+                })
+                .max_by(|left, right| {
+                    left.0
+                        .total_cmp(&right.0)
+                        .then_with(|| right.1.node_id.cmp(&left.1.node_id))
+                })
+                .map(|(_, cache)| cache)
         }
-        // A third host first: a holder there, else a cache there that
-        // admits; then the same on any host.
+        // A third host first, under the gate before over it: a holder
+        // there, else a cache there that admits; then the same on any host.
         let chosen = [true, false].into_iter().find_map(|apart| {
             let on_its_own_host = |cache: &&CacheCandidate| {
                 !apart || !shares_host(cache, &caches, request.held_hosts)
             };
-            best(
-                session,
+            let holders = || {
                 regional
                     .iter()
                     .copied()
                     .filter(free)
                     .filter(on_its_own_host)
                     .filter(|cache| cache.holds_playlist() && healthy(cache))
-                    .collect(),
-            )
-            .or_else(|| {
-                best(
-                    session,
-                    regional
-                        .iter()
-                        .copied()
-                        .filter(free)
-                        .filter(on_its_own_host)
-                        .filter(|cache| admits(cache))
-                        .collect(),
-                )
-            })
+                    .collect::<Vec<_>>()
+            };
+            let admitting = || {
+                regional
+                    .iter()
+                    .copied()
+                    .filter(free)
+                    .filter(on_its_own_host)
+                    .filter(|cache| admits(cache))
+                    .collect::<Vec<_>>()
+            };
+            [true, false]
+                .into_iter()
+                .find_map(|under| {
+                    best(session, holders(), under, &room)
+                        .or_else(|| best(session, admitting(), under, &room))
+                })
         });
         if let Some(cache) = chosen {
             ranked.retain(|(_, _, other)| other.node_id != cache.node_id);
@@ -1523,7 +1551,10 @@ mod tests {
         // Spread over the holders by the session.
         assert_eq!(spares.len(), 3, "{spares:?}");
         assert!(spares.values().all(|count| *count > 120), "{spares:?}");
-        // A holder that admits nobody is still a spare.
+        // A holder over the redundant leg's gate is passed over for a cache
+        // under it (the lead's decision of 24 Nov: a hedge there would be
+        // over the gate), and is the spare when no cache under the gate is
+        // left: a holder that admits nobody is still a spare then.
         let mut overloaded = caches.clone();
         overloaded[2].overloaded = true;
         overloaded[2].load_permille = 1_200;
@@ -1531,6 +1562,14 @@ mod tests {
         let mut held = legs(&assignment);
         held.sort_unstable();
         assert_eq!(held, ["edge-1", "edge-2"]);
+        assert_eq!(assignment.caches[2].node_id, "edge-4");
+        assert_eq!(assignment.caches[2].reason, AssignmentReason::Spare);
+        let assignment = assign(
+            ask("listener-1"),
+            AssignmentPolicy::default(),
+            &overloaded[..3],
+        )
+        .unwrap();
         assert_eq!(assignment.caches[2].node_id, "edge-3");
         assert_eq!(assignment.caches[2].reason, AssignmentReason::Spare);
         // Two holders, both legs: the spare is a cache that admits.

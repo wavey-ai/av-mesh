@@ -401,6 +401,12 @@ pub(crate) struct EdgeUdpStats {
     /// B rule 9: new subscriptions of a redundant leg (`o=`) refused
     /// because the edge was overloaded (they are in `load_refusals` too).
     pub redundant_refusals: AtomicU64,
+    /// The lead's decision of 24 Nov (B 3.8 with the spare by headroom): new
+    /// legs that name a part and another leg (a hedge at a spare, a
+    /// replacement) taken while this edge was at or over the redundant
+    /// leg's gate (`--rebalance-target-permille`). Taken, as losing no part
+    /// matters more; the rebalance moves them afterwards.
+    pub hedges_over_gate: AtomicU64,
     /// `--client-udp-move-grace-ms`, for the gauges.
     pub move_grace_ms: AtomicU64,
 }
@@ -2449,6 +2455,13 @@ fn refused_for_load(from_part: Option<u64>, others: [u64; 2], overloaded: bool) 
     overloaded && (from_part.is_none() || others != NO_OTHER_LEGS)
 }
 
+/// Whether a new subscription that is taken is a hedge (or a replacement:
+/// it names a part and another leg) over the redundant leg's gate, which
+/// the entry points would not have granted (counted, `hedges_over_gate`).
+fn hedge_over_gate(from_part: Option<u64>, others: [u64; 2], load: u32, gate: u32) -> bool {
+    from_part.is_some() && others != NO_OTHER_LEGS && load >= gate
+}
+
 /// Send a compact-lane subscriber the parts that it asks for again: each
 /// part that was sent to it already (the cache-fed sender has passed it, or
 /// the fast lane or cut-through carried it; the others are still due),
@@ -2876,6 +2889,14 @@ async fn admit(
         )
         .await;
         return;
+    }
+    if hedge_over_gate(
+        from_part,
+        others,
+        router.edge_load.admission_snapshot().load_permille,
+        router.assignment_policy.rebalance_target_permille,
+    ) {
+        stats.hedges_over_gate.fetch_add(1, Ordering::Relaxed);
     }
     // The same demand as the first playlist request of a reader (without
     // its wait for a playable copy, when admitted on the first part).
@@ -6490,6 +6511,19 @@ mod tests {
         let marked = |short| compact_marked(&canonical, 0, false, short);
         assert!(!compact::is_short(&marked(first.compact[0].2.short_header)));
         assert!(compact::is_short(&marked(next.compact[0].2.short_header)));
+    }
+
+    /// The lead's decision of 24 Nov: a hedge (a part and another leg) taken
+    /// at or over the gate is counted; a lone mover, a new listener and a
+    /// hedge under the gate are not.
+    #[test]
+    fn a_hedge_taken_over_the_gate_is_counted() {
+        let other = [7, 0];
+        assert!(hedge_over_gate(Some(10), other, 800, 800));
+        assert!(hedge_over_gate(Some(10), other, 950, 800));
+        assert!(!hedge_over_gate(Some(10), other, 799, 800));
+        assert!(!hedge_over_gate(Some(10), NO_OTHER_LEGS, 950, 800));
+        assert!(!hedge_over_gate(None, other, 950, 800));
     }
 
     /// B rule 9: an overloaded edge refuses a redundant leg (`o=`) even when

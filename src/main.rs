@@ -14724,12 +14724,22 @@ struct ClientUdpGauges {
     /// B rule 9 (cumulative): redundant legs refused because the edge was
     /// overloaded.
     redundant_refusals: u64,
+    /// Hedges and replacements taken at or over the redundant leg's gate
+    /// (cumulative; the lead's decision of 24 Nov).
+    hedges_over_gate: u64,
     /// Subscribers now that named no other leg (`o=`).
     single_legs: Option<u64>,
     /// Subscribers now by the node they name as another leg, for a roll's
     /// capacity gate: a leg cannot move to its listener's other edge. A
     /// node that is not one of the region's advertised nodes is `""`.
     legs_by_other: BTreeMap<String, u64>,
+    /// The client fast lane's counters, as `/api/assignment` gives them
+    /// (`client_udp.fast_lane`): the fan-out's start, policies, first
+    /// dispatch faults and longest waits on the class thread
+    /// (`fanout_*`, `class_*_max_us`, `class_arena_warm_bytes`), which the
+    /// stall hunt's sampler reads here once a second (D 7, fanout-stall).
+    /// Null without the lane.
+    fast_lane: Option<fast_plane::edge_clients::FastLaneSnapshot>,
 }
 
 /// One playlist that a cache holds. This is what a cache advertises to the
@@ -21853,8 +21863,14 @@ impl AppRouter {
             moves_expired: stats.moves_expired.load(Ordering::Relaxed),
             moves_taken_back: stats.moves_taken_back.load(Ordering::Relaxed),
             redundant_refusals: stats.redundant_refusals.load(Ordering::Relaxed),
+            hedges_over_gate: stats.hedges_over_gate.load(Ordering::Relaxed),
             single_legs,
             legs_by_other,
+            fast_lane: stats
+                .fast_lane
+                .get()
+                .and_then(std::sync::Weak::upgrade)
+                .map(|lane| lane.snapshot_stats()),
         })
     }
 
@@ -23498,6 +23514,16 @@ impl AppRouter {
             .into();
         // B Y2: why fewer legs than asked were granted.
         body["why"] = why.map(|why| why.word()).into();
+        // The lead's decision of 24 Nov: hedges taken over the gate.
+        if let Some(udp) = body["client_udp"].as_object_mut() {
+            udp.insert(
+                "hedges_over_gate".to_owned(),
+                self.edge_udp_stats
+                    .hedges_over_gate
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+        }
         body["failover_entries"] = serde_json::Value::Array(failover_entries);
         // AM 12, 13: the forwarder's lease children and cache-mesh children.
         body["fast_plane"] = serde_json::to_value(self.fast_plane_gauges()).unwrap_or_default();

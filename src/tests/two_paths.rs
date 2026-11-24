@@ -1698,7 +1698,8 @@ async fn the_36_legs_of_a_killed_edge() {
 
 /// The same kill with the client's defaults (a spare): each dead leg's
 /// place goes first to the listener's spare, a weighted rendezvous among
-/// the edges that are not its other leg, weighted by `FULL_LOAD - load`.
+/// the edges that are not its other leg, weighted by its headroom under the
+/// redundant leg's gate.
 /// That is not the entry's apportionment by headroom to the target, so the
 /// share clause is not claimed here (raised with the lead, review of B Y5,
 /// finding 4); what the design claims is: every leg replaced, as a hedge or,
@@ -1717,6 +1718,16 @@ async fn the_36_legs_of_a_killed_edge_with_a_spare() {
             "{replacement:?}"
         );
     }
+    // The spare is chosen by headroom under the redundant leg's gate (the
+    // lead's decision of 24 Nov). That does not bring each survivor within
+    // 1.3 of its headroom share (integration 2: 13/15/16 against 19.1/14.5/
+    // 10.3, from 12/15/17 by headroom to full load): a spare is drawn per
+    // listener from the edges that are not its legs, so an edge seldom a
+    // leg is overrepresented among a dead edge's spares, and a draw of ~44
+    // among three spreads by about 30 % at one sigma. The share clause needs
+    // the hedge's place apportioned (integration report 2); it is printed,
+    // not asserted.
+    eprintln!("the_36_legs (spare): taken and shares {:?}", killed.shares());
     for ((index, _), peak) in killed.survivors.iter().zip(&killed.peaks) {
         assert!(
             *peak <= 800,
