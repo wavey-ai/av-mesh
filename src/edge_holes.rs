@@ -42,6 +42,19 @@ const LOOKS: usize = 2;
 /// The cache mesh's arrivals of a stream count for its holes when the fast
 /// plane has fed the stream nothing for this long (and four parts).
 const FAST_PLANE_QUIET: Duration = Duration::from_millis(250);
+/// A stream the fast plane fed and then left quiet this long (and four
+/// parts) is asked of the cache-mesh parents beyond its newest part: the
+/// catch-up when both fast-plane parents are silent (4K on Linode, 24 Nov:
+/// a stop of the only parent that sent an edge a video stream's sources
+/// left the edge without its parts until the parent came back, 2.2 to
+/// 2.65 s, although the other parent had them 35 ms after packaging).
+const QUIET_CATCH_UP: Duration = Duration::from_millis(150);
+/// While quiet, the ask is repeated this often (and every two parts), so
+/// the parts that the parent commits meanwhile come at about this delay.
+const QUIET_REPEAT: Duration = Duration::from_millis(50);
+/// A quiet stream is asked for no longer than this after its last part
+/// from anywhere: an ended stream costs a few small requests, no more.
+const QUIET_GIVE_UP: Duration = Duration::from_secs(5);
 
 /// Who saw a part arrive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +73,11 @@ struct StreamHoles {
     arrivals: u32,
     /// When the fast plane last fed the stream.
     fast_at: Option<Instant>,
+    /// The newest part seen from anywhere, and when it came.
+    head: Option<u64>,
+    head_at: Option<Instant>,
+    /// When the quiet catch-up last asked.
+    quiet_asked: Option<Instant>,
 }
 
 /// Which parts of each stream are due to be looked at.
@@ -92,6 +110,9 @@ impl HoleScan {
                             next: [u64::MAX; LOOKS],
                             arrivals: 0,
                             fast_at: Some(now),
+                            head: None,
+                            head_at: None,
+                            quiet_asked: None,
                         },
                     );
                 }
@@ -125,7 +146,18 @@ impl HoleScan {
             next: [u64::MAX; LOOKS],
             arrivals: 0,
             fast_at: None,
+            head: None,
+            head_at: None,
+            quiet_asked: None,
         });
+        // A part far behind the head is a new epoch that counts from 0.
+        if entry
+            .head
+            .is_none_or(|head| part > head || head > part.saturating_add(MAX_SCAN_PARTS))
+        {
+            entry.head = Some(part);
+        }
+        entry.head_at = Some(Instant::now());
         if let Some(part_us) = part_us {
             entry.part_us = part_us;
             entry.arrivals = 0;
@@ -153,6 +185,41 @@ impl HoleScan {
     }
 }
 
+impl HoleScan {
+    /// The streams to ask of the cache-mesh parents now, with the first
+    /// part to ask for: each stream that the fast plane fed and has left
+    /// quiet for [`QUIET_CATCH_UP`] (and four parts), again every
+    /// [`QUIET_REPEAT`] (and two parts) while it stays quiet, until
+    /// [`QUIET_GIVE_UP`] after its last part from anywhere.
+    fn quiet_due(&mut self, now: Instant) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        for (&stream_id, entry) in &mut self.streams {
+            let (Some(fast_at), Some(head)) = (entry.fast_at, entry.head) else {
+                continue;
+            };
+            let part = Duration::from_micros(entry.part_us);
+            if now.saturating_duration_since(fast_at) < QUIET_CATCH_UP.max(part * 4) {
+                continue;
+            }
+            if entry
+                .head_at
+                .is_some_and(|at| now.saturating_duration_since(at) >= QUIET_GIVE_UP)
+            {
+                continue;
+            }
+            if entry
+                .quiet_asked
+                .is_some_and(|at| now.saturating_duration_since(at) < QUIET_REPEAT.max(part * 2))
+            {
+                continue;
+            }
+            entry.quiet_asked = Some(now);
+            out.push((stream_id, head + 1));
+        }
+        out
+    }
+}
+
 pub(crate) struct HoleTrigger {
     cache: Arc<LiveTsCache>,
     mesh: Arc<CacheMeshHandle>,
@@ -162,6 +229,8 @@ pub(crate) struct HoleTrigger {
     pub holes: AtomicU64,
     /// Of them, the requests of the second look (to both parents).
     pub rechecks: AtomicU64,
+    /// Requests of the quiet catch-up (both parents, beyond the head).
+    pub quiet_requests: AtomicU64,
 }
 
 impl std::fmt::Debug for HoleTrigger {
@@ -195,6 +264,7 @@ impl HoleTrigger {
                 requests: AtomicU64::new(0),
                 holes: AtomicU64::new(0),
                 rechecks: AtomicU64::new(0),
+                quiet_requests: AtomicU64::new(0),
             })
         })
     }
@@ -221,6 +291,27 @@ impl HoleTrigger {
             if let Some((from, upto)) = range {
                 self.ask(stream_id, from, upto, look + 1);
             }
+        }
+    }
+
+    /// The quiet catch-up (call it every few tens of milliseconds, off the
+    /// live path): ask both cache-mesh parents for the parts beyond the
+    /// head of each stream that the fast plane has left quiet. A parent
+    /// sends what it holds of them; the parts that arrive are looked at
+    /// for holes as the cache mesh's arrivals of a quiet stream are.
+    pub(crate) fn sweep_quiet(&self) {
+        let due = self.scan.lock().unwrap().quiet_due(Instant::now());
+        for (stream_id, from) in due {
+            self.quiet_requests.fetch_add(1, Ordering::Relaxed);
+            let mesh = Arc::clone(&self.mesh);
+            tokio::spawn(async move {
+                if let Err(error) = mesh
+                    .request_parts(stream_id, from as usize, MAX_SCAN_PARTS as u32, 2)
+                    .await
+                {
+                    debug!(stream_id, from, error = %error, "quiet catch-up request failed");
+                }
+            });
         }
     }
 
@@ -331,5 +422,39 @@ mod tests {
         assert!(!scan.counts(7, Arrival::CacheMesh, now + Duration::from_millis(10)));
         assert!(scan.counts(7, Arrival::CacheMesh, now + FAST_PLANE_QUIET));
         assert!(scan.counts(8, Arrival::CacheMesh, now));
+    }
+
+    /// A stream the fast plane fed and then left quiet is asked of the
+    /// cache-mesh parents beyond its head after 150 ms (four parts at the
+    /// least), every 50 ms (two parts) while it stays quiet, and no more
+    /// once it has had no part from anywhere for 5 s.
+    #[test]
+    fn a_quiet_stream_is_asked_beyond_its_head() {
+        let mut scan = HoleScan {
+            distance_us: 15_000,
+            streams: HashMap::new(),
+        };
+        let start = Instant::now();
+        assert!(scan.counts(1, Arrival::FastPlane, start));
+        scan.due(1, 500, Some(41_667));
+        let at = |ms| start + Duration::from_millis(ms);
+        assert!(scan.quiet_due(at(100)).is_empty(), "four 42 ms parts not yet");
+        assert_eq!(scan.quiet_due(at(170)), vec![(1, 501)]);
+        assert!(scan.quiet_due(at(200)).is_empty(), "two parts between asks");
+        assert_eq!(scan.quiet_due(at(255)), vec![(1, 501)]);
+        // The cache mesh brings parts: the next ask starts beyond them.
+        assert!(scan.counts(1, Arrival::CacheMesh, at(260)));
+        scan.due(1, 506, None);
+        assert_eq!(scan.quiet_due(at(345)), vec![(1, 507)]);
+        // The fast plane is back: nothing to ask.
+        assert!(scan.counts(1, Arrival::FastPlane, at(350)));
+        scan.due(1, 507, None);
+        assert!(scan.quiet_due(at(400)).is_empty());
+        // A stream that ended: asked for 5 s after its last part, then not.
+        assert!(!scan.quiet_due(at(600)).is_empty());
+        assert!(scan.quiet_due(Instant::now() + Duration::from_secs(6)).is_empty());
+        // A stream never fed by the fast plane is not asked.
+        scan.due(2, 10, Some(1_000));
+        assert!(scan.quiet_due(at(10_000)).iter().all(|(stream, _)| *stream != 2));
     }
 }

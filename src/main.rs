@@ -3988,6 +3988,21 @@ async fn main() -> Result<()> {
             )
         })
         .flatten();
+    // The quiet catch-up of the trigger (a stream that the fast plane left
+    // quiet is asked of the cache-mesh parents), off the live path.
+    let hole_quiet_task = hole_trigger.clone().map(|trigger| {
+        let mut shutdown = ingest_shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(25));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = shutdown.changed() => return,
+                    _ = tick.tick() => trigger.sweep_quiet(),
+                }
+            }
+        })
+    });
     let fast_ingest_planned =
         args.relay_class_threads && args.relay_controlled_local && fast_plane::sys::supported();
     let mesh_applied_task = tokio::spawn(run_mesh_applied_parts(
@@ -4761,6 +4776,9 @@ async fn main() -> Result<()> {
     }
     let _ = media_fec_ingest_task.await;
     let _ = mesh_applied_task.await;
+    if let Some(task) = hole_quiet_task {
+        let _ = task.await;
+    }
     let _ = playlist_demand_task.await;
     let _ = playlist_standby_task.await;
     if let Some(task) = upstream_demand_task {
