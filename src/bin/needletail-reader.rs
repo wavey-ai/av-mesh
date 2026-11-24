@@ -14,7 +14,10 @@
 //! It moves to another cache in three cases, and records each move:
 //!
 //! - the cache fails: a request times out, the connection breaks, or the part
-//!   is not there. The reader uses the next cache of its list.
+//!   is not there. The reader uses the next cache of its list. A cache that
+//!   has sent the reader parts and then sends nothing for half the stall
+//!   time (`--stall-ms`) is asked for its playlist on the connection the
+//!   reader has; with no answer by the stall time the reader leaves it.
 //! - the cache drains: a playlist reload is answered with a redirect.
 //! - the entry point steers it: the Content Steering manifest puts another
 //!   cache first.
@@ -99,6 +102,15 @@ struct Args {
     /// its path to it, so that a far reader does not take delay for failure.
     #[arg(long, default_value_t = 1_500)]
     request_timeout_ms: u64,
+
+    /// A cache that has sent this reader parts and then sends no byte for
+    /// the stall time (this, or eight parts if longer, and four round trips)
+    /// is left: at half of it the reader asks the cache for its playlist,
+    /// and a cache that answers is kept. 400 ms is two minimum TCP
+    /// retransmission timeouts, so a live connection on a lossy path does
+    /// not look dead. --request-timeout-ms still bounds a first request.
+    #[arg(long, default_value_t = 400)]
+    stall_ms: u64,
 
     /// Time allowed for the first answer of an entry point or of a cache,
     /// which includes the TCP and TLS handshakes.
@@ -779,6 +791,9 @@ struct Reader {
     /// Caches that failed lately, and when. A player leaves a pathway that
     /// failed alone for a while.
     penalised: HashMap<String, Instant>,
+    /// The current cache has sent this reader a part: a silence of the
+    /// stall time leaves it (B 3.10).
+    received_from_current: bool,
 }
 
 impl Reader {
@@ -814,6 +829,12 @@ impl Reader {
     /// still opens its window.
     fn timeout(&self) -> Duration {
         Duration::from_millis(self.args.request_timeout_ms) + self.path_round_trip() * 4
+    }
+
+    /// How long a cache that has sent this reader parts may send nothing
+    /// before the reader leaves it (B 3.10).
+    fn stall_timeout(&self, part_us: u64) -> Duration {
+        stall_timeout_for(self.args.stall_ms, part_us, self.path_round_trip())
     }
 
     /// Time allowed for a request to `url`: longer when it needs a new
@@ -862,6 +883,7 @@ impl Reader {
     fn record_move(&mut self, part: u64, to: usize, reason: &str, detail: String) {
         let from = self.current_name();
         self.current = to;
+        self.received_from_current = false;
         // The next cache can be on another path, for example in another
         // region. Its round trip is measured anew.
         self.round_trip = None;
@@ -909,6 +931,7 @@ impl Reader {
             let previous = self.current_name();
             if self.load_master().await.is_ok() {
                 self.current = 0;
+                self.received_from_current = false;
                 self.report.moves.push(Move {
                     at_ms: self.elapsed_ms(),
                     part,
@@ -1385,51 +1408,122 @@ impl Reader {
             }
             self.report.pipeline_depth = self.report.pipeline_depth.max(inflight.len());
 
+            // The playlist that the cache gave when it was asked during the
+            // wait, when it shows the part to be a hole.
+            let mut answered_hole: Option<MediaPlaylist> = None;
             let outcome = match inflight.pop_front() {
                 Some(mut pending) => {
                     debug_assert_eq!(pending.part, next);
                     // The time allowed runs from the moment the reader began
                     // to wait for this part, not from the moment it asked.
                     // A cache that still sends bytes is slow, not dead: the
-                    // time runs again from the last bytes.
+                    // time runs again from the last bytes. A cache that has
+                    // sent this reader parts is asked for its playlist at
+                    // half the stall time, and left at the stall time
+                    // unless it answers (B 3.10).
                     let end = freeze_at.unwrap_or(deadline).min(deadline);
+                    let stall = self
+                        .received_from_current
+                        .then(|| self.stall_timeout(default_duration_us));
+                    let mut wait = PartWait::new(stall, self.timeout());
                     let waited = loop {
-                        let limit = pending
+                        let since = pending
                             .started
                             .max(part_started)
-                            .max(self.http.pace.last_bytes())
-                            + self.timeout();
-                        match tokio::time::timeout_at(limit.min(end).into(), &mut pending.handle)
+                            .max(self.http.pace.last_bytes());
+                        let now = Instant::now();
+                        let until = match wait.step(since, now) {
+                            WaitStep::Until(at) => at,
+                            WaitStep::TimedOut => break Waited::TimedOut,
+                            WaitStep::Stalled => break Waited::Stalled,
+                            WaitStep::AskPlaylist { by } => {
+                                // On the connection the reader has, and no
+                                // other cache: a pause of the stream opens
+                                // no connection anywhere.
+                                let within = by.saturating_duration_since(now);
+                                match self.load_playlist_within(next, within).await {
+                                    Ok(Some(loaded)) => {
+                                        match playlist_verdict(&loaded.parts, next) {
+                                            PlaylistVerdict::SkipTo(_) => {
+                                                break Waited::Hole(loaded)
+                                            }
+                                            PlaylistVerdict::Stopped | PlaylistVerdict::Listed => {
+                                                wait.answered()
+                                            }
+                                        }
+                                    }
+                                    // Redirected or refused: the reader may
+                                    // have another cache now.
+                                    Ok(None) if self.current != pending.cache => {
+                                        break Waited::Moved
+                                    }
+                                    Ok(None) => wait.answered(),
+                                    // No answer: the stall time decides.
+                                    Err(_) => {}
+                                }
+                                continue;
+                            }
+                        };
+                        match tokio::time::timeout_at(until.min(end).into(), &mut pending.handle)
                             .await
                         {
-                            Ok(result) => break Ok(result),
-                            Err(_) if Instant::now() >= end => break Err(true),
-                            Err(_)
-                                if self.http.pace.last_bytes() + self.timeout()
-                                    > Instant::now() => {}
-                            Err(_) => break Err(false),
+                            Ok(result) => break Waited::Done(result),
+                            Err(_) if Instant::now() >= end => break Waited::End,
+                            Err(_) => {}
                         }
                     };
                     match waited {
-                        Ok(Ok(result)) => {
+                        Waited::Done(Ok(result)) => {
                             if result.is_err() {
                                 self.http.forget(&pending.authority);
                             }
                             result
                         }
-                        Ok(Err(join)) => Err(anyhow!("request task failed: {join}")),
-                        Err(true) => {
+                        Waited::Done(Err(join)) => Err(anyhow!("request task failed: {join}")),
+                        Waited::End => {
                             // The run or the reading ends here. Keep the
                             // request open.
                             inflight.push_front(pending);
                             continue;
                         }
-                        Err(false) => {
+                        Waited::TimedOut => {
                             pending.handle.abort();
                             // A request that timed out can leave a stalled
                             // connection.
                             self.http.forget(&pending.authority);
                             Err(anyhow!("timeout after {} ms", self.timeout().as_millis()))
+                        }
+                        Waited::Hole(loaded) => {
+                            pending.handle.abort();
+                            answered_hole = Some(loaded);
+                            Err(anyhow!("part {next} is a hole in the cache's playlist"))
+                        }
+                        Waited::Moved => {
+                            pending.handle.abort();
+                            for pending in inflight.drain(..) {
+                                pending.handle.abort();
+                            }
+                            request_next = next;
+                            continue;
+                        }
+                        Waited::Stalled => {
+                            pending.handle.abort();
+                            for pending in inflight.drain(..) {
+                                pending.handle.abort();
+                            }
+                            request_next = next;
+                            self.http.forget(&pending.authority);
+                            failed += 1;
+                            let detail = format!(
+                                "part {next}: no byte and no answer to the playlist in {} ms",
+                                stall.unwrap_or_default().as_millis()
+                            );
+                            self.fail_over(next, failed, detail).await;
+                            // The next cache is the same for every reader
+                            // of the playlist on this cache: they open it
+                            // spread over 100 ms.
+                            tokio::time::sleep(next_cache_delay(&self.session)).await;
+                            continue;
                         }
                     }
                 }
@@ -1491,19 +1585,23 @@ impl Reader {
                     // reader used to leave, and went round every cache of
                     // two regions while the source was silent.
                     let timed_out = detail.contains("timeout after");
-                    if not_found || timed_out {
-                        let within = self.quick_answer();
-                        if let Ok(Some(loaded)) = self.load_playlist_within(next, within).await {
-                            let newest = loaded.parts.iter().map(|(sequence, _)| *sequence).max();
-                            if part_after_a_hole(&loaded.parts, next, true).is_none()
-                                && newest.is_none_or(|newest| newest < next)
-                            {
+                    let loaded = match answered_hole {
+                        Some(loaded) => Some(loaded),
+                        None if not_found || timed_out => {
+                            let within = self.quick_answer();
+                            self.load_playlist_within(next, within).await.ok().flatten()
+                        }
+                        None => None,
+                    };
+                    if let Some(loaded) = loaded {
+                        match playlist_verdict(&loaded.parts, next) {
+                            PlaylistVerdict::Stopped => {
                                 if self.master.steering.is_some() {
                                     self.poll_steering(next).await;
                                 }
                                 continue;
                             }
-                            if let Some(skip_to) = part_after_a_hole(&loaded.parts, next, true) {
+                            PlaylistVerdict::SkipTo(skip_to) => {
                                 for (sequence, duration) in &loaded.parts {
                                     durations.insert(*sequence, *duration);
                                 }
@@ -1520,6 +1618,7 @@ impl Reader {
                                 failed = 0;
                                 continue;
                             }
+                            PlaylistVerdict::Listed => {}
                         }
                     }
                     failed += 1;
@@ -1617,6 +1716,7 @@ impl Reader {
             let cache = self.current_name();
             *self.report.parts_by_cache.entry(cache.clone()).or_default() += 1;
             self.report.parts_received += 1;
+            self.received_from_current = true;
             self.report.bytes += response.body.len() as u64;
             self.report.last_part = next;
             if self.args.record_parts {
@@ -1778,6 +1878,7 @@ async fn main() -> Result<()> {
                 round_trip: None,
                 priority: Vec::new(),
                 penalised: HashMap::new(),
+                received_from_current: false,
                 args,
             };
             reader.run().await
@@ -1942,6 +2043,136 @@ fn parts_in_two_seconds(part_us: u64) -> usize {
         .max(2)
 }
 
+/// The stall time of a cache that has sent a reader parts (B 3.10): the
+/// larger of `stall_ms` and eight parts, and four round trips.
+fn stall_timeout_for(stall_ms: u64, part_us: u64, round_trip: Duration) -> Duration {
+    Duration::from_millis(stall_ms).max(Duration::from_micros(part_us.saturating_mul(8)))
+        + round_trip * 4
+}
+
+/// How long a reader that left a vanished cache waits before it opens the
+/// next one: 0 to 100 ms by its session, because the next cache is the same
+/// for every reader of a playlist on a cache.
+fn next_cache_delay(session: &str) -> Duration {
+    // FNV-1a, the same in every build.
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in session.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash ^= hash >> 29;
+    Duration::from_micros(hash % 100_000)
+}
+
+/// What a reader does next while it waits for a part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitStep {
+    /// Wait for the part until then.
+    Until(Instant),
+    /// Ask the cache for its playlist, to be answered by then.
+    AskPlaylist { by: Instant },
+    /// The cache sent no byte and gave no answer for the stall time.
+    Stalled,
+    /// The request timeout passed (a first request, or a cache that
+    /// answered its playlist).
+    TimedOut,
+}
+
+/// The wait for one part (B 3.10). Before the cache has sent the reader a
+/// part the request timeout alone bounds it. After, a silence of half the
+/// stall time sends one playlist question to the cache (again after each
+/// sign of life), and a silence of the stall time leaves the cache; a
+/// cache that answers lives, and the request timeout bounds the wait again.
+#[derive(Debug, Clone, Copy)]
+struct PartWait {
+    stall: Option<Duration>,
+    timeout: Duration,
+    asked: Option<Instant>,
+    alive: bool,
+}
+
+impl PartWait {
+    fn new(stall: Option<Duration>, timeout: Duration) -> Self {
+        Self {
+            stall,
+            timeout,
+            asked: None,
+            alive: false,
+        }
+    }
+
+    /// The next step at `now`, `since` being the later of the start of the
+    /// wait and the last byte from any connection.
+    fn step(&mut self, since: Instant, now: Instant) -> WaitStep {
+        let Some(stall) = self.stall.filter(|_| !self.alive) else {
+            let limit = since + self.timeout;
+            return if now >= limit {
+                WaitStep::TimedOut
+            } else {
+                WaitStep::Until(limit)
+            };
+        };
+        let give_up = since + stall;
+        if now >= give_up {
+            return WaitStep::Stalled;
+        }
+        if self.asked.is_some_and(|asked| asked >= since) {
+            return WaitStep::Until(give_up);
+        }
+        let ask_at = since + stall / 2;
+        if now >= ask_at {
+            self.asked = Some(now);
+            WaitStep::AskPlaylist { by: give_up }
+        } else {
+            WaitStep::Until(ask_at)
+        }
+    }
+
+    /// The cache answered its playlist: it lives.
+    fn answered(&mut self) {
+        self.alive = true;
+    }
+}
+
+/// How the wait for a part ended.
+enum Waited {
+    /// The request finished.
+    Done(std::result::Result<Result<HttpResponse>, tokio::task::JoinError>),
+    /// The run or the reading ends.
+    End,
+    TimedOut,
+    Stalled,
+    /// The cache's playlist shows the part to be a hole.
+    Hole(MediaPlaylist),
+    /// The playlist question moved the reader to another cache.
+    Moved,
+}
+
+/// What the playlist of the cache says of the part a reader waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaylistVerdict {
+    /// Nothing at or after it is listed: the stream has stopped, for every
+    /// cache alike. A player waits where it is.
+    Stopped,
+    /// Later parts are listed and it is not: it was lost, and a player
+    /// plays this one next, from the same cache.
+    SkipTo(u64),
+    /// It is listed.
+    Listed,
+}
+
+fn playlist_verdict(listed: &[(u64, u64)], wanted: u64) -> PlaylistVerdict {
+    if let Some(skip_to) = part_after_a_hole(listed, wanted, true) {
+        return PlaylistVerdict::SkipTo(skip_to);
+    }
+    let newest = listed.iter().map(|(sequence, _)| *sequence).max();
+    if newest.is_none_or(|newest| newest < wanted) {
+        PlaylistVerdict::Stopped
+    } else {
+        PlaylistVerdict::Listed
+    }
+}
+
 /// The part that a reader goes on from when the part that it waits for will
 /// not come: the first listed part after `wanted`, when `wanted` is overdue
 /// and the playlist does not list it.
@@ -1959,6 +2190,124 @@ fn part_after_a_hole(listed: &[(u64, u64)], wanted: u64, overdue: bool) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ms(millis: u64) -> Duration {
+        Duration::from_millis(millis)
+    }
+
+    /// B 3.10: a cache that has sent the reader parts and then sends
+    /// nothing is asked for its playlist at half the stall time and left at
+    /// the stall time: about 400 ms + 8 r, where the request timeout was
+    /// 1,500 ms + 4 r.
+    #[test]
+    fn a_cache_that_stops_sending_is_left_after_the_stall_time() {
+        let stall = stall_timeout_for(400, 1_000, ms(2));
+        assert_eq!(stall, ms(408));
+        // Eight long parts are more than 400 ms.
+        assert_eq!(stall_timeout_for(400, 100_000, ms(2)), ms(808));
+        let t0 = Instant::now();
+        let mut wait = PartWait::new(Some(stall), ms(1_508));
+        assert_eq!(wait.step(t0, t0), WaitStep::Until(t0 + ms(204)));
+        assert_eq!(
+            wait.step(t0, t0 + ms(204)),
+            WaitStep::AskPlaylist { by: t0 + ms(408) }
+        );
+        // Asked once: no answer, and the stall time decides.
+        assert_eq!(wait.step(t0, t0 + ms(250)), WaitStep::Until(t0 + ms(408)));
+        assert_eq!(wait.step(t0, t0 + ms(408)), WaitStep::Stalled);
+        // Bytes came after the question: the silence starts again, and so
+        // does the question.
+        let t1 = t0 + ms(300);
+        let mut wait = PartWait::new(Some(stall), ms(1_508));
+        assert!(matches!(
+            wait.step(t0, t0 + ms(204)),
+            WaitStep::AskPlaylist { .. }
+        ));
+        assert_eq!(wait.step(t1, t1 + ms(100)), WaitStep::Until(t1 + ms(204)));
+        assert_eq!(
+            wait.step(t1, t1 + ms(204)),
+            WaitStep::AskPlaylist { by: t1 + ms(408) }
+        );
+        // Before the cache has sent a part, the request timeout alone.
+        let mut first = PartWait::new(None, ms(1_508));
+        assert_eq!(first.step(t0, t0 + ms(1_000)), WaitStep::Until(t0 + ms(1_508)));
+        assert_eq!(first.step(t0, t0 + ms(1_508)), WaitStep::TimedOut);
+    }
+
+    /// B 3.10: a cache that answers its playlist lives: the reader keeps
+    /// it, and only the request timeout bounds the wait from then on.
+    #[test]
+    fn a_cache_that_answers_its_playlist_is_kept() {
+        let t0 = Instant::now();
+        let mut wait = PartWait::new(Some(ms(408)), ms(1_508));
+        assert!(matches!(
+            wait.step(t0, t0 + ms(204)),
+            WaitStep::AskPlaylist { .. }
+        ));
+        wait.answered();
+        assert_eq!(wait.step(t0, t0 + ms(408)), WaitStep::Until(t0 + ms(1_508)));
+        assert_eq!(wait.step(t0, t0 + ms(1_508)), WaitStep::TimedOut);
+        // What the answer says: the part is listed (the cache is slow), or
+        // later parts are and it is not (it is skipped, on this cache).
+        let listed = [(40, 1_000), (41, 1_000), (42, 1_000)];
+        assert_eq!(playlist_verdict(&listed, 41), PlaylistVerdict::Listed);
+        let holed = [(40, 1_000), (42, 1_000), (43, 1_000)];
+        assert_eq!(playlist_verdict(&holed, 41), PlaylistVerdict::SkipTo(42));
+    }
+
+    /// B 3.10: a pause of the stream is answered by the cache (nothing at
+    /// or after the part is listed): the reader waits where it is and is
+    /// never told to leave, so no connection opens anywhere.
+    #[test]
+    fn a_quiet_stream_opens_no_connection() {
+        let quiet = [(38, 1_000), (39, 1_000), (40, 1_000)];
+        assert_eq!(playlist_verdict(&quiet, 41), PlaylistVerdict::Stopped);
+        assert_eq!(playlist_verdict(&[], 41), PlaylistVerdict::Stopped);
+        let t0 = Instant::now();
+        let mut wait = PartWait::new(Some(ms(408)), ms(1_508));
+        let mut questions = 0;
+        let mut since = t0;
+        for step in 0..60_u64 {
+            let now = t0 + ms(step * 25);
+            match wait.step(since, now) {
+                WaitStep::AskPlaylist { .. } => {
+                    // The cache answers on the connection the reader has;
+                    // its answer is bytes.
+                    questions += 1;
+                    wait.answered();
+                    since = now;
+                }
+                WaitStep::Stalled => panic!("left a cache that answered, at {step}"),
+                WaitStep::TimedOut => {
+                    // The request timeout: the part is asked for again
+                    // from the same cache, after the same question.
+                    assert!(now >= since + ms(1_508));
+                    break;
+                }
+                WaitStep::Until(_) => {}
+            }
+        }
+        assert_eq!(questions, 1);
+    }
+
+    /// B 3.10: the readers that leave a vanished cache all go to the same
+    /// next cache; each opens it after 0 to 100 ms by its session.
+    #[test]
+    fn readers_open_the_next_cache_spread_over_100_ms() {
+        let mut buckets = [0_usize; 10];
+        for index in 0..2_000 {
+            let session = format!("reader-{index}");
+            let delay = next_cache_delay(&session);
+            assert!(delay < ms(100), "{session}: {delay:?}");
+            assert_eq!(delay, next_cache_delay(&session));
+            buckets[(delay.as_millis() / 10) as usize] += 1;
+        }
+        // 200 a bucket of 10 ms if even.
+        assert!(
+            buckets.iter().all(|count| (140..=260).contains(count)),
+            "{buckets:?}"
+        );
+    }
 
     #[test]
     fn url_references_resolve_like_a_player() {
