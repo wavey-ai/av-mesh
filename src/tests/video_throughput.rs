@@ -566,7 +566,7 @@ fn delivery(
 
 /// W3_PTRACER=1 lets a sampling profiler that is not this process's parent
 /// (eu-stack) read the stacks of its threads.
-fn allow_sampling() {
+pub(super) fn allow_sampling() {
     if std::env::var_os("W3_PTRACER").is_some() {
         // SAFETY: prctl with integer arguments only.
         unsafe { libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY, 0, 0, 0) };

@@ -14,6 +14,7 @@
 //! back, and a stall of the runtime never stops forwarding.
 
 pub mod burst_copy;
+pub mod decode_pool;
 pub mod dedup;
 pub mod demand;
 pub mod edge_clients;

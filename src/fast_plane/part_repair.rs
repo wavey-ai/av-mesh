@@ -320,6 +320,15 @@ pub fn window_for(node_id: &str) -> u32 {
 
 // ------------------------------------------------------------------ parent
 
+/// The children of a decoded part's stream, as `PartRepair::keep` uses
+/// them: those that lose datagrams from this node (with their loss, ppm),
+/// and those that take this node's sources.
+#[derive(Default)]
+pub struct Children {
+    pub lossy: Vec<(Arc<dyn SendSocket>, SocketAddr, u32)>,
+    pub sources: Vec<(Arc<dyn SendSocket>, SocketAddr)>,
+}
+
 /// Something a datagram can leave from.
 pub trait SendSocket: Send + Sync {
     fn send_fd(&self) -> RawFd;
@@ -377,6 +386,21 @@ pub struct Plans {
     pub generated: u64,
 }
 
+/// The source-symbol counts whose plans the repair thread makes at start:
+/// those of the contributor's plan grid (16 an octave) from 768 to 2,560
+/// symbols (parts of 0.9 to 3.2 MB at 1,264-byte symbols), 29 plans of about
+/// 34 MB.
+pub fn prewarm_symbol_counts() -> Vec<u16> {
+    let mut out = Vec::new();
+    let mut k: u32 = 768;
+    while k <= 2_560 {
+        out.push(k as u16);
+        let octave = 31 - k.leading_zeros();
+        k += 1 << (octave - 4);
+    }
+    out
+}
+
 /// Plans kept at most, and their source symbols in all (a plan of K
 /// symbols is roughly 0.75 K KiB: about 48 MiB at this bound).
 const PLAN_CAPACITY: usize = 96;
@@ -405,29 +429,105 @@ impl Plans {
     }
 }
 
+/// What part repair needs of a part, from one of its symbols, owned: a
+/// decode on the pool completes after the symbol's bytes are gone.
+#[derive(Debug, Clone)]
+pub struct PartMeta {
+    pub key: PartKey,
+    pub generation: u64,
+    pub subscription_id: u64,
+    pub kind: MediaObjectKind,
+    pub deadline_us: u64,
+    /// One RQD2 datagram of the part (its coding profile).
+    pub fec: Vec<u8>,
+    pub seq_base: u32,
+    pub source_symbols: u16,
+    pub slim: bool,
+}
+
+impl PartMeta {
+    pub fn of(view: &RlsView<'_>) -> Self {
+        Self {
+            key: PartKey::of(view),
+            generation: view.generation,
+            subscription_id: view.subscription_id,
+            kind: view.kind,
+            deadline_us: view.deadline_us,
+            fec: view.fec.to_vec(),
+            seq_base: view.packet_sequence.wrapping_sub(view.esi),
+            source_symbols: view.source_symbols,
+            slim: view.slim.is_some(),
+        }
+    }
+
+    /// Whether part repair takes the part: two symbols or more.
+    pub const fn repairable(&self) -> bool {
+        !self.slim && self.source_symbols >= 2
+    }
+}
+
 impl StoredPart {
-    /// From the view of one of its symbols and its decoded envelope.
-    pub fn new(
-        view: &RlsView<'_>,
-        object_key: ObjectKey,
-        envelope: Vec<u8>,
-    ) -> Option<Self> {
-        let profile = RaptorQBlockProfile::from_datagram(view.fec).ok()?;
+    /// From its part's description and its decoded envelope.
+    pub fn new(meta: &PartMeta, object_key: ObjectKey, envelope: Vec<u8>) -> Option<Self> {
+        let profile = RaptorQBlockProfile::from_datagram(&meta.fec).ok()?;
         if profile.transfer_length() as usize != envelope.len() {
             return None;
         }
         Some(Self {
-            key: PartKey::of(view),
+            key: meta.key,
             object_key,
-            kind: view.kind,
-            generation: TopologyGeneration::new(view.generation).ok()?,
-            subscription: SubscriptionId::new(view.subscription_id).ok()?,
-            deadline: MediaDeadline::from_micros(view.deadline_us),
+            kind: meta.kind,
+            generation: TopologyGeneration::new(meta.generation).ok()?,
+            subscription: SubscriptionId::new(meta.subscription_id).ok()?,
+            deadline: MediaDeadline::from_micros(meta.deadline_us),
             profile,
-            seq_base: view.packet_sequence.wrapping_sub(view.esi),
+            seq_base: meta.seq_base,
             envelope,
             encoder: StdMutex::new(None),
         })
+    }
+
+    /// The source symbols `esis` as RLS1 datagrams, byte for byte those its
+    /// source sent (the part's own packet sequences): a child's first-arrival
+    /// table takes whichever copy comes first.
+    pub fn sources(&self, esis: &[u32], limits: RelayLimits) -> Vec<Vec<u8>> {
+        let (k, size) = (self.profile.source_symbols(), self.profile.symbol_size());
+        let t = usize::from(size);
+        esis.iter()
+            .filter(|esi| **esi < u32::from(k))
+            .filter_map(|&esi| {
+                let at = esi as usize * t;
+                let mut data = self.envelope.get(at..(at + t).min(self.envelope.len()))?.to_vec();
+                data.resize(t, 0);
+                let serialized =
+                    raptorq::EncodingPacket::new(raptorq::PayloadId::new(0, esi), data).serialize();
+                let header = DatagramFecHeader::raptorq(
+                    self.profile.block_id(),
+                    self.profile.transfer_length(),
+                    self.seq_base.wrapping_add(esi),
+                    k,
+                    size,
+                    &serialized,
+                )
+                .ok()?;
+                let mut fec_datagram = vec![0_u8; HEADER_LEN];
+                header.encode(&mut fec_datagram).ok()?;
+                fec_datagram.extend_from_slice(&serialized);
+                let datagram = RelayDatagram::new(
+                    self.generation,
+                    self.subscription,
+                    self.object_key.clone(),
+                    self.kind,
+                    MediaDatagramRole::Source,
+                    MediaPathIntent::PrimarySource,
+                    self.deadline,
+                    fec_datagram,
+                    limits,
+                )
+                .ok()?;
+                encode_datagram(&datagram, limits).ok()
+            })
+            .collect()
     }
 
     pub fn source_symbols(&self) -> u32 {
@@ -531,6 +631,13 @@ enum Job {
         part: Arc<StoredPart>,
         sends: Vec<(Arc<dyn SendSocket>, SocketAddr, u32)>,
     },
+    /// The sources this node lacked and its decode regenerated, to every
+    /// child that takes its sources.
+    Sources {
+        part: Arc<StoredPart>,
+        esis: Vec<u32>,
+        sends: Vec<(Arc<dyn SendSocket>, SocketAddr)>,
+    },
 }
 
 /// The counters of both sides, for `GET /api/node` (fast_plane.part_repair).
@@ -562,6 +669,8 @@ pub struct PartRepairStats {
     pub encode_us_max: AtomicU64,
     pub link_repair_parts: AtomicU64,
     pub link_repair_symbols: AtomicU64,
+    pub regenerated_parts: AtomicU64,
+    pub regenerated_symbols: AtomicU64,
     pub child_loss_reports: AtomicU64,
     pub ledgers: AtomicU64,
 }
@@ -592,6 +701,8 @@ pub struct PartRepairSnapshot {
     pub encode_us_max: u64,
     pub link_repair_parts: u64,
     pub link_repair_symbols: u64,
+    pub regenerated_parts: u64,
+    pub regenerated_symbols: u64,
     pub child_loss_reports: u64,
     pub ledgers: u64,
 }
@@ -623,6 +734,8 @@ impl PartRepairStats {
             encode_us_max: load(&self.encode_us_max),
             link_repair_parts: load(&self.link_repair_parts),
             link_repair_symbols: load(&self.link_repair_symbols),
+            regenerated_parts: load(&self.regenerated_parts),
+            regenerated_symbols: load(&self.regenerated_symbols),
             child_loss_reports: load(&self.child_loss_reports),
             ledgers: load(&self.ledgers),
         }
@@ -645,6 +758,9 @@ pub struct PartRepairConfig {
     pub window: u32,
     /// The media deadline: no ask after it.
     pub deadline_us: u64,
+    /// `--relay-regenerate-sources`: a part decoded here goes to the
+    /// children that take this node's sources with the sources it lacked.
+    pub regenerate_sources: bool,
 }
 
 impl Default for PartRepairConfig {
@@ -655,6 +771,7 @@ impl Default for PartRepairConfig {
             initial_rtt_us: 50_000,
             window: WINDOW,
             deadline_us: 1_000_000,
+            regenerate_sources: true,
         }
     }
 }
@@ -715,9 +832,16 @@ impl PartRepair {
     pub fn keep(
         &self,
         part: StoredPart,
-        children: impl FnOnce(&dyn Fn(SocketAddr) -> u32) -> Vec<(Arc<dyn SendSocket>, SocketAddr, u32)>,
+        missing: &[u32],
+        children: impl FnOnce(&dyn Fn(SocketAddr) -> u32) -> Children,
     ) {
         let part = Arc::new(part);
+        let children = children(&|child| self.child_loss(child));
+        let regenerated = if self.config.regenerate_sources && !children.sources.is_empty() {
+            u32::try_from(missing.len()).unwrap_or(u32::MAX)
+        } else {
+            0
+        };
         let waiting = {
             let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
             store.bytes += part.envelope.len();
@@ -743,7 +867,29 @@ impl PartRepair {
             waiting
         };
         self.stats.stored_parts.fetch_add(1, Ordering::Relaxed);
-        for (via, to, request) in waiting {
+        // The sources this node lacked first: below a lossy link every
+        // child lacks them too, and with them it needs no decode.
+        if regenerated > 0 {
+            self.stats.regenerated_parts.fetch_add(1, Ordering::Relaxed);
+            self.queue(Job::Sources {
+                part: Arc::clone(&part),
+                esis: missing.to_vec(),
+                sends: children.sources.clone(),
+            });
+        }
+        for (via, to, mut request) in waiting {
+            // An ask that waited for this decode is answered now, less the
+            // regenerated sources that go to the asker anyway.
+            if regenerated > 0 && children.sources.iter().any(|(_, child)| *child == to) {
+                if request.wanted > 0 {
+                    let left = u32::from(request.wanted).saturating_sub(regenerated);
+                    if left == 0 {
+                        answer(&*via, to, &request, AnswerStatus::Sending, 0, self.config.window);
+                        continue;
+                    }
+                    request.wanted = u16::try_from(left).unwrap_or(u16::MAX);
+                }
+            }
             self.queue(Job::Answer {
                 via,
                 to,
@@ -755,8 +901,8 @@ impl PartRepair {
             return;
         }
         let k = part.source_symbols();
-        let loss = |child: SocketAddr| self.child_loss(child);
-        let sends: Vec<_> = children(&loss)
+        let sends: Vec<_> = children
+            .lossy
             .into_iter()
             .filter_map(|(via, to, loss_ppm)| {
                 let count = link_repair(k, loss_ppm);
@@ -925,6 +1071,12 @@ fn run_repair_thread(
     extra_sent: Arc<StdMutex<HashMap<SocketAddr, u64>>>,
 ) {
     let mut plans = Plans::default();
+    // The plans of the part sizes a large stream sends most, made before
+    // the first job: a plan made on demand cost a part 40-80 ms (and every
+    // job queued behind it).
+    for k in prewarm_symbol_counts() {
+        plans.plan(k);
+    }
     let count_extra = |to: SocketAddr, count: usize| {
         *extra_sent
             .lock()
@@ -970,6 +1122,14 @@ fn run_repair_thread(
                 stats.answers.fetch_add(1, Ordering::Relaxed);
                 stats.answer_symbols.fetch_add(sent as u64, Ordering::Relaxed);
             }
+            Job::Sources { part, esis, sends } => {
+                let datagrams = part.sources(&esis, limits);
+                for (via, to) in sends {
+                    let sent = send_all(&*via, to, &datagrams);
+                    count_extra(to, sent);
+                    stats.regenerated_symbols.fetch_add(sent as u64, Ordering::Relaxed);
+                }
+            }
             Job::Link { part, sends } => {
                 let most = sends.iter().map(|(_, _, count)| *count).max().unwrap_or(0);
                 if most == 0 {
@@ -1001,11 +1161,17 @@ const STREAMS: usize = 64;
 /// A run of missing part numbers longer than this is a new epoch or a
 /// stream that started again, not an outage to ask for.
 const MAX_GAP_PARTS: u64 = 64;
-/// The parent has moved on to a later part: this long more for its
-/// datagrams still in flight (another parent's, reordered).
-const MOVED_ON_GRACE_US: u64 = 3_000;
-/// No symbol of a part for this long: it is as complete as it will get.
-const IDLE_US: u64 = 6_000;
+/// A part's datagrams have stopped when none came for twice its lane's
+/// jitter (the mean of each part's longest gap between source symbols) and
+/// 0.5 ms, and not less than its own longest gap, within these bounds.
+const JITTER_MIN_US: u64 = 1_000;
+const JITTER_MAX_US: u64 = 20_000;
+/// A part that holds enough to decode is asked for only this long after its
+/// last symbol (its decode, on the pool, failed).
+const DECODE_GRACE_US: u64 = 150_000;
+/// The planned link repair is waited for at most this long after the
+/// sources (its measured arrival, `repair_tail_us`, capped).
+const LINK_REPAIR_WAIT_MAX_US: u64 = 30_000;
 /// A parent that sends parts of several symbols is probed this often for
 /// the round trip.
 const PROBE_EVERY_US: u64 = 500_000;
@@ -1021,6 +1187,8 @@ struct OpenPart {
     last_us: u64,
     /// The last source symbol's arrival (0: none yet).
     last_source_us: u64,
+    /// The longest gap between two of its source symbols (µs).
+    gap_us: u64,
     /// Symbols of it that its parent made (ordinals in the parent's window:
     /// link repair or answers), and when the link repair this node expects
     /// of its parent had all come (0: not yet).
@@ -1072,9 +1240,13 @@ pub struct Requester {
     open: Vec<OpenPart>,
     heads: Vec<StreamHead>,
     parents: Vec<Parent>,
-    /// From a part's last source to its decode, for parts that decoded with
-    /// no ask (µs, a running mean): the repair that is still coming.
+    /// From a part's last source to the arrival of its planned link repair
+    /// (µs, a running mean, every part): the parent's decode and encode.
     repair_tail_us: u64,
+    /// The expected link repair of each lane for its last (K, loss).
+    expected_cache: [(u32, u32, u32); 2],
+    /// Each lane's jitter: the mean longest gap within a part (µs).
+    lane_gap_us: [u64; 2],
 }
 
 impl Requester {
@@ -1093,6 +1265,8 @@ impl Requester {
             heads: Vec::with_capacity(STREAMS),
             parents: Vec::new(),
             repair_tail_us: 0,
+            expected_cache: [(u32::MAX, 0, 0); 2],
+            lane_gap_us: [0; 2],
         }
     }
 
@@ -1137,6 +1311,9 @@ impl Requester {
         if let Some(part) = self.open.iter_mut().find(|part| part.key == key) {
             part.held += 1;
             part.k = view.source_symbols;
+            if view.esi < k && part.last_source_us != 0 {
+                part.gap_us = part.gap_us.max(now_us.saturating_sub(part.last_source_us));
+            }
             part.last_us = now_us;
             if view.esi < k {
                 part.last_source_us = now_us;
@@ -1161,6 +1338,7 @@ impl Requester {
             first_us: now_us,
             last_us: now_us,
             last_source_us: if view.esi < k { now_us } else { 0 },
+            gap_us: 0,
             regenerated,
             link_done_us: 0,
             moved_on_us: 0,
@@ -1262,6 +1440,7 @@ impl Requester {
                 first_us: now_us,
                 last_us: now_us,
                 last_source_us: 0,
+                gap_us: 0,
                 regenerated: 0,
                 link_done_us: 0,
                 moved_on_us: now_us,
@@ -1282,13 +1461,17 @@ impl Requester {
     pub fn done(&mut self, key: PartKey, now_us: u64) {
         if let Some(at) = self.open.iter().position(|part| part.key == key) {
             let part = self.open.swap_remove(at);
+            // The lane's jitter as its parts see it: a running mean of each
+            // part's longest gap between source symbols.
+            if part.gap_us > 0 {
+                let lane = lane_of(&part);
+                let sample = part.gap_us.min(JITTER_MAX_US);
+                self.lane_gap_us[lane] = (self.lane_gap_us[lane] * 7 + sample) / 8;
+            }
             // How long after its sources a part that needed no ask kept
             // getting repair (forwarded and link repair, each made after an
             // upstream decode): the first ask waits that out.
-            if part.attempts == 0 && part.last_source_us != 0 && part.link_done_us == 0 {
-                let sample = now_us.saturating_sub(part.last_source_us).min(200_000);
-                self.repair_tail_us = (self.repair_tail_us * 7 + sample) / 8;
-            }
+
             if part.attempts > 0 {
                 self.stats().recovered_parts.fetch_add(1, Ordering::Relaxed);
                 self.stats().repair_wait_max_us.fetch_max(
@@ -1350,17 +1533,16 @@ impl Requester {
     /// The link repair this node's parent on `lane` sends a part of `k`
     /// symbols: the parent sizes it from this node's reported loss (here a
     /// tenth less, for the report's lag).
-    fn expected_link_repair(&self, k: u32, lane: usize) -> u32 {
-        let ppm = self.lanes.lane_loss_ppm(self.class, lane);
-        let expected = link_repair(k, u32::try_from(ppm).unwrap_or(u32::MAX));
-        expected - expected / 10
-    }
-
-    /// How long after its last source symbol a part is first asked for:
-    /// the repair still to come (`repair_tail_us`) and a quarter more, and
-    /// 2 ms; at least [`IDLE_US`], at most 80 ms.
-    pub fn first_wait_us(&self) -> u64 {
-        (self.repair_tail_us + self.repair_tail_us / 4 + 2_000).clamp(IDLE_US, 80_000)
+    fn expected_link_repair(&mut self, k: u32, lane: usize) -> u32 {
+        let ppm = u32::try_from(self.lanes.lane_loss_ppm(self.class, lane)).unwrap_or(u32::MAX);
+        // A binomial search: kept for the last (K, loss) of each lane, not
+        // made again for every symbol.
+        let cached = &mut self.expected_cache[lane];
+        if cached.0 != k || cached.1 != ppm {
+            let expected = link_repair(k, ppm);
+            *cached = (k, ppm, expected - expected / 10);
+        }
+        cached.2
     }
 
     /// The wait before asking again after `attempts` asks of a part whose
@@ -1398,21 +1580,32 @@ impl Requester {
                 continue;
             }
             index += 1;
-            let due = if part.attempts == 0 {
-                let wait = self.first_wait_us();
+            // A part that holds enough to decode (K + 1) is being decoded:
+            // it is asked for only if that has not ended it after a while
+            // (a decode that failed for want of symbols).
+            let decodable = part.k > 0 && part.held > u32::from(part.k);
+            let due = if decodable {
+                now_us >= part.last_us + DECODE_GRACE_US
+                    && (part.attempts == 0 || now_us >= part.next_due_us)
+            } else if part.attempts == 0 {
+                let jitter = (2 * self.lane_gap_us[lane_of(&part)] + 500)
+                    .max(part.gap_us)
+                    .clamp(JITTER_MIN_US, JITTER_MAX_US);
                 if part.held == 0 {
                     // Nothing of it came: from when a later part came.
-                    now_us >= part.moved_on_us + MOVED_ON_GRACE_US.max(wait)
+                    now_us >= part.moved_on_us + jitter
                 } else {
-                    // Its symbols have stopped, and the link repair this
-                    // node's lane gets has come (then the part is short for
-                    // good), or the repair that follows a part's sources has
-                    // had its usual time.
+                    // Its last expected datagram should have come: its
+                    // datagrams stopped for the link's jitter, and the link
+                    // repair this lane is planned to get has come (or had
+                    // its measured time after the sources and the jitter).
                     let lane = lane_of(&part);
-                    let link_done = self.expected_link_repair(u32::from(part.k), lane) > 0
-                        && part.link_done_us != 0;
-                    now_us >= part.last_us + MOVED_ON_GRACE_US
-                        && (link_done || now_us >= part.last_source_us.max(part.first_us) + wait)
+                    let expected = self.expected_link_repair(u32::from(part.k), lane);
+                    let link_wait = self.repair_tail_us.min(LINK_REPAIR_WAIT_MAX_US);
+                    now_us >= part.last_us + jitter
+                        && (expected == 0
+                            || part.link_done_us != 0
+                            || now_us >= part.last_source_us.max(part.first_us) + link_wait + jitter)
                 }
             } else {
                 now_us >= part.next_due_us

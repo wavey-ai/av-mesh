@@ -55,6 +55,13 @@ pub struct RelayObjectReceiverConfig {
     /// `--relay-media-deadline-ms`: how far behind the head of its stream,
     /// in the stream's own time, a part may be and still be taken.
     pub media_deadline_us: u64,
+    /// 4k-repair: a part of at least this many source symbols (0: none) is
+    /// assembled here, not in relay-session's assembler: whole from its
+    /// source symbols it is the sources' bytes (no RaptorQ); short of them,
+    /// its RaptorQ decode is a [`DecodeJob`] for the caller to run off its
+    /// thread ([`RelayObjectReceiver::take_decode_jobs`],
+    /// [`RelayObjectReceiver::complete_decode`]).
+    pub defer_decode_min_symbols: u16,
 }
 
 impl Default for RelayObjectReceiverConfig {
@@ -71,6 +78,7 @@ impl Default for RelayObjectReceiverConfig {
             object_inactivity_timeout_us: 10_000_000,
             expiry_scan_interval_us: 250_000,
             media_deadline_us: 1_000_000,
+            defer_decode_min_symbols: 0,
         }
     }
 }
@@ -337,6 +345,10 @@ pub struct RelayObjectReceiverState {
 /// identifiers and parent identities stay in traces rather than metric labels.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RelayIngressCounters {
+    /// 4k-repair: parts decoded off the receiver's thread, and decodes that
+    /// failed for want of symbols (asked again with more).
+    pub deferred_decodes: u64,
+    pub deferred_decode_failures: u64,
     pub datagrams_received: u64,
     pub datagrams_rejected: u64,
     pub source_datagrams: u64,
@@ -658,6 +670,8 @@ struct SymbolFingerprint {
 struct ActiveObject {
     announcement: ObjectAnnouncement,
     assembler: ObjectAssembler,
+    /// The assembly of a part decoded off the receiver's thread.
+    deferred: Option<Deferred>,
     parent_sessions: HashSet<u64>,
     symbols: HashMap<u32, SymbolFingerprint>,
     source_symbols: usize,
@@ -765,6 +779,8 @@ pub struct RelayObjectReceiver {
     /// Each stream's place on its own timeline: what a deadline is measured
     /// against (never this node's wall clock).
     clocks: MediaClocks,
+    /// Decodes ready to run off this thread (4k-repair).
+    decode_jobs: Vec<DecodeJob>,
 }
 
 impl fmt::Debug for RelayObjectReceiver {
@@ -805,6 +821,7 @@ impl RelayObjectReceiver {
             compact_order: VecDeque::with_capacity(config.max_completed_objects),
             whole_done: HashSet::with_capacity(config.max_completed_objects),
             clocks: MediaClocks::new(MEDIA_CLOCK_STREAMS),
+            decode_jobs: Vec::new(),
         })
     }
 
@@ -1020,6 +1037,9 @@ impl RelayObjectReceiver {
         self.objects.insert(
             announcement.key.clone(),
             ActiveObject {
+                deferred: (self.config.defer_decode_min_symbols > 0
+                    && announcement.coding.source_symbols() >= self.config.defer_decode_min_symbols)
+                    .then(|| Deferred::new(&announcement)),
                 announcement,
                 assembler,
                 parent_sessions,
@@ -1268,7 +1288,28 @@ impl RelayObjectReceiver {
             return Err(RelayIngressError::BufferedDatagramLimitExceeded);
         }
 
-        let decoded = state.assembler.push_symbol(&symbol)?;
+        let mut job = None;
+        let (decoded, whole_envelope) = match state.deferred.as_mut() {
+            Some(deferred) => {
+                check_deferred_symbol(&state.announcement, &symbol, self.config.relay_limits)?;
+                match deferred.push(&symbol.fec_datagram, &symbol.object_key)? {
+                    DeferredStep::Pending => (None, None),
+                    DeferredStep::Submit(ready) => {
+                        job = Some(ready);
+                        (None, None)
+                    }
+                    DeferredStep::Whole(envelope) => {
+                        let object = decode_part_envelope(
+                            &envelope,
+                            &state.announcement.key,
+                            self.config.relay_limits,
+                        )?;
+                        (Some(object), Some(envelope))
+                    }
+                }
+            }
+            None => (state.assembler.push_symbol(&symbol)?, None),
+        };
         state.symbols.insert(header.packet_sequence, fingerprint);
         match symbol.role {
             MediaDatagramRole::Source => {
@@ -1284,17 +1325,106 @@ impl RelayObjectReceiver {
         self.buffered_datagrams = self.buffered_datagrams.saturating_add(1);
 
         let Some(object) = decoded else {
+            if let Some(job) = job {
+                self.decode_jobs.push(job);
+            }
             return Ok(RelayIngressOutcome::Buffered {
                 key: symbol.object_key,
                 role: symbol.role,
                 deadline: symbol.deadline,
             });
         };
-        validate_object_kind(&object, state.announcement.kind)?;
-        let envelope = state
-            .assembler
-            .take_completed_envelope()
-            .expect("a completed object must retain its validated canonical envelope");
+        let envelope = match whole_envelope {
+            Some(envelope) => envelope,
+            None => state
+                .assembler
+                .take_completed_envelope()
+                .expect("a completed object must retain its validated canonical envelope"),
+        };
+        self.finish_decoded(object, envelope, symbol.role, symbol.deadline, now_us)
+    }
+
+    /// The decodes that the symbols taken so far made ready (4k-repair):
+    /// run each off this thread ([`DecodeJob::run`]) and hand its result to
+    /// [`Self::complete_decode`].
+    pub fn take_decode_jobs(&mut self) -> Vec<DecodeJob> {
+        std::mem::take(&mut self.decode_jobs)
+    }
+
+    /// Whether a decode is ready for [`Self::take_decode_jobs`].
+    #[must_use]
+    pub fn has_decode_jobs(&self) -> bool {
+        !self.decode_jobs.is_empty()
+    }
+
+    /// Whether this receiver assembles large parts itself and leaves their
+    /// decode to the caller.
+    #[must_use]
+    pub const fn defers_decode(&self) -> bool {
+        self.config.defer_decode_min_symbols > 0
+    }
+
+    /// Assemble parts of at least `min_symbols` here, their decodes left to
+    /// the caller (0: none). Parts announced from now on.
+    pub fn set_defer_decode(&mut self, min_symbols: u16) {
+        self.config.defer_decode_min_symbols = min_symbols;
+    }
+
+    /// The result of a [`DecodeJob`] of the part `key`: its envelope, or
+    /// `None` when RaptorQ could not decode it from what the job held (the
+    /// part is asked again when two more symbols come). `Ok(None)` when the
+    /// part is no longer under way (it completed from its sources, or
+    /// expired).
+    ///
+    /// # Errors
+    ///
+    /// An envelope that does not read as the part's object.
+    pub fn complete_decode(
+        &mut self,
+        key: &ObjectKey,
+        envelope: Option<Vec<u8>>,
+        now_us: u64,
+    ) -> Result<Option<RelayIngressOutcome>, RelayIngressError> {
+        let Some(state) = self.objects.get_mut(key) else {
+            return Ok(None);
+        };
+        let Some(envelope) = envelope else {
+            self.counters.deferred_decode_failures =
+                self.counters.deferred_decode_failures.saturating_add(1);
+            if let Some(deferred) = state.deferred.as_mut() {
+                deferred.in_flight = false;
+                deferred.submit_at = deferred.held + 2;
+            }
+            return Ok(None);
+        };
+        let object = decode_part_envelope(&envelope, &state.announcement.key, self.config.relay_limits)?;
+        let deadline = state.announcement.deadline;
+        self.counters.deferred_decodes = self.counters.deferred_decodes.saturating_add(1);
+        self.finish_decoded(object, envelope, MediaDatagramRole::Repair, deadline, now_us)
+            .map(Some)
+    }
+
+    /// The end of a part's assembly: the object is checked against its
+    /// announcement, the assembly becomes a completed tombstone, and the
+    /// caller gets the object and its exact envelope.
+    fn finish_decoded(
+        &mut self,
+        object: MediaObject,
+        envelope: Vec<u8>,
+        role: MediaDatagramRole,
+        deadline: MediaDeadline,
+        now_us: u64,
+    ) -> Result<RelayIngressOutcome, RelayIngressError> {
+        let kind = self
+            .objects
+            .get(object.key())
+            .map(|state| state.announcement.kind)
+            .ok_or(RelayIngressError::AnnouncementRequired)?;
+        validate_object_kind(&object, kind)?;
+        let state = self
+            .objects
+            .get(object.key())
+            .expect("decoded object has active receive state");
         // A whole audio part carries its stream's descriptor for the
         // compact parts that follow it.
         if state.announcement.kind == MediaObjectKind::Audio
@@ -1336,8 +1466,8 @@ impl RelayObjectReceiver {
         Ok(RelayIngressOutcome::Decoded {
             object: Box::new(object),
             envelope,
-            role: symbol.role,
-            deadline: symbol.deadline,
+            role,
+            deadline,
             parent_count,
             accepted_datagrams,
         })
@@ -1757,6 +1887,202 @@ fn validate_completed_symbol(
         return Err(RelayIngressError::UnauthorizedParent);
     }
     Ok(())
+}
+
+/// The assembly of a part whose decode runs off the receiver's thread
+/// (4k-repair): its source symbols in place, its repair symbols as they
+/// came. Whole from its sources, it is their bytes; short of them, a
+/// [`DecodeJob`] is made when it holds K + 1 symbols, one at a time; after
+/// a failed decode, again when it holds two more.
+#[derive(Debug)]
+struct Deferred {
+    k: u16,
+    t: u16,
+    transfer_length: u32,
+    sources: Vec<u8>,
+    have: Vec<bool>,
+    have_sources: u32,
+    repairs: Vec<Vec<u8>>,
+    held: usize,
+    submit_at: usize,
+    /// A decode of it is under way: no other until it fails.
+    in_flight: bool,
+}
+
+enum DeferredStep {
+    Pending,
+    Submit(DecodeJob),
+    Whole(Vec<u8>),
+}
+
+impl Deferred {
+    fn new(announcement: &ObjectAnnouncement) -> Self {
+        let k = announcement.coding.source_symbols();
+        let t = announcement.coding.symbol_size();
+        Self {
+            k,
+            t,
+            transfer_length: announcement.coding.transfer_length(),
+            sources: Vec::new(),
+            have: Vec::new(),
+            have_sources: 0,
+            repairs: Vec::new(),
+            held: 0,
+            submit_at: usize::from(k) + 1,
+            in_flight: false,
+        }
+    }
+
+    fn push(&mut self, fec: &[u8], key: &ObjectKey) -> Result<DeferredStep, RelayIngressError> {
+        let header = DatagramFecHeader::decode(fec).map_err(relay_session::Error::from)?;
+        let payload = header.payload(fec).map_err(relay_session::Error::from)?;
+        if payload.len() < 4 {
+            return Err(RelayIngressError::Compact("short RaptorQ payload"));
+        }
+        let esi = u32::from_be_bytes([0, payload[1], payload[2], payload[3]]);
+        let (k, t) = (usize::from(self.k), usize::from(self.t));
+        if (esi as usize) < k {
+            if self.sources.is_empty() {
+                self.sources = vec![0; k * t];
+                self.have = vec![false; k];
+            }
+            let data = &payload[4..];
+            if !self.have[esi as usize] && data.len() == t {
+                let at = esi as usize * t;
+                self.sources[at..at + t].copy_from_slice(data);
+                self.have[esi as usize] = true;
+                self.have_sources += 1;
+            }
+        } else {
+            self.repairs.push(fec.to_vec());
+        }
+        self.held += 1;
+        if self.have_sources == u32::from(self.k) {
+            let mut envelope = std::mem::take(&mut self.sources);
+            envelope.truncate(self.transfer_length as usize);
+            return Ok(DeferredStep::Whole(envelope));
+        }
+        if !self.in_flight && self.held >= self.submit_at {
+            self.in_flight = true;
+            return Ok(DeferredStep::Submit(DecodeJob {
+                key: key.clone(),
+                transfer_length: self.transfer_length,
+                k: self.k,
+                t: self.t,
+                sources: self.sources.clone(),
+                have: self.have.clone(),
+                repairs: self.repairs.clone(),
+            }));
+        }
+        Ok(DeferredStep::Pending)
+    }
+}
+
+/// A RaptorQ decode of one part, to run off the receiver's thread.
+#[derive(Debug, Clone)]
+pub struct DecodeJob {
+    key: ObjectKey,
+    transfer_length: u32,
+    k: u16,
+    t: u16,
+    sources: Vec<u8>,
+    have: Vec<bool>,
+    repairs: Vec<Vec<u8>>,
+}
+
+impl DecodeJob {
+    #[must_use]
+    pub const fn key(&self) -> &ObjectKey {
+        &self.key
+    }
+
+    #[must_use]
+    pub const fn source_symbols(&self) -> u16 {
+        self.k
+    }
+
+    /// The source symbols this node lacked (and the decode regenerates).
+    #[must_use]
+    pub fn missing_sources(&self) -> Vec<u32> {
+        (0..u32::from(self.k))
+            .filter(|esi| !self.have.get(*esi as usize).copied().unwrap_or(false))
+            .collect()
+    }
+
+    /// The part's envelope, or `None` when its symbols do not decode.
+    #[must_use]
+    pub fn run(&self) -> Option<Vec<u8>> {
+        let oti = raptorq::ObjectTransmissionInformation::new(
+            u64::from(self.transfer_length),
+            self.t,
+            1,
+            1,
+            1,
+        );
+        let mut decoder =
+            raptorq::SourceBlockDecoder::new(0, &oti, u64::from(self.transfer_length));
+        let t = usize::from(self.t);
+        let sources = self.have.iter().enumerate().filter(|(_, have)| **have).map(|(esi, _)| {
+            raptorq::EncodingPacket::new(
+                raptorq::PayloadId::new(0, esi as u32),
+                self.sources[esi * t..(esi + 1) * t].to_vec(),
+            )
+        });
+        let repairs = self.repairs.iter().filter_map(|fec| {
+            let header = DatagramFecHeader::decode(fec).ok()?;
+            let payload = header.payload(fec).ok()?;
+            Some(raptorq::EncodingPacket::deserialize(payload))
+        });
+        let mut envelope = decoder.decode(sources.chain(repairs))?;
+        envelope.truncate(self.transfer_length as usize);
+        Some(envelope)
+    }
+}
+
+/// The checks relay-session's assembler makes of a symbol, for a part
+/// assembled here.
+fn check_deferred_symbol(
+    announcement: &ObjectAnnouncement,
+    symbol: &relay_session::RelayDatagram,
+    limits: RelayLimits,
+) -> Result<(), RelayIngressError> {
+    symbol.validate(limits)?;
+    if symbol.generation != announcement.generation
+        || symbol.subscription_id != announcement.subscription_id
+        || symbol.object_key != announcement.key
+        || symbol.object_kind != announcement.kind
+        || symbol.deadline != announcement.deadline
+    {
+        return Err(RelayIngressError::ObjectIdentityConflict);
+    }
+    if symbol.coding != announcement.coding {
+        return Err(RelayIngressError::RelaySession(
+            relay_session::Error::CodingProfileConflict,
+        ));
+    }
+    Ok(())
+}
+
+/// A part's object from its envelope, bound to its announced key.
+fn decode_part_envelope(
+    envelope: &[u8],
+    key: &ObjectKey,
+    limits: RelayLimits,
+) -> Result<MediaObject, RelayIngressError> {
+    let hard = media_object::Limits::HARD;
+    let object = media_object::decode_with_limits(
+        envelope,
+        media_object::Limits {
+            max_payload_bytes: hard.max_payload_bytes.min(limits.max_protected_object_bytes),
+            max_envelope_bytes: hard.max_envelope_bytes.min(limits.max_protected_object_bytes),
+            ..hard
+        },
+    )
+    .map_err(relay_session::Error::from)?;
+    if object.key() != key {
+        return Err(RelayIngressError::ObjectIdentityConflict);
+    }
+    Ok(object)
 }
 
 fn validate_object_kind(
@@ -2922,6 +3248,60 @@ mod tests {
         assert_eq!(counters.repair_assisted_objects, 1);
         assert_eq!(counters.datagrams_rejected, 0);
         assert_eq!(counters.rejected_by_kind, RejectedByKind::default());
+    }
+
+    /// 4k-repair: a part of several symbols assembled by the receiver. Whole
+    /// from its sources it completes at once (their bytes, no RaptorQ);
+    /// short of them it makes one decode job at K + 1 symbols (none more
+    /// while it runs), whose result completes it with the exact envelope;
+    /// a failed decode lets the next two symbols make another.
+    #[test]
+    fn a_large_part_is_whole_from_its_sources_or_decoded_off_the_thread() {
+        let (mut dispatch, peers) = dispatch_with(&[ParentPath::PromotedSecondary]);
+        dispatch.receiver_mut().set_defer_decode(2);
+        let whole = fmp4_object(7, 12_000);
+        let (sources, _) = wire_symbols(&whole, FAR_DEADLINE_US, MediaPriority::VideoKey, 4);
+        let last = sources.len() - 1;
+        for (index, symbol) in sources.iter().enumerate() {
+            assert_eq!(decoded(dispatch.push(peers[0], symbol, 1_000)), index == last);
+        }
+        assert!(!dispatch.receiver().has_decode_jobs());
+
+        let damaged = fmp4_object(8, 12_000);
+        let (sources, repair) = wire_symbols(&damaged, FAR_DEADLINE_US, MediaPriority::VideoKey, 6);
+        for symbol in sources.iter().skip(2) {
+            assert!(!decoded(dispatch.push(peers[0], symbol, 1_000)));
+        }
+        // K - 2 sources: three repair make K + 1, and one job; the rest
+        // make none while it is under way.
+        for symbol in &repair {
+            assert!(!decoded(dispatch.push(peers[0], symbol, 1_100)));
+        }
+        let jobs = dispatch.receiver_mut().take_decode_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].missing_sources(), vec![0, 1]);
+        // A decode that failed lets the next symbols make another.
+        assert!(dispatch
+            .receiver_mut()
+            .complete_decode(jobs[0].key(), None, 1_200)
+            .expect("no error")
+            .is_none());
+        let envelope = jobs[0].run().expect("decodes");
+        let outcome = dispatch
+            .receiver_mut()
+            .complete_decode(jobs[0].key(), Some(envelope.clone()), 1_200)
+            .expect("reads")
+            .expect("completes");
+        match outcome {
+            RelayIngressOutcome::Decoded { object, envelope: out, .. } => {
+                assert_eq!(*object, damaged);
+                assert_eq!(out, envelope);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(is_duplicate(dispatch.push(peers[0], &sources[0], 1_300)));
+        let counters = dispatch.receiver().snapshot().counters;
+        assert_eq!((counters.deferred_decodes, counters.deferred_decode_failures), (1, 1));
     }
 
     /// A ranked parent is a third promoted session; four parents may bring

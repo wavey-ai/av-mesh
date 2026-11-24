@@ -443,6 +443,19 @@ pub(super) async fn chain_node(
             loss_report: true,
             video_socket_buffer_ms: 0,
             trim_forwarded_repair: trim,
+            trim_to_margin: std::env::var("KR_TRIM_TO_MARGIN").is_ok(),
+            // Each node's own pool (KR_DECODE_WORKERS, default 1: a
+            // 2-vCPU node's), when part repair is on.
+            decode_pool: if trim {
+                fast_plane::decode_pool::DecodePool::start(
+                    std::env::var("KR_DECODE_WORKERS")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(1),
+                )
+            } else {
+                None
+            },
             part_repair: Some(Arc::clone(&repair)),
             ..Default::default()
         },
@@ -650,6 +663,7 @@ pub(super) fn run_chain(parts: &[Part], measured: std::ops::Range<usize>, case: 
         initial_rtt_us: 50_000,
         window: fast_plane::part_repair::window_for(name),
         deadline_us: 1_000_000,
+        regenerate_sources: case.requests,
     };
     let mut links: Vec<Link> = (0..4).map(|_| Link::bind()).collect();
     let source = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -685,11 +699,15 @@ pub(super) fn run_chain(parts: &[Part], measured: std::ops::Range<usize>, case: 
     let start = Instant::now() + Duration::from_millis(100);
     let one_way = |rtt_ms: u64| Duration::from_micros(rtt_ms * 500);
     let rtts = [1, case.rtt_ms, 1, case.rtt_ms.min(30)];
+    // KR_LOSSY_LINKS (e.g. "2"): only these links (1-4) take the loss.
+    let lossy: Vec<usize> = std::env::var("KR_LOSSY_LINKS")
+        .map(|links| links.split(',').filter_map(|link| link.trim().parse().ok()).collect())
+        .unwrap_or_else(|_| vec![1, 2, 3, 4]);
     for (index, link) in links.iter_mut().enumerate() {
         link.start(
             nodes[index + 1].video_in,
             one_way(rtts[index]),
-            case.loss,
+            if lossy.contains(&(index + 1)) { case.loss } else { Loss::None },
             0x5eed_0000 + index as u64 * 7_919 + case.rtt_ms,
             start,
             // Each link's outages at their own times.
@@ -914,6 +932,7 @@ pub(super) fn bench_parts(
 #[test]
 #[ignore = "a measurement: run it alone, in release"]
 fn part_repair_chain_bench() {
+    super::video_throughput::allow_sampling();
     let seconds: u64 = std::env::var("KR_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(12);
     // "integrated": the build before 4k-repair: the contributor's repair
     // (AdaptiveFecController: 5 % of K, at most 16) forwarded as it is, no
@@ -954,23 +973,29 @@ fn part_repair_chain_bench() {
             if std::env::var("KR_DEBUG").is_ok() {
                 for ((name, _), f) in run.repair.iter().zip(&run.fast) {
                     println!(
-                        "  {name}: tee lag max {} ms, tee cpu {:.0} %, tee dropped {}, shed {}, trimmed {}, lane loss {:?}, video received {}",
+                        "  {name}: tee lag max {} ms, tee cpu {:.0} %, tee dropped {}, shed {}, trimmed {}, lane loss {:?}, video received {}, pool decodes {} ({:.0} % cpu, max {} ms, inline {}, failed {})",
                         f.video_tee_lag_max_us / 1_000,
                         f.video_tee_cpu_us as f64 / 1e4 / run.seconds,
                         f.tee_dropped,
                         f.video_tee_parts_shed,
                         f.repair_trimmed,
                         f.video_parent_loss_ppm,
-                        f.video_received
+                        f.video_received,
+                        f.decode_pool.decodes,
+                        f.decode_pool.decode_us as f64 / 1e4 / run.seconds,
+                        f.decode_pool.decode_us_max / 1_000,
+                        f.decode_pool.inline,
+                        f.decode_pool.failures
                     );
                 }
                 for (name, s) in &run.repair {
                     println!(
-                        "  {name}: asks {} retries {} whole {} gap {} recovered {} gave_up {} probes {} heard {} missing_heard {} srtt_max {} wait_max {} | asked_here {} answers {} ans_sym {} waiting {} missing {} busy {} stored {} link_parts {} link_sym {} loss_reports {} ledgers {} encode_max {}",
+                        "  {name}: asks {} retries {} whole {} gap {} recovered {} gave_up {} probes {} heard {} missing_heard {} srtt_max {} wait_max {} | asked_here {} answers {} ans_sym {} waiting {} missing {} busy {} stored {} link_parts {} link_sym {} loss_reports {} ledgers {} encode_max {} regen {}/{}",
                         s.requests, s.retries, s.whole_parts_asked, s.gap_parts, s.recovered_parts, s.gave_up_parts,
                         s.probes, s.answers_heard, s.missing_heard, s.srtt_us_max, s.repair_wait_max_us,
                         s.asks, s.answers, s.answer_symbols, s.answer_waiting, s.answer_missing, s.busy, s.stored_parts,
-                        s.link_repair_parts, s.link_repair_symbols, s.child_loss_reports, s.ledgers, s.encode_us_max
+                        s.link_repair_parts, s.link_repair_symbols, s.child_loss_reports, s.ledgers, s.encode_us_max,
+                        s.regenerated_parts, s.regenerated_symbols
                     );
                 }
             }

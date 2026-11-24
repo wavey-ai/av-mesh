@@ -1554,6 +1554,39 @@ struct Args {
     )]
     relay_trim_forwarded_repair: bool,
 
+    /// 4k-repair: a part decoded here goes, before its link repair, to the
+    /// children that take this node's sources with the source symbols it
+    /// lacked (byte for byte its source's), so that below a lossy link a
+    /// node gets whole sources and needs no decode.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_REGENERATE_SOURCES",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_regenerate_sources: bool,
+
+    /// 4k-repair: with --relay-regenerate-sources, forward source-taking
+    /// children only the trim's margin of upstream repair: below a lossy
+    /// link they wait for this node's decode and need none of their own
+    /// (less processor time at edges, a decode's time more latency on a
+    /// damaged part). Off (the default): they also get the upstream repair
+    /// of what the part lacks here, and decode as soon as they hold K.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_TRIM_TO_MARGIN",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    relay_trim_to_margin: bool,
+
+    /// 4k-repair: workers that run RaptorQ decodes of damaged parts off the
+    /// tees, at the tee's nice value (+10), unpinned. Default: the node's
+    /// CPUs less the two class threads, at least 1, at most 4 (1 on a
+    /// 2-vCPU node). 0 decodes on the tees.
+    #[arg(long, env = "NEEDLETAIL_RELAY_DECODE_WORKERS")]
+    relay_decode_workers: Option<usize>,
+
     /// Wave 7 item 5: renditions of one source, `;`-separated groups of
     /// `,`-separated stream ids (the DAW lane's FLAC, Opus and PCM from base
     /// stream 2001 are "2001,3001,4001"). A forwarder sends a rendition of a
@@ -4444,11 +4477,17 @@ async fn main() -> Result<()> {
                     initial_rtt_us: args.relay_part_repair_rtt_ms.saturating_mul(1_000),
                     window: fast_plane::part_repair::window_for(&node_id),
                     deadline_us: args.relay_media_deadline_us(),
+                    regenerate_sources: args.relay_regenerate_sources,
                 },
                 relay_session::RelayLimits::default(),
             )
         }),
         trim_forwarded_repair: args.relay_trim_forwarded_repair,
+        trim_to_margin: args.relay_trim_to_margin,
+        decode_pool: fast_plane::decode_pool::DecodePool::start(
+            args.relay_decode_workers
+                .unwrap_or_else(fast_plane::decode_pool::default_workers),
+        ),
         ..Default::default()
     };
     let fec_ingest_task = match (fec_socket, class_sockets) {
@@ -46371,6 +46410,8 @@ mod tests {
                 video_socket_buffer_ms: 0,
                 video_socket_buffer_max_bytes: 0,
                 part_repair: None,
+                decode_pool: None,
+                trim_to_margin: false,
                 trim_forwarded_repair: true,
                 test_tee_panic: Some(fast_plane::TrafficClass::Audio),
                 test_video_tee_spin_ns: 0,
