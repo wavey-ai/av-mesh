@@ -33,13 +33,16 @@
 //! [`UdpSession::hold`] for the end-of-run drain.
 
 use crate::client_compact::{
-    smoothed_loss, CompactPlan, LegId, LegLoss, LegStart, NackTiming, PathPlans, BURSTY,
-    HOLE_GIVE_UP, IP_UDP_HEADER_BYTES, MAX_LEGS, RESIDUAL_TARGET,
+    smoothed_loss, CompactPlan, LegId, LegLoss, LegStart as Expected, LegStats, NackTiming,
+    PathPlans, BURSTY, HOLE_GIVE_UP, IP_UDP_HEADER_BYTES, MAX_LEGS, RESIDUAL_TARGET,
 };
-use crate::client_director::{LegEvent, LegState, LegView, SessionLegs};
+use crate::client_director::{
+    LegEvent, LegFailure, LegKey, LegStart, LegView, SessionLegs, StartFrom,
+};
 use crate::client_udp::{
     Control, ObjectReceiver, PartObject, RepairPolicy, MAX_OTHER_LEGS, REFRESH, UNMEASURED_LOSS,
 };
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -146,6 +149,7 @@ pub struct SessionConfig {
     /// new edge serves from the part asked when it holds it (S2). Before
     /// (`false`) the holes were dropped with the old flow: a killed edge's
     /// listeners lost the parts it had not repaired (~2 a listener at 1 ms).
+    /// A leg added with [`StartFrom::OldestHole`] follows it too.
     pub move_from_hole: bool,
     /// Move when the edge does not answer the subscription in this time.
     pub answer: Duration,
@@ -176,8 +180,9 @@ pub struct SessionConfig {
     pub residual_target: f64,
     /// When a hole is given up (`--hole-give-up-ms`, [`HOLE_GIVE_UP`]).
     pub hole_give_up: Duration,
-    /// A leg with no `TOKEN` this long after its first request is passed
-    /// over (the director asks another edge; the leg goes on asking).
+    /// The token wait of a leg begun with [`UdpSession::begin`]
+    /// (`--token-ms`); a leg the director adds carries its own
+    /// ([`LegStart::token_wait`]).
     pub token_wait: Duration,
     /// A leg's first tokenless `SUB` and its first `SUB` with the token
     /// are each sent again this soon (zero: not).
@@ -232,7 +237,8 @@ impl SessionConfig {
 /// What a datagram was.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Received {
-    /// Not from a leg's edge, or before any edge.
+    /// Not from a leg's edge, from a leg the session gave up, or before
+    /// any edge.
     Ignored,
     /// A control datagram that changes nothing for the caller.
     Control,
@@ -244,20 +250,48 @@ pub enum Received {
     Move(String),
 }
 
+/// Where a leg is in its life (B 3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    /// Asked, no `TOKEN` yet.
+    Asking,
+    /// The edge gave its token; no `OK` yet.
+    Tokened,
+    /// The edge answered `OK`: it serves the leg.
+    Live,
+    /// The edge sent `MOVE`: it still serves the leg until it is released
+    /// or the edge's grace ends.
+    Leaving,
+    /// The session gave the leg up (or the edge refused it): nothing more
+    /// is taken from it, and it stays until it is released.
+    Failed,
+}
+
 /// One leg: what the session keeps for its subscription at one edge.
 #[derive(Debug)]
 struct Leg {
+    /// The director's name for it.
+    key: LegKey,
+    /// Its slot, in the session and in the receiver.
     id: LegId,
     /// The edge's node id ("" for a leg begun without one).
     node: String,
     target: SocketAddr,
-    state: LegState,
+    state: State,
     /// The reason of the edge's `MOVE`, while leaving.
     leaving: Option<String>,
+    /// Why the leg failed, as [`UdpSession::poll`] reports it.
+    failure: Option<String>,
     added_at: Instant,
+    /// The edge's first `OK`, and when the leg was reported live (its `OK`
+    /// and its first media had come).
+    ok_at: Option<Instant>,
     live_at: Option<Instant>,
     token: Option<u64>,
     token_at: Option<Instant>,
+    /// With no `TOKEN` this long after its first request the leg is passed
+    /// over.
+    token_wait: Duration,
     /// The part the first requests name (until the edge sends parts).
     from_part: Option<u64>,
     /// The edge has sent a part (or a repair datagram) since the request:
@@ -265,7 +299,9 @@ struct Leg {
     /// `from_part` (an edge that has admitted the client would go back to
     /// it and send those parts again; wave 9 review).
     media_here: bool,
+    /// The part its edge's `OK` named, and the first part it brought.
     first_part: Option<u64>,
+    first_brought: Option<u64>,
     /// The first request, for the answer wait and the token wait.
     asked_at: Instant,
     /// The first copy of the request now unanswered (its answer measures a
@@ -285,7 +321,11 @@ struct Leg {
     /// round trip of it, before its `OK`, is ignored).
     takeback_at: Option<Instant>,
     rtt: Option<Duration>,
+    /// The last datagram of any kind (from when the leg was added, for the
+    /// timers), and whether one came at all.
     last_datagram: Instant,
+    heard_at: Option<Instant>,
+    first_media: Option<Instant>,
     last_media: Option<Instant>,
     /// When a datagram of this leg last delivered a part first.
     last_first: Option<Instant>,
@@ -293,9 +333,6 @@ struct Leg {
     passed_over: bool,
     hedge_due: bool,
     suspect: bool,
-    steady: bool,
-    /// The legs it was reported level with (bits by slot).
-    level_with: u8,
     /// The delivering legs that its last `SUB` named in `o=` (bits by slot).
     others_sent: u8,
     // The compact lane at this edge.
@@ -328,21 +365,27 @@ struct Leg {
 
 impl Leg {
     fn is_live(&self) -> bool {
-        matches!(self.state, LegState::Live | LegState::Leaving)
+        matches!(self.state, State::Live | State::Leaving)
     }
 
-    /// Counted in the plans: live, not leaving, not suspect.
+    fn is_failed(&self) -> bool {
+        self.state == State::Failed
+    }
+
+    /// Counted in the plans: live (its `OK` and media came), not leaving,
+    /// not suspect.
     fn is_counted(&self) -> bool {
-        self.state == LegState::Live && !self.suspect
+        self.state == State::Live && self.live_at.is_some() && !self.suspect
     }
 
     fn bit(&self) -> u8 {
         1 << self.id.index()
     }
 
-    /// Its last media, or when it went live (or was added) if none came.
+    /// Its last media, or when its edge answered (or it was added) if none
+    /// came.
     fn media_since(&self) -> Instant {
-        self.last_media.or(self.live_at).unwrap_or(self.added_at)
+        self.last_media.or(self.ok_at).unwrap_or(self.added_at)
     }
 }
 
@@ -394,6 +437,32 @@ struct Released {
     answered_at: Option<Instant>,
 }
 
+/// What the client's report keeps of one leg (B 2.8): read it before the
+/// leg is released.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LegReport {
+    pub node: String,
+    pub target: SocketAddr,
+    /// The part its edge's `OK` named, else the first part it brought.
+    pub first_part: Option<u64>,
+    /// Its edge serves the compact lane.
+    pub compact: bool,
+    pub rtt: Option<Duration>,
+    /// Its median lag behind the first arrival (see [`LegView::lag`]).
+    pub lag: Option<Duration>,
+    /// Its smoothed datagram loss, and the plan it asks for.
+    pub loss: Option<f64>,
+    pub plan: CompactPlan,
+    /// Media datagrams from its edge, their bytes on the wire, and the
+    /// longest time between two of them.
+    pub datagrams: u64,
+    pub wire_bytes: u64,
+    pub longest_gap: Duration,
+    /// Its compact datagrams, first arrivals, duplicates and parts below
+    /// the session's first part.
+    pub stats: LegStats,
+}
+
 /// One listener's subscription to a stream, held as one or more legs. See
 /// the module's documentation.
 #[derive(Debug)]
@@ -402,7 +471,10 @@ pub struct UdpSession {
     pub receiver: ObjectReceiver,
     legs: [Option<Leg>; MAX_LEGS],
     released: Vec<Released>,
-    events: Vec<LegEvent>,
+    events: VecDeque<LegEvent>,
+    /// The key of the next leg begun with [`Self::begin`] (counting down,
+    /// apart from the director's).
+    next_own_key: u32,
     /// The largest loss measured in one check, and the largest mean burst
     /// (any leg).
     pub loss_max: Option<f64>,
@@ -446,23 +518,23 @@ pub struct UdpSession {
     joint_estimate: Option<f64>,
     joint_burst: Option<f64>,
     /// Every leg went silent and no media came since: the longer silence
-    /// applies, and the next report is due then.
+    /// applies, and the next report is due then. `silent_for`: the silence
+    /// of the last report.
     all_silent: bool,
     next_all_silent: Option<Instant>,
+    silent_for: Duration,
     next_loss_check: Instant,
-    next_judge: Instant,
     /// When the timers last ran: a verdict whose time is not after it was
     /// judged then, and [`Self::next_wake`] does not wake for it again.
     polled_at: Instant,
     pending: Option<PartObject>,
     /// The lanes of the last 16 parts a datagram delivered (bit set: a
-    /// RaptorQ object).
+    /// RaptorQ object), and whether [`LegEvent::ObjectLane`] went.
     raptorq_recent: u16,
     delivered_recent: u8,
+    object_lane: bool,
 }
 
-/// The legs judged steady or level this often while one awaits it.
-const JUDGE_EVERY: Duration = Duration::from_millis(4);
 /// A released leg's second `UNSUB` goes this long after the first.
 const SECOND_UNSUB_AFTER: Duration = Duration::from_millis(20);
 /// A datagram from a released edge is answered with `UNSUB` for this long,
@@ -496,7 +568,8 @@ impl UdpSession {
             receiver,
             legs: Default::default(),
             released: Vec::new(),
-            events: Vec::new(),
+            events: VecDeque::new(),
+            next_own_key: u32::MAX,
             loss_max: None,
             burst_max: None,
             repair_changes: 0,
@@ -519,12 +592,13 @@ impl UdpSession {
             joint_burst: None,
             all_silent: false,
             next_all_silent: None,
+            silent_for: config.silence,
             next_loss_check: now + LOSS_CHECK,
-            next_judge: now,
             polled_at: now,
             pending: None,
             raptorq_recent: 0,
             delivered_recent: 0,
+            object_lane: false,
         }
     }
 
@@ -532,16 +606,28 @@ impl UdpSession {
         self.legs.iter().flatten()
     }
 
-    fn leg(&self, leg: LegId) -> Option<&Leg> {
-        self.legs[leg.index()].as_ref()
+    /// The legs not given up.
+    fn held(&self) -> impl Iterator<Item = &Leg> {
+        self.legs_iter().filter(|leg| !leg.is_failed())
+    }
+
+    /// The slot of the leg named `key`.
+    fn slot(&self, key: LegKey) -> Option<usize> {
+        self.legs
+            .iter()
+            .position(|leg| leg.as_ref().is_some_and(|leg| leg.key == key))
+    }
+
+    fn by_key(&self, key: LegKey) -> Option<&Leg> {
+        self.slot(key).and_then(|index| self.legs[index].as_ref())
     }
 
     /// The leg whose plan and repair the caller reports: the repair leg
     /// (the counted leg live longest), else the first leg held.
     fn main_leg(&self) -> Option<&Leg> {
         self.repair_leg()
-            .and_then(|leg| self.leg(leg))
-            .or_else(|| self.legs_iter().next())
+            .and_then(|leg| self.legs[leg.index()].as_ref())
+            .or_else(|| self.held().next())
     }
 
     /// The counted leg that has been live longest: it alone is asked for
@@ -590,6 +676,25 @@ impl UdpSession {
         self.legs_iter().any(Leg::is_live)
     }
 
+    /// What the client's report keeps of a leg.
+    pub fn leg_report(&self, key: LegKey) -> Option<LegReport> {
+        let leg = self.by_key(key)?;
+        Some(LegReport {
+            node: leg.node.clone(),
+            target: leg.target,
+            first_part: leg.first_part.or(leg.first_brought),
+            compact: leg.compact_confirmed,
+            rtt: leg.rtt,
+            lag: self.receiver.compact.leg_lag(leg.id),
+            loss: leg.loss_estimate,
+            plan: leg.plan,
+            datagrams: leg.datagrams,
+            wire_bytes: leg.wire_bytes,
+            longest_gap: leg.longest_gap,
+            stats: self.receiver.compact.leg_stats(leg.id),
+        })
+    }
+
     /// The plan a new leg starts on: beside another leg `C0.32.0`; alone,
     /// the plan for an unmeasured path (B X3).
     fn start_plan(&self, beside: bool) -> CompactPlan {
@@ -611,18 +716,20 @@ impl UdpSession {
         plan.with_short_header(self.short_header)
     }
 
-    /// The delivering legs (bits by slot): live or leaving, not suspect,
-    /// media within max(20 ms, 8 part intervals).
+    /// Whether a leg delivers now: live or leaving, and it brought a
+    /// datagram of the stream (a first arrival, a duplicate or a row)
+    /// within max(20 ms, 8 part intervals).
+    fn delivers(&self, leg: &Leg, now: Instant) -> bool {
+        leg.is_live()
+            && leg
+                .last_media
+                .is_some_and(|at| now.saturating_duration_since(at) <= self.suspect_after())
+    }
+
+    /// The delivering legs (bits by slot).
     fn delivering_mask(&self, now: Instant) -> u8 {
-        let window = self.suspect_after();
         self.legs_iter()
-            .filter(|leg| {
-                leg.is_live()
-                    && !leg.suspect
-                    && leg
-                        .last_media
-                        .is_some_and(|at| now.saturating_duration_since(at) <= window)
-            })
+            .filter(|leg| self.delivers(leg, now))
             .fold(0, |mask, leg| mask | leg.bit())
     }
 
@@ -686,20 +793,49 @@ impl UdpSession {
         send(target, &Control::Unsubscribe { stream_id, token }.encode());
     }
 
-    /// Open a leg at `target` and send its first request (see
+    /// The part a new leg asks its edge to start from (see [`StartFrom`]).
+    fn start_from(&self, from: StartFrom) -> Option<u64> {
+        let newest = self.receiver.compact.newest();
+        let after = newest.map(|newest| newest + 1);
+        match from {
+            StartFrom::AfterNewest => after,
+            StartFrom::OldestHole => match (self.receiver.compact.lowest_hole(), newest) {
+                (Some(hole), Some(newest))
+                    if self.config.move_from_hole
+                        && hole < newest
+                        && newest - hole <= MOVE_HOLE_PARTS =>
+                {
+                    Some(hole)
+                }
+                _ => after,
+            },
+        }
+    }
+
+    /// Open the leg `key` at `target` and send its first request (see
     /// [`SessionLegs::add_leg`]).
+    #[allow(clippy::too_many_arguments)]
     fn open_leg(
         &mut self,
+        key: LegKey,
         node: &str,
         target: SocketAddr,
         from_part: Option<u64>,
         token: Option<u64>,
+        token_wait: Duration,
         measured: Option<PathMeasure>,
         now: Instant,
         send: &mut dyn FnMut(SocketAddr, &[u8]),
-    ) -> Option<LegId> {
-        let beside = self.legs_iter().next().is_some();
-        let id = self.receiver.open_leg()?;
+    ) {
+        if self.slot(key).is_some() {
+            return;
+        }
+        let beside = self.held().next().is_some();
+        let Some(id) = self.receiver.open_leg() else {
+            return;
+        };
+        // The edge's datagrams are this leg's now: no more UNSUB to them.
+        self.released.retain(|released| released.target != target);
         // A leg beside another starts on the plan of two legs; so do the
         // legs that have not measured their path yet (a join adds two).
         let start = self.start_plan(beside);
@@ -719,22 +855,27 @@ impl UdpSession {
             RepairPolicy::for_loss(UNMEASURED_LOSS, base_repair)
         };
         self.legs[id.index()] = Some(Leg {
+            key,
             id,
             node: node.to_owned(),
             target,
             state: if token.is_some() {
-                LegState::Tokened
+                State::Tokened
             } else {
-                LegState::Asking
+                State::Asking
             },
             leaving: None,
+            failure: None,
             added_at: now,
+            ok_at: None,
             live_at: None,
             token,
             token_at: token.map(|_| now),
+            token_wait,
             from_part,
             media_here: false,
             first_part: None,
+            first_brought: None,
             asked_at: now,
             request_sent_at: now,
             unanswered: 1,
@@ -744,14 +885,14 @@ impl UdpSession {
             takeback_at: None,
             rtt: None,
             last_datagram: now,
+            heard_at: None,
+            first_media: None,
             last_media: None,
             last_first: None,
             next_refresh: now,
             passed_over: false,
             hedge_due: false,
             suspect: false,
-            steady: false,
-            level_with: 0,
             others_sent: 0,
             compact_asked,
             compact_confirmed: false,
@@ -784,28 +925,28 @@ impl UdpSession {
         self.edges += 1;
         self.send_subscribe(id, from_part, token.is_none(), false, now, send);
         let double = self.config.first_double;
-        let wait = unanswered_wait(&self.config, self.leg(id).expect("the leg opened"));
         let leg = self.legs[id.index()].as_mut().expect("the leg opened");
         leg.double_at = (!double.is_zero()).then(|| now + double);
-        leg.next_refresh = now + wait;
+        leg.next_refresh = now + unanswered_wait(&self.config, leg);
         self.sync_nack(id);
-        Some(id)
     }
 
     /// Let a leg go: `UNSUB` now (and again in 20 ms, when `twice`), and its
     /// edge's datagrams answered with `UNSUB` for a while.
     fn drop_leg(
         &mut self,
-        leg: LegId,
+        index: usize,
         twice: bool,
         now: Instant,
         send: &mut dyn FnMut(SocketAddr, &[u8]),
-    ) -> Option<Leg> {
-        let state = self.legs[leg.index()].take()?;
+    ) {
+        let Some(state) = self.legs[index].take() else {
+            return;
+        };
         if let Some(token) = state.token {
             Self::unsubscribe(self.config.stream_id, state.target, token, send);
         }
-        self.receiver.close_leg(leg);
+        self.receiver.close_leg(state.id);
         self.released
             .retain(|released| released.target != state.target);
         self.released.push(Released {
@@ -815,30 +956,27 @@ impl UdpSession {
             second_unsub: (twice && state.token.is_some()).then(|| now + SECOND_UNSUB_AFTER),
             answered_at: None,
         });
-        Some(state)
     }
 
-    /// A leg failed: it is let go and reported.
-    fn fail_leg(
-        &mut self,
-        leg: LegId,
-        reason: String,
-        now: Instant,
-        send: &mut dyn FnMut(SocketAddr, &[u8]),
-    ) {
-        if let Some(state) = self.drop_leg(leg, false, now, send) {
-            self.events.push(LegEvent::Failed {
-                leg,
-                node: state.node,
-                reason,
-            });
-        }
+    /// The session gives a leg up (or its edge refused it): nothing more is
+    /// taken from it, and `event` reports it. The leg stays, holding its
+    /// slot, until it is released.
+    fn stop_leg(&mut self, index: usize, event: LegEvent, reason: String) {
+        let Some(leg) = self.legs[index].as_mut().filter(|leg| !leg.is_failed()) else {
+            return;
+        };
+        leg.state = State::Failed;
+        leg.failure = Some(reason);
+        leg.double_at = None;
+        let id = leg.id;
+        self.receiver.compact.set_leg_nack(id, false);
+        self.events.push_back(event);
     }
 
     /// Whether the receiver NACKs on a leg: its edge gave the token and
     /// serves it the compact lane.
     fn sync_nack(&mut self, leg: LegId) {
-        let nack = self.leg(leg).is_some_and(|state| {
+        let nack = self.legs[leg.index()].as_ref().is_some_and(|state| {
             state.token.is_some() && state.compact_confirmed && state.is_live()
         });
         self.receiver.compact.set_leg_nack(leg, nack);
@@ -879,14 +1017,17 @@ impl UdpSession {
             plan: leg.plan,
         });
         for index in 0..MAX_LEGS {
-            if self.legs[index].is_some() {
-                self.drop_leg(LegId::from_index(index), false, now, send);
-            }
+            self.drop_leg(index, false, now, send);
         }
         // What the legs let go reported is the caller's to act on now.
         self.events.clear();
         self.pending = None;
-        self.open_leg("", target, from_part, None, measured, now, send);
+        let key = LegKey(self.next_own_key);
+        self.next_own_key -= 1;
+        let token_wait = self.config.token_wait;
+        self.open_leg(
+            key, "", target, from_part, None, token_wait, measured, now, send,
+        );
     }
 
     /// Leave every leg's edge (`UNSUB`), at the end of a run. The legs are
@@ -897,7 +1038,9 @@ impl UdpSession {
                 if let Some(token) = leg.token.take() {
                     Self::unsubscribe(self.config.stream_id, leg.target, token, send);
                 }
-                leg.state = LegState::Asking;
+                if !leg.is_failed() {
+                    leg.state = State::Asking;
+                }
             }
             self.receiver
                 .compact
@@ -906,8 +1049,8 @@ impl UdpSession {
     }
 
     /// The timers, for a caller that holds one leg and moves itself: as
-    /// [`SessionLegs::poll_legs`], and the reason to move if its leg failed
-    /// or went silent.
+    /// [`Self::poll_legs`], and the reason to move if its leg failed or
+    /// went silent.
     pub fn poll(
         &mut self,
         now: Instant,
@@ -915,15 +1058,42 @@ impl UdpSession {
     ) -> Option<String> {
         self.poll_legs(now, send);
         let mut reason = None;
-        for event in self.events.drain(..) {
+        while let Some(event) = self.events.pop_front() {
             let found = match event {
-                LegEvent::Failed { reason, .. } => reason,
-                LegEvent::AllSilent { silence } => format!("silence-{}ms", silence.as_millis()),
+                LegEvent::Failed { leg, cause } => self
+                    .by_key(leg)
+                    .and_then(|leg| leg.failure.clone())
+                    .unwrap_or_else(|| cause.reason().to_owned()),
+                LegEvent::AllSilent => format!("silence-{}ms", self.silent_for.as_millis()),
                 _ => continue,
             };
             reason.get_or_insert(found);
         }
         reason
+    }
+
+    /// The timers of every leg: requests, refreshes, NACKs, loss checks and
+    /// the verdicts of B 3.2. What they found comes out of
+    /// [`SessionLegs::next_event`]. Run it when [`Self::next_wake`] comes.
+    pub fn poll_legs(&mut self, now: Instant, send: &mut dyn FnMut(SocketAddr, &[u8])) {
+        let stream_id = self.config.stream_id;
+        self.released.retain_mut(|released| {
+            if let (Some(at), Some(token)) = (released.second_unsub, released.token) {
+                if now >= at {
+                    released.second_unsub = None;
+                    Self::unsubscribe(stream_id, released.target, token, send);
+                }
+            }
+            now < released.until
+        });
+        self.judge_legs(now);
+        if now >= self.next_loss_check {
+            self.next_loss_check = now + LOSS_CHECK;
+            self.check_loss(now);
+        }
+        self.send_nacks(now, send);
+        self.refresh_legs(now, send);
+        self.polled_at = now;
     }
 
     /// The silence after which every leg counts as silent (see
@@ -949,19 +1119,26 @@ impl UdpSession {
 
     /// The verdicts on each leg (B 3.2): the answer and token waits, and,
     /// on an empty socket, suspect, hedged, dead and every leg silent.
-    fn judge_legs(&mut self, now: Instant, send: &mut dyn FnMut(SocketAddr, &[u8])) {
+    fn judge_legs(&mut self, now: Instant) {
         let config = self.config;
-        let mut failed: Vec<(LegId, String)> = Vec::new();
-        for leg in self.legs.iter_mut().flatten() {
-            if leg.is_live() {
+        let mut failed: Vec<(usize, LegFailure, String)> = Vec::new();
+        for (index, leg) in self.legs.iter_mut().enumerate() {
+            let Some(leg) = leg
+                .as_mut()
+                .filter(|leg| !leg.is_live() && !leg.is_failed())
+            else {
                 continue;
-            }
+            };
             let waited = now.saturating_duration_since(leg.asked_at);
             if !self.hold && waited > config.answer {
-                failed.push((leg.id, format!("no-answer-{}ms", config.answer.as_millis())));
-            } else if leg.token.is_none() && !leg.passed_over && waited >= config.token_wait {
+                failed.push((
+                    index,
+                    LegFailure::NoAnswer,
+                    format!("no-answer-{}ms", config.answer.as_millis()),
+                ));
+            } else if leg.token.is_none() && !leg.passed_over && waited >= leg.token_wait {
                 leg.passed_over = true;
-                self.events.push(LegEvent::PassedOver { leg: leg.id });
+                self.events.push_back(LegEvent::NoToken(leg.key));
             }
         }
         if !self.hold && !self.queued {
@@ -971,7 +1148,7 @@ impl UdpSession {
                 let Some(leg) = self.legs[index].as_ref().filter(|leg| leg.is_live()) else {
                     continue;
                 };
-                let id = leg.id;
+                let (id, key) = (leg.id, leg.key);
                 let quiet = now.saturating_duration_since(leg.last_datagram);
                 let no_media = now.saturating_duration_since(leg.media_since());
                 let here = self.receiver.compact.leg_highest(id);
@@ -999,11 +1176,13 @@ impl UdpSession {
                 // Dead: silent while another leg sends, or without media
                 // while another delivers.
                 if quiet >= config.silence && other_datagram {
-                    failed.push((id, format!("silence-{}ms", config.silence.as_millis())));
+                    let reason = format!("silence-{}ms", config.silence.as_millis());
+                    failed.push((index, LegFailure::Dead, reason));
                     continue;
                 }
                 if no_media >= config.silence && other_delivers {
-                    failed.push((id, format!("behind-{}ms", config.silence.as_millis())));
+                    let reason = format!("behind-{}ms", config.silence.as_millis());
+                    failed.push((index, LegFailure::Dead, reason));
                     continue;
                 }
                 let suspect = !leg.suspect && ahead && no_media >= suspect_after;
@@ -1016,11 +1195,10 @@ impl UdpSession {
                 let leg = self.legs[index].as_mut().expect("a live leg");
                 if suspect {
                     leg.suspect = true;
-                    self.events.push(LegEvent::Suspect { leg: id });
                 }
                 if hedge {
                     leg.hedge_due = true;
-                    self.events.push(LegEvent::HedgeDue { leg: id });
+                    self.events.push_back(LegEvent::HedgeDue(key));
                 }
                 if suspect {
                     // The plans without it, at once.
@@ -1038,19 +1216,22 @@ impl UdpSession {
                     .all(|leg| now.saturating_duration_since(leg.last_datagram) > silence)
             {
                 self.all_silent = true;
+                self.silent_for = silence;
                 self.next_all_silent = Some(now + config.silence.max(config.silence_repeat));
-                self.events.push(LegEvent::AllSilent { silence });
+                self.events.push_back(LegEvent::AllSilent);
             }
         }
-        for (leg, reason) in failed {
-            self.fail_leg(leg, reason, now, send);
+        for (index, cause, reason) in failed {
+            if let Some(key) = self.legs[index].as_ref().map(|leg| leg.key) {
+                self.stop_leg(index, LegEvent::Failed { leg: key, cause }, reason);
+            }
         }
     }
 
     /// The loss check of every leg: their repair, and the plans.
     fn check_loss(&mut self, now: Instant) {
         for index in 0..MAX_LEGS {
-            let Some(leg) = self.legs[index].as_ref() else {
+            let Some(leg) = self.legs[index].as_ref().filter(|leg| !leg.is_failed()) else {
                 continue;
             };
             let id = leg.id;
@@ -1209,7 +1390,7 @@ impl UdpSession {
         let config = self.config;
         let delivering = self.delivering_mask(now);
         for index in 0..MAX_LEGS {
-            let Some(leg) = self.legs[index].as_ref() else {
+            let Some(leg) = self.legs[index].as_ref().filter(|leg| !leg.is_failed()) else {
                 continue;
             };
             let id = leg.id;
@@ -1313,7 +1494,7 @@ impl UdpSession {
             self.queued_since = None;
             true
         };
-        if !drained || !self.legs_iter().any(|leg| leg.compact_confirmed) {
+        if !drained || !self.held().any(|leg| leg.compact_confirmed) {
             return;
         }
         let mut due = self.receiver.nacks_due(now);
@@ -1335,51 +1516,7 @@ impl UdpSession {
         }
     }
 
-    /// The legs' steadiness, and the new legs level with leaving ones.
-    fn judge_steady(&mut self, now: Instant) {
-        if now < self.next_judge {
-            return;
-        }
-        self.next_judge = now + JUDGE_EVERY;
-        for index in 0..MAX_LEGS {
-            let Some(leg) = self.legs[index].as_ref() else {
-                continue;
-            };
-            if !leg.is_live() {
-                continue;
-            }
-            let id = leg.id;
-            let steady = self.receiver.compact.steady(id);
-            let mut level = 0_u8;
-            if leg.leaving.is_none() && steady {
-                for old in self.legs_iter() {
-                    if old.leaving.is_some()
-                        && old.id != id
-                        && leg.level_with & old.bit() == 0
-                        && self.receiver.compact.level(id, old.id)
-                    {
-                        level |= old.bit();
-                    }
-                }
-            }
-            let leg = self.legs[index].as_mut().expect("a live leg");
-            if steady && !leg.steady {
-                self.events.push(LegEvent::Steady { leg: id });
-            }
-            leg.steady = steady;
-            leg.level_with |= level;
-            for with in 0..MAX_LEGS {
-                if level & (1 << with) != 0 {
-                    self.events.push(LegEvent::Level {
-                        leg: id,
-                        with: LegId::from_index(with),
-                    });
-                }
-            }
-        }
-    }
-
-    /// When [`Self::poll`] wants to run next.
+    /// When [`Self::poll_legs`] wants to run next.
     pub fn next_wake(&self) -> Instant {
         let mut wake = self.next_loss_check;
         // A verdict's time that the last poll judged already is not woken
@@ -1400,7 +1537,7 @@ impl UdpSession {
         let suspect_after = self.suspect_after();
         let live = self.legs_iter().filter(|leg| leg.is_live()).count();
         let mut last_datagram: Option<Instant> = None;
-        for leg in self.legs_iter() {
+        for leg in self.held() {
             wake = wake.min(leg.next_refresh);
             if let Some(at) = leg.double_at {
                 wake = wake.min(at);
@@ -1411,7 +1548,7 @@ impl UdpSession {
                     verdict(&mut wake, leg.asked_at + self.config.answer + ms);
                 }
                 if leg.token.is_none() && !leg.passed_over {
-                    verdict(&mut wake, leg.asked_at + self.config.token_wait);
+                    verdict(&mut wake, leg.asked_at + leg.token_wait);
                 }
                 continue;
             }
@@ -1438,14 +1575,7 @@ impl UdpSession {
             let at = (last + self.silence() + ms).max(self.next_all_silent.unwrap_or(last));
             verdict(&mut wake, at);
         }
-        if live > 1
-            && self
-                .legs_iter()
-                .any(|leg| leg.is_live() && (!leg.steady || leg.leaving.is_some()))
-        {
-            wake = wake.min(self.next_judge);
-        }
-        if self.legs_iter().any(|leg| leg.compact_confirmed) {
+        if self.held().any(|leg| leg.compact_confirmed) {
             if let Some(at) = self.receiver.compact.next_nack_at() {
                 wake = wake.min(at);
             }
@@ -1456,9 +1586,13 @@ impl UdpSession {
     /// Which leg a datagram from `peer` is for: the leg whose edge is
     /// exactly `peer`, else (unless `peer` is an edge let go) the only leg
     /// at that address (B 3.1).
-    fn attribute(&self, peer: SocketAddr, now: Instant) -> Option<LegId> {
-        if let Some(leg) = self.legs_iter().find(|leg| leg.target == peer) {
-            return Some(leg.id);
+    fn attribute(&self, peer: SocketAddr, now: Instant) -> Option<usize> {
+        if let Some(index) = self
+            .legs
+            .iter()
+            .position(|leg| leg.as_ref().is_some_and(|leg| leg.target == peer))
+        {
+            return Some(index);
         }
         if self
             .released
@@ -1469,7 +1603,7 @@ impl UdpSession {
         }
         let mut same_ip = self.legs_iter().filter(|leg| leg.target.ip() == peer.ip());
         match (same_ip.next(), same_ip.next()) {
-            (Some(leg), None) => Some(leg.id),
+            (Some(leg), None) => Some(leg.id.index()),
             _ => None,
         }
     }
@@ -1482,7 +1616,7 @@ impl UdpSession {
         now: Instant,
         send: &mut dyn FnMut(SocketAddr, &[u8]),
     ) -> Received {
-        let Some(id) = self.attribute(peer, now) else {
+        let Some(index) = self.attribute(peer, now) else {
             // An edge let go in the last 10 s that still sends: UNSUB again.
             let exact = self.released.iter().any(|released| released.target == peer);
             if let Some(released) = self.released.iter_mut().find(|released| {
@@ -1500,11 +1634,16 @@ impl UdpSession {
             }
             return Received::Ignored;
         };
-        let index = id.index();
         let leg = self.legs[index].as_mut().expect("an attributed leg");
+        if leg.is_failed() {
+            // Given up: it stays only until the director releases it.
+            return Received::Ignored;
+        }
+        let (id, key) = (leg.id, leg.key);
         leg.last_datagram = now;
+        leg.heard_at = Some(now);
         let Some(control) = Control::decode(datagram) else {
-            return self.on_media(id, datagram, now);
+            return self.on_media(index, datagram, now);
         };
         match control {
             Control::Token { token: given, .. } => {
@@ -1524,13 +1663,12 @@ impl UdpSession {
                 }
                 let first = leg.token.is_none();
                 leg.token = Some(given);
-                if leg.state == LegState::Asking {
-                    leg.state = LegState::Tokened;
+                if leg.state == State::Asking {
+                    leg.state = State::Tokened;
                 }
-                self.events.push(LegEvent::Tokened {
-                    leg: id,
-                    token: given,
-                });
+                if first {
+                    self.events.push_back(LegEvent::Tokened(key));
+                }
                 let leg = self.legs[index].as_mut().expect("an attributed leg");
                 let from = leg.from_part.filter(|_| !leg.media_here);
                 let live = leg.is_live();
@@ -1552,7 +1690,7 @@ impl UdpSession {
             }
             Control::Subscribed {
                 next_part, compact, ..
-            } => self.on_subscribed(id, next_part, compact, now, send),
+            } => self.on_subscribed(index, next_part, compact, now),
             Control::Move { reason, .. } => {
                 // A MOVE within a round trip of a take-back, before its OK,
                 // answers the SUB before it.
@@ -1562,25 +1700,33 @@ impl UdpSession {
                     return Received::Control;
                 }
                 leg.takeback_at = None;
-                self.sample_refresh(id, now);
+                self.sample_refresh(index, now);
                 let leg = self.legs[index].as_mut().expect("an attributed leg");
                 if !leg.is_live() {
                     // The edge refuses a leg it never served.
-                    self.fail_leg(id, reason.clone(), now, send);
+                    let refused = LegEvent::Refused {
+                        leg: key,
+                        reason: reason.clone(),
+                    };
+                    self.stop_leg(index, refused, reason.clone());
                     return Received::Move(reason);
                 }
                 if leg.leaving.as_deref() != Some(reason.as_str()) {
-                    leg.state = LegState::Leaving;
+                    leg.state = State::Leaving;
                     leg.leaving = Some(reason.clone());
-                    self.events.push(LegEvent::Moved {
-                        leg: id,
+                    self.events.push_back(LegEvent::Moved {
+                        leg: key,
                         reason: reason.clone(),
                     });
                 }
                 Received::Move(reason)
             }
             Control::Refused { reason, .. } => {
-                self.fail_leg(id, reason.clone(), now, send);
+                let refused = LegEvent::Refused {
+                    leg: key,
+                    reason: reason.clone(),
+                };
+                self.stop_leg(index, refused, reason.clone());
                 Received::Move(reason)
             }
             _ => Received::Control,
@@ -1588,27 +1734,41 @@ impl UdpSession {
     }
 
     /// A refresh answered: a round trip, if nothing else was outstanding.
-    fn sample_refresh(&mut self, leg: LegId, now: Instant) {
-        let Some(state) = self.legs[leg.index()].as_mut() else {
+    fn sample_refresh(&mut self, index: usize, now: Instant) {
+        let Some(state) = self.legs[index].as_mut() else {
             return;
         };
         if let Some(sent) = state.refresh_sent_at.take() {
             let rtt = now.saturating_duration_since(sent);
             state.rtt = Some(state.rtt.map_or(rtt, |previous| (previous * 7 + rtt) / 8));
-            self.receiver.compact.set_leg_rtt(leg, rtt);
+            self.receiver.compact.set_leg_rtt(state.id, rtt);
         }
+    }
+
+    /// The leg's `OK` and its first media have both come: it is live.
+    fn report_live(&mut self, index: usize, now: Instant) {
+        let Some(leg) = self.legs[index]
+            .as_mut()
+            .filter(|leg| leg.is_live() && leg.live_at.is_none() && leg.media_here)
+        else {
+            return;
+        };
+        leg.live_at = Some(now);
+        self.events.push_back(LegEvent::Live {
+            leg: leg.key,
+            compact: leg.compact_confirmed,
+        });
     }
 
     fn on_subscribed(
         &mut self,
-        id: LegId,
+        index: usize,
         next_part: u64,
         compact: bool,
         now: Instant,
-        send: &mut dyn FnMut(SocketAddr, &[u8]),
     ) -> Received {
-        let index = id.index();
         let leg = self.legs[index].as_mut().expect("an attributed leg");
+        let (id, key) = (leg.id, leg.key);
         // An edge older than the short form refuses a plan word with it
         // (C...7) and serves the RaptorQ lane: asked again at once with the
         // long form (wave 7 review). An edge that refuses the lane for
@@ -1624,14 +1784,13 @@ impl UdpSession {
             return Received::Control;
         }
         let first = !leg.is_live() && leg.first_part.is_none();
-        if leg.takeback_at.take().is_some() && leg.state == LegState::Leaving {
-            leg.state = LegState::Live;
+        if leg.takeback_at.take().is_some() && leg.state == State::Leaving {
+            leg.state = State::Live;
             leg.leaving = None;
-            leg.level_with = 0;
-            self.events.push(LegEvent::TakenBack { leg: id });
+            self.events.push_back(LegEvent::TakenBack(key));
         }
         if !first {
-            self.sample_refresh(id, now);
+            self.sample_refresh(index, now);
         }
         let leg = self.legs[index].as_mut().expect("an attributed leg");
         if first {
@@ -1648,31 +1807,39 @@ impl UdpSession {
                 .receiver
                 .expect(id, self.config.stream_id, next_part, compact)
             {
-                LegStart::Started => {}
-                LegStart::Stale => {
+                Expected::Started => {}
+                Expected::Stale => {
                     self.stale_starts += 1;
-                    self.fail_leg(id, "stale-start".to_owned(), now, send);
+                    let stale = LegEvent::Failed {
+                        leg: key,
+                        cause: LegFailure::Stale,
+                    };
+                    self.stop_leg(index, stale, LegFailure::Stale.reason().to_owned());
                     return Received::Control;
                 }
-                LegStart::Displaces(stale) => {
+                Expected::Displaces(stale) => {
                     self.stale_starts += 1;
-                    self.fail_leg(stale, "stale-start".to_owned(), now, send);
+                    if let Some(stale_key) = self.legs[stale.index()].as_ref().map(|leg| leg.key) {
+                        let event = LegEvent::Failed {
+                            leg: stale_key,
+                            cause: LegFailure::Stale,
+                        };
+                        let reason = LegFailure::Stale.reason().to_owned();
+                        self.stop_leg(stale.index(), event, reason);
+                    }
                 }
             }
             self.first_subscribed_at.get_or_insert(now);
             self.first_subscribed_part.get_or_insert(next_part);
             let leg = self.legs[index].as_mut().expect("an attributed leg");
             leg.first_part = Some(next_part);
-            leg.state = LegState::Live;
-            leg.live_at = Some(now);
-            self.events.push(LegEvent::Live {
-                leg: id,
-                first_part: next_part,
-            });
+            leg.state = State::Live;
+            leg.ok_at = Some(now);
         }
         let leg = self.legs[index].as_mut().expect("an attributed leg");
         if !leg.is_live() {
-            leg.state = LegState::Live;
+            leg.state = State::Live;
+            leg.ok_at.get_or_insert(now);
         }
         leg.compact_confirmed = compact;
         if compact {
@@ -1707,15 +1874,18 @@ impl UdpSession {
             leg.next_refresh = now;
         }
         self.sync_nack(id);
+        // Parts that came before the OK: it is live now.
+        self.report_live(index, now);
         Received::Subscribed { next_part, first }
     }
 
-    fn on_media(&mut self, id: LegId, datagram: &[u8], now: Instant) -> Received {
-        let index = id.index();
+    fn on_media(&mut self, index: usize, datagram: &[u8], now: Instant) -> Received {
         let leg = self.legs[index].as_mut().expect("an attributed leg");
+        let id = leg.id;
         if let Some(last) = leg.last_media {
             leg.longest_gap = leg.longest_gap.max(now.saturating_duration_since(last));
         }
+        leg.first_media.get_or_insert(now);
         leg.last_media = Some(now);
         leg.media_here = true;
         leg.hedge_due = false;
@@ -1726,12 +1896,20 @@ impl UdpSession {
         let first_before = self.receiver.compact.leg_stats(id).parts_first;
         let raptorq = !is_compact_datagram(datagram);
         self.pending = self.receiver.push(id, datagram);
-        if self.pending.is_some() || self.receiver.compact.leg_stats(id).parts_first > first_before
-        {
-            let leg = self.legs[index].as_mut().expect("an attributed leg");
+        let delivered = self.pending.is_some()
+            || self.receiver.compact.leg_stats(id).parts_first > first_before;
+        let leg = self.legs[index].as_mut().expect("an attributed leg");
+        if leg.first_brought.is_none() {
+            leg.first_brought = self.receiver.compact.leg_highest(id);
+        }
+        if delivered {
             leg.last_first = Some(now);
             self.raptorq_recent = (self.raptorq_recent << 1) | u16::from(raptorq);
             self.delivered_recent = self.delivered_recent.saturating_add(1).min(16);
+            if !self.object_lane && self.mostly_raptorq() {
+                self.object_lane = true;
+                self.events.push_back(LegEvent::ObjectLane);
+            }
         }
         let leg = self.legs[index].as_mut().expect("an attributed leg");
         if leg.suspect {
@@ -1742,7 +1920,14 @@ impl UdpSession {
                 self.plan_legs(now);
             }
         }
+        self.report_live(index, now);
         Received::Media
+    }
+
+    /// 8 of the last 16 parts delivered came as RaptorQ objects: a stream
+    /// over the two-path bit rate (B 3.9).
+    fn mostly_raptorq(&self) -> bool {
+        self.delivered_recent >= 16 && self.raptorq_recent.count_ones() >= 8
     }
 
     /// The objects that the last media datagram delivered, one at a time.
@@ -1766,113 +1951,86 @@ fn is_compact_datagram(datagram: &[u8]) -> bool {
 impl SessionLegs for UdpSession {
     fn add_leg(
         &mut self,
+        leg: LegKey,
         node: &str,
-        target: SocketAddr,
-        from_part: Option<u64>,
-        token: Option<u64>,
+        addr: SocketAddr,
+        start: LegStart,
         now: Instant,
         send: &mut dyn FnMut(SocketAddr, &[u8]),
-    ) -> Option<LegId> {
-        self.open_leg(node, target, from_part, token, None, now, send)
+    ) {
+        let from = self.start_from(start.from);
+        self.open_leg(
+            leg,
+            node,
+            addr,
+            from,
+            start.token,
+            start.token_wait,
+            None,
+            now,
+            send,
+        );
     }
 
-    fn release_leg(&mut self, leg: LegId, now: Instant, send: &mut dyn FnMut(SocketAddr, &[u8])) {
-        self.drop_leg(leg, true, now, send);
+    fn release_leg(&mut self, leg: LegKey, now: Instant, send: &mut dyn FnMut(SocketAddr, &[u8])) {
+        if let Some(index) = self.slot(leg) {
+            self.drop_leg(index, true, now, send);
+        }
     }
 
-    fn takeback_leg(&mut self, leg: LegId, now: Instant, send: &mut dyn FnMut(SocketAddr, &[u8])) {
+    fn takeback_leg(&mut self, leg: LegKey, now: Instant, send: &mut dyn FnMut(SocketAddr, &[u8])) {
         let from = self.receiver.compact.newest().map(|newest| newest + 1);
-        let Some(state) = self.legs[leg.index()].as_mut() else {
+        let Some(index) = self.slot(leg) else {
             return;
         };
+        let state = self.legs[index].as_mut().expect("a slot held");
         state.takeback_at = Some(now);
         state.refresh_sent_at = None;
-        self.send_subscribe(leg, from, false, false, now, send);
+        let id = state.id;
+        self.send_subscribe(id, from, false, false, now, send);
     }
 
-    fn reask_leg(&mut self, leg: LegId, now: Instant, send: &mut dyn FnMut(SocketAddr, &[u8])) {
+    fn reask_leg(&mut self, leg: LegKey, now: Instant, send: &mut dyn FnMut(SocketAddr, &[u8])) {
         let from = self
             .receiver
             .compact
             .lowest_hole()
             .or_else(|| self.receiver.compact.newest().map(|newest| newest + 1));
-        if let Some(state) = self.legs[leg.index()].as_mut() {
-            state.refresh_sent_at = None;
-            self.send_subscribe(leg, from, false, from.is_some(), now, send);
+        let Some(index) = self.slot(leg) else {
+            return;
+        };
+        let state = self.legs[index].as_mut().expect("a slot held");
+        state.refresh_sent_at = None;
+        let id = state.id;
+        self.send_subscribe(id, from, false, from.is_some(), now, send);
+    }
+
+    fn leg(&self, leg: LegKey, now: Instant) -> Option<LegView> {
+        let leg = self.by_key(leg)?;
+        Some(LegView {
+            delivering: self.delivers(leg, now),
+            steady: self.receiver.compact.steady(leg.id),
+            first_part: leg.first_part.or(leg.first_brought),
+            first_media: leg.first_media,
+            last_media: leg.last_media,
+            last_datagram: leg.heard_at,
+            lag: self.receiver.compact.leg_lag(leg.id),
+        })
+    }
+
+    fn level(&self, new: LegKey, old: LegKey) -> bool {
+        match (self.by_key(new), self.by_key(old)) {
+            (Some(new), Some(old)) => self.receiver.compact.level(new.id, old.id),
+            _ => false,
         }
-    }
-
-    fn poll_legs(&mut self, now: Instant, send: &mut dyn FnMut(SocketAddr, &[u8])) {
-        let stream_id = self.config.stream_id;
-        self.released.retain_mut(|released| {
-            if let (Some(at), Some(token)) = (released.second_unsub, released.token) {
-                if now >= at {
-                    released.second_unsub = None;
-                    Self::unsubscribe(stream_id, released.target, token, send);
-                }
-            }
-            now < released.until
-        });
-        self.judge_legs(now, send);
-        if now >= self.next_loss_check {
-            self.next_loss_check = now + LOSS_CHECK;
-            self.check_loss(now);
-        }
-        self.send_nacks(now, send);
-        self.refresh_legs(now, send);
-        self.judge_steady(now);
-        self.polled_at = now;
-    }
-
-    fn take_events(&mut self) -> Vec<LegEvent> {
-        std::mem::take(&mut self.events)
-    }
-
-    fn legs(&self) -> Vec<LegView> {
-        let now = Instant::now();
-        let delivering = self.delivering_mask(now);
-        self.legs_iter()
-            .map(|leg| LegView {
-                leg: leg.id,
-                node: leg.node.clone(),
-                target: leg.target,
-                state: leg.state,
-                token: leg.token,
-                first_part: leg.first_part,
-                leaving: leg.leaving.clone(),
-                delivering: delivering & leg.bit() != 0,
-                suspect: leg.suspect,
-                compact: leg.compact_confirmed,
-                rtt: leg.rtt,
-                datagrams: leg.datagrams,
-                wire_bytes: leg.wire_bytes,
-                longest_gap: leg.longest_gap,
-            })
-            .collect()
-    }
-
-    fn newest(&self) -> Option<u64> {
-        self.receiver.compact.newest()
     }
 
     fn oldest_hole(&self) -> Option<u64> {
         self.receiver.compact.lowest_hole()
     }
 
-    fn steady(&self, leg: LegId) -> bool {
-        self.receiver.compact.steady(leg)
-    }
-
-    fn level(&self, new: LegId, old: LegId) -> bool {
-        self.receiver.compact.level(new, old)
-    }
-
-    fn mostly_raptorq(&self) -> bool {
-        self.delivered_recent >= 16 && self.raptorq_recent.count_ones() >= 8
-    }
-
-    fn next_wake(&self) -> Instant {
-        UdpSession::next_wake(self)
+    fn next_event(&mut self) -> Option<LegEvent> {
+        self.events.pop_front()
     }
 }
 
@@ -2839,6 +2997,10 @@ mod tests {
         "127.0.0.2:19446".parse().unwrap()
     }
 
+    fn edge_c() -> SocketAddr {
+        "127.0.0.4:19446".parse().unwrap()
+    }
+
     fn part(part: u64) -> Vec<u8> {
         crate::client_compact::encode_part(part, 0, b"pcm").unwrap()
     }
@@ -2866,48 +3028,64 @@ mod tests {
         move |to, datagram| sent.push((to, Control::decode(datagram).expect("a control")))
     }
 
-    /// A session whose legs `a` (node "a" at `edge()`, token 5) and `b`
-    /// (node "b" at `edge_b()`, token 6) are live from part `first`.
-    fn two_legs(config: SessionConfig, first: u64, now: Instant) -> (UdpSession, LegId, LegId) {
+    const A: LegKey = LegKey(1);
+    const B: LegKey = LegKey(2);
+    const C: LegKey = LegKey(3);
+
+    /// How the director starts a leg beside a delivering one, without a
+    /// token.
+    fn start() -> LegStart {
+        LegStart {
+            from: StartFrom::AfterNewest,
+            token: None,
+            token_wait: Duration::from_millis(DEFAULT_TOKEN_MS),
+        }
+    }
+
+    fn events(session: &mut UdpSession) -> Vec<LegEvent> {
+        std::iter::from_fn(|| session.next_event()).collect()
+    }
+
+    fn held(session: &UdpSession, key: LegKey) -> &Leg {
+        session.by_key(key).expect("the leg is held")
+    }
+
+    fn held_mut(session: &mut UdpSession, key: LegKey) -> &mut Leg {
+        let index = session.slot(key).expect("the leg is held");
+        session.legs[index].as_mut().unwrap()
+    }
+
+    fn view(session: &UdpSession, key: LegKey, now: Instant) -> LegView {
+        session.leg(key, now).expect("the leg is held")
+    }
+
+    /// A session whose legs `A` (node "a" at `edge()`, token 5) and `B`
+    /// (node "b" at `edge_b()`, token 6) are answered from part `first`; no
+    /// media yet.
+    fn two_legs(config: SessionConfig, first: u64, now: Instant) -> UdpSession {
         let mut session = UdpSession::new(config, now);
         let mut send = |_: SocketAddr, _: &[u8]| {};
-        let a = session
-            .add_leg("a", edge(), None, None, now, &mut send)
-            .unwrap();
-        let b = session
-            .add_leg("b", edge_b(), None, None, now, &mut send)
-            .unwrap();
+        session.add_leg(A, "a", edge(), start(), now, &mut send);
+        session.add_leg(B, "b", edge_b(), start(), now, &mut send);
         for (target, given) in [(edge(), 5), (edge_b(), 6)] {
             session.on_datagram(target, &token(given), now, &mut send);
             session.on_datagram(target, &ok(first), now, &mut send);
         }
-        session.take_events();
-        (session, a, b)
-    }
-
-    fn view(session: &UdpSession, leg: LegId) -> LegView {
+        events(&mut session);
         session
-            .legs()
-            .into_iter()
-            .find(|view| view.leg == leg)
-            .expect("the leg is held")
     }
 
     /// B X5: two legs are asked and subscribed each at its own edge, each
-    /// part comes out once whichever leg brings it first, and each leg's
-    /// refresh names the other delivering leg in `o=`.
+    /// is live at its first media after its `OK`, each part comes out once
+    /// whichever leg brings it first, and each leg's refresh names the
+    /// other delivering leg in `o=`.
     #[test]
     fn two_legs_subscribe_and_each_part_comes_out_once() {
         let now = Instant::now();
         let mut session = UdpSession::new(SessionConfig::new(1), now);
         let mut sent = Sent::new();
-        let a = session
-            .add_leg("a", edge(), None, None, now, &mut sender(&mut sent))
-            .unwrap();
-        let b = session
-            .add_leg("b", edge_b(), None, None, now, &mut sender(&mut sent))
-            .unwrap();
-        assert_ne!(a, b);
+        session.add_leg(A, "a", edge(), start(), now, &mut sender(&mut sent));
+        session.add_leg(B, "b", edge_b(), start(), now, &mut sender(&mut sent));
         assert!(matches!(
             &sent[..],
             [
@@ -2930,15 +3108,10 @@ mod tests {
             && matches!(control, Control::Subscribe { token: Some(5), .. })));
         assert!(sent.iter().any(|(to, control)| *to == edge_b()
             && matches!(control, Control::Subscribe { token: Some(6), .. })));
-        let events = session.take_events();
-        assert!(events.contains(&LegEvent::Live {
-            leg: a,
-            first_part: 100
-        }));
-        assert!(events.contains(&LegEvent::Live {
-            leg: b,
-            first_part: 100
-        }));
+        assert_eq!(
+            events(&mut session),
+            vec![LegEvent::Tokened(A), LegEvent::Tokened(B)]
+        );
         let mut delivered = Vec::new();
         let ms = Duration::from_millis(1);
         for number in 100..110_u64 {
@@ -2956,14 +3129,34 @@ mod tests {
                 }
             }
         }
+        assert_eq!(
+            events(&mut session),
+            vec![
+                LegEvent::Live {
+                    leg: A,
+                    compact: true
+                },
+                LegEvent::Live {
+                    leg: B,
+                    compact: true
+                }
+            ]
+        );
         assert_eq!(delivered, (100..110).collect::<Vec<_>>());
-        assert_eq!(session.receiver.compact.leg_stats(a).parts_first, 5);
-        assert_eq!(session.receiver.compact.leg_stats(b).parts_first, 5);
-        assert_eq!(view(&session, a).datagrams, 10);
-        assert!(view(&session, a).delivering && view(&session, b).delivering);
+        let report = session.leg_report(A).unwrap();
+        assert_eq!(report.stats.parts_first, 5);
+        assert_eq!(session.leg_report(B).unwrap().stats.parts_first, 5);
+        assert_eq!(report.datagrams, 10);
+        assert_eq!(report.first_part, Some(100));
+        let at = now + ms * 11;
+        let a = view(&session, A, at);
+        assert!(a.delivering && view(&session, B, at).delivering);
+        assert_eq!(a.first_part, Some(100));
+        assert_eq!(a.last_media, Some(now + ms * 10));
+        // Not delivering once no media came for 20 ms.
+        assert!(!view(&session, A, at + ms * 30).delivering);
         // Each leg's next SUB names the other in o=, at once.
         sent.clear();
-        let at = now + ms * 11;
         session.poll_legs(at, &mut sender(&mut sent));
         let others = |target: SocketAddr| {
             sent.iter().find_map(|(to, control)| match control {
@@ -2981,6 +3174,45 @@ mod tests {
         assert!(sent.is_empty(), "{sent:?}");
     }
 
+    /// B X5 review: a leg is live (and counted in the plans) once its
+    /// edge's `OK` and its first media have come, in either order.
+    #[test]
+    fn a_leg_is_live_at_its_ok_and_its_first_media() {
+        let now = Instant::now();
+        let mut session = UdpSession::new(SessionConfig::new(1), now);
+        let mut send = |_: SocketAddr, _: &[u8]| {};
+        session.add_leg(A, "a", edge(), start(), now, &mut send);
+        session.on_datagram(edge(), &token(5), now, &mut send);
+        session.on_datagram(edge(), &ok(100), now, &mut send);
+        assert_eq!(events(&mut session), vec![LegEvent::Tokened(A)]);
+        assert_eq!(session.repair_leg(), None, "an OK alone is not live");
+        session.on_datagram(edge(), &part(100), now, &mut send);
+        assert_eq!(
+            events(&mut session),
+            vec![LegEvent::Live {
+                leg: A,
+                compact: true
+            }]
+        );
+        assert_eq!(session.repair_leg(), Some(held(&session, A).id));
+        // A part before the OK (the OK came late): live at the OK.
+        session.add_leg(B, "b", edge_b(), start(), now, &mut send);
+        session.on_datagram(edge_b(), &token(6), now, &mut send);
+        session.on_datagram(edge_b(), &part(101), now, &mut send);
+        assert_eq!(events(&mut session), vec![LegEvent::Tokened(B)]);
+        session.on_datagram(edge_b(), &ok(101), now, &mut send);
+        assert_eq!(
+            events(&mut session),
+            vec![LegEvent::Live {
+                leg: B,
+                compact: true
+            }]
+        );
+        // Once only.
+        session.on_datagram(edge_b(), &part(102), now, &mut send);
+        assert_eq!(events(&mut session), vec![]);
+    }
+
     /// B X5: a datagram goes to the leg whose edge is exactly its source,
     /// else to the only leg at that address; one from an edge let go in the
     /// last 10 s is answered with `UNSUB`, at most every 100 ms.
@@ -2991,15 +3223,11 @@ mod tests {
         let mut send = |_: SocketAddr, _: &[u8]| {};
         let first: SocketAddr = "127.0.0.1:19446".parse().unwrap();
         let second: SocketAddr = "127.0.0.1:19447".parse().unwrap();
-        let a = session
-            .add_leg("a", first, None, None, now, &mut send)
-            .unwrap();
-        let b = session
-            .add_leg("b", second, None, None, now, &mut send)
-            .unwrap();
+        session.add_leg(A, "a", first, start(), now, &mut send);
+        session.add_leg(B, "b", second, start(), now, &mut send);
         session.on_datagram(second, &token(6), now, &mut send);
-        assert_eq!(view(&session, b).token, Some(6));
-        assert_eq!(view(&session, a).token, None);
+        assert_eq!(held(&session, B).token, Some(6));
+        assert_eq!(held(&session, A).token, None);
         // Another port of that host: neither leg's.
         let stranger: SocketAddr = "127.0.0.1:9999".parse().unwrap();
         assert_eq!(
@@ -3007,18 +3235,16 @@ mod tests {
             Received::Ignored
         );
         // The only leg at an address takes its datagrams from any port.
-        let c = session
-            .add_leg(
-                "c",
-                "127.0.0.3:19446".parse().unwrap(),
-                None,
-                None,
-                now,
-                &mut send,
-            )
-            .unwrap();
+        session.add_leg(
+            C,
+            "c",
+            "127.0.0.3:19446".parse().unwrap(),
+            start(),
+            now,
+            &mut send,
+        );
         session.on_datagram("127.0.0.3:5000".parse().unwrap(), &token(7), now, &mut send);
-        assert_eq!(view(&session, c).token, Some(7));
+        assert_eq!(held(&session, C).token, Some(7));
         // b is let go: UNSUB twice, 20 ms apart; its edge's datagrams are
         // answered with UNSUB, at most every 100 ms, for 10 s.
         let mut sent = Sent::new();
@@ -3029,7 +3255,7 @@ mod tests {
                 })
                 .count()
         };
-        session.release_leg(b, now, &mut sender(&mut sent));
+        session.release_leg(B, now, &mut sender(&mut sent));
         assert_eq!(unsubs(&sent), 1);
         session.poll_legs(now + Duration::from_millis(19), &mut sender(&mut sent));
         assert_eq!(unsubs(&sent), 1);
@@ -3056,16 +3282,59 @@ mod tests {
             &mut sender(&mut sent),
         );
         assert!(sent.is_empty());
-        assert!(session.legs().iter().all(|view| view.leg != b));
+        assert!(session.leg(B, now).is_none());
+    }
+
+    /// B X5 review: a leg added at an edge released less than 10 s ago (a
+    /// hedge back at the spare) ends that edge's `UNSUB`s: the second
+    /// `UNSUB` of the release does not go, and its datagrams are the new
+    /// leg's.
+    #[test]
+    fn a_leg_added_where_one_was_released_takes_its_datagrams() {
+        let now = Instant::now();
+        let mut session = two_legs(SessionConfig::new(1), 100, now);
+        let mut sent = Sent::new();
+        session.release_leg(A, now, &mut sender(&mut sent));
+        assert_eq!(sent.len(), 1, "the first UNSUB");
+        let hedge = LegStart {
+            token: Some(5),
+            ..start()
+        };
+        let ms = Duration::from_millis(1);
+        session.add_leg(C, "a", edge(), hedge, now + ms * 5, &mut sender(&mut sent));
+        sent.clear();
+        session.poll_legs(now + ms * 25, &mut sender(&mut sent));
+        assert!(
+            !sent
+                .iter()
+                .any(|(_, control)| matches!(control, Control::Unsubscribe { .. })),
+            "{sent:?}"
+        );
+        assert_eq!(
+            session.on_datagram(edge(), &ok(101), now + ms * 26, &mut sender(&mut sent)),
+            Received::Subscribed {
+                next_part: 101,
+                first: true
+            }
+        );
+        assert_eq!(
+            session.on_datagram(edge(), &part(101), now + ms * 26, &mut sender(&mut sent)),
+            Received::Media
+        );
+        assert_eq!(session.leg_report(C).unwrap().datagrams, 1);
+        assert!(sent
+            .iter()
+            .all(|(_, control)| !matches!(control, Control::Unsubscribe { .. })));
     }
 
     /// B X5: a leg with no media beside a leg that delivers is suspect at
     /// max(20 ms, 8 parts), due a hedge at 50 ms, and dead at 200 ms; the
-    /// other leg is never judged.
+    /// other leg is never judged. The dead leg delivers nothing more and
+    /// stays until the director releases it.
     #[test]
     fn a_leg_without_media_beside_a_delivering_leg_is_hedged_then_dead() {
         let now = Instant::now();
-        let (mut session, a, b) = two_legs(SessionConfig::new(1), 100, now);
+        let mut session = two_legs(SessionConfig::new(1), 100, now);
         let ms = Duration::from_millis(1);
         let mut sent = Sent::new();
         for number in 100..120_u64 {
@@ -3073,9 +3342,11 @@ mod tests {
             session.on_datagram(edge(), &part(number), at, &mut sender(&mut sent));
             session.on_datagram(edge_b(), &part(number), at, &mut sender(&mut sent));
         }
+        events(&mut session);
         // b stops at part 119 (t = 19 ms); a goes on, a part a ms.
         let stopped = now + ms * 19;
         let mut seen: Vec<(u32, LegEvent)> = Vec::new();
+        let mut suspect_at = None;
         for step in 1..=200_u32 {
             let at = stopped + ms * step;
             session.on_datagram(
@@ -3085,7 +3356,10 @@ mod tests {
                 &mut sender(&mut sent),
             );
             session.poll_legs(at, &mut sender(&mut sent));
-            seen.extend(session.take_events().into_iter().map(|event| (step, event)));
+            if suspect_at.is_none() && held(&session, B).suspect {
+                suspect_at = Some(step);
+            }
+            seen.extend(events(&mut session).into_iter().map(|event| (step, event)));
             if seen
                 .iter()
                 .any(|(_, event)| matches!(event, LegEvent::Failed { .. }))
@@ -3093,28 +3367,184 @@ mod tests {
                 break;
             }
         }
-        seen.retain(|(_, event)| !matches!(event, LegEvent::Steady { .. }));
+        assert_eq!(suspect_at, Some(20));
         assert_eq!(
-            seen.iter()
-                .map(|(_, event)| event.clone())
-                .collect::<Vec<_>>(),
+            seen,
             vec![
-                LegEvent::Suspect { leg: b },
-                LegEvent::HedgeDue { leg: b },
-                LegEvent::Failed {
-                    leg: b,
-                    node: "b".to_owned(),
-                    reason: "silence-200ms".to_owned()
-                },
+                (50, LegEvent::HedgeDue(B)),
+                (
+                    200,
+                    LegEvent::Failed {
+                        leg: B,
+                        cause: LegFailure::Dead
+                    }
+                ),
             ]
         );
-        assert_eq!(seen[0].0, 20);
-        assert_eq!(seen[1].0, 50);
-        assert_eq!(seen[2].0, 200);
+        assert_eq!(held(&session, B).failure.as_deref(), Some("silence-200ms"));
+        // Kept until released; its datagrams are not taken.
+        while session.next_object().is_some() {}
+        let at = stopped + ms * 201;
+        assert!(session.leg(B, at).is_some_and(|view| !view.delivering));
+        assert_eq!(
+            session.on_datagram(edge_b(), &part(500), at, &mut sender(&mut sent)),
+            Received::Ignored
+        );
+        assert!(session.next_object().is_none());
+        assert!(!sent
+            .iter()
+            .any(|(_, control)| matches!(control, Control::Unsubscribe { .. })));
+        session.release_leg(B, at, &mut sender(&mut sent));
         assert!(sent.iter().any(|(to, control)| *to == edge_b()
             && matches!(control, Control::Unsubscribe { token: 6, .. })));
-        assert_eq!(session.legs().len(), 1);
-        assert_eq!(view(&session, a).state, LegState::Live);
+        assert!(session.leg(B, at).is_none());
+        assert!(view(&session, A, at).delivering);
+        assert_eq!(held(&session, A).state, State::Live);
+    }
+
+    /// B X5 review: a failed leg keeps its slot until the director
+    /// releases it: a leg added meanwhile (the hedge taking its place) gets
+    /// another, and the release lets only the failed leg go.
+    #[test]
+    fn a_failed_leg_keeps_its_place_until_it_is_released() {
+        let now = Instant::now();
+        let mut session = UdpSession::new(SessionConfig::new(1), now);
+        let mut sent = Sent::new();
+        session.add_leg(A, "a", edge(), start(), now, &mut sender(&mut sent));
+        session.add_leg(B, "b", edge_b(), start(), now, &mut sender(&mut sent));
+        session.on_datagram(edge(), &token(5), now, &mut sender(&mut sent));
+        session.on_datagram(edge(), &ok(100), now, &mut sender(&mut sent));
+        session.on_datagram(edge(), &part(100), now, &mut sender(&mut sent));
+        // b's edge gives a token and never answers the SUB with it.
+        session.on_datagram(edge_b(), &token(6), now, &mut sender(&mut sent));
+        events(&mut session);
+        let late = now + Duration::from_millis(5_001);
+        session.hold = true;
+        session.poll_legs(late, &mut sender(&mut sent));
+        assert_eq!(events(&mut session), vec![], "held: no verdict");
+        session.hold = false;
+        session.poll_legs(late, &mut sender(&mut sent));
+        assert!(events(&mut session).contains(&LegEvent::Failed {
+            leg: B,
+            cause: LegFailure::NoAnswer
+        }));
+        let b_slot = held(&session, B).id;
+        // The hedge, added before the failed leg is released.
+        let hedge = LegStart {
+            token: Some(7),
+            ..start()
+        };
+        sent.clear();
+        session.add_leg(C, "c", edge_c(), hedge, late, &mut sender(&mut sent));
+        assert_ne!(held(&session, C).id, b_slot);
+        assert!(matches!(
+            &sent[..],
+            [(to, Control::Subscribe { token: Some(7), from_part: Some(101), .. })] if *to == edge_c()
+        ));
+        sent.clear();
+        session.release_leg(B, late, &mut sender(&mut sent));
+        assert!(matches!(
+            &sent[..],
+            [(to, Control::Unsubscribe { token: 6, .. })] if *to == edge_b()
+        ));
+        assert!(session.leg(B, late).is_none());
+        assert!(session.leg(C, late).is_some());
+        assert_eq!(
+            session.on_datagram(edge_c(), &ok(101), late, &mut sender(&mut sent)),
+            Received::Subscribed {
+                next_part: 101,
+                first: true
+            }
+        );
+    }
+
+    /// B X5 review: an edge that answers a leg it never served with `MOVE`,
+    /// or with `REFUSED`, refuses it: the leg is given up until released.
+    #[test]
+    fn a_move_before_the_ok_is_a_refusal() {
+        let now = Instant::now();
+        let mut session = UdpSession::new(SessionConfig::new(1), now);
+        let mut send = |_: SocketAddr, _: &[u8]| {};
+        session.add_leg(A, "a", edge(), start(), now, &mut send);
+        session.add_leg(B, "b", edge_b(), start(), now, &mut send);
+        session.on_datagram(edge(), &token(5), now, &mut send);
+        let moved = Control::Move {
+            stream_id: 1,
+            reason: "stale-copy".into(),
+        }
+        .encode();
+        assert_eq!(
+            session.on_datagram(edge(), &moved, now, &mut send),
+            Received::Move("stale-copy".into())
+        );
+        let refused = Control::Refused {
+            stream_id: 1,
+            reason: "edge-busy".into(),
+        }
+        .encode();
+        assert_eq!(
+            session.on_datagram(edge_b(), &refused, now, &mut send),
+            Received::Move("edge-busy".into())
+        );
+        assert_eq!(
+            events(&mut session),
+            vec![
+                LegEvent::Tokened(A),
+                LegEvent::Refused {
+                    leg: A,
+                    reason: "stale-copy".into()
+                },
+                LegEvent::Refused {
+                    leg: B,
+                    reason: "edge-busy".into()
+                }
+            ]
+        );
+        assert!(held(&session, A).is_failed() && held(&session, B).is_failed());
+        assert_eq!(
+            session.on_datagram(edge(), &ok(100), now, &mut send),
+            Received::Ignored
+        );
+    }
+
+    /// B X5: a leg asks its edge to start after the newest part when
+    /// another leg delivers, or from the oldest hole (at most 4,096 back).
+    #[test]
+    fn a_new_leg_starts_after_the_newest_or_from_the_oldest_hole() {
+        let now = Instant::now();
+        let mut session = UdpSession::new(SessionConfig::new(1), now);
+        let mut sent = Sent::new();
+        session.add_leg(A, "a", edge(), start(), now, &mut sender(&mut sent));
+        assert!(matches!(
+            &sent[..],
+            [(
+                _,
+                Control::Subscribe {
+                    from_part: None,
+                    ..
+                }
+            )]
+        ));
+        session.on_datagram(edge(), &token(5), now, &mut sender(&mut sent));
+        session.on_datagram(edge(), &ok(100), now, &mut sender(&mut sent));
+        for number in [100_u64, 101, 103] {
+            session.on_datagram(edge(), &part(number), now, &mut sender(&mut sent));
+        }
+        sent.clear();
+        session.add_leg(B, "b", edge_b(), start(), now, &mut sender(&mut sent));
+        let hole = LegStart {
+            from: StartFrom::OldestHole,
+            ..start()
+        };
+        session.add_leg(C, "c", edge_c(), hole, now, &mut sender(&mut sent));
+        let from = |target: SocketAddr| {
+            sent.iter().find_map(|(to, control)| match control {
+                Control::Subscribe { from_part, .. } if *to == target => Some(*from_part),
+                _ => None,
+            })
+        };
+        assert_eq!(from(edge_b()), Some(Some(104)));
+        assert_eq!(from(edge_c()), Some(Some(102)));
     }
 
     /// B X5: while the caller says datagrams are queued, no leg is judged
@@ -3122,16 +3552,17 @@ mod tests {
     #[test]
     fn no_verdict_while_datagrams_are_queued() {
         let now = Instant::now();
-        let (mut session, a, b) = two_legs(SessionConfig::new(1), 100, now);
+        let mut session = two_legs(SessionConfig::new(1), 100, now);
         let mut send = |_: SocketAddr, _: &[u8]| {};
         for target in [edge(), edge_b()] {
             session.on_datagram(target, &part(100), now, &mut send);
         }
+        events(&mut session);
         // The host stalls 300 ms with both legs' datagrams queued.
         let stall = now + Duration::from_millis(300);
         session.queued = true;
         session.poll_legs(stall, &mut send);
-        assert_eq!(session.take_events(), vec![]);
+        assert_eq!(events(&mut session), vec![]);
         // The backlog, read.
         for number in 101..400_u64 {
             for target in [edge(), edge_b()] {
@@ -3140,18 +3571,14 @@ mod tests {
         }
         session.queued = false;
         session.poll_legs(stall, &mut send);
-        assert!(session
-            .take_events()
-            .iter()
-            .all(|event| matches!(event, LegEvent::Steady { .. })));
-        assert_eq!(session.legs().len(), 2);
-        assert!(view(&session, a).delivering && view(&session, b).delivering);
+        assert_eq!(events(&mut session), vec![]);
+        assert!(view(&session, A, stall).delivering && view(&session, B, stall).delivering);
         // One leg alone: no hedge while queued either.
         let mut alone = subscribed(SessionConfig::new(1), now);
-        alone.take_events();
+        events(&mut alone);
         alone.queued = true;
         alone.poll_legs(stall, &mut send);
-        assert_eq!(alone.take_events(), vec![]);
+        assert_eq!(events(&mut alone), vec![]);
     }
 
     /// B X5: when no leg has sent a datagram for 200 ms nobody is failed
@@ -3165,43 +3592,42 @@ mod tests {
             nack_timing: NackTiming::BEFORE,
             ..SessionConfig::new(1)
         };
-        let (mut session, a, b) = two_legs(config, 100, now);
+        let mut session = two_legs(config, 100, now);
         let mut sent = Sent::new();
         for number in [100_u64, 101, 102, 104, 105] {
             for target in [edge(), edge_b()] {
                 session.on_datagram(target, &part(number), now, &mut sender(&mut sent));
             }
         }
+        events(&mut session);
         assert_eq!(session.oldest_hole(), Some(103));
-        let mut events = Vec::new();
+        let mut silences = Vec::new();
         let mut at = now;
         while at < now + Duration::from_millis(1_300) {
             at = session.next_wake().max(at + Duration::from_micros(100));
             session.poll_legs(at, &mut sender(&mut sent));
-            for event in session.take_events() {
-                if matches!(event, LegEvent::AllSilent { .. }) {
-                    events.push((at - now, event));
+            for event in events(&mut session) {
+                assert!(
+                    matches!(event, LegEvent::AllSilent | LegEvent::HedgeDue(_)),
+                    "{event:?}"
+                );
+                if event == LegEvent::AllSilent {
+                    silences.push(at - now);
                 }
             }
-        }
-        assert_eq!(session.legs().len(), 2, "nobody failed");
-        assert_eq!(events.len(), 2, "{events:?}");
-        assert!(
-            events[0].0 > Duration::from_millis(200) && events[0].0 < Duration::from_millis(210)
-        );
-        assert_eq!(
-            events[0].1,
-            LegEvent::AllSilent {
-                silence: Duration::from_millis(200)
+            if silences.len() == 1 {
+                assert_eq!(session.silent_for, Duration::from_millis(200));
             }
+        }
+        assert!(session.leg(A, at).is_some() && session.leg(B, at).is_some());
+        assert!(!held(&session, A).is_failed() && !held(&session, B).is_failed());
+        assert_eq!(silences.len(), 2, "{silences:?}");
+        assert!(
+            silences[0] > Duration::from_millis(200) && silences[0] < Duration::from_millis(210)
         );
-        assert!(events[1].0 >= events[0].0 + Duration::from_millis(1_000));
-        assert!(session
-            .take_events()
-            .iter()
-            .all(|event| !matches!(event, LegEvent::Failed { .. })));
+        assert!(silences[1] >= silences[0] + Duration::from_millis(1_000));
         sent.clear();
-        for leg in [a, b] {
+        for leg in [A, B] {
             session.reask_leg(leg, at, &mut sender(&mut sent));
         }
         for (target, given) in [(edge(), 5), (edge_b(), 6)] {
@@ -3214,39 +3640,39 @@ mod tests {
         // A media datagram ends the silence: the short silence again.
         session.on_datagram(edge(), &part(106), at, &mut sender(&mut sent));
         session.poll_legs(at + Duration::from_millis(150), &mut sender(&mut sent));
-        assert!(!session
-            .take_events()
-            .iter()
-            .any(|event| matches!(event, LegEvent::AllSilent { .. })));
+        assert!(!events(&mut session).contains(&LegEvent::AllSilent));
     }
 
-    /// B X5: a leg with no `TOKEN` in the token wait is passed over (once)
-    /// and goes on asking; if its edge answers it is used; with no answer in
-    /// the answer wait it fails.
+    /// B X5: a leg with no `TOKEN` in its own token wait is passed over
+    /// (once) and goes on asking; if its edge answers it is used; with no
+    /// answer in the answer wait it fails.
     #[test]
     fn a_leg_without_a_token_is_passed_over_and_used_if_it_answers() {
         let now = Instant::now();
         let mut session = UdpSession::new(SessionConfig::new(1), now);
         let mut sent = Sent::new();
-        let a = session
-            .add_leg("a", edge(), Some(7), None, now, &mut sender(&mut sent))
-            .unwrap();
-        let b = session
-            .add_leg("b", edge_b(), Some(7), None, now, &mut sender(&mut sent))
-            .unwrap();
+        let from_hole = LegStart {
+            from: StartFrom::OldestHole,
+            ..start()
+        };
+        session.add_leg(A, "a", edge(), from_hole, now, &mut sender(&mut sent));
+        // A far entry: four round trips of 200 ms.
+        let far = LegStart {
+            token_wait: Duration::from_millis(800),
+            ..from_hole
+        };
+        session.add_leg(B, "b", edge_b(), far, now, &mut sender(&mut sent));
         session.poll_legs(now + Duration::from_millis(399), &mut sender(&mut sent));
-        assert_eq!(session.take_events(), vec![]);
+        assert_eq!(events(&mut session), vec![]);
         session.poll_legs(now + Duration::from_millis(400), &mut sender(&mut sent));
-        assert_eq!(
-            session.take_events(),
-            vec![
-                LegEvent::PassedOver { leg: a },
-                LegEvent::PassedOver { leg: b }
-            ]
-        );
+        assert_eq!(events(&mut session), vec![LegEvent::NoToken(A)]);
+        session.poll_legs(now + Duration::from_millis(799), &mut sender(&mut sent));
+        assert_eq!(events(&mut session), vec![]);
+        session.poll_legs(now + Duration::from_millis(800), &mut sender(&mut sent));
+        assert_eq!(events(&mut session), vec![LegEvent::NoToken(B)]);
         sent.clear();
-        let mut at = now + Duration::from_millis(400);
-        while at < now + Duration::from_millis(900) {
+        let mut at = now + Duration::from_millis(800);
+        while at < now + Duration::from_millis(1_300) {
             at = session.next_wake();
             session.poll_legs(at, &mut sender(&mut sent));
         }
@@ -3255,32 +3681,42 @@ mod tests {
                 control,
                 Control::Subscribe {
                     token: None,
-                    from_part: Some(7),
+                    from_part: None,
                     ..
                 }
             )));
-        assert!(session.take_events().is_empty(), "passed over once");
+        assert!(events(&mut session).is_empty(), "passed over once");
         // a's edge answers late: the leg is used.
         session.on_datagram(edge(), &token(5), at, &mut sender(&mut sent));
         session.on_datagram(edge(), &ok(7), at, &mut sender(&mut sent));
+        session.on_datagram(edge(), &part(7), at, &mut sender(&mut sent));
         assert_eq!(
-            session.take_events(),
+            events(&mut session),
             vec![
-                LegEvent::Tokened { leg: a, token: 5 },
+                LegEvent::Tokened(A),
                 LegEvent::Live {
-                    leg: a,
-                    first_part: 7
+                    leg: A,
+                    compact: true
                 }
             ]
         );
         // b's never does: failed at the answer wait.
+        session.hold = true;
         session.poll_legs(now + Duration::from_millis(5_001), &mut sender(&mut sent));
-        assert!(session.take_events().contains(&LegEvent::Failed {
-            leg: b,
-            node: "b".to_owned(),
-            reason: "no-answer-5000ms".to_owned()
+        assert!(!events(&mut session).contains(&LegEvent::Failed {
+            leg: B,
+            cause: LegFailure::NoAnswer
         }));
-        assert_eq!(session.legs().len(), 1);
+        session.hold = false;
+        session.poll_legs(now + Duration::from_millis(5_001), &mut sender(&mut sent));
+        assert!(events(&mut session).contains(&LegEvent::Failed {
+            leg: B,
+            cause: LegFailure::NoAnswer
+        }));
+        assert_eq!(
+            held(&session, B).failure.as_deref(),
+            Some("no-answer-5000ms")
+        );
     }
 
     /// B X5 (2.6): 45 s after its token a leg's refresh is joined by a
@@ -3341,9 +3777,7 @@ mod tests {
             let now = Instant::now();
             let mut session = UdpSession::new(SessionConfig::new(1), now);
             let mut send = |_: SocketAddr, _: &[u8]| {};
-            let leg = session
-                .add_leg("a", edge(), None, None, now, &mut send)
-                .unwrap();
+            session.add_leg(A, "a", edge(), start(), now, &mut send);
             // The edge answers each request one round trip after its first
             // copy; the client runs its timers meanwhile.
             let until = |session: &mut UdpSession, end: Instant| {
@@ -3359,15 +3793,15 @@ mod tests {
             session.on_datagram(edge(), &ok(10), now + rtt * 2, &mut send);
             if rtt_ms < 25 {
                 // Only the double went: a sample of each exchange.
-                assert_eq!(view(&session, leg).rtt, Some(rtt), "{rtt_ms} ms");
+                assert_eq!(held(&session, A).rtt, Some(rtt), "{rtt_ms} ms");
                 continue;
             }
-            assert_eq!(view(&session, leg).rtt, None, "{rtt_ms} ms: repeated");
+            assert_eq!(held(&session, A).rtt, None, "{rtt_ms} ms: repeated");
             // The first refresh, answered a round trip later.
             let refresh = only(&session).next_refresh;
             until(&mut session, refresh + Duration::from_micros(1));
             session.on_datagram(edge(), &ok(10), refresh + rtt, &mut send);
-            assert_eq!(view(&session, leg).rtt, Some(rtt), "{rtt_ms} ms");
+            assert_eq!(held(&session, A).rtt, Some(rtt), "{rtt_ms} ms");
         }
     }
 
@@ -3424,7 +3858,6 @@ mod tests {
     /// brings the stream.
     #[test]
     fn a_nack_goes_to_every_leg_that_sent_the_part() {
-        let now = Instant::now();
         let config = SessionConfig {
             nack_timing: NackTiming {
                 silence: false,
@@ -3432,13 +3865,15 @@ mod tests {
             },
             ..SessionConfig::new(1)
         };
-        let (mut session, a, b) = two_legs(config, 100, now);
-        for (leg, rtt) in [(a, 10), (b, 2)] {
+        let mut session = two_legs(config, 100, Instant::now());
+        for (leg, rtt) in [(A, 10), (B, 2)] {
             let rtt = Duration::from_millis(rtt);
-            session.legs[leg.index()].as_mut().unwrap().rtt = Some(rtt);
-            session.receiver.compact.set_leg_rtt(leg, rtt);
+            held_mut(&mut session, leg).rtt = Some(rtt);
+            let id = held(&session, leg).id;
+            session.receiver.compact.set_leg_rtt(id, rtt);
         }
         let mut send = |_: SocketAddr, _: &[u8]| {};
+        let now = Instant::now();
         for number in [100_u64, 101, 103] {
             for target in [edge(), edge_b()] {
                 session.on_datagram(target, &part(number), now, &mut send);
@@ -3453,9 +3888,9 @@ mod tests {
                 })
                 .collect()
         };
-        // (The receiver keeps its holes on the real clock: the test's
-        // times are a little ahead of it.)
-        let first = now + Duration::from_millis(1);
+        // The receiver keeps its holes on the real clock: the first poll
+        // is taken from it, after the pushes, past the first NACK's wait.
+        let first = Instant::now() + Duration::from_millis(1);
         session.poll_legs(first, &mut sender(&mut sent));
         assert_eq!(nacks(&sent), vec![(edge_b(), 6, vec![102])]);
         sent.clear();
@@ -3476,11 +3911,11 @@ mod tests {
     #[test]
     fn a_suspect_leg_changes_the_plan_at_once() {
         let now = Instant::now();
-        let (mut session, a, b) = two_legs(SessionConfig::new(1), 100, now);
-        assert_eq!(only_plan(&session, a), "C0.32.0.7");
-        assert_eq!(only_plan(&session, b), "C0.32.0.7");
-        for leg in [a, b] {
-            let state = session.legs[leg.index()].as_mut().unwrap();
+        let mut session = two_legs(SessionConfig::new(1), 100, now);
+        assert_eq!(only_plan(&session, A), "C0.32.0.7");
+        assert_eq!(only_plan(&session, B), "C0.32.0.7");
+        for leg in [A, B] {
+            let state = held_mut(&mut session, leg);
             state.compact_estimate = Some(0.0);
             state.loss_samples = PLAN_SAMPLES;
         }
@@ -3493,7 +3928,7 @@ mod tests {
             }
         }
         session.plan_legs(now + ms * 9);
-        assert_eq!(only_plan(&session, a), "C0.32.0.7");
+        assert_eq!(only_plan(&session, A), "C0.32.0.7");
         let mut suspect_at = None;
         for step in 1..=30_u32 {
             let at = now + ms * (9 + step);
@@ -3505,32 +3940,28 @@ mod tests {
                 &mut sender(&mut sent),
             );
             session.poll_legs(at, &mut sender(&mut sent));
-            if session
-                .take_events()
-                .contains(&LegEvent::Suspect { leg: b })
-            {
+            if held(&session, B).suspect {
                 suspect_at = Some(step);
                 break;
             }
         }
         assert_eq!(suspect_at, Some(20));
-        assert_eq!(only_plan(&session, a), "C0.32.1.7");
+        assert_eq!(only_plan(&session, A), "C0.32.1.7");
         assert!(sent.iter().any(|(to, control)| *to == edge()
             && matches!(control, Control::Subscribe { compact: Some(plan), .. } if plan.word() == "C0.32.1.7")));
-        assert!(view(&session, b).suspect);
     }
 
-    fn only_plan(session: &UdpSession, leg: LegId) -> String {
-        session.legs[leg.index()].as_ref().unwrap().plan.word()
+    fn only_plan(session: &UdpSession, leg: LegKey) -> String {
+        held(session, leg).plan.word()
     }
 
     /// B X5: a leg whose edge sent `MOVE` is leaving and still receives
     /// (its parts delivered, its NACKs sent) until the director releases
-    /// it; a new leg level with it is reported; released, it gets `UNSUB`
-    /// twice and its datagrams are ignored. A take-back makes it live again.
+    /// it; a new leg level with it is seen to be; released, it gets
+    /// `UNSUB` twice and its datagrams are ignored. A take-back makes it
+    /// live again.
     #[test]
     fn a_moved_leg_receives_until_it_is_released() {
-        let now = Instant::now();
         let config = SessionConfig {
             nack_timing: NackTiming {
                 silence: false,
@@ -3538,7 +3969,7 @@ mod tests {
             },
             ..SessionConfig::new(1)
         };
-        let (mut session, a, b) = two_legs(config, 100, now);
+        let mut session = two_legs(config, 100, Instant::now());
         let mut sent = Sent::new();
         let moved = Control::Move {
             stream_id: 1,
@@ -3546,66 +3977,60 @@ mod tests {
         }
         .encode();
         assert_eq!(
-            session.on_datagram(edge(), &moved, now, &mut sender(&mut sent)),
+            session.on_datagram(edge(), &moved, Instant::now(), &mut sender(&mut sent)),
             Received::Move("draining".into())
         );
         assert_eq!(
-            session.take_events(),
+            events(&mut session),
             vec![LegEvent::Moved {
-                leg: a,
+                leg: A,
                 reason: "draining".into()
             }]
         );
-        assert_eq!(view(&session, a).state, LegState::Leaving);
-        assert_eq!(view(&session, a).leaving.as_deref(), Some("draining"));
-        // It still delivers: a's parts come first, b's a little later.
-        let ms = Duration::from_millis(1);
+        assert_eq!(held(&session, A).state, State::Leaving);
+        assert_eq!(held(&session, A).leaving.as_deref(), Some("draining"));
+        // It still delivers: a's parts come first, b's a little later. The
+        // receiver times arrivals on the real clock, so the test does too.
         let mut first_from_a = 0;
         for number in 100..140_u64 {
-            let at = now + ms * (number - 99) as u32;
             if number == 120 {
                 continue;
             }
+            let at = Instant::now();
             session.on_datagram(edge(), &part(number), at, &mut sender(&mut sent));
             if session.next_object().is_some() {
                 first_from_a += 1;
             }
-            session.on_datagram(
-                edge_b(),
-                &part(number),
-                at + Duration::from_micros(100),
-                &mut sender(&mut sent),
-            );
+            session.on_datagram(edge_b(), &part(number), at, &mut sender(&mut sent));
             while session.next_object().is_some() {}
-            session.poll_legs(at + Duration::from_micros(100), &mut sender(&mut sent));
+            session.poll_legs(at, &mut sender(&mut sent));
         }
         assert_eq!(first_from_a, 39);
-        let events = session.take_events();
-        assert!(
-            events.contains(&LegEvent::Level { leg: b, with: a }),
-            "{events:?}"
-        );
-        // Its NACKs still go (the hole of part 120, asked of both).
+        assert!(session.level(B, A));
+        assert!(!session.level(A, C), "no such leg");
+        // Its NACKs still go (the hole of part 120, asked of a first: both
+        // round trips are 0, and a is the first leg).
+        let due = Instant::now() + Duration::from_millis(30);
+        session.poll_legs(due, &mut sender(&mut sent));
         assert!(sent.iter().any(
             |(to, control)| *to == edge() && matches!(control, Control::Nack { token: 5, .. })
         ));
         // A refresh still goes to it.
         sent.clear();
-        let at = now + Duration::from_secs(2);
+        let at = due + REFRESH;
         session.poll_legs(at, &mut sender(&mut sent));
         assert!(sent.iter().any(|(to, control)| *to == edge()
             && matches!(control, Control::Subscribe { token: Some(5), .. })));
         // A take-back: the edge's OK makes it live again.
-        session.takeback_leg(a, at, &mut sender(&mut sent));
+        let ms = Duration::from_millis(1);
+        session.takeback_leg(A, at, &mut sender(&mut sent));
         session.on_datagram(edge(), &ok(140), at + ms, &mut sender(&mut sent));
-        assert!(session
-            .take_events()
-            .contains(&LegEvent::TakenBack { leg: a }));
-        assert_eq!(view(&session, a).state, LegState::Live);
+        assert!(events(&mut session).contains(&LegEvent::TakenBack(A)));
+        assert_eq!(held(&session, A).state, State::Live);
         // Released: UNSUB now and 20 ms later; its datagrams no longer
         // deliver.
         sent.clear();
-        session.release_leg(a, at, &mut sender(&mut sent));
+        session.release_leg(A, at, &mut sender(&mut sent));
         session.poll_legs(at + ms * 20, &mut sender(&mut sent));
         let unsubs = sent
             .iter()
@@ -3616,6 +4041,36 @@ mod tests {
         assert_eq!(unsubs, 2);
         session.on_datagram(edge(), &part(141), at + ms * 21, &mut sender(&mut sent));
         assert!(session.next_object().is_none());
-        assert_eq!(session.legs().len(), 1);
+        assert!(session.leg(A, at).is_none() && session.leg(B, at).is_some());
+    }
+
+    /// B X5 (3.9): once 8 of the last 16 parts delivered came as RaptorQ
+    /// objects, the director is told, once.
+    #[test]
+    fn a_stream_of_objects_is_reported_once() {
+        let now = Instant::now();
+        let mut session = UdpSession::new(SessionConfig::new(7), now);
+        let mut send = |_: SocketAddr, _: &[u8]| {};
+        session.add_leg(A, "a", edge(), start(), now, &mut send);
+        let mut reported = Vec::new();
+        for number in 1..=20_u64 {
+            let object = PartObject {
+                kind: ObjectKind::Part,
+                datagrams: 0,
+                stream_id: 7,
+                part: number,
+                available_unix_us: 5,
+                published_unix_us: 4,
+                payload: Bytes::from_static(&[9_u8; 2_000]),
+            };
+            for datagram in encode_object(&object, 1_200, RepairPolicy::default()).unwrap() {
+                session.on_datagram(edge(), &datagram, now, &mut send);
+                while session.next_object().is_some() {}
+            }
+            if events(&mut session).contains(&LegEvent::ObjectLane) {
+                reported.push(number);
+            }
+        }
+        assert_eq!(reported, vec![16]);
     }
 }
