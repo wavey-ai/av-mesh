@@ -45369,4 +45369,8 @@ mod tests {
     /// first integration): one leg as the wave 9 client, two legs on two
     /// edges.
     mod two_leg_session;
+    /// Two-path listeners (the director over the session) against four
+    /// edges and two entry points in this process, through the referee's
+    /// changes (B Y5).
+    mod two_paths;
 }

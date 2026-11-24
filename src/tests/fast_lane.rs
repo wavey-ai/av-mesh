@@ -283,6 +283,38 @@ impl LaneEdge {
         max_subscribers: usize,
         send_twins: bool,
     ) -> Self {
+        let client = "127.0.0.1:0".parse().unwrap();
+        Self::start_full(
+            ip,
+            client,
+            hole_distance,
+            max_subscribers,
+            send_twins,
+            |router| router,
+        )
+        .await
+    }
+
+    /// An edge whose client UDP sockets are at `client`, its router made
+    /// by `configure` (B Y5: the edges of a region at one port on their own
+    /// addresses, as a deploy has them, each with its node and rules).
+    pub(super) async fn start_at(
+        ip: Ipv4Addr,
+        client: SocketAddr,
+        max_subscribers: usize,
+        configure: impl FnOnce(AppRouter) -> AppRouter,
+    ) -> Self {
+        Self::start_full(ip, client, Duration::ZERO, max_subscribers, true, configure).await
+    }
+
+    async fn start_full(
+        ip: Ipv4Addr,
+        client: SocketAddr,
+        hole_distance: Duration,
+        max_subscribers: usize,
+        send_twins: bool,
+        configure: impl FnOnce(AppRouter) -> AppRouter,
+    ) -> Self {
         let (ports, sockets) = bind_edge_class_ports(ip);
         let forwarders = [
             UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap(),
@@ -339,21 +371,18 @@ impl LaneEdge {
             cache.relay_ingress_snapshot().fast_plane.threads == 2
         })
         .await;
-        let router = app_router_for_tests(Arc::clone(&cache), mesh);
-        let client_sockets = bind_edge_class_sockets_with(
-            "127.0.0.1:0".parse().unwrap(),
-            4 << 20,
-            cache.stream_classes(),
-            send_twins,
-        )
-        .unwrap()
-        .with_fast_lane(Some(Arc::clone(&lane)))
-        .with_hop_journal(Some(journal));
+        let router = configure(app_router_for_tests(Arc::clone(&cache), mesh));
+        let client_sockets =
+            bind_edge_class_sockets_with(client, 4 << 20, cache.stream_classes(), send_twins)
+                .unwrap()
+                .with_fast_lane(Some(Arc::clone(&lane)))
+                .with_hop_journal(Some(journal));
         let client_port = client_sockets
             .class_socket(fast_plane::TrafficClass::Audio)
             .local_addr()
             .unwrap();
-        let stats: Arc<edge_udp::EdgeUdpStats> = Arc::default();
+        // The edge's counters are its router's, as a node's are.
+        let stats = Arc::clone(&router.edge_udp_stats);
         let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, max_subscribers);
         // A host stall must not make the cache-fed lane skip a part it owes.
         config.playout = Duration::from_secs(5);
