@@ -110,16 +110,17 @@ impl Resolver {
                     });
                     let config = Arc::new(config);
                     let limit = Arc::new(tokio::sync::Semaphore::new(config.in_flight.max(1)));
+                    let names = Arc::new(Names::default());
                     let answer_txs = Arc::new(answer_txs);
                     while let Some(request) = rx.recv().await {
-                        let (http, config, limit, answer_txs) = (
+                        let (http, config, limit, names, answer_txs) = (
                             Arc::clone(&http),
                             Arc::clone(&config),
                             Arc::clone(&limit),
+                            Arc::clone(&names),
                             Arc::clone(&answer_txs),
                         );
                         tokio::spawn(async move {
-                            let _permit = limit.acquire().await;
                             let reply = match request.job {
                                 Job::Https {
                                     id,
@@ -127,6 +128,7 @@ impl Resolver {
                                     path,
                                     sid,
                                 } => {
+                                    let _permit = limit.acquire().await;
                                     let body = tokio::time::timeout(
                                         config.timeout,
                                         ask(&http, &entry, &path, &sid),
@@ -137,15 +139,7 @@ impl Resolver {
                                     Reply::Https { id, body }
                                 }
                                 Job::Resolve { host } => {
-                                    let ip = tokio::time::timeout(
-                                        config.timeout,
-                                        tokio::net::lookup_host((host.as_str(), 0)),
-                                    )
-                                    .await
-                                    .ok()
-                                    .and_then(Result::ok)
-                                    .and_then(|mut addrs| addrs.next())
-                                    .map(|addr| addr.ip());
+                                    let ip = names.resolve(&host, config.timeout).await;
                                     Reply::Resolved { host, ip }
                                 }
                             };
@@ -183,6 +177,54 @@ impl Drop for Resolver {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+/// A name lookup is kept this long, a failed one this long: a wave of
+/// thousands of joins (each a director that resolves its entry points)
+/// makes one lookup a host, as the real client makes one a process.
+const RESOLVED_KEPT: Duration = Duration::from_secs(60);
+const UNRESOLVED_KEPT: Duration = Duration::from_secs(1);
+
+type Lookup = Arc<tokio::sync::OnceCell<(std::time::Instant, Option<IpAddr>)>>;
+
+/// The resolver's name lookups by host: one in flight a host, its answer
+/// shared by every request that asked meanwhile and kept for a while.
+#[derive(Default)]
+struct Names {
+    lookups: std::sync::Mutex<HashMap<String, Lookup>>,
+}
+
+impl Names {
+    async fn resolve(&self, host: &str, timeout: Duration) -> Option<IpAddr> {
+        let lookup = {
+            let mut lookups = self.lookups.lock().unwrap();
+            let fresh = |lookup: &Lookup| {
+                lookup.get().is_none_or(|(at, ip)| {
+                    at.elapsed() < if ip.is_some() { RESOLVED_KEPT } else { UNRESOLVED_KEPT }
+                })
+            };
+            match lookups.get(host) {
+                Some(lookup) if fresh(lookup) => Arc::clone(lookup),
+                _ => {
+                    let lookup = Lookup::default();
+                    lookups.insert(host.to_owned(), Arc::clone(&lookup));
+                    lookup
+                }
+            }
+        };
+        lookup
+            .get_or_init(|| async {
+                let ip = tokio::time::timeout(timeout, tokio::net::lookup_host((host, 0)))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .and_then(|mut addrs| addrs.next())
+                    .map(|addr| addr.ip());
+                (std::time::Instant::now(), ip)
+            })
+            .await
+            .1
     }
 }
 
@@ -329,6 +371,32 @@ mod tests {
         assert_eq!(host_of("10.0.0.1:19444"), "10.0.0.1");
         assert_eq!(host_of("[::1]:443"), "::1");
         assert_eq!(host_of("edge.example"), "edge.example");
+    }
+
+    /// A crowd of directors resolving one entry point's name: one lookup,
+    /// shared, and kept for the next.
+    #[tokio::test]
+    async fn a_host_is_looked_up_once_for_a_crowd_and_kept() {
+        let names = Arc::new(Names::default());
+        let crowd: Vec<_> = (0..200)
+            .map(|_| {
+                let names = Arc::clone(&names);
+                tokio::spawn(async move { names.resolve("localhost", Duration::from_secs(5)).await })
+            })
+            .collect();
+        for listener in crowd {
+            assert!(listener.await.unwrap().is_some());
+        }
+        let lookup = |names: &Names| {
+            let lookups = names.lookups.lock().unwrap();
+            assert_eq!(lookups.len(), 1);
+            Arc::clone(&lookups["localhost"])
+        };
+        let done = lookup(&names);
+        assert!(done.get().is_some_and(|(_, ip)| ip.is_some()));
+        // Kept: the next request takes the same lookup's answer.
+        assert!(names.resolve("localhost", Duration::from_secs(5)).await.is_some());
+        assert!(Arc::ptr_eq(&done, &lookup(&names)), "no second lookup");
     }
 
     #[test]
