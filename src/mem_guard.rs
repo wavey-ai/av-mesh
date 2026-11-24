@@ -648,6 +648,64 @@ mod tests {
         assert_eq!(parse_cgroup_limit("2147483648\n"), Some(2 * GB));
     }
 
+    /// Integration 5: the budgets of a g6-dedicated-2 (MemTotal 3,921 MB on
+    /// Linode) as the lab runs it. Under the mesh unit's `MemoryHigh=75%`
+    /// and `MemoryMax=85%`, `auto` is taken of the cgroup's memory.high (75%
+    /// of MemTotal): every share shrinks by a quarter. The deploy therefore
+    /// renders the shares of MemTotal explicitly, which gives back the
+    /// budgets of a node without the unit's limits. Printed with
+    /// `--nocapture` for the hand-over.
+    #[test]
+    fn a_four_gb_linode_s_budgets_with_and_without_the_unit_s_limits() {
+        let auto = MemSetting::Auto;
+        let node = four_gb();
+        let unit = NodeMemory {
+            cgroup_high_bytes: Some(node.total_bytes / 100 * 75),
+            cgroup_max_bytes: Some(node.total_bytes / 100 * 85),
+            ..node
+        };
+        let plain = Budgets::resolve(node, auto, auto, auto, auto, auto);
+        let under_unit = Budgets::resolve(unit, auto, auto, auto, auto, auto);
+        // What the deploy renders on a g6-dedicated-2: 10%, 50% and 65% of
+        // 3,921 MB.
+        let rendered = Budgets::resolve(
+            unit,
+            MemSetting::Mb(392),
+            auto,
+            MemSetting::Mb(1_960),
+            MemSetting::Mb(2_548),
+            auto,
+        );
+        for (name, budgets) in [
+            ("auto, no cgroup limit", plain),
+            ("auto, MemoryHigh=75% MemoryMax=85%", under_unit),
+            ("rendered 392/1960/2548, same unit", rendered),
+        ] {
+            println!(
+                "{name}: node {} MB, video cache {} MB, per playlist {} MB, shed floor {} MB, \
+                 soft {} MB, hard {} MB, sockets {} MB asked",
+                budgets.node_memory_bytes / MB,
+                budgets.video_cache_bytes / MB,
+                budgets.video_cache_playlist_bytes / MB,
+                budgets.shed_floor_bytes / MB,
+                budgets.soft_bytes / MB,
+                budgets.hard_bytes / MB,
+                budgets.socket_bytes / MB,
+            );
+        }
+        assert_eq!(under_unit.node_memory_bytes, unit.cgroup_high_bytes.unwrap());
+        assert!(under_unit.video_cache_bytes < plain.video_cache_bytes * 8 / 10);
+        assert!(under_unit.hard_bytes < unit.cgroup_high_bytes.unwrap());
+        // Rendered, the budgets are the plain node's (within a MB of
+        // rounding) and the hard limit stays under memory.high.
+        assert!(rendered.video_cache_bytes.abs_diff(plain.video_cache_bytes) < MB);
+        assert!(rendered.soft_bytes.abs_diff(plain.soft_bytes) < MB);
+        assert!(rendered.hard_bytes.abs_diff(plain.hard_bytes) < MB);
+        assert!(rendered.hard_bytes < unit.cgroup_high_bytes.unwrap());
+        // The sockets' budget is the UDP threshold's quarter either way.
+        assert_eq!(rendered.socket_bytes, plain.socket_bytes);
+    }
+
     #[test]
     fn the_guard_sheds_at_its_limits_and_leaves_them_below_ninety_percent() {
         let guard = Guard::new(2 * GB, 3 * GB);
