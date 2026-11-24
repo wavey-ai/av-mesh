@@ -372,6 +372,10 @@ pub struct FastPlaneStats {
     /// Validated epochs that found no slot in the class threads' table
     /// (`ValidatedEpochs::unrecorded`): their streams are never stale.
     pub media_clock_unrecorded: AtomicU64,
+    /// The loss (ppm) the video thread measures on each parent lane, by
+    /// `lane_index`, against its parent's ledgers (4k-repair: the
+    /// contributor's video lanes, and a forwarder's to its children).
+    pub video_parent_loss_ppm: [AtomicU64; 2],
 }
 
 /// The counters of one parent lane (one receive socket) of the audio class.
@@ -704,6 +708,8 @@ pub struct FastPlaneSnapshot {
     /// The video sockets' receive buffers as the kernel reports them, the
     /// larger of the two (fix4-video: sized to two seconds of the stream).
     pub video_socket_buffer_bytes: u64,
+    /// The loss the video thread measures on each parent lane (ppm).
+    pub video_parent_loss_ppm: [u64; 2],
 }
 
 impl FastPlaneStats {
@@ -790,6 +796,10 @@ impl FastPlaneStats {
                 .map(load)
                 .max()
                 .unwrap_or(0),
+            video_parent_loss_ppm: [
+                load(&self.video_parent_loss_ppm[0]),
+                load(&self.video_parent_loss_ppm[1]),
+            ],
         }
     }
 }
@@ -1767,8 +1777,11 @@ impl ClassThread {
         let mut copies = (self.class == TrafficClass::Audio && self.forwarder.is_some())
             .then(|| BurstCopies::new(self.burst_copy_ms.saturating_mul(1_000)))
             .flatten();
-        // The loss of each parent lane, on the audio thread.
-        let mut meters: Vec<LossMeter> = if self.loss_report && self.class == TrafficClass::Audio {
+        // The loss of each parent lane: on the audio thread (the copies of
+        // one-symbol audio parts), and on the video thread (4k-repair: the
+        // contributor sizes video repair to it, a forwarder its children's
+        // link repair, a child its asks).
+        let mut meters: Vec<LossMeter> = if self.loss_report {
             self.sockets.iter().map(|_| LossMeter::new()).collect()
         } else {
             Vec::new()
@@ -1978,14 +1991,20 @@ impl ClassThread {
                 }
             }
             worst = worst.max(meter.loss_ppm());
+            if self.class == TrafficClass::Video {
+                self.stats.video_parent_loss_ppm[lane_index(self.sockets[index].0)]
+                    .store(u64::from(meter.loss_ppm()), Ordering::Relaxed);
+            }
             if let Some(lane) = self.stats.lane(self.class, self.sockets[index].0) {
                 lane.loss_ppm
                     .store(u64::from(meter.loss_ppm()), Ordering::Relaxed);
             }
         }
-        self.stats
-            .parent_loss_ppm
-            .store(u64::from(worst), Ordering::Relaxed);
+        if self.class == TrafficClass::Audio {
+            self.stats
+                .parent_loss_ppm
+                .store(u64::from(worst), Ordering::Relaxed);
+        }
     }
 
     /// Send the burst copies that are due, after the batch's own sends.

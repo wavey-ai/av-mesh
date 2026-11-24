@@ -120,7 +120,7 @@ impl Frame {
 /// The canonical envelope of 4K frame `sequence` of `media_bytes`, as
 /// av-contrib's `build_fmp4_media_object` builds it, at `fps` frames a
 /// second.
-fn frame_envelope(stream_id: u64, sequence: u64, media_bytes: usize, fps: u64) -> Vec<u8> {
+pub(super) fn frame_envelope(stream_id: u64, sequence: u64, media_bytes: usize, fps: u64) -> Vec<u8> {
     let mut media = vec![0_u8; media_bytes];
     for (index, byte) in media.iter_mut().enumerate() {
         *byte = ((index as u64 * 31 + sequence * 7) % 251) as u8;

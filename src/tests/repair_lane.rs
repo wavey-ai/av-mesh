@@ -499,3 +499,78 @@ async fn a_forwarder_passes_its_childrens_demand_only_when_each_has_reported() {
     }
     relay.stop().await;
 }
+
+/// 4k-repair (a): the video thread measures its parent lane against the
+/// parent's video ledgers (RLL1 on the video socket) and reports the loss
+/// (RLR1) from the video socket, as the audio thread does for audio: the
+/// contributor sizes each video part's repair to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_video_thread_reports_the_loss_of_its_parent_lane() {
+    let (child, _child_video) = bind_class_pair(1_000).await;
+    let relay = start_fast_relay_with(
+        ParentPath::Secondary,
+        &[(child.local_addr().unwrap(), RelayForwardRole::All)],
+        fast_plane::relay::RelayClassConfig {
+            port_offset: 1_000,
+            cpus: [None, None],
+            realtime: false,
+            tee_capacity: 8_192,
+            loss_report: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let video = relay.primary_video.expect("a video port");
+    let deadline = now_unix_us() + 600_000_000;
+    let started = Instant::now();
+    let (mut sent, mut index) = (0_u64, 0_u64);
+    // 2 s of 40 KB video parts at 50 a second, every 20th datagram lost.
+    for part in 0..100_u64 {
+        tokio::time::sleep_until((started + Duration::from_millis(part * 20)).into()).await;
+        let envelope = super::video_throughput::frame_envelope(1, part, 40_000, 50);
+        let (sources, _) = fast_test_symbols(
+            &envelope,
+            relay_session::MediaPriority::VideoDelta,
+            1_200,
+            400,
+            1,
+            deadline,
+        );
+        for datagram in &sources {
+            if index % 20 != 7 {
+                relay.primary_sender.send_to(datagram, video).await.unwrap();
+            }
+            index += 1;
+            sent += 1;
+            if sent % 100 == 0 {
+                relay
+                    .primary_sender
+                    .send_to(&fast_plane::loss_report::encode_ledger(sent), video)
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+    let mut reports = Vec::new();
+    let mut buf = [0_u8; 64];
+    while let Ok(Ok((len, from))) = tokio::time::timeout(
+        Duration::from_millis(1_200),
+        relay.primary_sender.recv_from(&mut buf),
+    )
+    .await
+    {
+        if let Some(report) = decode_loss_report(&buf[..len]) {
+            assert_eq!(from, video, "from the video socket the symbols came to");
+            reports.push(report);
+        }
+        if reports.len() > 16 {
+            break;
+        }
+    }
+    let snapshot = relay.stats();
+    relay.stop().await;
+    let (last, _) = *reports.last().expect("a lossy video lane is reported");
+    assert!((35_000..=65_000).contains(&last), "{reports:?}");
+    assert!((35_000..=65_000).contains(&snapshot.video_parent_loss_ppm[0]), "{snapshot:?}");
+    assert_eq!(snapshot.parent_loss_ppm, 0, "the audio lanes' figure is not the video's");
+}
