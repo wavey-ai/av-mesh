@@ -1576,6 +1576,29 @@ struct Args {
     )]
     relay_video_tee_mb: usize,
 
+    /// Milliseconds of its stream that a video RelaySession socket of the
+    /// fast plane holds: once a second its receive buffer grows to this
+    /// long of the busiest second it has had, from --udp-socket-buffer-bytes
+    /// up to --relay-video-socket-buffer-max-mb, and never shrinks. The 8
+    /// MiB default held 0.3 s at 247 Mbit/s of 4K, less than a stalled
+    /// node's class thread is away. Past net.core.rmem_max it needs
+    /// CAP_NET_ADMIN. 0 leaves the sockets as made.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_VIDEO_SOCKET_BUFFER_MS",
+        default_value_t = fast_plane::relay::DEFAULT_VIDEO_SOCKET_BUFFER_MS
+    )]
+    relay_video_socket_buffer_ms: u64,
+
+    /// MiB a video socket's receive buffer may be asked for at most (the
+    /// kernel books twice that in buffer memory while it is full).
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_VIDEO_SOCKET_BUFFER_MAX_MB",
+        default_value_t = fast_plane::relay::DEFAULT_VIDEO_SOCKET_BUFFER_MAX_BYTES >> 20
+    )]
+    relay_video_socket_buffer_max_mb: usize,
+
     /// Feed every cache-mesh playlist lease that this node serves on the
     /// fast plane as well: a forwarder with --relay-class-threads sends the
     /// contributor's RLS1 symbols of a leased stream to the child (an edge)
@@ -4329,6 +4352,9 @@ async fn main() -> Result<()> {
         // A 2.5: the class threads' media clocks take the budget that the
         // receiver and the warm holds take (join J2 of the A reports).
         media_deadline_us: args.relay_media_deadline_us(),
+        socket_buffer_bytes: args.udp_socket_buffer_bytes,
+        video_socket_buffer_ms: args.relay_video_socket_buffer_ms,
+        video_socket_buffer_max_bytes: args.relay_video_socket_buffer_max_mb.saturating_mul(1 << 20),
         ..Default::default()
     };
     let fec_ingest_task = match (fec_socket, class_sockets) {
@@ -46035,6 +46061,9 @@ mod tests {
                 lease_descriptors: true,
                 video_gro: true,
                 media_deadline_us: fast_plane::relay::DEFAULT_MEDIA_DEADLINE_US,
+                socket_buffer_bytes: 4 << 20,
+                video_socket_buffer_ms: 0,
+                video_socket_buffer_max_bytes: 0,
                 test_tee_panic: Some(fast_plane::TrafficClass::Audio),
                 test_video_tee_spin_ns: 0,
                 test_alloc_counter: None,

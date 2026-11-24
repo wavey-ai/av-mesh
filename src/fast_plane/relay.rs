@@ -65,6 +65,12 @@ pub const DEFAULT_TEE_CAPACITY: usize = 65_536;
 /// lab run. Only the first 16 MB is faulted in and locked at start; the
 /// rest when a video datagram first comes (`tee_ring::tee_ring_growing`).
 pub const DEFAULT_VIDEO_TEE_BYTES: usize = 96 << 20;
+/// `--relay-video-socket-buffer-ms`: a video socket holds two seconds of
+/// its stream's busiest second (`VideoSocketBuffers`).
+pub const DEFAULT_VIDEO_SOCKET_BUFFER_MS: u64 = 2_000;
+/// `--relay-video-socket-buffer-max-mb`: 128 MiB asked (the kernel books
+/// twice that in buffer memory: about 2.7 s at 300 Mbit/s of 4K).
+pub const DEFAULT_VIDEO_SOCKET_BUFFER_MAX_BYTES: usize = 128 << 20;
 /// Symbols the first-arrival table remembers per class.
 const DEDUP_CAPACITY: usize = 65_536;
 /// How often an idle class thread looks at the stop flag.
@@ -140,6 +146,15 @@ pub struct RelayClassConfig {
     /// `--relay-media-deadline-ms` in µs (A 2.5): a datagram whose deadline
     /// is this far behind the head of its stream's timeline here is stale.
     pub media_deadline_us: u64,
+    /// The receive buffer the class sockets were made with
+    /// (`--udp-socket-buffer-bytes`): the least a video socket keeps.
+    pub socket_buffer_bytes: usize,
+    /// `--relay-video-socket-buffer-ms` (fix4-video): a video socket's
+    /// receive buffer grows to hold this long of the most its stream
+    /// brought in a second, up to `video_socket_buffer_max_bytes`; 0 leaves
+    /// it as made.
+    pub video_socket_buffer_ms: u64,
+    pub video_socket_buffer_max_bytes: usize,
     /// Tests: the tee of this class panics on its first datagram.
     #[cfg(test)]
     pub test_tee_panic: Option<TrafficClass>,
@@ -175,6 +190,9 @@ impl Default for RelayClassConfig {
             lease_descriptors: true,
             video_gro: true,
             media_deadline_us: DEFAULT_MEDIA_DEADLINE_US,
+            socket_buffer_bytes: 8 << 20,
+            video_socket_buffer_ms: DEFAULT_VIDEO_SOCKET_BUFFER_MS,
+            video_socket_buffer_max_bytes: DEFAULT_VIDEO_SOCKET_BUFFER_MAX_BYTES,
             #[cfg(test)]
             test_tee_panic: None,
             #[cfg(test)]
@@ -346,6 +364,11 @@ pub struct FastPlaneStats {
     /// class's ring in use.
     pub tee_dropped_growing: AtomicU64,
     pub tee_ring_bytes: [AtomicU64; 2],
+    /// Bytes the video sockets received, by `lane_index` (primary,
+    /// secondary), and their receive buffers as the kernel reports them
+    /// (twice what was asked: its booking of buffer memory).
+    pub video_rx_bytes: [AtomicU64; 2],
+    pub video_socket_buffer_bytes: [AtomicU64; 2],
     /// Validated epochs that found no slot in the class threads' table
     /// (`ValidatedEpochs::unrecorded`): their streams are never stale.
     pub media_clock_unrecorded: AtomicU64,
@@ -678,6 +701,9 @@ pub struct FastPlaneSnapshot {
     /// and the bytes of the video tee ring in use.
     pub tee_dropped_growing: u64,
     pub video_tee_ring_bytes: u64,
+    /// The video sockets' receive buffers as the kernel reports them, the
+    /// larger of the two (fix4-video: sized to two seconds of the stream).
+    pub video_socket_buffer_bytes: u64,
 }
 
 impl FastPlaneStats {
@@ -758,6 +784,12 @@ impl FastPlaneStats {
             video_tee_parts_shed: load(&self.tee_parts_shed),
             tee_dropped_growing: load(&self.tee_dropped_growing),
             video_tee_ring_bytes: load(&self.tee_ring_bytes[1]),
+            video_socket_buffer_bytes: self
+                .video_socket_buffer_bytes
+                .iter()
+                .map(load)
+                .max()
+                .unwrap_or(0),
         }
     }
 }
@@ -2032,6 +2064,11 @@ impl ClassThread {
                 .received
                 .fetch_add(batch.len() as u64, Ordering::Relaxed);
         }
+        if class == TrafficClass::Video {
+            // What `VideoSocketBuffers` sizes the socket's buffer to.
+            let bytes: usize = (0..batch.len()).map(|message| batch.data(message).len()).sum();
+            self.stats.video_rx_bytes[lane_index(path)].fetch_add(bytes as u64, Ordering::Relaxed);
+        }
         for message in 0..batch.len() {
             let received = batch.get(message);
             if let Some(dropped) = received.dropped {
@@ -2754,6 +2791,82 @@ impl Tee {
     }
 }
 
+/// The video sockets' receive buffers, sized to their stream (fix4-video,
+/// task 4). A video socket was made with `--udp-socket-buffer-bytes` (8 MiB
+/// asked; the kernel books 16 MiB of buffer memory against it, which holds
+/// 10-12 MB of 1,390-byte datagrams at their skb truesize): 0.3 s at 247
+/// Mbit/s of 4K (37 MB/s on the wire), 0.8-1.1 s at 80. A class thread
+/// that does not run longer than that (a node stopped 1.6-8.5 s, Linode
+/// wave 9) loses what overflows. Once a second this asks the kernel for
+/// `ms` of the busiest second the socket has had, if that is more than it
+/// has, up to `max` (the kernel books twice what is asked, so the buffer
+/// holds about 1.3 times `ms` of that second at a truesize of 1.5 times the
+/// datagram). It never shrinks: a buffer is a bound, not memory, until a
+/// stall fills it. Past `net.core.rmem_max` it needs CAP_NET_ADMIN
+/// (SO_RCVBUFFORCE), which the deploy gives. Off the class thread, on a
+/// timer (`fast_control::run_video_socket_buffers`).
+pub(crate) struct VideoSocketBuffers {
+    sockets: Vec<(usize, std::net::UdpSocket)>,
+    ms: u64,
+    floor: usize,
+    max: usize,
+    asked: [usize; 2],
+    last_bytes: [u64; 2],
+}
+
+/// What a video socket's receive buffer is asked for: `ms` of
+/// `bytes_per_second`, at least `floor` and at most `max` (all as asked of
+/// `SO_RCVBUF`, which the kernel doubles).
+pub(crate) fn video_socket_buffer_target(
+    bytes_per_second: u64,
+    ms: u64,
+    floor: usize,
+    max: usize,
+) -> usize {
+    let wanted = bytes_per_second.saturating_mul(ms) / 1_000;
+    (usize::try_from(wanted).unwrap_or(usize::MAX))
+        .clamp(floor.min(max), max.max(floor))
+}
+
+impl VideoSocketBuffers {
+    fn new(sockets: Vec<(usize, std::net::UdpSocket)>, config: &RelayClassConfig) -> Self {
+        Self {
+            sockets,
+            ms: config.video_socket_buffer_ms,
+            floor: config.socket_buffer_bytes,
+            max: config.video_socket_buffer_max_bytes,
+            asked: [config.socket_buffer_bytes; 2],
+            last_bytes: [0; 2],
+        }
+    }
+
+    /// One second's look: grow each socket whose stream asks for more.
+    pub(crate) fn turn(&mut self, stats: &FastPlaneStats, elapsed: Duration) {
+        for (lane, socket) in &self.sockets {
+            let lane = *lane;
+            let bytes = stats.video_rx_bytes[lane].load(Ordering::Relaxed);
+            let delta = bytes.saturating_sub(self.last_bytes[lane]);
+            self.last_bytes[lane] = bytes;
+            let per_second = (delta as f64 / elapsed.as_secs_f64().max(1e-3)) as u64;
+            let target = video_socket_buffer_target(per_second, self.ms, self.floor, self.max);
+            if self.ms > 0 && target > self.asked[lane] {
+                let granted = sys::grow_receive_buffer(socket, target);
+                info!(
+                    lane,
+                    bytes_per_second = per_second,
+                    asked_bytes = target,
+                    granted_bytes = granted,
+                    "a video socket's receive buffer grows to its stream"
+                );
+                self.asked[lane] = target;
+            }
+            if let Some(granted) = sys::receive_buffer(socket) {
+                stats.video_socket_buffer_bytes[lane].store(granted as u64, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// The relay ingest on the fast plane. Takes the place of
 /// `run_udp_fec_ingest`; `runtime.secondary_socket` is unused (the
 /// secondary port's sockets are among `sockets`).
@@ -2818,9 +2931,16 @@ pub async fn run_relay_class_ingest(
         None => None,
     };
     let mut by_class: [Vec<(RelayIngressParentPath, std::net::UdpSocket)>; 2] = Default::default();
+    // The video sockets again (the same sockets), for their buffers.
+    let mut video_sockets = Vec::new();
     for socket in sockets {
+        if socket.class == TrafficClass::Video {
+            video_sockets.push((lane_index(socket.path), socket.socket.try_clone()?));
+        }
         by_class[socket.class.index()].push((socket.path, socket.socket));
     }
+    let video_buffers = (!video_sockets.is_empty())
+        .then(|| VideoSocketBuffers::new(video_sockets, &config));
     let mut dispatches = [Some(dispatch), Some(video_dispatch)];
     let mut threads = Vec::new();
     let mut tees = tokio::task::JoinSet::new();
@@ -2943,6 +3063,13 @@ pub async fn run_relay_class_ingest(
         Arc::clone(&stats),
         shutdown_rx.clone(),
     ));
+    let video_buffers = video_buffers.map(|buffers| {
+        tokio::spawn(crate::fast_control::run_video_socket_buffers(
+            buffers,
+            Arc::clone(&stats),
+            shutdown_rx.clone(),
+        ))
+    });
     let controller = failover_controller.map(|controller| {
         tokio::spawn(crate::fast_control::run_failover_controller(
             controller,
@@ -2982,6 +3109,9 @@ pub async fn run_relay_class_ingest(
     }
     housekeeping.abort();
     sampler.abort();
+    if let Some(video_buffers) = &video_buffers {
+        video_buffers.abort();
+    }
     stop.store(true, Ordering::Relaxed);
     join_threads(threads).await;
     // With the threads gone the tees' channels close and they end.
@@ -3026,6 +3156,56 @@ mod two_contributors;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_video_socket_buffer_is_asked_for_seconds_of_its_stream() {
+        let (floor, max) = (8 << 20, 128 << 20);
+        // 247 Mbit/s of 4K: 37 MB/s on the wire, two seconds of it.
+        assert_eq!(video_socket_buffer_target(37_000_000, 2_000, floor, max), 74_000_000);
+        // A quiet socket keeps what it was made with.
+        assert_eq!(video_socket_buffer_target(1_000_000, 2_000, floor, max), floor);
+        // 1 Gbit/s is capped.
+        assert_eq!(video_socket_buffer_target(125_000_000, 2_000, floor, max), max);
+        assert_eq!(video_socket_buffer_target(u64::MAX, 2_000, floor, max), max);
+    }
+
+    /// A turn grows a socket whose stream asks for more, never shrinks it,
+    /// and reports what the kernel gave (here within net.core.rmem_max: no
+    /// CAP_NET_ADMIN).
+    #[test]
+    fn a_video_socket_s_buffer_grows_to_its_stream_and_never_shrinks() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let small = 64 * 1024;
+        socket2::SockRef::from(&socket)
+            .set_recv_buffer_size(small)
+            .unwrap();
+        let made = sys::receive_buffer(&socket).unwrap();
+        let stats = FastPlaneStats::default();
+        let config = RelayClassConfig {
+            socket_buffer_bytes: small,
+            video_socket_buffer_ms: 2_000,
+            video_socket_buffer_max_bytes: 1 << 20,
+            ..Default::default()
+        };
+        let mut buffers = VideoSocketBuffers::new(vec![(1, socket.try_clone().unwrap())], &config);
+        // 400 kB in a second: 800 kB asked.
+        stats.video_rx_bytes[1].store(400_000, Ordering::Relaxed);
+        buffers.turn(&stats, Duration::from_secs(1));
+        let grown = sys::receive_buffer(&socket).unwrap();
+        assert!(grown > made, "{made} -> {grown}");
+        assert_eq!(buffers.asked[1], 800_000);
+        assert_eq!(
+            stats.video_socket_buffer_bytes[1].load(Ordering::Relaxed),
+            grown as u64
+        );
+        // A quiet second asks for nothing less; a busier one for no more
+        // than the cap.
+        buffers.turn(&stats, Duration::from_secs(1));
+        assert_eq!(sys::receive_buffer(&socket).unwrap(), grown);
+        stats.video_rx_bytes[1].store(400_000 + 10_000_000, Ordering::Relaxed);
+        buffers.turn(&stats, Duration::from_secs(1));
+        assert_eq!(buffers.asked[1], 1 << 20);
+    }
 
     #[test]
     fn a_video_part_is_teed_whole_or_not_at_all() {
