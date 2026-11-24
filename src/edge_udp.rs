@@ -315,6 +315,9 @@ pub(crate) struct EdgeUdpStats {
     pub bytes: AtomicU64,
     pub send_errors: AtomicU64,
     pub tokens_sent: AtomicU64,
+    /// Tokenless `SUB`s answered `MOVE draining` instead of a token: the
+    /// edge drains (a spare's renewal, a join that raced the drain).
+    pub tokens_withheld: AtomicU64,
     pub bad_tokens: AtomicU64,
     /// Wave 9 B: `ASSIGN` requests answered, and those not answered (too
     /// short, too many at once, or the answer would be longer).
@@ -1870,6 +1873,24 @@ impl EdgeControl {
             }
             // Answer only a request at least as large as the answer.
             if len >= MIN_FIRST_REQUEST_BYTES || token.is_some() {
+                // A draining (or starting, or stopping) edge gives no token:
+                // a listener that holds it as a spare, renewing its token,
+                // drops it and asks its entry for another (av-mesh-fix-3:
+                // a draining edge was kept as a spare until a hedge found
+                // it), and one that joins it is moved a round trip sooner.
+                if self.router.lifecycle.is_draining().await {
+                    self.stats.tokens_withheld.fetch_add(1, Ordering::Relaxed);
+                    send_control(
+                        &socket,
+                        peer,
+                        &Control::Move {
+                            stream_id,
+                            reason: "draining".into(),
+                        },
+                    )
+                    .await;
+                    return;
+                }
                 self.stats.tokens_sent.fetch_add(1, Ordering::Relaxed);
                 send_control(
                     &socket,

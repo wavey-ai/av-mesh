@@ -658,6 +658,8 @@ struct Live {
     /// nodes of the legs it holds that are not leaving.
     state: std::sync::Mutex<String>,
     legs: std::sync::Mutex<Vec<String>>,
+    /// The director's spare.
+    spare: std::sync::Mutex<Option<String>>,
     /// Its socket's address.
     addr: std::sync::Mutex<Option<SocketAddr>>,
 }
@@ -925,6 +927,7 @@ async fn listen(
                 .filter(|leg| leg.leaving.is_none() && leg.hedge_for.is_none())
                 .map(|leg| leg.node.clone())
                 .collect();
+            *live.spare.lock().unwrap() = director.spare().map(str::to_owned);
             *live.state.lock().unwrap() = format!(
                 "{}: legs {legs:?}, spare {:?}, want {}, skipped {:?}, delivering {delivering}",
                 config.sid,
@@ -1766,6 +1769,185 @@ async fn a_sigterm_stop_hands_two_path_listeners_over() {
         assert!(!handovers.is_empty(), "{}: moved off {stopped_node}", run.sid);
         assert_handovers(run, handovers);
     }
+}
+
+/// The edge that most listeners hold as their spare, and how many do.
+fn busiest_spare(region: &Region, crowd: &Crowd) -> (usize, usize) {
+    (0..4)
+        .map(|index| {
+            let node = region.node(index);
+            let holders = crowd
+                .lives
+                .iter()
+                .filter(|live| live.spare.lock().unwrap().as_deref() == Some(node.as_str()))
+                .count();
+            (index, holders)
+        })
+        .max_by_key(|(_, holders)| *holders)
+        .unwrap()
+}
+
+/// av-mesh-fix-3 (by2's open item): a draining edge is not kept as a spare.
+/// It answers the renewal of a spare's token with `MOVE draining`, and the
+/// listener drops it and asks its entry for another, which never names a
+/// draining edge; by the second renewal (15 s) no listener holds it, and
+/// none does again. The drain itself hands its legs over as any drain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_draining_edge_is_not_kept_as_a_spare() {
+    let _serial = SERIAL.lock().await;
+    let region = Region::start(232, Payload::Pcm, [100; 4]).await;
+    let crowd = Crowd::join(&region, listeners("spare-drain", 12)).await;
+    steady(STEADY_BEFORE).await;
+    let (index, holders) = busiest_spare(&region, &crowd);
+    let node = region.node(index);
+    assert!(holders > 0, "a listener holds a spare at {node}:\n{}", crowd.describe());
+    let start = now_us();
+    drain_watched(&region, &crowd, index, Duration::from_secs(6)).await;
+    let marks = Marks {
+        start,
+        end: now_us(),
+    };
+    let held_there = |crowd: &Crowd| {
+        crowd
+            .lives
+            .iter()
+            .filter(|live| live.spare.lock().unwrap().as_deref() == Some(node.as_str()))
+            .count()
+    };
+    until(
+        "no listener holds the draining edge as its spare",
+        av_mesh::client_director::SPARE_RENEW + Duration::from_secs(2),
+        || held_there(&crowd) == 0,
+    )
+    .await;
+    let withheld = region.edge(index).stats.tokens_withheld.load(Ordering::Relaxed);
+    assert!(withheld > 0, "the renewals at {node} were answered MOVE");
+    // Nor named again while it drains.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(held_there(&crowd), 0, "{}", crowd.describe());
+    let (runs, last, sent) = finish(&region, crowd, marks).await;
+    region.shutdown().await;
+    assert_the_rule(
+        "a_draining_edge_is_not_kept_as_a_spare",
+        &runs,
+        marks,
+        last,
+        &sent,
+        Payload::Pcm.part_us(),
+    );
+    let moved: u64 = runs.iter().map(|run| run.stats.spares_moved).sum();
+    eprintln!("spare drain: {holders} spares at {node}, {moved} dropped at a MOVE, {withheld} tokens withheld");
+    assert!(moved >= holders as u64, "{moved} of {holders} spares dropped");
+}
+
+/// av-mesh-fix-3 (by2's open item): an edge restarted at its address
+/// (new process, new token keys) leaves no listener on a token the new
+/// process does not know. The in-process edge takes about a second to
+/// start (its class threads' warm-up); a restart within 200 ms meets the
+/// listeners the same way, since a leg silent for 200 ms is dead whether or
+/// not the new process is up, and a refresh that reaches the new process
+/// first is answered with its token and taken at once. Its legs there go
+/// silent and are replaced as after a kill; a spare there holds the old process's token
+/// until a hedge or a renewal uses it, and the new process answers that
+/// with a token of its own, which the hedge takes at once (one round trip
+/// more, B 3.8). Here another edge is killed 2 s after the restart, so the
+/// listeners that held their spare at the restarted edge hedge there with
+/// the dead token: every one of them is on two paths again within the
+/// kill's bound, and nothing is missing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_edge_leaves_no_leg_or_spare_on_a_dead_token() {
+    let _serial = SERIAL.lock().await;
+    let region = Region::start(240, Payload::Opus, [100; 4]).await;
+    let crowd = Crowd::join(&region, listeners("restart", 12)).await;
+    steady(STEADY_BEFORE).await;
+    let (restarted, holders) = busiest_spare(&region, &crowd);
+    let restarted_node = region.node(restarted);
+    assert!(holders > 0, "{}", crowd.describe());
+    let spares_there: Vec<usize> = crowd
+        .lives
+        .iter()
+        .enumerate()
+        .filter(|(_, live)| {
+            live.spare.lock().unwrap().as_deref() == Some(restarted_node.as_str())
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let start = now_us();
+    let began = Instant::now();
+    region.kill(restarted).await;
+    region.start_edge(restarted).await;
+    let took = began.elapsed();
+    eprintln!("restart of {restarted_node} took {took:?}");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Another edge with legs of the listeners whose spare is at the
+    // restarted edge is killed: they hedge there with the old token.
+    let killed = (0..4)
+        .filter(|index| *index != restarted)
+        .max_by_key(|index| {
+            let node = region.node(*index);
+            spares_there
+                .iter()
+                .filter(|listener| {
+                    crowd.lives[**listener]
+                        .legs
+                        .lock()
+                        .unwrap()
+                        .contains(&node)
+                })
+                .count()
+        })
+        .unwrap();
+    let killed_node = region.node(killed);
+    region.kill(killed).await;
+    let marks = Marks {
+        start,
+        end: now_us(),
+    };
+    until(
+        "every listener on two paths after the restart and the kill",
+        Duration::from_secs(10),
+        || crowd.all_on_two_paths(),
+    )
+    .await;
+    let bad_tokens = region
+        .edge(restarted)
+        .stats
+        .bad_tokens
+        .load(Ordering::Relaxed);
+    let (runs, last, sent) = finish(&region, crowd, marks).await;
+    region.shutdown().await;
+    assert_the_rule(
+        "a_restarted_edge_leaves_no_leg_or_spare_on_a_dead_token",
+        &runs,
+        marks,
+        last,
+        &sent,
+        Payload::Opus.part_us(),
+    );
+    let mut hedged_with_old_token = 0;
+    for listener in &spares_there {
+        let run = &runs[*listener];
+        for replacement in run
+            .replacements
+            .iter()
+            .filter(|r| r.from == killed_node && r.to == restarted_node)
+        {
+            hedged_with_old_token += 1;
+            let exposure = replacement.exposure.expect("an exposure");
+            assert!(
+                exposure <= Duration::from_millis(500),
+                "{}: {replacement:?}",
+                run.sid
+            );
+        }
+    }
+    for run in held_at(&runs, &killed_node) {
+        let (_, longest) = single_path_in(run, marks);
+        assert!(longest <= 500_000, "{}: {longest} us on one path", run.sid);
+    }
+    eprintln!(
+        "restart: {holders} spares at {restarted_node}; {hedged_with_old_token} hedged there after {killed_node}'s kill; {bad_tokens} dead tokens answered there"
+    );
 }
 
 /// 72 two-path listeners of 2.5 ms Opus on four edges; the edge with the

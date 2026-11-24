@@ -436,6 +436,9 @@ pub struct DirectorStats {
     pub hedges_released: u64,
     /// Spares dropped for unanswered renewals.
     pub spares_dropped: u64,
+    /// Spares whose edge answered their token's renewal with `MOVE` (it
+    /// drains): dropped, and another asked for.
+    pub spares_moved: u64,
     pub failovers: u64,
     pub home_returns: u64,
     pub takebacks: u64,
@@ -999,6 +1002,31 @@ impl Director {
             return false;
         };
         let assigned = rest.starts_with(b"ASSIGNED ");
+        // The spare's edge drains: it answered the renewal of the token
+        // with `MOVE` (av-mesh-fix-3). The spare is dropped, its node
+        // skipped as a moved leg's is, and another asked for.
+        if rest.starts_with(b"MOVE ")
+            && self.spare.as_ref().is_some_and(|spare| spare.addr == peer)
+            && !self.legs.iter().any(|leg| leg.addr == peer)
+        {
+            if let Some(Control::Move { stream_id, .. }) = Control::decode(datagram) {
+                if stream_id == self.config.stream_id {
+                    if let Some(spare) = self.spare.take() {
+                        self.skip.insert(
+                            spare.node,
+                            Skip {
+                                since: now,
+                                until: Some(now + SKIP_AFTER_MOVE),
+                                cause: SkipCause::Moved,
+                            },
+                        );
+                        self.stats.spares_moved += 1;
+                    }
+                    self.run(legs, now, out);
+                    return true;
+                }
+            }
+        }
         if !assigned && !rest.starts_with(b"TOKEN ") {
             return false;
         }
