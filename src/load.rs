@@ -231,6 +231,9 @@ pub struct Counters {
     pub refused_before_start: u64,
     pub generation_returns: u64,
     pub refusing_legs: u64,
+    /// Legs failed because no media came for a second while their edge
+    /// said the stream went on (stuck4k).
+    pub stalled_legs: u64,
     /// Fix 4 (F5): a listener's part numbers jumped ahead past its tracked
     /// window (an outage of the source, a wide hole): each jump once, and
     /// the parts it passed over, which are not counted as `missing`.
@@ -362,6 +365,7 @@ impl Counters {
         self.refused_before_start += other.refused_before_start;
         self.generation_returns += other.generation_returns;
         self.refusing_legs += other.refusing_legs;
+        self.stalled_legs += other.stalled_legs;
         self.jumps += other.jumps;
         self.jump_parts += other.jump_parts;
         self.first_parts += other.first_parts;
@@ -460,6 +464,7 @@ impl Counters {
             },
             "generation_returns": self.generation_returns,
             "refusing_legs": self.refusing_legs,
+            "stalled_legs": self.stalled_legs,
             "jumps": self.jumps,
             "jump_parts": self.jump_parts,
             "first_parts": self.first_parts,
@@ -2119,12 +2124,14 @@ fn service(
     if now >= listener.session.next_wake() {
         let socket = &listener.socket;
         let refusing = listener.session.refusing_legs;
+        let stalled = listener.session.stalled_legs;
         listener.session.poll_legs(now, &mut |to, bytes| {
             let _ = socket.send_to(bytes, to);
         });
-        if listener.session.refusing_legs > refusing {
+        if listener.session.refusing_legs > refusing || listener.session.stalled_legs > stalled {
             ensure(counters, listener.home);
             counters[listener.home].refusing_legs += listener.session.refusing_legs - refusing;
+            counters[listener.home].stalled_legs += listener.session.stalled_legs - stalled;
         }
     }
     if !draining {
@@ -3493,6 +3500,7 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
             },
             "generation_returns": counters.generation_returns,
             "refusing_legs": counters.refusing_legs,
+            "stalled_legs": counters.stalled_legs,
             "jumps": counters.jumps,
             "jump_parts": counters.jump_parts,
             "listeners_with_parts": counters.first_parts,

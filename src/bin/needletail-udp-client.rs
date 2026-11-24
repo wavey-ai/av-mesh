@@ -34,7 +34,7 @@ use av_mesh::client_director::{
     ReplacementKind, SessionLegs, ShortGrants, SinglePath,
 };
 use av_mesh::client_session::{LegReport, Received, SessionConfig, UdpSession};
-use av_mesh::client_udp::{ObjectKind, PartObject};
+use av_mesh::client_udp::{Lane, ObjectKind, PartObject};
 use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use http::{Request, StatusCode};
@@ -872,14 +872,17 @@ struct Arrival {
     kernel_us: u64,
     /// The edge (an index into the client's node names).
     edge: Option<usize>,
+    /// The lane that brought it.
+    lane: Lane,
 }
 
-/// The `--arrivals` file: the six columns of v1, then `edge` (B 2.8). The
-/// referee's `ntcmp udp-ingest` reads the first three by position; the
-/// lab's scripts read columns by name.
+/// The `--arrivals` file: the six columns of v1, then `edge` (B 2.8) and
+/// `lane` (stuck4k: `fast`, `cache`, `cut-through`, `compact` or
+/// `compact-fast`). The referee's `ntcmp udp-ingest` reads the first three
+/// by position; the lab's scripts read columns by name.
 fn arrivals_csv(arrivals: &BTreeMap<u64, Arrival>, nodes: &[String]) -> String {
     let mut text = String::from(
-        "part,arrival_unix_us,bytes,published_unix_us,available_unix_us,kernel_unix_us,edge\n",
+        "part,arrival_unix_us,bytes,published_unix_us,available_unix_us,kernel_unix_us,edge,lane\n",
     );
     for (part, arrival) in arrivals {
         let edge = arrival
@@ -887,12 +890,13 @@ fn arrivals_csv(arrivals: &BTreeMap<u64, Arrival>, nodes: &[String]) -> String {
             .and_then(|index| nodes.get(index))
             .map_or("", String::as_str);
         text.push_str(&format!(
-            "{part},{},{},{},{},{},{edge}\n",
+            "{part},{},{},{},{},{},{edge},{}\n",
             arrival.arrival_us,
             arrival.bytes,
             arrival.published_us,
             arrival.available_us,
-            arrival.kernel_us
+            arrival.kernel_us,
+            arrival.lane.word()
         ));
     }
     text
@@ -954,6 +958,10 @@ struct Report {
     fast_lane_parts: u64,
     compact_fast_lane_parts: u64,
     cache_lane_parts: u64,
+    /// The parts taken, by the lane that brought each (stuck4k: plainly,
+    /// with cut-through and the compact lane apart from the cache-fed
+    /// lane's RaptorQ objects; the `--arrivals` file names each part's).
+    lanes: BTreeMap<&'static str, u64>,
     fast_envelope_bytes: Percentiles,
     fast_envelope_overhead_bytes: Percentiles,
     fast_epoch_changes: u64,
@@ -976,6 +984,10 @@ struct Report {
     hedges: u64,
     hedges_released: u64,
     longest_silence_ms: f64,
+    /// From the last first arrival to the end of the run, or from the start
+    /// with none (stuck4k: one part and then 40 s of nothing reported a
+    /// longest silence of 0, the silence between first arrivals).
+    silence_at_end_ms: f64,
     interruptions: u64,
     wire_bytes_per_part: Option<f64>,
     before_start: u64,
@@ -987,9 +999,15 @@ struct Report {
     /// generations taken (a generation taken again after it was refused is
     /// a return); and the legs failed for refusing everything for a second.
     refused: RefusedCounts,
+    /// The RaptorQ lane's objects decoded and not taken, by reason, and the
+    /// fast lane's objects of an old epoch among them (stuck4k).
+    raptorq_refused: RaptorqRefusedCounts,
     generation_changes: u64,
     generation_returns: u64,
     refusing_legs: u64,
+    /// Legs failed because no media came for a second while their edge
+    /// said the stream went on (stuck4k).
+    stalled_legs: u64,
     /// Fix 4 (F5): jumps of the part numbers past the receiver's window
     /// (an outage of the source), `[from, to]` the parts either side, and
     /// the parts they passed over: one gap each, neither expected nor
@@ -1064,6 +1082,15 @@ struct RefusedCounts {
     before_start: u64,
     /// Of parts delivered already (the other leg's copy, a copy, a repeat).
     duplicate: u64,
+}
+
+/// RaptorQ objects (parts and gaps) decoded and not taken, by reason.
+#[derive(Debug, Default, Serialize)]
+struct RaptorqRefusedCounts {
+    stale_generation: u64,
+    before_start: u64,
+    duplicate: u64,
+    stale_fast_objects: u64,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -1366,6 +1393,7 @@ async fn main() -> Result<()> {
         connections: Arc::default(),
     };
     let started = Instant::now();
+    let started_unix_us = now_unix_us();
     let deadline = started + Duration::from_secs(args.duration_seconds);
     let socket = UdpSocket::bind(args.bind.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap())).await?;
     set_receive_buffer(&socket, args.receive_buffer_bytes);
@@ -1448,6 +1476,7 @@ async fn main() -> Result<()> {
     let mut fast_lane_parts = 0_u64;
     let mut compact_fast_lane_parts = 0_u64;
     let mut cache_lane_parts = 0_u64;
+    let mut lanes: BTreeMap<&'static str, u64> = BTreeMap::new();
     let mut fast_envelope_bytes = Vec::new();
     let mut fast_envelope_overhead = Vec::new();
     let mut publish_ms = Vec::new();
@@ -1697,6 +1726,9 @@ async fn main() -> Result<()> {
         }
         let fast_envelope = session.receiver.last_fast_envelope_bytes;
         let compact_fast = std::mem::take(&mut session.receiver.last_compact_fast_lane);
+        // The lane of the object that the datagram's push returned (the
+        // first out); the others out of this push came compact.
+        let mut pushed_lane = session.receiver.last_lane.take();
         let arrival_us = now_unix_us();
         let kernel_us = kernel_us.filter(|kernel| *kernel <= arrival_us);
         if let Some(kernel) = kernel_us {
@@ -1711,6 +1743,11 @@ async fn main() -> Result<()> {
                 available_unix_us,
                 ..
             } = object;
+            let lane = pushed_lane.take().unwrap_or(if compact_fast.contains(&part) {
+                Lane::CompactFast
+            } else {
+                Lane::Compact
+            });
             match kind {
                 ObjectKind::Init => init_objects += 1,
                 // Past the end of the run: not taken.
@@ -1763,6 +1800,7 @@ async fn main() -> Result<()> {
                         }
                         None => cache_lane_parts += 1,
                     }
+                    *lanes.entry(lane.word()).or_default() += 1;
                     received.insert(part, payload.len());
                     payload_bytes += payload.len() as u64;
                     if published_unix_us > 0 {
@@ -1791,6 +1829,7 @@ async fn main() -> Result<()> {
                                 available_us: available_unix_us,
                                 kernel_us: kernel_us.unwrap_or(0),
                                 edge,
+                                lane,
                             },
                         );
                     }
@@ -1970,6 +2009,7 @@ async fn main() -> Result<()> {
         fast_lane_parts,
         compact_fast_lane_parts,
         cache_lane_parts,
+        lanes,
         fast_envelope_bytes: percentiles(fast_envelope_bytes),
         fast_envelope_overhead_bytes: percentiles(fast_envelope_overhead),
         fast_epoch_changes: receiver.fast_epoch_changes,
@@ -1993,6 +2033,9 @@ async fn main() -> Result<()> {
         hedges: director.stats.hedges,
         hedges_released: director.stats.hedges_released,
         longest_silence_ms: longest_silence_us as f64 / 1_000.0,
+        silence_at_end_ms: now_unix_us()
+            .saturating_sub(last_first_us.unwrap_or(started_unix_us)) as f64
+            / 1_000.0,
         interruptions,
         wire_bytes_per_part: (!received.is_empty())
             .then(|| receiver.wire_bytes as f64 / received.len() as f64),
@@ -2005,9 +2048,16 @@ async fn main() -> Result<()> {
             before_start: stats.before_start,
             duplicate: stats.duplicates,
         },
+        raptorq_refused: RaptorqRefusedCounts {
+            stale_generation: receiver.raptorq_refused.stale_generation,
+            before_start: receiver.raptorq_refused.before_start,
+            duplicate: receiver.raptorq_refused.duplicate,
+            stale_fast_objects: receiver.stale_fast_objects,
+        },
         generation_changes: stats.generation_changes,
         generation_returns: stats.generation_returns,
         refusing_legs: session.refusing_legs,
+        stalled_legs: session.stalled_legs,
         jumps: accounted.jumps,
         jump_parts: accounted.jump_parts,
     };
@@ -2311,6 +2361,7 @@ mod tests {
                     available_us: 950 + part,
                     kernel_us: 999 + part,
                     edge,
+                    lane: Lane::Fast,
                 },
             );
         }
@@ -2319,10 +2370,10 @@ mod tests {
         let lines: Vec<&str> = text.trim().split('\n').collect();
         assert_eq!(
             lines[0],
-            "part,arrival_unix_us,bytes,published_unix_us,available_unix_us,kernel_unix_us,edge"
+            "part,arrival_unix_us,bytes,published_unix_us,available_unix_us,kernel_unix_us,edge,lane"
         );
-        assert_eq!(lines[1], "100,1100,56,1000,1050,1099,lon-edge-2");
-        assert_eq!(lines[3], "102,1102,56,1002,1052,1101,");
+        assert_eq!(lines[1], "100,1100,56,1000,1050,1099,lon-edge-2,fast");
+        assert_eq!(lines[3], "102,1102,56,1002,1052,1101,,fast");
         // As ntcmp reads it.
         for (line, part) in lines[1..].iter().zip([100_i64, 101, 102]) {
             let fields: Vec<&str> = line.split(',').collect();
