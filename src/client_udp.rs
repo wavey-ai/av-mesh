@@ -1157,6 +1157,12 @@ pub struct ObjectReceiver {
     /// (a contributor restart: its part numbers start again).
     pub fast_epoch: Option<u64>,
     pub fast_epoch_changes: u64,
+    /// The last few epochs before [`Self::fast_epoch`], and the fast-lane
+    /// objects of one of them that came late and were dropped (two edges
+    /// see a new epoch a moment apart: the late one's objects of the old
+    /// epoch must not start the old flow again).
+    old_fast_epochs: VecDeque<u64>,
+    pub stale_fast_objects: u64,
     /// The compact lane's receiver.
     pub compact: CompactReceiver,
     /// The stream of this receiver, for the objects of the compact lane
@@ -1181,6 +1187,9 @@ const LOSS_SETTLE: Duration = Duration::from_millis(150);
 /// path may already be lossy.
 pub const UNMEASURED_LOSS: f64 = 0.02;
 const SETTLED_MEMORY: usize = 8_192;
+/// Source epochs remembered after they were replaced: a fast-lane object of
+/// one of them is late, not a new epoch.
+const OLD_FAST_EPOCHS: usize = 4;
 
 impl ObjectReceiver {
     /// A receiver with its first leg open ([`LegId::FIRST`]).
@@ -1350,10 +1359,8 @@ impl ObjectReceiver {
         match decoders[space].push_datagram(datagram) {
             Ok(Some(bytes)) => match decode_any_object(bytes) {
                 Ok((object, fast)) => {
-                    if let Some(fast) = fast {
-                        self.fast_decoded(leg, header.block_id, fast);
-                    }
-                    self.objects += 1;
+                    let stale =
+                        fast.is_some_and(|fast| !self.fast_decoded(leg, header.block_id, fast));
                     let blocks = &mut self.legs[leg.index()];
                     if let Some(count) = blocks.blocks.get_mut(&header.block_id) {
                         // A cut-through or fast-lane object does not say how
@@ -1362,6 +1369,12 @@ impl ObjectReceiver {
                         count.sent = Some(object.datagrams);
                         count.decoded = true;
                     }
+                    if stale {
+                        self.stale_fast_objects += 1;
+                        return None;
+                    }
+                    self.objects += 1;
+                    let blocks = &mut self.legs[leg.index()];
                     if seen < u32::from(header.source_symbols) || !source_symbol {
                         // Decoded with fewer than all source symbols, or
                         // completed by a repair symbol.
@@ -1403,9 +1416,18 @@ impl ObjectReceiver {
     /// restarted, and counts its parts from 0 again) starts a new flow: the
     /// old epoch's blocks of the same numbers must not meet the new ones in
     /// a decoder, nor its completed blocks hide them. The block that showed
-    /// the new epoch stays completed in the new flow.
-    fn fast_decoded(&mut self, leg: LegId, block: u32, fast: FastObject) {
-        if self.fast_epoch.is_some_and(|epoch| epoch != fast.epoch) {
+    /// the new epoch stays completed in the new flow. An object of one of
+    /// the last few epochs is late (another leg's edge saw the new epoch
+    /// first): `false`, and it is dropped.
+    fn fast_decoded(&mut self, leg: LegId, block: u32, fast: FastObject) -> bool {
+        if self.old_fast_epochs.contains(&fast.epoch) {
+            return false;
+        }
+        if let Some(epoch) = self.fast_epoch.filter(|epoch| *epoch != fast.epoch) {
+            self.old_fast_epochs.push_back(epoch);
+            if self.old_fast_epochs.len() > OLD_FAST_EPOCHS {
+                self.old_fast_epochs.pop_front();
+            }
             self.new_flow();
             let blocks = &mut self.legs[leg.index()];
             blocks.decoders.get_or_insert_with(Default::default)[FAST_SPACE].expire_block(block);
@@ -1416,6 +1438,7 @@ impl ObjectReceiver {
         self.fast_parts += 1;
         self.fast_envelope_bytes += fast.envelope_bytes as u64;
         self.last_fast_envelope_bytes = Some(fast.envelope_bytes);
+        true
     }
 
     /// Count a leg's blocks that have settled, and return the datagram loss
@@ -2547,6 +2570,47 @@ mod tests {
         assert_eq!(decoded.part, 500);
         assert_eq!(receiver.fast_parts, 1);
         assert_eq!(receiver.last_fast_envelope_bytes, Some(envelope.len()));
+    }
+
+    /// B X4 review: two legs see a new source epoch a moment apart. The
+    /// first object of the new epoch starts one new flow; an object of the
+    /// old epoch that the other leg decodes later is dropped, and the flow
+    /// does not go back to it.
+    #[test]
+    fn a_late_object_of_the_old_epoch_on_another_leg_is_dropped() {
+        let mut receiver = ObjectReceiver::new();
+        let b = receiver.open_leg().expect("a second leg");
+        let decode = |receiver: &mut ObjectReceiver, leg: LegId, epoch: u64, part: u64| {
+            fast_datagrams(&envelope(epoch, part, 300), part, 400, 1)
+                .iter()
+                .find_map(|datagram| receiver.push(leg, datagram))
+        };
+        for part in 1_000..1_004 {
+            assert_eq!(
+                decode(&mut receiver, LegId::FIRST, 1, part).unwrap().part,
+                part
+            );
+        }
+        let flows = receiver.flows;
+        // Leg A's edge has the new epoch, counting from 0.
+        for part in 0..4 {
+            assert_eq!(
+                decode(&mut receiver, LegId::FIRST, 2, part).unwrap().part,
+                part
+            );
+        }
+        assert_eq!(receiver.flows, flows + 1);
+        // Leg B's edge, a moment behind, still sends the old epoch.
+        assert!(decode(&mut receiver, b, 1, 1_004).is_none());
+        assert_eq!(receiver.stale_fast_objects, 1);
+        assert_eq!(receiver.fast_epoch, Some(2));
+        assert_eq!(receiver.fast_epoch_changes, 1);
+        assert_eq!(receiver.flows, flows + 1, "no flow back to the old epoch");
+        // Then B has the new epoch too: its parts are the new flow's, and
+        // those A delivered already are not delivered again.
+        assert!(decode(&mut receiver, b, 2, 3).is_none());
+        assert_eq!(decode(&mut receiver, b, 2, 4).unwrap().part, 4);
+        assert_eq!(receiver.flows, flows + 1);
     }
 
     #[test]
