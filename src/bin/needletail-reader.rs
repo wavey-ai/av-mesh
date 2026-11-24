@@ -797,6 +797,48 @@ struct Reader {
 }
 
 impl Reader {
+    /// A reader that starts now.
+    fn new(args: Args, connector: TlsConnector, session: String) -> Self {
+        let now = Instant::now();
+        Self {
+            http: HttpClient {
+                connector,
+                server_name: args.server_name.clone(),
+                session: session.clone(),
+                connections: HashMap::new(),
+                lanes: HashMap::new(),
+                pace: Arc::new(Pace {
+                    read_bps: args.read_kbps * 1_000,
+                    frozen: AtomicBool::new(false),
+                    last_bytes_us: AtomicU64::new(0),
+                    epoch: now,
+                }),
+                connect_timeout: Duration::from_millis(args.connect_timeout_ms),
+                tcp_round_trip: None,
+            },
+            master_url: Url {
+                authority: String::new(),
+                path_and_query: "/".into(),
+            },
+            master: MasterPlaylist::default(),
+            current: 0,
+            report: ReaderReport {
+                session: session.clone(),
+                ..ReaderReport::default()
+            },
+            session,
+            started: now,
+            steering_due: now,
+            playlist_due: now,
+            rejected_in_a_row: 0,
+            round_trip: None,
+            priority: Vec::new(),
+            penalised: HashMap::new(),
+            received_from_current: false,
+            args,
+        }
+    }
+
     /// Parts to ask for at one time: enough to cover a round trip and a
     /// little more, so that a part is on its way before the reader needs it.
     fn pipeline_depth(&self, part_us: u64) -> usize {
@@ -1427,11 +1469,16 @@ impl Reader {
                         .then(|| self.stall_timeout(default_duration_us));
                     let mut wait = PartWait::new(stall, self.timeout());
                     let waited = loop {
+                        // No verdict on the cache once the run or the
+                        // reading has ended (review of B Z4).
+                        let now = Instant::now();
+                        if now >= end {
+                            break Waited::End;
+                        }
                         let since = pending
                             .started
                             .max(part_started)
                             .max(self.http.pace.last_bytes());
-                        let now = Instant::now();
                         let until = match wait.step(since, now) {
                             WaitStep::Until(at) => at,
                             WaitStep::TimedOut => break Waited::TimedOut,
@@ -1440,7 +1487,7 @@ impl Reader {
                                 // On the connection the reader has, and no
                                 // other cache: a pause of the stream opens
                                 // no connection anywhere.
-                                let within = by.saturating_duration_since(now);
+                                let within = by.min(end).saturating_duration_since(now);
                                 match self.load_playlist_within(next, within).await {
                                     Ok(Some(loaded)) => {
                                         match playlist_verdict(&loaded.parts, next) {
@@ -1458,18 +1505,21 @@ impl Reader {
                                         break Waited::Moved
                                     }
                                     Ok(None) => wait.answered(),
-                                    // No answer: the stall time decides.
-                                    Err(_) => {}
+                                    // No answer, or a refusal: no sign of
+                                    // life, though a refusal's body moved
+                                    // the time of the last byte. The stall
+                                    // time the question was asked for
+                                    // decides.
+                                    Err(_) => wait.unanswered(by),
                                 }
                                 continue;
                             }
                         };
-                        match tokio::time::timeout_at(until.min(end).into(), &mut pending.handle)
-                            .await
+                        if let Ok(result) =
+                            tokio::time::timeout_at(until.min(end).into(), &mut pending.handle)
+                                .await
                         {
-                            Ok(result) => break Waited::Done(result),
-                            Err(_) if Instant::now() >= end => break Waited::End,
-                            Err(_) => {}
+                            break Waited::Done(result);
                         }
                     };
                     match waited {
@@ -1843,45 +1893,7 @@ async fn main() -> Result<()> {
         let connector = connector.clone();
         tasks.push(tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            let now = Instant::now();
-            let reader = Reader {
-                http: HttpClient {
-                    connector,
-                    server_name: args.server_name.clone(),
-                    session: session.clone(),
-                    connections: HashMap::new(),
-                    lanes: HashMap::new(),
-                    pace: Arc::new(Pace {
-                        read_bps: args.read_kbps * 1_000,
-                        frozen: AtomicBool::new(false),
-                        last_bytes_us: AtomicU64::new(0),
-                        epoch: Instant::now(),
-                    }),
-                    connect_timeout: Duration::from_millis(args.connect_timeout_ms),
-                    tcp_round_trip: None,
-                },
-                master_url: Url {
-                    authority: String::new(),
-                    path_and_query: "/".into(),
-                },
-                master: MasterPlaylist::default(),
-                current: 0,
-                report: ReaderReport {
-                    session: session.clone(),
-                    ..ReaderReport::default()
-                },
-                session,
-                started: now,
-                steering_due: now,
-                playlist_due: now,
-                rejected_in_a_row: 0,
-                round_trip: None,
-                priority: Vec::new(),
-                penalised: HashMap::new(),
-                received_from_current: false,
-                args,
-            };
-            reader.run().await
+            Reader::new(args, connector, session).run().await
         }));
     }
     let mut reports = Vec::with_capacity(readers);
@@ -2083,12 +2095,16 @@ enum WaitStep {
 /// stall time sends one playlist question to the cache (again after each
 /// sign of life), and a silence of the stall time leaves the cache; a
 /// cache that answers lives, and the request timeout bounds the wait again.
+/// A question that fails is no sign of life: the wait then ends at the
+/// stall time it was asked for, unless the part comes.
 #[derive(Debug, Clone, Copy)]
 struct PartWait {
     stall: Option<Duration>,
     timeout: Duration,
     asked: Option<Instant>,
     alive: bool,
+    /// A question failed; the cache is left at this time.
+    unanswered_by: Option<Instant>,
 }
 
 impl PartWait {
@@ -2098,6 +2114,7 @@ impl PartWait {
             timeout,
             asked: None,
             alive: false,
+            unanswered_by: None,
         }
     }
 
@@ -2112,6 +2129,13 @@ impl PartWait {
                 WaitStep::Until(limit)
             };
         };
+        if let Some(give_up) = self.unanswered_by {
+            return if now >= give_up {
+                WaitStep::Stalled
+            } else {
+                WaitStep::Until(give_up)
+            };
+        }
         let give_up = since + stall;
         if now >= give_up {
             return WaitStep::Stalled;
@@ -2131,6 +2155,12 @@ impl PartWait {
     /// The cache answered its playlist: it lives.
     fn answered(&mut self) {
         self.alive = true;
+    }
+
+    /// The question asked to be answered `by` failed: no sign of life,
+    /// whatever bytes its answer carried.
+    fn unanswered(&mut self, by: Instant) {
+        self.unanswered_by = Some(by);
     }
 }
 
@@ -2195,12 +2225,14 @@ mod tests {
         Duration::from_millis(millis)
     }
 
-    /// B 3.10: a cache that has sent the reader parts and then sends
-    /// nothing is asked for its playlist at half the stall time and left at
-    /// the stall time: about 400 ms + 8 r, where the request timeout was
-    /// 1,500 ms + 4 r.
+    /// B 3.10: the wait for a part. A cache that has sent the reader parts
+    /// and then sends nothing is asked for its playlist once at half the
+    /// stall time and left at the stall time (about 400 ms + 8 r, where the
+    /// request timeout was 1,500 ms + 4 r); a cache that answers lives and
+    /// the request timeout bounds the wait again; a question that fails is
+    /// no sign of life, though its answer's bytes moved the last byte.
     #[test]
-    fn a_cache_that_stops_sending_is_left_after_the_stall_time() {
+    fn the_part_wait_asks_once_at_half_the_stall_time() {
         let stall = stall_timeout_for(400, 1_000, ms(2));
         assert_eq!(stall, ms(408));
         // Eight long parts are more than 400 ms.
@@ -2228,18 +2260,20 @@ mod tests {
             wait.step(t1, t1 + ms(204)),
             WaitStep::AskPlaylist { by: t1 + ms(408) }
         );
-        // Before the cache has sent a part, the request timeout alone.
-        let mut first = PartWait::new(None, ms(1_508));
-        assert_eq!(first.step(t0, t0 + ms(1_000)), WaitStep::Until(t0 + ms(1_508)));
-        assert_eq!(first.step(t0, t0 + ms(1_508)), WaitStep::TimedOut);
-    }
-
-    /// B 3.10: a cache that answers its playlist lives: the reader keeps
-    /// it, and only the request timeout bounds the wait from then on.
-    #[test]
-    fn a_cache_that_answers_its_playlist_is_kept() {
-        let t0 = Instant::now();
-        let mut wait = PartWait::new(Some(ms(408)), ms(1_508));
+        // The question failed with a body (a 503): its bytes moved the last
+        // byte, but the cache is left at the stall time it was asked for,
+        // and not asked again.
+        let mut wait = PartWait::new(Some(stall), ms(1_508));
+        let by = match wait.step(t0, t0 + ms(204)) {
+            WaitStep::AskPlaylist { by } => by,
+            other => panic!("{other:?}"),
+        };
+        wait.unanswered(by);
+        let answered_at = t0 + ms(210);
+        assert_eq!(wait.step(answered_at, t0 + ms(300)), WaitStep::Until(by));
+        assert_eq!(wait.step(answered_at, by), WaitStep::Stalled);
+        // An answer: the request timeout alone from then on.
+        let mut wait = PartWait::new(Some(stall), ms(1_508));
         assert!(matches!(
             wait.step(t0, t0 + ms(204)),
             WaitStep::AskPlaylist { .. }
@@ -2247,47 +2281,370 @@ mod tests {
         wait.answered();
         assert_eq!(wait.step(t0, t0 + ms(408)), WaitStep::Until(t0 + ms(1_508)));
         assert_eq!(wait.step(t0, t0 + ms(1_508)), WaitStep::TimedOut);
-        // What the answer says: the part is listed (the cache is slow), or
-        // later parts are and it is not (it is skipped, on this cache).
+        // Before the cache has sent a part, the request timeout alone.
+        let mut first = PartWait::new(None, ms(1_508));
+        assert_eq!(
+            first.step(t0, t0 + ms(1_000)),
+            WaitStep::Until(t0 + ms(1_508))
+        );
+        assert_eq!(first.step(t0, t0 + ms(1_508)), WaitStep::TimedOut);
+        // What an answer says: the part is listed (the cache is slow), later
+        // parts are and it is not (it is skipped, on this cache), or nothing
+        // at or after it is (the stream has stopped).
         let listed = [(40, 1_000), (41, 1_000), (42, 1_000)];
         assert_eq!(playlist_verdict(&listed, 41), PlaylistVerdict::Listed);
         let holed = [(40, 1_000), (42, 1_000), (43, 1_000)];
         assert_eq!(playlist_verdict(&holed, 41), PlaylistVerdict::SkipTo(42));
-    }
-
-    /// B 3.10: a pause of the stream is answered by the cache (nothing at
-    /// or after the part is listed): the reader waits where it is and is
-    /// never told to leave, so no connection opens anywhere.
-    #[test]
-    fn a_quiet_stream_opens_no_connection() {
         let quiet = [(38, 1_000), (39, 1_000), (40, 1_000)];
         assert_eq!(playlist_verdict(&quiet, 41), PlaylistVerdict::Stopped);
         assert_eq!(playlist_verdict(&[], 41), PlaylistVerdict::Stopped);
-        let t0 = Instant::now();
-        let mut wait = PartWait::new(Some(ms(408)), ms(1_508));
-        let mut questions = 0;
-        let mut since = t0;
-        for step in 0..60_u64 {
-            let now = t0 + ms(step * 25);
-            match wait.step(since, now) {
-                WaitStep::AskPlaylist { .. } => {
-                    // The cache answers on the connection the reader has;
-                    // its answer is bytes.
-                    questions += 1;
-                    wait.answered();
-                    since = now;
-                }
-                WaitStep::Stalled => panic!("left a cache that answered, at {step}"),
-                WaitStep::TimedOut => {
-                    // The request timeout: the part is asked for again
-                    // from the same cache, after the same question.
-                    assert!(now >= since + ms(1_508));
-                    break;
-                }
-                WaitStep::Until(_) => {}
-            }
+    }
+
+    /// What a test cache does from the moment the test changes it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CacheMode {
+        /// A part every 10 ms; a request for a later part waits for it.
+        Serving,
+        /// The host vanished: nothing is answered.
+        Silent,
+        /// The stream stopped: the playlist lists nothing newer.
+        Stopped,
+        /// The cache lists the parts and sends none (a slow cache).
+        Listing,
+        /// The playlist is refused with a 503 and a body.
+        Refusing,
+    }
+
+    const TEST_PART_MS: u64 = 10;
+
+    /// An LL-HLS cache for the reader's tests: HTTP/2 over TLS on
+    /// 127.0.0.1, serving the master playlist that names both test caches,
+    /// a media playlist and 10 ms parts from its start, and counting the
+    /// connections it accepts.
+    struct TestCache {
+        authority: String,
+        /// The mode, and the newest part when it was set.
+        mode: Arc<std::sync::Mutex<(CacheMode, u64)>>,
+        accepted: Arc<std::sync::Mutex<Vec<Instant>>>,
+        epoch: Instant,
+    }
+
+    impl TestCache {
+        fn head(&self) -> u64 {
+            self.epoch.elapsed().as_millis() as u64 / TEST_PART_MS
         }
-        assert_eq!(questions, 1);
+
+        fn set(&self, mode: CacheMode) {
+            *self.mode.lock().unwrap() = (mode, self.head());
+        }
+
+        fn accepted(&self) -> Vec<Instant> {
+            self.accepted.lock().unwrap().clone()
+        }
+    }
+
+    fn test_tls() -> (tokio_rustls::TlsAcceptor, TlsConnector) {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()),
+        );
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut server = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![certified.cert.der().clone()], key)
+            .unwrap();
+        server.alpn_protocols = vec![b"h2".to_vec()];
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certified.cert.der().clone()).unwrap();
+        let mut client = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client.alpn_protocols = vec![b"h2".to_vec()];
+        (
+            tokio_rustls::TlsAcceptor::from(Arc::new(server)),
+            TlsConnector::from(Arc::new(client)),
+        )
+    }
+
+    /// The answer of a test cache to `path`, in `mode` with the newest
+    /// part `head`. `None`: not answered yet.
+    fn test_answer(
+        path: &str,
+        master: &str,
+        mode: CacheMode,
+        head: u64,
+    ) -> Option<(StatusCode, String)> {
+        let playlist = |newest: u64| {
+            let mut body = String::from("#EXTM3U\n#EXT-X-PART-INF:PART-TARGET=0.010\n");
+            for sequence in newest.saturating_sub(30)..=newest {
+                body.push_str(&format!(
+                    "#EXT-X-PART:DURATION=0.010,URI=\"part{sequence}.bin\"\n"
+                ));
+            }
+            body
+        };
+        if path.ends_with("master.m3u8") {
+            return Some((StatusCode::OK, master.to_owned()));
+        }
+        if path.ends_with("stream.m3u8") {
+            return match mode {
+                CacheMode::Serving | CacheMode::Stopped => Some((StatusCode::OK, playlist(head))),
+                CacheMode::Listing => Some((StatusCode::OK, playlist(head + 20))),
+                CacheMode::Refusing => Some((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "the cache admits no request now\n".repeat(8),
+                )),
+                CacheMode::Silent => None,
+            };
+        }
+        let (part, _) = part_sequence(path)?;
+        if mode == CacheMode::Silent || part > head {
+            return None;
+        }
+        Some((StatusCode::OK, format!("part {part} ").repeat(20)))
+    }
+
+    /// Two test caches, A and B; the master playlist names A first.
+    async fn test_caches() -> (TestCache, TestCache, TlsConnector) {
+        let (acceptor, connector) = test_tls();
+        let listeners = [
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        ];
+        let authorities = listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap().to_string())
+            .collect::<Vec<_>>();
+        let master = Arc::new(format!(
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100000\nhttps://{}/live/1/stream.m3u8\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=100000\nhttps://{}/live/1/stream.m3u8\n",
+            authorities[0], authorities[1]
+        ));
+        let epoch = Instant::now();
+        let mut caches = Vec::new();
+        for (listener, authority) in listeners.into_iter().zip(authorities) {
+            let cache = TestCache {
+                authority,
+                mode: Arc::new(std::sync::Mutex::new((CacheMode::Serving, 0))),
+                accepted: Arc::new(std::sync::Mutex::new(Vec::new())),
+                epoch,
+            };
+            let (mode, accepted, acceptor, master) = (
+                Arc::clone(&cache.mode),
+                Arc::clone(&cache.accepted),
+                acceptor.clone(),
+                Arc::clone(&master),
+            );
+            tokio::spawn(async move {
+                while let Ok((tcp, _)) = listener.accept().await {
+                    accepted.lock().unwrap().push(Instant::now());
+                    let (mode, acceptor, master) =
+                        (Arc::clone(&mode), acceptor.clone(), Arc::clone(&master));
+                    tokio::spawn(async move {
+                        let Ok(tls) = acceptor.accept(tcp).await else {
+                            return;
+                        };
+                        let service = hyper::service::service_fn(
+                            move |request: Request<hyper::body::Incoming>| {
+                                let (mode, master) = (Arc::clone(&mode), Arc::clone(&master));
+                                async move {
+                                    let path = request.uri().path().to_owned();
+                                    let (status, body) = loop {
+                                        let (now_mode, frozen) = *mode.lock().unwrap();
+                                        let head = match now_mode {
+                                            CacheMode::Serving => {
+                                                epoch.elapsed().as_millis() as u64 / TEST_PART_MS
+                                            }
+                                            _ => frozen,
+                                        };
+                                        if let Some(answer) =
+                                            test_answer(&path, &master, now_mode, head)
+                                        {
+                                            break answer;
+                                        }
+                                        tokio::time::sleep(Duration::from_millis(2)).await;
+                                    };
+                                    let mut response = http::Response::new(
+                                        http_body_util::Full::new(Bytes::from(body)),
+                                    );
+                                    *response.status_mut() = status;
+                                    Ok::<_, std::convert::Infallible>(response)
+                                }
+                            },
+                        );
+                        let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                            .serve_connection(TokioIo::new(tls), service)
+                            .await;
+                    });
+                }
+            });
+            caches.push(cache);
+        }
+        let b = caches.pop().unwrap();
+        let a = caches.pop().unwrap();
+        (a, b, connector)
+    }
+
+    /// A reader of the test caches with the default stall time; no
+    /// playlist reload during the run, so that only the wait for a part
+    /// judges the cache.
+    fn test_reader(a: &TestCache, connector: TlsConnector, session: &str, seconds: u64) -> Reader {
+        let args = Args::try_parse_from([
+            "needletail-reader",
+            "--entry",
+            &format!("https://{}", a.authority),
+            "--tls-ca",
+            "unused.pem",
+            "--server-name",
+            "localhost",
+            "--session",
+            session,
+            "--duration-seconds",
+            &seconds.to_string(),
+            "--playlist-interval-ms",
+            "60000",
+        ])
+        .unwrap();
+        Reader::new(args, connector, session.to_owned())
+    }
+
+    /// Milliseconds from the reader's start to `at`.
+    fn reader_ms(reader_started: Instant, at: Instant) -> u64 {
+        at.saturating_duration_since(reader_started).as_millis() as u64
+    }
+
+    /// B 3.10: the host of a cache that has sent the reader parts vanishes.
+    /// The reader leaves it at the stall time (400 ms on a local path), not
+    /// the request timeout (1,500 ms), aborts what it asked there, and
+    /// opens the next cache after its spread delay; the parts come from
+    /// there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cache_that_stops_sending_is_left_after_the_stall_time() {
+        let (a, b, connector) = test_caches().await;
+        let session = "vanish-3";
+        let reader = test_reader(&a, connector, session, 3);
+        let started = reader.started;
+        let task = tokio::spawn(reader.run());
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        a.set(CacheMode::Silent);
+        let stopped = reader_ms(started, Instant::now());
+        let report = task.await.unwrap();
+        assert!(report.ok, "{:?}", report.error);
+        let moved = report.moves.first().expect("the reader left the cache");
+        assert_eq!(
+            (
+                moved.reason.as_str(),
+                moved.from.as_str(),
+                moved.to.as_str()
+            ),
+            ("failure", a.authority.as_str(), b.authority.as_str()),
+            "{:?}",
+            report.moves
+        );
+        // Left at the stall time after the last byte, with slack for a
+        // loaded machine; the request timeout would be 1,500 ms.
+        let after = moved.at_ms.saturating_sub(stopped);
+        assert!(
+            (380..=900).contains(&after),
+            "left {after} ms after the stop"
+        );
+        // The next cache is opened after the spread delay, and serves.
+        let opened = b.accepted();
+        assert_eq!(opened.len(), 1, "{opened:?}");
+        let delay = next_cache_delay(session).as_millis() as u64;
+        assert!(
+            reader_ms(started, opened[0]) + 1 >= moved.at_ms + delay,
+            "opened at {} ms, left at {} ms, delay {delay} ms",
+            reader_ms(started, opened[0]),
+            moved.at_ms
+        );
+        assert!(
+            report
+                .parts_by_cache
+                .get(&b.authority)
+                .copied()
+                .unwrap_or(0)
+                > 50
+        );
+        assert_eq!(report.final_cache, b.authority);
+    }
+
+    /// B 3.10: a cache that answers its playlist with the part listed is
+    /// slow, not gone: the reader keeps it past the stall time, until the
+    /// request timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cache_that_answers_its_playlist_is_kept() {
+        let (a, _b, connector) = test_caches().await;
+        let reader = test_reader(&a, connector, "slow-1", 3);
+        let started = reader.started;
+        let task = tokio::spawn(reader.run());
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        a.set(CacheMode::Listing);
+        let stopped = reader_ms(started, Instant::now());
+        let report = task.await.unwrap();
+        assert!(report.ok, "{:?}", report.error);
+        // No move before the request timeout (1,500 ms after the last
+        // byte); the stall time (400 ms) passed long before.
+        if let Some(moved) = report.moves.first() {
+            assert!(
+                moved.at_ms >= stopped + 1_400,
+                "left {} ms after the stop: {:?}",
+                moved.at_ms - stopped,
+                report.moves
+            );
+        }
+    }
+
+    /// B 3.10: a pause of the stream is answered by the cache (nothing
+    /// newer listed): the reader waits where it is, and no connection
+    /// opens anywhere, on its cache or another.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_quiet_stream_opens_no_connection() {
+        let (a, b, connector) = test_caches().await;
+        let reader = test_reader(&a, connector, "quiet-1", 2);
+        let task = tokio::spawn(reader.run());
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        a.set(CacheMode::Stopped);
+        let report = task.await.unwrap();
+        assert!(report.ok, "{:?}", report.error);
+        assert!(report.moves.is_empty(), "{:?}", report.moves);
+        assert_eq!(report.final_cache, a.authority);
+        // The master playlist, the media playlist, the parts and the
+        // question all went on one connection.
+        assert_eq!(a.accepted().len(), 1);
+        assert!(b.accepted().is_empty());
+    }
+
+    /// Review of B Z4: a cache that refuses the playlist question with a
+    /// body (a 503) gave no sign of life: the reader leaves it at the stall
+    /// time, though the refusal's bytes arrived after the last part.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cache_that_refuses_its_playlist_is_left_at_the_stall_time() {
+        let (a, b, connector) = test_caches().await;
+        let reader = test_reader(&a, connector, "refused-1", 3);
+        let started = reader.started;
+        let task = tokio::spawn(reader.run());
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        a.set(CacheMode::Refusing);
+        let stopped = reader_ms(started, Instant::now());
+        let report = task.await.unwrap();
+        assert!(report.ok, "{:?}", report.error);
+        let moved = report.moves.first().expect("the reader left the cache");
+        assert_eq!(
+            (moved.reason.as_str(), moved.to.as_str()),
+            ("failure", b.authority.as_str()),
+            "{:?}",
+            report.moves
+        );
+        let after = moved.at_ms.saturating_sub(stopped);
+        assert!(
+            (380..=900).contains(&after),
+            "left {after} ms after the stop"
+        );
     }
 
     /// B 3.10: the readers that leave a vanished cache all go to the same
