@@ -2408,6 +2408,18 @@ struct Args {
     )]
     client_udp_drain_spread_ms: u64,
 
+    /// B rule 1: a UDP subscriber that this edge has sent `MOVE` (a drain,
+    /// a rebalance, lost parents) is still served this many ms, until its
+    /// `UNSUB`, so that its client moves make-before-break; `MOVE` goes to it
+    /// again every 250 ms. 0: removed at the `MOVE`, as before (for A/B
+    /// runs only).
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_MOVE_GRACE_MS",
+        default_value_t = edge_udp::DEFAULT_MOVE_GRACE_MS
+    )]
+    client_udp_move_grace_ms: u64,
+
     /// Wave 8 review: while a stream has no new part, an edge sends its UDP
     /// subscribers `WAIT` this often, under the clients' 200 ms move
     /// silence, so that a quiet stream (a contributor gap, a failover
@@ -4299,6 +4311,7 @@ async fn main() -> Result<()> {
                 send_queue: Duration::from_millis(args.client_udp_send_queue_ms),
                 playout: Duration::from_millis(args.client_udp_playout_ms),
                 move_hold_down: Duration::from_millis(args.client_udp_move_hold_down_ms),
+                move_grace: Duration::from_millis(args.client_udp_move_grace_ms),
                 batch_send: args.client_udp_batch_send,
                 inline_complete_bytes: args.client_udp_inline_complete_bytes,
                 gso: args.client_udp_gso,
@@ -14055,6 +14068,15 @@ struct ClientUdpGauges {
     load_refusals: u64,
     /// Clients sent to a failover region (`region-lost`, Phase AM item 11).
     region_lost_moves: u64,
+    /// B rule 1: subscribers sent `MOVE` that are still served (they are in
+    /// `subscribers` too), and --client-udp-move-grace-ms.
+    leaving: Option<u64>,
+    move_grace_ms: u64,
+    /// B rules 3 to 5 (cumulative): leaving subscribers that left with
+    /// their `UNSUB`, those cut at the grace, and those taken back.
+    moves_completed: u64,
+    moves_expired: u64,
+    moves_taken_back: u64,
 }
 
 /// One playlist that a cache holds. This is what a cache advertises to the
@@ -19490,10 +19512,16 @@ impl AppRouter {
     /// A round's quota from the region as this edge sees it now.
     async fn plan_rebalance(&self, config: RebalanceConfig, now: Instant) -> usize {
         let egress = self.edge_load.admission_snapshot();
+        // B rule 7: subscribers already leaving are not this edge's to send
+        // away again (its advertised count keeps them: they are still load).
+        let stats = &self.edge_udp_stats;
         let own = edge_udp::RebalanceEdge {
             node_id: self.node.node_id.clone(),
             load_permille: egress.load_permille,
-            subscribers: self.edge_udp_stats.live_subscribers().unwrap_or(0),
+            subscribers: stats
+                .live_subscribers()
+                .unwrap_or(0)
+                .saturating_sub(stats.live_leaving().unwrap_or(0)),
         };
         if own.subscribers == 0 || own.load_permille <= config.target_permille {
             // Under the target (or nothing to move): a rebalance's check
@@ -19873,6 +19901,11 @@ impl AppRouter {
             egress_wire_bytes: stats.egress_wire_bytes(),
             load_refusals: stats.load_refusals.load(Ordering::Relaxed),
             region_lost_moves: stats.region_lost_moves.load(Ordering::Relaxed),
+            leaving: stats.live_leaving(),
+            move_grace_ms: stats.move_grace_ms.load(Ordering::Relaxed),
+            moves_completed: stats.moves_completed.load(Ordering::Relaxed),
+            moves_expired: stats.moves_expired.load(Ordering::Relaxed),
+            moves_taken_back: stats.moves_taken_back.load(Ordering::Relaxed),
         })
     }
 
@@ -36730,15 +36763,19 @@ mod tests {
         mesh.shutdown();
     }
 
-    /// Phase AM item 9: a draining edge with 1,000 UDP subscribers sends
-    /// them away spread over --client-udp-drain-spread-ms (2 s): the live
-    /// gauge falls across at least 1.5 s, never by more than a few ticks'
-    /// share at once; with the spread at 0 they all go at once.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_draining_edge_sends_its_udp_clients_away_spread_over_two_seconds() {
-        use av_mesh::client_udp::Control;
+    /// An edge serving client UDP for stream 77 (four 250 ms parts cached)
+    /// with `config`, for the tests of moves (B unit Z).
+    struct UdpEdgeForTests {
+        cache: Arc<LiveTsCache>,
+        mesh: Arc<CacheMeshHandle>,
+        router: AppRouter,
+        edge: SocketAddr,
+        shutdown_tx: watch::Sender<()>,
+        task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    }
 
-        async fn drain(spread_ms: u64) -> (Duration, u64, String) {
+    impl UdpEdgeForTests {
+        async fn start(config: edge_udp::EdgeUdpConfig) -> Self {
             let cache = LiveTsCache::new(1, Duration::from_millis(250), 4, 32, 64).await;
             for sequence in 0..4_u64 {
                 cache
@@ -36762,21 +36799,328 @@ mod tests {
             let edge = socket.local_addr().unwrap();
             router.client_udp_port = Some(edge.port());
             let (shutdown_tx, shutdown_rx) = watch::channel(());
-            let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, 2_000);
-            config.playout = Duration::ZERO;
-            config.drain_spread = Duration::from_millis(spread_ms);
-            let stats = Arc::clone(&router.edge_udp_stats);
             let task = tokio::spawn(edge_udp::run_edge_udp(
                 edge_udp::EdgeSockets::single(socket),
                 router.clone(),
                 config,
-                Arc::clone(&stats),
+                Arc::clone(&router.edge_udp_stats),
                 Vec::new(),
                 shutdown_rx,
             ));
+            Self {
+                cache,
+                mesh,
+                router,
+                edge,
+                shutdown_tx,
+                task,
+            }
+        }
+
+        fn stats(&self) -> &edge_udp::EdgeUdpStats {
+            &self.router.edge_udp_stats
+        }
+
+        /// Publish part `sequence` of stream 77.
+        async fn commit(&self, sequence: u64) {
+            self.cache
+                .commit_stream_payload(
+                    77,
+                    encode_test_canonical_fmp4_bundle_with_duration(
+                        77,
+                        sequence,
+                        None,
+                        &[sequence as u8; 400],
+                        Some(250),
+                        true,
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+
+        /// A client subscribed from part 0, and its token.
+        async fn client(&self) -> (UdpSocket, u64) {
+            use av_mesh::client_udp::Control;
             let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let answer = subscribe_udp_for_tests(&client, edge, Some(0)).await;
-            assert!(matches!(answer, Control::Subscribed { .. }), "{answer:?}");
+            client
+                .send_to(&udp_subscribe_for_tests(None, None), self.edge)
+                .await
+                .unwrap();
+            let mut buf = vec![0_u8; 65_536];
+            let token = loop {
+                let (len, _) =
+                    tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+                        .await
+                        .expect("a token")
+                        .unwrap();
+                if let Some(Control::Token { token, .. }) = Control::decode(&buf[..len]) {
+                    break token;
+                }
+            };
+            client
+                .send_to(&udp_subscribe_for_tests(Some(token), Some(0)), self.edge)
+                .await
+                .unwrap();
+            loop {
+                let (len, _) =
+                    tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+                        .await
+                        .expect("an answer")
+                        .unwrap();
+                match Control::decode(&buf[..len]) {
+                    Some(Control::Subscribed { .. }) => break,
+                    Some(other @ Control::Refused { .. }) => panic!("{other:?}"),
+                    _ => {}
+                }
+            }
+            (client, token)
+        }
+
+        async fn stop(self) {
+            let _ = self.shutdown_tx.send(());
+            self.task.await.unwrap().unwrap();
+            self.mesh.shutdown();
+        }
+    }
+
+    /// A `SUB` of stream 77 (RaptorQ lane, no repair).
+    fn udp_subscribe_for_tests(token: Option<u64>, from_part: Option<u64>) -> Vec<u8> {
+        use av_mesh::client_udp::{Control, RepairPolicy};
+        Control::Subscribe {
+            stream_id: 77,
+            from_part,
+            repair: RepairPolicy {
+                permille: 0,
+                min_symbols: 0,
+                loss_ppm: 0,
+            },
+            token,
+            fast_lane: false,
+            compact: None,
+            others: Vec::new(),
+            resume: false,
+        }
+        .encode()
+    }
+
+    /// What a test client receives within `wait`: the control datagrams,
+    /// each with when it came, and the media datagrams counted.
+    async fn udp_receive_for_tests(
+        client: &UdpSocket,
+        wait: Duration,
+    ) -> (Vec<(Instant, av_mesh::client_udp::Control)>, usize) {
+        let mut buf = vec![0_u8; 65_536];
+        let until = Instant::now() + wait;
+        let (mut controls, mut media) = (Vec::new(), 0);
+        while let Ok(Ok((len, _))) =
+            tokio::time::timeout_at(until.into(), client.recv_from(&mut buf)).await
+        {
+            match av_mesh::client_udp::Control::decode(&buf[..len]) {
+                Some(control) => controls.push((Instant::now(), control)),
+                None => media += 1,
+            }
+        }
+        (controls, media)
+    }
+
+    fn is_move_for_tests(control: &av_mesh::client_udp::Control, reason: &str) -> bool {
+        matches!(control, av_mesh::client_udp::Control::Move { reason: got, .. } if got == reason)
+    }
+
+    /// Wait (at most `wait`) for `MOVE <reason>`; `false` if none came.
+    async fn udp_wait_for_move_for_tests(client: &UdpSocket, reason: &str, wait: Duration) -> bool {
+        let mut buf = vec![0_u8; 65_536];
+        let until = Instant::now() + wait;
+        while let Ok(Ok((len, _))) =
+            tokio::time::timeout_at(until.into(), client.recv_from(&mut buf)).await
+        {
+            if av_mesh::client_udp::Control::decode(&buf[..len])
+                .is_some_and(|control| is_move_for_tests(&control, reason))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// B rules 1 to 4: a client that a draining edge sent `MOVE` is still
+    /// sent the stream's new parts until it leaves: with its `UNSUB` at
+    /// once (a completed move), and one that only refreshes (each refresh
+    /// answered `MOVE`) at the grace (an expired move).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_moved_subscriber_is_kept_until_its_unsub_or_the_grace() {
+        use av_mesh::client_udp::Control;
+
+        let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, 16);
+        config.playout = Duration::ZERO;
+        config.drain_spread = Duration::ZERO;
+        config.move_grace = Duration::from_millis(1_500);
+        let edge = UdpEdgeForTests::start(config).await;
+        let (leaver, leaver_token) = edge.client().await;
+        let (stayer, stayer_token) = edge.client().await;
+        // The cached parts arrive.
+        udp_receive_for_tests(&leaver, Duration::from_millis(300)).await;
+        udp_receive_for_tests(&stayer, Duration::from_millis(300)).await;
+        edge.router.lifecycle.set_draining(true).await;
+        let marked_by = Instant::now();
+        for client in [&leaver, &stayer] {
+            assert!(
+                udp_wait_for_move_for_tests(client, "draining", Duration::from_millis(1_200)).await
+            );
+        }
+        assert_eq!(edge.stats().live_subscribers(), Some(2));
+        assert_eq!(edge.stats().live_leaving(), Some(2));
+        // A part published after the MOVE still reaches both.
+        edge.commit(4).await;
+        for client in [&leaver, &stayer] {
+            let (_, media) = udp_receive_for_tests(client, Duration::from_millis(300)).await;
+            assert!(media > 0, "served after its MOVE");
+        }
+        // UNSUB: gone at once, a completed move.
+        leaver
+            .send_to(
+                &Control::Unsubscribe {
+                    stream_id: 77,
+                    token: leaver_token,
+                }
+                .encode(),
+                edge.edge,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while edge.stats().live_subscribers() != Some(1) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the UNSUB removes it");
+        assert_eq!(edge.stats().moves_completed.load(Ordering::Relaxed), 1);
+        // The other refreshes: answered MOVE, and cut at the grace anyway.
+        let mut answered_move = 0;
+        let mut buf = vec![0_u8; 65_536];
+        while edge.stats().live_subscribers() == Some(1) {
+            assert!(
+                marked_by.elapsed() < Duration::from_secs(5),
+                "cut at the grace"
+            );
+            stayer
+                .send_to(
+                    &udp_subscribe_for_tests(Some(stayer_token), None),
+                    edge.edge,
+                )
+                .await
+                .unwrap();
+            if let Ok(Ok((len, _))) =
+                tokio::time::timeout(Duration::from_millis(200), stayer.recv_from(&mut buf)).await
+            {
+                if Control::decode(&buf[..len])
+                    .is_some_and(|control| is_move_for_tests(&control, "draining"))
+                {
+                    answered_move += 1;
+                }
+            }
+        }
+        assert!(answered_move >= 3, "{answered_move}");
+        assert_eq!(edge.stats().moves_expired.load(Ordering::Relaxed), 1);
+        assert_eq!(edge.stats().moves.load(Ordering::Relaxed), 2);
+        edge.stop().await;
+    }
+
+    /// B rule 3: a leaving subscriber that neither leaves nor refreshes is
+    /// sent `MOVE` again every 250 ms until the grace.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn move_is_repeated_to_a_subscriber_that_stays() {
+        let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, 16);
+        config.playout = Duration::ZERO;
+        config.drain_spread = Duration::ZERO;
+        config.move_grace = Duration::from_millis(3_000);
+        let edge = UdpEdgeForTests::start(config).await;
+        let (client, _) = edge.client().await;
+        edge.router.lifecycle.set_draining(true).await;
+        // The first within a housekeeping second, then one every 250 ms
+        // (the sender looks at least every keepalive, 80 ms).
+        assert!(
+            udp_wait_for_move_for_tests(&client, "draining", Duration::from_millis(1_200)).await
+        );
+        let first = Instant::now();
+        let (controls, _) = udp_receive_for_tests(&client, Duration::from_millis(1_400)).await;
+        let moves: Vec<Instant> = std::iter::once(first)
+            .chain(
+                controls
+                    .iter()
+                    .filter(|(_, control)| is_move_for_tests(control, "draining"))
+                    .map(|(at, _)| *at),
+            )
+            .collect();
+        let gaps: Vec<Duration> = moves.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        assert!(moves.len() >= 4, "{gaps:?}");
+        for gap in &gaps {
+            assert!(*gap >= Duration::from_millis(200), "{gaps:?}");
+            assert!(*gap <= Duration::from_millis(600), "{gaps:?}");
+        }
+        assert_eq!(
+            edge.stats().moves.load(Ordering::Relaxed),
+            1,
+            "one move, reminded"
+        );
+        assert_eq!(edge.stats().live_subscribers(), Some(1));
+        edge.stop().await;
+    }
+
+    /// B rule 6: an edge that stops tells every subscriber still there to
+    /// move.
+    #[tokio::test]
+    async fn a_stopping_edge_sends_move_to_whoever_is_left() {
+        let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, 16);
+        config.playout = Duration::ZERO;
+        let edge = UdpEdgeForTests::start(config).await;
+        let (first, _) = edge.client().await;
+        let (second, _) = edge.client().await;
+        udp_receive_for_tests(&first, Duration::from_millis(200)).await;
+        udp_receive_for_tests(&second, Duration::from_millis(200)).await;
+        edge.stop().await;
+        for client in [&first, &second] {
+            let (controls, _) = udp_receive_for_tests(client, Duration::from_millis(500)).await;
+            assert!(
+                controls
+                    .iter()
+                    .any(|(_, control)| is_move_for_tests(control, "draining")),
+                "{controls:?}"
+            );
+        }
+    }
+
+    /// Phase AM item 9 and B rules 1 to 4: a draining edge with 1,000 UDP
+    /// subscribers sends them `MOVE` spread over --client-udp-drain-spread-ms
+    /// (2 s) and serves each until it leaves: the leaving gauge rises
+    /// across at least 1.5 s, the live gauge holds until the first grace
+    /// ends, a client's UNSUB takes it out at once, the rest go at their
+    /// grace. With the spread at 0 they are all marked at once; with the
+    /// grace at 0 they all go at once, as before B.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_draining_edge_serves_its_udp_clients_until_they_have_left() {
+        use av_mesh::client_udp::Control;
+
+        struct Drained {
+            /// From the drain: the first and last rise of the leaving gauge,
+            /// the first fall of the live gauge, and when it reached 0.
+            marked: (Duration, Duration),
+            first_gone: Duration,
+            all_gone: Duration,
+            completed: u64,
+            expired: u64,
+        }
+
+        async fn drain(spread_ms: u64, grace_ms: u64) -> Drained {
+            let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, 2_000);
+            config.playout = Duration::ZERO;
+            config.drain_spread = Duration::from_millis(spread_ms);
+            config.move_grace = Duration::from_millis(grace_ms);
+            let edge = UdpEdgeForTests::start(config).await;
+            let stats = edge.stats();
+            let (client, token) = edge.client().await;
             // 999 more, with no client behind them: privileged ports that no
             // socket of another test (ephemeral, any address) can hold.
             let crowd: Vec<SocketAddr> = (1..=999_u16)
@@ -36785,54 +37129,180 @@ mod tests {
             edge_udp::insert_test_subscribers(&stats.table.get().unwrap().0, 77, &crowd, 4);
             assert_eq!(stats.live_subscribers(), Some(1_000));
             let moves_before = stats.moves.load(Ordering::Relaxed);
-            router.lifecycle.set_draining(true).await;
+            edge.router.lifecycle.set_draining(true).await;
             let started = Instant::now();
-            let (mut first, mut largest_drop, mut last_count) = (None, 0_u64, 1_000_u64);
-            let mut samples: Vec<(Duration, u64)> = Vec::new();
-            loop {
-                let count = stats.live_subscribers().unwrap_or(0);
-                if count < last_count {
-                    first.get_or_insert(started.elapsed());
-                    largest_drop = largest_drop.max(last_count - count);
-                    last_count = count;
-                }
-                samples.push((started.elapsed(), count));
-                if count == 0 || started.elapsed() > Duration::from_secs(8) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            let across = started.elapsed() - first.unwrap_or_default();
-            assert_eq!(last_count, 0, "every subscriber left: {samples:?}");
-            assert_eq!(stats.moves.load(Ordering::Relaxed) - moves_before, 1_000);
-            // The real client was told why.
+            let (mut first_mark, mut last_mark, mut first_gone) = (None, None, None);
+            let (mut leaving_seen, mut unsubscribed) = (0, false);
             let mut buf = vec![0_u8; 65_536];
-            let reason = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let (len, _) = client.recv_from(&mut buf).await.unwrap();
-                    if let Some(Control::Move { reason, .. }) = Control::decode(&buf[..len]) {
-                        break reason;
-                    }
+            let all_gone = loop {
+                let count = stats.live_subscribers().unwrap_or(0);
+                let leaving = stats.live_leaving().unwrap_or(0);
+                if leaving > leaving_seen {
+                    first_mark.get_or_insert(started.elapsed());
+                    last_mark = Some(started.elapsed());
+                    leaving_seen = leaving;
                 }
-            })
-            .await
-            .expect("the client is moved");
-            let _ = shutdown_tx.send(());
-            task.await.unwrap().unwrap();
-            mesh.shutdown();
-            (across, largest_drop, reason)
+                if count < 1_000 && (!unsubscribed || count < 999) {
+                    first_gone.get_or_insert(started.elapsed());
+                }
+                if count == 0 {
+                    break started.elapsed();
+                }
+                assert!(started.elapsed() < Duration::from_secs(10), "{count} left");
+                // The real client: served after its MOVE, then leaves.
+                if !unsubscribed {
+                    if let Ok(Ok((len, _))) =
+                        tokio::time::timeout(Duration::from_millis(1), client.recv_from(&mut buf))
+                            .await
+                    {
+                        if Control::decode(&buf[..len])
+                            .is_some_and(|control| is_move_for_tests(&control, "draining"))
+                            && grace_ms > 0
+                        {
+                            edge.commit(4).await;
+                            let (_, media) =
+                                udp_receive_for_tests(&client, Duration::from_millis(300)).await;
+                            assert!(media > 0, "served after its MOVE");
+                            let unsubscribe = Control::Unsubscribe {
+                                stream_id: 77,
+                                token,
+                            };
+                            client
+                                .send_to(&unsubscribe.encode(), edge.edge)
+                                .await
+                                .unwrap();
+                            unsubscribed = true;
+                        }
+                    }
+                } else {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            };
+            assert_eq!(stats.moves.load(Ordering::Relaxed) - moves_before, 1_000);
+            let drained = Drained {
+                marked: (
+                    first_mark.unwrap_or_default(),
+                    last_mark.unwrap_or_default(),
+                ),
+                first_gone: first_gone.unwrap_or_default(),
+                all_gone,
+                completed: stats.moves_completed.load(Ordering::Relaxed),
+                expired: stats.moves_expired.load(Ordering::Relaxed),
+            };
+            edge.stop().await;
+            drained
         }
 
-        let (across, largest, reason) = drain(2_000).await;
-        assert_eq!(reason, "draining");
-        assert!(across >= Duration::from_millis(1_500), "{across:?}");
-        assert!(across <= Duration::from_millis(3_000), "{across:?}");
-        // A 50 ms tick sends ~25; the samples may see two or three at once.
-        assert!(largest <= 100, "largest drop {largest}");
-        // Before (spread 0): all of them in one housekeeping round.
-        let (across, largest, _) = drain(0).await;
-        assert!(across < Duration::from_millis(500), "{across:?}");
-        assert!(largest >= 900, "largest drop {largest}");
+        let spread = drain(2_000, 1_500).await;
+        let across = spread.marked.1 - spread.marked.0;
+        assert!(
+            across >= Duration::from_millis(1_500),
+            "marked across {across:?}"
+        );
+        assert!(
+            across <= Duration::from_millis(3_000),
+            "marked across {across:?}"
+        );
+        // Nobody is cut before the grace of the first mark.
+        assert!(
+            spread.first_gone >= spread.marked.0 + Duration::from_millis(1_000),
+            "first gone at {:?}, first marked at {:?}",
+            spread.first_gone,
+            spread.marked.0
+        );
+        assert!(
+            spread.all_gone <= spread.marked.1 + Duration::from_millis(2_500),
+            "{:?}",
+            spread.all_gone
+        );
+        assert_eq!(spread.completed, 1);
+        assert_eq!(spread.expired, 999);
+        // Spread 0: every one marked in one round, cut at the grace.
+        let at_once = drain(0, 1_500).await;
+        assert!(at_once.marked.1 - at_once.marked.0 < Duration::from_millis(500));
+        assert!(at_once.first_gone >= at_once.marked.0 + Duration::from_millis(1_400));
+        // Grace 0: removed at the MOVE, all in one round, as before B.
+        let before = drain(0, 0).await;
+        assert!(
+            before.all_gone < Duration::from_millis(1_500),
+            "{:?}",
+            before.all_gone
+        );
+        assert_eq!(before.expired, 0);
+        assert_eq!(before.completed, 0);
+    }
+
+    /// B 2.2: the leaving subscribers and the moves' outcomes are on
+    /// /api/assignment beside the other gauges.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_gauges_show_leaving_subscribers() {
+        use av_mesh::client_udp::Control;
+
+        let args = Args::try_parse_from(["av-mesh"]).unwrap();
+        assert_eq!(args.client_udp_move_grace_ms, 10_000);
+        let args = Args::try_parse_from(["av-mesh", "--client-udp-move-grace-ms", "0"]).unwrap();
+        assert_eq!(args.client_udp_move_grace_ms, 0);
+
+        let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, 16);
+        config.playout = Duration::ZERO;
+        config.drain_spread = Duration::ZERO;
+        config.move_grace = Duration::from_millis(1_500);
+        let edge = UdpEdgeForTests::start(config).await;
+        let (client, token) = edge.client().await;
+        let crowd: Vec<SocketAddr> = (1..=3_u16)
+            .map(|port| SocketAddr::from(([127, 0, 0, 4], port)))
+            .collect();
+        edge_udp::insert_test_subscribers(&edge.stats().table.get().unwrap().0, 77, &crowd, 4);
+        let gauges = || async {
+            let api: serde_json::Value = serde_json::from_slice(
+                get_for_tests(&edge.router, "/api/assignment?stream=77")
+                    .await
+                    .body
+                    .as_ref()
+                    .unwrap(),
+            )
+            .unwrap();
+            api["client_udp"].clone()
+        };
+        let block = gauges().await;
+        assert_eq!(block["leaving"], 0, "{block:#}");
+        assert_eq!(block["move_grace_ms"], 1_500, "{block:#}");
+        edge.router.lifecycle.set_draining(true).await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while edge.stats().live_leaving() != Some(4) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("all four are marked");
+        let block = gauges().await;
+        assert_eq!(block["subscribers"], 4, "{block:#}");
+        assert_eq!(block["leaving"], 4, "{block:#}");
+        client
+            .send_to(
+                &Control::Unsubscribe {
+                    stream_id: 77,
+                    token,
+                }
+                .encode(),
+                edge.edge,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while edge.stats().live_subscribers() != Some(0) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the rest are cut at the grace");
+        let block = gauges().await;
+        assert_eq!(block["subscribers"], 0, "{block:#}");
+        assert_eq!(block["leaving"], 0, "{block:#}");
+        assert_eq!(block["moves_completed"], 1, "{block:#}");
+        assert_eq!(block["moves_expired"], 3, "{block:#}");
+        assert_eq!(block["moves_taken_back"], 0, "{block:#}");
+        edge.stop().await;
     }
 
     /// Without the counter (--client-udp-egress-load false) and with

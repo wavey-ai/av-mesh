@@ -69,6 +69,14 @@ pub(crate) const DEFAULT_SEND_QUEUE_MS: u64 = 250;
 pub(crate) const DEFAULT_PLAYOUT_MS: u64 = 500;
 /// Default of --client-udp-move-hold-down-ms.
 pub(crate) const DEFAULT_MOVE_HOLD_DOWN_MS: u64 = 3_000;
+/// Default of --client-udp-move-grace-ms: a subscription that stops
+/// refreshing ends after `SUBSCRIPTION_TTL` (10 s) anyway, and a new copy at
+/// the edge a client moves to takes up to `ADMIT_WAIT` to start.
+pub(crate) const DEFAULT_MOVE_GRACE_MS: u64 = 10_000;
+/// While a stream has a leaving subscriber its housekeeping runs this often,
+/// and `MOVE` is sent again to a leaving subscriber this long after the last
+/// (B rule 3).
+const LEAVING_TICK: Duration = Duration::from_millis(250);
 /// Default of --client-udp-inline-complete-bytes: an audio part, and not a
 /// 4K frame, whose encode takes milliseconds.
 pub(crate) const DEFAULT_INLINE_COMPLETE_BYTES: usize = 16_384;
@@ -106,6 +114,10 @@ pub(crate) struct EdgeUdpConfig {
     /// admission, and a client moved away for that is taken back within
     /// this of its move (zero: no hold-down).
     pub move_hold_down: Duration,
+    /// How long a subscriber that was sent `MOVE` is still served, until
+    /// its `UNSUB` (`--client-udp-move-grace-ms`, B rule 1; zero: removed
+    /// at the `MOVE`, as before).
+    pub move_grace: Duration,
     /// Hand the datagrams of a part for all its clients to the kernel in
     /// one `sendmmsg` (`false`: one `sendto` each).
     pub batch_send: bool,
@@ -197,6 +209,7 @@ impl EdgeUdpConfig {
             send_queue: Duration::from_millis(DEFAULT_SEND_QUEUE_MS),
             playout: Duration::from_millis(DEFAULT_PLAYOUT_MS),
             move_hold_down: Duration::from_millis(DEFAULT_MOVE_HOLD_DOWN_MS),
+            move_grace: Duration::from_millis(DEFAULT_MOVE_GRACE_MS),
             batch_send: true,
             inline_complete_bytes: DEFAULT_INLINE_COMPLETE_BYTES,
             gso: true,
@@ -367,6 +380,14 @@ pub(crate) struct EdgeUdpStats {
     /// Wave 9 review: rebalances that did not lower the load (its LL-HLS
     /// readers' CPU, not its UDP listeners), each followed by a pause.
     pub rebalance_ineffective: AtomicU64,
+    /// B rules 3 to 5: subscribers sent `MOVE` that left with their
+    /// `UNSUB`, those cut at the grace (or that stopped refreshing), and
+    /// those taken back.
+    pub moves_completed: AtomicU64,
+    pub moves_expired: AtomicU64,
+    pub moves_taken_back: AtomicU64,
+    /// `--client-udp-move-grace-ms`, for the gauges.
+    pub move_grace_ms: AtomicU64,
 }
 
 /// The subscriber table, for the live gauges.
@@ -388,6 +409,21 @@ impl EdgeUdpStats {
     pub(crate) fn live_subscribers(&self) -> Option<u64> {
         let table = self.table.get()?;
         Some(subscriber_count(&table.0) as u64)
+    }
+
+    /// Subscribers now that were sent `MOVE` and are still served (B rule
+    /// 1), or `None` before the edge serves clients. They are in
+    /// [`Self::live_subscribers`] too.
+    pub(crate) fn live_leaving(&self) -> Option<u64> {
+        let table = self.table.get()?;
+        let table = table.0.lock().unwrap();
+        Some(
+            table
+                .values()
+                .flat_map(|entry| entry.subscribers.values())
+                .filter(|subscriber| subscriber.leaving.is_some())
+                .count() as u64,
+        )
     }
 
     /// Bytes that the client lanes sent, every lane (cache-fed,
@@ -1263,6 +1299,20 @@ pub(crate) struct Subscriber {
     /// The windows (their first parts) whose repair went to it, newest
     /// last: whichever lane completes a window sends its repair once.
     windows_repaired: VecDeque<u64>,
+    /// It was sent `MOVE` and is served until its `UNSUB` or the grace (B
+    /// rule 1).
+    leaving: Option<Leaving>,
+}
+
+/// Why and since when a subscriber is leaving (B rule 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Leaving {
+    /// When it was sent `MOVE` for `reason` (a drain marks a subscriber
+    /// leaving for a rebalance again, and its grace starts again).
+    since: Instant,
+    reason: &'static str,
+    /// When `MOVE` last went to it.
+    reminded_at: Instant,
 }
 
 /// A subscriber's NACK budget in the current interval: parts, and bytes.
@@ -1430,7 +1480,12 @@ impl Tokens {
     }
 
     fn valid(&self, peer: SocketAddr, token: u64) -> bool {
-        let minute = Self::minute();
+        self.valid_at(peer, token, Self::minute())
+    }
+
+    /// Whether `token` is valid for `peer` in `minute`: issued in it or in
+    /// the minute before.
+    fn valid_at(&self, peer: SocketAddr, token: u64, minute: u64) -> bool {
         token == self.token(peer, minute) || token == self.token(peer, minute.saturating_sub(1))
     }
 }
@@ -1464,6 +1519,10 @@ pub(crate) async fn run_edge_udp(
         .await;
     let table: Table = Arc::default();
     let _ = stats.table.set(LiveTable(Arc::clone(&table)));
+    stats.move_grace_ms.store(
+        u64::try_from(config.move_grace.as_millis()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
     if let Some(lane) = sockets.fast_lane() {
         let _ = stats.fast_lane.set(Arc::clone(lane));
         // The lane's own copy of the sockets does not hold the lane.
@@ -1522,6 +1581,29 @@ pub(crate) async fn run_edge_udp(
         // Which socket: 0 audio, 1 video, 2 and 3 their send-only twins.
         let (len, peer, source) = tokio::select! {
             _ = shutdown_rx.changed() => {
+                // B rule 6: whoever is left is told to go, once, so that a
+                // client still here moves now rather than at its silence.
+                let left: Vec<(u64, SocketAddr)> = edge
+                    .table
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|(stream_id, entry)| {
+                        entry.subscribers.keys().map(move |peer| (*stream_id, *peer))
+                    })
+                    .collect();
+                edge.stats.moves.fetch_add(left.len() as u64, Ordering::Relaxed);
+                for (stream_id, peer) in left {
+                    send_control(
+                        edge.sockets.for_stream(stream_id),
+                        peer,
+                        &Control::Move {
+                            stream_id,
+                            reason: "draining".into(),
+                        },
+                    )
+                    .await;
+                }
                 // The streams' senders end with their subscribers: a stopped
                 // edge sends no more WAIT (which, every 80 ms, would hold
                 // its clients on it until their subscriptions expired).
@@ -1585,10 +1667,12 @@ pub(crate) async fn run_edge_udp(
                 token,
                 fast_lane,
                 compact,
+                resume,
                 ..
             } => {
                 edge.on_subscribe(
                     socket, peer, len, stream_id, from_part, repair, token, fast_lane, compact,
+                    resume,
                 )
                 .await;
             }
@@ -1652,6 +1736,7 @@ impl EdgeControl {
         token: Option<u64>,
         fast_lane: bool,
         compact: Option<CompactPlan>,
+        resume: bool,
     ) {
         let config = self.config;
         let compact = compact
@@ -1680,32 +1765,51 @@ impl EdgeControl {
         let repair = repair.bounded();
         let window = self.router.cache.window_parts_for(stream_id).await as u64;
         let head = head_part(&self.router, stream_id).await;
+        // B rule 5: a leaving subscriber that names a part may be coming
+        // back; whether it is taken depends on why the edge moves clients
+        // now.
+        let leaving = from_part.and_then(|_| {
+            self.table
+                .lock()
+                .unwrap()
+                .get(&stream_id)
+                .and_then(|entry| entry.subscribers.get(&peer))
+                .and_then(|subscriber| subscriber.leaving)
+        });
+        let mut reason_now = None;
+        let mut take_back = None;
+        if let Some(leaving) = leaving {
+            reason_now = move_reason(&self.router, stream_id).await;
+            let now = Instant::now();
+            take_back = takes_back(leaving, reason_now, config.move_hold_down, now)
+                .then_some(leaving.since);
+        }
+        let request = RefreshRequest {
+            repair,
+            compact,
+            from_part,
+            resume,
+            head,
+            window,
+        };
         let refreshed = {
             let mut guard = self.table.lock().unwrap();
-            let refreshed = match guard
+            let refreshed = guard
                 .get_mut(&stream_id)
                 .and_then(|entry| entry.subscribers.get_mut(&peer))
+                .map(|subscriber| {
+                    refresh_subscriber(
+                        subscriber,
+                        request,
+                        take_back,
+                        config.move_grace,
+                        Instant::now(),
+                    )
+                });
+            if refreshed
+                .as_ref()
+                .is_some_and(|refreshed| refreshed.regroup)
             {
-                Some(subscriber) => {
-                    subscriber.expires_at = Instant::now() + SUBSCRIPTION_TTL;
-                    // A fast-lane client whose repair changed moves
-                    // to the group of its new policy.
-                    let regroup = subscriber.fast.is_some()
-                        && (subscriber.repair != repair || subscriber.compact != compact);
-                    subscriber.repair = repair;
-                    subscriber.compact = compact;
-                    // A client that names a part has not yet heard
-                    // the edge's answer: it resumes there.
-                    if let (Some(part), Some(head)) = (from_part, head) {
-                        if part < subscriber.next_part && head.saturating_sub(part) < window {
-                            subscriber.next_part = part;
-                        }
-                    }
-                    Some((subscriber.next_part, regroup))
-                }
-                None => None,
-            };
-            if refreshed.is_some_and(|(_, regroup)| regroup) {
                 if config.batched_admission {
                     let (sockets, table, rebuilds) = (
                         self.sockets.clone(),
@@ -1719,19 +1823,29 @@ impl EdgeControl {
                     fast_lane_changed(&self.sockets, &guard);
                 }
             }
-            refreshed.map(|(next_part, _)| next_part)
+            refreshed
         };
-        if let Some(next_part) = refreshed {
-            send_control(
-                &socket,
-                peer,
-                &Control::Subscribed {
+        if let Some(refreshed) = refreshed {
+            if let Some(reason) = refreshed.taken_back {
+                self.stats.moves_taken_back.fetch_add(1, Ordering::Relaxed);
+                if reason == "parents-lost" && reason_now == Some("parents-lost") {
+                    // Taken back within the hold-down, as `admit` takes a
+                    // client it sent away for lost parents.
+                    self.stats.moves_held_down.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            let answer = match refreshed.answer {
+                RefreshAnswer::Subscribed(next_part) => Control::Subscribed {
                     stream_id,
                     next_part,
                     compact: compact.is_some(),
                 },
-            )
-            .await;
+                RefreshAnswer::Move(reason) => Control::Move {
+                    stream_id,
+                    reason: reason.into(),
+                },
+            };
+            send_control(&socket, peer, &answer).await;
             return;
         }
         if !self.admitting.lock().unwrap().insert((peer, stream_id)) {
@@ -1785,6 +1899,9 @@ impl EdgeControl {
         let removed = guard
             .get_mut(&stream_id)
             .and_then(|entry| entry.subscribers.remove(&peer));
+        if let Some(subscriber) = &removed {
+            book_unsubscribe(&self.stats, subscriber);
+        }
         if removed.is_some_and(|subscriber| subscriber.fast.is_some()) {
             if self.config.batched_admission {
                 drop(guard);
@@ -2017,6 +2134,136 @@ impl ConfirmLimit {
         }
         *count += 1;
         true
+    }
+}
+
+/// What a refresh asks of a subscription that the edge holds.
+#[derive(Debug, Clone, Copy)]
+struct RefreshRequest {
+    repair: RepairPolicy,
+    compact: Option<CompactPlan>,
+    from_part: Option<u64>,
+    /// `r=1`: send again from `from_part` (B rule 8).
+    resume: bool,
+    /// The stream's newest part at this edge, and its window.
+    head: Option<u64>,
+    window: u64,
+}
+
+/// How a refresh is answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshAnswer {
+    /// `OK`, with the subscriber's next part.
+    Subscribed(u64),
+    /// `MOVE` for this reason: the subscriber is leaving.
+    Move(&'static str),
+}
+
+#[derive(Debug)]
+struct Refreshed {
+    answer: RefreshAnswer,
+    /// Its place on the fast lane changed: the lane's snapshot is rebuilt.
+    regroup: bool,
+    /// It was leaving for this reason and is taken back.
+    taken_back: Option<&'static str>,
+}
+
+/// Whether a subscriber leaving for `leaving.reason` that asks with a part
+/// is taken back, when the edge's own reason to move clients is now
+/// `reason_now` (B rule 5): a rebalanced one whenever the edge has none, one
+/// sent away for lost parents when they are back or within the hold-down of
+/// its mark (the take-back that `admit` gives a client that comes back);
+/// one sent away for a drain or a lost region never.
+fn takes_back(
+    leaving: Leaving,
+    reason_now: Option<&str>,
+    hold_down: Duration,
+    now: Instant,
+) -> bool {
+    match leaving.reason {
+        "rebalance" => reason_now.is_none(),
+        "parents-lost" => {
+            reason_now.is_none()
+                || (reason_now == Some("parents-lost")
+                    && now.saturating_duration_since(leaving.since) < hold_down)
+        }
+        _ => false,
+    }
+}
+
+/// A refresh of a subscription that the edge holds (a `SUB` with a valid
+/// token). A client that names a part has not yet heard the edge's answer:
+/// it resumes there, and with `r=1` (B rule 8, every leg of the listener
+/// went silent) the edge sends again from there what any lane sent: the
+/// part's NACKs are answered, the playout floor does not cut the backfill,
+/// and the fast lane's claims are forgotten. A leaving subscriber is
+/// answered `MOVE` and served no longer than the grace (B rule 5), unless
+/// `take_back` names its mark: then it stays, as if admitted now.
+fn refresh_subscriber(
+    subscriber: &mut Subscriber,
+    request: RefreshRequest,
+    take_back: Option<Instant>,
+    grace: Duration,
+    now: Instant,
+) -> Refreshed {
+    let RefreshRequest {
+        repair,
+        compact,
+        from_part,
+        resume,
+        head,
+        window,
+    } = request;
+    subscriber.expires_at = now + SUBSCRIPTION_TTL;
+    // A fast-lane client whose repair changed moves to the group of its new
+    // policy.
+    let mut regroup =
+        subscriber.fast.is_some() && (subscriber.repair != repair || subscriber.compact != compact);
+    subscriber.repair = repair;
+    subscriber.compact = compact;
+    if let (Some(part), Some(head)) = (from_part, head) {
+        if part < subscriber.next_part && head.saturating_sub(part) < window {
+            subscriber.next_part = part;
+            if resume {
+                subscriber.catching_up = true;
+                subscriber.first_part = subscriber.first_part.min(part);
+                if subscriber.fast.is_some() {
+                    subscriber.fast = Some(FastClient::new(part));
+                    regroup = true;
+                }
+            }
+        }
+    }
+    let mut taken_back = None;
+    if let Some(leaving) = subscriber.leaving.as_mut() {
+        if take_back != Some(leaving.since) {
+            subscriber.expires_at = subscriber.expires_at.min(leaving.since + grace);
+            leaving.reminded_at = now;
+            return Refreshed {
+                answer: RefreshAnswer::Move(leaving.reason),
+                regroup,
+                taken_back: None,
+            };
+        }
+        taken_back = Some(leaving.reason);
+        subscriber.leaving = None;
+        // Not moved again at once: a rebalance leaves it for
+        // REBALANCE_MIN_AGE, lost parents for the hold-down.
+        subscriber.admitted_at = now;
+        subscriber.moved_in |= taken_back == Some("parents-lost");
+    }
+    Refreshed {
+        answer: RefreshAnswer::Subscribed(subscriber.next_part),
+        regroup,
+        taken_back,
+    }
+}
+
+/// A subscriber left with its `UNSUB`: a leaving one has completed its move
+/// (B rule 4).
+fn book_unsubscribe(stats: &EdgeUdpStats, subscriber: &Subscriber) {
+    if subscriber.leaving.is_some() {
+        stats.moves_completed.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -2551,6 +2798,7 @@ async fn admit(
                 first_part,
                 nack_interval: NackInterval::new(Instant::now()),
                 windows_repaired: VecDeque::new(),
+                leaving: None,
             },
         );
         let start = !std::mem::replace(&mut entry.running, true);
@@ -2829,6 +3077,13 @@ fn take_due(table: &Table, stream_id: u64, part: u64, gap: bool) -> Due {
         }
         if !cut || gap {
             match subscriber.compact {
+                // B rule 10: the first part that the edge sends a subscriber
+                // goes in the long form, so that the client's time anchor
+                // comes with its first part.
+                Some(plan) if part == subscriber.first_part => {
+                    due.compact
+                        .push((*peer, subscriber.repair, plan.with_short_header(false)));
+                }
                 Some(plan) => due.compact.push((*peer, subscriber.repair, plan)),
                 None => due.blocks.push((*peer, subscriber.repair)),
             }
@@ -3162,11 +3417,20 @@ async fn run_stream_sender(
                 return;
             };
             let mut fast_expired = false;
+            let mut leaving_expired = 0_u64;
             entry.subscribers.retain(|_, subscriber| {
                 let live = subscriber.expires_at > now;
                 fast_expired |= !live && subscriber.fast.is_some();
+                // A leaving subscriber's expiry is its grace at the latest
+                // (B rule 3).
+                leaving_expired += u64::from(!live && subscriber.leaving.is_some());
                 live
             });
+            if leaving_expired > 0 {
+                stats
+                    .moves_expired
+                    .fetch_add(leaving_expired, Ordering::Relaxed);
+            }
             let empty = entry.subscribers.is_empty();
             if empty {
                 guard.remove(&stream_id);
@@ -3218,7 +3482,6 @@ async fn run_stream_sender(
             {
                 AfterHousekeeping::Send => {}
                 AfterHousekeeping::Again => continue,
-                AfterHousekeeping::Stop => return,
             }
         }
 
@@ -3400,14 +3663,14 @@ enum AfterHousekeeping {
     /// Look at the stream again before it sends (subscribers are held while
     /// the edge has lost its parents).
     Again,
-    /// The stream has no subscriber left: the sender ends.
-    Stop,
 }
 
 /// The housekeeping of a stream's sender: with a reason to move its
-/// subscribers (drain, lost parents, lost region) it sends them `MOVE`,
-/// paced for a drain; without, it keeps the playlist's demand and sends a
-/// rebalance round's share away.
+/// subscribers (drain, lost parents, lost region) it marks them leaving and
+/// sends them `MOVE`, paced for a drain; without, it keeps the playlist's
+/// demand and sends a rebalance round's share away. A leaving subscriber is
+/// served until its `UNSUB` or the grace (B rules 1 to 3), and sent `MOVE`
+/// again every `LEAVING_TICK`, which is then how often this runs.
 #[allow(clippy::too_many_arguments)]
 async fn housekeeping_moves(
     house: &mut Housekeeping,
@@ -3428,7 +3691,7 @@ async fn housekeeping_moves(
     if !paced {
         house.drain = None;
     }
-    if let Some(reason) = reason {
+    let after = if let Some(reason) = reason {
         // Lost parents do not move a subscriber that came by a
         // move within the hold-down: it may have just come from an
         // edge that lost its parents too. A subscriber that did not
@@ -3439,64 +3702,75 @@ async fn housekeeping_moves(
         } else {
             Duration::ZERO
         };
-        let (leaving, kept, newly_held) = {
+        let (marked, unmarked, newly_held) = {
             let mut guard = table.lock().unwrap();
-            match guard.get_mut(&stream_id) {
+            let (marked, unmarked, newly_held, fast_removed) = match guard.get_mut(&stream_id) {
                 Some(entry) => {
                     let limit = paced.then(|| {
                         let pace = house.drain.get_or_insert_with(|| DrainPace {
                             started: now,
-                            initial: entry.subscribers.len(),
+                            initial: entry
+                                .subscribers
+                                .values()
+                                .filter(|subscriber| !leaving_for(subscriber, "draining"))
+                                .count(),
                             sent: 0,
                         });
                         pace.due(now, config.drain_spread)
                     });
-                    let leaving = take_movable(entry, hold_down, now, limit);
+                    let marked =
+                        mark_movable(entry, hold_down, now, limit, reason, config.move_grace);
                     if let Some(pace) = house.drain.as_mut() {
-                        pace.sent += leaving.len();
+                        pace.sent += marked.len();
                     }
-                    let kept = entry.subscribers.len();
-                    let newly_held = count_held_down(entry);
-                    if kept == 0 {
-                        guard.remove(&stream_id);
-                    }
-                    if !leaving.is_empty() {
-                        fast_lane_changed(sockets, &guard);
-                    }
-                    (leaving, kept, newly_held)
+                    let unmarked = entry
+                        .subscribers
+                        .values()
+                        .any(|subscriber| !leaving_for(subscriber, reason));
+                    let newly_held = if hold_down.is_zero() {
+                        0
+                    } else {
+                        count_held_down(entry)
+                    };
+                    let fast_removed =
+                        config.move_grace.is_zero() && remove_subscribers(entry, &marked);
+                    (marked, unmarked, newly_held, fast_removed)
                 }
-                None => (Vec::new(), 0, 0),
+                None => (Vec::new(), false, 0, false),
+            };
+            if fast_removed {
+                fast_lane_changed(sockets, &guard);
             }
+            (marked, unmarked, newly_held)
         };
         if newly_held > 0 {
             stats
                 .moves_held_down
                 .fetch_add(newly_held, Ordering::Relaxed);
         }
-        if !leaving.is_empty() {
+        if !marked.is_empty() {
             stats
                 .moves
-                .fetch_add(leaving.len() as u64, Ordering::Relaxed);
+                .fetch_add(marked.len() as u64, Ordering::Relaxed);
             if reason == "region-lost" {
                 stats
                     .region_lost_moves
-                    .fetch_add(leaving.len() as u64, Ordering::Relaxed);
+                    .fetch_add(marked.len() as u64, Ordering::Relaxed);
             }
             info!(
                 stream_id,
                 reason,
-                clients = leaving.len(),
-                kept,
+                clients = marked.len(),
                 "edge client UDP moves its clients"
             );
             if !hold_down.is_zero() {
                 let mut moved = moved.lock().unwrap();
-                for peer in &leaving {
+                for peer in &marked {
                     moved.insert((*peer, stream_id), now);
                 }
             }
         }
-        for peer in leaving {
+        for peer in marked {
             send_control(
                 socket,
                 peer,
@@ -3507,94 +3781,121 @@ async fn housekeeping_moves(
             )
             .await;
         }
-        if kept == 0 {
-            return AfterHousekeeping::Stop;
-        }
         if paced {
-            // The next share soon; those not yet sent away are
-            // served as before (their parts, repaired).
-            house.at = Instant::now() + DRAIN_TICK;
-            return AfterHousekeeping::Send;
-        }
-        house.held_while_lost = true;
-        return AfterHousekeeping::Again;
-    }
-    if now >= house.demand_at {
-        house.demand_at = now + HOUSEKEEPING;
-        // Keep the playlist held, as a reader's playlist reloads
-        // do (wave 9: without the wait for a playable copy,
-        // which held a cold edge's first subscribers' parts
-        // back).
-        if config.prompt_sender {
-            router.open_playlist_demand(stream_id).await;
-        } else {
-            router.ensure_playlist_copy(stream_id).await;
-        }
-        router
-            .request_replica_for_stream(stream_id, "udp-client-demand", None)
-            .await;
-    }
-    // Wave 9 C1: over its target with room in the region, the
-    // edge sends some listeners there (a share every tick of
-    // the round). They ask the assignment again without this
-    // edge and resume from their oldest hole at the next.
-    // The share is reserved now, so that the senders of the
-    // edge's other streams do not take it too (wave 9 review);
-    // what this one does not send is handed back.
-    let (due, active) = router.rebalance_due(now).await;
-    if due > 0 {
-        let (leaving, kept) = {
-            let mut guard = table.lock().unwrap();
-            match guard.get_mut(&stream_id) {
-                Some(entry) => {
-                    let leaving =
-                        take_movable_aged(entry, Duration::ZERO, REBALANCE_MIN_AGE, now, Some(due));
-                    let kept = entry.subscribers.len();
-                    if kept == 0 {
-                        guard.remove(&stream_id);
-                    }
-                    if !leaving.is_empty() {
-                        fast_lane_changed(sockets, &guard);
-                    }
-                    (leaving, kept)
-                }
-                None => (Vec::new(), 0),
+            // The next share soon, while some are not yet sent away; they
+            // are served as before (their parts, repaired).
+            if unmarked {
+                house.at = Instant::now() + DRAIN_TICK;
             }
-        };
-        router.rebalance_sent(now, due, leaving.len());
-        if !leaving.is_empty() {
-            stats
-                .moves
-                .fetch_add(leaving.len() as u64, Ordering::Relaxed);
-            stats
-                .rebalance_moves
-                .fetch_add(leaving.len() as u64, Ordering::Relaxed);
-            info!(
-                stream_id,
-                clients = leaving.len(),
-                kept,
-                "edge client UDP rebalances clients to an edge with room"
-            );
+            AfterHousekeeping::Send
+        } else {
+            house.held_while_lost = true;
+            AfterHousekeeping::Again
         }
-        for peer in leaving {
-            send_control(
-                socket,
-                peer,
-                &Control::Move {
+    } else {
+        if now >= house.demand_at {
+            house.demand_at = now + HOUSEKEEPING;
+            // Keep the playlist held, as a reader's playlist reloads
+            // do (wave 9: without the wait for a playable copy,
+            // which held a cold edge's first subscribers' parts
+            // back).
+            if config.prompt_sender {
+                router.open_playlist_demand(stream_id).await;
+            } else {
+                router.ensure_playlist_copy(stream_id).await;
+            }
+            router
+                .request_replica_for_stream(stream_id, "udp-client-demand", None)
+                .await;
+        }
+        // Wave 9 C1: over its target with room in the region, the
+        // edge sends some listeners there (a share every tick of
+        // the round). They ask the assignment again without this
+        // edge and resume from their oldest hole at the next.
+        // The share is reserved now, so that the senders of the
+        // edge's other streams do not take it too (wave 9 review);
+        // what this one does not send is handed back.
+        let (due, active) = router.rebalance_due(now).await;
+        if due > 0 {
+            let marked = {
+                let mut guard = table.lock().unwrap();
+                let (marked, fast_removed) = match guard.get_mut(&stream_id) {
+                    Some(entry) => {
+                        let marked = mark_movable_aged(
+                            entry,
+                            Duration::ZERO,
+                            REBALANCE_MIN_AGE,
+                            now,
+                            Some(due),
+                            "rebalance",
+                            config.move_grace,
+                        );
+                        let fast_removed =
+                            config.move_grace.is_zero() && remove_subscribers(entry, &marked);
+                        (marked, fast_removed)
+                    }
+                    None => (Vec::new(), false),
+                };
+                if fast_removed {
+                    fast_lane_changed(sockets, &guard);
+                }
+                marked
+            };
+            router.rebalance_sent(now, due, marked.len());
+            if !marked.is_empty() {
+                stats
+                    .moves
+                    .fetch_add(marked.len() as u64, Ordering::Relaxed);
+                stats
+                    .rebalance_moves
+                    .fetch_add(marked.len() as u64, Ordering::Relaxed);
+                info!(
                     stream_id,
-                    reason: "rebalance".into(),
-                },
-            )
-            .await;
+                    clients = marked.len(),
+                    "edge client UDP rebalances clients to an edge with room"
+                );
+            }
+            for peer in marked {
+                send_control(
+                    socket,
+                    peer,
+                    &Control::Move {
+                        stream_id,
+                        reason: "rebalance".into(),
+                    },
+                )
+                .await;
+            }
         }
-        if kept == 0 {
-            return AfterHousekeeping::Stop;
+        if active {
+            house.at = Instant::now() + DRAIN_TICK;
         }
+        AfterHousekeeping::Send
+    };
+    // B rule 3: `MOVE` again to a leaving subscriber that stays, and the
+    // housekeeping every LEAVING_TICK while one does.
+    let (reminders, leaving) = {
+        let mut guard = table.lock().unwrap();
+        match guard.get_mut(&stream_id) {
+            Some(entry) => reminders_due(entry, now),
+            None => (Vec::new(), false),
+        }
+    };
+    for (peer, reason) in reminders {
+        send_control(
+            socket,
+            peer,
+            &Control::Move {
+                stream_id,
+                reason: reason.into(),
+            },
+        )
+        .await;
     }
-    if active {
-        house.at = Instant::now() + DRAIN_TICK;
+    if leaving {
+        house.at = house.at.min(Instant::now() + LEAVING_TICK);
     }
-    AfterHousekeeping::Send
+    after
 }
 
 /// A subscriber's next part against the stream's `head`: a part the window
@@ -3663,6 +3964,7 @@ pub(crate) fn insert_test_subscribers(
                 first_part: next_part,
                 nack_interval: NackInterval::new(now),
                 windows_repaired: VecDeque::new(),
+                leaving: None,
             },
         );
     }
@@ -3975,50 +4277,110 @@ impl RebalanceState {
     }
 }
 
-/// Take the subscribers that may be moved: all of them, or with a
-/// hold-down all but those that came by a move less than that long ago;
-/// at most `limit` of them, if given (a paced drain).
-fn take_movable(
+/// The subscriber is leaving for `reason`.
+fn leaving_for(subscriber: &Subscriber, reason: &str) -> bool {
+    subscriber
+        .leaving
+        .is_some_and(|leaving| leaving.reason == reason)
+}
+
+/// Mark the subscribers that may be moved as leaving for `reason` (B rule
+/// 1): all of them, or with a hold-down all but those that came by a move
+/// less than that long ago; at most `limit` of them, if given (a paced
+/// drain). Returns them; it removes none.
+fn mark_movable(
     entry: &mut StreamEntry,
     hold_down: Duration,
     now: Instant,
     limit: Option<usize>,
+    reason: &'static str,
+    grace: Duration,
 ) -> Vec<SocketAddr> {
-    take_movable_aged(entry, hold_down, Duration::ZERO, now, limit)
+    mark_movable_aged(entry, hold_down, Duration::ZERO, now, limit, reason, grace)
 }
 
-/// [`take_movable`], and none admitted less than `min_age` ago, nor one
-/// still catching up after a move (a rebalance, wave 9 C1).
-fn take_movable_aged(
+/// [`mark_movable`], and none admitted less than `min_age` ago, nor one
+/// still catching up after a move (a rebalance, wave 9 C1). A subscriber
+/// that is leaving already is not taken again, except by a drain from a
+/// rebalance: its reason becomes `draining` and its grace starts again. A
+/// marked subscriber is served no longer than `grace` from now.
+fn mark_movable_aged(
     entry: &mut StreamEntry,
     hold_down: Duration,
     min_age: Duration,
     now: Instant,
     limit: Option<usize>,
+    reason: &'static str,
+    grace: Duration,
 ) -> Vec<SocketAddr> {
-    let leaving: Vec<SocketAddr> = entry
-        .subscribers
-        .iter()
-        .filter(|(_, subscriber)| {
-            let age = now.saturating_duration_since(subscriber.admitted_at);
-            (!subscriber.moved_in || age >= hold_down)
-                && (min_age.is_zero() || (age >= min_age && !subscriber.catching_up))
-        })
-        .map(|(peer, _)| *peer)
-        .take(limit.unwrap_or(usize::MAX))
-        .collect();
-    for peer in &leaving {
-        entry.subscribers.remove(peer);
+    let mut marked = Vec::new();
+    let limit = limit.unwrap_or(usize::MAX);
+    for (peer, subscriber) in &mut entry.subscribers {
+        if marked.len() >= limit {
+            break;
+        }
+        let free = match subscriber.leaving {
+            None => true,
+            Some(leaving) => reason == "draining" && leaving.reason == "rebalance",
+        };
+        let age = now.saturating_duration_since(subscriber.admitted_at);
+        if !free
+            || (subscriber.moved_in && age < hold_down)
+            || (!min_age.is_zero() && (age < min_age || subscriber.catching_up))
+        {
+            continue;
+        }
+        subscriber.leaving = Some(Leaving {
+            since: now,
+            reason,
+            reminded_at: now,
+        });
+        subscriber.expires_at = subscriber.expires_at.min(now + grace);
+        marked.push(*peer);
     }
-    leaving
+    marked
 }
 
-/// The subscribers left after `take_movable` are held within the
-/// hold-down: count each of them once, the first time it is held.
+/// Remove `peers` from the stream (a move with no grace, as before B);
+/// `true` if one of them was on the fast lane.
+fn remove_subscribers(entry: &mut StreamEntry, peers: &[SocketAddr]) -> bool {
+    let mut fast = false;
+    for peer in peers {
+        fast |= entry
+            .subscribers
+            .remove(peer)
+            .is_some_and(|subscriber| subscriber.fast.is_some());
+    }
+    fast
+}
+
+/// The leaving subscribers whose last `MOVE` was `LEAVING_TICK` ago or
+/// more, with their reasons (their reminders are booked as sent now); and
+/// whether the stream has a leaving subscriber at all.
+fn reminders_due(entry: &mut StreamEntry, now: Instant) -> (Vec<(SocketAddr, &'static str)>, bool) {
+    let mut due = Vec::new();
+    let mut any = false;
+    for (peer, subscriber) in &mut entry.subscribers {
+        let Some(leaving) = subscriber.leaving.as_mut() else {
+            continue;
+        };
+        any = true;
+        if now.saturating_duration_since(leaving.reminded_at) >= LEAVING_TICK {
+            leaving.reminded_at = now;
+            due.push((*peer, leaving.reason));
+        }
+    }
+    (due, any)
+}
+
+/// The subscribers that lost parents do not move (they came by a move within
+/// the hold-down): count each of them once, the first time it is held.
 fn count_held_down(entry: &mut StreamEntry) -> u64 {
     let mut newly = 0;
     for subscriber in entry.subscribers.values_mut() {
-        if !std::mem::replace(&mut subscriber.held_down_counted, true) {
+        if subscriber.leaving.is_none()
+            && !std::mem::replace(&mut subscriber.held_down_counted, true)
+        {
             newly += 1;
         }
     }
@@ -5002,6 +5364,7 @@ mod tests {
             first_part: 0,
             nack_interval: NackInterval::new(admitted_at),
             windows_repaired: VecDeque::new(),
+            leaving: None,
         }
     }
 
@@ -5047,14 +5410,27 @@ mod tests {
         entry
             .subscribers
             .insert(new, subscriber(now - Duration::from_millis(500)));
+        let grace = Duration::from_secs(10);
         assert_eq!(
-            take_movable(&mut entry, Duration::from_secs(3), now, None),
+            mark_movable(
+                &mut entry,
+                Duration::from_secs(3),
+                now,
+                None,
+                "parents-lost",
+                grace
+            ),
             vec![old]
         );
-        assert_eq!(entry.subscribers.len(), 1);
-        // Without a hold-down (or draining) every subscriber goes.
-        assert_eq!(take_movable(&mut entry, Duration::ZERO, now, None), vec![new]);
-        assert!(entry.subscribers.is_empty());
+        assert!(entry.subscribers[&old].leaving.is_some());
+        assert!(entry.subscribers[&new].leaving.is_none());
+        // Without a hold-down (or draining) every subscriber goes; one
+        // marked already is not marked again.
+        assert_eq!(
+            mark_movable(&mut entry, Duration::ZERO, now, None, "parents-lost", grace),
+            vec![new]
+        );
+        assert_eq!(entry.subscribers.len(), 2, "marked, not removed");
     }
 
     /// The hold-down is for clients that came by a move: a client that
@@ -5075,20 +5451,24 @@ mod tests {
             moved,
             moved_subscriber(now - Duration::from_millis(200), true),
         );
+        let grace = Duration::from_secs(10);
+        let hold = Duration::from_secs(3);
         assert_eq!(
-            take_movable(&mut entry, Duration::from_secs(3), now, None),
+            mark_movable(&mut entry, hold, now, None, "parents-lost", grace),
             vec![fresh]
         );
         assert_eq!(count_held_down(&mut entry), 1);
         // A later round holds it again but does not count it again.
-        assert!(take_movable(&mut entry, Duration::from_secs(3), now, None).is_empty());
+        assert!(mark_movable(&mut entry, hold, now, None, "parents-lost", grace).is_empty());
         assert_eq!(count_held_down(&mut entry), 0);
         assert_eq!(
-            take_movable(
+            mark_movable(
                 &mut entry,
-                Duration::from_secs(3),
+                hold,
                 now + Duration::from_secs(3),
-                None
+                None,
+                "parents-lost",
+                grace
             ),
             vec![moved]
         );
@@ -5257,41 +5637,102 @@ mod tests {
                 .subscribers
                 .insert(SocketAddr::from(([127, 0, 0, 1], 40_000 + index as u16)), subscriber);
         }
-        let leaving = take_movable_aged(&mut entry, Duration::ZERO, REBALANCE_MIN_AGE, now, Some(5));
+        let grace = Duration::from_secs(10);
+        let mark = |entry: &mut StreamEntry| {
+            mark_movable_aged(
+                entry,
+                Duration::ZERO,
+                REBALANCE_MIN_AGE,
+                now,
+                Some(5),
+                "rebalance",
+                grace,
+            )
+        };
+        let leaving = mark(&mut entry);
         assert_eq!(leaving.len(), 2, "{leaving:?}");
-        assert_eq!(entry.subscribers.len(), 2);
-        let leaving = take_movable_aged(&mut entry, Duration::ZERO, REBALANCE_MIN_AGE, now, Some(5));
+        assert_eq!(entry.subscribers.len(), 4);
+        // Nor one that is leaving already.
+        let leaving = mark(&mut entry);
         assert!(leaving.is_empty());
     }
 
+    /// Phase AM item 9 and B rule 1: a paced drain of 1,000 subscribers
+    /// over 2 s marks a share at each 50 ms tick, the first at once, the
+    /// last at the end of the spread, at most a tick's share (~25) at once,
+    /// and removes none of them. Its pace counts only the subscribers not
+    /// yet leaving for the drain: one leaving for a rebalance is counted
+    /// (the drain takes it too).
     #[test]
-    fn a_paced_drain_spreads_a_thousand_moves_over_its_spread() {
+    fn a_paced_drain_marks_its_shares() {
         let start = Instant::now();
         let spread = Duration::from_millis(2_000);
+        let grace = Duration::from_secs(10);
+        let old = start - Duration::from_secs(60);
+        let mut entry = StreamEntry::default();
+        for index in 0..1_000_u16 {
+            let mut subscriber = moved_subscriber(old, false);
+            if index < 100 {
+                subscriber.leaving = Some(Leaving {
+                    since: old,
+                    reason: "rebalance",
+                    reminded_at: old,
+                });
+            } else if index < 150 {
+                subscriber.leaving = Some(Leaving {
+                    since: old,
+                    reason: "draining",
+                    reminded_at: old,
+                });
+            }
+            entry.subscribers.insert(
+                SocketAddr::from(([127, 0, 0, 2], 1_000 + index)),
+                subscriber,
+            );
+        }
         let mut pace = DrainPace {
             started: start,
-            initial: 1_000,
+            initial: entry
+                .subscribers
+                .values()
+                .filter(|subscriber| !leaving_for(subscriber, "draining"))
+                .count(),
             sent: 0,
         };
-        let mut left = 1_000_usize;
+        assert_eq!(pace.initial, 950);
         let (mut first, mut last, mut largest) = (None, None, 0);
         let mut at = start;
-        while left > 0 {
-            let due = pace.due(at, spread).min(left);
-            if due > 0 {
+        while entry
+            .subscribers
+            .values()
+            .any(|subscriber| !leaving_for(subscriber, "draining"))
+        {
+            let due = pace.due(at, spread);
+            let marked = mark_movable(&mut entry, Duration::ZERO, at, Some(due), "draining", grace);
+            if !marked.is_empty() {
                 first.get_or_insert(at);
                 last = Some(at);
-                largest = largest.max(due);
+                largest = largest.max(marked.len());
             }
-            pace.sent += due;
-            left -= due;
+            pace.sent += marked.len();
             at += DRAIN_TICK;
+            assert!(
+                at <= start + spread + DRAIN_TICK,
+                "the drain ends with its spread"
+            );
         }
+        assert_eq!(pace.sent, 950);
+        assert_eq!(entry.subscribers.len(), 1_000, "every one is still served");
         let across = last.unwrap() - first.unwrap();
         assert_eq!(first, Some(start), "the first share goes at once");
         assert!(across >= Duration::from_millis(1_500), "{across:?}");
         assert!(across <= spread, "{across:?}");
         assert!(largest <= 26, "{largest}");
+        // Each is served until the grace from its own mark at the latest.
+        assert!(entry.subscribers.values().all(|subscriber| {
+            let leaving = subscriber.leaving.unwrap();
+            subscriber.expires_at <= leaving.since + grace
+        }));
         // Newcomers since the start and those left at the end go at once.
         let pace = DrainPace {
             started: start,
@@ -5306,6 +5747,380 @@ mod tests {
             sent: 0,
         };
         assert_eq!(pace.due(start, spread), 1);
+    }
+
+    /// B rule 1: a drain takes a subscriber leaving for a rebalance: its
+    /// reason becomes `draining` and its grace starts again. One leaving
+    /// for lost parents or a drain already is not taken again, and a
+    /// rebalance never takes a leaving subscriber.
+    #[test]
+    fn a_drain_re_marks_a_rebalanced_subscriber() {
+        let start = Instant::now() - Duration::from_secs(60);
+        let grace = Duration::from_secs(10);
+        let peers: Vec<SocketAddr> = (0..3_u16)
+            .map(|index| SocketAddr::from(([127, 0, 0, 1], 3_000 + index)))
+            .collect();
+        let mut entry = StreamEntry::default();
+        for (peer, reason) in peers.iter().zip(["rebalance", "parents-lost", "draining"]) {
+            let mut subscriber = moved_subscriber(start, false);
+            subscriber.expires_at = start + Duration::from_secs(55);
+            subscriber.leaving = Some(Leaving {
+                since: start,
+                reason,
+                reminded_at: start,
+            });
+            entry.subscribers.insert(*peer, subscriber);
+        }
+        let later = start + Duration::from_secs(5);
+        assert!(mark_movable_aged(
+            &mut entry,
+            Duration::ZERO,
+            REBALANCE_MIN_AGE,
+            later + REBALANCE_MIN_AGE,
+            None,
+            "rebalance",
+            grace
+        )
+        .is_empty());
+        assert_eq!(
+            mark_movable(&mut entry, Duration::ZERO, later, None, "draining", grace),
+            vec![peers[0]]
+        );
+        let leaving = entry.subscribers[&peers[0]].leaving.unwrap();
+        assert_eq!(leaving.reason, "draining");
+        assert_eq!(leaving.since, later, "its grace starts again");
+        assert_eq!(leaving.reminded_at, later);
+        assert_eq!(
+            entry.subscribers[&peers[1]].leaving.unwrap().reason,
+            "parents-lost"
+        );
+        assert_eq!(entry.subscribers[&peers[2]].leaving.unwrap().since, start);
+    }
+
+    /// B rule 3: `MOVE` again to a leaving subscriber whose last one was
+    /// LEAVING_TICK ago or more, and none to the others.
+    #[test]
+    fn move_reminders_are_due_every_leaving_tick() {
+        let start = Instant::now();
+        let stays: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let other: SocketAddr = "127.0.0.1:1001".parse().unwrap();
+        let mut entry = StreamEntry::default();
+        entry
+            .subscribers
+            .insert(stays, moved_subscriber(start, false));
+        entry
+            .subscribers
+            .insert(other, moved_subscriber(start, false));
+        assert_eq!(reminders_due(&mut entry, start), (Vec::new(), false));
+        let grace = Duration::from_secs(10);
+        mark_movable(
+            &mut entry,
+            Duration::ZERO,
+            start,
+            Some(1),
+            "region-lost",
+            grace,
+        );
+        let marked = if entry.subscribers[&stays].leaving.is_some() {
+            stays
+        } else {
+            other
+        };
+        assert_eq!(
+            reminders_due(&mut entry, start + Duration::from_millis(100)),
+            (Vec::new(), true)
+        );
+        let tick = start + LEAVING_TICK;
+        assert_eq!(
+            reminders_due(&mut entry, tick),
+            (vec![(marked, "region-lost")], true)
+        );
+        assert_eq!(
+            reminders_due(&mut entry, tick + Duration::from_millis(10)),
+            (Vec::new(), true)
+        );
+        assert_eq!(reminders_due(&mut entry, tick + LEAVING_TICK).0.len(), 1);
+    }
+
+    fn refresh_request(from_part: Option<u64>, resume: bool) -> RefreshRequest {
+        RefreshRequest {
+            repair: RepairPolicy {
+                permille: 0,
+                min_symbols: 0,
+                loss_ppm: 0,
+            },
+            compact: None,
+            from_part,
+            resume,
+            head: Some(1_000),
+            window: 4_096,
+        }
+    }
+
+    /// B rule 5: a leaving subscriber's plain refresh is answered `MOVE`
+    /// and never serves it past its grace. One that asks with a part,
+    /// leaving for a rebalance, is taken back while the edge has no reason
+    /// of its own to move clients (not while it drains): admitted now, so
+    /// that the next round leaves it for REBALANCE_MIN_AGE.
+    #[test]
+    fn a_rebalanced_subscriber_that_asks_with_a_part_is_taken_back_unless_draining() {
+        let start = Instant::now();
+        let grace = Duration::from_secs(10);
+        let hold = Duration::from_secs(3);
+        let mut subscriber = moved_subscriber(start - Duration::from_secs(60), false);
+        subscriber.next_part = 900;
+        let mark = Leaving {
+            since: start,
+            reason: "rebalance",
+            reminded_at: start,
+        };
+        subscriber.leaving = Some(mark);
+        let at = start + Duration::from_secs(5);
+        let refreshed = refresh_subscriber(
+            &mut subscriber,
+            refresh_request(None, false),
+            None,
+            grace,
+            at,
+        );
+        assert_eq!(refreshed.answer, RefreshAnswer::Move("rebalance"));
+        assert_eq!(subscriber.expires_at, start + grace, "not past the grace");
+        assert_eq!(subscriber.leaving.unwrap().reminded_at, at);
+        // With a part, while the edge drains: not taken back.
+        assert!(!takes_back(mark, Some("draining"), hold, at));
+        let refreshed = refresh_subscriber(
+            &mut subscriber,
+            refresh_request(Some(901), false),
+            None,
+            grace,
+            at,
+        );
+        assert_eq!(refreshed.answer, RefreshAnswer::Move("rebalance"));
+        assert!(subscriber.leaving.is_some());
+        // With no reason of its own: taken back, an OK with its next part.
+        assert!(takes_back(mark, None, hold, at));
+        let refreshed = refresh_subscriber(
+            &mut subscriber,
+            refresh_request(Some(901), false),
+            Some(mark.since),
+            grace,
+            at,
+        );
+        assert_eq!(refreshed.answer, RefreshAnswer::Subscribed(900));
+        assert_eq!(refreshed.taken_back, Some("rebalance"));
+        assert!(subscriber.leaving.is_none());
+        assert_eq!(subscriber.admitted_at, at);
+        assert_eq!(subscriber.expires_at, at + SUBSCRIPTION_TTL);
+        // A take-back judged against an older mark (the drain re-marked it
+        // since) is no take-back.
+        subscriber.leaving = Some(Leaving {
+            since: at,
+            reason: "draining",
+            reminded_at: at,
+        });
+        let refreshed = refresh_subscriber(
+            &mut subscriber,
+            refresh_request(Some(901), false),
+            Some(mark.since),
+            grace,
+            at,
+        );
+        assert_eq!(refreshed.answer, RefreshAnswer::Move("draining"));
+        // A drain's or a lost region's mark is never taken back.
+        for reason in ["draining", "region-lost"] {
+            let leaving = Leaving {
+                since: start,
+                reason,
+                reminded_at: start,
+            };
+            assert!(!takes_back(leaving, None, hold, start));
+        }
+    }
+
+    /// B rule 5: a subscriber sent away for lost parents that asks with a
+    /// part is taken back within the hold-down of its mark (as `admit`
+    /// takes back a client it moved), or once the parents are back; after
+    /// the hold-down, while they are lost, it is sent away again. Taken
+    /// back, it counts as come by a move, so the hold-down keeps it.
+    #[test]
+    fn a_subscriber_sent_away_for_lost_parents_is_taken_back_within_the_hold_down() {
+        let start = Instant::now();
+        let grace = Duration::from_secs(10);
+        let hold = Duration::from_secs(3);
+        let mark = Leaving {
+            since: start,
+            reason: "parents-lost",
+            reminded_at: start,
+        };
+        assert!(takes_back(
+            mark,
+            Some("parents-lost"),
+            hold,
+            start + Duration::from_secs(2)
+        ));
+        assert!(!takes_back(mark, Some("parents-lost"), hold, start + hold));
+        assert!(takes_back(mark, None, hold, start + Duration::from_secs(9)));
+        assert!(!takes_back(mark, Some("draining"), hold, start));
+        assert!(!takes_back(
+            mark,
+            Some("parents-lost"),
+            Duration::ZERO,
+            start
+        ));
+        let mut subscriber = moved_subscriber(start - Duration::from_secs(60), false);
+        subscriber.leaving = Some(mark);
+        let at = start + Duration::from_secs(1);
+        let refreshed = refresh_subscriber(
+            &mut subscriber,
+            refresh_request(Some(0), false),
+            Some(mark.since),
+            grace,
+            at,
+        );
+        assert_eq!(refreshed.taken_back, Some("parents-lost"));
+        assert!(matches!(refreshed.answer, RefreshAnswer::Subscribed(_)));
+        assert!(subscriber.moved_in);
+        let mut entry = StreamEntry::default();
+        entry
+            .subscribers
+            .insert("127.0.0.1:1000".parse().unwrap(), subscriber);
+        assert!(
+            mark_movable(&mut entry, hold, at, None, "parents-lost", grace).is_empty(),
+            "held down after the take-back"
+        );
+    }
+
+    /// B rule 8: a refresh with `r=1` from a part before the subscriber's
+    /// next part sends again from there what any lane sent: the fast lane's
+    /// claims are forgotten (the cache-fed lane takes those parts again),
+    /// the NACKs of the part are answered, and the playout floor does not
+    /// cut the backfill. Without `r=1` only the next part goes back.
+    #[test]
+    fn a_refresh_from_a_part_sends_again_what_the_fast_lane_sent() {
+        let start = Instant::now();
+        let grace = Duration::from_secs(10);
+        let peer: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let mut subscriber = moved_subscriber(start, false);
+        subscriber.catching_up = false;
+        subscriber.first_part = 100;
+        subscriber.next_part = 120;
+        let fast = FastClient::new(100);
+        for part in 100..120 {
+            assert!(fast.claim_fast(part));
+        }
+        subscriber.fast = Some(Arc::clone(&fast));
+        // Without r=1: the rewind alone.
+        let refreshed = refresh_subscriber(
+            &mut subscriber,
+            refresh_request(Some(110), false),
+            None,
+            grace,
+            start,
+        );
+        assert_eq!(refreshed.answer, RefreshAnswer::Subscribed(110));
+        assert!(!refreshed.regroup);
+        assert!(Arc::ptr_eq(subscriber.fast.as_ref().unwrap(), &fast));
+        let table: Table = Arc::default();
+        table
+            .lock()
+            .unwrap()
+            .entry(7)
+            .or_default()
+            .subscribers
+            .insert(peer, subscriber);
+        let due = take_due(&table, 7, 110, false);
+        assert_eq!(due.on_fast_lane.len(), 1, "the fast lane had sent it");
+        // With r=1 from an older part (inside the window).
+        let mut guard = table.lock().unwrap();
+        let subscriber = guard
+            .get_mut(&7)
+            .unwrap()
+            .subscribers
+            .get_mut(&peer)
+            .unwrap();
+        let refreshed = refresh_subscriber(
+            subscriber,
+            refresh_request(Some(90), true),
+            None,
+            grace,
+            start,
+        );
+        assert_eq!(refreshed.answer, RefreshAnswer::Subscribed(90));
+        assert!(
+            refreshed.regroup,
+            "the new fast client goes into the snapshot"
+        );
+        assert!(subscriber.catching_up);
+        assert_eq!(subscriber.first_part, 90);
+        assert!(!Arc::ptr_eq(subscriber.fast.as_ref().unwrap(), &fast));
+        drop(guard);
+        for part in 90..120 {
+            let due = take_due(&table, 7, part, false);
+            assert_eq!(
+                due.blocks.len(),
+                1,
+                "part {part} goes again on the cache-fed lane"
+            );
+        }
+        // A part older than the window is no resume.
+        let mut guard = table.lock().unwrap();
+        let subscriber = guard
+            .get_mut(&7)
+            .unwrap()
+            .subscribers
+            .get_mut(&peer)
+            .unwrap();
+        let mut request = refresh_request(Some(10), true);
+        request.window = 500;
+        refresh_subscriber(subscriber, request, None, grace, start);
+        assert_eq!(subscriber.next_part, 120);
+        assert_eq!(subscriber.first_part, 90);
+    }
+
+    /// B rule 10: the first part that the edge sends a compact subscriber
+    /// is in the long form whatever its plan, the later ones as it asked.
+    #[test]
+    fn the_first_part_of_a_subscription_is_in_the_long_form() {
+        let start = Instant::now();
+        let peer: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let mut subscriber = moved_subscriber(start, false);
+        subscriber.compact = Some(CompactPlan::CLEAN.with_short_header(true));
+        subscriber.first_part = 40;
+        subscriber.next_part = 40;
+        let table: Table = Arc::default();
+        table
+            .lock()
+            .unwrap()
+            .entry(7)
+            .or_default()
+            .subscribers
+            .insert(peer, subscriber);
+        let first = take_due(&table, 7, 40, false);
+        assert_eq!(first.compact.len(), 1);
+        assert!(!first.compact[0].2.short_header);
+        let next = take_due(&table, 7, 41, false);
+        assert!(next.compact[0].2.short_header);
+        // The datagrams themselves.
+        let canonical = compact::encode_part(40, 1_000_000, &[7_u8; 56]).unwrap();
+        let marked = |short| compact_marked(&canonical, 0, false, short);
+        assert!(!compact::is_short(&marked(first.compact[0].2.short_header)));
+        assert!(compact::is_short(&marked(next.compact[0].2.short_header)));
+    }
+
+    /// B 2.6: a token is valid in the minute it was issued in and the next,
+    /// not after.
+    #[test]
+    fn a_token_is_valid_in_its_minute_and_the_next() {
+        let tokens = Tokens(RandomState::new());
+        let peer: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let other: SocketAddr = "127.0.0.1:1001".parse().unwrap();
+        let token = tokens.token(peer, 1_000);
+        assert!(tokens.valid_at(peer, token, 1_000));
+        assert!(tokens.valid_at(peer, token, 1_001));
+        assert!(!tokens.valid_at(peer, token, 1_002));
+        assert!(!tokens.valid_at(peer, token, 999));
+        assert!(!tokens.valid_at(other, token, 1_000));
+        assert!(tokens.valid(peer, tokens.current(peer)));
     }
 
     #[test]

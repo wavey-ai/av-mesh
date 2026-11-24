@@ -436,6 +436,19 @@ impl LaneEdge {
         self.ingest.await.unwrap().unwrap();
         self.udp.await.unwrap().unwrap();
     }
+
+    /// A kill: the client UDP task ends without a word to its clients (a
+    /// stop sends them `MOVE draining`, B rule 6) and its streams' senders
+    /// with their subscribers (no more `WAIT`), then the rest stops.
+    pub(super) async fn kill(self) {
+        self.udp.abort();
+        let _ = self.udp.await;
+        if let Some(table) = self.stats.table.get() {
+            table.0.lock().unwrap().clear();
+        }
+        let _ = self.shutdown_tx.send(());
+        self.ingest.await.unwrap().unwrap();
+    }
 }
 
 /// What one client received.
