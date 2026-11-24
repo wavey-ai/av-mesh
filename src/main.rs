@@ -2948,6 +2948,20 @@ struct Args {
     )]
     client_udp_rebalance_margin_permille: u32,
 
+    /// B rule R3: an edge also sends UDP listeners away when its load is
+    /// over its region's mean by half of
+    /// --client-udp-rebalance-margin-permille (it sheds to that, the target
+    /// staying the ceiling), so that an edge that restarted or joined takes
+    /// its share of listeners that hold two legs already. `false`: only
+    /// over --rebalance-target-permille, as before.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_CLIENT_UDP_REBALANCE_TO_MEAN",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    client_udp_rebalance_to_mean: bool,
+
     /// Wave 9 C1: ms between two rebalance rounds of an edge (each from the
     /// region's advertisements of that moment).
     #[arg(
@@ -4198,6 +4212,7 @@ async fn main() -> Result<()> {
                 margin_permille: args.client_udp_rebalance_margin_permille,
                 interval: Duration::from_millis(args.client_udp_rebalance_interval_ms.max(500)),
                 spread: Duration::from_millis(args.client_udp_drain_spread_ms),
+                to_mean: args.client_udp_rebalance_to_mean,
             }),
     );
     let telemetry_fec_sender = if let Some(queue) = telemetry_fec_queue.clone() {
@@ -14077,6 +14092,15 @@ struct ClientUdpGauges {
     moves_completed: u64,
     moves_expired: u64,
     moves_taken_back: u64,
+    /// B rule 9 (cumulative): redundant legs refused because the edge was
+    /// overloaded.
+    redundant_refusals: u64,
+    /// Subscribers now that named no other leg (`o=`).
+    single_legs: Option<u64>,
+    /// Subscribers now by the node they name as another leg, for a roll's
+    /// capacity gate: a leg cannot move to its listener's other edge. A
+    /// node that is not one of the region's advertised nodes is `""`.
+    legs_by_other: BTreeMap<String, u64>,
 }
 
 /// One playlist that a cache holds. This is what a cache advertises to the
@@ -19191,6 +19215,9 @@ struct RebalanceConfig {
     margin_permille: u32,
     interval: Duration,
     spread: Duration,
+    /// B rule R3: an edge also sheds when it is over the region's mean load
+    /// by half the margin (--client-udp-rebalance-to-mean).
+    to_mean: bool,
 }
 
 /// A request that the entry point answers for a reader.
@@ -19463,12 +19490,14 @@ impl AppRouter {
     /// interval from the region's advertisements (see
     /// [`edge_udp::rebalance_quota`]) and paced over the spread; none
     /// while the edge drains or is not an edge.
-    async fn rebalance_due(&self, now: Instant) -> (usize, bool) {
+    /// The tags of the round's receivers come with a share due: a listener
+    /// whose other legs are at every one of them is not sent (B rule R1).
+    async fn rebalance_due(&self, now: Instant) -> (usize, bool, Vec<u64>) {
         let Some(config) = self.rebalance else {
-            return (0, false);
+            return (0, false, Vec::new());
         };
         if self.cache_mesh_role != CacheMeshRole::Edge || self.lifecycle.is_draining().await {
-            return (0, false);
+            return (0, false, Vec::new());
         }
         let plan = self
             .rebalance_state
@@ -19476,7 +19505,7 @@ impl AppRouter {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take_plan_turn(now, config.interval);
         if plan {
-            let quota = self.plan_rebalance(config, now).await;
+            let (quota, receivers) = self.plan_rebalance(config, now).await;
             if quota > 0 {
                 self.edge_udp_stats
                     .rebalance_rounds
@@ -19489,7 +19518,7 @@ impl AppRouter {
             self.rebalance_state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .start_round(now, quota);
+                .start_round(now, quota, receivers);
         }
         // The share due now is reserved (wave 9 review): the senders of
         // the edge's other streams, on other workers, do not get it too.
@@ -19498,7 +19527,29 @@ impl AppRouter {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let due = state.reserve(now, config.spread);
-        (due, state.active())
+        let receivers = if due > 0 {
+            state.receivers().to_vec()
+        } else {
+            Vec::new()
+        };
+        (due, state.active(), receivers)
+    }
+
+    /// B rule R2: a listener sent away by a rebalance was taken back. A
+    /// round of which more than half came back pauses, as an ineffective
+    /// one does.
+    fn rebalance_returned(&self, now: Instant) {
+        let paused = self
+            .rebalance_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .returned(now);
+        if paused {
+            self.edge_udp_stats
+                .rebalance_ineffective
+                .fetch_add(1, Ordering::Relaxed);
+            info!("edge rebalance: most of its round came back: paused");
+        }
     }
 
     /// `sent` listeners of a reserved share of `reserved` were sent away.
@@ -19509,8 +19560,9 @@ impl AppRouter {
             .settle(now, reserved, sent);
     }
 
-    /// A round's quota from the region as this edge sees it now.
-    async fn plan_rebalance(&self, config: RebalanceConfig, now: Instant) -> usize {
+    /// A round's quota from the region as this edge sees it now, and the
+    /// tags of its receivers.
+    async fn plan_rebalance(&self, config: RebalanceConfig, now: Instant) -> (usize, Vec<u64>) {
         let egress = self.edge_load.admission_snapshot();
         // B rule 7: subscribers already leaving are not this edge's to send
         // away again (its advertised count keeps them: they are still load).
@@ -19523,14 +19575,17 @@ impl AppRouter {
                 .unwrap_or(0)
                 .saturating_sub(stats.live_leaving().unwrap_or(0)),
         };
-        if own.subscribers == 0 || own.load_permille <= config.target_permille {
+        // B rule R3: an edge under the target may be over its region's
+        // mean; its check is then judged, not cleared.
+        if own.subscribers == 0 || (own.load_permille <= config.target_permille && !config.to_mean)
+        {
             // Under the target (or nothing to move): a rebalance's check
             // is done.
             self.rebalance_state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clear_check();
-            return 0;
+            return (0, Vec::new());
         }
         let snapshots = self.regional_snapshots().await;
         let now_ms = now_unix_ms();
@@ -19571,22 +19626,28 @@ impl AppRouter {
                 load_permille = own.load_permille,
                 "edge rebalance did not lower its load: paused"
             );
-            return 0;
+            return (0, Vec::new());
         }
         let recent = state.recent_shed(now, window);
-        let quota = edge_udp::rebalance_quota(
+        let plan = edge_udp::rebalance_quota(
             &own,
             recent,
             &others,
             config.target_permille,
             config.margin_permille,
+            config.to_mean,
         );
-        if quota > 0 {
+        if plan.quota > 0 {
             if let Some(cost) = edge_udp::rebalance_cost(&own, &others) {
                 state.begin_check(own.load_permille, own.subscribers, cost);
             }
         }
-        quota
+        let receivers = plan
+            .receivers
+            .iter()
+            .map(|index| assignment::node_tag(&others[*index].node_id))
+            .collect();
+        (plan.quota, receivers)
     }
 
     fn with_client_udp_port(mut self, port: Option<u16>) -> Self {
@@ -19906,7 +19967,36 @@ impl AppRouter {
             moves_completed: stats.moves_completed.load(Ordering::Relaxed),
             moves_expired: stats.moves_expired.load(Ordering::Relaxed),
             moves_taken_back: stats.moves_taken_back.load(Ordering::Relaxed),
+            redundant_refusals: stats.redundant_refusals.load(Ordering::Relaxed),
+            single_legs: stats.single_legs(),
+            legs_by_other: self.legs_by_other().await,
         })
+    }
+
+    /// `ClientUdpGauges::legs_by_other`: the tags of `o=` matched against
+    /// the node ids of this region's advertisements.
+    async fn legs_by_other(&self) -> BTreeMap<String, u64> {
+        let by_tag = self.edge_udp_stats.legs_by_other();
+        if by_tag.is_empty() {
+            return BTreeMap::new();
+        }
+        let snapshots = self.regional_snapshots().await;
+        let names: HashMap<u64, &str> = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.node.region == self.node.region)
+            .map(|snapshot| {
+                (
+                    assignment::node_tag(&snapshot.node.node_id),
+                    snapshot.node.node_id.as_str(),
+                )
+            })
+            .collect();
+        let mut legs = BTreeMap::new();
+        for (tag, count) in by_tag {
+            let name = names.get(&tag).copied().unwrap_or_default();
+            *legs.entry(name.to_owned()).or_default() += count;
+        }
+        legs
     }
 
     async fn prometheus_metrics(&self) -> Bytes {
@@ -36841,6 +36931,12 @@ mod tests {
 
         /// A client subscribed from part 0, and its token.
         async fn client(&self) -> (UdpSocket, u64) {
+            self.client_with(&[]).await
+        }
+
+        /// A client subscribed from part 0 that names `others` as its
+        /// other legs (`o=`), and its token.
+        async fn client_with(&self, others: &[&str]) -> (UdpSocket, u64) {
             use av_mesh::client_udp::Control;
             let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             client
@@ -36858,10 +36954,25 @@ mod tests {
                     break token;
                 }
             };
-            client
-                .send_to(&udp_subscribe_for_tests(Some(token), Some(0)), self.edge)
-                .await
-                .unwrap();
+            let mut subscribe = udp_subscribe_for_tests(Some(token), Some(0));
+            if !others.is_empty() {
+                subscribe = Control::Subscribe {
+                    stream_id: 77,
+                    from_part: Some(0),
+                    repair: av_mesh::client_udp::RepairPolicy {
+                        permille: 0,
+                        min_symbols: 0,
+                        loss_ppm: 0,
+                    },
+                    token: Some(token),
+                    fast_lane: false,
+                    compact: None,
+                    others: others.iter().map(|node| (*node).to_owned()).collect(),
+                    resume: false,
+                }
+                .encode();
+            }
+            client.send_to(&subscribe, self.edge).await.unwrap();
             loop {
                 let (len, _) =
                     tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
@@ -37302,6 +37413,80 @@ mod tests {
         assert_eq!(block["moves_completed"], 1, "{block:#}");
         assert_eq!(block["moves_expired"], 3, "{block:#}");
         assert_eq!(block["moves_taken_back"], 0, "{block:#}");
+        edge.stop().await;
+    }
+
+    /// B 2.3: the edge counts its subscribers that name no other leg, and
+    /// those by the other node they name, matched against the region's
+    /// advertised nodes ("" for one it does not know); a refresh that names
+    /// another set moves the count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_gauges_count_legs_by_their_other_edge() {
+        let args = Args::try_parse_from(["av-mesh"]).unwrap();
+        assert!(args.client_udp_rebalance_to_mean);
+        let args =
+            Args::try_parse_from(["av-mesh", "--client-udp-rebalance-to-mean", "false"]).unwrap();
+        assert!(!args.client_udp_rebalance_to_mean);
+
+        let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, 16);
+        config.playout = Duration::ZERO;
+        let edge = UdpEdgeForTests::start(config).await;
+        let mut other = telemetry_snapshot_for_tests(
+            "edge-b",
+            &edge.router.node.region,
+            "test-continent",
+            51.6,
+            -0.2,
+            Vec::new(),
+            77,
+        );
+        other.edge_service = Some(EdgeServiceSnapshot::from_node(
+            &other.node,
+            None,
+            "edge",
+            EdgeLoadSnapshot::default(),
+        ));
+        edge.router.telemetry.ingest_snapshot(other).await;
+        let _alone = edge.client().await;
+        let _beside_b = edge.client_with(&["edge-b"]).await;
+        let (both, both_token) = edge.client_with(&["edge-b", "edge-unknown"]).await;
+        let gauges = || async {
+            let api: serde_json::Value = serde_json::from_slice(
+                get_for_tests(&edge.router, "/api/assignment?stream=77")
+                    .await
+                    .body
+                    .as_ref()
+                    .unwrap(),
+            )
+            .unwrap();
+            api["client_udp"].clone()
+        };
+        let block = gauges().await;
+        assert_eq!(block["subscribers"], 3, "{block:#}");
+        assert_eq!(block["single_legs"], 1, "{block:#}");
+        assert_eq!(
+            block["legs_by_other"],
+            serde_json::json!({"edge-b": 2, "": 1}),
+            "{block:#}"
+        );
+        assert_eq!(block["redundant_refusals"], 0, "{block:#}");
+        // Its other leg went: the refresh says so.
+        both.send_to(&udp_subscribe_for_tests(Some(both_token), None), edge.edge)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while edge.stats().single_legs() != Some(2) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the refresh updates its other legs");
+        let block = gauges().await;
+        assert_eq!(
+            block["legs_by_other"],
+            serde_json::json!({"edge-b": 1}),
+            "{block:#}"
+        );
         edge.stop().await;
     }
 

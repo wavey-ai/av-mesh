@@ -386,6 +386,9 @@ pub(crate) struct EdgeUdpStats {
     pub moves_completed: AtomicU64,
     pub moves_expired: AtomicU64,
     pub moves_taken_back: AtomicU64,
+    /// B rule 9: new subscriptions of a redundant leg (`o=`) refused
+    /// because the edge was overloaded (they are in `load_refusals` too).
+    pub redundant_refusals: AtomicU64,
     /// `--client-udp-move-grace-ms`, for the gauges.
     pub move_grace_ms: AtomicU64,
 }
@@ -424,6 +427,36 @@ impl EdgeUdpStats {
                 .filter(|subscriber| subscriber.leaving.is_some())
                 .count() as u64,
         )
+    }
+
+    /// Subscribers now that named no other leg (`o=`): the listener has
+    /// nothing else; or `None` before the edge serves clients.
+    pub(crate) fn single_legs(&self) -> Option<u64> {
+        let table = self.table.get()?;
+        let table = table.0.lock().unwrap();
+        Some(
+            table
+                .values()
+                .flat_map(|entry| entry.subscribers.values())
+                .filter(|subscriber| subscriber.others == NO_OTHER_LEGS)
+                .count() as u64,
+        )
+    }
+
+    /// Subscribers now by each node tag that they name in `o=` (one that
+    /// names two counts at each); empty before the edge serves clients.
+    pub(crate) fn legs_by_other(&self) -> HashMap<u64, u64> {
+        let mut legs = HashMap::new();
+        let Some(table) = self.table.get() else {
+            return legs;
+        };
+        let table = table.0.lock().unwrap();
+        for subscriber in table.values().flat_map(|entry| entry.subscribers.values()) {
+            for tag in subscriber.others.iter().filter(|tag| **tag != 0) {
+                *legs.entry(*tag).or_default() += 1;
+            }
+        }
+        legs
     }
 
     /// Bytes that the client lanes sent, every lane (cache-fed,
@@ -1302,6 +1335,22 @@ pub(crate) struct Subscriber {
     /// It was sent `MOVE` and is served until its `UNSUB` or the grace (B
     /// rule 1).
     leaving: Option<Leaving>,
+    /// The tags (`assignment::node_tag`) of the nodes of the listener's
+    /// other legs that deliver now (`o=`), 0 for none: a rebalance does not
+    /// send it to an edge it holds already (B rule R1).
+    others: [u64; 2],
+}
+
+/// `Subscriber::others` of a listener with no other leg.
+const NO_OTHER_LEGS: [u64; 2] = [0, 0];
+
+/// The tags of the nodes in a `SUB`'s `o=` (at most two are kept).
+fn other_leg_tags(others: &[String]) -> [u64; 2] {
+    let mut tags = NO_OTHER_LEGS;
+    for (tag, node) in tags.iter_mut().zip(others) {
+        *tag = crate::assignment::node_tag(node);
+    }
+    tags
 }
 
 /// Why and since when a subscriber is leaving (B rule 1).
@@ -1667,11 +1716,20 @@ pub(crate) async fn run_edge_udp(
                 token,
                 fast_lane,
                 compact,
+                others,
                 resume,
-                ..
             } => {
                 edge.on_subscribe(
-                    socket, peer, len, stream_id, from_part, repair, token, fast_lane, compact,
+                    socket,
+                    peer,
+                    len,
+                    stream_id,
+                    from_part,
+                    repair,
+                    token,
+                    fast_lane,
+                    compact,
+                    other_leg_tags(&others),
                     resume,
                 )
                 .await;
@@ -1736,6 +1794,7 @@ impl EdgeControl {
         token: Option<u64>,
         fast_lane: bool,
         compact: Option<CompactPlan>,
+        others: [u64; 2],
         resume: bool,
     ) {
         let config = self.config;
@@ -1788,6 +1847,7 @@ impl EdgeControl {
             repair,
             compact,
             from_part,
+            others,
             resume,
             head,
             window,
@@ -1828,6 +1888,10 @@ impl EdgeControl {
         if let Some(refreshed) = refreshed {
             if let Some(reason) = refreshed.taken_back {
                 self.stats.moves_taken_back.fetch_add(1, Ordering::Relaxed);
+                if reason == "rebalance" {
+                    // B rule R2: its share goes back to the round.
+                    self.router.rebalance_returned(Instant::now());
+                }
                 if reason == "parents-lost" && reason_now == Some("parents-lost") {
                     // Taken back within the hold-down, as `admit` takes a
                     // client it sent away for lost parents.
@@ -1881,6 +1945,7 @@ impl EdgeControl {
             repair,
             fast_lane,
             compact,
+            others,
         );
         let admitting = Arc::clone(&self.admitting);
         tokio::spawn(async move {
@@ -2143,6 +2208,8 @@ struct RefreshRequest {
     repair: RepairPolicy,
     compact: Option<CompactPlan>,
     from_part: Option<u64>,
+    /// `o=`, as tags.
+    others: [u64; 2],
     /// `r=1`: send again from `from_part` (B rule 8).
     resume: bool,
     /// The stream's newest part at this edge, and its window.
@@ -2210,11 +2277,13 @@ fn refresh_subscriber(
         repair,
         compact,
         from_part,
+        others,
         resume,
         head,
         window,
     } = request;
     subscriber.expires_at = now + SUBSCRIPTION_TTL;
+    subscriber.others = others;
     // A fast-lane client whose repair changed moves to the group of its new
     // policy.
     let mut regroup =
@@ -2260,11 +2329,24 @@ fn refresh_subscriber(
 }
 
 /// A subscriber left with its `UNSUB`: a leaving one has completed its move
-/// (B rule 4).
+/// (B rule 4), and one sent away by a rebalance is a rebalance move.
 fn book_unsubscribe(stats: &EdgeUdpStats, subscriber: &Subscriber) {
-    if subscriber.leaving.is_some() {
-        stats.moves_completed.fetch_add(1, Ordering::Relaxed);
+    let Some(leaving) = subscriber.leaving else {
+        return;
+    };
+    stats.moves_completed.fetch_add(1, Ordering::Relaxed);
+    if leaving.reason == "rebalance" {
+        stats.rebalance_moves.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Whether an `overloaded` edge (with --client-udp-admit-by-load) refuses a
+/// new subscription `edge-busy` (Phase AM item 8, B rule 9): a new
+/// listener, and a redundant leg (`o=`) even when it names a part; a lone
+/// leg that moves here (it names a part and has nothing else) is taken, or
+/// it would be stranded.
+fn refused_for_load(from_part: Option<u64>, others: [u64; 2], overloaded: bool) -> bool {
+    overloaded && (from_part.is_none() || others != NO_OTHER_LEGS)
 }
 
 /// Send a compact-lane subscriber the parts that it asks for again: each
@@ -2644,6 +2726,7 @@ async fn admit(
     repair: RepairPolicy,
     fast_lane: bool,
     compact: Option<CompactPlan>,
+    others: [u64; 2],
 ) {
     let admitted_in = Instant::now();
     let reason = match move_reason(&router, stream_id).await {
@@ -2676,11 +2759,13 @@ async fn admit(
         .await;
         return;
     }
-    // Phase AM item 8: an overloaded edge takes no new listener (one that
-    // moves here is taken: refused everywhere, it would be stranded).
-    if config.admit_by_load && from_part.is_none() && router.edge_load.overloaded_now() {
+    let overloaded = config.admit_by_load && router.edge_load.overloaded_now();
+    if refused_for_load(from_part, others, overloaded) {
         stats.refusals.fetch_add(1, Ordering::Relaxed);
         stats.load_refusals.fetch_add(1, Ordering::Relaxed);
+        if others != NO_OTHER_LEGS {
+            stats.redundant_refusals.fetch_add(1, Ordering::Relaxed);
+        }
         send_control(
             &socket,
             peer,
@@ -2799,6 +2884,7 @@ async fn admit(
                 nack_interval: NackInterval::new(Instant::now()),
                 windows_repaired: VecDeque::new(),
                 leaving: None,
+                others,
             },
         );
         let start = !std::mem::replace(&mut entry.running, true);
@@ -3815,7 +3901,7 @@ async fn housekeeping_moves(
         // The share is reserved now, so that the senders of the
         // edge's other streams do not take it too (wave 9 review);
         // what this one does not send is handed back.
-        let (due, active) = router.rebalance_due(now).await;
+        let (due, active, receivers) = router.rebalance_due(now).await;
         if due > 0 {
             let marked = {
                 let mut guard = table.lock().unwrap();
@@ -3829,6 +3915,7 @@ async fn housekeeping_moves(
                             Some(due),
                             "rebalance",
                             config.move_grace,
+                            &receivers,
                         );
                         let fast_removed =
                             config.move_grace.is_zero() && remove_subscribers(entry, &marked);
@@ -3846,9 +3933,12 @@ async fn housekeeping_moves(
                 stats
                     .moves
                     .fetch_add(marked.len() as u64, Ordering::Relaxed);
-                stats
-                    .rebalance_moves
-                    .fetch_add(marked.len() as u64, Ordering::Relaxed);
+                if config.move_grace.is_zero() {
+                    // Removed at the MOVE: no UNSUB will count it (B rule 4).
+                    stats
+                        .rebalance_moves
+                        .fetch_add(marked.len() as u64, Ordering::Relaxed);
+                }
                 info!(
                     stream_id,
                     clients = marked.len(),
@@ -3965,6 +4055,7 @@ pub(crate) fn insert_test_subscribers(
                 nack_interval: NackInterval::new(now),
                 windows_repaired: VecDeque::new(),
                 leaving: None,
+                others: NO_OTHER_LEGS,
             },
         );
     }
@@ -4002,15 +4093,22 @@ impl DrainPace {
 /// its advertised load and its live UDP subscribers.
 #[derive(Debug, Clone)]
 pub(crate) struct RebalanceEdge {
-    #[allow(dead_code)]
     pub(crate) node_id: String,
     pub(crate) load_permille: u32,
     pub(crate) subscribers: u64,
 }
 
+/// A rebalance round's plan: how many UDP listeners to send away, and the
+/// receivers (indices into the region's other edges) that have room.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RebalancePlan {
+    pub(crate) quota: usize,
+    pub(crate) receivers: Vec<usize>,
+}
+
 /// How many UDP listeners an edge sends away in one rebalance round (wave
 /// 9 C1), from its own load and subscribers and those of the other live
-/// edges of its region (fresh, serving, not draining).
+/// edges of its region (fresh, serving, not draining), and the receivers.
 ///
 /// The cost of a listener, `k` permille, is the median of load over
 /// subscribers among the edges with a few. An advertised load is a mean
@@ -4023,6 +4121,12 @@ pub(crate) struct RebalanceEdge {
 ///   while that is under `target - margin`, up to `target - margin / 2`;
 /// - another edge over the target asks its excess as this one does.
 ///
+/// With `to_mean` (B rule R3) the target is no higher than the region's
+/// mean load (this edge's and the others', each reckoned as above) plus half
+/// the margin: an edge well over its region's mean sheds to it, so that a
+/// restarted or joined edge takes its share of listeners that hold two legs
+/// already.
+///
 /// The receivers' room is shared among the edges over the target by their
 /// excess, so that none is overshot by several at once; an edge never
 /// sends more than its own excess.
@@ -4032,32 +4136,43 @@ pub(crate) fn rebalance_quota(
     others: &[RebalanceEdge],
     target: u32,
     margin: u32,
-) -> usize {
+    to_mean: bool,
+) -> RebalancePlan {
     let Some(k) = rebalance_cost(own, others) else {
-        return 0;
+        return RebalancePlan::default();
     };
-    let target = f64::from(target);
-    let margin = f64::from(margin.min(target as u32));
     let own_load = (f64::from(own.load_permille) - recent_shed * k).max(0.0);
+    let mut target = f64::from(target);
+    if to_mean {
+        let others_load: f64 = others
+            .iter()
+            .map(|edge| f64::from(edge.load_permille).max(k * edge.subscribers as f64))
+            .sum();
+        let mean = (own_load + others_load) / (others.len() + 1) as f64;
+        target = target.min(mean + f64::from(margin) / 2.0);
+    }
+    let margin = f64::from(margin).min(target);
     if own_load <= target {
-        return 0;
+        return RebalancePlan::default();
     }
     let excess = |load: f64, subscribers: u64| -> f64 {
         ((load - target) / k).ceil().clamp(0.0, subscribers as f64)
     };
     let own_excess = excess(own_load, own.subscribers);
     if own_excess < 1.0 {
-        return 0;
+        return RebalancePlan::default();
     }
     let mut shedders = 1.0;
     let mut total_excess = own_excess;
     let mut total_room = 0.0;
-    for edge in others {
+    let mut receivers = Vec::new();
+    for (index, edge) in others.iter().enumerate() {
         let live = k * edge.subscribers as f64;
         let load = f64::from(edge.load_permille);
         let high = load.max(live);
         if high < target - margin {
             total_room += ((target - margin / 2.0 - high) / k).floor().max(0.0);
+            receivers.push(index);
         }
         let low = load.min(live);
         if low > target {
@@ -4069,7 +4184,7 @@ pub(crate) fn rebalance_quota(
         }
     }
     if total_room < 1.0 {
-        return 0;
+        return RebalancePlan::default();
     }
     let share = (total_room * own_excess / total_excess).floor();
     let share = if share < 1.0 && total_room >= shedders {
@@ -4077,7 +4192,10 @@ pub(crate) fn rebalance_quota(
     } else {
         share
     };
-    share.min(own_excess) as usize
+    RebalancePlan {
+        quota: share.min(own_excess) as usize,
+        receivers,
+    }
 }
 
 /// What one UDP listener costs an edge (permille), as a rebalance reckons
@@ -4104,6 +4222,10 @@ pub(crate) fn rebalance_cost(own: &RebalanceEdge, others: &[RebalanceEdge]) -> O
 pub(crate) struct RebalanceState {
     planned_at: Option<Instant>,
     round: Option<DrainPace>,
+    /// B rule R2: listeners of the round that came back (taken back by
+    /// this edge), and the tags of the round's receivers (R1).
+    round_returned: usize,
+    receivers: Vec<u64>,
     shed: VecDeque<(Instant, usize)>,
     check: Option<RebalanceCheck>,
     paused_until: Option<Instant>,
@@ -4150,12 +4272,48 @@ impl RebalanceState {
         due
     }
 
-    pub(crate) fn start_round(&mut self, now: Instant, total: usize) {
+    /// A round of `total` listeners, into the edges tagged `receivers`.
+    pub(crate) fn start_round(&mut self, now: Instant, total: usize, receivers: Vec<u64>) {
         self.round = (total > 0).then_some(DrainPace {
             started: now,
             initial: total,
             sent: 0,
         });
+        self.round_returned = 0;
+        self.receivers = receivers;
+    }
+
+    /// The tags of the round's receivers (B rule R1).
+    pub(crate) fn receivers(&self) -> &[u64] {
+        &self.receivers
+    }
+
+    /// A listener sent away came back (B rule R2): it is no longer what the
+    /// edge shed (the newest send, and the open check), and its share goes
+    /// back to the round, to be offered to another subscriber. A round of
+    /// which more than half came back pauses rebalancing, as an ineffective
+    /// one does: `true` then.
+    pub(crate) fn returned(&mut self, now: Instant) -> bool {
+        if let Some((_, count)) = self.shed.back_mut() {
+            *count -= 1;
+            if *count == 0 {
+                self.shed.pop_back();
+            }
+        }
+        if let Some(check) = self.check.as_mut() {
+            check.sent = check.sent.saturating_sub(1);
+        }
+        let Some(round) = self.round.as_mut() else {
+            return false;
+        };
+        round.sent = round.sent.saturating_sub(1);
+        self.round_returned += 1;
+        if self.round_returned * 2 <= round.initial {
+            return false;
+        }
+        self.paused_until = Some(now + REBALANCE_PAUSE);
+        self.round = None;
+        true
     }
 
     /// Listeners to send away now: the round's share due by the next tick
@@ -4296,14 +4454,26 @@ fn mark_movable(
     reason: &'static str,
     grace: Duration,
 ) -> Vec<SocketAddr> {
-    mark_movable_aged(entry, hold_down, Duration::ZERO, now, limit, reason, grace)
+    mark_movable_aged(
+        entry,
+        hold_down,
+        Duration::ZERO,
+        now,
+        limit,
+        reason,
+        grace,
+        &[],
+    )
 }
 
 /// [`mark_movable`], and none admitted less than `min_age` ago, nor one
 /// still catching up after a move (a rebalance, wave 9 C1). A subscriber
 /// that is leaving already is not taken again, except by a drain from a
 /// rebalance: its reason becomes `draining` and its grace starts again. A
-/// marked subscriber is served no longer than `grace` from now.
+/// marked subscriber is served no longer than `grace` from now. One whose
+/// other legs (`o=`) are at every edge in `avoid` (the rebalance's
+/// receivers, B rule R1) is passed over: it has no edge to move to.
+#[allow(clippy::too_many_arguments)]
 fn mark_movable_aged(
     entry: &mut StreamEntry,
     hold_down: Duration,
@@ -4312,6 +4482,7 @@ fn mark_movable_aged(
     limit: Option<usize>,
     reason: &'static str,
     grace: Duration,
+    avoid: &[u64],
 ) -> Vec<SocketAddr> {
     let mut marked = Vec::new();
     let limit = limit.unwrap_or(usize::MAX);
@@ -4327,6 +4498,7 @@ fn mark_movable_aged(
         if !free
             || (subscriber.moved_in && age < hold_down)
             || (!min_age.is_zero() && (age < min_age || subscriber.catching_up))
+            || (!avoid.is_empty() && avoid.iter().all(|tag| subscriber.others.contains(tag)))
         {
             continue;
         }
@@ -5365,6 +5537,7 @@ mod tests {
             nack_interval: NackInterval::new(admitted_at),
             windows_repaired: VecDeque::new(),
             leaving: None,
+            others: NO_OTHER_LEGS,
         }
     }
 
@@ -5499,7 +5672,10 @@ mod tests {
         // k ~ 30.3; own excess (1000 - 800) / k -> 7; e2 (900) asks 4 and
         // e1 (850) 2. The slot's room: (800 - 75) / k -> 23, so e3 takes
         // 23 x 7 / 13 = 12 -> its excess, 7.
-        assert_eq!(rebalance_quota(&own, 0.0, &others, 800, 150), 7);
+        assert_eq!(
+            rebalance_quota(&own, 0.0, &others, 800, 150, false).quota,
+            7
+        );
         // The slot is the only receiver: with 3 edges asking 24 between
         // them the round shares its room, never more than it has.
         let crowded = [
@@ -5508,25 +5684,53 @@ mod tests {
             rebalance_edge("e4", 600, 15),
         ];
         // Room (725 - max(600, 450)) / 30 -> 4; e3 asks 7 of 21: 1.
-        assert_eq!(rebalance_quota(&own, 0.0, &crowded, 800, 150), 1);
+        assert_eq!(
+            rebalance_quota(&own, 0.0, &crowded, 800, 150, false).quota,
+            1
+        );
         // A receiver whose live subscribers say it is fuller than its
         // (lagging) load takes nothing: 22 x 30 = 660 > 650.
         let filled = [rebalance_edge("e4", 200, 22), rebalance_edge("e1", 700, 23)];
-        assert_eq!(rebalance_quota(&own, 0.0, &filled, 800, 150), 0);
+        assert_eq!(
+            rebalance_quota(&own, 0.0, &filled, 800, 150, false).quota,
+            0
+        );
         // No room anywhere, or under its own target: nothing.
         let full = [rebalance_edge("e1", 760, 25), rebalance_edge("e2", 700, 23)];
-        assert_eq!(rebalance_quota(&own, 0.0, &full, 800, 150), 0);
+        assert_eq!(rebalance_quota(&own, 0.0, &full, 800, 150, false).quota, 0);
         assert_eq!(
-            rebalance_quota(&rebalance_edge("e3", 790, 26), 0.0, &others, 800, 150),
+            rebalance_quota(
+                &rebalance_edge("e3", 790, 26),
+                0.0,
+                &others,
+                800,
+                150,
+                false
+            )
+            .quota,
             0
         );
         // What it sent away in the window (its load still holds 6 of them)
         // counts: 1,000 - 6 x 30 = 820 -> 1 more.
-        assert_eq!(rebalance_quota(&own, 6.0, &others, 800, 150), 1);
-        assert_eq!(rebalance_quota(&own, 7.0, &others, 800, 150), 0);
+        assert_eq!(
+            rebalance_quota(&own, 6.0, &others, 800, 150, false).quota,
+            1
+        );
+        assert_eq!(
+            rebalance_quota(&own, 7.0, &others, 800, 150, false).quota,
+            0
+        );
         // Never more than its own subscribers; none without a cost.
         assert_eq!(
-            rebalance_quota(&rebalance_edge("e3", 1_000, 0), 0.0, &others, 800, 150),
+            rebalance_quota(
+                &rebalance_edge("e3", 1_000, 0),
+                0.0,
+                &others,
+                800,
+                150,
+                false
+            )
+            .quota,
             0
         );
     }
@@ -5540,7 +5744,7 @@ mod tests {
         assert!(state.take_plan_turn(start, interval));
         assert!(!state.take_plan_turn(start + Duration::from_millis(100), interval));
         assert_eq!(state.due(start, spread), 0, "no round yet");
-        state.start_round(start, 40);
+        state.start_round(start, 40, Vec::new());
         assert!(state.active());
         let mut sent = 0;
         let mut at = start;
@@ -5565,7 +5769,7 @@ mod tests {
         assert!(late > 6.0 && late < 10.0, "{late}");
         assert_eq!(state.recent_shed(start + Duration::from_secs(13), window), 0.0);
         assert!(state.take_plan_turn(start + interval, interval));
-        state.start_round(start + interval, 0);
+        state.start_round(start + interval, 0, Vec::new());
         assert!(!state.active());
     }
 
@@ -5577,7 +5781,7 @@ mod tests {
         let start = Instant::now();
         let spread = Duration::from_millis(2_000);
         let mut state = RebalanceState::default();
-        state.start_round(start, 10);
+        state.start_round(start, 10, Vec::new());
         let first = state.reserve(start, spread);
         assert!(first >= 1);
         assert_eq!(state.reserve(start, spread), 0, "the other stream's sender");
@@ -5588,7 +5792,7 @@ mod tests {
         let window = Duration::from_secs(10);
         let mut state = RebalanceState::default();
         state.begin_check(900, 40, 15.0);
-        state.start_round(start, 6);
+        state.start_round(start, 6, Vec::new());
         let due = state.reserve(start + spread, spread);
         assert_eq!(due, 6);
         state.settle(start + spread, due, 6);
@@ -5647,6 +5851,7 @@ mod tests {
                 Some(5),
                 "rebalance",
                 grace,
+                &[],
             )
         };
         let leaving = mark(&mut entry);
@@ -5779,7 +5984,8 @@ mod tests {
             later + REBALANCE_MIN_AGE,
             None,
             "rebalance",
-            grace
+            grace,
+            &[],
         )
         .is_empty());
         assert_eq!(
@@ -5851,6 +6057,7 @@ mod tests {
             },
             compact: None,
             from_part,
+            others: NO_OTHER_LEGS,
             resume,
             head: Some(1_000),
             window: 4_096,
@@ -6105,6 +6312,199 @@ mod tests {
         let marked = |short| compact_marked(&canonical, 0, false, short);
         assert!(!compact::is_short(&marked(first.compact[0].2.short_header)));
         assert!(compact::is_short(&marked(next.compact[0].2.short_header)));
+    }
+
+    /// B rule 9: an overloaded edge refuses a redundant leg (`o=`) even when
+    /// it names a part, and a new listener; it takes a lone leg that moves
+    /// here (it has nothing else). Not overloaded, it refuses none.
+    #[test]
+    fn a_redundant_leg_is_refused_by_an_overloaded_edge_and_a_lone_mover_is_not() {
+        let redundant = other_leg_tags(&["lon-edge-2".to_owned()]);
+        assert_ne!(redundant, NO_OTHER_LEGS);
+        assert_eq!(redundant[0], crate::assignment::node_tag("lon-edge-2"));
+        assert!(refused_for_load(Some(900), redundant, true));
+        assert!(refused_for_load(None, redundant, true));
+        assert!(refused_for_load(None, NO_OTHER_LEGS, true));
+        assert!(!refused_for_load(Some(900), NO_OTHER_LEGS, true));
+        for (from_part, others) in [(None, NO_OTHER_LEGS), (Some(900), redundant)] {
+            assert!(!refused_for_load(from_part, others, false));
+        }
+        // At most two other legs are kept; none is 0.
+        let three: Vec<String> = ["a", "b", "c"]
+            .iter()
+            .map(|node| (*node).to_owned())
+            .collect();
+        let tags = other_leg_tags(&three);
+        assert!(tags.iter().all(|tag| *tag != 0));
+        assert_eq!(tags[1], crate::assignment::node_tag("b"));
+        assert_eq!(other_leg_tags(&[]), NO_OTHER_LEGS);
+    }
+
+    /// B rule R1: a rebalance passes over a subscriber whose other legs are
+    /// at every receiver: it has nowhere to go. One with another leg
+    /// elsewhere, or none, is taken.
+    #[test]
+    fn a_rebalance_passes_over_a_subscriber_whose_other_leg_is_the_only_receiver() {
+        let now = Instant::now();
+        let old = now - REBALANCE_MIN_AGE * 2;
+        let grace = Duration::from_secs(10);
+        let receiver = crate::assignment::node_tag("edge-3");
+        let elsewhere = crate::assignment::node_tag("edge-1");
+        let held = SocketAddr::from(([127, 0, 0, 1], 5_000));
+        let other = SocketAddr::from(([127, 0, 0, 1], 5_001));
+        let single = SocketAddr::from(([127, 0, 0, 1], 5_002));
+        let mut entry = StreamEntry::default();
+        for (peer, others) in [
+            (held, [receiver, 0]),
+            (other, [elsewhere, 0]),
+            (single, NO_OTHER_LEGS),
+        ] {
+            let mut subscriber = moved_subscriber(old, false);
+            subscriber.others = others;
+            entry.subscribers.insert(peer, subscriber);
+        }
+        let mut marked = mark_movable_aged(
+            &mut entry,
+            Duration::ZERO,
+            REBALANCE_MIN_AGE,
+            now,
+            None,
+            "rebalance",
+            grace,
+            &[receiver],
+        );
+        marked.sort();
+        assert_eq!(marked, vec![other, single]);
+        assert!(entry.subscribers[&held].leaving.is_none());
+        // With two receivers it has one to go to.
+        let mut entry = StreamEntry::default();
+        let mut subscriber = moved_subscriber(old, false);
+        subscriber.others = [receiver, 0];
+        entry.subscribers.insert(held, subscriber);
+        let marked = mark_movable_aged(
+            &mut entry,
+            Duration::ZERO,
+            REBALANCE_MIN_AGE,
+            now,
+            None,
+            "rebalance",
+            grace,
+            &[receiver, elsewhere],
+        );
+        assert_eq!(marked, vec![held]);
+    }
+
+    /// B rule R2: a listener taken back is no longer what the edge shed,
+    /// and its share goes back to the round, which offers it to another
+    /// subscriber at the next tick.
+    #[test]
+    fn a_take_back_returns_its_share_to_the_round() {
+        let start = Instant::now();
+        let spread = Duration::from_millis(2_000);
+        let window = Duration::from_secs(10);
+        let mut state = RebalanceState::default();
+        state.begin_check(900, 40, 15.0);
+        state.start_round(start, 10, vec![7]);
+        assert_eq!(state.receivers(), &[7]);
+        let end = start + spread;
+        let due = state.reserve(end, spread);
+        assert_eq!(due, 10);
+        state.settle(end, due, 10);
+        assert!(!state.active());
+        let shed = state.recent_shed(end, window);
+        assert!(!state.returned(end), "one of ten is no pause");
+        assert!(state.active(), "its share is due again");
+        assert_eq!(state.reserve(end, spread), 1);
+        assert!((state.recent_shed(end, window) - (shed - 1.0)).abs() < 1e-9);
+        assert_eq!(state.check.unwrap().sent, 9);
+        // Without a round (the edge planned nothing since) only what it
+        // shed is booked.
+        let mut idle = RebalanceState::default();
+        idle.start_round(start, 0, Vec::new());
+        assert!(!idle.returned(start));
+        assert!(!idle.active());
+    }
+
+    /// B rule R2: a round of which more than half came back pauses the
+    /// rebalance, as an ineffective one does.
+    #[test]
+    fn a_round_that_mostly_comes_back_pauses() {
+        let start = Instant::now();
+        let spread = Duration::from_millis(2_000);
+        let interval = Duration::from_millis(3_000);
+        let mut state = RebalanceState::default();
+        assert!(state.take_plan_turn(start, interval));
+        state.start_round(start, 3, Vec::new());
+        let due = state.reserve(start + spread, spread);
+        state.settle(start + spread, due, due);
+        let back = start + spread + Duration::from_millis(100);
+        assert!(!state.returned(back), "one of three");
+        assert!(state.returned(back), "two of three");
+        assert!(!state.active());
+        assert_eq!(state.due(back, spread), 0);
+        assert!(!state.take_plan_turn(back + interval, interval));
+        assert!(state.take_plan_turn(back + REBALANCE_PAUSE, interval));
+    }
+
+    /// B rule R3: three edges at 720 / 720 / 0 (a listener at 15 permille)
+    /// settle at 555 / 555 / 330 in one round: each loaded edge sheds 11 to
+    /// the empty one, which is the round's only receiver. Without it, under
+    /// the target of 800, nobody moves.
+    #[test]
+    fn an_edge_over_the_mean_sheds_to_the_mean() {
+        let own = rebalance_edge("e1", 720, 48);
+        let others = [rebalance_edge("e2", 720, 48), rebalance_edge("e3", 0, 0)];
+        let plan = rebalance_quota(&own, 0.0, &others, 800, 150, true);
+        assert_eq!(plan.quota, 11);
+        assert_eq!(plan.receivers, vec![1]);
+        assert_eq!(720 - plan.quota as u32 * 15, 555);
+        let other = rebalance_quota(
+            &others[0],
+            0.0,
+            &[own.clone(), others[1].clone()],
+            800,
+            150,
+            true,
+        );
+        assert_eq!(other.quota, 11);
+        assert_eq!(2 * 11 * 15, 330);
+        assert_eq!(
+            rebalance_quota(&own, 0.0, &others, 800, 150, false),
+            RebalancePlan::default()
+        );
+        // Once shed (its load still holds them for the window), and with
+        // the receiver's live subscribers counted: at the mean, no more.
+        let after = [rebalance_edge("e2", 720, 37), rebalance_edge("e3", 0, 22)];
+        assert_eq!(rebalance_quota(&own, 11.0, &after, 800, 150, true).quota, 0);
+        // Over the target, the target is still the ceiling.
+        let hot = rebalance_edge("e1", 1_000, 33);
+        let region = [rebalance_edge("e2", 950, 32), rebalance_edge("e3", 900, 30)];
+        assert_eq!(
+            rebalance_quota(&hot, 0.0, &region, 800, 150, true).quota,
+            0,
+            "no room"
+        );
+    }
+
+    /// B rule 4: the UNSUB of a subscriber leaving for a rebalance is a
+    /// completed move and a rebalance move; of one leaving for a drain a
+    /// completed move only; of one not leaving neither.
+    #[test]
+    fn rebalance_moves_count_at_the_unsub() {
+        let now = Instant::now();
+        let stats = EdgeUdpStats::default();
+        let mut subscriber = moved_subscriber(now, false);
+        book_unsubscribe(&stats, &subscriber);
+        for reason in ["rebalance", "draining"] {
+            subscriber.leaving = Some(Leaving {
+                since: now,
+                reason,
+                reminded_at: now,
+            });
+            book_unsubscribe(&stats, &subscriber);
+        }
+        assert_eq!(stats.moves_completed.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.rebalance_moves.load(Ordering::Relaxed), 1);
     }
 
     /// B 2.6: a token is valid in the minute it was issued in and the next,
