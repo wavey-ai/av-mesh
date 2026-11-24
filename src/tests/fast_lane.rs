@@ -995,6 +995,12 @@ async fn the_fields_needletail_s_tools_read_are_served() {
         "/client_udp/load_permille",
         "/client_udp/rebalance_moves",
         "/client_udp/moves_expired",
+        "/relay_counters/duplicate_mismatch",
+        "/relay_counters/not_admitted",
+        "/relay_counters/stale_media",
+        "/relay_counters/canonical_conflicts",
+        "/relay_counters/wide_hole_releases",
+        "/relay_counters/skipped_parts",
     ] {
         assert!(node.pointer(path).is_some_and(|v| v.is_u64()), "{path}: {node:#}");
     }

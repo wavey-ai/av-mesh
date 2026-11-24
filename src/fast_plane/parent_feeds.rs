@@ -45,6 +45,12 @@ const RESET_BEHIND: u64 = 4_096;
 const MAX_FEEDS: usize = 4_096;
 /// An entry without a datagram for this long is dropped by the sampler.
 const RETIRE_AFTER_US: u64 = 300_000_000;
+/// The skips an entry remembers, newest last (integration 4): which objects
+/// a lane moved past, so that the sampler can say which objects every
+/// parent of a stream skipped. A healthy lane skips 0 to 4 in 10 s (local
+/// proof 2); a lane that skips more than this in 10 s has its figure for
+/// that stream unknown, not short.
+const SKIP_RECORDS: usize = 32;
 
 /// The counters of one entry: cumulative since the entry was made, but for
 /// the head and the slack minima.
@@ -95,8 +101,22 @@ struct Feed {
     slack_n: AtomicU64,
     slack_second: [AtomicU64; SLACK_SLOTS],
     slack_min_us: [AtomicI64; SLACK_SLOTS],
+    /// The newest skips: (epoch, first object, last object, Unix µs) each,
+    /// slot `skip_writes % SKIP_RECORDS`; written on a skip only.
+    skip_ranges: [[AtomicU64; 4]; SKIP_RECORDS],
+    skip_writes: AtomicU64,
     /// The sampler's copies and figures. Never taken by a class thread.
     history: StdMutex<History>,
+}
+
+/// One skip of an entry: the objects `first..=last` of `epoch`, moved past
+/// at `at_us`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SkipRange {
+    epoch: u64,
+    first: u64,
+    last: u64,
+    at_us: u64,
 }
 
 /// One more, by the entry's only writer: a load and a store, no locked
@@ -132,6 +152,8 @@ impl Feed {
             slack_n: AtomicU64::new(0),
             slack_second: std::array::from_fn(|_| AtomicU64::new(0)),
             slack_min_us: std::array::from_fn(|_| AtomicI64::new(0)),
+            skip_ranges: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+            skip_writes: AtomicU64::new(0),
             history: StdMutex::new(History::default()),
         }
     }
@@ -174,6 +196,16 @@ impl Feed {
         if !has_head || starts_again || view.object > head {
             if has_head && !starts_again {
                 bump(&self.skipped, view.object - head - 1);
+                if view.object > head + 1 {
+                    // Four stores, on a skip only.
+                    let writes = self.skip_writes.load(Ordering::Relaxed);
+                    let slot = &self.skip_ranges[(writes % SKIP_RECORDS as u64) as usize];
+                    slot[0].store(view.epoch, Ordering::Relaxed);
+                    slot[1].store(head + 1, Ordering::Relaxed);
+                    slot[2].store(view.object - 1, Ordering::Relaxed);
+                    slot[3].store(rx_us, Ordering::Relaxed);
+                    self.skip_writes.store(writes + 1, Ordering::Relaxed);
+                }
             }
             self.epoch.store(view.epoch, Ordering::Relaxed);
             self.head.store(view.object, Ordering::Relaxed);
@@ -202,6 +234,35 @@ impl Feed {
             self.slack_second[slot].store(second + 1, Ordering::Relaxed);
         }
         self.seq.store(seq.wrapping_add(2), Ordering::Release);
+    }
+
+    /// A consistent copy of the skips kept, oldest first, and whether
+    /// skips older than the oldest kept were dropped.
+    fn read_skips(&self) -> (Vec<SkipRange>, bool) {
+        loop {
+            let seq = self.seq.load(Ordering::Acquire);
+            if seq & 1 == 1 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let writes = self.skip_writes.load(Ordering::Relaxed);
+            let kept = writes.min(SKIP_RECORDS as u64);
+            let ranges: Vec<SkipRange> = (writes - kept..writes)
+                .map(|write| {
+                    let slot = &self.skip_ranges[(write % SKIP_RECORDS as u64) as usize];
+                    SkipRange {
+                        epoch: slot[0].load(Ordering::Relaxed),
+                        first: slot[1].load(Ordering::Relaxed),
+                        last: slot[2].load(Ordering::Relaxed),
+                        at_us: slot[3].load(Ordering::Relaxed),
+                    }
+                })
+                .collect();
+            fence(Ordering::Acquire);
+            if self.seq.load(Ordering::Relaxed) == seq {
+                return (ranges, writes > SKIP_RECORDS as u64);
+            }
+        }
     }
 
     /// A consistent copy of the counters.
@@ -313,6 +374,56 @@ impl History {
                 .min(),
         };
     }
+}
+
+/// The objects that every lane of `parents` skipped: the intersection of
+/// their skips (by epoch and object), counted. `None` when a lane's record
+/// is not whole.
+fn skipped_by_all(parents: &[Option<Vec<SkipRange>>]) -> Option<u64> {
+    // Each lane's skips as sorted, merged (epoch, first, last) runs.
+    let merged = |ranges: &[SkipRange]| -> Vec<(u64, u64, u64)> {
+        let mut runs: Vec<(u64, u64, u64)> = ranges
+            .iter()
+            .map(|range| (range.epoch, range.first, range.last))
+            .collect();
+        runs.sort_unstable();
+        let mut out: Vec<(u64, u64, u64)> = Vec::with_capacity(runs.len());
+        for run in runs {
+            match out.last_mut() {
+                Some(last) if last.0 == run.0 && run.1 <= last.2.saturating_add(1) => {
+                    last.2 = last.2.max(run.2);
+                }
+                _ => out.push(run),
+            }
+        }
+        out
+    };
+    let mut common: Option<Vec<(u64, u64, u64)>> = None;
+    for parent in parents {
+        let lane = merged(parent.as_deref()?);
+        common = Some(match common {
+            None => lane,
+            Some(common) => {
+                let mut both = Vec::new();
+                for a in &common {
+                    for b in lane.iter().filter(|b| b.0 == a.0) {
+                        let (first, last) = (a.1.max(b.1), a.2.min(b.2));
+                        if first <= last {
+                            both.push((a.0, first, last));
+                        }
+                    }
+                }
+                both
+            }
+        });
+    }
+    Some(
+        common
+            .unwrap_or_default()
+            .iter()
+            .map(|(_, first, last)| last - first + 1)
+            .sum(),
+    )
 }
 
 /// One (parent address, stream, track) as `GET /api/node` reports it.
@@ -588,6 +699,9 @@ pub struct ParentFeeds {
     /// it was last seen to have risen (Unix µs; 0: never).
     received_seen: AtomicU64,
     received_changed_us: AtomicU64,
+    /// The sampler's figure of each stream: the objects of its last ten
+    /// seconds that every parent delivering it skipped (`None`: unknown).
+    every_parent: StdMutex<std::collections::BTreeMap<u64, Option<u64>>>,
 }
 
 impl Default for ParentFeeds {
@@ -603,6 +717,7 @@ impl Default for ParentFeeds {
             plane: StdMutex::new(Plane::default()),
             received_seen: AtomicU64::new(0),
             received_changed_us: AtomicU64::new(0),
+            every_parent: StdMutex::new(std::collections::BTreeMap::new()),
         }
     }
 }
@@ -850,14 +965,42 @@ impl ParentFeeds {
         let table = self.table.load_full();
         let mut admitted_1s = 0_u64;
         let mut idle = false;
+        // The skips of the last ten seconds of each (stream, track), by
+        // parent that delivered within them.
+        let since_us = now_us.saturating_sub(WINDOW_SECONDS * 1_000_000);
+        let mut lanes: std::collections::BTreeMap<(u64, &str), Vec<Option<Vec<SkipRange>>>> =
+            std::collections::BTreeMap::new();
         for feed in table.feeds() {
             let counters = feed.read();
             let mut history = lock(&feed.history);
             history.take(counters, now_us);
             admitted_1s += history.figures.datagrams_1s;
-            idle |= now_us.saturating_sub(counters.last_source_us.max(counters.last_repair_us))
-                > RETIRE_AFTER_US;
+            let last_us = counters.last_source_us.max(counters.last_repair_us);
+            idle |= now_us.saturating_sub(last_us) > RETIRE_AFTER_US;
+            if let Some(stream_id) = feed.stream_id.filter(|_| last_us > since_us) {
+                let (ranges, dropped) = feed.read_skips();
+                let recent: Vec<SkipRange> = ranges
+                    .iter()
+                    .copied()
+                    .filter(|range| range.at_us > since_us)
+                    .collect();
+                // A skip dropped from the record may lie in the window: the
+                // oldest kept is within it.
+                let whole = !dropped || ranges.first().is_none_or(|oldest| oldest.at_us <= since_us);
+                lanes
+                    .entry((stream_id, &*feed.track))
+                    .or_default()
+                    .push(whole.then_some(recent));
+            }
         }
+        let mut every_parent: std::collections::BTreeMap<u64, Option<u64>> =
+            std::collections::BTreeMap::new();
+        for ((stream_id, _), parents) in lanes {
+            let objects = skipped_by_all(&parents);
+            let entry = every_parent.entry(stream_id).or_insert(Some(0));
+            *entry = entry.zip(objects).map(|(sum, objects)| sum + objects);
+        }
+        *lock(&self.every_parent) = every_parent;
         {
             let mut plane = lock(&self.plane);
             plane.figures = PlaneFigures {
@@ -886,6 +1029,14 @@ impl ParentFeeds {
             });
             self.retired.keep(old);
         }
+    }
+
+    /// The objects of each stream that every parent delivering it in the
+    /// sampler's last ten seconds skipped in them (`None`: a parent skipped
+    /// more than its record keeps); a stream that no parent delivered in
+    /// them is not named. Summed over the stream's tracks.
+    pub fn skipped_by_every_parent(&self) -> std::collections::BTreeMap<u64, Option<u64>> {
+        lock(&self.every_parent).clone()
     }
 
     /// The plane's figures, with the age of the last received datagram
@@ -1066,6 +1217,62 @@ mod tests {
         assert_eq!((row.stream_id, row.track.as_str()), (Some(3001), "opaque-audio"));
         // The first object of an entry skipped nothing, whatever its number.
         assert_eq!(feeds.plane(6, T0 + 10_000).admitted_1s, 6);
+    }
+
+    /// Integration 4 (`streams[].skipped_by_every_parent_10s`, P2 (c)): the
+    /// objects that every parent delivering a stream moved past in the last
+    /// ten seconds, from the lanes' own skips; unknown when a lane skipped
+    /// more than its record keeps within them.
+    #[test]
+    fn the_objects_every_parent_skipped_are_counted() {
+        let feeds = ParentFeeds::default();
+        let (a, b) = (parent(11), parent(12));
+        // a skips 13 and 14; b skips 11 to 13: only 13 is skipped by both.
+        for object in [10, 11, 12, 15, 16] {
+            observe(&feeds, a, &source(object, T0 + SECOND), T0 + object);
+        }
+        for object in [10, 14, 15, 16] {
+            observe(&feeds, b, &source(object, T0 + SECOND), T0 + object);
+        }
+        // A late 13 on a does not take its skip back.
+        observe(&feeds, a, &source(13, T0 + SECOND), T0 + 20);
+        feeds.sample(9, 0, T0 + 1_000);
+        assert_eq!(feeds.skipped_by_every_parent().get(&3001), Some(&Some(1)));
+        // The same objects of another epoch are other objects.
+        let other = |object| view("3001", 8, object, MediaDatagramRole::Source, T0 + SECOND);
+        // One parent alone: its own skips.
+        let single = ParentFeeds::default();
+        for object in [1, 2, 5] {
+            observe(&single, a, &other(object), T0 + object);
+        }
+        single.sample(3, 0, T0 + 1_000);
+        assert_eq!(single.skipped_by_every_parent().get(&3001), Some(&Some(2)));
+        // Ten seconds on (both still delivering, nothing skipped since),
+        // the skip of 13 is out of the window.
+        for second in 1..=11_u64 {
+            let at = T0 + second * SECOND;
+            observe(&feeds, a, &source(16 + second, at + SECOND), at);
+            observe(&feeds, b, &source(16 + second, at + SECOND), at);
+        }
+        feeds.sample(40, 0, T0 + 10 * SECOND);
+        assert_eq!(feeds.skipped_by_every_parent()[&3001], Some(1), "still in the window");
+        feeds.sample(42, 0, T0 + 11 * SECOND + 1_000);
+        assert_eq!(feeds.skipped_by_every_parent()[&3001], Some(0));
+        // A lane that skipped more than its record keeps in the window:
+        // unknown.
+        let busy = ParentFeeds::default();
+        for object in 0..(SKIP_RECORDS as u64 + 2) {
+            observe(&busy, a, &source(object * 3, T0 + SECOND), T0 + object);
+            observe(&busy, b, &source(object * 3, T0 + SECOND), T0 + object);
+        }
+        busy.sample(80, 0, T0 + 1_000);
+        assert_eq!(busy.skipped_by_every_parent().get(&3001), Some(&None));
+        // No allocation on the class thread's side for a skip.
+        let before = allocations();
+        for object in [200, 205, 211] {
+            observe(&busy, a, &source(object, T0 + SECOND), T0 + 50);
+        }
+        assert_eq!(allocations(), before, "a skip allocates nothing");
     }
 
     #[test]

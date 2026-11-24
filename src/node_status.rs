@@ -149,6 +149,26 @@ pub struct FastPlaneStatus {
     pub received_age_ms: Option<u64>,
 }
 
+/// The relay's counters that the change tools hold still across a change
+/// (A's contributor rules, K3): the same counters as `/api/mesh/local`'s,
+/// read here so that a gate never asks for that document (integration 4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayCounters {
+    /// Copies whose bytes differ from the first copy's, summed over the
+    /// audio class's parent lanes.
+    pub duplicate_mismatch: u64,
+    /// Datagrams that no session admitted.
+    pub not_admitted: u64,
+    /// Admitted datagrams the class threads' media clocks held stale.
+    pub stale_media: u64,
+    /// Canonical commits refused for other bytes under a slot's identity.
+    pub canonical_conflicts: u64,
+    /// Holes wider than the gap scan that the repair horizon released.
+    pub wide_hole_releases: u64,
+    /// Parts the contiguous watermark passed without them.
+    pub skipped_parts: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngestStatus {
     /// Datagrams the tee of each class dropped as past their deadline.
@@ -209,6 +229,17 @@ pub struct StreamStatus {
     /// The window it must hold to be warm: `--cache-mesh-warm-parts`, at
     /// most the stream's window; 0 when that flag is 0.
     pub warm_parts: u64,
+    /// Parts of it this node did not commit in the last 10 s: the parts the
+    /// contiguous watermark passed without them (a hole released as a gap,
+    /// or one still missing when the gap hold ran out). A part that came
+    /// after it was passed is counted all the same (P2 (b), integration 4).
+    pub missed_10s: u64,
+    /// Objects of it in the parent feeds sampler's last 10 s that every
+    /// parent delivering it in them skipped (no parent's lane carried a
+    /// datagram of the object before moving past it). Null when no parent
+    /// delivered it in them, or one skipped more than its record keeps
+    /// (P2 (c), integration 4).
+    pub skipped_by_every_parent_10s: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -354,6 +385,7 @@ pub struct NodeStatus {
     pub hello_draining: bool,
     pub fast_plane: FastPlaneStatus,
     pub ingest: IngestStatus,
+    pub relay_counters: RelayCounters,
     pub parents: Vec<ParentStatus>,
     pub streams: Vec<StreamStatus>,
     pub children: ChildrenStatus,
@@ -783,6 +815,8 @@ mod tests {
             first_part: Some(5_111_456),
             window_parts: 12_001,
             warm_parts: 4_500,
+            missed_10s: 0,
+            skipped_by_every_parent_10s: Some(0),
         }
     }
 
@@ -1329,6 +1363,14 @@ mod tests {
                 received_age_ms: Some(0),
             },
             ingest: IngestStatus::default(),
+            relay_counters: RelayCounters {
+                duplicate_mismatch: 0,
+                not_admitted: 2,
+                stale_media: 0,
+                canonical_conflicts: 0,
+                wide_hole_releases: 1,
+                skipped_parts: 4_315,
+            },
             parents: vec![ParentStatus {
                 address: "172.236.1.10".to_owned(),
                 id: "lon-dist-a".to_owned(),

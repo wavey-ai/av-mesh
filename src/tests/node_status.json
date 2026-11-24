@@ -43,6 +43,14 @@
     "video_deadline_drops": 0,
     "tee_dropped": 0
   },
+  "relay_counters": {
+    "duplicate_mismatch": 0,
+    "not_admitted": 2,
+    "stale_media": 0,
+    "canonical_conflicts": 0,
+    "wide_hole_releases": 1,
+    "skipped_parts": 4315
+  },
   "parents": [
     {
       "address": "172.236.1.10",
@@ -81,7 +89,9 @@
       "head_part": 5123456,
       "first_part": 5111456,
       "window_parts": 12001,
-      "warm_parts": 4500
+      "warm_parts": 4500,
+      "missed_10s": 0,
+      "skipped_by_every_parent_10s": 0
     }
   ],
   "children": {

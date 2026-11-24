@@ -236,6 +236,9 @@ const DEFAULT_CANONICAL_GAP_HOLD_MS: u64 = 1_000;
 /// Upper bound on the slots probed per commit while a hole blocks the
 /// watermark, so a long loss burst cannot make every commit rescan it.
 const CANONICAL_GAP_SCAN_LIMIT: usize = 1_024;
+/// `/api/node`'s `missed_10s`: its window, and the seconds kept per stream.
+const MISSED_WINDOW_S: u64 = 10;
+const MISSED_SECONDS: usize = 12;
 const CANONICAL_GAP_LOG_INTERVAL_MS: u64 = 1_000;
 /// The repair horizon before this node has measured a repair (wave 5, W2):
 /// a hole is published as a gap once it is this old.
@@ -9024,6 +9027,9 @@ struct LiveTsCache {
     /// The parts of each stream that the watermark passed as holes: the
     /// playlist lists them as gaps while they are missing.
     gap_parts: StdMutex<HashMap<u64, BTreeSet<u64>>>,
+    /// Per stream, the parts the watermark passed without them, by Unix
+    /// second (the newest MISSED_SECONDS): `/api/node`'s `missed_10s`.
+    missed_parts: StdMutex<HashMap<u64, VecDeque<(u64, u64)>>>,
     /// Per stream, parts stored more than CANONICAL_GAP_SCAN_LIMIT above
     /// the watermark, no two within the scan of each other (at most
     /// WIDE_HOLE_RECORDS): where the walk of a hole wider than its scan
@@ -9184,6 +9190,7 @@ impl LiveTsCache {
             canonical_conflicts: AtomicU64::new(0),
             canonical_stale_epoch: AtomicU64::new(0),
             gap_parts: StdMutex::new(HashMap::new()),
+            missed_parts: StdMutex::new(HashMap::new()),
             wide_hole_resume: StdMutex::new(HashMap::new()),
             wide_hole_releases: AtomicU64::new(0),
             part_updates,
@@ -9600,6 +9607,47 @@ impl LiveTsCache {
         while stream.len() > MAX_GAP_PARTS_PER_STREAM {
             stream.pop_first();
         }
+    }
+
+    /// Book parts of a stream that the watermark passed without them (once
+    /// a hole, never per datagram).
+    fn note_missed_parts(&self, stream_id: u64, parts: u64, now_us: u64) {
+        let second = now_us / 1_000_000;
+        let mut missed = self
+            .missed_parts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let seconds = missed.entry(stream_id).or_default();
+        match seconds.back_mut() {
+            Some((at, count)) if *at == second => *count = count.saturating_add(parts),
+            _ => seconds.push_back((second, parts)),
+        }
+        while seconds.len() > MISSED_SECONDS {
+            seconds.pop_front();
+        }
+    }
+
+    /// The parts of each stream that the watermark passed without them in
+    /// the last [`MISSED_WINDOW_S`] seconds (the whole Unix seconds that
+    /// hold them, so 10 to 11 s); streams with none are left out.
+    fn missed_parts_10s(&self, now_us: u64) -> HashMap<u64, u64> {
+        let since = (now_us / 1_000_000).saturating_sub(MISSED_WINDOW_S);
+        let mut missed = self
+            .missed_parts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        missed.retain(|_, seconds| seconds.back().is_some_and(|(at, _)| *at >= since));
+        missed
+            .iter()
+            .map(|(stream_id, seconds)| {
+                let parts = seconds
+                    .iter()
+                    .filter(|(at, _)| *at >= since)
+                    .map(|(_, count)| *count)
+                    .sum();
+                (*stream_id, parts)
+            })
+            .collect()
     }
 
     /// A part has come: it is no longer a gap. Returns whether it was one.
@@ -10165,6 +10213,7 @@ impl LiveTsCache {
                 self.canonical_gap_skips.fetch_add(1, Ordering::Relaxed);
                 self.canonical_gap_skipped_parts
                     .fetch_add(skipped_parts, Ordering::Relaxed);
+                self.note_missed_parts(stream_id, skipped_parts, now_unix_us());
             }
             if idle_flush {
                 self.canonical_gap_idle_flushes
@@ -21729,7 +21778,8 @@ impl AppRouter {
         let class_of = |stream_id: u64| classes.class(stream_id).as_str().to_owned();
 
         // The fast plane, and what each parent delivered on it.
-        let plane = self.cache.relay_ingress_snapshot().fast_plane;
+        let ingress = self.cache.relay_ingress_snapshot();
+        let plane = ingress.fast_plane;
         let plane_stats = self.cache.fast_plane.get();
         let feeds = self.cache.parent_feeds();
         let figures = feeds
@@ -21756,7 +21806,28 @@ impl AppRouter {
             }),
             tee_dropped: plane.tee_dropped,
         };
+        // The counters the change tools hold still across a change, as
+        // `/api/mesh/local` serves them (integration 4).
+        let relay_counters = node_status::RelayCounters {
+            duplicate_mismatch: plane
+                .parent_lanes
+                .iter()
+                .map(|lane| lane.duplicate_mismatch)
+                .sum(),
+            not_admitted: plane.not_admitted,
+            stale_media: plane.media_clock.stale_media,
+            canonical_conflicts: ingress.canonical_conflicts,
+            wide_hole_releases: ingress.wide_hole_releases,
+            skipped_parts: self
+                .cache
+                .canonical_gap_skipped_parts
+                .load(Ordering::Relaxed),
+        };
         let rows = feeds.map(|feeds| feeds.snapshot(now_us)).unwrap_or_default();
+        let every_parent = feeds
+            .map(|feeds| feeds.skipped_by_every_parent())
+            .unwrap_or_default();
+        let missed = self.cache.missed_parts_10s(now_us);
         let mut parents: Vec<ParentStatus> = Vec::new();
         for row in &rows {
             let class = row.stream_id.map_or_else(|| "audio".to_owned(), class_of);
@@ -21843,6 +21914,8 @@ impl AppRouter {
                     } else {
                         source.warm_parts
                     },
+                    missed_10s: missed.get(&stream_id).copied().unwrap_or(0),
+                    skipped_by_every_parent_10s: every_parent.get(&stream_id).copied().flatten(),
                 }
             })
             .collect();
@@ -22077,6 +22150,7 @@ impl AppRouter {
             hello_draining: self.mesh.is_draining(),
             fast_plane,
             ingest,
+            relay_counters,
             parents,
             streams,
             children,
@@ -29650,6 +29724,11 @@ mod tests {
         assert_eq!(skip.skipped_parts, 1);
         assert_eq!(skip.idle_flushes, 0);
         assert!(cache.stream_is_locally_fresh(stream_id).await);
+        // `/api/node`'s `missed_10s` (integration 4): the part passed.
+        assert_eq!(
+            cache.missed_parts_10s(now_unix_us()).get(&stream_id),
+            Some(&1)
+        );
 
         // Publication stays contiguous afterwards with no further skips.
         for sequence in head + 1..=head + 3 * TEST_GAP_HOLD_PARTS {
@@ -29669,6 +29748,28 @@ mod tests {
             canonical_gap_test_watermark(&cache, stream_id).await,
             Some((head + 3 * TEST_GAP_HOLD_PARTS) as usize)
         );
+    }
+
+    /// `/api/node`'s `missed_10s` (integration 4): parts passed without
+    /// them, by stream, over the whole Unix seconds of the last 10 s; older
+    /// seconds and streams with none in them are left out.
+    #[tokio::test]
+    async fn missed_parts_count_over_the_last_ten_seconds() {
+        let cache = canonical_gap_test_cache().await;
+        let t0 = 1_763_900_000_000_000_u64;
+        cache.note_missed_parts(7, 3, t0);
+        cache.note_missed_parts(7, 2, t0 + 400_000);
+        let at = |offset_s: u64| cache.missed_parts_10s(t0 + offset_s * 1_000_000 + 1);
+        assert_eq!(at(0), HashMap::from([(7, 5)]));
+        cache.note_missed_parts(8, 4_315, t0 + 5_000_000);
+        assert_eq!(at(10), HashMap::from([(7, 5), (8, 4_315)]));
+        assert_eq!(at(11), HashMap::from([(8, 4_315)]));
+        assert_eq!(at(16), HashMap::new());
+        // A stream that misses every second keeps only its newest seconds.
+        for second in 0..40 {
+            cache.note_missed_parts(9, 1, t0 + second * 1_000_000);
+        }
+        assert_eq!(at(39).get(&9), Some(&11));
     }
 
     #[tokio::test]
