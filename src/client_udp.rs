@@ -159,6 +159,41 @@ pub const MIN_ASSIGN_REQUEST_BYTES: usize = 512;
 /// entry point for an assignment over UDP unless told another.
 pub const DEFAULT_CLIENT_UDP_PORT: u16 = 19_446;
 
+/// Why an assignment granted fewer legs than asked (`why=` of `ASSIGNED`,
+/// `"why"` of `/api/assignment`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShortGrant {
+    /// No other edge of the region serves the stream.
+    OneEdge,
+    /// The playlist is over the two-path bit rate: one leg, whatever was
+    /// asked.
+    Bitrate,
+    /// Other edges serve it, but none passes the redundant leg's gate.
+    Gate,
+}
+
+impl ShortGrant {
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::OneEdge => "one-edge",
+            Self::Bitrate => "bitrate",
+            Self::Gate => "gate",
+        }
+    }
+
+    /// A word this build knows; `None` for any other (a later build's
+    /// reason is read as no reason).
+    pub fn from_word(word: &str) -> Option<Self> {
+        match word {
+            "one-edge" => Some(Self::OneEdge),
+            "bitrate" => Some(Self::Bitrate),
+            "gate" => Some(Self::Gate),
+            _ => None,
+        }
+    }
+}
+
 /// One cache of an `ASSIGNED` answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssignedCache {
@@ -370,6 +405,8 @@ pub enum Control {
         paths: u8,
         /// The cache after the legs is the spare (`s=1`).
         spare: bool,
+        /// Why fewer legs than asked were granted (`why=`).
+        why: Option<ShortGrant>,
     },
 }
 
@@ -511,6 +548,7 @@ impl Control {
                 caches,
                 paths,
                 spare,
+                why,
             } => {
                 let mut text = format!(
                     "{CONTROL_PREFIX}ASSIGNED {stream_id} {nonce:016x} {}",
@@ -531,6 +569,10 @@ impl Control {
                 }
                 if *spare {
                     text.push_str(" s=1");
+                }
+                if let Some(why) = why {
+                    text.push_str(" why=");
+                    text.push_str(why.word());
                 }
                 text
             }
@@ -719,11 +761,12 @@ impl Control {
                         failover,
                     });
                 }
-                let (mut paths, mut spare) = (None, None);
+                let (mut paths, mut spare, mut why) = (None, None, None);
                 for word in words.by_ref() {
                     match field(word)? {
                         ("p", value) => once(&mut paths, value.parse().ok()?)?,
                         ("s", value) => once(&mut spare, flag(value)?)?,
+                        ("why", value) => once(&mut why, ShortGrant::from_word(value))?,
                         _ => {}
                     }
                 }
@@ -734,6 +777,7 @@ impl Control {
                     caches,
                     paths: paths.unwrap_or(1),
                     spare: spare.unwrap_or(false),
+                    why: why.flatten(),
                 }
             }
             _ => return None,
@@ -1854,6 +1898,7 @@ mod tests {
                 ],
                 paths: 1,
                 spare: false,
+                why: None,
             },
             Control::Assigned {
                 stream_id: 3001,
@@ -1862,6 +1907,7 @@ mod tests {
                 caches: Vec::new(),
                 paths: 1,
                 spare: false,
+                why: None,
             },
             Control::Assigned {
                 stream_id: 3001,
@@ -1876,6 +1922,7 @@ mod tests {
                 ],
                 paths: 2,
                 spare: true,
+                why: None,
             },
         ] {
             assert!(answer.encode().len() < ASSIGN_REQUEST_BYTES);
@@ -2039,6 +2086,7 @@ mod tests {
             caches,
             paths,
             spare,
+            why: None,
         };
         const LEG_A: &str = "lon-edge-1|https://lon-edge-1:19444|0";
         const LEG_B: &str = "lon-edge-2|https://lon-edge-2:19444|0";
@@ -2111,6 +2159,49 @@ mod tests {
             let sent = format!("{HEAD} {tail}");
             assert_eq!(Control::decode(sent.as_bytes()), None, "{sent}");
         }
+    }
+
+    /// B Y2 (the lead's decision): an answer that grants fewer legs than
+    /// asked says why (`why=`), after `p=` and `s=`; a reason this build
+    /// does not know reads as none, and a reason given twice refuses it.
+    #[test]
+    fn a_short_grant_says_why() {
+        const HEAD: &str = "NTU/1 ASSIGNED 3001 0000000000000009 19446";
+        const LEG: &str = "lon-edge-1|https://lon-edge-1:19444|0";
+        const SPARE: &str = "lon-edge-2|https://lon-edge-2:19444|0";
+        let cache = |node: &str| AssignedCache {
+            node_id: node.into(),
+            playback_base_url: format!("https://{node}:19444"),
+            failover: false,
+        };
+        for why in [ShortGrant::OneEdge, ShortGrant::Bitrate, ShortGrant::Gate] {
+            let answer = Control::Assigned {
+                stream_id: 3001,
+                nonce: 9,
+                port: Some(19_446),
+                caches: vec![cache("lon-edge-1"), cache("lon-edge-2")],
+                paths: 1,
+                spare: true,
+                why: Some(why),
+            };
+            assert_eq!(
+                text(&answer),
+                format!("{HEAD} {LEG} {SPARE} s=1 why={}", why.word())
+            );
+            assert_eq!(Control::decode(&answer.encode()), Some(answer));
+            assert_eq!(ShortGrant::from_word(why.word()), Some(why));
+        }
+        let unknown = format!("{HEAD} {LEG} why=later-reason");
+        assert!(matches!(
+            Control::decode(unknown.as_bytes()),
+            Some(Control::Assigned {
+                why: None,
+                paths: 1,
+                ..
+            })
+        ));
+        let twice = format!("{HEAD} {LEG} why=gate why=gate");
+        assert_eq!(Control::decode(twice.as_bytes()), None);
     }
 
     /// `o=`, the listener's other legs, and `r=1` on a `SUB`: after the
@@ -2294,6 +2385,7 @@ mod tests {
                 }],
                 paths: 2,
                 spare: true,
+                why: None,
             },
             Control::Assigned {
                 stream_id: 9,
@@ -2302,6 +2394,7 @@ mod tests {
                 caches: Vec::new(),
                 paths: 1,
                 spare: false,
+                why: None,
             },
         ];
         let with = |control: &Control, tail: &str| {

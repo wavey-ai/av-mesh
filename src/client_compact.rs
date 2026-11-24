@@ -2788,6 +2788,18 @@ impl CompactReceiver {
         (brought, Some(lags[brought / 2]))
     }
 
+    /// A leg's lag behind the first arrival of `part` (0 when it brought it
+    /// first), while the part is among the last 64 parts the session knows;
+    /// `None` when the leg did not bring it. For the clients' per-leg lag
+    /// percentiles (B 2.8 `lag_ms`).
+    pub fn leg_lag_of(&self, leg: LegId, part: u64) -> Option<Duration> {
+        let arrival = self
+            .arrivals
+            .get((part % ARRIVALS as u64) as usize)
+            .filter(|arrival| arrival.part == part)?;
+        Some(arrival.legs[leg.index()]?.saturating_duration_since(arrival.first?))
+    }
+
     /// A leg's median lag behind the first arrival over the last
     /// [`JUDGED_PARTS`] parts delivered that it brought (0 on a part it
     /// brought first).

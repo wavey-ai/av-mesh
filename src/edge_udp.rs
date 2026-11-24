@@ -2143,7 +2143,7 @@ impl EdgeControl {
             Arc::clone(&self.assigning),
         );
         tokio::spawn(async move {
-            let (port, caches, legs, spare) = router
+            let answer = router
                 .udp_assignment(
                     stream_id,
                     &session,
@@ -2154,9 +2154,7 @@ impl EdgeControl {
                     spare,
                 )
                 .await;
-            if let Some(answer) =
-                assigned_within(stream_id, nonce, port, caches, legs, spare, budget)
-            {
+            if let Some(answer) = assigned_within(stream_id, nonce, answer, budget) {
                 stats.assignments.fetch_add(1, Ordering::Relaxed);
                 stats.tokens_sent.fetch_add(1, Ordering::Relaxed);
                 // The token first: the client confirms as soon as
@@ -2182,12 +2180,16 @@ impl EdgeControl {
 fn assigned_within(
     stream_id: u64,
     nonce: u64,
-    port: Option<u16>,
-    mut caches: Vec<AssignedCache>,
-    legs: u8,
-    spare: bool,
+    answer: crate::UdpAssignment,
     budget: usize,
 ) -> Option<Vec<u8>> {
+    let crate::UdpAssignment {
+        port,
+        mut caches,
+        legs,
+        spare,
+        why,
+    } = answer;
     let kept = usize::from(legs) + usize::from(spare);
     loop {
         let answer = Control::Assigned {
@@ -2197,6 +2199,7 @@ fn assigned_within(
             caches: caches.clone(),
             paths: legs,
             spare,
+            why,
         }
         .encode();
         if answer.len() <= budget {
@@ -7131,12 +7134,20 @@ mod tests {
                 caches: indices.iter().map(|index| caches[*index].clone()).collect(),
                 paths: 2,
                 spare: true,
+                why: None,
             }
             .encode()
             .len()
         };
         let within = |budget: usize| {
-            assigned_within(801, 7, Some(19_446), caches.clone(), 2, true, budget)
+            let answer = crate::UdpAssignment {
+                port: Some(19_446),
+                caches: caches.clone(),
+                legs: 2,
+                spare: true,
+                why: None,
+            };
+            assigned_within(801, 7, answer, budget)
         };
         // Room for all.
         let (all, paths, spare) = names(&within(encoded(&[0, 1, 2, 3, 4, 5, 6])).unwrap());

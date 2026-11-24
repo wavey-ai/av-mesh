@@ -29,7 +29,9 @@
 //!   socket, [`Action::Https`] answered with [`Director::on_https`],
 //!   [`Action::Resolve`] with [`Director::on_resolved`].
 
-use crate::client_udp::{AssignedCache, Control, RepairPolicy, CONTROL_PREFIX, MAX_PATHS};
+use crate::client_udp::{
+    AssignedCache, Control, RepairPolicy, ShortGrant, CONTROL_PREFIX, MAX_PATHS,
+};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -44,6 +46,11 @@ pub const SKIP_FAILED: Duration = Duration::from_secs(30);
 pub const SKIP_AFTER_MOVE: Duration = Duration::from_secs(3);
 /// A node that sent no `TOKEN` within the token wait is skipped this long.
 pub const SKIP_NO_TOKEN: Duration = Duration::from_secs(3);
+/// A node that refused a leg for a reason that passes in seconds (its
+/// load: `edge-busy`, `edge-full`; or a rebalance's `MOVE` before the
+/// `OK`) is skipped this long (the lead's decision on B Y1/X5; a drain or
+/// lost parents keeps [`SKIP_FAILED`]).
+pub const SKIP_BUSY: Duration = Duration::from_secs(3);
 /// The spare's token is fetched again this often; the renewal is also the
 /// spare's liveness probe.
 pub const SPARE_RENEW: Duration = Duration::from_secs(15);
@@ -92,6 +99,8 @@ pub const REGION_LOST: &str = "region-lost";
 pub const HOME_REGION: &str = "home-region";
 const REBALANCE: &str = "rebalance";
 const PARENTS_LOST: &str = "parents-lost";
+/// Refusals for load, which passes in seconds.
+const BUSY_REFUSALS: [&str; 2] = ["edge-busy", "edge-full"];
 
 pub const DEFAULT_PATHS: u8 = 2;
 pub const DEFAULT_TOKEN_MS: u64 = 400;
@@ -392,6 +401,29 @@ impl Via {
     }
 }
 
+/// Answers that granted fewer legs than asked, by the entry's reason
+/// (`why=`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShortGrants {
+    pub one_edge: u64,
+    pub bitrate: u64,
+    pub gate: u64,
+    /// No reason given (an entry that names none).
+    pub unexplained: u64,
+}
+
+impl ShortGrants {
+    fn count(&mut self, why: Option<ShortGrant>) {
+        let counter = match why {
+            Some(ShortGrant::OneEdge) => &mut self.one_edge,
+            Some(ShortGrant::Bitrate) => &mut self.bitrate,
+            Some(ShortGrant::Gate) => &mut self.gate,
+            None => &mut self.unexplained,
+        };
+        *counter += 1;
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DirectorStats {
     /// Requests made, and answers taken by each way.
@@ -407,6 +439,7 @@ pub struct DirectorStats {
     pub failovers: u64,
     pub home_returns: u64,
     pub takebacks: u64,
+    pub short_grants: ShortGrants,
 }
 
 /// A leg as the director holds it.
@@ -483,6 +516,8 @@ enum SkipCause {
     Moved,
     Failed,
     NoToken,
+    /// Refused for load, or sent away for a rebalance before its `OK`.
+    Busy,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -538,6 +573,8 @@ struct Request {
 #[derive(Debug, Clone)]
 struct AnswerCache {
     node: String,
+    /// Its playback base URL (for `--verify-http`).
+    url: String,
     host: String,
     port: Option<u16>,
     failover: Option<String>,
@@ -549,6 +586,7 @@ struct Answer {
     caches: Vec<AnswerCache>,
     paths: u8,
     spare: bool,
+    why: Option<ShortGrant>,
 }
 
 /// The end of one leaving leg's move.
@@ -617,6 +655,8 @@ pub struct Director {
     silence: Option<Silence>,
     pending: Vec<Pending>,
     resolved: HashMap<String, Option<IpAddr>>,
+    /// The playback base URL of each cache an answer named.
+    urls: HashMap<String, String>,
     next_check: Instant,
     wake: Instant,
 }
@@ -702,6 +742,7 @@ impl Director {
             silence: None,
             pending: Vec::new(),
             resolved: HashMap::new(),
+            urls: HashMap::new(),
             next_check: now,
             wake: now,
         };
@@ -741,6 +782,11 @@ impl Director {
     /// Away from the home region, since when.
     pub fn away_since(&self) -> Option<Instant> {
         self.away_since
+    }
+
+    /// The playback base URL of a cache an answer named.
+    pub fn cache_url(&self, node: &str) -> Option<&str> {
+        self.urls.get(node).map(String::as_str)
     }
 
     /// When [`Self::poll`] must run next (at the latest).
@@ -878,15 +924,17 @@ impl Director {
             SkipCause::Moved => None,
             SkipCause::Failed => Some(now + SKIP_FAILED),
             SkipCause::NoToken => Some(now + SKIP_NO_TOKEN),
+            SkipCause::Busy => Some(now + SKIP_BUSY),
         };
         // A failure always takes its 30 s. A move's skip gives way only to
-        // a failure; a token's skip never shortens a longer one.
+        // a failure; a token's or a busy edge's skip never shortens a
+        // longer one.
         if let Some(old) = self.skip.get(node) {
             let active = old.until.is_none_or(|end| now < end);
             let keep = match cause {
                 SkipCause::Failed => false,
                 SkipCause::Moved => old.cause == SkipCause::Failed,
-                SkipCause::NoToken => old
+                SkipCause::NoToken | SkipCause::Busy => old
                     .until
                     .is_none_or(|end| until.is_some_and(|new_end| end >= new_end)),
             };
@@ -987,6 +1035,7 @@ impl Director {
                 caches,
                 paths,
                 spare,
+                why,
             }) if stream_id == self.config.stream_id => {
                 let entry = self.entry_at(peer);
                 let answer = Answer {
@@ -994,6 +1043,7 @@ impl Director {
                     caches: caches.into_iter().filter_map(answer_cache).collect(),
                     paths,
                     spare,
+                    why,
                 };
                 self.on_udp_answer(legs, entry, nonce, answer, now, out);
                 self.run(legs, now, out);
@@ -1149,8 +1199,16 @@ impl Director {
             LegEvent::Tokened(key) => self.on_tokened(legs, key, now, out),
             LegEvent::Live { leg, compact } => self.on_live(legs, leg, compact, now, out),
             LegEvent::Moved { leg, reason } => self.on_moved(leg, reason, now),
+            // Skipped by cause: a refusal for load or a rebalance passes in
+            // seconds; a drain, lost parents or anything else is the
+            // edge's for longer.
             LegEvent::Refused { leg, reason } => {
-                self.fail(legs, leg, &reason, SkipCause::Failed, now, out)
+                let cause = if reason == REBALANCE || BUSY_REFUSALS.contains(&reason.as_str()) {
+                    SkipCause::Busy
+                } else {
+                    SkipCause::Failed
+                };
+                self.fail(legs, leg, &reason, cause, now, out)
             }
             LegEvent::NoToken(key) => {
                 if let Some(index) = self.leg_index(key) {
@@ -1779,6 +1837,15 @@ impl Director {
         if !failover.is_empty() {
             self.failover = failover;
         }
+        for cache in answer
+            .caches
+            .iter()
+            .filter(|cache| cache.failover.is_none())
+        {
+            if self.urls.get(&cache.node) != Some(&cache.url) {
+                self.urls.insert(cache.node.clone(), cache.url.clone());
+            }
+        }
         let region: Vec<(String, SocketAddr)> = answer
             .caches
             .iter()
@@ -1821,25 +1888,21 @@ impl Director {
             return;
         }
         let granted = answer.paths.min(request.paths) as usize;
-        // Step 1: want is what the entry granted for --paths. A short grant
-        // beside a cache the listener could take (the spare, an alternate)
-        // is the entry's choice (a stream over the two-path bit rate, or no
-        // edge under the gate): want is the grant, and nothing is asked
-        // again until the listener holds no leg. A short grant naming
-        // nothing more is for want of an edge: asked again on the backoff.
-        if request.kind != RequestKind::Silence
-            && request.hold.is_empty()
-            && request.paths == self.full_paths()
-        {
-            let offered = usable
-                .iter()
-                .filter(|(node, _)| !self.skipped_now(node, now))
-                .count();
-            self.want = if granted < request.paths as usize && offered > granted {
-                granted.max(1) as u8
-            } else {
-                self.full_paths()
-            };
+        if granted < request.paths as usize {
+            self.stats.short_grants.count(answer.why);
+        }
+        // Step 1: want is what the entry granted for --paths. A stream over
+        // the two-path bit rate (`why=bitrate`) keeps the legs it holds and
+        // the ones granted, and nothing is asked again until the listener
+        // holds no leg. Any other short grant (no other edge, none through
+        // the gate) is for want of an edge: want stays, and the missing leg
+        // is asked again on the backoff.
+        if request.kind != RequestKind::Silence {
+            if answer.why == Some(ShortGrant::Bitrate) {
+                self.want = (self.held() + granted).max(1) as u8;
+            } else if request.hold.is_empty() && request.paths == self.full_paths() {
+                self.want = self.full_paths();
+            }
         }
         let need = match request.kind {
             RequestKind::Silence => request.paths as usize,
@@ -2653,10 +2716,78 @@ impl Director {
     }
 }
 
+/// A two-path session's time on fewer than two delivering legs (B 2.8
+/// `single_path_ms`, `single_path_spans`), for the clients' reports. A leg
+/// delivers while its last media is at most `window` old (max(20 ms, 8
+/// part intervals), as [`LegView::delivering`]). Time is counted only once
+/// two legs have delivered together, and only while two legs are wanted.
+#[derive(Debug, Default, Clone)]
+pub struct SinglePath {
+    two_seen: bool,
+    open: Option<Instant>,
+    /// Each span, closed.
+    pub spans: Vec<(Instant, Instant)>,
+    pub total: Duration,
+}
+
+impl SinglePath {
+    /// Judge the session now from the last media of each leg it holds
+    /// (live or leaving); `two_paths`: two legs are wanted now. Call it at
+    /// every media datagram and every wake: a span ends at the datagram
+    /// that brings a second leg back, and begins when the second-freshest
+    /// leg's media went stale.
+    pub fn observe(
+        &mut self,
+        now: Instant,
+        window: Duration,
+        lasts: impl IntoIterator<Item = Instant>,
+        two_paths: bool,
+    ) {
+        let (mut first, mut second): (Option<Instant>, Option<Instant>) = (None, None);
+        let mut delivering = 0;
+        for last in lasts {
+            if now.saturating_duration_since(last) <= window {
+                delivering += 1;
+            }
+            if first.is_none_or(|first| last > first) {
+                second = first;
+                first = Some(last);
+            } else if second.is_none_or(|second| last > second) {
+                second = Some(last);
+            }
+        }
+        if delivering >= 2 {
+            self.two_seen = true;
+        }
+        if delivering >= 2 || !two_paths {
+            self.close(now);
+            return;
+        }
+        if self.two_seen && self.open.is_none() {
+            let since = second.map_or(now, |second| (second + window).min(now));
+            self.open = Some(since);
+        }
+    }
+
+    /// End an open span at `now` (the end of the run).
+    pub fn close(&mut self, now: Instant) {
+        if let Some(since) = self.open.take() {
+            self.total += now.saturating_duration_since(since);
+            self.spans.push((since, now));
+        }
+    }
+
+    /// Whether the session is on fewer than two legs now.
+    pub fn is_open(&self) -> bool {
+        self.open.is_some()
+    }
+}
+
 fn answer_cache(cache: AssignedCache) -> Option<AnswerCache> {
     if cache.failover {
         return Some(AnswerCache {
             node: cache.node_id,
+            url: String::new(),
             host: String::new(),
             port: None,
             failover: Some(entry_url(&cache.playback_base_url)),
@@ -2665,6 +2796,7 @@ fn answer_cache(cache: AssignedCache) -> Option<AnswerCache> {
     Some(AnswerCache {
         host: url_host(&cache.playback_base_url)?,
         node: cache.node_id,
+        url: cache.playback_base_url,
         port: None,
         failover: None,
     })
@@ -2683,6 +2815,7 @@ fn parse_https_answer(body: &[u8]) -> Option<Answer> {
         if cache["failover_entry"].as_bool() == Some(true) {
             caches.push(AnswerCache {
                 node: node.to_owned(),
+                url: String::new(),
                 host: String::new(),
                 port: None,
                 failover: Some(entry_url(url)),
@@ -2694,6 +2827,7 @@ fn parse_https_answer(body: &[u8]) -> Option<Answer> {
         };
         caches.push(AnswerCache {
             node: node.to_owned(),
+            url: url.to_owned(),
             host,
             port: cache["client_udp_port"].as_u64().map(|port| port as u16),
             failover: None,
@@ -2716,6 +2850,7 @@ fn parse_https_answer(body: &[u8]) -> Option<Answer> {
         caches,
         paths,
         spare: spare.is_some(),
+        why: json["why"].as_str().and_then(ShortGrant::from_word),
     })
 }
 
@@ -2965,6 +3100,21 @@ mod tests {
             spare: bool,
             token: Option<u64>,
         ) {
+            self.answer_why(from, nonce, caches, paths, spare, token, None);
+        }
+
+        /// An answer that says why it grants fewer legs than asked.
+        #[allow(clippy::too_many_arguments)]
+        fn answer_why(
+            &mut self,
+            from: SocketAddr,
+            nonce: u64,
+            caches: Vec<AssignedCache>,
+            paths: u8,
+            spare: bool,
+            token: Option<u64>,
+            why: Option<ShortGrant>,
+        ) {
             if let Some(token) = token {
                 assert!(
                     self.token_from(from, token),
@@ -2978,6 +3128,7 @@ mod tests {
                 caches,
                 paths,
                 spare,
+                why,
             }
             .encode();
             assert!(self
@@ -3256,6 +3407,7 @@ mod tests {
                 }],
                 paths: 1,
                 spare: false,
+                why: None,
             }
             .encode()
         };
@@ -3821,8 +3973,17 @@ mod tests {
         let mut w = World::new("one-edge", 2, true);
         w.poll();
         let (to, nonce, _) = w.requests().pop().unwrap();
-        w.answer(to, nonce, vec![cache(1)], 1, false, Some(0x1));
+        w.answer_why(
+            to,
+            nonce,
+            vec![cache(1)],
+            1,
+            false,
+            Some(0x1),
+            Some(ShortGrant::OneEdge),
+        );
         assert_eq!(w.held(), ["e1"]);
+        assert_eq!(w.d.stats.short_grants.one_edge, 1);
         w.live("e1");
         let spread = spread("one-edge", 0, ASK_SPREAD).as_millis() as u64;
         let mut answered = w.ms();
@@ -3967,15 +4128,20 @@ mod tests {
         let mut w = World::new("4k-1", 2, true);
         w.poll();
         let (to, nonce, _) = w.requests().pop().unwrap();
-        // One leg granted: the next cache is the spare.
-        w.answer(to, nonce, vec![cache(1), cache(2), cache(3)], 1, true, None);
+        // One leg granted for the bit rate: the next cache is the spare.
+        w.answer_why(
+            to,
+            nonce,
+            vec![cache(1), cache(2), cache(3)],
+            1,
+            true,
+            None,
+            Some(ShortGrant::Bitrate),
+        );
         assert_eq!(w.held(), ["e1"]);
         assert_eq!(w.d.spare(), Some("e2"));
-        assert_eq!(
-            w.d.want(),
-            1,
-            "the entry's grant, beside caches it could name"
-        );
+        assert_eq!(w.d.want(), 1, "the entry's grant, for the bit rate");
+        assert_eq!(w.d.stats.short_grants.bitrate, 1);
         w.live("e1");
         assert!(w.token_from(edge_addr(2), 0x22));
         // No second leg is asked for, though the objects have not shown yet
@@ -4244,11 +4410,20 @@ mod tests {
                 && matches!(control, Control::Subscribe { token: None, .. })));
         assert!(w.token_from(edge_addr(1), 0x11));
 
-        // With --paths 2, a stream the entry gives one leg swaps the same.
+        // With --paths 2, a stream the entry gives one leg for its bit rate
+        // swaps the same.
         let mut w = World::new("swap-3", 2, true);
         w.poll();
         let (to, nonce, _) = w.requests().pop().unwrap();
-        w.answer(to, nonce, vec![cache(1), cache(2), cache(3)], 1, true, None);
+        w.answer_why(
+            to,
+            nonce,
+            vec![cache(1), cache(2), cache(3)],
+            1,
+            true,
+            None,
+            Some(ShortGrant::Bitrate),
+        );
         assert_eq!((w.held(), w.d.spare()), (vec!["e1".to_owned()], Some("e2")));
         assert!(w.token_from(edge_addr(2), 0x22));
         w.run_to(w.ms() + 11);
@@ -4703,5 +4878,200 @@ mod tests {
         w.run_to(cut + 2_300);
         assert_eq!(w.d.stats.assignment_failures, 3);
         assert_eq!(w.d.stats.failovers, 1);
+    }
+
+    /// The lead's decision on a short grant: `why=gate` (or `one-edge`)
+    /// keeps two legs wanted and asks again on the backoff, beside the
+    /// alternates the entry named; each short grant is counted by reason.
+    #[test]
+    fn a_short_grant_for_the_gate_is_asked_again_and_counted() {
+        let mut w = World::new("gate-1", 2, true);
+        w.poll();
+        let (to, nonce, _) = w.requests().pop().unwrap();
+        w.answer_why(
+            to,
+            nonce,
+            vec![cache(1), cache(2), cache(3)],
+            1,
+            true,
+            Some(0xe0),
+            Some(ShortGrant::Gate),
+        );
+        assert_eq!(w.held(), ["e1"]);
+        assert_eq!(w.d.spare(), Some("e2"));
+        assert_eq!(w.d.want(), 2, "the gate is no reason to stay on one leg");
+        assert_eq!(w.d.stats.short_grants.gate, 1);
+        w.live("e1");
+        assert!(w.token_from(edge_addr(2), 0x22));
+        let answered = w.ms();
+        let spread = spread("gate-1", 0, ASK_SPREAD).as_millis() as u64;
+        let (to, nonce, request) = loop {
+            w.run_to(w.ms() + 1);
+            if let Some(request) = w.requests().pop() {
+                break request;
+            }
+            assert!(w.ms() <= answered + 1_000 + spread + 1, "asked again");
+        };
+        assert!(w.ms() + 1 >= answered + 1_000 + spread);
+        let Control::Assign {
+            paths, spare, hold, ..
+        } = request
+        else {
+            unreachable!()
+        };
+        assert_eq!((paths, spare, hold), (1, false, vec!["e1".to_owned()]));
+        // Still over the gate: counted again; then the second leg comes.
+        w.answer_why(
+            to,
+            nonce,
+            Vec::new(),
+            0,
+            false,
+            None,
+            Some(ShortGrant::Gate),
+        );
+        assert_eq!(w.d.stats.short_grants.gate, 2);
+        let (to, nonce, _) = loop {
+            w.run_to(w.ms() + 1);
+            if let Some(request) = w.requests().pop() {
+                break request;
+            }
+            assert!(w.ms() <= answered + 10_000, "asked a third time");
+        };
+        w.answer(to, nonce, vec![cache(3)], 1, false, None);
+        assert_eq!(w.held(), ["e1", "e3"]);
+        assert_eq!(w.d.stats.short_grants.unexplained, 0);
+    }
+
+    /// The lead's decision on a leg its edge sends away before its `OK`
+    /// (`Refused`): the skip ends by cause, 3 s for a rebalance or a
+    /// refusal for load, 30 s for a drain, lost parents or anything else.
+    #[test]
+    fn a_refused_leg_is_skipped_by_its_cause() {
+        for (reason, skip_ms) in [
+            ("rebalance", 3_000),
+            ("edge-busy", 3_000),
+            ("edge-full", 3_000),
+            ("draining", 30_000),
+            ("parents-lost", 30_000),
+            ("stale-copy", 30_000),
+        ] {
+            let mut w = World::new(&format!("refused-{reason}"), 2, false);
+            w.join(&[1, 2], None);
+            let e2 = w.key("e2");
+            w.event(LegEvent::Failed {
+                leg: e2,
+                cause: LegFailure::Dead,
+            });
+            let (to, nonce, _) = loop {
+                w.run_to(w.ms() + 1);
+                if let Some(request) = w.requests().pop() {
+                    break request;
+                }
+            };
+            w.answer(to, nonce, vec![cache(3)], 1, false, None);
+            let e3 = w.key("e3");
+            w.event(LegEvent::Refused {
+                leg: e3,
+                reason: reason.into(),
+            });
+            let refused = w.ms();
+            assert!(w.s.legs[&e3].released, "{reason}");
+            w.run_to(refused + skip_ms - 1);
+            assert!(w.d.skipped(w.now).contains(&"e3".to_owned()), "{reason}");
+            w.run_to(refused + skip_ms);
+            assert!(!w.d.skipped(w.now).contains(&"e3".to_owned()), "{reason}");
+        }
+    }
+
+    /// The lead's decision on a one-leg listener whose edge drains while
+    /// its region names no other edge: it moves make-before-break to the
+    /// failover region's entry, and comes home by the probe of 30 s.
+    #[test]
+    fn a_one_leg_drain_with_no_other_edge_goes_to_the_failover_region_and_comes_home() {
+        let failover_addr = entry_addr("https://10.0.9.1:19444");
+        let away = AssignedCache {
+            node_id: "n1".into(),
+            playback_base_url: "https://10.0.2.1:19444".into(),
+            failover: false,
+        };
+        let mut w = World::new("one-leg-home", 1, false);
+        w.poll();
+        let (to, nonce, _) = w.requests().pop().unwrap();
+        w.answer(to, nonce, vec![cache(1), failover_entry()], 1, false, None);
+        w.live("e1");
+        let e1 = w.key("e1");
+        w.event(LegEvent::Moved {
+            leg: e1,
+            reason: "draining".into(),
+        });
+        let (to, nonce, _) = w.requests().pop().unwrap();
+        w.answer(to, nonce, vec![failover_entry()], 1, false, None);
+        assert_eq!(w.d.stats.failovers, 1);
+        let (to, nonce, _) = w.requests().pop().unwrap();
+        assert_eq!(to, failover_addr);
+        w.answer(to, nonce, vec![away], 1, false, None);
+        assert!(!w.s.legs[&e1].released, "make before break");
+        w.live("n1");
+        let n1 = w.key("n1");
+        w.s.level.insert((n1, e1));
+        w.run_to(w.ms() + 5);
+        assert_eq!(w.held(), ["n1"]);
+        assert_eq!(
+            w.d.replacements
+                .last()
+                .map(|r| (r.kind, r.from.as_str(), r.to.as_str())),
+            Some((ReplacementKind::Handover, "e1", "n1"))
+        );
+        // Home is probed 30 s after the move; it names e2 now.
+        let left = (w.d.away_since().unwrap() - w.t0).as_millis() as u64;
+        w.run_to(left + 29_999);
+        assert!(w.requests().is_empty());
+        w.run_to(left + 30_000);
+        let (to, nonce, _) = w.requests().pop().expect("the home region is probed");
+        assert_eq!(to, w.first_entry());
+        w.answer(to, nonce, vec![cache(2)], 1, false, None);
+        assert!(w.leaving("n1") && !w.s.legs[&n1].released);
+        w.live("e2");
+        let e2 = w.key("e2");
+        w.s.level.insert((e2, n1));
+        w.run_to(w.ms() + 5);
+        assert_eq!(w.held(), ["e2"]);
+        assert_eq!(w.d.stats.home_returns, 1);
+        assert_eq!(w.d.away_since(), None);
+    }
+
+    /// The time on one path: from when the second-freshest leg's media went
+    /// stale to the datagram that brings a second leg back; nothing before
+    /// two legs first delivered together, nor while one leg is wanted.
+    #[test]
+    fn single_path_spans_run_from_the_stale_leg_to_the_second_leg_back() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let window = Duration::from_millis(20);
+        let mut path = SinglePath::default();
+        // A join: one leg for 5 ms is not single-path time.
+        path.observe(ms(0), window, [ms(0)], true);
+        path.observe(ms(5), window, [ms(5), ms(5)], true);
+        assert!(!path.is_open());
+        // Both deliver up to 100 ms; then one leg stops.
+        path.observe(ms(100), window, [ms(100), ms(100)], true);
+        path.observe(ms(110), window, [ms(110), ms(100)], true);
+        assert!(!path.is_open(), "10 ms is within the window");
+        path.observe(ms(130), window, [ms(130), ms(100)], true);
+        assert!(path.is_open());
+        // The hedge leg's first part at 175 ms.
+        path.observe(ms(175), window, [ms(175), ms(100), ms(175)], true);
+        assert!(!path.is_open());
+        assert_eq!(path.spans, [(ms(120), ms(175))]);
+        assert_eq!(path.total, Duration::from_millis(55));
+        // One leg wanted: no time on one path.
+        path.observe(ms(300), window, [ms(300)], false);
+        assert!(!path.is_open());
+        // Open at the end of the run: closed there.
+        path.observe(ms(400), window, [ms(400), ms(350)], true);
+        path.close(ms(410));
+        assert_eq!(path.spans.len(), 2);
+        assert_eq!(path.total, Duration::from_millis(55 + 40));
     }
 }

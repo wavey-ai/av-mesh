@@ -1,40 +1,39 @@
-//! A client of a Needletail stream by RaptorQ FEC UDP from an edge.
+//! A client of a Needletail stream by UDP from the edges of its region.
 //!
-//! The client is assigned an edge exactly as an LL-HLS reader is: it asks an
-//! entry point for an assignment (`/api/assignment`), which names the
-//! assigned cache and the caches that follow it. It reads the media playlist
-//! of its stream from the assigned cache, which names the stream and its
-//! parts, and subscribes to the stream at the cache's client UDP port
-//! (`av_mesh::client_udp`). It receives each part as one RaptorQ object.
+//! The client holds its stream on two edges at once by default (B-listener
+//! section 1): two legs, each a subscription at one edge that sends every
+//! part, and a spare (a token at a third edge, nothing else there). The
+//! first arrival of each part number is delivered. Which edges is the
+//! director's (`av_mesh::client_director`): it asks one of the `--entry`
+//! points for an assignment (`ASSIGN` over UDP from the listener's own
+//! socket, HTTPS as a hedge), adds and releases legs, hedges a silent leg
+//! at the spare, answers each `MOVE` make-before-break by its reason, and
+//! fails over to another region. The legs themselves (requests, tokens,
+//! parts, loss, NACK, the verdicts on a silent leg) are the session's
+//! (`av_mesh::client_session`). This binary performs their I/O: the media
+//! socket, the HTTPS requests and the name lookups. `--paths 1` holds one
+//! leg; `--spare false` holds no spare.
 //!
-//! It moves to the next cache of its assignment when the cache tells it to
-//! (`MOVE`: the cache drains or has lost its parents), refuses it, or sends
-//! nothing for `--silence-ms`. It asks the next cache for the part that it
-//! needs next, so that a move loses no part that the region still holds.
+//! Each part comes as compact datagrams (`av_mesh::client_compact`, the
+//! default) or as a RaptorQ object, on the fast lane when the edge serves
+//! it. With `--verify-http` every part received is also fetched over HTTP
+//! from the edge whose datagram brought it, as an LL-HLS player would, and
+//! the bytes compared.
 //!
-//! With `--verify-http` it also fetches every part that it received by UDP
-//! from the same cache over HTTP, as an LL-HLS player would, and compares the
-//! bytes. The report says how many parts arrived, how many the FEC
-//! recovered, how many the cache skipped (gaps) and how many never arrived,
-//! every move, and the time from publication to arrival.
-//!
-//! With `--fast-lane` (the default) it asks the edge for the fast lane
-//! (`SUB ... F1`): an edge fed by the fast plane sends it each part's
-//! symbols as they arrive from the forwarders, the contributor's own, and the
-//! client builds the part from the canonical envelope with the edge's own
-//! slot functions. The report counts the parts of each lane and the envelope
-//! bytes of the fast-lane parts.
-//!
-//! With `--compact` (the default) it asks for the compact lane
-//! (`av_mesh::client_compact`): each part that fits one datagram comes as
-//! one, with the copies and the repair across parts that the client sizes
-//! from the loss and the bursts it measures, and it asks for a part it
-//! misses again (`NACK`). The report gives the bytes received on the wire
-//! (with IP and UDP headers) and their rate, beside the parts' own bytes.
+//! The report (`needletail.udp-client.v2`, standard output) keeps every
+//! field of v1 and adds the legs, their replacements, the time on one path,
+//! the wire bytes a part and the short grants by reason. `--arrivals`
+//! writes one line a part in part order, its seventh column the edge whose
+//! datagram was the first arrival; `--write-parts` the parts' bytes in the
+//! same order.
 
 use anyhow::{anyhow, bail, Context, Result};
 use av_mesh::client_compact::NackTiming;
-use av_mesh::client_session::{Received, SessionConfig, UdpSession};
+use av_mesh::client_director::{
+    Action, Director, DirectorConfig, LegEvent, LegKey, LegStart, LegView, Replacement,
+    ReplacementKind, SessionLegs, ShortGrants, SinglePath,
+};
+use av_mesh::client_session::{LegReport, Received, SessionConfig, UdpSession};
 use av_mesh::client_udp::{ObjectKind, PartObject};
 use bytes::{Bytes, BytesMut};
 use clap::Parser;
@@ -43,8 +42,8 @@ use http_body_util::{BodyExt, Empty};
 use hyper::client::conn::http2::SendRequest;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::net::SocketAddr;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -52,26 +51,30 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Semaphore};
 use tokio_rustls::TlsConnector;
 
-/// The edges a client has left are not taken again for this long (as
-/// needletail-load's skip set).
-const SKIP_FOR: Duration = Duration::from_secs(30);
-/// Assignment failures in a row before the client asks a failover region.
-const FAILOVER_AFTER_FAILURES: u32 = 2;
-/// Away from the region of `--entry` this long, the client probes it every
-/// HOME_PROBE_EVERY and goes back once it assigns a cache of its own.
-const HOME_HOLD: Duration = Duration::from_secs(30);
-const HOME_PROBE_EVERY: Duration = Duration::from_secs(10);
+/// A gap between first arrivals this long or longer is an interruption
+/// (B 2.8).
+const INTERRUPTION: Duration = Duration::from_millis(30);
+/// A leg delivers while its last media is at most this old, or 8 part
+/// intervals if longer (B 2.8, as `LegView::delivering`).
+const DELIVERING_FLOOR: Duration = Duration::from_millis(20);
+const DELIVERING_INTERVALS: u32 = 8;
+/// A part's lag on each leg is read this many parts after it, when the
+/// slower leg has brought it (the session keeps the last 64).
+const LAG_SETTLE_PARTS: u64 = 32;
+const LAG_FORGET_PARTS: u64 = 60;
 
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "needletail-udp-client",
     version = av_mesh::build::VERSION,
-    about = "Receive a Needletail stream by RaptorQ FEC UDP from an assigned edge"
+    about = "Receive a Needletail stream by UDP from two edges of its region"
 )]
 struct Args {
-    /// Entry point: `https://host:port`.
-    #[arg(long)]
-    entry: String,
+    /// Entry points, `https://host:port`: repeat the flag or separate them
+    /// with commas. One is asked first (by the session id), the next after
+    /// --first-retry-ms.
+    #[arg(long, required = true, value_delimiter = ',')]
+    entry: Vec<String>,
     #[arg(long)]
     stream: u64,
     /// PEM file of the certificate authority of the nodes.
@@ -85,6 +88,19 @@ struct Args {
     /// Client UDP port of the caches, when the assignment does not name it.
     #[arg(long)]
     udp_port: Option<u16>,
+    /// Legs held on a stream the entry grants two for (B 2.4). 1: one edge
+    /// at a time, with the moves of the two-path work.
+    #[arg(long, default_value_t = av_mesh::client_director::DEFAULT_PATHS)]
+    paths: u8,
+    /// Hold a spare (a token at a third edge) and hedge a silent leg to it.
+    /// `false`: a dead leg is replaced through the entry.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    spare: bool,
+    /// A leg with no TOKEN after this long (or four round trips to its
+    /// entry, if longer) is passed over: another edge is asked while it
+    /// goes on trying.
+    #[arg(long, default_value_t = av_mesh::client_director::DEFAULT_TOKEN_MS)]
+    token_ms: u64,
     /// Repair of each RaptorQ block, per thousand source symbols, at least.
     /// By default 0 when the edge serves the compact lane (NACK backs it
     /// up), and 250 on the RaptorQ lane alone, as before wave 5.
@@ -94,42 +110,64 @@ struct Args {
     /// the compact lane, 3 on the RaptorQ lane alone.
     #[arg(long)]
     min_repair: Option<u32>,
-    /// Move to the next cache after this long without a datagram (wave 8
-    /// S2: 200; 1,000 before).
+    /// A leg with no datagram for this long while another leg sent one has
+    /// failed; with no media for this long while another leg delivers,
+    /// likewise. No leg at all for this long: every leg is asked again.
     #[arg(long, default_value_t = av_mesh::client_session::DEFAULT_SILENCE_MS)]
     silence_ms: u64,
-    /// Move to the next cache when a subscription is not answered in this
-    /// time (a new playlist copy at an edge takes up to a second).
+    /// A leg with no OK this long after its first request has failed.
     #[arg(long, default_value_t = 5_000)]
     answer_ms: u64,
+    /// A leg with no media for this long while another leg delivers is
+    /// hedged at the spare.
+    #[arg(long, default_value_t = av_mesh::client_session::DEFAULT_HEDGE_AFTER_MS)]
+    hedge_after_ms: u64,
+    /// The only leg with no datagram at all for this long is hedged at the
+    /// spare (two keepalives and a margin: a lost WAIT moves nobody).
+    #[arg(long, default_value_t = av_mesh::client_session::DEFAULT_LONE_HEDGE_AFTER_MS)]
+    lone_hedge_after_ms: u64,
+    /// After MOVE rebalance: a replacement not level by then is released
+    /// and the old edge asked to take the listener back.
+    #[arg(long, default_value_t = av_mesh::client_director::DEFAULT_REBALANCE_GIVEUP_MS)]
+    rebalance_giveup_ms: u64,
+    /// After any other MOVE: a replacement that has delivered steadily for
+    /// this long takes over though it is not level.
+    #[arg(long, default_value_t = av_mesh::client_director::DEFAULT_LEVEL_WAIT_MS)]
+    level_wait_ms: u64,
+    /// A leg's first tokenless SUB and its first SUB with the token are
+    /// each sent again this soon. 0: off.
+    #[arg(long, default_value_t = av_mesh::client_session::DEFAULT_FIRST_DOUBLE_MS)]
+    first_double_ms: u64,
+    /// The residual part loss the compact plans aim for, parts per million.
+    #[arg(long, default_value_t = (av_mesh::client_compact::RESIDUAL_TARGET * 1e6).round() as u32)]
+    compact_residual_ppm: u32,
+    /// A hole is asked for until this long after it showed (or until it is
+    /// 3,072 parts behind the newest).
+    #[arg(long, default_value_t = av_mesh::client_compact::HOLE_GIVE_UP.as_millis() as u64)]
+    hole_give_up_ms: u64,
     /// Keep the repair that was asked for, whatever the measured loss.
     #[arg(long)]
     fixed_repair: bool,
-    /// Fetch every received part over HTTP from the same cache and compare.
+    /// Fetch every received part over HTTP from the edge whose datagram
+    /// brought it, and compare.
     #[arg(long)]
     verify_http: bool,
-    /// How long an entry point has to answer an assignment (ms); one that
-    /// does not, with a failover region known, sends the client there
-    /// (Phase AM item 11; HTTP requests otherwise wait 5 s).
-    #[arg(long, default_value_t = 1_000)]
+    /// The whole budget of one assignment request (ms).
+    #[arg(long, default_value_t = av_mesh::client_director::DEFAULT_ASSIGNMENT_TIMEOUT_MS)]
     assignment_timeout_ms: u64,
-    /// Wave 9 B (time to first audio under loss): ask the entry point for
-    /// the assignment over UDP too (`ASSIGN`, one datagram each way), at
-    /// this port of its address, repeated after --first-retry-ms and then
-    /// twice as long each time; the first answer of UDP or HTTPS is taken.
-    /// Over HTTPS alone a lost SYN waits a second for TCP's retransmission.
-    /// 0: HTTPS alone, as before.
+    /// The entry points' client UDP port: an assignment is asked there
+    /// (`ASSIGN`, one datagram each way, from the media socket). 0: HTTPS
+    /// alone.
     #[arg(long, default_value_t = av_mesh::client_udp::DEFAULT_CLIENT_UDP_PORT)]
     assignment_udp_port: u16,
-    /// Wave 9 B: with the assignment over UDP, the HTTPS request starts
-    /// this long after it (ms) unless UDP has answered (at once when UDP
-    /// fails: no port there, or no assignment).
-    #[arg(long, default_value_t = 50)]
+    /// With the assignment over UDP, the HTTPS request starts this long
+    /// after it (ms) unless UDP has answered.
+    #[arg(long, default_value_t = av_mesh::client_director::DEFAULT_ASSIGNMENT_HTTPS_AFTER_MS)]
     assignment_https_after_ms: u64,
-    /// Wave 9 B: an unanswered UDP request (the assignment, the first SUB,
-    /// the SUB with the token) is repeated after this (ms; three round
-    /// trips once one is measured), then twice as long each time up to
-    /// 300 ms. 0: every 300 ms, as before.
+    /// An unanswered UDP request (the assignment, a first SUB, a SUB with
+    /// the token) is repeated after this (ms; three round trips once one is
+    /// measured), then twice as long each time up to 300 ms; the next entry
+    /// is asked too after it. 0: every 300 ms.
     #[arg(long, default_value_t = av_mesh::client_session::DEFAULT_FIRST_RETRY_MS)]
     first_retry_ms: u64,
     /// Session id for assignment (CMCD `sid`).
@@ -141,9 +179,7 @@ struct Args {
     /// Wave 9 D: UDP GRO on the client's socket: an edge's GSO run of a 4K
     /// part's symbols (or what the NIC's GRO joined) is one receive of up to
     /// 64 KiB, cut into its datagrams here, instead of one receive and one
-    /// queue entry per symbol (at 300 Mbit/s a clip's loop point, 15 MB in
-    /// a quarter of a second, overflowed the client's 8 MB queue). `false`:
-    /// one datagram per receive, as before.
+    /// queue entry per symbol. `false`: one datagram per receive.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     gro: bool,
     /// Local address for the UDP socket.
@@ -152,115 +188,154 @@ struct Args {
     /// Write the parts' bytes, concatenated in part order, to this file.
     #[arg(long)]
     write_parts: Option<PathBuf>,
-    /// Ask the edge for the fast lane (`F1`): parts as their symbols arrive
-    /// at the edge, before it decodes them. `false` takes the cache-fed lane
-    /// alone, as before.
+    /// Ask the edges for the fast lane (`F1`): parts as their symbols
+    /// arrive at the edge, before it decodes them. `false` takes the
+    /// cache-fed lane alone.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     fast_lane: bool,
-    /// Ask the edge for the compact lane: a part that fits one datagram as
+    /// Ask the edges for the compact lane: a part that fits one datagram as
     /// one datagram, with repair across parts and NACK. `false` takes the
-    /// RaptorQ lane alone, with its repair of before wave 5. An edge that
-    /// does not answer a request for it (an edge older than the lane) is
-    /// asked again without it.
+    /// RaptorQ lane alone, with its repair of before wave 5.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     compact: bool,
-    /// On a path whose losses come in bursts (runs of two or more compact
-    /// datagrams, copies included), plan no copies (a part's copies go out
-    /// right behind it and a burst takes them too) and window repair rows
-    /// for the burst. `false`: one copy and at most two more rows, as before.
+    /// On a path whose losses come in bursts, plan no copies and window
+    /// repair rows for the burst. `false`: one copy and at most two more
+    /// rows, as before.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     compact_burst_rows: bool,
-    /// Ask for parts in the short form (wave 7 item 9): a 7-byte header
-    /// instead of 11 (`C...7`). The client reads both forms, so an edge
-    /// that does not send it is read as before. `false` asks for the long
-    /// form.
+    /// Ask for parts in the short form (a 7-byte header instead of 11).
+    /// `false` asks for the long form.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     compact_short_header: bool,
     /// Wait before the first NACK of a hole that a later part showed, in
-    /// µs (wave 6: 250; before, 1,000, when the cache-fed lane could trail
-    /// its fast-lane neighbours).
+    /// µs (longer while a slower leg may still bring it).
     #[arg(long, default_value_t = av_mesh::client_compact::FAST_NACK_DELAY.as_micros() as u64)]
     nack_delay_us: u64,
     /// The floor of the wait between NACKs of a hole, in µs (one and a half
-    /// round trips when longer; wave 6: 2,000; before, 5,000).
+    /// round trips when longer).
     #[arg(long, default_value_t = av_mesh::client_compact::FAST_NACK_RETRY.as_micros() as u64)]
     nack_retry_floor_us: u64,
     /// NACK the parts that are due when no part has come for an interval
     /// and a margin past the next one's due time, and again each interval
-    /// while the silence lasts (a burst on the path), up to 50 ms. `false`:
-    /// a hole is asked for only once a later part shows it, as before.
+    /// while the silence lasts, up to 50 ms. `false`: a hole is asked for
+    /// only once a later part shows it.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     silence_nack: bool,
-    /// Wave 8 (R6-3): the parts that one silence asks for, at most; its
-    /// holes then wait for a datagram. 0: no bound, and a silence's holes go
-    /// on in the ordinary schedule after its first 50 ms (before wave 8).
+    /// The parts that one silence asks for, at most. 0: no bound.
     #[arg(long, default_value_t = av_mesh::client_compact::DEFAULT_SILENCE_NACK_BUDGET)]
     silence_nack_budget: u16,
-    /// Wave 8 (R6-4): a silence's NACKs of a hole are one and a half round
-    /// trips apart at least, and asked again no sooner when it ends.
-    /// `false`: every interval, and 250 µs after the silence (before).
+    /// A silence's NACKs of a hole are one and a half round trips apart at
+    /// least. `false`: every interval.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     silence_nack_rtt_floor: bool,
-    /// Wave 8 (R6-5): a gap between arrivals longer than this many part
-    /// intervals is no sample of the interval or jitter (0: every gap is).
+    /// A gap between arrivals longer than this many part intervals is no
+    /// sample of the interval or jitter (0: every gap is).
     #[arg(long, default_value_t = av_mesh::client_compact::DEFAULT_INTERVAL_CAP)]
     interval_cap: u32,
-    /// Wave 8 (S4): a silence is NACKed this many part intervals past the
-    /// next part's due time (and at least 0.5 ms and four times the jitter);
-    /// 1 before wave 8.
+    /// A silence is NACKed this many part intervals past the next part's
+    /// due time (and at least 0.5 ms and four times the jitter).
     #[arg(long, default_value_t = av_mesh::client_compact::DEFAULT_SILENCE_MARGIN_INTERVALS)]
     silence_margin_intervals: u32,
-    /// Wave 8: the parts a second that the client asks for at most (0: no
-    /// cap): an overloaded edge is not asked for thousands a second.
+    /// The parts a second that the client asks for at most (0: no cap).
     #[arg(long, default_value_t = av_mesh::client_compact::DEFAULT_NACK_RATE_CAP)]
     nack_rate_cap: u32,
-    /// Wave 8 (S2): after a move for silence, until the new edge sends a
-    /// datagram, the silence (ms) that moves again (a stall of the stream
-    /// itself moves a client once a second, not every --silence-ms).
+    /// While every leg stays silent, the legs are asked again this often
+    /// (ms; a stall of the stream itself is not asked about every
+    /// --silence-ms).
     #[arg(long, default_value_t = av_mesh::client_session::DEFAULT_SILENCE_REPEAT_MS)]
     silence_repeat_ms: u64,
-    /// Wave 8: an edge that answers after the client gave up the compact
-    /// lane for want of an answer is asked for it again (twice at most).
-    /// `false`: the RaptorQ lane for the rest of the run at that edge.
+    /// An edge that answers after the client gave up the compact lane for
+    /// want of an answer is asked for it again (twice at most).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     compact_retry: bool,
-    /// Wave 8: drop the short-form parts that come before the edge's OK,
-    /// as before (`false`: kept, read once the OK comes).
+    /// Drop the short-form parts that come before the edge's OK (`false`:
+    /// kept, read once the OK comes).
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     drop_early_parts: bool,
-    /// Wave 8 local proofs: a move asks the new edge for the oldest part
-    /// still missing (a hole the old edge never repaired), not only the
-    /// parts after the newest (`false`: as before, those holes are lost).
+    /// A leg started where no leg delivers asks its edge for the oldest
+    /// part still missing, not only the parts after the newest.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     move_from_hole: bool,
-    /// Wave 8 (R6-2): no NACK while datagrams are queued on the socket
-    /// (after a stall the backlog fills most holes). `false`: NACKs between
-    /// the datagrams of a backlog, as before.
+    /// No NACK, and no verdict on a silent leg, while datagrams are queued
+    /// on the socket. `false`: NACKs between the datagrams of a backlog.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     nack_after_drain: bool,
     /// At the end of the run, keep receiving for up to this long (ms) to
-    /// fill the holes among the parts received so far, by NACK, so that a
-    /// part lost just before the end is not counted missing; parts past the
-    /// last one are not taken. 0: stop at the end, as before.
+    /// fill the holes among the parts received so far, by NACK; parts past
+    /// the last one are not taken. 0: stop at the end.
     #[arg(long, default_value_t = 300)]
     drain_ms: u64,
     /// Write one line for each part received, in part order: part number,
     /// arrival time (Unix µs), bytes, publication and availability times as
-    /// the object carries them, and the kernel's receive time of the
-    /// datagram (Unix µs, SO_TIMESTAMPNS; 0 where the host gives none):
-    /// arrival minus kernel time is the delay on the listener's host. With
-    /// --write-parts, a measurement tool can find each part's bytes (the
-    /// lengths give the offsets).
+    /// the object carries them, the kernel's receive time of the datagram
+    /// (Unix µs, SO_TIMESTAMPNS; 0 where the host gives none), and the edge
+    /// whose datagram was the first arrival. With --write-parts, a
+    /// measurement tool can find each part's bytes (the lengths give the
+    /// offsets).
     #[arg(long)]
     arrivals: Option<PathBuf>,
-    /// Read the assigned cache's media playlist before subscribing, as
-    /// before (wave 7 item 8). By default the client subscribes right after
-    /// the assignment and reads the playlist beside the subscription: a
-    /// cache whose playlist answers with an error before the subscription
-    /// is answered is still left. With --verify-http the playlist is read
-    /// first either way (it names the parts' extension).
+    /// Read the media playlist of each edge a leg is added at, beside the
+    /// subscription (its time is `startup.playlist_ms`). The client never
+    /// waits for it: the legs are judged by the UDP lane. With --verify-http
+    /// it is read either way (it names the parts' extension).
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     playlist_first: bool,
+}
+
+impl Args {
+    fn session_config(&self) -> SessionConfig {
+        SessionConfig {
+            stream_id: self.stream,
+            repair_permille: self.repair_permille,
+            min_repair: self.min_repair,
+            silence: Duration::from_millis(self.silence_ms),
+            silence_repeat: Duration::from_millis(self.silence_repeat_ms),
+            nack_after_drain: self.nack_after_drain,
+            compact_retry: self.compact_retry,
+            drop_early_parts: self.drop_early_parts,
+            move_from_hole: self.move_from_hole,
+            answer: Duration::from_millis(self.answer_ms),
+            fixed_repair: self.fixed_repair,
+            fast_lane: self.fast_lane,
+            compact: self.compact,
+            compact_burst_rows: self.compact_burst_rows,
+            compact_short_header: self.compact_short_header,
+            nack_timing: NackTiming {
+                delay: Duration::from_micros(self.nack_delay_us),
+                retry_floor: Duration::from_micros(self.nack_retry_floor_us),
+                silence: self.silence_nack,
+                silence_budget: self.silence_nack_budget,
+                rtt_floor: self.silence_nack_rtt_floor,
+                interval_cap: self.interval_cap,
+                margin_intervals: self.silence_margin_intervals,
+                rate_cap: self.nack_rate_cap,
+            },
+            known_parts: 0,
+            first_retry: Duration::from_millis(self.first_retry_ms),
+            residual_target: f64::from(self.compact_residual_ppm) / 1e6,
+            hole_give_up: Duration::from_millis(self.hole_give_up_ms),
+            token_wait: Duration::from_millis(self.token_ms),
+            first_double: Duration::from_millis(self.first_double_ms),
+            hedge_after: Duration::from_millis(self.hedge_after_ms),
+            lone_hedge_after: Duration::from_millis(self.lone_hedge_after_ms),
+        }
+    }
+
+    fn director_config(&self, nonce_seed: u64) -> DirectorConfig {
+        let mut config = DirectorConfig::new(self.stream, self.session.clone(), self.entry.clone());
+        config.paths = self.paths;
+        config.spare = self.spare;
+        config.token_wait = Duration::from_millis(self.token_ms);
+        config.rebalance_giveup = Duration::from_millis(self.rebalance_giveup_ms);
+        config.level_wait = Duration::from_millis(self.level_wait_ms);
+        config.first_retry = Duration::from_millis(self.first_retry_ms);
+        config.assignment_udp_port = self.assignment_udp_port;
+        config.assignment_https_after = Duration::from_millis(self.assignment_https_after_ms);
+        config.assignment_timeout = Duration::from_millis(self.assignment_timeout_ms);
+        config.udp_port = self.udp_port;
+        config.nonce_seed = nonce_seed;
+        config
+    }
 }
 
 fn now_unix_us() -> u64 {
@@ -396,249 +471,6 @@ fn tls_connector(args: &Args) -> Result<TlsConnector> {
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
-#[derive(Debug, Clone)]
-struct Cache {
-    node_id: String,
-    base: Url,
-    /// The entry point of a neighbouring region (Phase AM item 11): it is
-    /// asked for its own caches when this region's are lost.
-    failover: bool,
-}
-
-/// The caches and their client UDP port, and how the answer came.
-type AssignmentAnswer = (Vec<Cache>, Option<u16>, &'static str);
-
-/// The assignment of the entry point: over UDP (wave 9 B) and HTTPS, the
-/// first answer of either (HTTPS alone with --assignment-udp-port 0).
-async fn assignment(
-    http: &Http,
-    entry: &str,
-    args: &Args,
-    current: Option<&str>,
-    skip: &BTreeMap<String, Instant>,
-) -> Result<AssignmentAnswer> {
-    let limit = Duration::from_millis(args.assignment_timeout_ms.max(1));
-    let https_after = Duration::from_millis(args.assignment_https_after_ms);
-    let raced = async {
-        let mut https: Option<std::pin::Pin<Box<dyn std::future::Future<Output = Result<AssignmentAnswer>> + Send + '_>>> = None;
-        let mut udp: Option<std::pin::Pin<Box<dyn std::future::Future<Output = Result<AssignmentAnswer>> + Send + '_>>> = None;
-        if args.assignment_udp_port == 0 {
-            https = Some(Box::pin(https_assignment(http, entry, args, current, skip)));
-        } else {
-            udp = Some(Box::pin(udp_assignment(entry, args, current, skip)));
-        }
-        let start_https = tokio::time::sleep(https_after);
-        tokio::pin!(start_https);
-        let mut https_started = https.is_some();
-        let mut last_error = None;
-        loop {
-            if udp.is_none() && https.is_none() && https_started {
-                return Err(last_error.unwrap_or_else(|| anyhow!("no assignment")));
-            }
-            tokio::select! {
-                answer = async { udp.as_mut().expect("guarded").await }, if udp.is_some() => {
-                    udp = None;
-                    match answer {
-                        Ok(answer) => return Ok(answer),
-                        Err(error) => {
-                            last_error = Some(error);
-                            if !https_started {
-                                https_started = true;
-                                https = Some(Box::pin(https_assignment(http, entry, args, current, skip)));
-                            }
-                        }
-                    }
-                }
-                answer = async { https.as_mut().expect("guarded").await }, if https.is_some() => {
-                    https = None;
-                    match answer {
-                        Ok(answer) => return Ok(answer),
-                        Err(error) => last_error = Some(error),
-                    }
-                }
-                () = &mut start_https, if !https_started => {
-                    https_started = true;
-                    https = Some(Box::pin(https_assignment(http, entry, args, current, skip)));
-                }
-            }
-        }
-    };
-    tokio::time::timeout(limit, raced)
-        .await
-        .map_err(|_| anyhow!("assignment at {entry}: no answer in {} ms", args.assignment_timeout_ms))?
-}
-
-/// Wave 9 review: the confirmation of a UDP assignment goes again after
-/// this long.
-const CONFIRM_REPEAT: Duration = Duration::from_millis(30);
-
-/// Wave 9 B: the assignment over UDP (`ASSIGN` at the entry point's client
-/// UDP port), repeated after --first-retry-ms, then twice as long each time
-/// up to 300 ms, until it is answered.
-async fn udp_assignment(
-    entry: &str,
-    args: &Args,
-    current: Option<&str>,
-    skip: &BTreeMap<String, Instant>,
-) -> Result<AssignmentAnswer> {
-    use av_mesh::client_udp::Control;
-    let entry = Url::parse(entry)?;
-    let (host, _) = entry.host_port();
-    let target = tokio::net::lookup_host((host.as_str(), args.assignment_udp_port))
-        .await?
-        .next()
-        .ok_or_else(|| anyhow!("no address for {host}"))?;
-    let local: SocketAddr = if target.is_ipv4() {
-        "0.0.0.0:0".parse()?
-    } else {
-        "[::]:0".parse()?
-    };
-    let socket = UdpSocket::bind(local).await?;
-    socket.connect(target).await?;
-    let mut nonce = [0_u8; 8];
-    rustls::crypto::ring::default_provider()
-        .secure_random
-        .fill(&mut nonce)
-        .map_err(|_| anyhow!("no random nonce"))?;
-    let nonce = u64::from_be_bytes(nonce);
-    let skip: Vec<String> = skip.keys().cloned().collect();
-    let request = Control::Assign {
-        stream_id: args.stream,
-        nonce,
-        session: args.session.clone(),
-        skip: skip.clone(),
-        current: current.into_iter().map(str::to_owned).collect(),
-        paths: 1,
-        spare: false,
-        hold: Vec::new(),
-        token: None,
-    }
-    .encode();
-    // The node's token for this socket's address, which the confirmation
-    // of the answer carries (wave 9 review).
-    let mut given: Option<u64> = None;
-    let first = Duration::from_millis(args.first_retry_ms.max(1));
-    let mut wait = if args.first_retry_ms == 0 {
-        av_mesh::client_session::UNANSWERED_REFRESH
-    } else {
-        first
-    };
-    let mut buf = vec![0_u8; 2_048];
-    loop {
-        socket.send(&request).await?;
-        let until = tokio::time::Instant::now() + wait;
-        loop {
-            match tokio::time::timeout_at(until, socket.recv(&mut buf)).await {
-                Err(_) => break,
-                // An ICMP port unreachable: no client UDP port there.
-                Ok(Err(error)) => bail!("ASSIGN to {target}: {error}"),
-                Ok(Ok(len)) => {
-                    let control = Control::decode(&buf[..len]);
-                    if let Some(Control::Token { stream_id, token }) = control {
-                        if stream_id == args.stream {
-                            given = Some(token);
-                        }
-                        continue;
-                    }
-                    if let Some(Control::Assigned {
-                        stream_id,
-                        nonce: answered,
-                        port,
-                        caches,
-                        ..
-                    }) = control
-                    {
-                        if stream_id != args.stream || answered != nonce {
-                            continue;
-                        }
-                        let caches = caches
-                            .into_iter()
-                            .filter_map(|cache| {
-                                Some(Cache {
-                                    node_id: cache.node_id,
-                                    base: Url::parse(&cache.playback_base_url).ok()?,
-                                    failover: cache.failover,
-                                })
-                            })
-                            .collect::<Vec<_>>();
-                        if caches.is_empty() {
-                            bail!("no assignment (UDP): the entry point names no cache");
-                        }
-                        // Confirm the cache taken, so the entry point
-                        // charges it for this session (an unproven request
-                        // charges nothing): off the join's path, sent
-                        // twice against a loss.
-                        if let Some(token) = given {
-                            let confirm = Control::Assign {
-                                stream_id: args.stream,
-                                nonce,
-                                session: args.session.clone(),
-                                skip,
-                                current: vec![caches[0].node_id.clone()],
-                                paths: 1,
-                                spare: false,
-                                hold: Vec::new(),
-                                token: Some(token),
-                            }
-                            .encode();
-                            tokio::spawn(async move {
-                                for _ in 0..2 {
-                                    let _ = socket.send(&confirm).await;
-                                    tokio::time::sleep(CONFIRM_REPEAT).await;
-                                }
-                            });
-                        }
-                        return Ok((caches, port, "udp"));
-                    }
-                }
-            }
-        }
-        wait = (wait * 2).min(av_mesh::client_session::UNANSWERED_REFRESH);
-    }
-}
-
-async fn https_assignment(
-    http: &Http,
-    entry: &str,
-    args: &Args,
-    current: Option<&str>,
-    skip: &BTreeMap<String, Instant>,
-) -> Result<AssignmentAnswer> {
-    let entry = Url::parse(entry)?;
-    let mut path = format!(
-        "/api/assignment?stream={}&sid={}",
-        args.stream, args.session
-    );
-    // Phase AM item 10: the caches it has just left are not assigned.
-    if !skip.is_empty() {
-        path.push_str("&skip=");
-        path.push_str(&skip.keys().cloned().collect::<Vec<_>>().join(","));
-    }
-    if let Some(current) = current {
-        path.push_str(&format!("&current={current}"));
-    }
-    let (status, body) = http.get(&entry.authority, &path).await?;
-    let json: serde_json::Value = serde_json::from_slice(&body)
-        .with_context(|| format!("assignment answer is not JSON ({status})"))?;
-    let port = json["client_udp_port"].as_u64().map(|port| port as u16);
-    let caches = json["assigned"]
-        .as_array()
-        .ok_or_else(|| anyhow!("no assignment ({status}): {}", json["error"]))?
-        .iter()
-        .filter_map(|cache| {
-            Some(Cache {
-                node_id: cache["node_id"].as_str()?.to_owned(),
-                base: Url::parse(cache["playback_base_url"].as_str()?).ok()?,
-                failover: cache["failover_entry"].as_bool() == Some(true),
-            })
-        })
-        .collect::<Vec<_>>();
-    if caches.is_empty() {
-        bail!("the assignment names no cache");
-    }
-    Ok((caches, port, "https"))
-}
-
 /// The part numbers and extension that a media playlist names.
 fn playlist_parts(body: &str) -> (Option<u64>, String) {
     let mut last = None;
@@ -660,6 +492,175 @@ fn playlist_parts(body: &str) -> (Option<u64>, String) {
         }
     }
     (last, extension)
+}
+
+/// A leg's lag behind the first arrival of each part, in 10 µs buckets up
+/// to 100 ms (made when the leg is added: nothing is allocated per part).
+#[derive(Debug, Clone)]
+struct LagHistogram {
+    counts: Box<[u32]>,
+    over: u32,
+    max: Duration,
+}
+
+const LAG_BUCKET_US: u64 = 10;
+const LAG_BUCKETS: usize = 10_000;
+
+impl LagHistogram {
+    fn new() -> Self {
+        Self {
+            counts: vec![0; LAG_BUCKETS].into_boxed_slice(),
+            over: 0,
+            max: Duration::ZERO,
+        }
+    }
+
+    fn record(&mut self, lag: Duration) {
+        let bucket = (lag.as_micros() as u64 / LAG_BUCKET_US) as usize;
+        match self.counts.get_mut(bucket) {
+            Some(count) => *count += 1,
+            None => self.over += 1,
+        }
+        self.max = self.max.max(lag);
+    }
+
+    fn merge(&mut self, other: &Self) {
+        for (count, add) in self.counts.iter_mut().zip(other.counts.iter()) {
+            *count += add;
+        }
+        self.over += other.over;
+        self.max = self.max.max(other.max);
+    }
+
+    fn total(&self) -> u64 {
+        self.counts
+            .iter()
+            .map(|count| u64::from(*count))
+            .sum::<u64>()
+            + u64::from(self.over)
+    }
+
+    /// The `q` quantile in ms (a bucket's upper edge; the maximum past the
+    /// last bucket).
+    fn quantile_ms(&self, q: f64) -> Option<f64> {
+        let total = self.total();
+        if total == 0 {
+            return None;
+        }
+        let rank = ((total as f64 * q).ceil() as u64).clamp(1, total);
+        let mut seen = 0_u64;
+        for (bucket, count) in self.counts.iter().enumerate() {
+            seen += u64::from(*count);
+            if seen >= rank {
+                return Some(((bucket as u64 + 1) * LAG_BUCKET_US) as f64 / 1_000.0);
+            }
+        }
+        Some(self.max.as_secs_f64() * 1_000.0)
+    }
+}
+
+/// One leg as the report keeps it: where and when it was added, what the
+/// client saw of it, and the session's figures read as the director
+/// releases it (a released leg's figures are gone from the session).
+#[derive(Debug, Clone)]
+struct LegLog {
+    key: LegKey,
+    node: String,
+    /// Its node, as an index into the client's node names.
+    edge: usize,
+    added: Instant,
+    /// Its last media datagram (the client's view: for the time on one
+    /// path).
+    last_media: Option<Instant>,
+    lags: LagHistogram,
+    report: Option<LegReport>,
+}
+
+/// The session as the director drives it in this binary: every leg added
+/// is logged (its node named once in `nodes`), and its report is read
+/// before the session lets it go.
+struct Recorded<'a> {
+    session: &'a mut UdpSession,
+    logs: &'a mut Vec<LegLog>,
+    nodes: &'a mut Vec<String>,
+}
+
+impl SessionLegs for Recorded<'_> {
+    fn add_leg(
+        &mut self,
+        leg: LegKey,
+        node: &str,
+        addr: SocketAddr,
+        start: LegStart,
+        now: Instant,
+        send: &mut dyn FnMut(SocketAddr, &[u8]),
+    ) {
+        let edge = match self.nodes.iter().position(|known| known == node) {
+            Some(edge) => edge,
+            None => {
+                self.nodes.push(node.to_owned());
+                self.nodes.len() - 1
+            }
+        };
+        self.logs.push(LegLog {
+            key: leg,
+            node: node.to_owned(),
+            edge,
+            added: now,
+            last_media: None,
+            lags: LagHistogram::new(),
+            report: None,
+        });
+        self.session.add_leg(leg, node, addr, start, now, send);
+    }
+
+    fn release_leg(&mut self, leg: LegKey, now: Instant, send: &mut dyn FnMut(SocketAddr, &[u8])) {
+        if let Some(log) = self.logs.iter_mut().rev().find(|log| log.key == leg) {
+            log.report = self.session.leg_report(leg).or(log.report.take());
+        }
+        self.session.release_leg(leg, now, send);
+    }
+
+    fn takeback_leg(&mut self, leg: LegKey, now: Instant, send: &mut dyn FnMut(SocketAddr, &[u8])) {
+        self.session.takeback_leg(leg, now, send);
+    }
+
+    fn reask_leg(&mut self, leg: LegKey, now: Instant, send: &mut dyn FnMut(SocketAddr, &[u8])) {
+        self.session.reask_leg(leg, now, send);
+    }
+
+    fn leg(&self, leg: LegKey, now: Instant) -> Option<LegView> {
+        self.session.leg(leg, now)
+    }
+
+    fn level(&self, new: LegKey, old: LegKey) -> bool {
+        self.session.level(new, old)
+    }
+
+    fn oldest_hole(&self) -> Option<u64> {
+        self.session.oldest_hole()
+    }
+
+    fn next_event(&mut self) -> Option<LegEvent> {
+        self.session.next_event()
+    }
+}
+
+/// What a spawned task brings back to the loop.
+enum Done {
+    Https {
+        id: u64,
+        body: Option<Bytes>,
+    },
+    Resolved {
+        host: String,
+        ip: Option<IpAddr>,
+    },
+    /// A media playlist read: the parts' extension, or why it failed.
+    Playlist {
+        node: String,
+        answer: Result<String, String>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -700,16 +701,190 @@ fn percentiles(mut values: Vec<f64>) -> Percentiles {
 #[derive(Debug, Default, Serialize)]
 struct Startup {
     assignment_ms: Option<f64>,
-    /// How the first assignment came (wave 9 B): "udp" or "https".
+    /// How the first assignment came: "udp" or "https".
     assignment_via: Option<&'static str>,
-    /// The playlist read (beside the subscription unless --playlist-first).
+    /// The first playlist read (with --playlist-first or --verify-http).
     playlist_ms: Option<f64>,
     first_request_ms: Option<f64>,
     token_ms: Option<f64>,
     subscribed_ms: Option<f64>,
     first_part_ms: Option<f64>,
-    /// The first part received, after the part that the OK named.
+    /// The first part received, after the part that the first OK named.
     first_part_after_named: Option<u64>,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct LagFigures {
+    median: Option<f64>,
+    p99: Option<f64>,
+}
+
+/// One edge's legs in the report (B 2.8 `legs`; the legs a listener held at
+/// one node over the run, together).
+#[derive(Debug, Default, Serialize)]
+struct LegFigures {
+    legs: u64,
+    first_part: Option<u64>,
+    parts_first: u64,
+    duplicates: u64,
+    datagrams: u64,
+    wire_bytes: u64,
+    loss: Option<f64>,
+    rtt_ms: Option<f64>,
+    lag_ms: LagFigures,
+    longest_gap_ms: f64,
+    plan: Option<String>,
+    before_start: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplacementRecord {
+    at_ms: u64,
+    from: String,
+    to: String,
+    reason: String,
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    handover_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exposure_ms: Option<f64>,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct ShortGrantCounts {
+    #[serde(rename = "one-edge")]
+    one_edge: u64,
+    bitrate: u64,
+    gate: u64,
+    unexplained: u64,
+}
+
+impl From<ShortGrants> for ShortGrantCounts {
+    fn from(grants: ShortGrants) -> Self {
+        Self {
+            one_edge: grants.one_edge,
+            bitrate: grants.bitrate,
+            gate: grants.gate,
+            unexplained: grants.unexplained,
+        }
+    }
+}
+
+fn ms_of(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
+}
+
+/// The report's `legs`: each node's legs, from their logs.
+fn leg_figures(logs: &[LegLog]) -> BTreeMap<String, LegFigures> {
+    let mut figures: BTreeMap<String, LegFigures> = BTreeMap::new();
+    let mut lags: BTreeMap<&str, LagHistogram> = BTreeMap::new();
+    for log in logs {
+        let entry = figures.entry(log.node.clone()).or_default();
+        entry.legs += 1;
+        lags.entry(log.node.as_str())
+            .and_modify(|merged| merged.merge(&log.lags))
+            .or_insert_with(|| log.lags.clone());
+        let Some(report) = &log.report else {
+            continue;
+        };
+        entry.first_part = match (entry.first_part, report.first_part) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        entry.parts_first += report.stats.parts_first;
+        entry.duplicates += report.stats.duplicates;
+        entry.before_start += report.stats.before_start;
+        entry.datagrams += report.datagrams;
+        entry.wire_bytes += report.wire_bytes;
+        entry.loss = report.loss.or(entry.loss);
+        entry.rtt_ms = report.rtt.map(ms_of).or(entry.rtt_ms);
+        entry.longest_gap_ms = entry.longest_gap_ms.max(ms_of(report.longest_gap));
+        entry.plan = Some(report.plan.word());
+    }
+    for (node, histogram) in lags {
+        if let Some(entry) = figures.get_mut(node) {
+            entry.lag_ms = LagFigures {
+                median: histogram.quantile_ms(0.5),
+                p99: histogram.quantile_ms(0.99),
+            };
+        }
+    }
+    figures
+}
+
+/// The report's `replacements`, and `moves` (v1: one record per leg
+/// replaced, take-backs left out) with the new leg's first part.
+fn replacement_records(
+    replacements: &[Replacement],
+    logs: &[LegLog],
+    started: Instant,
+) -> (Vec<ReplacementRecord>, Vec<MoveRecord>) {
+    let at_ms = |at: Instant| at.saturating_duration_since(started).as_millis() as u64;
+    let records = replacements
+        .iter()
+        .map(|replacement| ReplacementRecord {
+            at_ms: at_ms(replacement.at),
+            from: replacement.from.clone(),
+            to: replacement.to.clone(),
+            reason: replacement.reason.clone(),
+            kind: replacement.kind.name(),
+            handover_ms: replacement.handover.map(ms_of),
+            exposure_ms: replacement.exposure.map(ms_of),
+        })
+        .collect();
+    let moves = replacements
+        .iter()
+        .filter(|replacement| replacement.kind != ReplacementKind::Takeback)
+        .map(|replacement| MoveRecord {
+            at_ms: at_ms(replacement.at),
+            from: replacement.from.clone(),
+            to: replacement.to.clone(),
+            reason: replacement.reason.clone(),
+            next_part: logs
+                .iter()
+                .rev()
+                .find(|log| log.node == replacement.to && log.added <= replacement.at)
+                .and_then(|log| log.report.as_ref())
+                .and_then(|report| report.first_part),
+        })
+        .collect();
+    (records, moves)
+}
+
+/// One part as the arrivals file writes it.
+#[derive(Debug, Clone, Copy)]
+struct Arrival {
+    arrival_us: u64,
+    bytes: usize,
+    published_us: u64,
+    available_us: u64,
+    kernel_us: u64,
+    /// The edge (an index into the client's node names).
+    edge: Option<usize>,
+}
+
+/// The `--arrivals` file: the six columns of v1, then `edge` (B 2.8). The
+/// referee's `ntcmp udp-ingest` reads the first three by position; the
+/// lab's scripts read columns by name.
+fn arrivals_csv(arrivals: &BTreeMap<u64, Arrival>, nodes: &[String]) -> String {
+    let mut text = String::from(
+        "part,arrival_unix_us,bytes,published_unix_us,available_unix_us,kernel_unix_us,edge\n",
+    );
+    for (part, arrival) in arrivals {
+        let edge = arrival
+            .edge
+            .and_then(|index| nodes.get(index))
+            .map_or("", String::as_str);
+        text.push_str(&format!(
+            "{part},{},{},{},{},{},{edge}\n",
+            arrival.arrival_us,
+            arrival.bytes,
+            arrival.published_us,
+            arrival.available_us,
+            arrival.kernel_us
+        ));
+    }
+    text
 }
 
 #[derive(Debug, Serialize)]
@@ -719,7 +894,7 @@ struct Report {
     duration_seconds: u64,
     caches: Vec<String>,
     moves: Vec<MoveRecord>,
-    /// Moves back to the region of `--entry` after a failover (wave 8).
+    /// Moves back to the home region after a failover.
     home_returns: u64,
     first_part: Option<u64>,
     last_part: Option<u64>,
@@ -746,23 +921,17 @@ struct Report {
     final_loss_ppm: u32,
     flows: u64,
     payload_bytes: u64,
-    /// Bytes of the media datagrams received, with 28 bytes of IPv4 and UDP
-    /// header each, and their rate over the parts' time.
+    /// Bytes of the media datagrams received from every leg, with 28 bytes
+    /// of IPv4 and UDP header each, and their rate over the parts' time.
     wire_bytes: u64,
     wire_bits_per_second: Option<f64>,
     /// Wire bytes over the parts' own bytes.
     wire_per_payload: Option<f64>,
-    /// The last edge was asked for the compact lane.
     compact_asked: bool,
-    /// Edges that did not answer a request for the compact lane and were
-    /// asked without it.
     compact_fallbacks: u64,
-    /// Edges that refused the compact lane asked with the short form, and
-    /// were asked again with the long form.
     compact_short_header_dropped: u64,
-    /// The round trip to the edge that the NACKs wait for.
+    /// The shortest round trip of the legs held at the end.
     nack_rtt_ms: Option<f64>,
-    /// The NACK timing asked for, and the interval between parts measured.
     nack_timing: String,
     part_interval_ms: Option<f64>,
     compact_confirmed: bool,
@@ -771,15 +940,9 @@ struct Report {
     burst_estimate_max: Option<f64>,
     compact: CompactReport,
     fast_lane_asked: bool,
-    /// Parts that came on the fast lane, and on the cache-fed lane.
     fast_lane_parts: u64,
-    /// The fast-lane parts that came as compact datagrams (marked by the
-    /// edge; an edge before the mark sends them unmarked, counted cache-fed).
     compact_fast_lane_parts: u64,
     cache_lane_parts: u64,
-    /// Bytes of the canonical envelope of each fast-lane part, and the bytes
-    /// of it that are not the part's media (the envelope's own header,
-    /// metadata and timestamps).
     fast_envelope_bytes: Percentiles,
     fast_envelope_overhead_bytes: Percentiles,
     fast_epoch_changes: u64,
@@ -791,6 +954,23 @@ struct Report {
     available_to_arrival_ms: Percentiles,
     time_to_first_part_ms: Option<f64>,
     startup: Startup,
+    // v2 (B 2.8).
+    paths: u8,
+    spare: Option<String>,
+    cpu_seconds: f64,
+    legs: BTreeMap<String, LegFigures>,
+    replacements: Vec<ReplacementRecord>,
+    single_path_ms: f64,
+    single_path_spans: Vec<[u64; 2]>,
+    hedges: u64,
+    hedges_released: u64,
+    longest_silence_ms: f64,
+    interruptions: u64,
+    wire_bytes_per_part: Option<f64>,
+    before_start: u64,
+    stale_start: u64,
+    cross_leg_mismatch: u64,
+    short_grants: ShortGrantCounts,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -823,6 +1003,24 @@ struct VerifyJob {
     path: String,
     part: u64,
     payload: Bytes,
+}
+
+/// A part waiting for the parts' extension before it can be verified.
+struct VerifyWaiting {
+    node: String,
+    part: u64,
+    payload: Bytes,
+}
+
+/// The process's user and system time, in seconds.
+fn cpu_seconds() -> f64 {
+    // SAFETY: getrusage writes one rusage to the pointer given.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+        return 0.0;
+    }
+    let seconds = |time: libc::timeval| time.tv_sec as f64 + time.tv_usec as f64 / 1e6;
+    seconds(usage.ru_utime) + seconds(usage.ru_stime)
 }
 
 fn set_receive_buffer(socket: &UdpSocket, bytes: usize) {
@@ -964,6 +1162,71 @@ async fn recv_timestamped(
         .await
 }
 
+/// Perform the director's actions: datagrams from the media socket, HTTPS
+/// requests and name lookups on tasks of their own, answered on `done`.
+async fn perform(
+    socket: &UdpSocket,
+    actions: &mut Vec<Action>,
+    http: &Http,
+    done: &mpsc::UnboundedSender<Done>,
+) {
+    for action in actions.drain(..) {
+        match action {
+            // A failed send is a lost request: the director repeats it.
+            Action::Send { to, datagram } => {
+                let _ = socket.send_to(&datagram, to).await;
+            }
+            Action::Https { id, entry, path } => {
+                let (http, done) = (http.clone(), done.clone());
+                tokio::spawn(async move {
+                    let body = match Url::parse(&entry) {
+                        Ok(url) => http
+                            .get(&url.authority, &path)
+                            .await
+                            .ok()
+                            .map(|(_, body)| body),
+                        Err(_) => None,
+                    };
+                    let _ = done.send(Done::Https { id, body });
+                });
+            }
+            Action::Resolve { host } => {
+                let done = done.clone();
+                tokio::spawn(async move {
+                    let ip = tokio::net::lookup_host((host.as_str(), 0))
+                        .await
+                        .ok()
+                        .and_then(|mut addresses| addresses.next())
+                        .map(|address| address.ip());
+                    let _ = done.send(Done::Resolved { host, ip });
+                });
+            }
+        }
+    }
+}
+
+async fn flush(socket: &UdpSocket, outbox: &mut Vec<(SocketAddr, Vec<u8>)>) {
+    for (to, datagram) in outbox.drain(..) {
+        // A failed send is a lost request: the next refresh repeats it.
+        let _ = socket.send_to(&datagram, to).await;
+    }
+}
+
+/// The leg of the director's whose edge sent from `peer`: the leg at
+/// exactly that address, else the only leg at that IP (B 3.1, as the
+/// session attributes it).
+fn leg_at(director: &Director, peer: SocketAddr) -> Option<LegKey> {
+    let legs = director.legs();
+    if let Some(leg) = legs.iter().find(|leg| leg.addr == peer) {
+        return Some(leg.key);
+    }
+    let mut same_ip = legs.iter().filter(|leg| leg.addr.ip() == peer.ip());
+    match (same_ip.next(), same_ip.next()) {
+        (Some(leg), None) => Some(leg.key),
+        _ => None,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -1030,48 +1293,24 @@ async fn main() -> Result<()> {
         report
     });
 
-    // The protocol of one subscription: av_mesh::client_session, as the
-    // load generator runs it.
-    let mut session = UdpSession::new(
-        SessionConfig {
-            stream_id: args.stream,
-            repair_permille: args.repair_permille,
-            min_repair: args.min_repair,
-            silence: Duration::from_millis(args.silence_ms),
-            silence_repeat: Duration::from_millis(args.silence_repeat_ms),
-            nack_after_drain: args.nack_after_drain,
-            compact_retry: args.compact_retry,
-            drop_early_parts: args.drop_early_parts,
-            move_from_hole: args.move_from_hole,
-            answer: Duration::from_millis(args.answer_ms),
-            fixed_repair: args.fixed_repair,
-            fast_lane: args.fast_lane,
-            compact: args.compact,
-            compact_burst_rows: args.compact_burst_rows,
-            compact_short_header: args.compact_short_header,
-            nack_timing: NackTiming {
-                delay: Duration::from_micros(args.nack_delay_us),
-                retry_floor: Duration::from_micros(args.nack_retry_floor_us),
-                silence: args.silence_nack,
-                silence_budget: args.silence_nack_budget,
-                rtt_floor: args.silence_nack_rtt_floor,
-                interval_cap: args.interval_cap,
-                margin_intervals: args.silence_margin_intervals,
-                rate_cap: args.nack_rate_cap,
-            },
-            known_parts: 0,
-            first_retry: Duration::from_millis(args.first_retry_ms),
-            residual_target: av_mesh::client_compact::RESIDUAL_TARGET,
-            hole_give_up: av_mesh::client_compact::HOLE_GIVE_UP,
-            token_wait: Duration::from_millis(av_mesh::client_session::DEFAULT_TOKEN_MS),
-            first_double: Duration::from_millis(av_mesh::client_session::DEFAULT_FIRST_DOUBLE_MS),
-            hedge_after: Duration::from_millis(av_mesh::client_session::DEFAULT_HEDGE_AFTER_MS),
-            lone_hedge_after: Duration::from_millis(
-                av_mesh::client_session::DEFAULT_LONE_HEDGE_AFTER_MS,
-            ),
-        },
+    // The legs (av_mesh::client_session) and the edge-choosing code
+    // (av_mesh::client_director), as needletail-load runs them.
+    let mut session = UdpSession::new(args.session_config(), Instant::now());
+    let mut nonce_seed = [0_u8; 8];
+    rustls::crypto::ring::default_provider()
+        .secure_random
+        .fill(&mut nonce_seed)
+        .map_err(|_| anyhow!("no random nonce seed"))?;
+    let mut director = Director::new(
+        args.director_config(u64::from_be_bytes(nonce_seed)),
         Instant::now(),
     );
+    let mut logs: Vec<LegLog> = Vec::new();
+    let mut actions: Vec<Action> = Vec::new();
+    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<Done>();
+    // The control datagrams that the session hands out, sent in order.
+    let mut outbox: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
+
     let mut received: BTreeMap<u64, usize> = BTreeMap::new();
     let mut gaps: BTreeSet<u64> = BTreeSet::new();
     let mut duplicates = 0_u64;
@@ -1089,35 +1328,29 @@ async fn main() -> Result<()> {
     let mut first_part_ms = None;
     let mut startup = Startup::default();
     let since_start = |started: Instant| started.elapsed().as_secs_f64() * 1_000.0;
-    let mut moves = Vec::new();
-    let mut caches_used = Vec::new();
     let mut parts_out = match &args.write_parts {
         Some(path) => Some(std::fs::File::create(path)?),
         None => None,
     };
     let mut written_parts: BTreeMap<u64, Bytes> = BTreeMap::new();
-    let mut arrivals: BTreeMap<u64, (u64, usize, u64, u64, u64)> = BTreeMap::new();
-
-    let mut current: Option<String> = None;
-    // The edges it left, and when (forgotten after SKIP_FOR, wave 8
-    // review: a set that never expired stranded a client that had left
-    // every edge of its region once).
-    let mut skip: BTreeMap<String, Instant> = BTreeMap::new();
-    let mut move_reason = String::from("start");
-    // Phase AM item 11: the entry point asked (the region's, or a failover
-    // region's once this one is lost), the failover entries of the last
-    // answer, and the assignment failures in a row.
-    let mut entry = args.entry.clone();
-    let mut failover_entries: Vec<Cache> = Vec::new();
-    let mut entry_failures = 0_u32;
-    // Wave 8 review: the region left is asked again (a probe of its entry
-    // point every HOME_PROBE_EVERY, once HOME_HOLD has passed), and the
-    // client goes back once it assigns a cache of its own.
-    let home = args.entry.clone();
-    let mut left_home_at: Option<Instant> = None;
-    let mut home_probe: Option<tokio::task::JoinHandle<Result<AssignmentAnswer>>> = None;
-    let mut next_home_probe = Instant::now();
-    let mut home_returns = 0_u64;
+    let mut arrivals: BTreeMap<u64, Arrival> = BTreeMap::new();
+    // The node names the arrivals and the time on one path refer to.
+    let mut nodes: Vec<String> = Vec::new();
+    let mut single_path = SinglePath::default();
+    // The last first arrival (kernel time where the host gives it), the
+    // longest gap between two, and the gaps of INTERRUPTION or more.
+    let mut last_first_us: Option<u64> = None;
+    let mut longest_silence_us = 0_u64;
+    let mut interruptions = 0_u64;
+    // Parts delivered whose lag on each leg is read once settled.
+    let mut lag_due: VecDeque<u64> = VecDeque::with_capacity(256);
+    // The parts' extension and the playlists asked for (--verify-http,
+    // --playlist-first), and the parts that wait for the extension.
+    let read_playlists = args.verify_http || args.playlist_first;
+    let mut playlists_asked: BTreeSet<String> = BTreeSet::new();
+    let mut extension: Option<String> = None;
+    let mut verify_waiting: Vec<VerifyWaiting> = Vec::new();
+    let mut logs_seen = 0_usize;
     let mut buf = vec![0_u8; 65_536];
     let mut first_published_us: Option<u64> = None;
     let mut last_published_us: Option<u64> = None;
@@ -1126,432 +1359,309 @@ async fn main() -> Result<()> {
     let drain = Duration::from_millis(args.drain_ms);
     let mut drain_last: Option<u64> = None;
     let mut drain_missing: BTreeSet<u64> = BTreeSet::new();
-    // The control datagrams that the session hands out, sent in order.
-    let mut outbox: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
-    async fn flush(socket: &UdpSocket, outbox: &mut Vec<(SocketAddr, Vec<u8>)>) {
-        for (to, datagram) in outbox.drain(..) {
-            // A failed send is a lost request: the next refresh repeats it.
-            let _ = socket.send_to(&datagram, to).await;
-        }
-    }
+    // The datagrams of a GRO receive still to read: (next, end, size,
+    // sender, kernel time) in `buf`.
+    let mut pending: Option<(usize, usize, usize, SocketAddr, Option<u64>)> = None;
 
-    'caches: while Instant::now() < deadline {
-        skip.retain(|_, at| at.elapsed() < SKIP_FOR);
-        // MOVE region-lost: straight to a failover region that an earlier
-        // answer named (this region's entry point may be silent too).
-        if move_reason == "region-lost" {
-            if let Some(next) = failover_entries.first().cloned() {
-                eprintln!("region lost: asking the failover region {}", next.node_id);
-                entry = format!("https://{}", next.base.authority);
-                failover_entries.clear();
-                skip.clear();
-                move_reason = format!("region-lost via {}", next.node_id);
+    director.poll(
+        &mut Recorded {
+            session: &mut session,
+            logs: &mut logs,
+            nodes: &mut nodes,
+        },
+        Instant::now(),
+        &mut actions,
+    );
+    perform(&socket, &mut actions, &http, &done_tx).await;
+
+    // At the end: the spare, and what the main leg asked for, read before
+    // the legs are let go.
+    let (spare_at_end, (repair, plan, compact_asked, compact_confirmed)) = loop {
+        let now = Instant::now();
+        if now >= deadline && drain_last.is_none() && session.is_subscribed() && !drain.is_zero() {
+            let last = received.keys().chain(gaps.iter()).max().copied();
+            let first = received.keys().chain(gaps.iter()).min().copied();
+            if let (Some(first), Some(last)) = (first, last) {
+                drain_last = Some(last);
+                drain_missing = (first..=last)
+                    .filter(|part| !received.contains_key(part) && !gaps.contains(part))
+                    .collect();
             }
         }
-        if entry != home {
-            left_home_at.get_or_insert_with(Instant::now);
-        } else {
-            left_home_at = None;
-        }
-        let (caches, port, via) = match assignment(&http, &entry, &args, current.as_deref(), &skip).await {
-            Ok(answer) => {
-                entry_failures = 0;
-                answer
-            }
-            Err(error) => {
-                eprintln!("assignment failed: {error:#}");
-                entry_failures += 1;
-                // The region's entry point does not answer twice in a row
-                // (the region is lost; one slow answer is not, wave 8
-                // review): ask a failover region's that an earlier answer
-                // named.
-                if entry_failures >= FAILOVER_AFTER_FAILURES {
-                    if let Some(next) = failover_entries.first() {
-                        eprintln!("asking the failover region {} instead", next.node_id);
-                        entry = format!("https://{}", next.base.authority);
-                        failover_entries.clear();
-                        entry_failures = 0;
-                        skip.clear();
-                        continue;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                continue;
-            }
-        };
-        failover_entries = caches.iter().filter(|cache| cache.failover).cloned().collect();
-        // A lost region (MOVE region-lost): none of its caches.
-        if move_reason == "region-lost" {
-            for cache in caches.iter().filter(|cache| !cache.failover) {
-                skip.insert(cache.node_id.clone(), Instant::now());
-            }
-        }
-        startup.assignment_ms.get_or_insert(since_start(started));
-        startup.assignment_via.get_or_insert(via);
-        let port = args.udp_port.or(port).ok_or_else(|| {
-            anyhow!("no client UDP port: the entry point names none; pass --udp-port")
-        })?;
-        // The first cache of the assignment that this client has not just
-        // left. When it has left every cache of the region: the failover
-        // region only for a region lost, else the cache of the region it
-        // left longest ago (wave 8 review: not out of the region for a
-        // string of edge stalls), or the first one.
-        let cache = caches
-            .iter()
-            .find(|cache| !skip.contains_key(&cache.node_id) && !cache.failover)
-            .or_else(|| {
-                if move_reason.starts_with("region-lost") {
-                    caches.iter().find(|cache| !skip.contains_key(&cache.node_id))
-                } else {
-                    caches
-                        .iter()
-                        .filter(|cache| !cache.failover)
-                        .min_by_key(|cache| skip.get(&cache.node_id).copied())
-                }
-            })
-            .unwrap_or(&caches[0])
-            .clone();
-        if skip.len() >= caches.len() {
-            skip.clear();
-        }
-        // A failover region's entry point: ask it for its caches.
-        if cache.failover {
-            eprintln!("moving to the failover region {}", cache.node_id);
-            entry = format!("https://{}", cache.base.authority);
-            skip.clear();
-            if move_reason == "region-lost" {
-                move_reason = format!("region-lost via {}", cache.node_id);
-            }
-            continue;
-        }
-        let next_part = received
-            .keys()
-            .chain(gaps.iter())
-            .max()
-            .map(|part| part + 1);
-        let playlist_path = format!("{}/{}/stream.m3u8", cache.base.path, args.stream);
-        // Unless it is read first, the playlist is read beside the
-        // subscription; its answer can still send the client on.
-        let mut playlist_check = None;
-        if !args.playlist_first && !args.verify_http {
-            let (http, authority, path) = (
-                http.clone(),
-                cache.base.authority.clone(),
-                playlist_path.clone(),
+        let draining = drain_last.is_some() && !drain_missing.is_empty() && now < deadline + drain;
+        // The drain waits for NACK answers: no verdict on a silence then.
+        session.hold = draining;
+        if now >= deadline && !draining {
+            let spare = director.spare().map(str::to_owned);
+            let main_leg = (
+                session.repair(),
+                session.plan(),
+                session.compact_asked(),
+                session.compact_confirmed(),
             );
-            playlist_check = Some(tokio::spawn(
-                async move { http.get(&authority, &path).await },
-            ));
+            director.leave(
+                &mut Recorded {
+                    session: &mut session,
+                    logs: &mut logs,
+                    nodes: &mut nodes,
+                },
+                now,
+                &mut actions,
+            );
+            perform(&socket, &mut actions, &http, &done_tx).await;
+            break (spare, main_leg);
         }
-        let read_first = playlist_check.is_none();
-        let extension = match async {
-            if read_first {
-                http.get(&cache.base.authority, &playlist_path).await
-            } else {
-                Ok((StatusCode::OK, Bytes::new()))
-            }
-        }
-        .await
-        {
-            Ok((StatusCode::OK, body)) => {
-                if read_first {
-                    startup.playlist_ms.get_or_insert(since_start(started));
-                }
-                playlist_parts(&String::from_utf8_lossy(&body)).1
-            }
-            Ok((status, _)) => {
-                eprintln!("{}: playlist answered {status}", cache.node_id);
-                skip.insert(cache.node_id.clone(), Instant::now());
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-            Err(error) => {
-                eprintln!("{}: playlist failed: {error:#}", cache.node_id);
-                skip.insert(cache.node_id.clone(), Instant::now());
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-        };
-        let (host, _) = cache.base.host_port();
-        let target: SocketAddr = match tokio::net::lookup_host((host.as_str(), port))
-            .await
-            .ok()
-            .and_then(|mut addresses| addresses.next())
-        {
-            Some(target) => target,
-            None => {
-                eprintln!("{}: no address for {host}", cache.node_id);
-                skip.insert(cache.node_id.clone(), Instant::now());
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-        };
-        if let Some(previous) = &current {
-            if previous != &cache.node_id {
-                moves.push(MoveRecord {
-                    at_ms: started.elapsed().as_millis() as u64,
-                    from: previous.clone(),
-                    to: cache.node_id.clone(),
-                    reason: move_reason.clone(),
-                    next_part,
-                });
-            }
-        }
-        current = Some(cache.node_id.clone());
-        caches_used.push(cache.node_id.clone());
-        // Leave the last edge (UNSUB), and subscribe at this one.
-        session.begin(target, next_part, Instant::now(), &mut |to, datagram| {
+
+        // The timers: the session's on an empty socket only for its
+        // verdicts (B 3.1), then the director's.
+        session.queued = args.nack_after_drain && (pending.is_some() || datagrams_queued(&socket));
+        session.poll_legs(now, &mut |to, datagram| {
             outbox.push((to, datagram.to_vec()))
         });
         flush(&socket, &mut outbox).await;
-        startup.first_request_ms.get_or_insert(since_start(started));
+        director.poll(
+            &mut Recorded {
+                session: &mut session,
+                logs: &mut logs,
+                nodes: &mut nodes,
+            },
+            now,
+            &mut actions,
+        );
+        perform(&socket, &mut actions, &http, &done_tx).await;
+        // The time on one path, judged from each held leg's last media.
+        let interval = session.receiver.compact.part_interval().unwrap_or_default();
+        let window = DELIVERING_FLOOR.max(interval * DELIVERING_INTERVALS);
+        single_path.observe(
+            now,
+            window,
+            director.legs().iter().filter_map(|leg| {
+                logs.iter()
+                    .rev()
+                    .find(|log| log.key == leg.key)
+                    .and_then(|log| log.last_media)
+            }),
+            director.want() >= 2,
+        );
+        // Legs added since: their playlists, and their names.
+        for log in &logs[logs_seen..] {
+            startup
+                .first_request_ms
+                .get_or_insert(ms_of(log.added.saturating_duration_since(started)));
+            if read_playlists && playlists_asked.insert(log.node.clone()) {
+                if let Some(url) = director
+                    .cache_url(&log.node)
+                    .and_then(|url| Url::parse(url).ok())
+                {
+                    let (http, done, node) = (http.clone(), done_tx.clone(), log.node.clone());
+                    let path = format!("{}/{}/stream.m3u8", url.path, args.stream);
+                    tokio::spawn(async move {
+                        let answer = match http.get(&url.authority, &path).await {
+                            Ok((StatusCode::OK, body)) => {
+                                Ok(playlist_parts(&String::from_utf8_lossy(&body)).1)
+                            }
+                            Ok((status, _)) => Err(format!("playlist answered {status}")),
+                            Err(error) => Err(format!("playlist failed: {error:#}")),
+                        };
+                        let _ = done.send(Done::Playlist { node, answer });
+                    });
+                }
+            }
+        }
+        logs_seen = logs.len();
 
-        // The datagrams of a GRO receive still to read: (next, end, size,
-        // sender, kernel time) in `buf`.
-        let mut pending: Option<(usize, usize, usize, SocketAddr, Option<u64>)> = None;
-        loop {
-            let now = Instant::now();
-            if now >= deadline
-                && drain_last.is_none()
-                && session.is_subscribed()
-                && !drain.is_zero()
-            {
-                let last = received.keys().chain(gaps.iter()).max().copied();
-                let first = received
-                    .keys()
-                    .chain(gaps.iter())
-                    .chain(session.first_subscribed_part.iter())
-                    .min()
-                    .copied();
-                if let (Some(first), Some(last)) = (first, last) {
-                    drain_last = Some(last);
-                    drain_missing = (first..=last)
-                        .filter(|part| !received.contains_key(part) && !gaps.contains(part))
-                        .collect();
-                }
-            }
-            let draining =
-                drain_last.is_some() && !drain_missing.is_empty() && now < deadline + drain;
-            // The drain waits for NACK answers: no move for a silence then.
-            session.hold = draining;
-            if now >= deadline && !draining {
-                session.leave(&mut |to, datagram| outbox.push((to, datagram.to_vec())));
-                flush(&socket, &mut outbox).await;
-                break 'caches;
-            }
-            // The playlist read beside the subscription: an error before
-            // the subscription is answered sends the client on, as a read
-            // before it did.
-            if playlist_check
-                .as_ref()
-                .is_some_and(|check| check.is_finished())
-            {
-                let answer = playlist_check.take().expect("finished").await;
-                startup.playlist_ms.get_or_insert(since_start(started));
-                let failure = match answer {
-                    Ok(Ok((StatusCode::OK, _))) => None,
-                    Ok(Ok((status, _))) => Some(format!("playlist answered {status}")),
-                    Ok(Err(error)) => Some(format!("playlist failed: {error:#}")),
-                    Err(error) => Some(format!("playlist read failed: {error}")),
-                };
-                if let (Some(failure), false) = (failure, session.is_subscribed()) {
-                    eprintln!("{}: {failure}", cache.node_id);
-                    skip.insert(cache.node_id.clone(), Instant::now());
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue 'caches;
-                }
-            }
-            // Away from its region: probe the region's entry point, and go
-            // back once it assigns a cache of the region.
-            if left_home_at.is_some_and(|at| at.elapsed() >= HOME_HOLD)
-                && home_probe.is_none()
-                && now >= next_home_probe
-                && !draining
-            {
-                next_home_probe = now + HOME_PROBE_EVERY;
-                let (http, home, args) = (http.clone(), home.clone(), args.clone());
-                home_probe = Some(tokio::spawn(async move {
-                    assignment(&http, &home, &args, None, &BTreeMap::new()).await
-                }));
-            }
-            if home_probe
-                .as_ref()
-                .is_some_and(|probe| probe.is_finished())
-            {
-                let answer = home_probe.take().expect("finished").await;
-                if let Ok(Ok((caches, _, _))) = answer {
-                    if caches.iter().any(|cache| !cache.failover) {
-                        eprintln!("the home region answers: moving back");
-                        entry = home.clone();
-                        left_home_at = None;
-                        skip.clear();
-                        entry_failures = 0;
-                        home_returns += 1;
-                        move_reason = "home-region".to_owned();
-                        continue 'caches;
-                    }
-                }
-            }
-            let fallbacks = session.compact_fallbacks;
-            session.queued =
-                args.nack_after_drain && (pending.is_some() || datagrams_queued(&socket));
-            let failed = session.poll(now, &mut |to, datagram| {
-                outbox.push((to, datagram.to_vec()))
-            });
-            flush(&socket, &mut outbox).await;
-            if session.compact_fallbacks > fallbacks {
-                eprintln!(
-                    "{}: no answer to the compact lane: asking without it",
-                    cache.node_id
-                );
-            }
-            if let Some(reason) = failed {
-                move_reason = reason;
-                skip.insert(cache.node_id.clone(), Instant::now());
-                continue 'caches;
-            }
-            let end = if draining { deadline + drain } else { deadline };
-            let wake = end.min(session.next_wake());
-            let wait = wake.saturating_duration_since(now);
-            let (start, len, peer, kernel_us) = if let Some((next, end, size, peer, kernel)) =
-                pending.take()
-            {
+        let end = if draining { deadline + drain } else { deadline };
+        let wake = end.min(session.next_wake()).min(director.next_wake());
+        let (start, len, peer, kernel_us) =
+            if let Some((next, end, size, peer, kernel)) = pending.take() {
                 let len = size.min(end - next);
                 if next + len < end {
                     pending = Some((next + len, end, size, peer, kernel));
                 }
                 (next, len, peer, kernel)
             } else {
-                match tokio::time::timeout(wait, recv_timestamped(&socket, &mut buf)).await {
-                    Ok(Ok((len, peer, kernel_us, Some(size)))) if size > 0 && size < len => {
-                        pending = Some((size, len, size, peer, kernel_us));
-                        (0, size, peer, kernel_us)
+                tokio::select! {
+                    biased;
+                    received = recv_timestamped(&socket, &mut buf) => match received {
+                        Ok((len, peer, kernel_us, Some(size))) if size > 0 && size < len => {
+                            pending = Some((size, len, size, peer, kernel_us));
+                            (0, size, peer, kernel_us)
+                        }
+                        Ok((len, peer, kernel_us, _)) => (0, len, peer, kernel_us),
+                        Err(_) => continue,
+                    },
+                    Some(done) = done_rx.recv() => {
+                        let now = Instant::now();
+                        let mut legs = Recorded {
+                            session: &mut session,
+                            logs: &mut logs,
+                            nodes: &mut nodes,
+                        };
+                        match done {
+                            Done::Https { id, body } => {
+                                director.on_https(&mut legs, id, body.as_deref(), now, &mut actions)
+                            }
+                            Done::Resolved { host, ip } => {
+                                director.on_resolved(&mut legs, &host, ip, now, &mut actions)
+                            }
+                            Done::Playlist { node, answer } => match answer {
+                                Ok(found) => {
+                                    startup.playlist_ms.get_or_insert(since_start(started));
+                                    extension.get_or_insert(found);
+                                }
+                                Err(failure) => eprintln!("{node}: {failure}"),
+                            },
+                        }
+                        perform(&socket, &mut actions, &http, &done_tx).await;
+                        continue;
                     }
-                    Ok(Ok((len, peer, kernel_us, _))) => (0, len, peer, kernel_us),
-                    Ok(Err(_)) => continue,
-                    Err(_) => continue,
+                    () = tokio::time::sleep_until(wake.into()) => continue,
                 }
             };
-            let dropped = session.short_header_dropped;
-            let outcome =
-                session.on_datagram(peer, &buf[start..start + len], Instant::now(), &mut |to, datagram| {
-                    outbox.push((to, datagram.to_vec()))
-                });
-            flush(&socket, &mut outbox).await;
-            if session.short_header_dropped > dropped {
-                eprintln!(
-                    "{}: the compact lane was refused with the short form: asking with the long form",
-                    cache.node_id
-                );
+        let datagram = &buf[start..start + len];
+        let now = Instant::now();
+        // An assignment, or a token of an entry or of the spare: the
+        // director's.
+        if director.on_datagram(
+            &mut Recorded {
+                session: &mut session,
+                logs: &mut logs,
+                nodes: &mut nodes,
+            },
+            peer,
+            datagram,
+            now,
+            &mut actions,
+        ) {
+            perform(&socket, &mut actions, &http, &done_tx).await;
+            continue;
+        }
+        let outcome = session.on_datagram(peer, datagram, now, &mut |to, datagram| {
+            outbox.push((to, datagram.to_vec()))
+        });
+        flush(&socket, &mut outbox).await;
+        match outcome {
+            Received::Media => {}
+            // The OK that the parts before it waited for: taken now.
+            Received::Subscribed { .. } if session.has_objects() => {}
+            _ => continue,
+        }
+        // The leg whose edge sent it: its last media, and the edge of the
+        // parts it brings first.
+        let leg = leg_at(&director, peer);
+        let mut edge = None;
+        if let Some(log) = leg.and_then(|key| logs.iter_mut().rev().find(|log| log.key == key)) {
+            if outcome == Received::Media {
+                log.last_media = Some(now);
             }
-            match outcome {
-                Received::Media => {}
-                // The OK that the parts before it waited for: taken now.
-                Received::Subscribed { .. } if session.has_objects() => {}
-                Received::Move(reason) => {
-                    move_reason = reason;
-                    skip.insert(cache.node_id.clone(), Instant::now());
-                    continue 'caches;
+            edge = Some(log.edge);
+        }
+        let fast_envelope = session.receiver.last_fast_envelope_bytes;
+        let compact_fast = std::mem::take(&mut session.receiver.last_compact_fast_lane);
+        let arrival_us = now_unix_us();
+        let kernel_us = kernel_us.filter(|kernel| *kernel <= arrival_us);
+        if let Some(kernel) = kernel_us {
+            host_ms.push(arrival_us.saturating_sub(kernel) as f64 / 1_000.0);
+        }
+        while let Some(object) = session.next_object() {
+            let PartObject {
+                kind,
+                part,
+                payload,
+                published_unix_us,
+                available_unix_us,
+                ..
+            } = object;
+            match kind {
+                ObjectKind::Init => init_objects += 1,
+                // Past the end of the run: not taken.
+                ObjectKind::Gap | ObjectKind::Part
+                    if drain_last.is_some_and(|last| part > last) => {}
+                ObjectKind::Gap => {
+                    drain_missing.remove(&part);
+                    gaps.insert(part);
                 }
-                _ => continue,
-            }
-            let fast_envelope = session.receiver.last_fast_envelope_bytes;
-            let compact_fast = std::mem::take(&mut session.receiver.last_compact_fast_lane);
-            let arrival_us = now_unix_us();
-            let kernel_us = kernel_us.filter(|kernel| *kernel <= arrival_us);
-            if let Some(kernel) = kernel_us {
-                host_ms.push(arrival_us.saturating_sub(kernel) as f64 / 1_000.0);
-            }
-            while let Some(object) = session.next_object() {
-                let PartObject {
-                    kind,
-                    part,
-                    payload,
-                    published_unix_us,
-                    available_unix_us,
-                    ..
-                } = object;
-                match kind {
-                    ObjectKind::Init => init_objects += 1,
-                    // Past the end of the run: not taken.
-                    ObjectKind::Gap | ObjectKind::Part
-                        if drain_last.is_some_and(|last| part > last) => {}
-                    ObjectKind::Gap => {
-                        drain_missing.remove(&part);
-                        gaps.insert(part);
+                ObjectKind::Part => {
+                    drain_missing.remove(&part);
+                    if received.contains_key(&part) {
+                        duplicates += 1;
+                        continue;
                     }
-                    ObjectKind::Part => {
-                        drain_missing.remove(&part);
-                        if received.contains_key(&part) {
-                            duplicates += 1;
-                            continue;
+                    // A part that came after its gap (the edge got it
+                    // late) is received, not a gap.
+                    gaps.remove(&part);
+                    if first_part_ms.is_none() {
+                        first_part_ms = Some(since_start(started));
+                        startup.first_part_ms = first_part_ms;
+                        startup.first_part_after_named = session
+                            .first_subscribed_part
+                            .map(|named| part.saturating_sub(named));
+                    }
+                    let at_us = kernel_us.unwrap_or(arrival_us);
+                    if let Some(last) = last_first_us {
+                        let gap = at_us.saturating_sub(last);
+                        longest_silence_us = longest_silence_us.max(gap);
+                        if gap >= INTERRUPTION.as_micros() as u64 {
+                            interruptions += 1;
                         }
-                        // A part that came after its gap (the edge got it
-                        // late) is received, not a gap.
-                        gaps.remove(&part);
-                        if first_part_ms.is_none() {
-                            first_part_ms = Some(since_start(started));
-                            startup.first_part_ms = first_part_ms;
-                            startup.first_part_after_named = session
-                                .first_subscribed_part
-                                .map(|named| part.saturating_sub(named));
+                    }
+                    last_first_us = Some(last_first_us.map_or(at_us, |last| last.max(at_us)));
+                    if lag_due.len() == lag_due.capacity() {
+                        lag_due.pop_front();
+                    }
+                    lag_due.push_back(part);
+                    match fast_envelope {
+                        Some(envelope) => {
+                            fast_lane_parts += 1;
+                            fast_envelope_bytes.push(envelope as f64);
+                            fast_envelope_overhead
+                                .push(envelope.saturating_sub(payload.len()) as f64);
                         }
-                        match fast_envelope {
-                            Some(envelope) => {
-                                fast_lane_parts += 1;
-                                fast_envelope_bytes.push(envelope as f64);
-                                fast_envelope_overhead
-                                    .push(envelope.saturating_sub(payload.len()) as f64);
-                            }
-                            // A compact datagram of the edge's fast lane.
-                            None if compact_fast.contains(&part) => {
-                                fast_lane_parts += 1;
-                                compact_fast_lane_parts += 1;
-                            }
-                            None => cache_lane_parts += 1,
+                        // A compact datagram of the edge's fast lane.
+                        None if compact_fast.contains(&part) => {
+                            fast_lane_parts += 1;
+                            compact_fast_lane_parts += 1;
                         }
-                        received.insert(part, payload.len());
-                        payload_bytes += payload.len() as u64;
-                        if published_unix_us > 0 {
-                            first_published_us =
-                                Some(first_published_us.map_or(published_unix_us, |first| {
-                                    first.min(published_unix_us)
-                                }));
-                            last_published_us = Some(
-                                last_published_us
-                                    .map_or(published_unix_us, |last| last.max(published_unix_us)),
-                            );
-                            publish_ms.push(
-                                arrival_us.saturating_sub(published_unix_us) as f64 / 1_000.0,
-                            );
-                        }
-                        if available_unix_us > 0 {
-                            available_ms.push(
-                                arrival_us.saturating_sub(available_unix_us) as f64 / 1_000.0,
-                            );
-                        }
-                        if args.arrivals.is_some() {
-                            arrivals.insert(
-                                part,
-                                (
-                                    arrival_us,
-                                    payload.len(),
-                                    published_unix_us,
-                                    available_unix_us,
-                                    kernel_us.unwrap_or(0),
-                                ),
-                            );
-                        }
-                        if parts_out.is_some() {
-                            written_parts.insert(part, payload.clone());
-                        }
-                        if args.verify_http {
-                            let _ = verify_tx.send(VerifyJob {
-                                authority: cache.base.authority.clone(),
-                                path: format!(
-                                    "{}/{}/part{part}.{extension}",
-                                    cache.base.path, args.stream
-                                ),
+                        None => cache_lane_parts += 1,
+                    }
+                    received.insert(part, payload.len());
+                    payload_bytes += payload.len() as u64;
+                    if published_unix_us > 0 {
+                        first_published_us = Some(
+                            first_published_us
+                                .map_or(published_unix_us, |first| first.min(published_unix_us)),
+                        );
+                        last_published_us = Some(
+                            last_published_us
+                                .map_or(published_unix_us, |last| last.max(published_unix_us)),
+                        );
+                        publish_ms
+                            .push(arrival_us.saturating_sub(published_unix_us) as f64 / 1_000.0);
+                    }
+                    if available_unix_us > 0 {
+                        available_ms
+                            .push(arrival_us.saturating_sub(available_unix_us) as f64 / 1_000.0);
+                    }
+                    if args.arrivals.is_some() {
+                        arrivals.insert(
+                            part,
+                            Arrival {
+                                arrival_us,
+                                bytes: payload.len(),
+                                published_us: published_unix_us,
+                                available_us: available_unix_us,
+                                kernel_us: kernel_us.unwrap_or(0),
+                                edge,
+                            },
+                        );
+                    }
+                    if parts_out.is_some() {
+                        written_parts.insert(part, payload.clone());
+                    }
+                    if args.verify_http {
+                        if let Some(node) = edge.map(|index| nodes[index].clone()) {
+                            verify_waiting.push(VerifyWaiting {
+                                node,
                                 part,
                                 payload,
                             });
@@ -1560,33 +1670,66 @@ async fn main() -> Result<()> {
                 }
             }
         }
-    }
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    let _ = session
-        .receiver
-        .take_loss(av_mesh::client_compact::LegId::FIRST, session.repair());
-    let since = |at: Option<Instant>| {
-        at.map(|at| at.saturating_duration_since(started).as_secs_f64() * 1_000.0)
+        // Each leg's lag on the parts that every leg has had time to bring.
+        if let Some(newest) = session.receiver.compact.newest() {
+            while let Some(&part) = lag_due.front() {
+                if newest < part + LAG_SETTLE_PARTS {
+                    break;
+                }
+                lag_due.pop_front();
+                if newest >= part + LAG_FORGET_PARTS {
+                    continue;
+                }
+                for leg in director.legs() {
+                    if let Some(lag) = session.leg_lag_of(leg.key, part) {
+                        if let Some(log) = logs.iter_mut().rev().find(|log| log.key == leg.key) {
+                            log.lags.record(lag);
+                        }
+                    }
+                }
+            }
+        }
+        // Parts to verify, once the parts' extension is known.
+        if let Some(extension) = &extension {
+            for waiting in verify_waiting.drain(..) {
+                if let Some(url) = director
+                    .cache_url(&waiting.node)
+                    .and_then(|url| Url::parse(url).ok())
+                {
+                    let _ = verify_tx.send(VerifyJob {
+                        path: format!(
+                            "{}/{}/part{}.{extension}",
+                            url.path, args.stream, waiting.part
+                        ),
+                        authority: url.authority,
+                        part: waiting.part,
+                        payload: waiting.payload,
+                    });
+                }
+            }
+        }
     };
+    // The second UNSUB of each leg let go goes 20 ms after the first.
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    session.poll_legs(Instant::now(), &mut |to, datagram| {
+        outbox.push((to, datagram.to_vec()))
+    });
+    flush(&socket, &mut outbox).await;
+    single_path.close(Instant::now());
+    let since = |at: Option<Instant>| at.map(|at| ms_of(at.saturating_duration_since(started)));
     startup.token_ms = since(session.first_token_at);
     startup.subscribed_ms = since(session.first_subscribed_at);
+    if let Some((at, via)) = director.first_answer {
+        startup.assignment_ms = since(Some(at));
+        startup.assignment_via = Some(via.name());
+    }
     let receiver = &session.receiver;
-    let repair = session.repair();
-    let plan = session.plan();
-    let compact_asked = session.compact_asked();
     drop(verify_tx);
     let verify = verifier.await.ok();
 
     if let Some(path) = &args.arrivals {
-        let mut text = String::from(
-            "part,arrival_unix_us,bytes,published_unix_us,available_unix_us,kernel_unix_us\n",
-        );
-        for (part, (arrival, bytes, published, available, kernel)) in &arrivals {
-            text.push_str(&format!(
-                "{part},{arrival},{bytes},{published},{available},{kernel}\n"
-            ));
-        }
-        std::fs::write(path, text).with_context(|| format!("write {}", path.display()))?;
+        std::fs::write(path, arrivals_csv(&arrivals, &nodes))
+            .with_context(|| format!("write {}", path.display()))?;
     }
     if let Some(file) = parts_out.as_mut() {
         use std::io::Write;
@@ -1595,14 +1738,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Missing parts are counted from the part that the first edge said it
-    // would send first.
-    let first = received
-        .keys()
-        .chain(gaps.iter())
-        .chain(session.first_subscribed_part.iter())
-        .min()
-        .copied();
+    // Missing parts are counted from the session's floor: its first part
+    // delivered (B 3.1).
+    let first = received.keys().chain(gaps.iter()).min().copied();
     let last = received.keys().chain(gaps.iter()).max().copied();
     let expected = match (first, last) {
         (Some(first), Some(last)) => last - first + 1,
@@ -1619,13 +1757,20 @@ async fn main() -> Result<()> {
         _ => None,
     };
     let stats = receiver.compact.stats;
+    let legs = leg_figures(&logs);
+    let nack_rtt_ms = legs
+        .values()
+        .filter_map(|figures| figures.rtt_ms)
+        .min_by(f64::total_cmp);
+    let (replacements, moves) = replacement_records(&director.replacements, &logs, started);
+    let at_ms = |at: Instant| at.saturating_duration_since(started).as_millis() as u64;
     let report = Report {
-        schema: "needletail.udp-client.v1",
+        schema: "needletail.udp-client.v2",
         stream_id: args.stream,
         duration_seconds: args.duration_seconds,
-        caches: caches_used,
+        caches: logs.iter().map(|log| log.node.clone()).collect(),
         moves,
-        home_returns,
+        home_returns: director.stats.home_returns,
         first_part: first,
         last_part: last,
         expected_parts: expected,
@@ -1659,19 +1804,13 @@ async fn main() -> Result<()> {
         compact_asked,
         compact_fallbacks: session.compact_fallbacks,
         compact_short_header_dropped: session.short_header_dropped,
+        nack_rtt_ms,
         nack_timing: format!(
             "delay {} us, retry floor {} us, silence {}",
             args.nack_delay_us, args.nack_retry_floor_us, args.silence_nack
         ),
-        part_interval_ms: receiver
-            .compact
-            .part_interval()
-            .map(|interval| interval.as_secs_f64() * 1_000.0),
-        nack_rtt_ms: receiver
-            .compact
-            .leg_rtt(av_mesh::client_compact::LegId::FIRST)
-            .map(|rtt| rtt.as_secs_f64() * 1_000.0),
-        compact_confirmed: session.compact_confirmed(),
+        part_interval_ms: receiver.compact.part_interval().map(ms_of),
+        compact_confirmed,
         final_compact_plan: compact_asked.then(|| plan.word()),
         compact_plan_changes: session.plan_changes,
         burst_estimate_max: session.burst_max,
@@ -1701,6 +1840,27 @@ async fn main() -> Result<()> {
         available_to_arrival_ms: percentiles(available_ms),
         time_to_first_part_ms: first_part_ms,
         startup,
+        paths: args.paths,
+        spare: spare_at_end,
+        cpu_seconds: cpu_seconds(),
+        legs,
+        replacements,
+        single_path_ms: ms_of(single_path.total),
+        single_path_spans: single_path
+            .spans
+            .iter()
+            .map(|(from, to)| [at_ms(*from), at_ms(*to)])
+            .collect(),
+        hedges: director.stats.hedges,
+        hedges_released: director.stats.hedges_released,
+        longest_silence_ms: longest_silence_us as f64 / 1_000.0,
+        interruptions,
+        wire_bytes_per_part: (!received.is_empty())
+            .then(|| receiver.wire_bytes as f64 / received.len() as f64),
+        before_start: stats.before_start,
+        stale_start: session.stale_starts,
+        cross_leg_mismatch: stats.cross_leg_mismatch,
+        short_grants: director.stats.short_grants.into(),
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
@@ -1709,17 +1869,282 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use av_mesh::client_udp::{AssignedCache, Control};
+    use av_mesh::client_compact::{CompactPlan, LegStats};
+
+    /// The referee's probe (needletail-compare's change steps): this
+    /// command line must keep working unchanged.
+    const PROBE: [&str; 17] = [
+        "needletail-udp-client",
+        "--entry",
+        "https://lon-dist-a:19444",
+        "--stream",
+        "3001",
+        "--tls-ca",
+        "/ca.pem",
+        "--server-name",
+        "mesh.needletail.test",
+        "--duration-seconds",
+        "360",
+        "--session",
+        "probe-lon-1",
+        "--arrivals",
+        "/out/arrivals.csv",
+        "--write-parts",
+        "/out/parts.bin",
+    ];
 
     /// C CR3: every binary of the crate names the build it came from
     /// (`--version`).
     #[test]
     fn the_version_names_the_build() {
         use clap::CommandFactory;
+        assert_eq!(Args::command().get_version(), Some(av_mesh::build::VERSION));
+    }
+
+    /// B 2.4: entry points by a repeated flag or a list, and the probe's
+    /// command line of before, which takes the two-path defaults.
+    #[test]
+    fn two_entries_parse() {
+        let args = Args::try_parse_from([
+            "needletail-udp-client",
+            "--entry",
+            "https://lon-dist-a:19444,https://lon-dist-b:19444",
+            "--entry",
+            "https://lon-dist-c:19444",
+            "--stream",
+            "3001",
+            "--tls-ca",
+            "/ca.pem",
+        ])
+        .unwrap();
         assert_eq!(
-            Args::command().get_version(),
-            Some(av_mesh::build::VERSION)
+            args.entry,
+            [
+                "https://lon-dist-a:19444",
+                "https://lon-dist-b:19444",
+                "https://lon-dist-c:19444"
+            ]
         );
+        assert!(
+            Args::try_parse_from(["needletail-udp-client", "--stream", "1", "--tls-ca", "/c"])
+                .is_err()
+        );
+        let args = Args::try_parse_from(PROBE).unwrap();
+        assert_eq!(args.entry, ["https://lon-dist-a:19444"]);
+        assert_eq!(args.session, "probe-lon-1");
+        assert_eq!(args.duration_seconds, 360);
+        assert_eq!(args.server_name.as_deref(), Some("mesh.needletail.test"));
+        assert_eq!(args.arrivals, Some(PathBuf::from("/out/arrivals.csv")));
+        assert_eq!(args.write_parts, Some(PathBuf::from("/out/parts.bin")));
+        // The defaults of B 2.4, on the director and the session.
+        let director = args.director_config(7);
+        assert_eq!((director.paths, director.spare), (2, true));
+        assert_eq!(director.token_wait, Duration::from_millis(400));
+        assert_eq!(director.rebalance_giveup, Duration::from_millis(3_000));
+        assert_eq!(director.level_wait, Duration::from_millis(1_000));
+        assert_eq!(director.entries, ["https://lon-dist-a:19444"]);
+        let session = args.session_config();
+        assert_eq!(session.silence, Duration::from_millis(200));
+        assert_eq!(session.answer, Duration::from_millis(5_000));
+        assert_eq!(session.hedge_after, Duration::from_millis(50));
+        assert_eq!(session.lone_hedge_after, Duration::from_millis(170));
+        assert_eq!(session.first_double, Duration::from_millis(3));
+        assert_eq!(session.hole_give_up, Duration::from_millis(3_000));
+        assert!((session.residual_target - 0.008).abs() < 1e-12);
+        // The controls the referee names: one path, and the residual.
+        let control = Args::try_parse_from(PROBE.into_iter().chain([
+            "--paths",
+            "1",
+            "--spare",
+            "false",
+            "--compact-residual-ppm",
+            "2000",
+        ]))
+        .unwrap();
+        let director = control.director_config(7);
+        assert_eq!((director.paths, director.spare), (1, false));
+        assert!((control.session_config().residual_target - 0.002).abs() < 1e-12);
+    }
+
+    fn report(node: &str, datagrams: u64, first: u64) -> LegReport {
+        LegReport {
+            node: node.into(),
+            target: "10.0.1.1:19446".parse().unwrap(),
+            first_part: Some(first),
+            compact: true,
+            rtt: Some(Duration::from_micros(1_500)),
+            lag: Some(Duration::from_micros(100)),
+            loss: Some(0.01),
+            plan: CompactPlan::CLEAN,
+            datagrams,
+            wire_bytes: datagrams * 91,
+            longest_gap: Duration::from_millis(12),
+            stats: LegStats {
+                datagrams,
+                parts_first: datagrams / 2,
+                duplicates: datagrams / 2,
+                before_start: 1,
+            },
+        }
+    }
+
+    /// B 2.8: the report names each leg (by edge, with its lag median and
+    /// p99 and its longest gap), each replacement with its kind and times,
+    /// the time on one path, the wire bytes a part and the short grants.
+    #[test]
+    fn the_report_names_each_leg_and_the_time_on_one_path() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let log = |key: u32, node: &str, added: u64, lags_us: &[u64], report: LegReport| {
+            let mut lags = LagHistogram::new();
+            for lag in lags_us {
+                lags.record(Duration::from_micros(*lag));
+            }
+            LegLog {
+                key: LegKey(key),
+                node: node.into(),
+                edge: key as usize,
+                added: ms(added),
+                last_media: None,
+                lags,
+                report: Some(report),
+            }
+        };
+        // e1 first on 99 parts and 1 ms behind on one; e2 always behind.
+        let mut e1_lags = vec![0; 99];
+        e1_lags.push(1_000);
+        let logs = vec![
+            log(0, "e1", 0, &e1_lags, report("e1", 1_000, 100)),
+            log(1, "e2", 0, &[300; 100], report("e2", 1_000, 101)),
+            log(2, "e3", 4_000, &[200; 10], report("e3", 400, 4_100)),
+        ];
+        let figures = leg_figures(&logs);
+        assert_eq!(figures.keys().collect::<Vec<_>>(), ["e1", "e2", "e3"]);
+        let e1 = &figures["e1"];
+        assert_eq!(
+            (e1.legs, e1.first_part, e1.datagrams),
+            (1, Some(100), 1_000)
+        );
+        assert_eq!(e1.lag_ms.median, Some(0.01));
+        assert_eq!(e1.lag_ms.p99, Some(0.01));
+        assert_eq!(figures["e2"].lag_ms.p99, Some(0.31));
+        assert_eq!(figures["e1"].longest_gap_ms, 12.0);
+        let replacements = vec![
+            Replacement {
+                at: ms(3_950),
+                from: "e2".into(),
+                to: "e3".into(),
+                reason: "silence".into(),
+                kind: ReplacementKind::Hedge,
+                handover: None,
+                exposure: Some(Duration::from_millis(62)),
+            },
+            Replacement {
+                at: ms(9_000),
+                from: "e1".into(),
+                to: "e1".into(),
+                reason: "rebalance".into(),
+                kind: ReplacementKind::Takeback,
+                handover: None,
+                exposure: None,
+            },
+        ];
+        let (records, moves) = replacement_records(&replacements, &logs, t0);
+        let json = serde_json::to_value(&records).unwrap();
+        assert_eq!(json[0]["kind"], "hedge");
+        assert_eq!(json[0]["exposure_ms"], 62.0);
+        assert!(json[0].get("handover_ms").is_none());
+        assert_eq!(json[1]["kind"], "takeback");
+        // v1's moves: one per leg replaced, take-backs left out.
+        assert_eq!(moves.len(), 1);
+        assert_eq!((moves[0].at_ms, moves[0].next_part), (3_950, None));
+        let mut path = SinglePath::default();
+        let window = Duration::from_millis(20);
+        path.observe(ms(100), window, [ms(100), ms(100)], true);
+        path.observe(ms(3_960), window, [ms(3_960), ms(3_900)], true);
+        path.observe(ms(3_982), window, [ms(3_982), ms(3_900), ms(3_982)], true);
+        assert_eq!(path.spans, [(ms(3_920), ms(3_982))]);
+        let counts = ShortGrantCounts::from(ShortGrants {
+            one_edge: 1,
+            bitrate: 0,
+            gate: 2,
+            unexplained: 0,
+        });
+        let json = serde_json::to_value(&counts).unwrap();
+        assert_eq!(json["one-edge"], 1);
+        assert_eq!(json["gate"], 2);
+        let figures = serde_json::to_value(&figures).unwrap();
+        for key in [
+            "first_part",
+            "parts_first",
+            "duplicates",
+            "datagrams",
+            "wire_bytes",
+            "loss",
+            "rtt_ms",
+            "lag_ms",
+            "longest_gap_ms",
+            "plan",
+        ] {
+            assert!(figures["e1"].get(key).is_some(), "{key}");
+        }
+    }
+
+    /// B 2.8: the arrivals file keeps v1's six columns first and adds the
+    /// edge of each first arrival. The referee's `ntcmp udp-ingest`
+    /// (needletail-compare/tools/ntcmp/udp.go) skips the first line, splits
+    /// each other line at commas and reads fields 0 to 2 by position (part,
+    /// arrival, bytes) for lines with three or more; the lab's scripts read
+    /// columns by name. A seventh column breaks neither.
+    #[test]
+    fn the_arrivals_file_keeps_the_referees_columns_first() {
+        let mut arrivals = BTreeMap::new();
+        for (part, edge) in [(100_u64, Some(1)), (101, Some(0)), (102, None)] {
+            arrivals.insert(
+                part,
+                Arrival {
+                    arrival_us: 1_000 + part,
+                    bytes: 56,
+                    published_us: 900 + part,
+                    available_us: 950 + part,
+                    kernel_us: 999 + part,
+                    edge,
+                },
+            );
+        }
+        let nodes = vec!["lon-edge-1".to_owned(), "lon-edge-2".to_owned()];
+        let text = arrivals_csv(&arrivals, &nodes);
+        let lines: Vec<&str> = text.trim().split('\n').collect();
+        assert_eq!(
+            lines[0],
+            "part,arrival_unix_us,bytes,published_unix_us,available_unix_us,kernel_unix_us,edge"
+        );
+        assert_eq!(lines[1], "100,1100,56,1000,1050,1099,lon-edge-2");
+        assert_eq!(lines[3], "102,1102,56,1002,1052,1101,");
+        // As ntcmp reads it.
+        for (line, part) in lines[1..].iter().zip([100_i64, 101, 102]) {
+            let fields: Vec<&str> = line.split(',').collect();
+            assert!(fields.len() >= 3);
+            assert_eq!(fields[0].parse::<i64>().unwrap(), part);
+            assert_eq!(fields[1].parse::<i64>().unwrap(), 1_000 + part);
+            assert_eq!(fields[2].parse::<i64>().unwrap(), 56);
+        }
+    }
+
+    /// The lag histogram's quantiles are bucket edges; past the last
+    /// bucket, the maximum.
+    #[test]
+    fn a_legs_lag_percentiles_come_from_every_part_it_brought() {
+        let mut lags = LagHistogram::new();
+        assert_eq!(lags.quantile_ms(0.99), None);
+        for _ in 0..98 {
+            lags.record(Duration::from_micros(5));
+        }
+        lags.record(Duration::from_micros(2_345));
+        lags.record(Duration::from_millis(250));
+        assert_eq!(lags.quantile_ms(0.5), Some(0.01));
+        assert_eq!(lags.quantile_ms(0.99), Some(2.35));
+        assert_eq!(lags.quantile_ms(1.0), Some(250.0));
     }
 
     /// Wave 9 D: with UDP GRO a sender's GSO run comes as one receive that
@@ -1789,139 +2214,14 @@ mod tests {
         }
     }
 
-    /// Wave 9 B: the assignment over UDP is repeated after 25 ms and then
-    /// twice as long each time until answered; an answer to another request
-    /// (its nonce) is not taken; a node with no client UDP port fails it at
-    /// once (so HTTPS starts without waiting).
-    #[tokio::test]
-    async fn the_udp_assignment_is_repeated_until_answered() {
-        let node = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let port = node.local_addr().unwrap().port();
-        let args = Args::parse_from([
-            "needletail-udp-client",
-            "--entry",
-            "https://127.0.0.1:19444",
-            "--stream",
-            "3001",
-            "--tls-ca",
-            "/nonexistent",
-            "--session",
-            "s-1",
-            "--assignment-udp-port",
-            &port.to_string(),
-        ]);
-        let server = tokio::spawn(async move {
-            let mut buf = vec![0_u8; 2_048];
-            let mut seen = Vec::new();
-            loop {
-                let (len, peer) = node.recv_from(&mut buf).await.unwrap();
-                seen.push(Instant::now());
-                let Some(Control::Assign { nonce, session, .. }) = Control::decode(&buf[..len])
-                else {
-                    panic!("not an ASSIGN");
-                };
-                assert_eq!(session, "s-1");
-                assert!(len >= av_mesh::client_udp::ASSIGN_REQUEST_BYTES);
-                // The first two are lost; the third is answered, first as
-                // if to another request.
-                if seen.len() < 3 {
-                    continue;
-                }
-                let answer = |nonce| Control::Assigned {
-                    stream_id: 3001,
-                    nonce,
-                    port: Some(19_446),
-                    caches: vec![AssignedCache {
-                        node_id: "lon-edge-2".into(),
-                        playback_base_url: "https://127.0.0.1:19444/live".into(),
-                        failover: false,
-                    }],
-                    paths: 1,
-                    spare: false,
-                };
-                // The node's token, then the answers.
-                let token = Control::Token {
-                    stream_id: 3001,
-                    token: 0xabc,
-                };
-                node.send_to(&token.encode(), peer).await.unwrap();
-                node.send_to(&answer(nonce ^ 1).encode(), peer).await.unwrap();
-                node.send_to(&answer(nonce).encode(), peer).await.unwrap();
-                // Wave 9 review: the client confirms the cache it took with
-                // the token, unpadded.
-                let (len, _) = node.recv_from(&mut buf).await.unwrap();
-                assert!(len < 200, "{len}");
-                match Control::decode(&buf[..len]) {
-                    Some(Control::Assign {
-                        token, current, ..
-                    }) => {
-                        assert_eq!(token, Some(0xabc));
-                        assert_eq!(current, ["lon-edge-2"]);
-                    }
-                    other => panic!("{other:?}"),
-                }
-                return seen;
-            }
-        });
-        let started = Instant::now();
-        let (caches, udp_port, via) = udp_assignment(&args.entry, &args, None, &BTreeMap::new())
-            .await
-            .unwrap();
-        assert_eq!(via, "udp");
-        assert_eq!(udp_port, Some(19_446));
-        assert_eq!(caches[0].node_id, "lon-edge-2");
-        let seen = server.await.unwrap();
-        let gaps: Vec<u128> = seen
-            .windows(2)
-            .map(|pair| pair[1].duration_since(pair[0]).as_millis())
-            .collect();
-        assert!((24..60).contains(&gaps[0]), "{gaps:?}");
-        assert!((49..100).contains(&gaps[1]), "{gaps:?}");
-        assert!(started.elapsed() < Duration::from_millis(250));
-        // No client UDP port there: an error at once (ICMP port
-        // unreachable), not a wait.
-        let closed = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let closed_port = closed.local_addr().unwrap().port();
-        drop(closed);
-        let args = Args::parse_from([
-            "needletail-udp-client",
-            "--entry",
-            "https://127.0.0.1:19444",
-            "--stream",
-            "3001",
-            "--tls-ca",
-            "/nonexistent",
-            "--assignment-udp-port",
-            &closed_port.to_string(),
-        ]);
-        let started = Instant::now();
-        let failed = tokio::time::timeout(
-            Duration::from_secs(2),
-            udp_assignment(&args.entry, &args, None, &BTreeMap::new()),
-        )
-        .await
-        .expect("an answer, not a wait");
-        assert!(failed.is_err());
-        assert!(started.elapsed() < Duration::from_millis(100));
-    }
-
-    /// Wave 7 item 8: the playlist is read beside the subscription by
-    /// default; --playlist-first true reads it first, as before.
+    /// The playlist is not read unless asked: the legs are judged by the
+    /// UDP lane alone (B 2.4).
     #[test]
-    fn the_playlist_is_read_beside_the_subscription_unless_asked_first() {
-        let base = [
-            "needletail-udp-client",
-            "--entry",
-            "https://edge:19444",
-            "--stream",
-            "3001",
-            "--tls-ca",
-            "/ca.pem",
-        ];
-        let args = Args::try_parse_from(base).unwrap();
-        assert!(!args.playlist_first);
+    fn the_playlist_is_read_only_when_asked() {
+        let args = Args::try_parse_from(PROBE).unwrap();
+        assert!(!args.playlist_first && !args.verify_http);
         let args =
-            Args::try_parse_from(base.into_iter().chain(["--playlist-first", "true"])).unwrap();
+            Args::try_parse_from(PROBE.into_iter().chain(["--playlist-first", "true"])).unwrap();
         assert!(args.playlist_first);
     }
 

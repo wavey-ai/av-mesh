@@ -35,7 +35,7 @@
 //! rebalance target with it, and never spills. The spare is a cache that
 //! holds the playlist, with no load gate: it carries nothing until a hedge.
 
-use av_mesh::client_udp::MAX_PATHS;
+use av_mesh::client_udp::{ShortGrant, MAX_PATHS};
 use serde::Serialize;
 
 /// Load at or above this, in thousandths of the limit of the cache, means the
@@ -267,6 +267,9 @@ pub struct Assignment {
     pub legs: u8,
     /// The cache after the legs is the spare.
     pub spare: bool,
+    /// Why fewer legs than asked were granted (B Y2, the lead's decision):
+    /// `why=` of `ASSIGNED`, `"why"` of `/api/assignment`.
+    pub short: Option<ShortGrant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -318,6 +321,7 @@ pub fn assign(
             pinned: true,
             legs: 1,
             spare: false,
+            short: None,
         });
     }
 
@@ -573,6 +577,22 @@ pub fn assign(
         caches.push(assigned(cache, AssignmentReason::SecondPath));
     }
     let legs = u8::try_from(caches.len()).unwrap_or(MAX_PATHS);
+    // Why fewer legs than asked: the bit rate, else no other edge of the
+    // region that serves at all, else none through the gate.
+    let short = if wanted < request.paths.min(MAX_PATHS) {
+        Some(ShortGrant::Bitrate)
+    } else if legs < wanted {
+        let other = regional
+            .iter()
+            .any(|cache| healthy(cache) && !caches.iter().any(|leg| leg.node_id == cache.node_id));
+        Some(if other {
+            ShortGrant::Gate
+        } else {
+            ShortGrant::OneEdge
+        })
+    } else {
+        None
+    };
     if rebalancing && legs == 0 && wanted > 0 {
         // No receiver under the level: no cache of the region is named.
         // A request for a spare alone is answered as any.
@@ -650,6 +670,7 @@ pub fn assign(
         pinned: false,
         legs,
         spare,
+        short,
     })
 }
 
@@ -730,6 +751,8 @@ pub fn assign_udp_in_region(
         pinned: false,
         legs: 1,
         spare: false,
+        // A spill: no cache took a redundant leg either.
+        short: (request.paths > 1).then_some(ShortGrant::Gate),
     })
 }
 
@@ -1317,6 +1340,41 @@ mod tests {
         assert!(assignment.caches[1..]
             .iter()
             .all(|cache| cache.reason == AssignmentReason::Alternate));
+    }
+
+    /// B Y2 (the lead's decision): an answer that grants fewer legs than
+    /// asked names why: no other edge serves, the bit rate, or the gate.
+    #[test]
+    fn a_short_grant_names_its_reason() {
+        let two = |session| AssignmentRequest {
+            paths: 2,
+            spare: true,
+            ..request(session)
+        };
+        let policy = AssignmentPolicy::default();
+        let alone = [
+            cache("edge-1", 100, Some(9)),
+            CacheCandidate {
+                draining: true,
+                ..cache("edge-2", 100, Some(9))
+            },
+        ];
+        let short = |request, caches: &[CacheCandidate]| {
+            let assignment = assign(request, policy, caches).unwrap();
+            (assignment.legs, assignment.short)
+        };
+        assert_eq!(short(two("a"), &alone), (1, Some(ShortGrant::OneEdge)));
+        let video = AssignmentRequest {
+            playlist_bps: Some(DEFAULT_TWO_PATH_MAX_BPS + 1),
+            ..two("b")
+        };
+        let pair = [cache("edge-1", 100, Some(9)), cache("edge-2", 100, Some(9))];
+        assert_eq!(short(video, &pair), (1, Some(ShortGrant::Bitrate)));
+        let full = [cache("edge-1", 100, Some(9)), cache("edge-2", 850, Some(9))];
+        assert_eq!(short(two("c"), &full), (1, Some(ShortGrant::Gate)));
+        // Two legs granted, or one asked: no reason.
+        assert_eq!(short(two("d"), &pair), (2, None));
+        assert_eq!(short(request("e"), &pair), (1, None));
     }
 
     /// B 3.6: a rebalanced listener goes only to a receiver that stays

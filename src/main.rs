@@ -20077,6 +20077,17 @@ struct RebalanceConfig {
     to_mean: bool,
 }
 
+/// The answer to a UDP `ASSIGN` ([`AppRouter::udp_assignment`]): the
+/// fields of `ASSIGNED`.
+#[derive(Debug)]
+pub(crate) struct UdpAssignment {
+    pub(crate) port: Option<u16>,
+    pub(crate) caches: Vec<av_mesh::client_udp::AssignedCache>,
+    pub(crate) legs: u8,
+    pub(crate) spare: bool,
+    pub(crate) why: Option<av_mesh::client_udp::ShortGrant>,
+}
+
 /// A request that the entry point answers for a reader.
 #[derive(Debug, Clone, Copy)]
 struct ReaderRequest<'a> {
@@ -22660,8 +22671,9 @@ impl AppRouter {
     /// the client's confirmation does that
     /// ([`Self::confirm_udp_assignment`]).
     ///
-    /// Also returns the legs granted and whether the cache after them is
-    /// the spare (`p=`, `s=` of `ASSIGNED`, B 2.1).
+    /// Also returns the legs granted, whether the cache after them is the
+    /// spare (`p=`, `s=` of `ASSIGNED`, B 2.1), and why fewer legs than
+    /// asked were granted (`why=`, B Y2).
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn udp_assignment(
         &self,
@@ -22672,7 +22684,7 @@ impl AppRouter {
         hold: &[String],
         paths: u8,
         spare: bool,
-    ) -> (Option<u16>, Vec<av_mesh::client_udp::AssignedCache>, u8, bool) {
+    ) -> UdpAssignment {
         let (assignment, _, assigned) = self
             .client_assignment(
                 ReaderRequest {
@@ -22689,9 +22701,9 @@ impl AppRouter {
                 false,
             )
             .await;
-        let (legs, spare) = assignment
-            .as_ref()
-            .map_or((0, false), |assignment| (assignment.legs, assignment.spare));
+        let (legs, spare, why) = assignment.as_ref().map_or((0, false, None), |assignment| {
+            (assignment.legs, assignment.spare, assignment.short)
+        });
         let caches = assigned
             .as_array()
             .map(|list| {
@@ -22706,7 +22718,13 @@ impl AppRouter {
                     .collect()
             })
             .unwrap_or_default();
-        (self.client_udp_port, caches, legs, spare)
+        UdpAssignment {
+            port: self.client_udp_port,
+            caches,
+            legs,
+            spare,
+            why,
+        }
     }
 
     async fn assignment_api_response(
@@ -22856,6 +22874,12 @@ impl AppRouter {
             .filter(|assignment| assignment.spare)
             .and_then(|assignment| assignment.caches.get(usize::from(assignment.legs)))
             .map(|cache| cache.node_id.clone())
+            .into();
+        // B Y2: why fewer legs than asked were granted.
+        body["why"] = assignment
+            .as_ref()
+            .and_then(|assignment| assignment.short)
+            .map(|why| why.word())
             .into();
         body["failover_entries"] = serde_json::Value::Array(failover_entries);
         // AM 12, 13: the forwarder's lease children and cache-mesh children.
@@ -37847,6 +37871,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(api["paths"], 1, "{api:#}");
+        assert_eq!(api["why"], "bitrate", "B Y2: the reason of a short grant");
         assert_eq!(api["assigned"][1]["reason"], "spare");
         assert_eq!(api["spare"], api["assigned"][1]["node_id"]);
         // A listener that holds a leg of it is granted none more (B 3.9;
@@ -37861,6 +37886,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(api["paths"], 0, "{api:#}");
+        assert_eq!(api["why"], "bitrate");
         let (edge, _shutdown) =
             start_edge_udp_for_tests(&router, edge_udp::EdgeUdpConfig::with_defaults(1_200, 16))
                 .await;
@@ -37873,6 +37899,7 @@ mod tests {
                 Control::Assigned {
                     paths: 1,
                     spare: true,
+                    why: Some(av_mesh::client_udp::ShortGrant::Bitrate),
                     ..
                 }
             ),
@@ -37886,6 +37913,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(api["paths"], 2, "{api:#}");
+        assert!(api["why"].is_null(), "a full grant gives no reason");
         mesh.shutdown();
     }
 

@@ -697,6 +697,14 @@ impl UdpSession {
         })
     }
 
+    /// Leg `key`'s lag behind the first arrival of `part`, while the part
+    /// is among the last 64 parts (see
+    /// [`crate::client_compact::CompactReceiver::leg_lag_of`]).
+    pub fn leg_lag_of(&self, key: LegKey, part: u64) -> Option<Duration> {
+        let leg = self.by_key(key)?;
+        self.receiver.compact.leg_lag_of(leg.id, part)
+    }
+
     /// The plan a new leg starts on: beside another leg `C0.32.0`; alone,
     /// the plan for an unmeasured path (B X3).
     fn start_plan(&self, beside: bool) -> CompactPlan {
