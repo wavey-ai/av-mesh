@@ -3123,6 +3123,20 @@ struct Args {
     #[arg(long, env = "NEEDLETAIL_HTTP_WORKER_THREADS", default_value_t = 0)]
     http_worker_threads: usize,
 
+    /// The kernel's time slice, µs, for the threads that serve readers
+    /// (Linux 6.12 and later; 0 keeps the kernel's own, 1.5 ms on two
+    /// CPUs). Their share of a full processor stays that of their nice
+    /// value, below the media's; a short slice lets a small response that a
+    /// commit wakes run at once rather than after the slice of a thread
+    /// busy with large work, and cuts a thread that sends a large response
+    /// into short turns.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_READER_SLICE_US",
+        default_value_t = DEFAULT_READER_SLICE_US
+    )]
+    reader_slice_us: u64,
+
     /// Edges of a region that hold each playlist that has readers. With two,
     /// a second edge takes a copy of a playlist as soon as one edge has a
     /// reader for it, so a reader whose cache fails moves to a cache that
@@ -4725,12 +4739,7 @@ async fn main() -> Result<()> {
     // at once fell behind its relays and lost parts for the whole region.
     // On one vCPU the kernel now shares the processor between the two, and
     // the threads of the readers have the lower priority.
-    let http_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(args.http_worker_threads())
-        .thread_name("needletail-http")
-        .on_thread_start(lower_thread_priority)
-        .enable_all()
-        .build()
+    let http_runtime = reader_runtime(args.http_worker_threads(), args.reader_slice_us)
         .context("failed to start the runtime that serves readers")?;
     let handle = http_runtime
         .spawn(async move { server.start().await })
@@ -4904,6 +4913,100 @@ async fn main() -> Result<()> {
     }
 }
 
+/// The runtime that serves readers (HTTP/2, HTTP/3): `workers` threads
+/// named `needletail-http`, at [`READER_THREAD_NICE`], with a kernel time
+/// slice of `slice_us` (0: the kernel's).
+fn reader_runtime(workers: usize, slice_us: u64) -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .thread_name("needletail-http")
+        .on_thread_start(move || {
+            lower_thread_priority();
+            if slice_us > 0 {
+                set_thread_slice(slice_us);
+            }
+        })
+        .enable_all()
+        .build()
+}
+
+/// `--reader-slice-us`: 200 µs. A reader of 1 ms parts asks a thousand
+/// times a second, and a request costs about 0.1 ms of a thread. Against
+/// the kernel's 1.5 ms on a two-vCPU guest, a reader's thread at nice 5 has
+/// the earlier deadline when a commit wakes it, also against the node's
+/// runtime at nice 0 (hls_beside_4k: commit to reply p99 1.2 to 1.4 ms
+/// beside 4K at 247 Mbit/s on a loaded node, 2.1 to 2.2 ms with the
+/// kernel's slice; 100 µs cost more processor and was no better).
+const DEFAULT_READER_SLICE_US: u64 = 200;
+
+/// Ask the kernel for a time slice of `slice_us` for the calling thread
+/// (`sched_attr.sched_runtime` of SCHED_OTHER, EEVDF, Linux 6.12; an older
+/// kernel ignores it). The thread keeps its policy and nice value, so its
+/// share of a busy processor does not change: the slice sets how soon it
+/// runs when woken (its deadline) and how long it runs before another
+/// thread that waits may.
+fn set_thread_slice(slice_us: u64) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        /// `struct sched_attr` (include/uapi/linux/sched/types.h).
+        #[repr(C)]
+        struct SchedAttr {
+            size: u32,
+            sched_policy: u32,
+            sched_flags: u64,
+            sched_nice: i32,
+            sched_priority: u32,
+            sched_runtime: u64,
+            sched_deadline: u64,
+            sched_period: u64,
+            sched_util_min: u32,
+            sched_util_max: u32,
+        }
+        // SAFETY: getpriority with integer arguments; on Linux 0 names the
+        // calling thread.
+        let nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        let attr = SchedAttr {
+            size: std::mem::size_of::<SchedAttr>() as u32,
+            sched_policy: libc::SCHED_OTHER as u32,
+            sched_flags: 0,
+            sched_nice: nice,
+            sched_priority: 0,
+            sched_runtime: slice_us.saturating_mul(1_000),
+            sched_deadline: 0,
+            sched_period: 0,
+            sched_util_min: 0,
+            sched_util_max: 0,
+        };
+        // SAFETY: sched_setattr on the calling thread (0) with a valid
+        // `sched_attr` that outlives the call.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_sched_setattr,
+                0,
+                &attr as *const SchedAttr,
+                0_u32,
+            )
+        };
+        if result != 0 {
+            debug!(
+                slice_us,
+                error = %std::io::Error::last_os_error(),
+                "the kernel kept its own slice for a thread that serves readers"
+            );
+        }
+        result == 0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = slice_us;
+        false
+    }
+}
+
+/// How much nicer than the node's runtime the threads that serve readers
+/// run.
+const READER_THREAD_NICE: i32 = 5;
+
 /// Give the calling thread a lower priority than the threads that carry the
 /// media. On Linux a nice value belongs to the thread.
 fn lower_thread_priority() {
@@ -4911,7 +5014,7 @@ fn lower_thread_priority() {
     {
         // SAFETY: `nice` has no memory effects. A failure leaves the
         // priority as it was.
-        let _ = unsafe { libc::nice(5) };
+        let _ = unsafe { libc::nice(READER_THREAD_NICE) };
     }
 }
 
@@ -46796,6 +46899,9 @@ mod tests {
     /// What a steady one-leg listener costs on the wire against the base
     /// (integration 2, the local smoke's +4 %): an ignored measurement.
     mod client_traffic;
+    /// LL-HLS audio beside 4K on one edge of two CPUs (cmpd7): a 1 ms
+    /// part's commit to its reply with a 4K stream committed and read.
+    mod hls_beside_4k;
     /// Two-path listeners (the director over the session) against four
     /// edges and two entry points in this process, through the referee's
     /// changes (B Y5).
