@@ -80,6 +80,9 @@ pub struct LeaseChildConfig {
     /// `--relay-lease-ranked`: a lease's rank (when the child gives one)
     /// says whether this forwarder is the child's primary for the stream.
     pub ranked: bool,
+    /// `--relay-media-deadline-ms`, in µs: how long a source held back from
+    /// a warm child is kept from its receipt.
+    pub warm_hold_us: u64,
 }
 
 /// What a lease child takes of a symbol.
@@ -576,20 +579,14 @@ impl LeaseChildren {
         self.snapshot.store(Arc::new(snapshot));
     }
 
-    /// Keep a video source held back from a repair-only child.
-    pub fn buffer_warm(
-        &self,
-        child: &LeaseChild,
-        object: u64,
-        expires_at_us: u64,
-        datagram: &[u8],
-        now_us: u64,
-    ) {
+    /// Keep a video source held back from a repair-only child, for the
+    /// media budget from `now_us`.
+    pub fn buffer_warm(&self, child: &LeaseChild, object: u64, datagram: &[u8], now_us: u64) {
         let mutation = child
             .warm
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(object, expires_at_us, datagram, now_us);
+            .push(object, self.config.warm_hold_us, datagram, now_us);
         self.stats
             .warm_buffered
             .fetch_add(mutation.added_datagrams as u64, Ordering::Relaxed);
@@ -728,6 +725,7 @@ mod tests {
                 primary_children: primary.iter().map(|ip| ip.parse().unwrap()).collect(),
                 max_children,
                 ranked,
+                warm_hold_us: 1_000_000,
             },
             1 << 20,
         )

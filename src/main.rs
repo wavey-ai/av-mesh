@@ -152,6 +152,8 @@ const DEFAULT_RELAY_FAILOVER_LEASE_MS: u64 = 1_000;
 const RELAY_WARM_SOURCE_REPLAY_MAX_OBJECTS_PER_CHILD: usize = 4;
 const RELAY_WARM_SOURCE_REPLAY_MAX_DATAGRAMS_PER_CHILD: usize = 2_048;
 const RELAY_WARM_SOURCE_REPLAY_MAX_BYTES_PER_CHILD: usize = 4 * 1024 * 1024;
+/// `--relay-media-deadline-ms`: the media budget.
+const DEFAULT_RELAY_MEDIA_DEADLINE_MS: u64 = 1_000;
 // The reliable subscription/catalog lane will supply this for late joins. The
 // local transition path starts each canonical stream at object zero.
 const PART_WAIT_MS: u64 = 3_000;
@@ -249,6 +251,8 @@ const REPAIR_HORIZON_BURST_COPY_MARGIN_MS: u64 = 10;
 const REPAIR_DELAY_SAMPLES: usize = 128;
 /// Gaps remembered for each stream's playlist: the oldest are forgotten.
 const MAX_GAP_PARTS_PER_STREAM: usize = 4_096;
+/// Wide holes a stream keeps on record (`LiveTsCache::wide_hole_resume`).
+const WIDE_HOLE_RECORDS: usize = 8;
 
 /// `--canonical-repair-horizon`: how long a hole may hold back the
 /// contiguous watermark of a stream (the playlist and the cache-mesh push)
@@ -1789,6 +1793,15 @@ struct Args {
 
     #[arg(long, default_value_t = 1)]
     relay_subscription_id: u64,
+
+    /// The media budget, in milliseconds. A part's deadline is a point on
+    /// the timeline of its stream, never compared with this node's clock: a
+    /// part is shed when the head of its stream here has passed its deadline
+    /// by this much (a sender that was frozen and has resumed), and a stream
+    /// that arrives late as a whole is taken. A source datagram held back
+    /// from a warm child is kept this long from its receipt.
+    #[arg(long, default_value_t = DEFAULT_RELAY_MEDIA_DEADLINE_MS)]
+    relay_media_deadline_ms: u64,
 
     /// Forward newly admitted RelaySession symbols to one subscribed child.
     /// Repeat as `BIND=TARGET,ROLE`, where ROLE is source, repair, or all. Each
@@ -3993,6 +4006,7 @@ async fn main() -> Result<()> {
         forwarder.set_batch(args.relay_forward_batch);
         forwarder.set_repair_lane_single_symbol(args.relay_repair_lane_single_symbol);
         forwarder.set_repair_lane_burst_copy(args.relay_repair_lane_burst_copy);
+        forwarder.set_warm_hold_us(args.relay_media_deadline_us());
         forwarder.set_demand_groups(args.relay_demand_renditions.clone());
         fast_path_report.record_relay_forward_sockets(
             forwarder.socket_groups.len(),
@@ -4600,6 +4614,12 @@ fn lower_thread_priority() {
 }
 
 impl Args {
+    /// `--relay-media-deadline-ms` in µs: the budget of this node's media
+    /// clocks and the hold of its warm sources.
+    fn relay_media_deadline_us(&self) -> u64 {
+        self.relay_media_deadline_ms.saturating_mul(1_000)
+    }
+
     /// Threads that serve readers: the configured number, or as many as the
     /// media has.
     fn http_worker_threads(&self) -> usize {
@@ -5576,6 +5596,7 @@ async fn start_lease_children(
             primary_children: args.relay_lease_primary_children.clone(),
             max_children: args.relay_max_lease_children,
             ranked: args.relay_lease_ranked,
+            warm_hold_us: args.relay_media_deadline_us(),
         },
         args.udp_socket_buffer_bytes,
     )?;
@@ -5611,8 +5632,11 @@ async fn start_lease_children(
 }
 
 fn configured_relay_udp_dispatch(args: &Args, node_id: &str) -> Result<RelayUdpDispatch> {
-    let receiver = RelayObjectReceiver::new(RelayObjectReceiverConfig::default())
-        .context("invalid RelaySession receive limits")?;
+    let receiver = RelayObjectReceiver::new(RelayObjectReceiverConfig {
+        media_deadline_us: args.relay_media_deadline_us(),
+        ..RelayObjectReceiverConfig::default()
+    })
+    .context("invalid RelaySession receive limits")?;
     let mut dispatch = RelayUdpDispatch::new(receiver);
     if !args.relay_controlled_local {
         return Ok(dispatch);
@@ -5761,6 +5785,8 @@ struct WarmSourceDatagram {
 /// The source datagrams held back from a warm repair-only child, replayed
 /// to it on promotion. A forwarder keeps one per child and class, touched
 /// only by that class's thread (or the single receive loop) and a replay.
+/// A datagram is kept for a hold from its receipt, on this node's clock (its
+/// wire deadline is on the stream's timeline and says nothing here).
 /// Datagram buffers are reused, and expiry and the bounds work from the
 /// front, so a push costs O(1) amortised and, once warm, allocates nothing.
 #[derive(Debug, Default)]
@@ -5812,30 +5838,27 @@ impl WarmSourceReplayBuffer {
     fn push_key(
         &mut self,
         object_key: &media_object::ObjectKey,
-        expires_at_us: u64,
+        hold_us: u64,
         wire: &[u8],
         now_us: u64,
     ) -> WarmSourceBufferMutation {
-        self.push(
-            warm_object_id_of_key(object_key),
-            expires_at_us,
-            wire,
-            now_us,
-        )
+        self.push(warm_object_id_of_key(object_key), hold_us, wire, now_us)
     }
 
+    /// Keep `wire` for `hold_us` from `now_us`, this node's clock.
     fn push(
         &mut self,
         object: u64,
-        expires_at_us: u64,
+        hold_us: u64,
         wire: &[u8],
         now_us: u64,
     ) -> WarmSourceBufferMutation {
         let mut mutation = WarmSourceBufferMutation::default();
         self.remove_expired(now_us, &mut mutation);
-        if expires_at_us <= now_us || wire.len() > RELAY_WARM_SOURCE_REPLAY_MAX_BYTES_PER_CHILD {
+        if hold_us == 0 || wire.len() > RELAY_WARM_SOURCE_REPLAY_MAX_BYTES_PER_CHILD {
             return mutation;
         }
+        let expires_at_us = now_us.saturating_add(hold_us);
 
         // Most pushes are of the newest object.
         match self
@@ -6039,6 +6062,9 @@ struct RelayDownstreamForwarder {
     repair_lane_single_symbol: AtomicBool,
     /// `--relay-repair-lane-burst-copy`: that symbol gets a burst copy.
     repair_lane_burst_copy: AtomicBool,
+    /// `--relay-media-deadline-ms`, in µs: how long a source held back from
+    /// a warm repair-only child is kept from its receipt.
+    warm_hold_us: AtomicU64,
     /// `--relay-demand-renditions`: renditions held off a compiled lane
     /// whose child does not read them. Unset or empty: none.
     demand_groups: OnceLock<fast_plane::demand::RenditionGroups>,
@@ -6207,6 +6233,7 @@ impl RelayDownstreamForwarder {
             batch: AtomicBool::new(true),
             repair_lane_single_symbol: AtomicBool::new(true),
             repair_lane_burst_copy: AtomicBool::new(true),
+            warm_hold_us: AtomicU64::new(DEFAULT_RELAY_MEDIA_DEADLINE_MS * 1_000),
             demand_groups: OnceLock::new(),
             hop_journal: OnceLock::new(),
             #[cfg(test)]
@@ -6221,7 +6248,6 @@ impl RelayDownstreamForwarder {
         datagram: &[u8],
         role: MediaDatagramRole,
         object_key: Option<&media_object::ObjectKey>,
-        expires_at_us: Option<u64>,
     ) {
         let nonblocking = self.nonblocking.load(Ordering::Relaxed);
         let batch = nonblocking && self.batch.load(Ordering::Relaxed);
@@ -6243,14 +6269,13 @@ impl RelayDownstreamForwarder {
                         datagram,
                         role,
                         object_key,
-                        expires_at_us,
                         &mut deferred,
                         &mut first_child,
                     );
                 }
                 continue;
             }
-            if !self.admits(path, datagram, role, object_key, expires_at_us) {
+            if !self.admits(path, datagram, role, object_key) {
                 continue;
             }
             let started = Instant::now();
@@ -6300,7 +6325,6 @@ impl RelayDownstreamForwarder {
         datagram: &[u8],
         role: MediaDatagramRole,
         object_key: Option<&media_object::ObjectKey>,
-        expires_at_us: Option<u64>,
     ) -> bool {
         let promoted = path.promoted.load(Ordering::Relaxed);
         let failover_source = promoted
@@ -6310,8 +6334,8 @@ impl RelayDownstreamForwarder {
             return true;
         }
         if path.role == RelayForwardRole::Repair && matches!(role, MediaDatagramRole::Source) {
-            if let (Some(object_key), Some(expires_at_us)) = (object_key, expires_at_us) {
-                self.buffer_warm_source(path, object_key, expires_at_us, datagram, now_unix_us());
+            if let Some(object_key) = object_key {
+                self.buffer_warm_source(path, object_key, datagram, now_unix_us());
             }
         }
         self.filtered_datagrams.fetch_add(1, Ordering::Relaxed);
@@ -6336,14 +6360,12 @@ impl RelayDownstreamForwarder {
     /// `sendmmsg`. Children the kernel did not take in that call get a
     /// non-blocking send of their own, and a full socket is waited for
     /// after every other child has the datagram, as in the unbatched path.
-    #[allow(clippy::too_many_arguments)]
     fn forward_group(
         &self,
         group: usize,
         datagram: &[u8],
         role: MediaDatagramRole,
         object_key: Option<&media_object::ObjectKey>,
-        expires_at_us: Option<u64>,
         deferred: &mut Vec<usize>,
         first_child: &mut Option<(SocketAddr, u64)>,
     ) {
@@ -6351,7 +6373,7 @@ impl RelayDownstreamForwarder {
         let mut count = 0;
         for &index in &self.socket_groups[group] {
             let path = &self.paths[index];
-            if !self.admits(path, datagram, role, object_key, expires_at_us) {
+            if !self.admits(path, datagram, role, object_key) {
                 continue;
             }
             #[cfg(test)]
@@ -6565,6 +6587,12 @@ impl RelayDownstreamForwarder {
         self.nonblocking.store(nonblocking, Ordering::Relaxed);
     }
 
+    /// How long a source held back from a warm child is kept, from its
+    /// receipt on this node's clock.
+    fn set_warm_hold_us(&self, hold_us: u64) {
+        self.warm_hold_us.store(hold_us, Ordering::Relaxed);
+    }
+
     fn set_batch(&self, batch: bool) {
         self.batch.store(batch, Ordering::Relaxed);
     }
@@ -6614,7 +6642,6 @@ impl RelayDownstreamForwarder {
         &self,
         path: &RelayForwardPath,
         object_key: &media_object::ObjectKey,
-        expires_at_us: u64,
         datagram: &[u8],
         now_us: u64,
     ) {
@@ -6622,27 +6649,26 @@ impl RelayDownstreamForwarder {
             path,
             fast_plane::TrafficClass::Audio,
             warm_object_id_of_key(object_key),
-            expires_at_us,
             datagram,
             now_us,
         );
     }
 
     /// Keep a source datagram held back from a warm repair-only child, in
-    /// the child's buffer of `class`.
+    /// the child's buffer of `class`, for the media budget from `now_us`.
     fn buffer_warm_source_class(
         &self,
         path: &RelayForwardPath,
         class: fast_plane::TrafficClass,
         object: u64,
-        expires_at_us: u64,
         datagram: &[u8],
         now_us: u64,
     ) {
+        let hold_us = self.warm_hold_us.load(Ordering::Relaxed);
         let mutation = path.warm_sources[class.index()]
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(object, expires_at_us, datagram, now_us);
+            .push(object, hold_us, datagram, now_us);
         self.record_warm_source_mutation(&mutation);
     }
 
@@ -7783,7 +7809,7 @@ async fn process_relay_audio_epoch_datagram(
     }
 
     if let Some(forwarder) = relay_forwarder {
-        forwarder.forward(datagram, role, None, None).await;
+        forwarder.forward(datagram, role, None).await;
     }
     if let Some(audio_epochs) = audio_epochs {
         let _ = audio_epochs.send(AudioEpochDatagram {
@@ -7855,16 +7881,10 @@ async fn process_udp_fec_ingest_datagram_inner(
     let relay_result = relay_dispatch.push(peer, datagram, received_us);
     match relay_result {
         Ok(RelayUdpDispatchOutcome::Legacy) => {}
-        Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Buffered {
-            key,
-            role,
-            deadline,
-        })) => {
-            journal_relay_symbol(cache, &key, peer, received_us, None);
+        Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Buffered { key, role, .. })) => {
+            journal_relay_symbol(cache, &key, peer, received_us);
             if let Some(forwarder) = relay_forwarder {
-                forwarder
-                    .forward(datagram, role, Some(&key), Some(deadline.expires_at_us))
-                    .await;
+                forwarder.forward(datagram, role, Some(&key)).await;
             }
             debug!(
                 peer = %peer,
@@ -7882,27 +7902,24 @@ async fn process_udp_fec_ingest_datagram_inner(
             object,
             envelope,
             role,
-            deadline,
             parent_count,
             accepted_datagrams,
             ..
         })) => {
-            journal_relay_symbol(cache, object.key(), peer, received_us, Some(now_unix_us()));
+            let decoded_us = now_unix_us();
+            journal_relay_symbol(cache, object.key(), peer, received_us);
             if let Some(forwarder) = relay_forwarder {
-                forwarder
-                    .forward(
-                        datagram,
-                        role,
-                        Some(object.key()),
-                        Some(deadline.expires_at_us),
-                    )
-                    .await;
+                forwarder.forward(datagram, role, Some(object.key())).await;
             }
             let stream = object.key().stream().to_owned();
             let sequence = object.key().object();
             let publication_clock = relay_publication_clock(&object);
             let decoded = match commit_relay_object(cache, *object, envelope).await {
-                Ok(_) => {
+                // Another copy, or one refused and counted: nothing new.
+                Ok(Committed::AlreadyPresent(_)) => true,
+                Ok(Committed::Refused(_)) => false,
+                Ok(Committed::Stored(_)) => {
+                    journal_relay_decoded(cache, &stream, sequence, peer, decoded_us);
                     if let Some(clock) = publication_clock {
                         cache.record_relay_availability(clock.observe(now_unix_us()));
                     }
@@ -7929,15 +7946,9 @@ async fn process_udp_fec_ingest_datagram_inner(
             };
             return Ok(Some(RelayDatagramObservation { role, decoded }));
         }
-        Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Duplicate {
-            key,
-            role,
-            deadline,
-        })) => {
+        Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Duplicate { key, role, .. })) => {
             if let Some(forwarder) = relay_forwarder {
-                forwarder
-                    .forward(datagram, role, Some(&key), Some(deadline.expires_at_us))
-                    .await;
+                forwarder.forward(datagram, role, Some(&key)).await;
             }
             debug!(
                 peer = %peer,
@@ -7951,21 +7962,17 @@ async fn process_udp_fec_ingest_datagram_inner(
                 decoded: false,
             }));
         }
-        Err(RelayIngressError::DeadlineExpired) => {
-            // This is an expected overload/late-arrival outcome and is already
-            // counted in RelayIngressCounters::deadline_drops. Logging every
+        Err(RelayIngressError::DeadlineExpired | RelayIngressError::StaleEpoch) => {
+            // This is an expected outcome (a sender that was frozen, the tail
+            // of a session that has ended) and is already counted in
+            // RelayIngressCounters (deadline_drops, rejected_by_kind). Logging every
             // expired symbol here would add synchronous work to the UDP receive
             // loop precisely when ingress is behind; the receive loop reports
             // one aggregate warning per expiry tick instead.
             return Ok(None);
         }
         Err(error) => {
-            warn!(
-                peer = %peer,
-                datagram_bytes = datagram.len(),
-                error = %error,
-                "RelaySession datagram rejected at configured dispatch seam"
-            );
+            warn_relay_rejection(relay_dispatch, peer, None, datagram.len(), &error);
             return Ok(None);
         }
     }
@@ -7981,12 +7988,12 @@ async fn process_udp_fec_ingest_datagram_inner(
                     .commit_stream_payload(stream_id, decoded.payload)
                     .await
                 {
-                    Ok(sequence) => {
+                    Ok(outcome) => {
                         debug!(
                             peer = %peer,
                             stream_id,
                             block_id,
-                            sequence,
+                            ?outcome,
                             payload_bytes,
                             "cached stream-prefixed UDP-FEC mesh byte payload"
                         );
@@ -8040,9 +8047,6 @@ async fn process_udp_fec_ingest_datagram_inner(
     Ok(None)
 }
 
-/// Journal the arrival of a RelaySession symbol: `relay_first` for the
-/// first symbol of an object, and `relay_decoded` when the symbol completed
-/// it.
 /// `--fast-busy-poll-us` on the audio class receive sockets; a refusal is
 /// said once and leaves them without it.
 fn apply_fast_busy_poll(sockets: &[fast_plane::relay::ClassSocket], micros: u32) {
@@ -8073,12 +8077,40 @@ fn apply_fast_busy_poll(sockets: &[fast_plane::relay::ClassSocket], micros: u32)
     );
 }
 
+/// A RelaySession datagram was rejected. The receiver counts it by kind
+/// (`relay_session.rejected_by_kind`); one line is logged a kind, at counts
+/// 1, 2, 4, 8... with the total, so that a parent that sends what this node
+/// refuses cannot flood the log. `class` is the fast-plane class whose tee
+/// rejected it; the single loop has none.
+fn warn_relay_rejection(
+    dispatch: &RelayUdpDispatch,
+    peer: SocketAddr,
+    class: Option<&str>,
+    datagram_bytes: usize,
+    error: &RelayIngressError,
+) {
+    let kind = error.kind();
+    let total = dispatch.receiver().counters().rejected_by_kind.get(kind);
+    if total.is_power_of_two() {
+        warn!(
+            %peer,
+            class,
+            kind = kind.as_str(),
+            total,
+            datagram_bytes,
+            error = %error,
+            "RelaySession datagram rejected at configured dispatch seam"
+        );
+    }
+}
+
+/// Journal the arrival of a RelaySession symbol: `relay_first` for the
+/// first symbol of an object (`relay_decoded` is `journal_relay_decoded`'s).
 fn journal_relay_symbol(
     cache: &LiveTsCache,
     key: &media_object::ObjectKey,
     peer: SocketAddr,
     received_us: u64,
-    decoded_us: Option<u64>,
 ) {
     let Some(journal) = cache.hops() else {
         return;
@@ -8086,14 +8118,70 @@ fn journal_relay_symbol(
     let Ok(stream) = key.stream().parse::<u64>() else {
         return;
     };
-    let seq = key.object();
     journal.record_first(
-        HopEvent::new(HopStage::RelayFirst, stream, seq, received_us).with_peer(Some(peer)),
+        HopEvent::new(HopStage::RelayFirst, stream, key.object(), received_us)
+            .with_peer(Some(peer)),
     );
-    if let Some(decoded_us) = decoded_us {
-        journal.record(
-            HopEvent::new(HopStage::RelayDecoded, stream, seq, decoded_us).with_peer(Some(peer)),
-        );
+}
+
+/// `relay_decoded`: the object decoded at `decoded_us` and its commit stored
+/// it (another copy, or a refused one, journals nothing).
+fn journal_relay_decoded(
+    cache: &LiveTsCache,
+    stream: &str,
+    sequence: u64,
+    peer: SocketAddr,
+    decoded_us: u64,
+) {
+    let (Some(journal), Ok(stream)) = (cache.hops(), stream.parse::<u64>()) else {
+        return;
+    };
+    journal.record(
+        HopEvent::new(HopStage::RelayDecoded, stream, sequence, decoded_us).with_peer(Some(peer)),
+    );
+}
+
+/// What `LiveTsCache::walk_holes` found.
+struct HoleWalk {
+    /// The newest slot the watermark may move to.
+    ceiling: Option<usize>,
+    /// How long the first hole released held the watermark.
+    held_us: Option<u64>,
+    /// No slot of the walk was stored (and it did not reach the part being
+    /// committed).
+    empty: bool,
+}
+
+/// What a commit did with a canonical object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Committed {
+    /// Written (a metadata object or a stream-prefixed payload: taken), at
+    /// this sequence.
+    Stored(u64),
+    /// The cache holds these bytes under the identity already (another copy,
+    /// or the cache mesh, wrote them first): nothing is new.
+    AlreadyPresent(u64),
+    /// Nothing written; counted. Whatever the cache holds stays.
+    Refused(CommitRefusal),
+}
+
+/// Why a commit wrote nothing. Neither is an error, and neither resets a
+/// stream: only a higher epoch does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitRefusal {
+    /// Other bytes under a slot's identity (`canonical_conflicts`).
+    IdentityConflict,
+    /// An epoch below the one the stream has taken up
+    /// (`canonical_stale_epoch`).
+    StaleEpoch,
+}
+
+impl CommitRefusal {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::IdentityConflict => "identity_conflict",
+            Self::StaleEpoch => "stale_epoch",
+        }
     }
 }
 
@@ -8101,7 +8189,7 @@ async fn commit_relay_object(
     cache: &LiveTsCache,
     object: MediaObject,
     envelope: Vec<u8>,
-) -> Result<u64> {
+) -> Result<Committed> {
     let stream_id = object
         .key()
         .stream()
@@ -8520,9 +8608,22 @@ struct LiveTsCache {
     /// Parts that came after they were listed as gaps: the cache has them
     /// for later readers.
     late_gap_fills: AtomicU64,
+    /// Commits refused for other bytes under a slot's identity, and for an
+    /// epoch below the stream's (`CommitRefusal`).
+    canonical_conflicts: AtomicU64,
+    canonical_stale_epoch: AtomicU64,
     /// The parts of each stream that the watermark passed as holes: the
     /// playlist lists them as gaps while they are missing.
     gap_parts: StdMutex<HashMap<u64, BTreeSet<u64>>>,
+    /// Per stream, parts stored more than CANONICAL_GAP_SCAN_LIMIT above
+    /// the watermark, no two within the scan of each other (at most
+    /// WIDE_HOLE_RECORDS): where the walk of a hole wider than its scan
+    /// resumes (both contributors lost, a source that jumped), the lowest
+    /// above the watermark first. Dropped once the watermark has passed
+    /// them.
+    wide_hole_resume: StdMutex<HashMap<u64, BTreeSet<u64>>>,
+    /// Holes wider than the scan that the repair horizon released.
+    wide_hole_releases: AtomicU64,
     part_updates: watch::Sender<u64>,
     playlist_cache: Vec<StdRwLock<Option<CachedPlaylist>>>,
     /// The scan memo of the playlist in each playlist slot.
@@ -8671,7 +8772,11 @@ impl LiveTsCache {
             watermark_stall_max_us: AtomicU64::new(0),
             watermark_stalls_over: AtomicU64::new(0),
             late_gap_fills: AtomicU64::new(0),
+            canonical_conflicts: AtomicU64::new(0),
+            canonical_stale_epoch: AtomicU64::new(0),
             gap_parts: StdMutex::new(HashMap::new()),
+            wide_hole_resume: StdMutex::new(HashMap::new()),
+            wide_hole_releases: AtomicU64::new(0),
             part_updates,
             playlist_cache,
             playlist_scan_memos,
@@ -8925,6 +9030,9 @@ impl LiveTsCache {
             self.relay_processing.buckets[index].load(Ordering::Relaxed)
         });
         self.relay_availability.apply_to(&mut snapshot);
+        snapshot.canonical_conflicts = self.canonical_conflicts.load(Ordering::Relaxed);
+        snapshot.canonical_stale_epoch = self.canonical_stale_epoch.load(Ordering::Relaxed);
+        snapshot.wide_hole_releases = self.wide_hole_releases.load(Ordering::Relaxed);
         if let Some(stats) = self.fast_plane.get() {
             snapshot.fast_plane = stats.snapshot();
         }
@@ -9106,6 +9214,54 @@ impl LiveTsCache {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&stream_id);
+        self.wide_hole_resume
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&stream_id);
+    }
+
+    /// Part `slot` was stored: when it is more than the scan limit above
+    /// the watermark, the walk of a hole below it may have to resume there.
+    /// It is recorded unless a record within the scan below it reaches it
+    /// already, so that each of several wide holes (a contributor pair that
+    /// flaps, a straggler between two outages) has the part after it on
+    /// record. A part near the watermark costs one load and one comparison.
+    fn note_wide_hole(&self, handle: StreamHandle, slot: usize) {
+        let Some(last) = self.chunk_cache.last_for_handle(handle) else {
+            return;
+        };
+        if slot <= last.saturating_add(CANONICAL_GAP_SCAN_LIMIT) {
+            return;
+        }
+        let (last, slot) = (last as u64, slot as u64);
+        let mut records = self
+            .wide_hole_resume
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let starts = records.entry(handle.stream_id()).or_default();
+        starts.retain(|start| *start > last);
+        let reach = slot.saturating_sub(CANONICAL_GAP_SCAN_LIMIT as u64);
+        if starts.range(reach..=slot).next().is_some() {
+            return;
+        }
+        starts.insert(slot);
+        // The lowest are released first; a part beyond the kept records is
+        // recorded again by a later commit once they are passed.
+        if starts.len() > WIDE_HOLE_RECORDS {
+            starts.pop_last();
+        }
+    }
+
+    /// Where the walk of a stream's wide hole resumes: its lowest record
+    /// above `last`.
+    fn wide_hole_resume_above(&self, stream_id: u64, last: usize) -> Option<usize> {
+        self.wide_hole_resume
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&stream_id)?
+            .range(last as u64 + 1..)
+            .next()
+            .and_then(|resume| usize::try_from(*resume).ok())
     }
 
     /// A part `part` of a stream was stored after a later part: a repair
@@ -9307,38 +9463,73 @@ impl LiveTsCache {
         }
         let now_us = now_unix_us();
         let end = head.min(last.saturating_add(CANONICAL_GAP_SCAN_LIMIT));
-        let mut ceiling = None;
-        let mut in_hole = false;
-        // How long the first hole released held the watermark.
-        let mut held_us = None;
-        for slot in first..=end {
+        let mut walk = self.walk_holes(handle, first..=end, false, committing, now_us, horizon_us);
+        // Nothing stored within the scan: a hole wider than the scan. Its
+        // walk resumes at the lowest part stored above it, as after a
+        // narrow hole.
+        let wide = walk.empty
+            && match self.wide_hole_resume_above(stream_id, last) {
+                Some(resume) if resume <= head => {
+                    let end = head.min(resume.saturating_add(CANONICAL_GAP_SCAN_LIMIT));
+                    walk =
+                        self.walk_holes(handle, resume..=end, true, committing, now_us, horizon_us);
+                    true
+                }
+                _ => false,
+            };
+        let ceiling = walk.ceiling.filter(|ceiling| *ceiling > last)?;
+        let watermark = self
+            .advance_canonical_watermark(handle, last, ceiling, false)
+            .await?;
+        self.repair_horizon_releases.fetch_add(1, Ordering::Relaxed);
+        if wide {
+            self.wide_hole_releases.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(held_us) = walk.held_us {
+            self.record_watermark_stall(held_us);
+        }
+        Some(watermark)
+    }
+
+    /// The walk of `release_holes_past_horizon` over `slots`, in order,
+    /// stopping at `committing`: the newest stored slot behind which every
+    /// hole is `horizon_us` old (a hole is as old as the first part stored
+    /// after it). `in_hole`: the first slot follows a hole.
+    fn walk_holes(
+        &self,
+        handle: StreamHandle,
+        slots: std::ops::RangeInclusive<usize>,
+        mut in_hole: bool,
+        committing: Option<usize>,
+        now_us: u64,
+        horizon_us: u64,
+    ) -> HoleWalk {
+        let mut walk = HoleWalk {
+            ceiling: None,
+            held_us: None,
+            empty: true,
+        };
+        for slot in slots {
             if committing == Some(slot) {
+                walk.empty = false;
                 break;
             }
             match self.chunk_cache.written_unix_us_for_handle(handle, slot) {
                 None => in_hole = true,
                 Some(written_us) => {
-                    // A hole is as old as the first part stored after it.
+                    walk.empty = false;
                     if in_hole && now_us.saturating_sub(written_us) < horizon_us {
                         break;
                     }
-                    if in_hole && held_us.is_none() {
-                        held_us = Some(now_us.saturating_sub(written_us));
+                    if in_hole && walk.held_us.is_none() {
+                        walk.held_us = Some(now_us.saturating_sub(written_us));
                     }
                     in_hole = false;
-                    ceiling = Some(slot);
+                    walk.ceiling = Some(slot);
                 }
             }
         }
-        let ceiling = ceiling.filter(|ceiling| *ceiling > last)?;
-        let watermark = self
-            .advance_canonical_watermark(handle, last, ceiling, false)
-            .await?;
-        self.repair_horizon_releases.fetch_add(1, Ordering::Relaxed);
-        if let Some(held_us) = held_us {
-            self.record_watermark_stall(held_us);
-        }
-        Some(watermark)
+        walk
     }
 
     /// Release every hole of every stream that the repair horizon has
@@ -9504,9 +9695,13 @@ impl LiveTsCache {
                 .chunk_cache
                 .retained_start(candidate)
                 .max(first_unpublished);
-            let mut skipped_parts = (retained_start - first_unpublished) as u64;
+            // At most the gaps a stream keeps are read, below the new
+            // watermark; the rest of a wider hole is counted unread (a hole
+            // of thousands of parts is one gap to a reader).
+            let read_from = retained_start.max(candidate.saturating_sub(MAX_GAP_PARTS_PER_STREAM));
+            let mut skipped_parts = (read_from - first_unpublished) as u64;
             let mut gaps = Vec::new();
-            for slot in retained_start..candidate {
+            for slot in read_from..candidate {
                 if self
                     .chunk_cache
                     .get_for_handle(handle, slot)
@@ -9538,7 +9733,7 @@ impl LiveTsCache {
             if let Some(journal) = self.hops() {
                 // The stored parts behind the released hole are visible now.
                 let t_us = now_unix_us();
-                for slot in retained_start..=candidate {
+                for slot in read_from..=candidate {
                     if slot == candidate
                         || self
                             .chunk_cache
@@ -9681,7 +9876,7 @@ impl LiveTsCache {
         Ok(())
     }
 
-    async fn commit_stream_payload(&self, stream_id: u64, payload: Bytes) -> Result<u64> {
+    async fn commit_stream_payload(&self, stream_id: u64, payload: Bytes) -> Result<Committed> {
         self.commit_stream_payload_inner(stream_id, payload, None)
             .await
     }
@@ -9691,17 +9886,40 @@ impl LiveTsCache {
         stream_id: u64,
         payload: Bytes,
         object: MediaObject,
-    ) -> Result<u64> {
+    ) -> Result<Committed> {
         self.commit_stream_payload_inner(stream_id, payload, Some(object))
             .await
     }
 
+    /// Count a refused commit; one log line at counts 1, 2, 4, 8... of each
+    /// refusal, so that two contributors that differ cannot flood the log.
+    fn refuse_commit(&self, refusal: CommitRefusal, stream_id: u64, sequence: u64) -> Committed {
+        let counter = match refusal {
+            CommitRefusal::IdentityConflict => &self.canonical_conflicts,
+            CommitRefusal::StaleEpoch => &self.canonical_stale_epoch,
+        };
+        let total = counter.fetch_add(1, Ordering::Relaxed) + 1;
+        if total.is_power_of_two() {
+            warn!(
+                stream_id,
+                sequence,
+                refusal = refusal.as_str(),
+                total,
+                "canonical commit refused; the first copy stays"
+            );
+        }
+        Committed::Refused(refusal)
+    }
+
+    /// Commit a part or a metadata object. Other bytes under a slot's
+    /// identity and an epoch the stream has left are refused, counted and
+    /// never an error: nothing is written and nothing is reset.
     async fn commit_stream_payload_inner(
         &self,
         stream_id: u64,
         payload: Bytes,
         validated_object: Option<MediaObject>,
-    ) -> Result<u64> {
+    ) -> Result<Committed> {
         let bytes = payload.len();
         self.make_room_for(stream_id).await?;
         // Stream commits and retirement share this lock so a newly arriving
@@ -9729,12 +9947,12 @@ impl LiveTsCache {
                     state.process_started_unix_us,
                 )
             };
-            if let Some(previous) = previous_epoch {
-                if source_epoch < previous {
-                    bail!(
-                        "stale canonical source epoch {source_epoch} for stream {stream_id}; current epoch is {previous}"
-                    );
-                }
+            if previous_epoch.is_some_and(|previous| source_epoch < previous) {
+                return Ok(self.refuse_commit(
+                    CommitRefusal::StaleEpoch,
+                    stream_id,
+                    object.key().object(),
+                ));
             }
             // An edge fed on the fast plane beside the cache mesh: the mesh
             // can have written parts of this epoch (a lease's warm-up window)
@@ -9838,9 +10056,6 @@ impl LiveTsCache {
                 state.stream_last_ingest_unix_ms.insert(stream_id, now_ms);
                 state.observe_stream_seq(stream_id, seq);
                 state.stream_media_kinds.insert(stream_id, media_kind);
-                if let Some(reboxed) = &reboxed_audio {
-                    state.stream_inits.insert(stream_id, reboxed.init.clone());
-                }
                 if matches!(
                     kind,
                     ObjectKind::Initialization | ObjectKind::CodecConfiguration
@@ -9849,15 +10064,6 @@ impl LiveTsCache {
                         .stream_inits
                         .insert(stream_id, Bytes::copy_from_slice(object.payload()));
                 }
-            }
-
-            if let Some(reboxed) = &reboxed_audio {
-                self.chunk_cache
-                    .set_stream_initialization(stream_id, reboxed.init.clone())
-                    .await
-                    .map_err(|err| {
-                        anyhow!("Soundkit fMP4 initialization cache write failed: {err}")
-                    })?;
             }
 
             if matches!(
@@ -9879,7 +10085,7 @@ impl LiveTsCache {
                     bytes = media_bytes,
                     "accepted canonical stream metadata object"
                 );
-                return Ok(seq);
+                return Ok(Committed::Stored(seq));
             }
 
             let slot_id = usize::try_from(seq).context("stream slot sequence too large")?;
@@ -9942,13 +10148,20 @@ impl LiveTsCache {
                 .and_then(|handle| self.chunk_cache.written_unix_us_for_handle(handle, slot_id))
                 .unwrap_or_else(now_unix_us);
             if write_result == PutIfAbsentResult::HashConflict {
-                bail!(
-                    "canonical media-object identity conflict for stream {stream_id} sequence {seq}"
-                );
+                return Ok(self.refuse_commit(CommitRefusal::IdentityConflict, stream_id, seq));
             }
             if write_result == PutIfAbsentResult::Inserted {
+                // A reboxed bundle's initialization is the stored part's: a
+                // copy that is present already or refused leaves the
+                // stream's alone. A reader that comes before it is set finds
+                // it in the part's slot.
+                if let Some(reboxed) = &reboxed_audio {
+                    self.remember_stream_init(stream_id, reboxed.init.clone())
+                        .await;
+                }
                 if let Some(handle) = handle {
                     self.observe_late_part(handle, seq, committed_us);
+                    self.note_wide_hole(handle, slot_id);
                 }
                 if let Some(journal) = self.hops() {
                     journal.record_part(HopStage::Committed, stream_id, seq, committed_us);
@@ -10002,7 +10215,11 @@ impl LiveTsCache {
             drop(state);
             self.trim_stream_ring(stream_id, slot_id).await;
             self.part_updates.send_replace(seq);
-            return Ok(seq);
+            return Ok(if write_result == PutIfAbsentResult::AlreadyPresent {
+                Committed::AlreadyPresent(seq)
+            } else {
+                Committed::Stored(seq)
+            });
         }
 
         let decoded = LiveSlotPayload::decode(payload.clone());
@@ -10061,7 +10278,7 @@ impl LiveTsCache {
         );
         drop(state);
         self.part_updates.send_replace(seq);
-        Ok(seq)
+        Ok(Committed::Stored(seq))
     }
 
     /// The source epoch of the newest part of a stream that the cache mesh
@@ -13337,6 +13554,19 @@ struct RelaySessionIngressSnapshot {
     compact_unknown_descriptor: u64,
     #[serde(default)]
     compact_descriptors_learned: u64,
+    /// Objects decoded more than the media budget after their Published
+    /// time by this node's clock, and the most any was (nothing acts on
+    /// either: what a wall-clock deadline would have shed).
+    wall_late_parts: u64,
+    wall_late_max_us: u64,
+    /// Every rejection of a datagram or an announcement, by kind.
+    rejected_by_kind: av_mesh::relay_ingress::RejectedByKind,
+    /// Commits refused for other bytes under a slot's identity, and for an
+    /// epoch below the stream's: the first copy stays.
+    canonical_conflicts: u64,
+    canonical_stale_epoch: u64,
+    /// Holes wider than the scan limit that the repair horizon released.
+    wide_hole_releases: u64,
     downstream_children: u64,
     forwarded_source_datagrams: u64,
     forwarded_repair_datagrams: u64,
@@ -13496,6 +13726,9 @@ impl From<RelayIngressSnapshot> for RelaySessionIngressSnapshot {
             compact_decoded_objects: snapshot.counters.compact_decoded_objects,
             compact_unknown_descriptor: snapshot.counters.compact_unknown_descriptor,
             compact_descriptors_learned: snapshot.counters.compact_descriptors_learned,
+            wall_late_parts: snapshot.counters.wall_late_parts,
+            wall_late_max_us: snapshot.counters.wall_late_max_us,
+            rejected_by_kind: snapshot.counters.rejected_by_kind,
             ..Self::default()
         }
     }
@@ -16752,6 +16985,42 @@ fn render_mesh_prometheus_metrics(snapshot: &MeshApiSnapshot) -> String {
         output.push_str(&format!(
             "av_mesh_relay_session_drops_total{{reason=\"{reason}\"}} {value}\n"
         ));
+    }
+    push_prometheus_metric_header(
+        &mut output,
+        "av_mesh_relay_session_rejected_total",
+        "RelaySession datagrams and announcements rejected, by the kind of error.",
+        "counter",
+    );
+    for (kind, value) in snapshot.relay_session.rejected_by_kind.named() {
+        output.push_str(&format!(
+            "av_mesh_relay_session_rejected_total{{kind=\"{kind}\"}} {value}\n"
+        ));
+    }
+    for (name, help, value) in [
+        (
+            "av_mesh_relay_session_wall_late_parts_total",
+            "Objects decoded more than the media budget after their Published time by this node's clock (counted, not acted on).",
+            snapshot.relay_session.wall_late_parts,
+        ),
+        (
+            "av_mesh_canonical_conflicts_total",
+            "Canonical commits refused for other bytes under a slot's identity; the first copy stays.",
+            snapshot.relay_session.canonical_conflicts,
+        ),
+        (
+            "av_mesh_canonical_stale_epoch_total",
+            "Canonical commits refused for an epoch below the stream's.",
+            snapshot.relay_session.canonical_stale_epoch,
+        ),
+        (
+            "av_mesh_canonical_wide_hole_releases_total",
+            "Holes wider than the gap scan that the repair horizon released.",
+            snapshot.relay_session.wide_hole_releases,
+        ),
+    ] {
+        push_prometheus_metric_header(&mut output, name, help, "counter");
+        output.push_str(&format!("{name} {value}\n"));
     }
 
     push_prometheus_metric_header(
@@ -27080,14 +27349,14 @@ mod tests {
                 .commit_stream_payload(stream_id, part_one.clone())
                 .await
                 .unwrap(),
-            1
+            Committed::Stored(1)
         );
         assert_eq!(
             cache
                 .commit_stream_payload(stream_id, part_zero.clone())
                 .await
                 .unwrap(),
-            0
+            Committed::Stored(0)
         );
 
         assert_eq!(
@@ -27119,10 +27388,14 @@ mod tests {
             true,
             b"different-object-at-zero",
         );
-        assert!(cache
-            .commit_stream_payload(stream_id, conflicting_zero)
-            .await
-            .is_err());
+        assert_eq!(
+            cache
+                .commit_stream_payload(stream_id, conflicting_zero)
+                .await
+                .unwrap(),
+            Committed::Refused(CommitRefusal::IdentityConflict)
+        );
+        assert_eq!(cache.canonical_conflicts.load(Ordering::Relaxed), 1);
         assert_eq!(
             cache.get_part_for_stream_id(stream_id, 0).await.unwrap().0,
             Bytes::from_static(b"moofmdat-zero")
@@ -27226,12 +27499,11 @@ mod tests {
             false,
             b"stale-epoch-41-2",
         );
-        assert!(cache
-            .commit_stream_payload(stream_id, stale)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("stale canonical source epoch"));
+        assert_eq!(
+            cache.commit_stream_payload(stream_id, stale).await.unwrap(),
+            Committed::Refused(CommitRefusal::StaleEpoch)
+        );
+        assert_eq!(cache.canonical_stale_epoch.load(Ordering::Relaxed), 1);
         assert_eq!(cache.stats(&mesh).await.canonical_epoch, Some(42));
 
         cache
@@ -28000,7 +28272,7 @@ mod tests {
                 )
                 .await
                 .unwrap(),
-            sequence
+            Committed::Stored(sequence)
         );
     }
 
@@ -28817,6 +29089,18 @@ mod tests {
             normalize_playback_base_url("https://node/live/"),
             "https://node/live"
         );
+    }
+
+    /// `--relay-media-deadline-ms` is the budget of the receiver's media
+    /// clocks.
+    #[test]
+    fn the_media_budget_flag_reaches_the_receiver() {
+        let default = Args::try_parse_from(["av-mesh"]).unwrap();
+        assert_eq!(default.relay_media_deadline_us(), 1_000_000);
+        let args = Args::try_parse_from(["av-mesh", "--relay-media-deadline-ms", "500"]).unwrap();
+        assert_eq!(args.relay_media_deadline_us(), 500_000);
+        let dispatch = configured_relay_udp_dispatch(&args, "relay-london").unwrap();
+        assert_eq!(dispatch.receiver().config().media_deadline_us, 500_000);
     }
 
     #[test]
@@ -32928,7 +33212,7 @@ mod tests {
                 .commit_stream_payload(77, Bytes::from_static(b"first"))
                 .await
                 .unwrap(),
-            0
+            Committed::Stored(0)
         );
 
         let waiting_cache = Arc::clone(&cache);
@@ -32945,7 +33229,7 @@ mod tests {
                 .commit_stream_payload(77, Bytes::from_static(b"second"))
                 .await
                 .unwrap(),
-            1
+            Committed::Stored(1)
         );
         let (sequence, bytes, _) = timeout(Duration::from_millis(100), waiter)
             .await
@@ -32966,7 +33250,7 @@ mod tests {
                 .commit_stream_payload(77, Bytes::from_static(b"one-"))
                 .await
                 .unwrap(),
-            0
+            Committed::Stored(0)
         );
         let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
         let router = Arc::new(app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh)));
@@ -32996,7 +33280,7 @@ mod tests {
                     .commit_stream_payload(77, Bytes::copy_from_slice(bytes))
                     .await
                     .unwrap(),
-                expected_sequence
+                Committed::Stored(expected_sequence)
             );
         }
         let response = timeout(Duration::from_millis(100), request)
@@ -33036,7 +33320,7 @@ mod tests {
                 .commit_stream_payload(77, Bytes::from_static(b"opus-track-a"))
                 .await
                 .unwrap(),
-            0
+            Committed::Stored(0)
         );
         let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
         let router = Arc::new(app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh)));
@@ -33061,7 +33345,7 @@ mod tests {
                 .commit_stream_payload(79, Bytes::from_static(b"unrelated-track"))
                 .await
                 .unwrap(),
-            0
+            Committed::Stored(0)
         );
         tokio::task::yield_now().await;
         assert!(!request.is_finished());
@@ -33071,7 +33355,7 @@ mod tests {
                 .commit_stream_payload(78, Bytes::from_static(b"opaque-track-b"))
                 .await
                 .unwrap(),
-            0
+            Committed::Stored(0)
         );
         let response = timeout(Duration::from_millis(100), request)
             .await
@@ -33142,7 +33426,7 @@ mod tests {
                 .commit_stream_payload(77, Bytes::from_static(b"first"))
                 .await
                 .unwrap(),
-            0
+            Committed::Stored(0)
         );
         let (bytes, _) = timeout(Duration::from_millis(100), first)
             .await
@@ -33157,7 +33441,7 @@ mod tests {
                 .commit_stream_payload(77, Bytes::from_static(b"second"))
                 .await
                 .unwrap(),
-            1
+            Committed::Stored(1)
         );
         let (bytes, _) = timeout(Duration::from_millis(100), second)
             .await
@@ -33703,7 +33987,6 @@ mod tests {
                 b"RLS1-warm-source-state",
                 MediaDatagramRole::Source,
                 None,
-                None,
             )
             .await;
         assert!(timeout(Duration::from_millis(20), async {
@@ -33713,7 +33996,7 @@ mod tests {
         .await
         .is_err());
         forwarder
-            .forward(expected, MediaDatagramRole::Repair, None, None)
+            .forward(expected, MediaDatagramRole::Repair, None)
             .await;
 
         let mut received = [0u8; 64];
@@ -33874,7 +34157,7 @@ mod tests {
                 &payload,
             )
             .unwrap();
-            let mutation = buffer.push_key(&key, now_us + 1_000_000, &payload, now_us);
+            let mutation = buffer.push_key(&key, 1_000_000, &payload, now_us);
             retired += mutation.retired_datagrams;
         }
 
@@ -33902,7 +34185,7 @@ mod tests {
     #[test]
     fn warm_source_buffer_bounds_interleaved_objects_and_reuses_buffers() {
         let now_us = 1_000_000;
-        let live = now_us + 1_000_000;
+        let live = 1_000_000;
         let mut buffer = WarmSourceReplayBuffer::default();
         let check = |buffer: &WarmSourceReplayBuffer| {
             let counted: usize = buffer.object_order.iter().map(|(_, count)| count).sum();
@@ -33970,7 +34253,7 @@ mod tests {
         // the next push, the live one stays.
         let mut buffer = WarmSourceReplayBuffer::default();
         for _ in 0..5 {
-            buffer.push(1, now_us + 10, &[1; 50], now_us);
+            buffer.push(1, 10, &[1; 50], now_us);
         }
         buffer.push(2, live, &[2; 50], now_us);
         let mutation = buffer.push(3, live, &[3; 50], now_us + 10);
@@ -33985,8 +34268,8 @@ mod tests {
             vec![2, 3]
         );
         check(&buffer);
-        // Not pushed when already expired.
-        assert_eq!(buffer.push(4, now_us, &[4; 50], now_us).added_datagrams, 0);
+        // Not pushed with no hold.
+        assert_eq!(buffer.push(4, 0, &[4; 50], now_us).added_datagrams, 0);
         let batch = buffer.take_live(now_us + 10);
         assert_eq!(batch.datagrams, vec![vec![2_u8; 50], vec![3_u8; 50]]);
         assert_eq!(buffer.bytes, 0);
@@ -34073,7 +34356,6 @@ mod tests {
                 buffered_source,
                 MediaDatagramRole::Source,
                 Some(&buffered_key),
-                Some(now_unix_us() + 1_000_000),
             )
             .await;
         assert_eq!(forwarder.snapshot().warm_source_buffered_datagrams, 1);
@@ -34110,7 +34392,7 @@ mod tests {
         assert_eq!(&received[..len], buffered_source);
 
         forwarder
-            .forward(b"promoted-source", MediaDatagramRole::Source, None, None)
+            .forward(b"promoted-source", MediaDatagramRole::Source, None)
             .await;
         let (len, _) = timeout(Duration::from_secs(1), child.recv_from(&mut received))
             .await
@@ -40603,7 +40885,7 @@ mod tests {
         // long before the first media datagram on a running relay.
         for _ in 0..3 {
             forwarder
-                .forward(b"warm", MediaDatagramRole::Source, None, None)
+                .forward(b"warm", MediaDatagramRole::Source, None)
                 .await;
         }
         for receiver in &receivers {
@@ -40617,7 +40899,7 @@ mod tests {
         // datagram at once, and only then does the relay wait for the first.
         forwarder.test_would_block.store(0b001, Ordering::Relaxed);
         forwarder
-            .forward(b"datagram-1", MediaDatagramRole::Source, None, None)
+            .forward(b"datagram-1", MediaDatagramRole::Source, None)
             .await;
         assert_eq!(
             take_relay_forward_attempts(&forwarder),
@@ -40635,7 +40917,7 @@ mod tests {
         // Two full children are waited for in the order of the paths.
         forwarder.test_would_block.store(0b101, Ordering::Relaxed);
         forwarder
-            .forward(b"datagram-2", MediaDatagramRole::Source, None, None)
+            .forward(b"datagram-2", MediaDatagramRole::Source, None)
             .await;
         assert_eq!(
             take_relay_forward_attempts(&forwarder),
@@ -40655,7 +40937,7 @@ mod tests {
         forwarder.test_would_block.store(0, Ordering::Relaxed);
         forwarder.set_nonblocking(false);
         forwarder
-            .forward(b"datagram-3", MediaDatagramRole::Source, None, None)
+            .forward(b"datagram-3", MediaDatagramRole::Source, None)
             .await;
         assert_eq!(
             take_relay_forward_attempts(&forwarder),
@@ -40692,7 +40974,6 @@ mod tests {
                             } else {
                                 MediaDatagramRole::Source
                             },
-                            None,
                             None,
                         )
                         .await;
@@ -40804,7 +41085,7 @@ mod tests {
         }
         take_relay_forward_attempts(&forwarder);
         forwarder
-            .forward(b"datagram-1", MediaDatagramRole::Source, None, None)
+            .forward(b"datagram-1", MediaDatagramRole::Source, None)
             .await;
         let attempts = take_relay_forward_attempts(&forwarder);
         assert!(!attempts.is_empty());
@@ -40829,7 +41110,7 @@ mod tests {
         take_relay_forward_attempts(&forwarder);
 
         forwarder
-            .forward(b"datagram-1", MediaDatagramRole::Source, None, None)
+            .forward(b"datagram-1", MediaDatagramRole::Source, None)
             .await;
         assert_eq!(
             take_relay_forward_attempts(&forwarder),
@@ -40851,7 +41132,7 @@ mod tests {
         // others have the datagram.
         forwarder.test_would_block.store(0b010, Ordering::Relaxed);
         forwarder
-            .forward(b"datagram-2", MediaDatagramRole::Source, None, None)
+            .forward(b"datagram-2", MediaDatagramRole::Source, None)
             .await;
         assert_eq!(
             take_relay_forward_attempts(&forwarder),
@@ -40870,7 +41151,7 @@ mod tests {
         // With the flag off each child gets a send of its own.
         forwarder.set_batch(false);
         forwarder
-            .forward(b"datagram-3", MediaDatagramRole::Source, None, None)
+            .forward(b"datagram-3", MediaDatagramRole::Source, None)
             .await;
         assert_eq!(
             take_relay_forward_attempts(&forwarder),
@@ -40884,7 +41165,7 @@ mod tests {
         forwarder.set_batch(true);
         forwarder.set_nonblocking(false);
         forwarder
-            .forward(b"datagram-4", MediaDatagramRole::Source, None, None)
+            .forward(b"datagram-4", MediaDatagramRole::Source, None)
             .await;
         assert_eq!(
             take_relay_forward_attempts(&forwarder),
@@ -40951,7 +41232,6 @@ mod tests {
                         format!("batched-{sequence:06}").as_bytes(),
                         role,
                         None,
-                        None,
                     )
                     .await;
                 expected_total += (0..4).filter(|child| wants(*child, sequence)).count() as u64;
@@ -40992,7 +41272,6 @@ mod tests {
                     .await;
             forwarder.set_batch(batch);
             forwarder.paths[0].socket.writable().await.unwrap();
-            let expires = now_unix_us() + 5_000_000;
             // Ten objects of ten symbols; the warm buffer keeps the newest
             // objects, more datagrams than one sendmmsg call carries.
             let payload = |object: u64, symbol: u64| format!("warm-{object:03}-{symbol:02}");
@@ -41014,7 +41293,6 @@ mod tests {
                             payload(object, symbol).as_bytes(),
                             MediaDatagramRole::Source,
                             Some(&key),
-                            Some(expires),
                         )
                         .await;
                 }
@@ -41158,13 +41436,12 @@ mod tests {
                     b"symbol",
                     MediaDatagramRole::Source,
                     Some(&key(object)),
-                    Some(now_unix_us() + 1_000_000),
                 )
                 .await;
         }
         // An AEP1 datagram has no object identity and is not journaled.
         forwarder
-            .forward(b"aep1", MediaDatagramRole::Source, None, None)
+            .forward(b"aep1", MediaDatagramRole::Source, None)
             .await;
         for receiver in &receivers {
             for _ in 0..5 {
@@ -41203,9 +41480,10 @@ mod tests {
             b"payload",
         )
         .unwrap();
-        journal_relay_symbol(&cache, &key, peer, 100, None);
-        journal_relay_symbol(&cache, &key, peer, 120, None);
-        journal_relay_symbol(&cache, &key, peer, 130, Some(140));
+        journal_relay_symbol(&cache, &key, peer, 100);
+        journal_relay_symbol(&cache, &key, peer, 120);
+        journal_relay_symbol(&cache, &key, peer, 130);
+        journal_relay_decoded(&cache, key.stream(), key.object(), peer, 140);
         let firsts = hop_events(&cache, HopStage::RelayFirst, stream_id);
         assert_eq!(firsts.len(), 1);
         assert_eq!(
@@ -41244,8 +41522,23 @@ mod tests {
                 .unwrap();
             assert!(event.t_us >= commit.t_us);
         }
-        // A retry of a stored part journals nothing more.
-        commit_canonical_gap_test_part(&cache, stream_id, 1).await;
+        // A retry of a stored part is no new part and journals nothing more.
+        assert_eq!(
+            cache
+                .commit_stream_payload(
+                    stream_id,
+                    encode_test_canonical_fmp4_object(
+                        stream_id,
+                        1,
+                        ObjectKind::Media,
+                        false,
+                        &canonical_gap_test_payload(1),
+                    ),
+                )
+                .await
+                .unwrap(),
+            Committed::AlreadyPresent(1)
+        );
         assert_eq!(hop_events(&cache, HopStage::Committed, stream_id).len(), 3);
 
         // The part response reports when this node committed the part and
@@ -43163,8 +43456,11 @@ mod tests {
         relay.stop().await;
     }
 
+    /// A deadline is a point on the stream's timeline: a stream whose
+    /// deadlines are behind this node's wall clock (a source clock that is
+    /// behind, a paused DAW, a slow path) is forwarded and committed.
     #[tokio::test]
-    async fn fast_plane_forwards_a_symbol_past_its_deadline() {
+    async fn fast_plane_forwards_and_commits_a_stream_behind_the_wall_clock() {
         let (child, _) = bind_class_pair(1_000).await;
         let relay = start_fast_relay(
             1_000,
@@ -43183,14 +43479,8 @@ mod tests {
         }
         let received = receive_all(&child, symbols.len()).await;
         assert_eq!(received.len(), symbols.len());
-        // The tee still bounds its receive state by the deadline.
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while relay.cache.relay_ingress_snapshot().deadline_drops == 0 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
+        wait_for_part(&relay.cache, 4001, 3).await;
+        assert_eq!(relay.cache.relay_ingress_snapshot().deadline_drops, 0);
         relay.stop().await;
     }
 
@@ -44377,6 +44667,10 @@ mod tests {
     /// The repair horizon of the live path: holes hold the watermark only
     /// briefly, and are listed as gaps.
     mod live_gaps;
+
+    /// Two contributors at one node: a commit stores a part once, and a
+    /// conflict or a stale epoch is counted, never an error (A AM5).
+    mod contributor_commits;
 
     /// Burst copies on the long-haul lanes: a burst of loss cannot take a
     /// part at the next forwarder.

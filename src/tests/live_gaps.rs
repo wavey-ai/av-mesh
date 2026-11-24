@@ -59,7 +59,7 @@ async fn commit(cache: &LiveTsCache, sequence: u64) {
             )
             .await
             .unwrap(),
-        sequence
+        Committed::Stored(sequence)
     );
 }
 
@@ -471,6 +471,150 @@ async fn with_the_horizon_off_a_gap_hold_skip_lists_no_gap() {
     assert!(!playlist.contains("GAP=YES"), "{playlist}");
     assert!(!playlist.contains("part3.mp4"), "{playlist}");
     assert!(playlist.contains("URI=\"part4.mp4\""), "{playlist}");
+}
+
+/// The repair horizon of the wide-hole tests: long enough that a stall of
+/// the test thread on a loaded host does not pass it between the commits
+/// that assert a hole is still held.
+const WIDE_HOLE_HORIZON_MS: u64 = 200;
+
+async fn sleep_past_the_horizon() {
+    tokio::time::sleep(Duration::from_millis(WIDE_HOLE_HORIZON_MS + 10)).await;
+}
+
+/// A canonical cache of 1 ms parts whose ring holds `ring_parts`, with the
+/// deployed gap hold and a repair horizon of `horizon_ms`.
+async fn wide_hole_cache(ring_parts: usize, horizon_ms: u64) -> Arc<LiveTsCache> {
+    let cache = LiveTsCache::with_ring(1, Duration::from_millis(1), 2, 64, 64, 2, ring_parts).await;
+    cache.set_canonical_gap_hold(Duration::from_millis(DEFAULT_CANONICAL_GAP_HOLD_MS));
+    cache.set_repair_horizon(RepairHorizon::Fixed(horizon_ms));
+    cache
+}
+
+/// Parts 0..=9, then `missing` numbers lost (both contributors down, the
+/// source running), then ten parts: the watermark waits at 9. Returns the
+/// first part after the hole.
+async fn commit_across_a_hole(cache: &LiveTsCache, missing: u64) -> u64 {
+    commit_init(cache).await;
+    for sequence in 0..10 {
+        commit(cache, sequence).await;
+    }
+    let resume = 10 + missing;
+    for sequence in resume..resume + 10 {
+        commit(cache, sequence).await;
+    }
+    assert_eq!(watermark(cache).await, Some(9));
+    resume
+}
+
+/// A hole wider than the walk's scan (1,024 parts) used to hold the
+/// watermark until it left the ring: 19 s or more of LL-HLS, cache-mesh
+/// push and cache-fed UDP. It is released after the repair horizon, as a
+/// narrow hole is.
+#[tokio::test]
+async fn a_hole_wider_than_the_scan_limit_is_released_after_the_horizon() {
+    let cache = wide_hole_cache(8_192, WIDE_HOLE_HORIZON_MS).await;
+    let resume = commit_across_a_hole(&cache, 5_000).await;
+    // Within the horizon the next part still waits.
+    let next = resume + 10;
+    commit(&cache, next).await;
+    assert_eq!(watermark(&cache).await, Some(9));
+    // The first part after the horizon: the watermark moves past the hole
+    // to it.
+    sleep_past_the_horizon().await;
+    commit(&cache, next + 1).await;
+    assert_eq!(watermark(&cache).await, Some(next as usize + 1));
+    assert_eq!(cache.relay_ingress_snapshot().wide_hole_releases, 1);
+    let snapshot = cache.canonical_gap_skip_snapshot();
+    assert_eq!(snapshot.repair_horizon_releases, 1);
+    assert_eq!(snapshot.skipped_parts, 5_000);
+    // The newest gaps are listed (a stream keeps 4,096); the rest of the
+    // hole is counted.
+    assert!(cache.is_gap_part(STREAM, resume - 1));
+    assert!(cache.is_gap_part(STREAM, next - MAX_GAP_PARTS_PER_STREAM as u64));
+    assert!(!cache.is_gap_part(STREAM, next - MAX_GAP_PARTS_PER_STREAM as u64 - 1));
+    // The stream goes on contiguously.
+    commit(&cache, next + 2).await;
+    assert_eq!(watermark(&cache).await, Some(next as usize + 2));
+}
+
+/// The same for a hole wider than the ring itself (30,000 parts with a
+/// ring of 20,000), and with no commit after the horizon: the
+/// housekeeping's release finds it.
+#[tokio::test]
+async fn a_hole_wider_than_the_ring_is_released() {
+    let cache = wide_hole_cache(20_000, WIDE_HOLE_HORIZON_MS).await;
+    let resume = commit_across_a_hole(&cache, 30_000).await;
+    assert_eq!(cache.release_expired_repair_holes().await, 0);
+    sleep_past_the_horizon().await;
+    assert_eq!(cache.release_expired_repair_holes().await, 1);
+    assert_eq!(watermark(&cache).await, Some(resume as usize + 9));
+    assert_eq!(cache.relay_ingress_snapshot().wide_hole_releases, 1);
+    assert_eq!(cache.canonical_gap_skip_snapshot().skipped_parts, 30_000);
+    commit(&cache, resume + 10).await;
+    assert_eq!(watermark(&cache).await, Some(resume as usize + 10));
+}
+
+#[tokio::test]
+async fn a_part_that_fills_a_wide_hole_late_is_still_stored() {
+    let cache = wide_hole_cache(8_192, WIDE_HOLE_HORIZON_MS).await;
+    let resume = commit_across_a_hole(&cache, 5_000).await;
+    sleep_past_the_horizon().await;
+    assert_eq!(cache.release_expired_repair_holes().await, 1);
+    let watermark_after = watermark(&cache).await;
+    assert_eq!(watermark_after, Some(resume as usize + 9));
+    // A part in the listed gaps, and one deeper in the hole.
+    for late in [resume - 1, 100] {
+        commit(&cache, late).await;
+        assert!(cache.get_part_for_stream_id(STREAM, late).await.is_some());
+        assert!(!cache.is_gap_part(STREAM, late));
+    }
+    assert_eq!(cache.canonical_gap_skip_snapshot().late_gap_fills, 1);
+    assert_eq!(watermark(&cache).await, watermark_after);
+    // A late part opens no wide hole of its own.
+    assert_eq!(cache.release_expired_repair_holes().await, 0);
+    assert_eq!(cache.relay_ingress_snapshot().wide_hole_releases, 1);
+}
+
+/// Two wide holes with a straggler between them (a contributor pair that
+/// flaps, a straggler between two outages): with no further commit, the
+/// housekeeping's passes release the first hole and then the second, each
+/// a horizon after the first part beyond it.
+#[tokio::test]
+async fn two_wide_holes_are_released_one_after_the_other() {
+    let cache = wide_hole_cache(20_000, WIDE_HOLE_HORIZON_MS).await;
+    commit_init(&cache).await;
+    for sequence in (0..10).chain(5_010..=5_100).chain(12_000..12_010) {
+        commit(&cache, sequence).await;
+    }
+    assert_eq!(watermark(&cache).await, Some(9));
+    sleep_past_the_horizon().await;
+    assert_eq!(cache.release_expired_repair_holes().await, 1);
+    assert_eq!(watermark(&cache).await, Some(5_100));
+    assert_eq!(cache.release_expired_repair_holes().await, 1);
+    assert_eq!(watermark(&cache).await, Some(12_009));
+    assert_eq!(cache.relay_ingress_snapshot().wide_hole_releases, 2);
+    assert_eq!(
+        cache.canonical_gap_skip_snapshot().skipped_parts,
+        5_000 + 6_899
+    );
+    commit(&cache, 12_010).await;
+    assert_eq!(watermark(&cache).await, Some(12_010));
+}
+
+#[tokio::test]
+async fn a_narrow_hole_is_released_as_before() {
+    let cache = wide_hole_cache(8_192, WIDE_HOLE_HORIZON_MS).await;
+    // 1,000 parts: inside the scan.
+    let resume = commit_across_a_hole(&cache, 1_000).await;
+    sleep_past_the_horizon().await;
+    commit(&cache, resume + 10).await;
+    assert_eq!(watermark(&cache).await, Some(resume as usize + 10));
+    assert_eq!(cache.relay_ingress_snapshot().wide_hole_releases, 0);
+    let snapshot = cache.canonical_gap_skip_snapshot();
+    assert_eq!(snapshot.repair_horizon_releases, 1);
+    assert_eq!(snapshot.skipped_parts, 1_000);
+    assert!(cache.is_gap_part(STREAM, 10));
 }
 
 #[tokio::test]

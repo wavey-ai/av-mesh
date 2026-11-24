@@ -18,15 +18,15 @@ use super::view::RlsView;
 use super::{class_addr, StreamClasses, TrafficClass};
 use crate::link_telemetry::LinkTelemetry;
 use crate::{
-    commit_relay_object, configure_udp_socket_buffers, journal_relay_symbol, now_unix_ms,
-    now_unix_us, process_relay_audio_epoch_datagram, process_udp_fec_ingest_datagram_inner,
-    relay_publication_clock, take_relay_deadline_drop_delta, AudioEpochDatagram, LiveTsCache,
-    NativeAudioRelay, RelayDownstreamForwarder, RelayForwardRole, RelayIngestRuntime,
-    RelayIngressParentPath, CANONICAL_STREAM_IDLE_RETENTION,
+    commit_relay_object, configure_udp_socket_buffers, journal_relay_decoded, journal_relay_symbol,
+    now_unix_ms, now_unix_us, process_relay_audio_epoch_datagram,
+    process_udp_fec_ingest_datagram_inner, relay_publication_clock, warn_relay_rejection,
+    AudioEpochDatagram, Committed, LiveTsCache, NativeAudioRelay, RelayDownstreamForwarder,
+    RelayForwardRole, RelayIngestRuntime, RelayIngressParentPath, CANONICAL_STREAM_IDLE_RETENTION,
 };
 use anyhow::{Context, Result};
 use av_mesh::relay_ingress::{
-    is_relay_datagram, PeerAdmission, RelayIngressError, RelayIngressOutcome, RelayIngressSnapshot,
+    is_relay_datagram, PeerAdmission, RelayIngressOutcome, RelayIngressSnapshot,
     RelayUdpDispatch, RelayUdpDispatchOutcome,
 };
 use av_mesh::udp_fec::UdpFecReceiver;
@@ -724,7 +724,6 @@ struct PlannedWarm {
     message: u16,
     path: u16,
     object: u64,
-    expires_at_us: u64,
 }
 
 /// A send to a lease child: `child` indexes the snapshot's children.
@@ -801,7 +800,6 @@ fn plan_lease(
                 message: message as u16,
                 path: child,
                 object: *object.get_or_insert_with(|| view_object_id(view)),
-                expires_at_us: view.deadline_us,
             }),
         }
     }
@@ -912,7 +910,6 @@ fn send_lease_plan(
         lease.buffer_warm(
             &snapshot.children[usize::from(warm.path)],
             warm.object,
-            warm.expires_at_us,
             batch.data(usize::from(warm.message)),
             now_us,
         );
@@ -983,7 +980,6 @@ impl RelayDownstreamForwarder {
                     message: message as u16,
                     path: index as u16,
                     object: *object.get_or_insert_with(|| view_object_id(view)),
-                    expires_at_us: view.deadline_us,
                 });
             }
             self.filtered_datagrams.fetch_add(1, Ordering::Relaxed);
@@ -1004,7 +1000,6 @@ impl RelayDownstreamForwarder {
                 &self.paths[usize::from(warm.path)],
                 class,
                 warm.object,
-                warm.expires_at_us,
                 batch.data(usize::from(warm.message)),
                 now_us,
             );
@@ -1921,6 +1916,9 @@ fn merge_snapshots(snapshots: &[RelayIngressSnapshot; 2]) -> RelayIngressSnapsho
     a.compact_decoded_objects += v.compact_decoded_objects;
     a.compact_unknown_descriptor += v.compact_unknown_descriptor;
     a.compact_descriptors_learned += v.compact_descriptors_learned;
+    a.wall_late_parts += v.wall_late_parts;
+    a.wall_late_max_us = a.wall_late_max_us.max(v.wall_late_max_us);
+    a.rejected_by_kind.add(&v.rejected_by_kind);
     merged
 }
 
@@ -1948,7 +1946,6 @@ struct Tee {
     upstream_repair: UpstreamRepair,
     limits: RelayLimits,
     holes: Option<Arc<crate::edge_holes::HoleTrigger>>,
-    reported_deadline_drops: u64,
     /// Tests: the tee panics on its first datagram.
     #[cfg(test)]
     panic_on_item: bool,
@@ -2019,24 +2016,15 @@ impl Tee {
                 "expired inactive UDP-FEC receive state"
             );
         }
+        // Assemblies that their stream's head has passed, or that went
+        // inactive. Datagrams the media clocks shed are counted by kind and
+        // logged by `process_symbol`'s limiter.
         let relay_expired = self.dispatch.receiver_mut().expire(now_unix_us());
         if relay_expired.objects > 0 {
             debug!(
                 class = self.class.as_str(),
                 expired_objects = relay_expired.objects,
-                "expired deadline-bound RelaySession receive state"
-            );
-        }
-        let snapshot = self.dispatch.receiver().snapshot();
-        if let Some(deadline_drops) = take_relay_deadline_drop_delta(
-            &mut self.reported_deadline_drops,
-            snapshot.counters.deadline_drops,
-        ) {
-            warn!(
-                class = self.class.as_str(),
-                deadline_drops,
-                deadline_drops_total = self.reported_deadline_drops,
-                "dropped expired RelaySession datagrams since previous ingress report"
+                "expired RelaySession receive state"
             );
         }
         self.publish();
@@ -2129,8 +2117,6 @@ impl Tee {
         video_kind: bool,
     ) {
         let peer = item.peer;
-        // The upstream repair of the stream's objects, for the fast lane's
-        // top-up.
         // The symbol's header, read again in place, for the fast lane's
         // top-up (the upstream repair of the stream's objects) and the hole
         // trigger.
@@ -2148,11 +2134,11 @@ impl Tee {
                 forwarder.journal_forward(key, child, sent_us);
             }
         };
-        // The deadline is checked against the arrival time: a symbol that
-        // waited in the tee is not dropped for it.
+        // The receiver's clocks age on the arrival time: a symbol that
+        // waited in the tee is not judged by the wait.
         match self.dispatch.push(peer, &item.bytes, item.rx_us) {
             Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Buffered { key, .. })) => {
-                journal_relay_symbol(&self.cache, &key, peer, item.rx_us, None);
+                journal_relay_symbol(&self.cache, &key, peer, item.rx_us);
                 journal_woken(&self.cache, &key, peer, item.woken_us);
                 journal_forward(&key);
                 self.mark_class(key.stream(), video_kind);
@@ -2164,13 +2150,8 @@ impl Tee {
                 accepted_datagrams,
                 ..
             })) => {
-                journal_relay_symbol(
-                    &self.cache,
-                    object.key(),
-                    peer,
-                    item.rx_us,
-                    Some(now_unix_us()),
-                );
+                let decoded_us = now_unix_us();
+                journal_relay_symbol(&self.cache, object.key(), peer, item.rx_us);
                 journal_woken(&self.cache, object.key(), peer, item.woken_us);
                 journal_forward(object.key());
                 self.mark_class(object.key().stream(), video_kind);
@@ -2187,7 +2168,21 @@ impl Tee {
                     .filter(|(lane, stream_id)| lane.load().streams.contains_key(stream_id))
                     .map(|_| envelope.clone());
                 match commit_relay_object(&self.cache, *object, envelope).await {
-                    Ok(_) => {
+                    // Another copy came first (the cache mesh, or the other
+                    // form of the part): its clients and the journal have
+                    // it. The parent is live all the same, and the stream
+                    // commits canonical slots all the same: the fast lane
+                    // serves it even while the cache mesh wins every part.
+                    Ok(Committed::AlreadyPresent(_)) => {
+                        if let (Some((lane, stream_id)), true) = (fast_lane, media) {
+                            lane.mark_committed(stream_id, canonical);
+                        }
+                        self.failover.stamp(&self.failover.decoded, Instant::now());
+                    }
+                    // Counted and logged by the cache; the first copy stays.
+                    Ok(Committed::Refused(_)) => {}
+                    Ok(Committed::Stored(_)) => {
+                        journal_relay_decoded(&self.cache, &stream, sequence, peer, decoded_us);
                         if let Some((lane, stream_id)) = fast_lane {
                             if media {
                                 lane.mark_committed(stream_id, canonical);
@@ -2233,13 +2228,14 @@ impl Tee {
             Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Duplicate { key, .. })) => {
                 journal_forward(&key);
             }
-            Ok(RelayUdpDispatchOutcome::Legacy) | Err(RelayIngressError::DeadlineExpired) => {}
+            Ok(RelayUdpDispatchOutcome::Legacy) => {}
             Err(error) => {
-                warn!(
-                    %peer,
-                    datagram_bytes = item.bytes.len(),
-                    error = %error,
-                    "RelaySession datagram rejected at configured dispatch seam"
+                warn_relay_rejection(
+                    &self.dispatch,
+                    peer,
+                    Some(self.class.as_str()),
+                    item.bytes.len(),
+                    &error,
                 );
             }
         }
@@ -2414,7 +2410,6 @@ pub async fn run_relay_class_ingest(
             upstream_repair: UpstreamRepair::default(),
             limits,
             holes: config.holes.clone(),
-            reported_deadline_drops: 0,
             #[cfg(test)]
             panic_on_item: config.test_tee_panic == Some(class),
         };

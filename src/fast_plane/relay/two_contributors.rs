@@ -800,6 +800,7 @@ fn a_kept_whole_part_ages_from_its_receipt_not_its_wire_deadline() {
             primary_children: ips.iter().map(|ip| (*ip).into()).collect(),
             max_children: 16,
             ranked: false,
+            warm_hold_us: DEFAULT_MEDIA_DEADLINE_US,
         },
         1 << 20,
     )
