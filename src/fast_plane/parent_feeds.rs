@@ -776,8 +776,12 @@ impl ParentFeeds {
     /// or the table is full: the table is copied with it.
     fn insert(&self, hash: u64, ip: IpAddr, stream: &str, track: &str) {
         let made = Arc::new(Feed::new(ip, stream, track));
+        // Whether the closure's last run replaced the table (rcu may run it
+        // again after a race): one that kept it has nothing to retire.
+        let replaced = std::cell::Cell::new(false);
         let old = self.table.rcu(|table| {
             if table.find(hash, ip, stream, track).is_some() || table.len >= MAX_FEEDS {
+                replaced.set(false);
                 return Arc::clone(table);
             }
             let mut next = Table::clone(table);
@@ -786,9 +790,12 @@ impl ParentFeeds {
                 .or_default()
                 .push(Arc::clone(&made));
             next.len += 1;
+            replaced.set(true);
             Arc::new(next)
         });
-        self.retired.keep(old);
+        if replaced.get() {
+            self.retired.keep(old);
+        }
     }
 
     /// Datagrams that found the table full.
@@ -1278,6 +1285,23 @@ mod tests {
         let feed = only(&feeds, T0 + 100);
         assert_eq!((feed.stream.as_str(), feed.track.as_str()), (stream.as_str(), track.as_str()));
         assert_eq!(feed.head_object, Some(41));
+    }
+
+    #[test]
+    fn an_insert_that_changes_nothing_retires_nothing() {
+        // D3 review 4: an insert of a key that exists (or into a full
+        // table) leaves the table as it is; it used to hand the current
+        // table to `retired`, where it and its feeds stayed for good.
+        let feeds = ParentFeeds::default();
+        let ip = parent(41);
+        let hash = feeds.hash(ip, "3001", "opaque-audio");
+        feeds.insert(hash, ip, "3001", "opaque-audio");
+        assert_eq!(feeds.retired.len(), 0);
+        for _ in 0..10 {
+            feeds.insert(hash, ip, "3001", "opaque-audio");
+        }
+        assert_eq!(feeds.retired.len(), 0);
+        assert_eq!(Arc::strong_count(&feeds.table.load_full()), 2, "the swap's and this one");
     }
 
     #[test]

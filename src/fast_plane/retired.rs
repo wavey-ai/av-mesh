@@ -29,13 +29,17 @@ impl<T> std::fmt::Debug for Retired<T> {
 
 impl<T> Retired<T> {
     /// Keep `old` while others hold it; free what no one else holds any
-    /// more, here. Called by the thread that replaced `old`.
+    /// more, here. Called by the thread that replaced `old`. A value kept
+    /// already is not kept twice: two entries would each count the other,
+    /// and the value would never be freed.
     pub fn keep(&self, old: Arc<T>) {
         let mut kept = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        kept.push(old);
+        if !kept.iter().any(|value| Arc::ptr_eq(value, &old)) {
+            kept.push(old);
+        }
         kept.retain(|value| Arc::strong_count(value) > 1);
     }
 
@@ -65,5 +69,22 @@ mod tests {
         retired.keep(swap.swap(Arc::new(3)));
         // The first is freed here, the second (no reader) at once.
         assert_eq!(retired.len(), 0);
+    }
+
+    #[test]
+    fn a_value_kept_twice_is_still_freed() {
+        // D3 review 4: two replacements that both hand over the same old
+        // value (an rcu whose closure kept the table) keep it once.
+        let retired = Retired::default();
+        let value = Arc::new(1_u32);
+        let weak = Arc::downgrade(&value);
+        let reader = Arc::clone(&value);
+        retired.keep(Arc::clone(&value));
+        retired.keep(value);
+        assert_eq!(retired.len(), 1);
+        drop(reader);
+        retired.keep(Arc::new(2));
+        assert_eq!(retired.len(), 0);
+        assert!(weak.upgrade().is_none(), "the value was freed");
     }
 }
