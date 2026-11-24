@@ -2432,6 +2432,45 @@ struct Args {
     #[arg(long, env = "NEEDLETAIL_MALLOC_TUNE", default_value_t = true, action = clap::ArgAction::Set)]
     malloc_tune: bool,
 
+    /// Memory round (24 Nov): the bytes of parts that the chunk caches of
+    /// every playlist keep together, in MB. `auto`: 10% of the node's memory
+    /// (the smaller of MemTotal and the cgroup's memory.max/high): 392 MB
+    /// on a 4 GB node, 800 MB on 8 GB. Shared equally among the streams
+    /// that hold 16 MB or more. 0: no bound (before: a 4K stream kept 46.5 s
+    /// of parts, 1.44 GB at 247 Mbit/s).
+    #[arg(long, env = "NEEDLETAIL_VIDEO_CACHE_MB", default_value = "auto")]
+    video_cache_mb: av_mesh::mem_guard::MemSetting,
+
+    /// The bytes one playlist's parts may take, in MB. `auto`: the node's
+    /// bound (`--video-cache-mb`). The window gives way to it: at 392 MB a
+    /// 4K stream keeps 12.7 s of parts at 247 Mbit/s (a playlist of 9.5 s)
+    /// and 9.8 s at 320 (a playlist of 7.4 s).
+    #[arg(long, env = "NEEDLETAIL_VIDEO_CACHE_PLAYLIST_MB", default_value = "auto")]
+    video_cache_playlist_mb: av_mesh::mem_guard::MemSetting,
+
+    /// The memory guard's soft limit on the process's RSS, in MB: above it
+    /// the video caches are shed to half a playlist's bound and no new video
+    /// playlist is taken. `auto`: 50% of the node's memory. 0: no guard.
+    #[arg(long, env = "NEEDLETAIL_MEMORY_SOFT_MB", default_value = "auto")]
+    memory_soft_mb: av_mesh::mem_guard::MemSetting,
+
+    /// The guard's hard limit, in MB: above it every video cache is shed.
+    /// `auto`: 65% of the node's memory.
+    #[arg(long, env = "NEEDLETAIL_MEMORY_HARD_MB", default_value = "auto")]
+    memory_hard_mb: av_mesh::mem_guard::MemSetting,
+
+    /// What the growable receive buffers of the video class and cache-mesh
+    /// sockets may ask for together, in MB (the kernel books twice this).
+    /// `auto`: 6% of the node's memory (235 MB asked of a 4 GB node). 0: no
+    /// node-level bound (each socket's own 128 MiB, as before).
+    #[arg(long, env = "NEEDLETAIL_SOCKET_BUFFER_MB", default_value = "auto")]
+    socket_buffer_mb: av_mesh::mem_guard::MemSetting,
+
+    /// A video stream with no part for this long keeps only its newest part
+    /// in the cache, and its memory goes back to the system. 0: never.
+    #[arg(long, env = "NEEDLETAIL_VIDEO_IDLE_RELEASE_MS", default_value_t = 30_000)]
+    video_idle_release_ms: u64,
+
     /// Wave 9 (cold start): fault in the pages of preallocated rings (the
     /// ones --mlock names) at start-up, not one by one while the first
     /// session fills them. `false`: as before.
@@ -3743,6 +3782,32 @@ async fn main() -> Result<()> {
         args.ring_parts,
     )
     .await;
+    let memory_budgets = av_mesh::mem_guard::Budgets::resolve(
+        av_mesh::mem_guard::NodeMemory::read(),
+        args.video_cache_mb,
+        args.video_cache_playlist_mb,
+        args.memory_soft_mb,
+        args.memory_hard_mb,
+        args.socket_buffer_mb,
+    );
+    let installed_memory = av_mesh::mem_guard::install(memory_budgets);
+    let _ = cache.memory_guard.set(Arc::clone(&installed_memory.guard));
+    cache
+        .set_byte_budget(CacheByteBudget {
+            playlist: memory_budgets.video_cache_playlist_bytes,
+            node: memory_budgets.video_cache_bytes,
+        })
+        .await;
+    info!(
+        node_memory_bytes = memory_budgets.node_memory_bytes,
+        video_cache_bytes = memory_budgets.video_cache_bytes,
+        video_cache_playlist_bytes = memory_budgets.video_cache_playlist_bytes,
+        soft_bytes = memory_budgets.soft_bytes,
+        hard_bytes = memory_budgets.hard_bytes,
+        socket_bytes = memory_budgets.socket_bytes,
+        "memory budgets"
+    );
+    spawn_memory_guard(Arc::clone(&cache), args.video_idle_release_ms);
     cache.set_canonical_gap_hold(Duration::from_millis(args.canonical_gap_hold_ms));
     cache.set_repair_horizon(args.canonical_repair_horizon);
     cache.set_repair_horizon_floor_for_burst_copy(Duration::from_millis(args.relay_burst_copy_ms));
@@ -9013,6 +9078,58 @@ fn canonical_gap_hold_parts(hold_ms: u64, part_target: Duration) -> u64 {
     hold_ms.saturating_mul(1_000).div_ceil(part_us)
 }
 
+/// Tests: hide a replaced or retired stream without giving its bytes back,
+/// as before the memory round (the memory bench's "before").
+#[cfg(test)]
+static LEGACY_HIDE: AtomicBool = AtomicBool::new(false);
+
+/// The memory guard (memory round, 24 Nov): once a second, off the hot
+/// path, it reads the process's RSS, sheds the video caches above its
+/// limits, releases quiet video streams, and gives the allocator's free
+/// pages back after a large release. See [`av_mesh::mem_guard`].
+fn spawn_memory_guard(cache: Arc<LiveTsCache>, idle_ms: u64) {
+    let Some(memory) = av_mesh::mem_guard::installed() else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(Duration::from_secs(1));
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticks.tick().await;
+            let rss = av_mesh::mem_guard::rss_bytes();
+            let tick = memory.guard.tick(rss, cache.chunk_cache.held_bytes());
+            if tick.changed {
+                warn!(
+                    state = ?tick.state,
+                    rss_bytes = rss,
+                    soft_bytes = memory.budgets.soft_bytes,
+                    hard_bytes = memory.budgets.hard_bytes,
+                    video_cache_bytes = cache.chunk_cache.held_bytes(),
+                    "memory guard: state changed (soft: video caches shed to their floor and no new video playlist; hard: every video cache shed)"
+                );
+            }
+            let released = cache
+                .memory_pass(
+                    tick.state,
+                    memory.budgets.shed_floor_bytes,
+                    idle_ms,
+                    now_unix_ms(),
+                )
+                .await;
+            if released > 0 && tick.state != av_mesh::mem_guard::GuardState::Ok {
+                memory.guard.note_shed(released);
+            }
+            if tick.trim {
+                if let Ok(returned) =
+                    tokio::task::spawn_blocking(av_mesh::mem_guard::trim).await
+                {
+                    memory.guard.note_trim(returned);
+                }
+            }
+        }
+    });
+}
+
 struct LiveTsCache {
     chunk_cache: Arc<ChunkCache>,
     stream_id: u64,
@@ -9104,6 +9221,9 @@ struct LiveTsCache {
     parent_feeds: OnceLock<Arc<fast_plane::parent_feeds::ParentFeeds>>,
     /// When this node started, in Unix µs: its boot id.
     started_unix_us: u64,
+    /// The node's memory guard: a new video playlist is refused above its
+    /// soft limit. Unset (tests), nothing is refused.
+    memory_guard: OnceLock<Arc<av_mesh::mem_guard::Guard>>,
 }
 
 impl LiveTsCache {
@@ -9243,6 +9363,7 @@ impl LiveTsCache {
             fast_plane: OnceLock::new(),
             parent_feeds: OnceLock::new(),
             started_unix_us,
+            memory_guard: OnceLock::new(),
         })
     }
 
@@ -10412,7 +10533,7 @@ impl LiveTsCache {
         validated_object: Option<MediaObject>,
     ) -> Result<Committed> {
         let bytes = payload.len();
-        self.make_room_for(stream_id).await?;
+        self.make_room_for(stream_id, bytes).await?;
         // Stream commits and retirement share this lock so a newly arriving
         // object cannot race cache/state removal for the same stream.
         let commit_lock = self.canonical_commit_lock(stream_id);
@@ -10464,7 +10585,7 @@ impl LiveTsCache {
                     source_epoch, "took up the canonical source epoch of the cache-mesh copy"
                 );
             } else if previous_epoch != Some(source_epoch) {
-                self.chunk_cache.zero_stream_id(stream_id);
+                self.hide_and_release_stream(stream_id);
                 self.forget_gap_parts(stream_id);
                 // A relay may restart and inherit an epoch that has already
                 // been active for minutes or hours. Its source age is not an
@@ -10499,6 +10620,8 @@ impl LiveTsCache {
                 state.stream_init_scanned.remove(&stream_id);
                 state.stream_inits.remove(&stream_id);
                 state.stream_media_kinds.remove(&stream_id);
+                state.stream_byte_caps.remove(&stream_id);
+                state.stream_ring_floor.remove(&stream_id);
                 if stream_id == self.stream_id {
                     state.last_committed_seq = None;
                     state.last_committed_unix_ms = None;
@@ -10892,6 +11015,117 @@ impl LiveTsCache {
         }
     }
 
+    /// Bound the bytes of the parts the cache keeps (`--video-cache-mb`,
+    /// `--video-cache-playlist-mb`).
+    async fn set_byte_budget(&self, budget: CacheByteBudget) {
+        self.state.write().await.byte_budget = budget;
+    }
+
+    /// One pass of the memory guard over the cache, off the hot path. Only
+    /// the large stores (streams that hold [`LARGE_STREAM_BYTES`] or more)
+    /// are ever capped, by their size, whatever they carry: a stream quiet
+    /// for `idle_ms` keeps only its newest part; above the soft limit the
+    /// large stores together keep `shed_floor` bytes, the largest cut first
+    /// (each to one level, the smaller ones kept whole); above the hard limit
+    /// each keeps only its newest part. The small 1 ms streams' stores are
+    /// never touched. The parts beyond a cap are dropped and their slots
+    /// cleared at once. Returns the retained bytes released.
+    async fn memory_pass(
+        &self,
+        state: av_mesh::mem_guard::GuardState,
+        shed_floor: u64,
+        idle_ms: u64,
+        now_ms: u64,
+    ) -> u64 {
+        use av_mesh::mem_guard::GuardState;
+        let (released, trims) = {
+            let mut live = self.state.write().await;
+            let mut caps = HashMap::new();
+            let mut large = Vec::new();
+            for (stream_id, held) in &live.stream_retained_bytes {
+                if *held < LARGE_STREAM_BYTES && !live.stream_byte_caps.contains_key(stream_id) {
+                    continue;
+                }
+                let quiet = idle_ms > 0
+                    && live
+                        .stream_last_ingest_unix_ms
+                        .get(stream_id)
+                        .is_some_and(|last| now_ms.saturating_sub(*last) > idle_ms);
+                if quiet {
+                    caps.insert(*stream_id, 0);
+                } else if *held >= LARGE_STREAM_BYTES {
+                    large.push(*held);
+                }
+            }
+            let level = match state {
+                GuardState::Ok => None,
+                GuardState::Hard => Some(0),
+                GuardState::Soft => Some(av_mesh::mem_guard::shed_level(&large, shed_floor)),
+            };
+            if let Some(level) = level {
+                for (stream_id, held) in &live.stream_retained_bytes {
+                    if *held >= LARGE_STREAM_BYTES || live.stream_byte_caps.contains_key(stream_id) {
+                        caps.entry(*stream_id).or_insert(level);
+                    }
+                }
+            }
+            if let Some(guard) = self.memory_guard.get() {
+                for (stream_id, cap) in &caps {
+                    if *cap == 0
+                        && !live.stream_byte_caps.contains_key(stream_id)
+                        && state == GuardState::Ok
+                    {
+                        guard.note_idle_release();
+                    }
+                }
+            }
+            live.stream_byte_caps = caps;
+            let capped: Vec<u64> = live.stream_byte_caps.keys().copied().collect();
+            let mut released = 0_u64;
+            let mut trims = Vec::new();
+            for stream_id in capped {
+                let before = live.stream_retained_bytes.get(&stream_id).copied().unwrap_or(0);
+                live.apply_retention(stream_id, self.window_parts);
+                let after = live.stream_retained_bytes.get(&stream_id).copied().unwrap_or(0);
+                released = released.saturating_add(before.saturating_sub(after));
+                if let Some(range) = live.ring_trim_range(stream_id, self.window_parts) {
+                    trims.push((stream_id, range));
+                }
+            }
+            (released, trims)
+        };
+        for (stream_id, (from, to)) in trims {
+            for id in from..to {
+                self.chunk_cache
+                    .clear_for_stream_id(stream_id, id as usize)
+                    .await;
+            }
+            self.invalidate_cached_playlist(stream_id);
+        }
+        released
+    }
+
+    /// Hide a stream's parts at once and give their bytes back off the
+    /// caller's path. A new source epoch takes the next free playlist slot,
+    /// so the old epoch's window would otherwise stay in memory until that
+    /// slot came round again (cmpd7: each step of a 4K sweep left its
+    /// window, 0.15-0.9 GB, until the node was killed).
+    fn hide_and_release_stream(&self, stream_id: u64) {
+        #[cfg(test)]
+        if LEGACY_HIDE.load(Ordering::Relaxed) {
+            // The memory bench's "before": hidden, the bytes left in place.
+            self.chunk_cache.zero_stream_id(stream_id);
+            return;
+        }
+        let Some(hidden) = self.chunk_cache.hide_stream_id(stream_id) else {
+            return;
+        };
+        let chunk_cache = Arc::clone(&self.chunk_cache);
+        tokio::spawn(async move {
+            chunk_cache.release_hidden(hidden).await;
+        });
+    }
+
     /// Drop the local copy of a playlist that the cache mesh supplied.
     async fn forget_mesh_stream(&self, stream_id: u64) {
         let commit_lock = self.canonical_commit_lock(stream_id);
@@ -10947,20 +11181,30 @@ impl LiveTsCache {
     /// The ring keeps four windows of nominal parts for every stream. A 4K
     /// part is hundreds of kilobytes, so a ring of them does not fit a small
     /// node. A stream keeps four of its own windows instead.
-    async fn trim_stream_ring(&self, stream_id: u64, newest: usize) {
-        let window_parts = self.window_parts_for(stream_id).await;
-        if window_parts >= self.window_parts {
-            return;
-        }
-        let retained = self
-            .state
-            .read()
-            .await
-            .stream_retained_parts(stream_id, self.window_parts);
-        if let Some(expired) = newest.checked_sub(retained) {
-            self.chunk_cache
-                .clear_for_stream_id(stream_id, expired)
-                .await;
+    ///
+    /// The byte budget can shorten a window by many parts at once (a rate
+    /// that rises, a second 4K stream, the memory guard), so the ring is
+    /// cleared from where it was last cleared up to the oldest retained
+    /// part, not one part per commit.
+    async fn trim_stream_ring(&self, stream_id: u64, _newest: usize) {
+        let range = {
+            let mut state = self.state.write().await;
+            // A stream of short parts (audio) whose window covers the
+            // configured one is left to the ring, as before, unless it is
+            // large.
+            if !state.stream_is_large(stream_id)
+                && state.stream_window_parts(stream_id, self.window_parts) >= self.window_parts
+            {
+                return;
+            }
+            state.ring_trim_range(stream_id, self.window_parts)
+        };
+        if let Some((from, to)) = range {
+            for id in from..to {
+                self.chunk_cache
+                    .clear_for_stream_id(stream_id, id as usize)
+                    .await;
+            }
         }
     }
 
@@ -11020,9 +11264,20 @@ impl LiveTsCache {
     /// took the slot of another: every stream of the node lost its window
     /// again and again. A full node now keeps what it has. A stream that
     /// has had no part for `STREAM_SLOT_IDLE_MS` gives up its slot.
-    async fn make_room_for(&self, stream_id: u64) -> Result<()> {
+    async fn make_room_for(&self, stream_id: u64, first_bytes: usize) -> Result<()> {
         if self.chunk_cache.resolve_stream(stream_id).is_some() {
             return Ok(());
+        }
+        // Above the guard's soft limit a new playlist whose first part is
+        // large is refused: by its size, whatever it carries. A stream of
+        // small parts (1 ms audio) is always taken.
+        if let Some(guard) = self.memory_guard.get() {
+            if !guard.takes_new_video() && first_bytes >= NEW_LARGE_PLAYLIST_BYTES {
+                guard.note_refused_video_playlist();
+                bail!(
+                    "the node's memory is above its soft limit: no new playlist of large parts (stream {stream_id}, {first_bytes} bytes)"
+                );
+            }
         }
         let slots = self.chunk_cache.options.num_playlists;
         if self.chunk_cache.stream_handles().len() < slots {
@@ -11073,7 +11328,7 @@ impl LiveTsCache {
                 continue;
             }
 
-            self.chunk_cache.zero_stream_id(stream_id);
+            self.hide_and_release_stream(stream_id);
             self.state.write().await.forget_stream(stream_id);
             self.forget_gap_parts(stream_id);
             for cached_playlist in &self.playlist_cache {
@@ -13213,7 +13468,36 @@ struct LiveState {
     stream_init_scanned: HashMap<u64, usize>,
     stream_inits: HashMap<u64, Bytes>,
     stream_media_kinds: HashMap<u64, LiveMediaKind>,
+    /// The bytes of parts that the cache keeps, per playlist and for the
+    /// node (`--video-cache-mb`, `--video-cache-playlist-mb`).
+    byte_budget: CacheByteBudget,
+    /// Tighter bounds on some streams' bytes: the memory guard's sheds and
+    /// the release of a video stream that has gone quiet.
+    stream_byte_caps: HashMap<u64, u64>,
+    /// The lowest part of each stream that the cache ring may still hold:
+    /// the ring is cleared from here up to the oldest retained part.
+    stream_ring_floor: HashMap<u64, u64>,
 }
+
+/// What the cache keeps of its parts, in bytes (memory round, 24 Nov). The
+/// windows count parts and time; a 4K stream's 46.5 s window was 1.44 GB at
+/// 247 Mbit/s, more than a 4 GB node can spare. 0: no bound.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CacheByteBudget {
+    /// One playlist's retained parts.
+    playlist: u64,
+    /// Every playlist of the node together, shared out equally among the
+    /// streams that hold at least [`LARGE_STREAM_BYTES`].
+    node: u64,
+}
+
+/// Above the memory guard's soft limit, a new playlist whose first part is
+/// this large or larger is refused.
+const NEW_LARGE_PLAYLIST_BYTES: usize = 256 << 10;
+
+/// A stream with fewer retained bytes than this does not take a share of
+/// the node's byte budget: an audio playlist holds a few megabytes.
+const LARGE_STREAM_BYTES: u64 = 16 << 20;
 
 impl LiveState {
     fn new() -> Self {
@@ -13250,7 +13534,132 @@ impl LiveState {
             stream_init_scanned: HashMap::new(),
             stream_inits: HashMap::new(),
             stream_media_kinds: HashMap::new(),
+            byte_budget: CacheByteBudget::default(),
+            stream_byte_caps: HashMap::new(),
+            stream_ring_floor: HashMap::new(),
         }
+    }
+
+    /// The bytes a stream's retained parts may take: its playlist's bound,
+    /// its share of the node's, and any cap the memory guard set. `None`:
+    /// no bound.
+    fn stream_byte_budget(&self, stream_id: u64) -> Option<u64> {
+        let mut budget = u64::MAX;
+        if self.byte_budget.playlist > 0 {
+            budget = self.byte_budget.playlist;
+        }
+        if self.byte_budget.node > 0 {
+            let large = self
+                .stream_retained_bytes
+                .values()
+                .filter(|bytes| **bytes >= LARGE_STREAM_BYTES)
+                .count()
+                .max(1) as u64;
+            budget = budget.min(self.byte_budget.node / large);
+        }
+        if let Some(cap) = self.stream_byte_caps.get(&stream_id) {
+            budget = budget.min(*cap);
+        }
+        (budget != u64::MAX).then_some(budget)
+    }
+
+    /// Whether a stream holds [`LARGE_STREAM_BYTES`] or more, or has a cap
+    /// of its own: only such a stream's byte budget is enforced beyond its
+    /// window (an audio stream's few megabytes never are).
+    fn stream_is_large(&self, stream_id: u64) -> bool {
+        self.stream_byte_caps.contains_key(&stream_id)
+            || self
+                .stream_retained_bytes
+                .get(&stream_id)
+                .is_some_and(|bytes| *bytes >= LARGE_STREAM_BYTES)
+    }
+
+    /// Parts of a stream that fit its byte budget, at the mean size of the
+    /// parts it holds. `None`: no bound, or nothing held to measure.
+    fn stream_byte_parts(&self, stream_id: u64) -> Option<usize> {
+        let budget = self.stream_byte_budget(stream_id)?;
+        let held = self.stream_retained_bytes.get(&stream_id).copied()?;
+        let parts = self.stream_parts.get(&stream_id)?.len() as u64;
+        if held == 0 || parts == 0 {
+            return None;
+        }
+        let mean = held.div_ceil(parts).max(1);
+        Some(usize::try_from(budget / mean).unwrap_or(usize::MAX))
+    }
+
+    /// A stream's playlist window and the parts kept after it, within its
+    /// byte budget. The window keeps what it can: the parts after it give
+    /// way first, down to a quarter of what fits. At least the newest part.
+    fn byte_bounded(&self, stream_id: u64, window: usize, after: usize) -> (usize, usize) {
+        let Some(fit) = self.stream_byte_parts(stream_id) else {
+            return (window, after);
+        };
+        if window.saturating_add(after) <= fit {
+            return (window, after);
+        }
+        let after = after.min(fit / 4);
+        let window = window.min(fit.saturating_sub(after)).max(1);
+        (window, after.min(fit.saturating_sub(window)))
+    }
+
+    /// Drop the records of a stream's parts beyond what it retains (its
+    /// retained parts, and its byte budget with an eighth's margin for a
+    /// rate that rises faster than the mean follows). The ring is cleared
+    /// up to the oldest retained part by [`Self::ring_trim_range`].
+    fn apply_retention(&mut self, stream_id: u64, configured: usize) {
+        let retained = if self.stream_declared_us.contains_key(&stream_id) {
+            self.stream_retained_parts(stream_id, configured)
+        } else {
+            self.stream_window_parts(stream_id, configured)
+        }
+        .max(1);
+        let hard = self
+            .stream_byte_budget(stream_id)
+            .map(|budget| budget.saturating_add(budget / 8));
+        let Some(parts) = self.stream_parts.get_mut(&stream_id) else {
+            return;
+        };
+        let mut held = self
+            .stream_retained_bytes
+            .get(&stream_id)
+            .copied()
+            .unwrap_or_default();
+        let head = parts.last_key_value().map_or(0, |(head, _)| *head);
+        let oldest = head.saturating_sub(retained.saturating_sub(1) as u64);
+        while parts.len() > 1
+            && parts.first_key_value().is_some_and(|(sequence, _)| {
+                *sequence < oldest || hard.is_some_and(|hard| held > hard)
+            })
+        {
+            if let Some((_, removed)) = parts.pop_first() {
+                held = held.saturating_sub(removed.bytes as u64);
+            }
+        }
+        self.stream_retained_bytes.insert(stream_id, held);
+    }
+
+    /// The parts of a stream whose slots the cache ring may still hold but
+    /// the stream no longer retains: from the ring floor up to (not
+    /// including) the oldest retained part, at most a ring of them. The
+    /// floor moves up to that part.
+    fn ring_trim_range(&mut self, stream_id: u64, configured: usize) -> Option<(u64, u64)> {
+        let ring = self.ring_parts_for(configured) as u64;
+        let parts = self.stream_parts.get(&stream_id)?;
+        let (head, _) = parts.last_key_value()?;
+        let head = *head;
+        let oldest_record = parts.first_key_value().map_or(head, |(sequence, _)| *sequence);
+        let retained = self.stream_retained_parts(stream_id, configured).max(1) as u64;
+        let keep_from = if self.stream_declared_us.contains_key(&stream_id) {
+            oldest_record.max(head.saturating_add(1).saturating_sub(retained))
+        } else {
+            head.saturating_add(1).saturating_sub(retained)
+        };
+        let floor = self.stream_ring_floor.get(&stream_id).copied()?;
+        if floor >= keep_from {
+            return None;
+        }
+        self.stream_ring_floor.insert(stream_id, keep_from);
+        Some((floor.max(keep_from.saturating_sub(ring)), keep_from))
     }
 
     fn next_stream_seq(&mut self, stream_id: u64) -> u64 {
@@ -13290,6 +13699,7 @@ impl LiveState {
                 .and_modify(|maximum| *maximum = (*maximum).max(duration_us))
                 .or_insert(duration_us);
         }
+        let configured_window = window_parts;
         // The record of a part outlives its place in the playlist, so that a
         // segment that has just left the playlist can still be put together.
         let window_parts = if stamp.is_some() || self.stream_declared_us.contains_key(&stream_id) {
@@ -13326,6 +13736,10 @@ impl LiveState {
                 })
                 .unwrap_or(u64::MAX)
         });
+        self.stream_ring_floor
+            .entry(stream_id)
+            .and_modify(|floor| *floor = (*floor).min(sequence))
+            .or_insert(sequence);
         let (inserted_bytes, removed_bytes) = {
             let parts = self.stream_parts.entry(stream_id).or_default();
             let inserted_bytes =
@@ -13388,6 +13802,11 @@ impl LiveState {
         *retained_bytes = retained_bytes
             .saturating_add(inserted_bytes)
             .saturating_sub(removed_bytes);
+        if self.stream_is_large(stream_id) && self.stream_byte_budget(stream_id).is_some() {
+            // The byte budget's margin: a rate that rises faster than the
+            // mean part follows.
+            self.apply_retention(stream_id, configured_window);
+        }
     }
 
     /// Segment number of a part of a stream whose segments start at key
@@ -13498,6 +13917,26 @@ impl LiveState {
     /// such as 0.25 ms PCM, covers it with more, up to what the cache ring
     /// holds beside the parts kept after the window.
     fn stream_window_parts(&self, stream_id: u64, configured: usize) -> usize {
+        self.stream_window_split(stream_id, configured).0
+    }
+
+    /// A stream's playlist window and the parts the cache keeps after it,
+    /// in parts: its window in time ([`Self::stream_time_window_parts`]) and
+    /// three target durations after it (four windows in all for a stream
+    /// without stamps), within the stream's byte budget.
+    fn stream_window_split(&self, stream_id: u64, configured: usize) -> (usize, usize) {
+        let window = self.stream_time_window_parts(stream_id, configured);
+        let after = match self.stream_declared_us.get(&stream_id) {
+            Some((part_us, target_us)) if *part_us > 0 => {
+                parts_after_window(u64::from(*part_us), u64::from(*target_us))
+            }
+            _ => window.saturating_mul(3),
+        };
+        self.byte_bounded(stream_id, window, after)
+    }
+
+    /// The playlist window of a stream in parts, by time alone.
+    fn stream_time_window_parts(&self, stream_id: u64, configured: usize) -> usize {
         let nominal_us = self.nominal_part_us;
         let ring = self.ring_parts_for(configured);
         if let Some((part_us, target_us)) = self
@@ -13593,17 +14032,12 @@ impl LiveState {
     /// three target durations after it, for which a part or a segment that
     /// has left the playlist must still be there for a reader that is slow.
     fn stream_retained_parts(&self, stream_id: u64, configured: usize) -> usize {
-        let window = self.stream_window_parts(stream_id, configured);
-        let retained = match self.stream_declared_us.get(&stream_id) {
-            Some((part_us, target_us)) if *part_us > 0 => {
-                let after = parts_after_window(u64::from(*part_us), u64::from(*target_us));
-                window.saturating_add(after)
-            }
-            // A stream without stamps keeps four windows, as the ring does.
-            _ => window.saturating_mul(4),
-        };
+        // A stream without stamps keeps four windows, as the ring does.
+        let (window, after) = self.stream_window_split(stream_id, configured);
         // A part that the ring has overwritten is not retained.
-        retained.min(self.ring_parts_for(configured))
+        window
+            .saturating_add(after)
+            .min(self.ring_parts_for(configured))
     }
 
     /// Longest part of a stream seen so far, or the nominal part of the
@@ -13853,6 +14287,8 @@ impl LiveState {
         self.stream_init_scanned.remove(&stream_id);
         self.stream_inits.remove(&stream_id);
         self.stream_media_kinds.remove(&stream_id);
+        self.stream_byte_caps.remove(&stream_id);
+        self.stream_ring_floor.remove(&stream_id);
     }
 
     fn take_current(&mut self, now: Instant, now_ms: u64) -> Option<PendingPart> {
@@ -22204,6 +22640,7 @@ impl AppRouter {
             client_udp,
             entry,
             node_warm: self.node_status.node_warm.clone(),
+            memory: av_mesh::mem_guard::installed().map(|installed| installed.snapshot()),
         });
         memory.cached = Some((now, Arc::clone(&status)));
         status
@@ -46775,6 +47212,11 @@ mod tests {
     /// The video tee at 247 and 300 Mbit/s of 4K (fix4-video): what it
     /// drops, what it commits and its processor time.
     mod video_tee;
+
+    /// The node's memory at 4K (memory round, 24 Nov): the caches' byte
+    /// bounds, the release of a replaced or quiet stream, the memory guard,
+    /// and the in-process memory bench.
+    mod memory_bound;
 
     /// Edge capacity (wave 7, item 10): listeners of 1 ms parts per edge,
     /// and an ingest that never drops for the fan-out.
