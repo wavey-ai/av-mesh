@@ -695,6 +695,9 @@ struct ListenerRun {
     /// the last media of the leg it replaced to its end, and each span on
     /// one path. What a change can do to this listener, it does then.
     events_us: Vec<(u64, u64)>,
+    /// Its director's changes (Unix ms): legs, requests, answers, moves
+    /// and spans on one path, for a failure's message.
+    trace: Vec<String>,
 }
 
 /// Datagram loss, deterministic per listener.
@@ -822,7 +825,9 @@ async fn listen(
         abandoned: 0,
         nacked: 0,
         events_us: Vec::new(),
+        trace: Vec::new(),
     };
+    let mut traced = 0_u64;
     let mut nodes: Vec<String> = Vec::new();
     let mut lasts: Vec<(LegKey, Instant)> = Vec::new();
     let mut outbox: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
@@ -885,6 +890,7 @@ async fn listen(
             outbox.push((to, datagram.to_vec()))
         });
         director.poll(&mut session, now, &mut actions);
+        trace_out(&mut run.trace, &actions);
         send_all(&socket, &mut outbox, &mut actions).await;
         let interval = session.receiver.compact.part_interval().unwrap_or_default();
         let window = Duration::from_millis(20).max(interval * 8);
@@ -893,6 +899,7 @@ async fn listen(
             single_path_observe(&mut run.single_path, &director, &lasts, now, window);
         }
         close_spans(&mut run);
+        trace_state(&mut run, &mut traced, &director, &lasts, now, window);
         let delivering = lasts
             .iter()
             .filter(|(_, at)| now.saturating_duration_since(*at) <= window)
@@ -959,7 +966,9 @@ async fn listen(
         };
         let datagram = &buf[..len];
         let now = Instant::now();
+        trace_in(&mut run.trace, peer, datagram);
         if director.on_datagram(&mut session, peer, datagram, now, &mut actions) {
+            trace_out(&mut run.trace, &actions);
             send_all(&socket, &mut outbox, &mut actions).await;
             continue;
         }
@@ -1022,6 +1031,17 @@ async fn listen(
     let unix = |at: Instant| {
         now_us().saturating_sub(Instant::now().saturating_duration_since(at).as_micros() as u64)
     };
+    for replacement in &run.replacements {
+        run.trace.push(format!(
+            "{} replacement {} -> {} {} {:?} {:?}",
+            unix(replacement.at) / 1_000,
+            replacement.from,
+            replacement.to,
+            replacement.reason,
+            replacement.kind,
+            replacement.handover
+        ));
+    }
     run.events_us = run
         .replacements
         .iter()
@@ -1039,6 +1059,107 @@ async fn listen(
     run.abandoned = session.receiver.compact.stats.abandoned;
     run.nacked = session.receiver.compact.stats.nacked;
     run
+}
+
+/// The director's legs, spare and want and the span on one path, traced
+/// when they change (`traced`: their hash; formatted only then).
+fn trace_state(
+    run: &mut ListenerRun,
+    traced: &mut u64,
+    director: &Director,
+    lasts: &[(LegKey, Instant)],
+    now: Instant,
+    window: Duration,
+) {
+    use std::hash::{Hash, Hasher};
+    let delivering = |key: LegKey| {
+        lasts
+            .iter()
+            .any(|(held, at)| *held == key && now.saturating_duration_since(*at) <= window)
+    };
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for leg in director.legs() {
+        (leg.key, &leg.node, leg.live, delivering(leg.key)).hash(&mut hasher);
+        (
+            leg.leaving.as_ref().map(|(why, _)| why),
+            leg.stands_for,
+            leg.hedge_for,
+        )
+            .hash(&mut hasher);
+    }
+    (director.want(), director.spare(), run.single_path.is_open()).hash(&mut hasher);
+    let state = hasher.finish();
+    if state == *traced {
+        return;
+    }
+    *traced = state;
+    let legs: Vec<String> = director
+        .legs()
+        .iter()
+        .map(|leg| {
+            format!(
+                "{}:{}{}{}{}{}{}",
+                leg.key.0,
+                leg.node,
+                if leg.live { "" } else { " not-live" },
+                if delivering(leg.key) {
+                    " delivering"
+                } else {
+                    ""
+                },
+                leg.leaving
+                    .as_ref()
+                    .map_or(String::new(), |(why, _)| format!(" leaving-{why}")),
+                leg.stands_for
+                    .map_or(String::new(), |key| format!(" for-{}", key.0)),
+                leg.hedge_for
+                    .map_or(String::new(), |key| format!(" hedge-{}", key.0)),
+            )
+        })
+        .collect();
+    run.trace.push(format!(
+        "{} legs {legs:?} want {} spare {:?} one-path {}",
+        now_us() / 1_000,
+        director.want(),
+        director.spare(),
+        run.single_path.is_open()
+    ));
+}
+
+/// The director's requests (not its confirmations) in `actions`.
+fn trace_out(trace: &mut Vec<String>, actions: &[Action]) {
+    for action in actions {
+        if let Action::Send { datagram, .. } = action {
+            if let Some(av_mesh::client_udp::Control::Assign {
+                nonce,
+                skip,
+                paths,
+                spare,
+                hold,
+                token: None,
+                ..
+            }) = av_mesh::client_udp::Control::decode(datagram)
+            {
+                trace.push(format!(
+                    "{} ask {nonce:x} p={paths} s={spare} skip={skip:?} hold={hold:?}",
+                    now_us() / 1_000
+                ));
+            }
+        }
+    }
+}
+
+/// An answer, a `MOVE` or a refusal that came.
+fn trace_in(trace: &mut Vec<String>, peer: SocketAddr, datagram: &[u8]) {
+    use av_mesh::client_udp::Control;
+    match Control::decode(datagram) {
+        Some(
+            control @ (Control::Assigned { .. } | Control::Move { .. } | Control::Refused { .. }),
+        ) => {
+            trace.push(format!("{} from {peer}: {control:?}", now_us() / 1_000));
+        }
+        _ => {}
+    }
 }
 
 fn single_path_observe(
@@ -1795,10 +1916,11 @@ async fn roll_of_three_edges() {
         let (_, longest) = single_path_in(run, marks);
         assert!(
             longest <= ROLL_SINGLE_PATH_BOUND.as_micros() as u64,
-            "{}: {longest} us on one path: {:?} {:?}",
+            "{}: {longest} us on one path: {:?} {:?}\ntrace:\n{}",
             run.sid,
             run.single_spans_us,
-            run.replacements
+            run.replacements,
+            run.trace.join("\n")
         );
         assert_handovers(run, &run.replacements);
     }
