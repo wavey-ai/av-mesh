@@ -23,6 +23,7 @@ use crate::AppRouter;
 use playlists::mesh::CacheMeshHandle;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -208,11 +209,17 @@ impl NodeLifecycle {
         Arc::clone(&self.inner.hello)
     }
 
-    /// The state the readiness evaluator found, for the hello.
-    pub(crate) fn set_hello_state(&self, state: NodeState) {
-        self.inner
-            .hello
-            .store(hello_state(state), Ordering::Relaxed);
+    /// The state the readiness evaluator found from the reasons `with`, for
+    /// the hello. When the reasons changed since, the change has set the
+    /// byte from the reasons now, and a state found from older ones is not
+    /// stored over it.
+    pub(crate) fn set_hello_state(&self, state: NodeState, with: DrainReasons) {
+        let _change = self.lock_change();
+        if self.reasons() == with {
+            self.inner
+                .hello
+                .store(hello_state(state), Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn reasons(&self) -> DrainReasons {
@@ -394,14 +401,12 @@ impl DrainState {
         }
     }
 
-    /// Keep an operator's drain from now: written whole or not at all.
+    /// Keep an operator's drain from now: written whole or not at all, and
+    /// on the disk before this returns, so that it survives a host that
+    /// stops uncleanly (C 4).
     fn write(path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            std::fs::create_dir_all(parent)?;
-        }
+        let parent = parent_dir(path);
+        std::fs::create_dir_all(parent)?;
         let state = Self {
             reason: DrainReason::Operator.as_str().to_owned(),
             since_unix_ms: crate::now_unix_ms(),
@@ -409,19 +414,29 @@ impl DrainState {
         let mut staged = path.as_os_str().to_owned();
         staged.push(".next");
         let staged = PathBuf::from(staged);
-        std::fs::write(
-            &staged,
-            serde_json::to_vec(&state).map_err(std::io::Error::other)?,
-        )?;
-        std::fs::rename(&staged, path)
+        let mut file = std::fs::File::create(&staged)?;
+        file.write_all(&serde_json::to_vec(&state).map_err(std::io::Error::other)?)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&staged, path)?;
+        std::fs::File::open(parent)?.sync_all()
     }
 
+    /// End an operator's drain, on the disk before this returns.
     fn remove(path: &Path) -> std::io::Result<()> {
         match std::fs::remove_file(path) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
-            _ => Ok(()),
+            Ok(()) => std::fs::File::open(parent_dir(path))?.sync_all(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
         }
     }
+}
+
+/// The directory that holds `path` (the working directory for a bare name).
+fn parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
 }
 
 /// SIGTERM and SIGINT, both a graceful stop.
@@ -600,7 +615,9 @@ async fn run_start(
     let mut tick = tokio::time::interval(START_POLL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut heads = crate::RegionHeads::default();
-    while lifecycle.holds(DrainReason::Start) {
+    // A stop wins: no warm-up is waited for, no copy opened, no start
+    // forced on a node that will not serve (C 4).
+    while lifecycle.holds(DrainReason::Start) && !lifecycle.holds(DrainReason::Stopping) {
         tokio::select! {
             _ = shutdown_rx.changed() => return,
             _ = tick.tick() => {}

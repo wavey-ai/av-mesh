@@ -21717,7 +21717,7 @@ impl AppRouter {
             Readiness::forwarder(&inputs, memory.warm)
         };
         memory.warm = readiness.warm;
-        self.lifecycle.set_hello_state(readiness.state);
+        self.lifecycle.set_hello_state(readiness.state, drain);
         if readiness.ready() && memory.ready_unix_ms.is_none() {
             memory.ready_unix_ms = Some(now_us / 1_000);
         }

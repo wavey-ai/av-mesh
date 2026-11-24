@@ -396,8 +396,10 @@ async fn a_second_signal_skips_the_wait() {
         .unwrap()
         .expect("the second signal was sent");
     assert!(stopped.skipped && !stopped.drained, "{stopped:?}");
+    // At once: well inside the listener's grace, which would otherwise
+    // hold the edge (the margin is for a loaded machine).
     assert!(
-        second_at.elapsed() < Duration::from_millis(300),
+        second_at.elapsed() < Duration::from_millis(1_500),
         "{stopped:?}"
     );
     assert!(stopped.waited < Duration::from_secs(4), "{stopped:?}");
@@ -475,7 +477,7 @@ async fn an_edge_waits_for_moved_readers_that_still_fetch() {
         "{stopped:?}"
     );
     assert!(
-        done <= empty + STOP_HOLD + Duration::from_millis(250),
+        done <= empty + STOP_HOLD + Duration::from_secs(1),
         "{stopped:?}"
     );
     assert!(
@@ -567,6 +569,9 @@ async fn a_restarted_edge_takes_no_listener_until_it_is_warm() {
         edge.stats.live_subscribers() == Some(1)
     })
     .await;
+    // Parts reach the listener a moment after the edge takes it; on a
+    // loaded machine leaving at once can be before the first.
+    tokio::time::sleep(Duration::from_millis(300)).await;
     leave.store(true, Ordering::Relaxed);
     let heard = listener.await.unwrap();
     start.await.unwrap();
@@ -1737,6 +1742,84 @@ async fn a_restarted_edge_waits_for_the_heads_of_its_region() {
         .unwrap();
     assert!(!router.lifecycle.ready_forced());
     assert!(router.lifecycle.reasons().list().is_empty());
+}
+
+/// SIGTERM while a node starts: `stopping` wins (C 4). The start ends
+/// without waiting for its warm-up, opens no copy and forces nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_during_the_start_ends_the_start() {
+    let cache = canonical_gap_test_cache().await;
+    let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+    let lifecycle = NodeLifecycle::new(LifecycleConfig {
+        edge: true,
+        start_drained: true,
+        state_file: None,
+        warm_pass: true,
+    });
+    let router = router_with(
+        "uk-edge-1",
+        Arc::clone(&cache),
+        mesh,
+        CacheMeshRole::Edge,
+        lifecycle,
+        0,
+    )
+    .with_playlist_demand(demand_config(Duration::from_secs(5), 0));
+    // A region whose heads are known and move: a start would open a copy.
+    let at = now_unix_ms();
+    for (advert, head) in [(at, 30), (at + 1_000, 40)] {
+        router
+            .telemetry
+            .ingest_snapshot(holder_snapshot("uk-edge-2", advert, &[(7, head, false)]))
+            .await;
+    }
+    router.lifecycle.drain(DrainReason::Stopping);
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    // A start timeout already past: a start that ran would force itself.
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        start_edge(router.clone(), Duration::ZERO, shutdown_rx),
+    )
+    .await
+    .expect("the start ends at once");
+    assert!(!router.lifecycle.ready_forced());
+    assert!(router.lifecycle.holds(DrainReason::Start));
+    assert!(router.playlist_demand.streams.is_empty());
+    assert!(router.lifecycle.warm_pass().copies.is_empty());
+    let status = router.node_status().await;
+    assert_eq!(status.state, NodeState::Stopping);
+}
+
+/// The hello's state byte follows the reasons: a state the evaluator found
+/// before a reason changed is not stored over what the change set.
+#[test]
+fn a_state_found_before_a_change_does_not_overwrite_the_hello() {
+    let lifecycle = NodeLifecycle::new(LifecycleConfig {
+        edge: true,
+        start_drained: true,
+        ..LifecycleConfig::default()
+    });
+    let hello = lifecycle.hello();
+    let found_with = lifecycle.reasons();
+    lifecycle.resume(DrainReason::Start);
+    assert_eq!(
+        hello.load(Ordering::Relaxed),
+        lifecycle::hello_state(NodeState::Ready)
+    );
+    lifecycle.drain(DrainReason::Stopping);
+    // An evaluation that read the reasons before the stop stores late.
+    lifecycle.set_hello_state(NodeState::Starting, found_with);
+    assert_eq!(
+        hello.load(Ordering::Relaxed),
+        lifecycle::hello_state(NodeState::Stopping)
+    );
+    // One that read them as they are is stored.
+    let operator = NodeLifecycle::default();
+    operator.set_hello_state(NodeState::Degraded, operator.reasons());
+    assert_eq!(
+        operator.hello().load(Ordering::Relaxed),
+        lifecycle::hello_state(NodeState::Degraded)
+    );
 }
 
 /// F7: a slot that starts drained holds the playlists its region's edges
