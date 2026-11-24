@@ -1036,6 +1036,19 @@ fn rendezvous_score(session: &str, cache: &CacheCandidate) -> f64 {
     -free / unit.ln()
 }
 
+/// A weighted rendezvous score of a cache for a session with the weight
+/// given (at least 1): the cache with the highest wins, each in proportion
+/// to its weight.
+fn weighted_rendezvous(session: &str, cache: &CacheCandidate, weight: f64) -> f64 {
+    let weight = weight.max(1.0);
+    if session.is_empty() {
+        return weight;
+    }
+    let hash = fnv1a64(session.as_bytes(), cache.node_id.as_bytes());
+    let unit = ((hash >> 11) as f64 + 0.5) / (1_u64 << 53) as f64;
+    -weight / unit.ln()
+}
+
 /// FNV-1a over the session and the cache name, with a final avalanche. The
 /// result must be the same on every node and in every build, so it does not
 /// use the standard library hasher.
@@ -1382,6 +1395,102 @@ mod tests {
         legs_busy.sort_unstable();
         assert_eq!(legs_busy, ["edge-1", "edge-2"]);
         assert!(assignment.second_leg_same_host);
+    }
+
+    /// D 5 against B 3.5, 3.8 (integration 2): after an edge dies, the
+    /// replacement leg (a mover that holds its other leg, apportioned by
+    /// headroom) and the new spare in the same answer avoid the surviving
+    /// leg's host when another is eligible, even where the edge that shares
+    /// it has the most headroom; and the spare a join is given (the hedge's
+    /// target when either leg dies) is on neither leg's host.
+    #[test]
+    fn a_replacement_leg_and_the_spare_avoid_the_surviving_leg_s_host() {
+        // edge-1 died (host-a); edge-2 is the leg that survives (host-b).
+        // edge-3 shares host-b and is the emptiest; edge-4 (host-c) and
+        // edge-5 (host-d) are on hosts of their own.
+        let caches = [
+            on_host("host-b", cache("edge-2", 300, Some(9))),
+            on_host("host-b", cache("edge-3", 50, Some(9))),
+            on_host("host-c", cache("edge-4", 400, Some(9))),
+            on_host("host-d", cache("edge-5", 450, Some(9))),
+        ];
+        let held = ["host-b".to_owned()];
+        for index in 0..200 {
+            let session = format!("listener-{index}");
+            let replacement = AssignmentRequest {
+                paths: 1,
+                spare: true,
+                redundant: true,
+                moving: true,
+                listener_permille: Some(5.0),
+                held_hosts: &held,
+                ..request(&session)
+            };
+            let assignment = assign(
+                replacement,
+                AssignmentPolicy::default(),
+                &caches[1..],
+            )
+            .unwrap();
+            let leg = legs(&assignment)[0];
+            assert_ne!(
+                host_of(&caches, leg),
+                Some("host-b"),
+                "{session}: {assignment:?}"
+            );
+            assert!(!assignment.second_leg_same_host, "{assignment:?}");
+            assert!(assignment.spare, "{assignment:?}");
+            let spare = &assignment.caches[1];
+            assert_eq!(spare.reason, AssignmentReason::Spare);
+            let spare_host = host_of(&caches, &spare.node_id);
+            assert_ne!(spare_host, Some("host-b"), "{session}: {assignment:?}");
+            assert_ne!(spare_host, host_of(&caches, leg), "{session}: {assignment:?}");
+        }
+        // Only the surviving leg's host has room under the gate: the
+        // replacement is made there all the same, and the answer says so.
+        let mut full = caches.clone();
+        full[2].load_permille = 900;
+        full[3].load_permille = 900;
+        let replacement = AssignmentRequest {
+            paths: 1,
+            redundant: true,
+            moving: true,
+            listener_permille: Some(5.0),
+            held_hosts: &held,
+            ..request("listener-1")
+        };
+        let assignment = assign(replacement, AssignmentPolicy::default(), &full[1..]).unwrap();
+        assert_eq!(legs(&assignment), ["edge-3"]);
+        assert!(assignment.second_leg_same_host);
+        // A join's spare (where a hedge goes when either leg dies) is on
+        // neither leg's host while a third host has a holder.
+        let join = [
+            on_host("host-a", cache("edge-1", 100, Some(9))),
+            on_host("host-b", cache("edge-2", 100, Some(9))),
+            on_host("host-b", cache("edge-3", 50, Some(9))),
+            on_host("host-c", cache("edge-4", 600, Some(9))),
+        ];
+        for index in 0..300 {
+            let session = format!("listener-{index}");
+            let ask = AssignmentRequest {
+                paths: 2,
+                spare: true,
+                ..request(&session)
+            };
+            let assignment = assign(ask, AssignmentPolicy::default(), &join).unwrap();
+            let leg_hosts: Vec<_> = legs(&assignment)
+                .iter()
+                .map(|leg| host_of(&join, leg))
+                .collect();
+            if leg_hosts[0] == leg_hosts[1] {
+                continue;
+            }
+            let spare = &assignment.caches[2];
+            assert!(
+                !leg_hosts.contains(&host_of(&join, &spare.node_id)),
+                "{session}: {assignment:?}"
+            );
+        }
     }
 
     /// D 5: every edge on one host gives the choice made without tags, and

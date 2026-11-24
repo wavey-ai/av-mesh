@@ -1665,6 +1665,109 @@ async fn roll_of_three_edges() {
     }
 }
 
+/// C 3.2 against B 3.12 (integration 2): SIGTERM on an edge that holds legs
+/// of two-path listeners, and a moved LL-HLS reader that still fetches, is
+/// a graceful stop. The edge says it is leaving (`stopping`, advertised as
+/// draining), moves each leg make before break, waits until its UDP
+/// subscribers have left (each at its `UNSUB` or the grace) and the reader
+/// has stopped fetching, then releases its subscriptions and exits; here it
+/// is then taken out as the process ends. Nothing is missing, no listener
+/// is on one path or interrupted, every leg there is handed over, nothing
+/// is cut at the grace, and the stop ends well within its bound (the
+/// default `--stop-drain-ms`: drain spread + move grace + 2 s = 14 s).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sigterm_stop_hands_two_path_listeners_over() {
+    let _serial = SERIAL.lock().await;
+    let region = Region::start(216, Payload::Pcm, [100; 4]).await;
+    let crowd = Crowd::join(&region, listeners("sigterm", 8)).await;
+    steady(STEADY_BEFORE).await;
+    let stopped_node = region.node(0);
+    let edge = region.edge(0);
+    assert!(region.legs_at(0) > 0, "{stopped_node} holds legs");
+    // A reader redirected at its last reload that still fetches parts it
+    // was told about for 1.2 s (`hls_moved_active`, then a read).
+    let request = |draining| PlaybackRequest {
+        session_id: Some("reader"),
+        stream_id: Some(STREAM),
+        draining,
+    };
+    assert_eq!(
+        edge.router.edge_load.admit_playback(request(false)),
+        PlaybackAdmission::Admitted
+    );
+    assert!(edge.router.edge_load.egress.release_session("reader"));
+    let fetching = edge.router.clone();
+    let reader = tokio::spawn(async move {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(1_200) {
+            let _ = fetching.edge_load.admit_playback(request(true));
+            let read = fetching.edge_load.begin_read(false);
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            drop(read);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Instant::now()
+    });
+    let bound = Duration::from_millis(
+        edge_udp::DEFAULT_DRAIN_SPREAD_MS
+            + edge_udp::DEFAULT_MOVE_GRACE_MS
+            + lifecycle::STOP_DRAIN_SPARE_MS,
+    );
+    let start = now_us();
+    let began = Instant::now();
+    // `stopping` is advertised at once: the entries assign the edge nobody.
+    region.slots.lock().unwrap()[0].draining = true;
+    let stopped = lifecycle::stop_edge(&edge.router, bound, std::future::pending()).await;
+    let reader_done = reader.await.unwrap();
+    let marks = Marks {
+        start,
+        end: now_us(),
+    };
+    assert!(stopped.drained && !stopped.skipped, "{stopped:?}");
+    assert!(
+        began + stopped.waited >= reader_done + lifecycle::STOP_HOLD,
+        "the stop waited for the moved reader: {stopped:?}"
+    );
+    // The drain spread (2 s), the hand-overs (B 3.11: level 32 parts after
+    // 3.5 r) and a second empty: far inside the bound.
+    assert!(
+        stopped.waited <= Duration::from_secs(6),
+        "{stopped:?} against a bound of {bound:?}"
+    );
+    assert_eq!(region.legs_at(0), 0, "{}", crowd.describe());
+    assert_eq!(
+        edge.stats.moves_expired.load(Ordering::Relaxed),
+        0,
+        "nothing cut at the grace"
+    );
+    drop(edge);
+    // The process ends.
+    region.stop(0).await;
+    let (runs, last, sent) = finish(&region, crowd, marks).await;
+    region.shutdown().await;
+    assert_the_rule("sigterm", &runs, marks, last, &sent, Payload::Pcm.part_us());
+    let hit = held_at(&runs, &stopped_node);
+    assert!(!hit.is_empty(), "a listener had a leg at {stopped_node}");
+    for run in &runs {
+        assert_eq!(
+            single_path_in(run, marks).0,
+            0,
+            "{}: {:?}",
+            run.sid,
+            run.single_spans_us
+        );
+    }
+    for run in hit {
+        let handovers: Vec<&Replacement> = run
+            .replacements
+            .iter()
+            .filter(|replacement| replacement.from == stopped_node)
+            .collect();
+        assert!(!handovers.is_empty(), "{}: moved off {stopped_node}", run.sid);
+        assert_handovers(run, handovers);
+    }
+}
+
 /// 72 two-path listeners of 2.5 ms Opus on four edges; the edge with the
 /// most legs (about 36) is killed. Its legs are replaced through the
 /// entries, which apportion movers by headroom to the rebalance target
