@@ -1982,15 +1982,16 @@ async fn the_36_legs_of_a_killed_edge() {
 }
 
 /// The same kill with the client's defaults (a spare): each dead leg's
-/// place goes first to the listener's spare, a weighted rendezvous among
-/// the edges that are not its other leg, weighted by its headroom under the
-/// redundant leg's gate.
-/// That is not the entry's apportionment by headroom to the target, so the
-/// share clause is not claimed here (raised with the lead, review of B Y5,
-/// finding 4); what the design claims is: every leg replaced, as a hedge or,
-/// where the spare refused it, through the entry; no survivor over the
-/// rebalance target (800) after the kill; nothing missing; the time on one
-/// path within the dead leg's verdict and the new leg's start.
+/// place goes first to the listener's spare (a hedge beside the live leg,
+/// at 50 to 70 ms), and then the entry is asked for that place as for a
+/// mover (the lead's decision after integration 2): where it apportions the
+/// place to another edge than the hedge's, the hedge leg moves there make
+/// before break and its edge is the spare again. Once the moves settle no
+/// survivor has taken more than 1.3 times its headroom share of the killed
+/// edge's legs; nothing is missing; no listener is on one path for longer
+/// than the dead leg's verdict and the hedge's start (the moves after it
+/// are hand-overs); no survivor passes the rebalance target. The extra
+/// moves are printed (integration 2 expected about 6 in 44).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_36_legs_of_a_killed_edge_with_a_spare() {
     let killed = kill_the_busiest_of_72(196, true).await;
@@ -2003,16 +2004,28 @@ async fn the_36_legs_of_a_killed_edge_with_a_spare() {
             "{replacement:?}"
         );
     }
-    // The spare is chosen by headroom under the redundant leg's gate (the
-    // lead's decision of 24 Nov). That does not bring each survivor within
-    // 1.3 of its headroom share (integration 2: 13/15/16 against 19.1/14.5/
-    // 10.3, from 12/15/17 by headroom to full load): a spare is drawn per
-    // listener from the edges that are not its legs, so an edge seldom a
-    // leg is overrepresented among a dead edge's spares, and a draw of ~44
-    // among three spreads by about 30 % at one sigma. The share clause needs
-    // the hedge's place apportioned (integration report 2); it is printed,
-    // not asserted.
-    eprintln!("the_36_legs (spare): taken and shares {:?}", killed.shares());
+    let settled = killed.settled_shares();
+    eprintln!(
+        "the_36_legs (spare): settled taken and shares {settled:?}; {} extra moves (apportioned) for {} legs",
+        killed.apportioned, killed.legs
+    );
+    for ((index, _), (got, share)) in killed.survivors.iter().zip(&settled) {
+        assert!(
+            *got <= share * 1.3,
+            "edge-{}: took {got} legs against a share of {share:.1}: {settled:?}",
+            index + 1
+        );
+    }
+    for move_ in &killed.apportion_moves {
+        assert_eq!(move_.kind, ReplacementKind::Handover, "{move_:?}");
+        assert!(move_.handover.is_some(), "{move_:?}");
+    }
+    assert!(
+        killed.apportioned < killed.legs / 2,
+        "{} of {} hedges moved again",
+        killed.apportioned,
+        killed.legs
+    );
     for ((index, _), peak) in killed.survivors.iter().zip(&killed.peaks) {
         assert!(
             *peak <= 800,
@@ -2029,13 +2042,33 @@ async fn the_36_legs_of_a_killed_edge_with_a_spare() {
 struct BusiestKilled {
     legs: u64,
     survivors: Vec<(usize, u64)>,
+    /// Each survivor's legs once the moves settled.
+    settled: Vec<u64>,
     bases: [u32; 4],
     peaks: Vec<u32>,
     landed: BTreeMap<String, u64>,
     replacements: Vec<Replacement>,
+    /// The hedge legs moved to the edge the entry apportioned their place
+    /// to, and how many.
+    apportion_moves: Vec<Replacement>,
+    apportioned: u64,
 }
 
 impl BusiestKilled {
+    /// Each survivor's legs taken once the moves settled (its legs then
+    /// less before the kill) and its share by headroom, as [`Self::shares`].
+    fn settled_shares(&self) -> Vec<(f64, f64)> {
+        let shares = self.shares();
+        self.survivors
+            .iter()
+            .zip(&self.settled)
+            .zip(shares)
+            .map(|(((_, before), after), (_, share))| {
+                (after.saturating_sub(*before) as f64, share)
+            })
+            .collect()
+    }
+
     /// Each survivor's legs taken and its share of them by headroom to the
     /// target (800) as the entries saw it.
     fn shares(&self) -> Vec<(f64, f64)> {
@@ -2100,6 +2133,10 @@ async fn kill_the_busiest_of_72(base: u8, spare: bool) -> BusiestKilled {
             *peak = (*peak).max(region.load(*index));
         }
     }
+    let settled: Vec<u64> = survivors
+        .iter()
+        .map(|(index, _)| region.legs_at(*index))
+        .collect();
     let (runs, last, sent) = finish(&region, crowd, marks).await;
     region.shutdown().await;
     assert_the_rule(
@@ -2112,12 +2149,20 @@ async fn kill_the_busiest_of_72(base: u8, spare: bool) -> BusiestKilled {
     );
     let mut landed: BTreeMap<String, u64> = BTreeMap::new();
     let mut replacements = Vec::new();
+    let mut apportion_moves = Vec::new();
     for run in &runs {
         for replacement in run.replacements.iter().filter(|r| r.from == node) {
             *landed.entry(replacement.to.clone()).or_default() += 1;
             replacements.push(replacement.clone());
         }
+        apportion_moves.extend(
+            run.replacements
+                .iter()
+                .filter(|r| r.reason == av_mesh::client_director::APPORTION)
+                .cloned(),
+        );
     }
+    let apportioned = runs.iter().map(|run| run.stats.apportion_moves).sum();
     let moved: u64 = landed.values().sum();
     eprintln!(
         "the_36_legs (spare {spare}): {legs} legs at {node}, {moved} replaced: {landed:?}, survivors {survivors:?}, peaks {peaks:?}"
@@ -2144,10 +2189,13 @@ async fn kill_the_busiest_of_72(base: u8, spare: bool) -> BusiestKilled {
     let killed = BusiestKilled {
         legs,
         survivors,
+        settled,
         bases,
         peaks,
         landed,
         replacements,
+        apportion_moves,
+        apportioned,
     };
     eprintln!(
         "the_36_legs (spare {spare}): taken and shares {:?}",

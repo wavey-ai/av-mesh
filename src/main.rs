@@ -20786,6 +20786,12 @@ struct ReaderRequest<'a> {
     paths: u8,
     /// A spare is wanted (`s=1`).
     spare: bool,
+    /// The spare the listener holds (`k=`, `&keep=`): kept while under
+    /// the redundant leg's gate, else another is named.
+    spare_held: Option<&'a str>,
+    /// The edge that holds the leg whose place is asked for (`a=`, `&at=`):
+    /// named while under its share of the movers.
+    place_at: Option<&'a str>,
 }
 
 impl Default for ReaderRequest<'_> {
@@ -20801,6 +20807,8 @@ impl Default for ReaderRequest<'_> {
             hold: &[],
             paths: 1,
             spare: false,
+            spare_held: None,
+            place_at: None,
         }
     }
 }
@@ -22702,6 +22710,8 @@ impl AppRouter {
             spare: reader.spare,
             redundant: !reader.hold.is_empty(),
             held_hosts: &held_hosts,
+            spare_held: reader.spare_held,
+            place_at: reader.place_at,
         };
         // A rebalanced listener goes only to a cache heard of lately: an
         // edge that has just died still looks fresh, and empty, for a few
@@ -23460,6 +23470,8 @@ impl AppRouter {
         hold: &[String],
         paths: u8,
         spare: bool,
+        spare_held: Option<&str>,
+        place_at: Option<&str>,
     ) -> UdpAssignment {
         let (assignment, _, assigned) = self
             .client_assignment(
@@ -23473,6 +23485,8 @@ impl AppRouter {
                     hold,
                     paths,
                     spare,
+                    spare_held,
+                    place_at,
                 },
                 false,
             )
@@ -23535,6 +23549,8 @@ impl AppRouter {
         let paths = parse_query_u64(query, "paths")
             .map_or(1, |paths| paths.min(u64::from(av_mesh::client_udp::MAX_PATHS)) as u8);
         let spare = parse_query_u64(query, "spare") == Some(1);
+        let spare_held = decoded("keep");
+        let place_at = decoded("at");
         // A client that names its session (a UDP client: this answer is its
         // assignment) is counted against the cache it is sent to until the
         // cache advertises again, as a reader of the steering list is, so a
@@ -23553,6 +23569,8 @@ impl AppRouter {
                     hold: &hold,
                     paths,
                     spare,
+                    spare_held: spare_held.as_deref(),
+                    place_at: place_at.as_deref(),
                 },
                 remember,
             )
@@ -38368,6 +38386,8 @@ mod tests {
                 paths: 1,
                 spare: false,
                 hold: Vec::new(),
+                spare_held: None,
+                place_at: None,
                 token: None,
             }
             .encode()
@@ -38417,6 +38437,8 @@ mod tests {
                 paths: 1,
                 spare: false,
                 hold: Vec::new(),
+                spare_held: None,
+                place_at: None,
                 token: Some(token),
             }
             .encode()
@@ -38582,6 +38604,8 @@ mod tests {
             paths,
             spare,
             hold: names_for_tests(hold),
+            spare_held: None,
+            place_at: None,
             token: None,
         }
         .encode();
@@ -39172,6 +39196,8 @@ mod tests {
                 paths: 1,
                 spare: false,
                 hold: Vec::new(),
+                spare_held: None,
+                place_at: None,
                 token: Some(token),
             }
             .encode()

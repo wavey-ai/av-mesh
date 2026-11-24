@@ -1803,6 +1803,8 @@ pub(crate) async fn run_edge_udp(
                 paths,
                 spare,
                 hold,
+                spare_held,
+                place_at,
                 token,
             } => {
                 edge.on_assign(
@@ -1818,6 +1820,8 @@ pub(crate) async fn run_edge_udp(
                         paths,
                         spare,
                         hold,
+                        spare_held,
+                        place_at,
                         token,
                     },
                 );
@@ -2125,6 +2129,8 @@ impl EdgeControl {
             paths,
             spare,
             hold,
+            spare_held,
+            place_at,
             token,
         } = request;
         // Wave 9 review: the client's confirmation of the answer
@@ -2207,6 +2213,8 @@ impl EdgeControl {
                     &hold,
                     paths,
                     spare,
+                    spare_held.as_deref(),
+                    place_at.as_deref(),
                 )
                 .await;
             if let Some(answer) = assigned_within(stream_id, nonce, answer, budget) {
@@ -2287,6 +2295,8 @@ struct AssignRequest {
     paths: u8,
     spare: bool,
     hold: Vec<String>,
+    spare_held: Option<String>,
+    place_at: Option<String>,
     token: Option<u64>,
 }
 

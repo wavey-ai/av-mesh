@@ -390,6 +390,17 @@ pub enum Control {
         /// The legs the client holds and keeps (`h=`): never in the
         /// answer, never counted as edges it left.
         hold: Vec<String>,
+        /// The spare the client holds (`k=`, with `s=1`): kept while its
+        /// edge stays under the redundant leg's gate, another named
+        /// otherwise (the lead's decision after integration 2). An entry
+        /// older than the field skips it and names a spare as for any
+        /// `s=1`.
+        spare_held: Option<String>,
+        /// The edge that holds the leg whose place is asked for (`a=`): a
+        /// hedge that took a dead leg's place. The entry apportions the
+        /// place as a mover's and names this edge while it is under its
+        /// share (the lead's decision after integration 2).
+        place_at: Option<String>,
         token: Option<u64>,
     },
     /// A node's answer to `ASSIGN`: the caches in assignment order (none
@@ -510,6 +521,8 @@ impl Control {
                 paths,
                 spare,
                 hold,
+                spare_held,
+                place_at,
                 token,
             } => {
                 let mut text = format!(
@@ -527,6 +540,14 @@ impl Control {
                 if !hold.is_empty() {
                     text.push_str(" h=");
                     text.push_str(&list(hold));
+                }
+                if let Some(spare) = spare_held {
+                    text.push_str(" k=");
+                    text.push_str(&list(std::slice::from_ref(spare)));
+                }
+                if let Some(place) = place_at {
+                    text.push_str(" a=");
+                    text.push_str(&list(std::slice::from_ref(place)));
                 }
                 match token {
                     // A confirmation: not answered, so not padded.
@@ -707,6 +728,7 @@ impl Control {
                 let skip = names(words.next()?);
                 let current = names(words.next()?);
                 let (mut paths, mut spare, mut hold, mut token_word) = (None, None, None, None);
+                let (mut spare_held, mut place_at) = (None, None);
                 let mut padded = false;
                 for word in words.by_ref() {
                     match field(word) {
@@ -717,6 +739,12 @@ impl Control {
                         }
                         Some(("s", value)) => once(&mut spare, flag(value)?)?,
                         Some(("h", value)) => once(&mut hold, names(value))?,
+                        Some(("k", value)) => {
+                            once(&mut spare_held, names(value).into_iter().next())?;
+                        }
+                        Some(("a", value)) => {
+                            once(&mut place_at, names(value).into_iter().next())?;
+                        }
                         Some(("t", value)) => once(&mut token_word, token(value)?)?,
                         Some(_) => {}
                         // The padding of a request.
@@ -733,6 +761,8 @@ impl Control {
                     paths: paths.unwrap_or(1),
                     spare: spare.unwrap_or(false),
                     hold: hold.unwrap_or_default(),
+                    spare_held: spare_held.flatten(),
+                    place_at: place_at.flatten(),
                     token: token_word,
                 }
             }
@@ -1808,6 +1838,8 @@ mod tests {
             paths: 1,
             spare: false,
             hold: Vec::new(),
+            spare_held: None,
+            place_at: None,
             token: None,
         };
         let bytes = request.encode();
@@ -1822,6 +1854,8 @@ mod tests {
             paths: 1,
             spare: false,
             hold: Vec::new(),
+            spare_held: None,
+            place_at: None,
             token: None,
         };
         assert_eq!(Control::decode(&bare.encode()), Some(bare));
@@ -1836,6 +1870,8 @@ mod tests {
             paths: 2,
             spare: true,
             hold: vec!["lon-edge-2".into()],
+            spare_held: None,
+            place_at: None,
             token: None,
         };
         let bytes = two_paths.encode();
@@ -1853,6 +1889,8 @@ mod tests {
             paths: 1,
             spare: false,
             hold: Vec::new(),
+            spare_held: None,
+            place_at: None,
             token: Some(0xfeed_0000_0000_0001),
         };
         let bytes = confirm.encode();
@@ -1868,6 +1906,8 @@ mod tests {
             paths: 1,
             spare: false,
             hold: Vec::new(),
+            spare_held: None,
+            place_at: None,
             token: Some(0xfeed_0000_0000_0001),
         };
         let bytes = confirm.encode();
@@ -1957,6 +1997,8 @@ mod tests {
             paths,
             spare,
             hold: owned(hold),
+            spare_held: None,
+            place_at: None,
             token,
         }
     }

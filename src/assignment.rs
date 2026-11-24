@@ -217,6 +217,15 @@ pub struct AssignmentRequest<'a> {
     /// The host tags of the legs the listener holds: a leg of the answer
     /// goes to another host where one is eligible.
     pub held_hosts: &'a [String],
+    /// The spare the listener holds (`k=`): with `spare`, it is the spare
+    /// again while its edge passes the redundant leg's gate; over the gate,
+    /// another under it is named if one is, else it is kept.
+    pub spare_held: Option<&'a str>,
+    /// The cache that holds the leg whose place a mover asks for (a hedge
+    /// at the listener's spare that took a dead leg's place): it keeps the
+    /// place while its share of the movers is not yet taken, so that only
+    /// the hedges over their share move again.
+    pub place_at: Option<&'a str>,
 }
 
 impl Default for AssignmentRequest<'_> {
@@ -238,6 +247,8 @@ impl Default for AssignmentRequest<'_> {
             spare: false,
             redundant: false,
             held_hosts: &[],
+            spare_held: None,
+            place_at: None,
         }
     }
 }
@@ -584,7 +595,7 @@ pub fn assign(
                         None => moves.push((leg.node_id.clone(), 1)),
                     }
                 }
-                apportion(&pool, &moves, level)
+                apportion_at(&pool, &moves, level, request.place_at)
             } else {
                 // Another holder by the session's weighted rendezvous, else the
                 // edge first in line for the standby copy: a small stream is
@@ -676,37 +687,62 @@ pub fn assign(
                 })
                 .map(|(_, cache)| cache)
         }
+        // The spare the listener holds, if it may still be one: free (not a
+        // leg of this answer), a holder that is healthy or a cache that
+        // admits.
+        let held_spare = request.spare_held.and_then(|name| {
+            regional.iter().copied().find(|cache| {
+                cache.node_id == name
+                    && free(cache)
+                    && ((cache.holds_playlist() && healthy(cache)) || admits(cache))
+            })
+        });
         // A third host first, under the gate before over it: a holder
         // there, else a cache there that admits; then the same on any host.
-        let chosen = [true, false].into_iter().find_map(|apart| {
-            let on_its_own_host = |cache: &&CacheCandidate| {
-                !apart || !shares_host(cache, &caches, request.held_hosts)
-            };
-            let holders = || {
-                regional
-                    .iter()
-                    .copied()
-                    .filter(free)
-                    .filter(on_its_own_host)
-                    .filter(|cache| cache.holds_playlist() && healthy(cache))
-                    .collect::<Vec<_>>()
-            };
-            let admitting = || {
-                regional
-                    .iter()
-                    .copied()
-                    .filter(free)
-                    .filter(on_its_own_host)
-                    .filter(|cache| admits(cache))
-                    .collect::<Vec<_>>()
-            };
-            [true, false]
-                .into_iter()
-                .find_map(|under| {
-                    best(session, holders(), under, &room)
-                        .or_else(|| best(session, admitting(), under, &room))
+        // A held spare under the gate is kept; over it, the passes under
+        // the gate look for another, and it is kept when none is.
+        let unders: &[bool] = if held_spare.is_some() {
+            &[true]
+        } else {
+            &[true, false]
+        };
+        let not_held = |cache: &&CacheCandidate| {
+            held_spare.is_none_or(|held| held.node_id != cache.node_id)
+        };
+        let kept = held_spare.filter(|cache| room(cache) > 0.0);
+        let chosen = kept
+            .or_else(|| {
+                [true, false].into_iter().find_map(|apart| {
+                    let on_its_own_host = |cache: &&CacheCandidate| {
+                        !apart || !shares_host(cache, &caches, request.held_hosts)
+                    };
+                    let holders = || {
+                        regional
+                            .iter()
+                            .copied()
+                            .filter(free)
+                            .filter(not_held)
+                            .filter(on_its_own_host)
+                            .filter(|cache| cache.holds_playlist() && healthy(cache))
+                            .collect::<Vec<_>>()
+                    };
+                    let admitting = || {
+                        regional
+                            .iter()
+                            .copied()
+                            .filter(free)
+                            .filter(not_held)
+                            .filter(on_its_own_host)
+                            .filter(|cache| admits(cache))
+                            .collect::<Vec<_>>()
+                    };
+                    unders.iter().find_map(|under| {
+                        best(session, holders(), *under, &room)
+                            .or_else(|| best(session, admitting(), *under, &room))
+                    })
                 })
-        });
+            })
+            .or(held_spare);
         if let Some(cache) = chosen {
             ranked.retain(|(_, _, other)| other.node_id != cache.node_id);
             caches.push(assigned(cache, AssignmentReason::Spare));
@@ -953,6 +989,19 @@ fn apportion(
     recent_moves: &[(String, u32)],
     level: Level,
 ) -> Option<usize> {
+    apportion_at(pool, recent_moves, level, None)
+}
+
+/// [`apportion`], where the mover holds its place at `place_at` already (a
+/// hedge leg): that cache keeps it while its due share less what it took
+/// is above zero, so that the hedges of a dead edge move only where their
+/// edge is over its share.
+fn apportion_at(
+    pool: &[(usize, &CacheCandidate)],
+    recent_moves: &[(String, u32)],
+    level: Level,
+    place_at: Option<&str>,
+) -> Option<usize> {
     let taken = |cache: &CacheCandidate| {
         recent_moves
             .iter()
@@ -976,6 +1025,9 @@ fn apportion(
     let mut best: Option<(f64, usize)> = None;
     for (index, cache) in pool {
         let deficit = headroom(cache) / whole * total - taken(cache);
+        if place_at == Some(cache.node_id.as_str()) && deficit > 1e-9 {
+            return Some(*index);
+        }
         if best.is_none_or(|(most, _)| deficit > most + 1e-9) {
             best = Some((deficit, *index));
         }
@@ -1699,6 +1751,121 @@ mod tests {
         assert!(assignment.caches[0].holds_playlist);
     }
 
+    /// The lead's decision after integration 2: a request that names the
+    /// spare it holds (`k=`) keeps it while its edge passes the redundant
+    /// leg's gate; over the gate another under it is named; with none under
+    /// it, the held one is kept. A draining edge, or one that no longer
+    /// admits, is never kept nor named (av-mesh-fix-3, task 5).
+    #[test]
+    fn a_held_spare_is_kept_under_the_gate_and_replaced_over_it() {
+        let caches = [
+            cache("edge-1", 100, Some(9)),
+            cache("edge-2", 100, Some(9)),
+            cache("edge-3", 700, Some(9)),
+            cache("edge-4", 300, Some(9)),
+        ];
+        let held = ["edge-1".to_owned()];
+        let ask = |session: &'static str, spare_held: &'static str| AssignmentRequest {
+            paths: 1,
+            spare: true,
+            redundant: true,
+            spare_held: Some(spare_held),
+            listener_permille: Some(5.0),
+            ..request(session)
+        };
+        let leg_and_spare = |assignment: &Assignment| {
+            (
+                legs(assignment)[0].to_owned(),
+                assignment.caches[usize::from(assignment.legs)].node_id.clone(),
+            )
+        };
+        let others = [caches[1].clone(), caches[2].clone(), caches[3].clone()];
+        let _ = held;
+        for index in 0..200 {
+            let session: &'static str = Box::leak(format!("keep-{index}").into_boxed_str());
+            // Under the gate: kept (unless it is the leg named).
+            let assignment = assign(ask(session, "edge-3"), AssignmentPolicy::default(), &others).unwrap();
+            let (leg, spare) = leg_and_spare(&assignment);
+            if leg != "edge-3" {
+                assert_eq!(spare, "edge-3", "{session}: {assignment:?}");
+            }
+        }
+        // edge-3 over the gate (800 with the listener): another under it.
+        let mut over = others.clone();
+        over[1].load_permille = 800;
+        for index in 0..200 {
+            let session: &'static str = Box::leak(format!("over-{index}").into_boxed_str());
+            let assignment = assign(ask(session, "edge-3"), AssignmentPolicy::default(), &over).unwrap();
+            let (leg, spare) = leg_and_spare(&assignment);
+            assert_ne!(spare, "edge-3", "{session}: {assignment:?}");
+            assert_ne!(spare, leg);
+        }
+        // Every other edge over the gate too: the held one is kept.
+        let mut all_over = over.clone();
+        all_over[0].load_permille = 850;
+        all_over[2].load_permille = 900;
+        let spare_only = AssignmentRequest {
+            paths: 0,
+            ..ask("all-over", "edge-3")
+        };
+        let assignment = assign(spare_only, AssignmentPolicy::default(), &all_over).unwrap();
+        assert_eq!(assignment.caches[0].node_id, "edge-3");
+        // A draining held spare is replaced, and never named.
+        let mut draining = others.clone();
+        draining[1].draining = true;
+        for index in 0..200 {
+            let session: &'static str = Box::leak(format!("drain-{index}").into_boxed_str());
+            for spare_held in [Some("edge-3"), None] {
+                let asked = AssignmentRequest {
+                    spare_held,
+                    ..ask(session, "edge-3")
+                };
+                let assignment = assign(asked, AssignmentPolicy::default(), &draining).unwrap();
+                assert!(
+                    assignment.caches.iter().take(usize::from(assignment.legs) + 1).all(|cache| cache.node_id != "edge-3"),
+                    "{session}: {assignment:?}"
+                );
+            }
+        }
+    }
+
+    /// A hedge's place asked for as a mover's (`a=`, the lead's decision
+    /// after integration 2): its edge keeps it while that edge has taken
+    /// less than its share of the movers, and the place goes by the shares
+    /// once it has taken that, so that only hedges over their share move.
+    #[test]
+    fn a_hedge_keeps_its_place_while_its_edge_is_under_its_share() {
+        let caches = [
+            cache("edge-1", 200, Some(9)),
+            cache("edge-3", 200, Some(9)),
+            cache("edge-4", 600, Some(9)),
+        ];
+        let ask = |moves: &'static [(String, u32)], at: &'static str| AssignmentRequest {
+            paths: 1,
+            redundant: true,
+            moving: true,
+            recent_moves: moves,
+            place_at: Some(at),
+            ..request("hedge")
+        };
+        // Nothing placed yet: every edge is under its share.
+        for at in ["edge-1", "edge-3", "edge-4"] {
+            let assignment = assign(ask(&[], at), AssignmentPolicy::default(), &caches).unwrap();
+            assert_eq!(legs(&assignment), [at]);
+        }
+        // edge-4 (a fifth of the headroom) has taken 3 of 9: over its share,
+        // the place goes to the edge furthest behind.
+        let moves: &'static [(String, u32)] = Box::leak(Box::new([
+            ("edge-1".to_owned(), 3),
+            ("edge-3".to_owned(), 3),
+            ("edge-4".to_owned(), 3),
+        ]));
+        let assignment = assign(ask(moves, "edge-4"), AssignmentPolicy::default(), &caches).unwrap();
+        assert_ne!(legs(&assignment), ["edge-4"]);
+        let assignment = assign(ask(moves, "edge-1"), AssignmentPolicy::default(), &caches).unwrap();
+        assert_eq!(legs(&assignment), ["edge-1"]);
+    }
+
     /// B 3.6: a region with one serving edge gives one leg and no spare.
     #[test]
     fn one_serving_edge_gives_one_path_and_no_spare() {
@@ -2229,6 +2396,8 @@ mod tests {
             spare: false,
             redundant: false,
             held_hosts: &[],
+            spare_held: None,
+            place_at: None,
         }
     }
 

@@ -99,6 +99,10 @@ pub const REGION_LOST: &str = "region-lost";
 pub const HOME_REGION: &str = "home-region";
 const REBALANCE: &str = "rebalance";
 const PARENTS_LOST: &str = "parents-lost";
+/// The reason of a hedge leg's move to the edge the entry apportioned its
+/// place to (the lead's decision after integration 2): the hedge's edge is
+/// the spare again once the new leg is level.
+pub const APPORTION: &str = "apportion";
 /// Refusals for load, which passes in seconds.
 const BUSY_REFUSALS: [&str; 2] = ["edge-busy", "edge-full"];
 
@@ -436,9 +440,14 @@ pub struct DirectorStats {
     pub hedges_released: u64,
     /// Spares dropped for unanswered renewals.
     pub spares_dropped: u64,
+    /// Spares the entry replaced when asked with the one held (`k=`): its
+    /// edge was over the redundant leg's gate.
+    pub spares_rechosen: u64,
     /// Spares whose edge answered their token's renewal with `MOVE` (it
     /// drains): dropped, and another asked for.
     pub spares_moved: u64,
+    /// Hedge legs moved to the edge the entry apportioned their place to.
+    pub apportion_moves: u64,
     pub failovers: u64,
     pub home_returns: u64,
     pub takebacks: u64,
@@ -473,6 +482,10 @@ pub struct DirectorLeg {
     spare: Option<Spare>,
     /// The leg this one replaces, booked at its first media.
     replaces: Option<Pending>,
+    /// A hedge that took a dead leg's place by the listener's spare, not
+    /// by the entry's apportionment: the entry is asked for the place as
+    /// for a mover (the lead's decision after integration 2).
+    unplaced: bool,
 }
 
 impl DirectorLeg {
@@ -571,6 +584,11 @@ struct Request {
     /// answered over UDP.
     tokens: Vec<(usize, u64)>,
     answered_by: Vec<usize>,
+    /// The spare it named as held (`k=`): an answer that names another
+    /// spare replaces it.
+    spare_held: Option<String>,
+    /// The hedge leg whose place it asks for as a mover.
+    place_of: Option<LegKey>,
 }
 
 #[derive(Debug, Clone)]
@@ -970,10 +988,24 @@ impl Director {
         self.config.token_wait.max(rtt * 4)
     }
 
+    /// No spare, none hedged, and none coming back: a leg leaving its
+    /// edge for the entry's apportionment leaves the spare there.
     fn spare_wanted(&self) -> bool {
         self.config.spare
             && self.spare.is_none()
-            && !self.legs.iter().any(|leg| leg.hedge_for.is_some())
+            && !self
+                .legs
+                .iter()
+                .any(|leg| leg.hedge_for.is_some() || leg.leaving_for(APPORTION))
+    }
+
+    /// The hedge leg whose place the entry is to apportion: it took a dead
+    /// leg's place, holds it still (counted), and no request asks for it.
+    fn unplaced(&self) -> Option<LegKey> {
+        self.legs
+            .iter()
+            .find(|leg| leg.unplaced && leg.counted())
+            .map(|leg| leg.key)
     }
 
     fn next_nonce(&mut self) -> u64 {
@@ -1490,6 +1522,7 @@ impl Director {
             spare,
             skip,
             Vec::new(),
+            None,
             now,
             out,
         );
@@ -1556,7 +1589,20 @@ impl Director {
             // The spare itself failed: a new one is asked for.
             return;
         }
-        // A hedge beside it takes its place.
+        // A leg added to take an apportioned place failed: the hedge leg it
+        // was to replace keeps that place.
+        if let Some(stood) = leg.stands_for {
+            if let Some(old) = self
+                .legs
+                .iter_mut()
+                .find(|other| other.key == stood && other.leaving_for(APPORTION))
+            {
+                old.leaving = None;
+                return;
+            }
+        }
+        // A hedge beside it takes its place, and the entry is asked for that
+        // place as for a mover.
         if let Some(hedge) = self
             .legs
             .iter_mut()
@@ -1564,6 +1610,7 @@ impl Director {
         {
             hedge.hedge_for = None;
             hedge.spare = None;
+            hedge.unplaced = self.config.spare;
             let first = Self::view(legs, hedge.key, now).first_media;
             self.replacements.push(Replacement {
                 at: now,
@@ -1743,6 +1790,7 @@ impl Director {
             quiet_since: None,
             spare: None,
             replaces: None,
+            unplaced: false,
         });
         key
     }
@@ -2003,6 +2051,33 @@ impl Director {
                 self.want = self.full_paths();
             }
         }
+        // The place of a hedge leg, apportioned: kept where the entry names
+        // the hedge's own edge (or names none, or one the listener cannot
+        // take); else the hedge leg leaves for the edge named, make before
+        // break, and is the spare again once that leg is level.
+        if let Some(place) = request.place_of {
+            if let Some(index) = self.leg_index(place).filter(|index| {
+                let leg = &self.legs[*index];
+                leg.unplaced && leg.counted()
+            }) {
+                self.legs[index].unplaced = false;
+                let named = answer
+                    .caches
+                    .iter()
+                    .take(granted)
+                    .find(|cache| cache.failover.is_none())
+                    .map(|cache| cache.node.clone());
+                let movable = named.as_ref().is_some_and(|named| {
+                    *named != self.legs[index].node
+                        && usable.iter().any(|(node, _)| node == named)
+                        && !self.skipped_now(named, now)
+                });
+                if movable {
+                    self.legs[index].leaving = Some((APPORTION.to_owned(), now));
+                    self.stats.apportion_moves += 1;
+                }
+            }
+        }
         let need = match request.kind {
             RequestKind::Silence => request.paths as usize,
             _ => (self.want as usize).saturating_sub(self.held()),
@@ -2068,8 +2143,14 @@ impl Director {
             self.legs[index].replaces = record;
         }
         // The cache after the legs is the spare (after a promoted spare's
-        // node too).
-        if request.spare && answer.spare && self.spare_wanted() {
+        // node too). A request that named the spare it holds (`k=`) gets it
+        // again while its edge passes the gate, else another: taken.
+        let held_named = request.spare_held.is_some()
+            && self
+                .spare
+                .as_ref()
+                .is_some_and(|spare| Some(&spare.node) == request.spare_held.as_ref());
+        if request.spare && answer.spare && (self.spare_wanted() || held_named) {
             let spare = usable[after.min(usable.len())..]
                 .iter()
                 .find(|(node, _)| {
@@ -2077,7 +2158,12 @@ impl Director {
                 })
                 .map(|cache| (cache.0.clone(), cache.1));
             if let Some((node, addr)) = spare {
-                self.set_spare(node, addr, now, out);
+                if self.spare.as_ref().is_none_or(|held| held.node != node) {
+                    if held_named {
+                        self.stats.spares_rechosen += 1;
+                    }
+                    self.set_spare(node, addr, now, out);
+                }
             }
         }
         // Confirm to every entry that answered, so that it charges the legs.
@@ -2099,7 +2185,11 @@ impl Director {
         // now (one sent before the last MOVE or failure, or for the spare
         // alone) holds nothing back: the loop asks at once for the rest.
         let asked_all = request.started >= self.changed_at && request.paths as usize >= need;
-        let short = chosen.len() < need || (request.spare && self.spare_wanted());
+        // A request that named the spare it held asked for a spare only to
+        // keep or replace it: one missing now (promoted to a leg) is asked
+        // for at once.
+        let short = chosen.len() < need
+            || (request.spare && request.spare_held.is_none() && self.spare_wanted());
         if !asked_all {
             self.retry_at = None;
         } else if no_cache || short {
@@ -2186,6 +2276,8 @@ impl Director {
             paths: request.paths,
             spare: request.spare,
             hold: request.hold.clone(),
+            spare_held: None,
+            place_at: None,
             token: Some(token),
         }
         .encode();
@@ -2220,9 +2312,11 @@ impl Director {
         spare: bool,
         skip: Vec<String>,
         hold: Vec<String>,
+        held: Option<(Option<String>, Option<LegKey>)>,
         now: Instant,
         out: &mut Vec<Action>,
     ) {
+        let (spare_held, place_of) = held.unwrap_or_default();
         let entries = if kind == RequestKind::HomeProbe {
             self.home.clone()
         } else {
@@ -2249,6 +2343,10 @@ impl Director {
             paths,
             spare,
             hold: hold.clone(),
+            spare_held: spare_held.clone(),
+            place_at: place_of
+                .and_then(|key| self.leg_index(key))
+                .map(|index| self.legs[index].node.clone()),
             token: None,
         }
         .encode();
@@ -2271,6 +2369,8 @@ impl Director {
             https_at: udp.then(|| now + self.config.assignment_https_after),
             tokens: Vec::new(),
             answered_by: Vec::new(),
+            spare_held,
+            place_of,
         };
         if !udp {
             if let Some(first) = request.pool.first() {
@@ -2339,6 +2439,18 @@ impl Director {
         }
         if request.spare {
             path.push_str("&spare=1");
+        }
+        if let Some(spare) = &request.spare_held {
+            path.push_str("&keep=");
+            path.push_str(spare);
+        }
+        if let Some(place) = request
+            .place_of
+            .and_then(|key| self.leg_index(key))
+            .map(|index| &self.legs[index].node)
+        {
+            path.push_str("&at=");
+            path.push_str(place);
         }
         path
     }
@@ -2535,6 +2647,11 @@ impl Director {
                         .map(|index| self.legs[index].node.clone());
                     if let Some(leg) = self.release(legs, old, now, out) {
                         let reason = leg.leaving.map(|(reason, _)| reason).unwrap_or_default();
+                        // A hedge leg that left for its apportioned place:
+                        // its edge is the spare again.
+                        if reason == APPORTION && self.config.spare && self.spare.is_none() {
+                            self.set_spare(leg.node.clone(), leg.addr, now, out);
+                        }
                         self.replacements.push(Replacement {
                             at: now,
                             from: leg.node,
@@ -2730,7 +2847,8 @@ impl Director {
         }
         let missing = self.missing();
         let spare = self.spare_wanted();
-        if missing == 0 && !spare {
+        let place_of = self.unplaced();
+        if missing == 0 && !spare && place_of.is_none() {
             self.deferred_ask = None;
             // Away from home: is the home region back?
             if self
@@ -2746,6 +2864,7 @@ impl Director {
                     self.config.spare,
                     Vec::new(),
                     Vec::new(),
+                    None,
                     now,
                     out,
                 );
@@ -2767,13 +2886,33 @@ impl Director {
             }
         }
         let skip = self.skipped(now);
+        // The hedge leg whose place is asked for is in neither the skip
+        // set nor the legs held: the entry may name its edge again.
         let hold: Vec<String> = self
             .legs
             .iter()
-            .filter(|leg| leg.counted())
+            .filter(|leg| leg.counted() && Some(leg.key) != place_of)
             .map(|leg| leg.node.clone())
             .collect();
-        self.send_request(RequestKind::Normal, missing, spare, skip, hold, now, out);
+        let paths = missing + u8::from(place_of.is_some());
+        // A request that names the spare it holds asks for one: the entry
+        // keeps it while its edge passes the gate.
+        let spare_held = self
+            .spare
+            .as_ref()
+            .filter(|_| self.config.spare)
+            .map(|spare| spare.node.clone());
+        let spare = spare || spare_held.is_some();
+        self.send_request(
+            RequestKind::Normal,
+            paths,
+            spare,
+            skip,
+            hold,
+            Some((spare_held, place_of)),
+            now,
+            out,
+        );
     }
 
     fn compute_wake(&self, now: Instant) -> Instant {
@@ -2825,7 +2964,7 @@ impl Director {
         if self.request.is_some() || self.pending_answer.is_some() {
             return None;
         }
-        if self.missing() == 0 && !self.spare_wanted() {
+        if self.missing() == 0 && !self.spare_wanted() && self.unplaced().is_none() {
             return self
                 .away_since
                 .map(|since| self.next_home_probe.max(since + HOME_HOLD));
@@ -3607,7 +3746,9 @@ mod tests {
         else {
             unreachable!()
         };
-        assert_eq!((paths, spare), (1, false));
+        // A spare is held: the request names it (`k=`) and asks for one,
+        // so that the entry keeps it or names another.
+        assert_eq!((paths, spare), (1, true));
         assert_eq!((skip, hold), (vec!["e1".to_owned()], vec!["e2".to_owned()]));
         w.answer(to, nonce, vec![cache(4)], 1, false, None);
         assert_eq!(w.fake("e4").start.from, StartFrom::AfterNewest);
@@ -3835,12 +3976,16 @@ mod tests {
         else {
             unreachable!()
         };
-        assert_eq!((paths, spare), (0, true));
+        // The hedge's place is asked for as a mover's (skip the dead leg,
+        // hold the other; the hedge's edge in neither), with a new spare.
+        assert_eq!((paths, spare), (1, true));
         assert_eq!(skip, ["e1"]);
-        assert_eq!(hold, ["e2", "e3"]);
-        w.answer(to, nonce, vec![cache(5)], 0, true, Some(0x77));
+        assert_eq!(hold, ["e2"]);
+        // The entry names the hedge's own edge: nothing moves.
+        w.answer(to, nonce, vec![cache(3), cache(5)], 1, true, Some(0x77));
         assert_eq!(w.d.spare(), Some("e5"));
-        assert_eq!(w.held(), ["e2", "e3"], "no leg from a spare-only answer");
+        assert_eq!(w.held(), ["e2", "e3"], "the hedge keeps its place");
+        assert_eq!(w.d.stats.apportion_moves, 0);
         // The confirmation names the hedge leg, so the entry charges it.
         let current = w
             .controls()
@@ -3860,6 +4005,171 @@ mod tests {
         assert!(w.d.skipped(w.now).contains(&"e1".to_owned()));
         w.run_to(failed + 30_001);
         assert!(!w.d.skipped(w.now).contains(&"e1".to_owned()));
+    }
+
+    /// The lead's decision after integration 2: a hedge that took a dead
+    /// leg's place, apportioned by the entry to another edge, moves there
+    /// make before break, and its edge is the spare again; no other spare is
+    /// asked for meanwhile.
+    #[test]
+    fn a_hedge_s_place_apportioned_elsewhere_moves_and_its_edge_is_the_spare_again() {
+        let mut w = World::new("apportion-1", 2, true);
+        w.join(&[1, 2], Some(3));
+        let e1 = w.key("e1");
+        w.view("e1", |view| view.delivering = false);
+        w.event(LegEvent::HedgeDue(e1));
+        w.run_to(w.ms() + 25);
+        w.live("e3");
+        w.event(LegEvent::Failed {
+            leg: e1,
+            cause: LegFailure::Dead,
+        });
+        let failed = w.ms();
+        let (to, nonce, request) = loop {
+            w.run_to(w.ms() + 1);
+            if let Some(request) = w.requests().pop() {
+                break request;
+            }
+            assert!(w.ms() <= failed + 250, "asked within 250 ms");
+        };
+        // The hedge's edge is named as where the place is (`a=`).
+        assert!(matches!(
+            request,
+            Control::Assign {
+                paths: 1,
+                spare: true,
+                spare_held: None,
+                place_at: Some(ref at),
+                ..
+            } if at == "e3"
+        ));
+        // The entry apportions the place to e4 (and names e5 as a spare).
+        w.answer(to, nonce, vec![cache(4), cache(5)], 1, true, Some(0x77));
+        assert_eq!(w.d.stats.apportion_moves, 1);
+        assert!(w.leaving("e3"), "{:?}", w.held());
+        assert_eq!(w.held(), ["e2", "e3", "e4"]);
+        assert_eq!(w.d.spare(), None, "the hedge's edge is to be the spare");
+        // Nothing more is asked while e3 is leaving for its place.
+        w.run_to(w.ms() + 600);
+        assert!(w.requests().is_empty());
+        assert!(!w.s.legs[&w.key("e3")].released, "make before break");
+        // e4 delivers and is level with e3: e3 goes, and is the spare again.
+        w.live("e4");
+        let (e3, e4) = (w.key("e3"), w.key("e4"));
+        w.s.level.insert((e4, e3));
+        w.run_to(w.ms() + 10);
+        assert_eq!(w.held(), ["e2", "e4"]);
+        assert_eq!(w.d.spare(), Some("e3"));
+        let moved = w.d.replacements.last().unwrap().clone();
+        assert_eq!(
+            (moved.from.as_str(), moved.to.as_str(), moved.reason.as_str()),
+            ("e3", "e4", APPORTION)
+        );
+        assert_eq!(moved.kind, ReplacementKind::Handover);
+        // Its token is fetched again (a tokenless SUB to e3).
+        assert!(w.s.legs[&e3].released);
+        w.run_to(w.ms() + 300);
+        assert!(w.requests().is_empty(), "no other spare asked");
+    }
+
+    /// A new leg for an apportioned place that fails leaves the hedge leg
+    /// where it is, holding its place.
+    #[test]
+    fn a_failed_leg_for_an_apportioned_place_leaves_the_hedge_where_it_is() {
+        let mut w = World::new("apportion-2", 2, true);
+        w.join(&[1, 2], Some(3));
+        let e1 = w.key("e1");
+        w.view("e1", |view| view.delivering = false);
+        w.event(LegEvent::HedgeDue(e1));
+        w.run_to(w.ms() + 25);
+        w.live("e3");
+        w.event(LegEvent::Failed {
+            leg: e1,
+            cause: LegFailure::Dead,
+        });
+        let (to, nonce, _) = loop {
+            w.run_to(w.ms() + 1);
+            if let Some(request) = w.requests().pop() {
+                break request;
+            }
+        };
+        w.answer(to, nonce, vec![cache(4), cache(5)], 1, true, Some(0x77));
+        assert!(w.leaving("e3"));
+        let e4 = w.key("e4");
+        w.event(LegEvent::Refused {
+            leg: e4,
+            reason: "edge-busy".into(),
+        });
+        assert!(!w.leaving("e3"), "{:?}", w.held());
+        assert_eq!(w.held(), ["e2", "e3"]);
+        // A spare is asked for again, with no place to apportion.
+        let (_, _, request) = loop {
+            w.run_to(w.ms() + 1);
+            if let Some(request) = w.requests().pop() {
+                break request;
+            }
+        };
+        assert!(matches!(request, Control::Assign { paths: 0, spare: true, .. }), "{request:?}");
+    }
+
+    /// A request for a leg names the spare the listener holds (`k=`): an
+    /// answer that names the same spare keeps it (its token too); one that
+    /// names another replaces it.
+    #[test]
+    fn a_request_names_the_spare_held_and_the_answer_may_replace_it() {
+        let mut w = World::new("keep-1", 2, true);
+        w.join(&[1, 2], Some(3));
+        assert_eq!(w.d.spare(), Some("e3"));
+        let e1 = w.key("e1");
+        w.event(LegEvent::Moved {
+            leg: e1,
+            reason: "draining".into(),
+        });
+        let (to, nonce, request) = loop {
+            w.run_to(w.ms() + 1);
+            if let Some(request) = w.requests().pop() {
+                break request;
+            }
+        };
+        let Control::Assign {
+            paths,
+            spare,
+            spare_held,
+            ..
+        } = request.clone()
+        else {
+            unreachable!()
+        };
+        assert_eq!((paths, spare, spare_held.as_deref()), (1, true, Some("e3")));
+        assert!(Control::decode(&request.encode()) == Some(request));
+        // The same spare: kept, no new token asked.
+        w.answer(to, nonce, vec![cache(4), cache(3)], 1, true, Some(0x77));
+        assert_eq!(w.d.spare(), Some("e3"));
+        assert_eq!(w.d.stats.spares_rechosen, 0);
+        assert!(!w
+            .controls()
+            .iter()
+            .any(|(to, control, _)| *to == edge_addr(3)
+                && matches!(control, Control::Subscribe { token: None, .. })));
+        // Another move: the entry names e5, under the gate where e3 is not.
+        w.live("e4");
+        let e4 = w.key("e4");
+        w.s.level.insert((e4, e1));
+        w.run_to(w.ms() + 10);
+        let e2 = w.key("e2");
+        w.event(LegEvent::Moved {
+            leg: e2,
+            reason: "draining".into(),
+        });
+        let (to, nonce, _) = loop {
+            w.run_to(w.ms() + 1);
+            if let Some(request) = w.requests().pop() {
+                break request;
+            }
+        };
+        w.answer(to, nonce, vec![cache(6), cache(5)], 1, true, Some(0x78));
+        assert_eq!(w.d.spare(), Some("e5"));
+        assert_eq!(w.d.stats.spares_rechosen, 1);
     }
 
     #[test]
@@ -4410,6 +4720,8 @@ mod tests {
             https_at: None,
             tokens: Vec::new(),
             answered_by: Vec::new(),
+            spare_held: None,
+            place_of: None,
         };
         assert_eq!(
             w.d.https_path(&request),
@@ -4744,9 +5056,10 @@ mod tests {
                 request,
                 Control::Assign {
                     paths: 1,
-                    spare: false,
+                    spare: true,
+                    spare_held: Some(ref held),
                     ..
-                }
+                } if held == "e3"
             ));
             // The entry names the spare: it is promoted, and a new spare is
             // asked for at once (a leg is leaving).
@@ -5150,7 +5463,7 @@ mod tests {
         else {
             unreachable!()
         };
-        assert_eq!((paths, spare, hold), (1, false, vec!["e1".to_owned()]));
+        assert_eq!((paths, spare, hold), (1, true, vec!["e1".to_owned()]));
         // Still over the gate: counted again; then the second leg comes.
         w.answer_why(
             to,
