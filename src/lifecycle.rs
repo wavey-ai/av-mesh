@@ -200,8 +200,15 @@ impl NodeLifecycle {
     pub(crate) fn attach_mesh(&self, mesh: &Arc<CacheMeshHandle>) {
         let _change = self.lock_change();
         if self.inner.mesh.set(Arc::clone(mesh)).is_ok() {
-            mesh.set_draining(self.inner.reasons.load(Ordering::Acquire) != 0);
+            mesh.set_draining(self.hello_draining());
         }
+    }
+
+    /// Whether the cache mesh's hello says draining now: any reason holds.
+    /// The mesh is built with it (`with_draining`), so that its first hello
+    /// says what [`Self::attach_mesh`] sets.
+    pub(crate) fn hello_draining(&self) -> bool {
+        self.inner.reasons.load(Ordering::Acquire) != 0
     }
 
     /// The state byte the cache mesh's hello reads.

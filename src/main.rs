@@ -3833,6 +3833,9 @@ async fn main() -> Result<()> {
         // C CR6: the hello gives this node's build and state.
         .with_build(av_mesh::build::GIT.to_owned())
         .with_hello_state(lifecycle.hello())
+        // cr68 finding 6: a node that starts drained says so in its first
+        // hello, not only once `attach_mesh` has run.
+        .with_draining(lifecycle.hello_draining())
         .with_test_future_frames(args.cache_mesh_test_future_frames)
         // A PL1 (A 2.7): a part from a parent keeps the first copy of its
         // epoch (two contributors publish the same parts).

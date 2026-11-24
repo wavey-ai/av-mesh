@@ -2896,7 +2896,7 @@ dependencies = [
 [[package]]
 name = "playlists"
 version = "0.2.0"
-source = "git+https://github.com/wavey-ai/playlists.git?rev=7496029f739403493926d873229eb4cd018ad613#7496029f739403493926d873229eb4cd018ad613"
+source = "git+https://github.com/wavey-ai/playlists.git?rev=3fcfea9e81f6eca9b6c4dd50485db5de4917bfc2#3fcfea9e81f6eca9b6c4dd50485db5de4917bfc2"
 dependencies = [
  "access-unit 0.1.5",
  "arc-swap",
