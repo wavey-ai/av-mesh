@@ -2004,6 +2004,36 @@ impl CompactReceiver {
         self.stats.generation_changes += 1;
     }
 
+    /// The session's source generation, if one has been taken.
+    pub fn generation(&self) -> Option<u8> {
+        self.generation
+    }
+
+    /// Take `generation` as the session's for a RaptorQ object (stuck4k;
+    /// `client_udp` judges which object wins): the first is taken as it is,
+    /// the current one again is nothing new, and another starts a new flow
+    /// (`true`), as a new compact generation does.
+    pub fn adopt_generation(&mut self, generation: u8, fast_lane: bool, now: Instant) -> bool {
+        match self.generation {
+            None => {
+                self.generation = Some(generation);
+                self.generation_fast_at = fast_lane.then_some(now);
+                false
+            }
+            Some(current) if current == generation => {
+                if fast_lane {
+                    self.generation_fast_at = Some(now);
+                }
+                self.challenger = None;
+                false
+            }
+            Some(_) => {
+                self.switch_generation(generation, None, fast_lane, now);
+                true
+            }
+        }
+    }
+
     /// Forget the generations refused (a leg refused everything for a
     /// second, see `client_session`): the next datagram of any generation
     /// is judged as if none had been seen but the current one.

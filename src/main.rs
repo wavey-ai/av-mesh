@@ -12091,6 +12091,47 @@ impl LiveTsCache {
         Some((handle, last))
     }
 
+    /// The newest part of a stream's current session, as the edge's UDP
+    /// clients are served it, and the session's source epoch (0 unknown).
+    ///
+    /// The cache's watermark, unless the slot there is a copy of an older
+    /// source epoch than the stream's: then the newest part this node
+    /// recorded. A cache-mesh copy of the previous session's part that comes
+    /// after the new session hid the old slots (its epoch is judged against
+    /// the slot it lands on, which the zero hid) is written, and raises the
+    /// watermark, but is never recorded (`observe_mesh_part`): stuck4k,
+    /// syd-edge-2 served two viewers the previous session's part 1233 as the
+    /// head while the new session was at 197, and then waited for 1234.
+    async fn client_head_for_id(&self, stream_id: u64) -> Option<(u64, u64)> {
+        let (handle, last) = self.stream_position_for_id(stream_id).await?;
+        let last = last as u64;
+        let (epoch, recorded) = {
+            let state = self.state.read().await;
+            (
+                state.stream_canonical_epoch.get(&stream_id).copied(),
+                state
+                    .stream_parts
+                    .get(&stream_id)
+                    .and_then(|parts| parts.keys().next_back().copied()),
+            )
+        };
+        let epoch_or_zero = epoch.unwrap_or(0);
+        // Recorded up to the watermark (or nothing recorded to judge by):
+        // the watermark. A part written a moment before it is recorded is
+        // read once, and is of the stream's epoch.
+        let (Some(recorded), Some(epoch)) = (recorded.filter(|recorded| *recorded < last), epoch)
+        else {
+            return Some((last, epoch_or_zero));
+        };
+        let stale = self
+            .chunk_cache
+            .get_for_handle(handle, usize::try_from(last).ok()?)
+            .await
+            .and_then(|(bytes, _)| mesh_slot_epoch(&bytes))
+            .is_some_and(|slot| slot < epoch);
+        Some((if stale { recorded } else { last }, epoch))
+    }
+
     async fn get_part_for_stream_id(&self, stream_id: u64, seq: u64) -> Option<(Bytes, u64)> {
         let (media, hash, media_kind, init) = self.read_part_for_stream_id(stream_id, seq).await?;
         if let Some(init) = init {
@@ -12142,7 +12183,13 @@ impl LiveTsCache {
             .await?;
         let epoch = mesh_slot_epoch(&bytes)?;
         let slot = LiveSlotPayload::decode_for_stream(bytes, stream_id);
-        (slot.has_media() && slot.media() == *media).then_some(epoch)
+        // The same bytes are a view of the same slot (no compare of a 4K
+        // part's megabyte).
+        let read = slot.media();
+        let same = slot.has_media()
+            && read.len() == media.len()
+            && (read.as_ptr() == media.as_ptr() || read == *media);
+        same.then_some(epoch)
     }
 
     async fn part_available_unix_us(&self, stream_id: u64, seq: u64) -> Option<u64> {
@@ -15473,6 +15520,9 @@ struct ClientUdpGauges {
     /// B rule 9 (cumulative): redundant legs refused because the edge was
     /// overloaded.
     redundant_refusals: u64,
+    /// Subscribers that a new session of their stream found waiting for a
+    /// part of the old numbering, started at the new head (stuck4k).
+    session_restarts: u64,
     /// Hedges and replacements taken at or over the redundant leg's gate
     /// (cumulative; the lead's decision of 24 Nov).
     hedges_over_gate: u64,
@@ -22679,6 +22729,7 @@ impl AppRouter {
             moves_expired: stats.moves_expired.load(Ordering::Relaxed),
             moves_taken_back: stats.moves_taken_back.load(Ordering::Relaxed),
             redundant_refusals: stats.redundant_refusals.load(Ordering::Relaxed),
+            session_restarts: stats.session_restarts.load(Ordering::Relaxed),
             hedges_over_gate: stats.hedges_over_gate.load(Ordering::Relaxed),
             single_legs,
             legs_by_other,
@@ -47293,4 +47344,7 @@ mod tests {
     /// edges and two entry points in this process, through the referee's
     /// changes (B Y5).
     mod two_paths;
+    /// A 4K viewer at an edge whose source session restarts, with a late
+    /// copy of the old session in its cache (stuck4k).
+    mod stuck_4k;
 }

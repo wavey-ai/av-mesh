@@ -360,6 +360,11 @@ pub enum Control {
     Waiting {
         stream_id: u64,
         next_part: u64,
+        /// The newest part of the stream's current session at the edge
+        /// (`h=`, stuck4k): a WAIT whose head moves while no part comes is
+        /// an edge that does not send a live stream. `None` from an edge
+        /// older than it.
+        head: Option<u64>,
     },
     Refused {
         stream_id: u64,
@@ -502,7 +507,11 @@ impl Control {
             Self::Waiting {
                 stream_id,
                 next_part,
-            } => format!("{CONTROL_PREFIX}WAIT {stream_id} {next_part}"),
+                head,
+            } => match head {
+                Some(head) => format!("{CONTROL_PREFIX}WAIT {stream_id} {next_part} h={head}"),
+                None => format!("{CONTROL_PREFIX}WAIT {stream_id} {next_part}"),
+            },
             Self::Refused { stream_id, reason } => {
                 format!(
                     "{CONTROL_PREFIX}REFUSED {stream_id} {}",
@@ -708,10 +717,20 @@ impl Control {
                     compact,
                 }
             }
-            "WAIT" => Self::Waiting {
-                stream_id,
-                next_part: words.next()?.parse().ok()?,
-            },
+            "WAIT" => {
+                let next_part = words.next()?.parse().ok()?;
+                let mut head = None;
+                for word in words.by_ref() {
+                    if let ("h", value) = field(word)? {
+                        once(&mut head, value.parse().ok()?)?;
+                    }
+                }
+                Self::Waiting {
+                    stream_id,
+                    next_part,
+                    head,
+                }
+            }
             // A reason has no `=`, so a field after the stream is a later
             // build's field on a datagram that gives no reason.
             "REFUSED" => Self::Refused {
@@ -932,6 +951,15 @@ pub struct PartObject {
     pub available_unix_us: u64,
     /// When the contributor published it, in µs since the epoch, or 0.
     pub published_unix_us: u64,
+    /// The generation of the source epoch of the part's own slot
+    /// (`client_compact::generation_of_epoch`), 0 when unknown (an edge
+    /// older than it, a gap, an init segment, cut-through, the fast lane,
+    /// whose envelope carries the epoch itself). It goes in the object
+    /// header's flags byte, which earlier builds wrote 0 and ignore: a part
+    /// of the cache-fed lane says which session it is of (stuck4k: an edge
+    /// sent a viewer the previous session's last part as the head of the
+    /// new one).
+    pub generation: u8,
     /// The bytes of the LL-HLS part (or init segment), unchanged.
     pub payload: Bytes,
 }
@@ -952,7 +980,7 @@ impl PartObject {
         let mut out = BytesMut::with_capacity(OBJECT_HEADER_LEN + self.payload.len());
         out.put_slice(OBJECT_MAGIC);
         out.put_u8(self.kind.code());
-        out.put_u8(0);
+        out.put_u8(self.generation);
         out.put_u32(self.datagrams);
         out.put_u32(crc32fast::hash(&self.payload));
         out.put_u64(self.stream_id);
@@ -969,7 +997,7 @@ impl PartObject {
         }
         let mut header = &object[4..OBJECT_HEADER_LEN];
         let kind = ObjectKind::from_code(header.get_u8()).ok_or(ObjectError("unknown kind"))?;
-        let _flags = header.get_u8();
+        let generation = header.get_u8();
         let datagrams = header.get_u32();
         let crc = header.get_u32();
         let stream_id = header.get_u64();
@@ -987,6 +1015,7 @@ impl PartObject {
             part,
             available_unix_us,
             published_unix_us,
+            generation,
             payload,
         })
     }
@@ -1103,6 +1132,7 @@ fn cut_through_object(frame: &[u8]) -> Option<PartObject> {
         part: slot,
         available_unix_us: 0,
         published_unix_us: slot_published_unix_us(&payload).unwrap_or(0),
+        generation: 0,
         payload: media,
     })
 }
@@ -1252,7 +1282,89 @@ pub struct ObjectReceiver {
     /// Objects that one datagram delivered beyond the one `push` returned
     /// (a window's repair recovers several): see [`Self::next_ready`].
     ready: VecDeque<PartObject>,
+    /// The lane of the object that the last `push` returned.
+    pub last_lane: Option<Lane>,
+    /// RaptorQ objects decoded and not taken, by reason (stuck4k: the
+    /// compact lane counts its datagrams so; a RaptorQ lane that took
+    /// nothing said nothing).
+    pub raptorq_refused: RaptorqRefused,
+    /// Each leg's RaptorQ datagrams since it last brought a part that was
+    /// taken, and when that was (see [`Self::leg_untaken`]).
+    takes: [LegTakes; compact::MAX_LEGS],
+    /// The session's generation as RaptorQ objects last showed it, its
+    /// objects since it was taken and the leg of the last; another
+    /// generation's objects in a row with none of it between (see
+    /// [`Self::object_session`]).
+    session_seen: Option<(u8, u32, LegId)>,
+    object_challenger: Option<(u8, u32)>,
 }
+
+/// What a receiver makes of a RaptorQ object's session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectSession {
+    /// The current session's (or of none known): taken.
+    Taken,
+    /// A new session: the parts delivered and every leg's blocks are
+    /// forgotten, and the object is taken as the new session's.
+    NewFlow,
+    /// Another session's, while the current one holds: dropped.
+    Refused,
+}
+
+/// The lane that brought a part to the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Lane {
+    /// A RaptorQ object that the edge encoded from its cache.
+    Cache,
+    /// The cache mesh's own symbols, forwarded as they came (cut-through).
+    CutThrough,
+    /// The contributor's symbols from the edge's fast lane.
+    Fast,
+    /// A compact datagram from the edge's cache-fed lane.
+    Compact,
+    /// A compact datagram from the edge's fast lane.
+    CompactFast,
+}
+
+impl Lane {
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Cache => "cache",
+            Self::CutThrough => "cut-through",
+            Self::Fast => "fast",
+            Self::Compact => "compact",
+            Self::CompactFast => "compact-fast",
+        }
+    }
+}
+
+/// RaptorQ objects (parts, gaps) that a receiver decoded and did not take,
+/// by reason.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RaptorqRefused {
+    /// Of a source session that the receiver refused (an old epoch of the
+    /// fast lane, an old or held-off generation of the cache-fed lane).
+    pub stale_generation: u64,
+    /// Below the session's first part.
+    pub before_start: u64,
+    /// Delivered already (another lane, leg or copy).
+    pub duplicate: u64,
+}
+
+/// A leg's RaptorQ datagrams since it last brought a part that was taken.
+#[derive(Debug, Default, Clone, Copy)]
+struct LegTakes {
+    untaken: u64,
+    taken_at: Option<Instant>,
+}
+
+/// A session that RaptorQ objects established (two of its objects, or one
+/// from another leg) holds against another generation of the cache-fed lane
+/// until this many of that one's objects come in a row, none of the current
+/// one between: a lone part of another session (the cache's late copy of
+/// the previous one) does not take the session over, and a new session
+/// takes it at its second part.
+pub const OBJECT_CHALLENGE: u32 = 2;
 
 /// A block is counted for loss once its datagrams have had this long to
 /// arrive.
@@ -1281,6 +1393,7 @@ impl ObjectReceiver {
     pub fn open_leg(&mut self) -> Option<LegId> {
         let leg = self.compact.open_leg()?;
         self.legs[leg.index()] = LegBlocks::default();
+        self.takes[leg.index()] = LegTakes::default();
         Some(leg)
     }
 
@@ -1289,6 +1402,42 @@ impl ObjectReceiver {
     pub fn close_leg(&mut self, leg: LegId) {
         self.compact.close_leg(leg);
         self.legs[leg.index()] = LegBlocks::default();
+        self.takes[leg.index()] = LegTakes::default();
+    }
+
+    /// Forget the sessions refused (a leg failed for refusing, or for a
+    /// stall): the next object or datagram of any generation is judged as
+    /// if only the current one had been seen, and none holds.
+    pub fn forget_sessions(&mut self) {
+        self.compact.forget_generations();
+        self.session_seen = None;
+        self.object_challenger = None;
+    }
+
+    /// A leg's RaptorQ datagrams since it last brought a part (or a gap, or
+    /// an init segment) that was taken or had been delivered already, and
+    /// when that was: a leg whose datagrams come and decode to nothing that
+    /// is taken (refused, or never whole) has failed (see
+    /// `client_session::REFUSING_FOR`).
+    pub fn leg_untaken(&self, leg: LegId) -> (u64, Option<Instant>) {
+        let takes = &self.takes[leg.index()];
+        (takes.untaken, takes.taken_at)
+    }
+
+    /// A new source session that the compact lane or a RaptorQ object
+    /// showed: every leg's RaptorQ decoders and blocks are forgotten (the
+    /// old session's blocks of the same numbers must not meet the new
+    /// ones), the block that showed it staying completed in `space`.
+    fn forget_blocks(&mut self, leg: LegId, space: Option<(usize, u32)>) {
+        for blocks in &mut self.legs {
+            *blocks = LegBlocks::default();
+        }
+        if let Some((space, block)) = space {
+            let blocks = &mut self.legs[leg.index()];
+            blocks.decoders.get_or_insert_with(Default::default)[space].expire_block(block);
+            blocks.settle(block);
+        }
+        self.flows += 1;
     }
 
     /// A new source epoch (its part numbers count again): every leg's
@@ -1361,6 +1510,11 @@ impl ObjectReceiver {
             .compact
             .push(leg, datagram, Instant::now(), now_unix_us);
         let after = self.compact.stats;
+        if after.generation_changes != before.generation_changes {
+            // A new session on the compact lane: the RaptorQ lane's blocks
+            // of the old one go too.
+            self.forget_blocks(leg, None);
+        }
         self.errors += after.errors - before.errors;
         self.duplicate_parts += after.duplicates - before.duplicates;
         for part in parts {
@@ -1384,6 +1538,7 @@ impl ObjectReceiver {
                 part: part.part,
                 available_unix_us: 0,
                 published_unix_us: part.published_unix_us,
+                generation: 0,
                 payload: Bytes::from(part.payload),
             });
         }
@@ -1397,8 +1552,17 @@ impl ObjectReceiver {
         self.wire_bytes += (datagram.len() + compact::IP_UDP_HEADER_BYTES) as u64;
         self.last_fast_envelope_bytes = None;
         self.last_compact_fast_lane.clear();
+        self.last_lane = None;
         if compact::is_compact(datagram) || compact::is_short(datagram) {
-            return self.push_compact(leg, datagram);
+            let object = self.push_compact(leg, datagram);
+            if let Some(object) = &object {
+                self.last_lane = Some(if self.last_compact_fast_lane.contains(&object.part) {
+                    Lane::CompactFast
+                } else {
+                    Lane::Compact
+                });
+            }
+            return object;
         }
         let header = match DatagramFecHeader::decode(datagram) {
             Ok(header) => header,
@@ -1423,6 +1587,12 @@ impl ObjectReceiver {
                 first_seen: Instant::now(),
             });
             count.received += 1;
+            // A datagram of a block not yet decoded waits for a part to be
+            // taken; one of a decoded block (a repair symbol after its
+            // sources) or a settled one does not.
+            if !count.decoded {
+                self.takes[leg.index()].untaken += 1;
+            }
         }
         let seen = blocks
             .blocks
@@ -1432,9 +1602,21 @@ impl ObjectReceiver {
         let decoders = blocks.decoders.get_or_insert_with(Default::default);
         match decoders[space].push_datagram(datagram) {
             Ok(Some(bytes)) => match decode_any_object(bytes) {
-                Ok((object, fast)) => {
-                    let stale =
-                        fast.is_some_and(|fast| !self.fast_decoded(leg, header.block_id, fast));
+                Ok((object, lane, fast)) => {
+                    let now = Instant::now();
+                    // The object's session: the fast lane's epoch, the
+                    // cache-fed lane's generation (stuck4k), none for
+                    // cut-through.
+                    let session = match fast {
+                        Some(fast) => self.fast_decoded(leg, fast, now),
+                        None if object.kind == ObjectKind::Part => {
+                            self.object_session(leg, object.generation, false, false, now)
+                        }
+                        None => ObjectSession::Taken,
+                    };
+                    if session == ObjectSession::NewFlow {
+                        self.forget_blocks(leg, Some((space, header.block_id)));
+                    }
                     let blocks = &mut self.legs[leg.index()];
                     if let Some(count) = blocks.blocks.get_mut(&header.block_id) {
                         // A cut-through or fast-lane object does not say how
@@ -1443,8 +1625,8 @@ impl ObjectReceiver {
                         count.sent = Some(object.datagrams);
                         count.decoded = true;
                     }
-                    if stale {
-                        self.stale_fast_objects += 1;
+                    if session == ObjectSession::Refused {
+                        self.raptorq_refused.stale_generation += 1;
                         return None;
                     }
                     self.objects += 1;
@@ -1461,16 +1643,30 @@ impl ObjectReceiver {
                         // complete, and are not loss.
                         blocks.settle_other_lanes(object.part, Some(header.block_id));
                     }
-                    if matches!(object.kind, ObjectKind::Part | ObjectKind::Gap)
-                        && !self
-                            .compact
-                            .delivered_elsewhere(leg, object.part, Instant::now())
-                    {
-                        // A part that the compact lane, another block or
-                        // another leg delivered already.
-                        self.duplicate_parts += 1;
-                        return None;
+                    if matches!(object.kind, ObjectKind::Part | ObjectKind::Gap) {
+                        let before_start = self.compact.stats.before_start;
+                        if !self.compact.delivered_elsewhere(leg, object.part, now) {
+                            if self.compact.stats.before_start != before_start {
+                                self.raptorq_refused.before_start += 1;
+                                return None;
+                            }
+                            // A part that the compact lane, another block or
+                            // another leg delivered already: the leg is on
+                            // the session.
+                            self.raptorq_refused.duplicate += 1;
+                            self.duplicate_parts += 1;
+                            self.takes[leg.index()] = LegTakes {
+                                untaken: 0,
+                                taken_at: Some(now),
+                            };
+                            return None;
+                        }
                     }
+                    self.takes[leg.index()] = LegTakes {
+                        untaken: 0,
+                        taken_at: Some(now),
+                    };
+                    self.last_lane = Some(lane);
                     Some(object)
                 }
                 Err(_) => {
@@ -1489,30 +1685,107 @@ impl ObjectReceiver {
     /// A fast-lane block decoded. A new source epoch (the contributor
     /// restarted, and counts its parts from 0 again) starts a new flow: the
     /// old epoch's blocks of the same numbers must not meet the new ones in
-    /// a decoder, nor its completed blocks hide them. The block that showed
-    /// the new epoch stays completed in the new flow. An object of one of
-    /// the last few epochs is late (another leg's edge saw the new epoch
-    /// first): `false`, and it is dropped.
-    fn fast_decoded(&mut self, leg: LegId, block: u32, fast: FastObject) -> bool {
-        if self.old_fast_epochs.contains(&fast.epoch) {
-            return false;
+    /// a decoder, nor its completed blocks hide them (the caller forgets the
+    /// blocks; the block that showed the new epoch stays completed in the new
+    /// flow). An object of one of the last few epochs is late (another leg's
+    /// edge saw the new epoch first): refused. The epoch's generation is the
+    /// session's for the other lanes too (stuck4k): a cache-fed part of
+    /// another session is judged against it.
+    fn fast_decoded(&mut self, leg: LegId, fast: FastObject, now: Instant) -> ObjectSession {
+        // A source epoch is its session's start time: an older one than the
+        // current is late.
+        if self.old_fast_epochs.contains(&fast.epoch)
+            || self.fast_epoch.is_some_and(|epoch| fast.epoch < epoch)
+        {
+            self.stale_fast_objects += 1;
+            return ObjectSession::Refused;
         }
-        if let Some(epoch) = self.fast_epoch.filter(|epoch| *epoch != fast.epoch) {
+        let new_epoch = self.fast_epoch.is_some_and(|epoch| epoch != fast.epoch);
+        // Its epoch is the session's once the fast lane has brought one;
+        // its first object is judged as a cache-fed object is.
+        let session = self.object_session(
+            leg,
+            compact::generation_of_epoch(fast.epoch),
+            self.fast_epoch.is_some(),
+            new_epoch,
+            now,
+        );
+        if let Some(epoch) = self.fast_epoch.filter(|_| new_epoch) {
             self.old_fast_epochs.push_back(epoch);
             if self.old_fast_epochs.len() > OLD_FAST_EPOCHS {
                 self.old_fast_epochs.pop_front();
             }
-            self.new_flow();
-            let blocks = &mut self.legs[leg.index()];
-            blocks.decoders.get_or_insert_with(Default::default)[FAST_SPACE].expire_block(block);
-            blocks.settle(block);
             self.fast_epoch_changes += 1;
         }
         self.fast_epoch = Some(fast.epoch);
         self.fast_parts += 1;
         self.fast_envelope_bytes += fast.envelope_bytes as u64;
         self.last_fast_envelope_bytes = Some(fast.envelope_bytes);
-        true
+        session
+    }
+
+    /// The session of a RaptorQ object of `generation` (0: unknown, taken).
+    /// A part object of the cache-fed lane carries its slot's own epoch's
+    /// generation, a fast-lane envelope its exact epoch (stuck4k).
+    ///
+    /// The fast lane's epochs are exact, and the older ones are refused
+    /// before this: once it has brought one (`exact`), its object's
+    /// generation is the session's (`new_epoch`: an epoch it had not
+    /// brought, a new flow even if the digests are alike). Otherwise (the
+    /// cache-fed lane), a generation other than the current one is refused
+    /// while the current one holds (two of its objects have come, or its
+    /// last came by another leg), until [`OBJECT_CHALLENGE`] of it come in a
+    /// row; it starts a new flow at once when the current one came only
+    /// once, by this leg (that edge changed its mind). Whatever the
+    /// order of the two sessions' objects, the receiver ends on the session
+    /// whose objects keep coming, and one late part of another session
+    /// never takes it over.
+    fn object_session(
+        &mut self,
+        leg: LegId,
+        generation: u8,
+        exact: bool,
+        new_epoch: bool,
+        now: Instant,
+    ) -> ObjectSession {
+        if generation == 0 {
+            return ObjectSession::Taken;
+        }
+        let current = self.compact.generation();
+        let other = current.is_some_and(|current| current != generation);
+        if other && !exact {
+            let holds = self.session_seen.is_some_and(|(seen, run, seen_leg)| {
+                Some(seen) == current && (run >= 2 || seen_leg != leg)
+            });
+            let run = match self.object_challenger {
+                Some((challenger, run)) if challenger == generation => run + 1,
+                _ => 1,
+            };
+            if holds && run < OBJECT_CHALLENGE {
+                self.object_challenger = Some((generation, run));
+                return ObjectSession::Refused;
+            }
+        }
+        self.object_challenger = None;
+        let new_flow = if new_epoch && !other {
+            // A new exact epoch whose digest is the current one's.
+            self.compact.new_flow();
+            self.compact.stats.generation_changes += 1;
+            true
+        } else {
+            self.compact.adopt_generation(generation, exact, now)
+        };
+        self.session_seen = Some(match self.session_seen {
+            Some((seen, run, _)) if seen == generation && !new_flow => {
+                (seen, run.saturating_add(1), leg)
+            }
+            _ => (generation, 1, leg),
+        });
+        if new_flow {
+            ObjectSession::NewFlow
+        } else {
+            ObjectSession::Taken
+        }
     }
 
     /// Count a leg's blocks that have settled, and return the datagram loss
@@ -1575,16 +1848,18 @@ struct FastObject {
 /// The object of a decoded block: a part object the edge encoded, a
 /// cache-mesh chunk frame (cut-through), or a canonical media-object
 /// envelope (the fast lane).
-fn decode_any_object(bytes: Vec<u8>) -> Result<(PartObject, Option<FastObject>), ObjectError> {
+fn decode_any_object(
+    bytes: Vec<u8>,
+) -> Result<(PartObject, Lane, Option<FastObject>), ObjectError> {
     if bytes.starts_with(OBJECT_MAGIC) {
-        return PartObject::decode(Bytes::from(bytes)).map(|object| (object, None));
+        return PartObject::decode(Bytes::from(bytes)).map(|object| (object, Lane::Cache, None));
     }
     if bytes.starts_with(&media_object::WIRE_MAGIC) {
         let (object, fast) = fast_object(Bytes::from(bytes))?;
-        return Ok((object, Some(fast)));
+        return Ok((object, Lane::Fast, Some(fast)));
     }
     cut_through_object(&bytes)
-        .map(|object| (object, None))
+        .map(|object| (object, Lane::CutThrough, None))
         .ok_or(ObjectError(
             "not a part object, a chunk frame or an envelope",
         ))
@@ -1609,6 +1884,7 @@ fn fast_object(envelope: Bytes) -> Result<(PartObject, FastObject), ObjectError>
             available_unix_us: 0,
             published_unix_us: crate::canonical_slot::object_published_unix_us(&part.object)
                 .unwrap_or(0),
+            generation: 0,
             payload: media,
         },
         FastObject {
@@ -1781,6 +2057,12 @@ mod tests {
             Control::Waiting {
                 stream_id: 9,
                 next_part: 78,
+                head: None,
+            },
+            Control::Waiting {
+                stream_id: 9,
+                next_part: 78,
+                head: Some(1_233),
             },
             Control::Refused {
                 stream_id: 9,
@@ -2397,6 +2679,7 @@ mod tests {
             Control::Waiting {
                 stream_id: 9,
                 next_part: 78,
+                head: Some(77),
             },
             Control::Refused {
                 stream_id: 9,
@@ -2782,6 +3065,162 @@ mod tests {
         assert_eq!(receiver.fast_parts, 20);
     }
 
+    /// Stuck4k in the receiver: a 4K viewer (one leg, the RaptorQ lane)
+    /// joins as a source session restarts. Its edge's `OK` names the
+    /// previous session's last part (1233) or the new head (197); the
+    /// previous session's part 1233 comes as a cache-fed object (its
+    /// generation stamped from its own slot) or a fast-lane envelope of the
+    /// old epoch; the new session's first parts come on the cache-fed lane
+    /// or the fast lane. Every order of the `OK`, the stale part and the new
+    /// session's first two parts is run: in each the receiver ends on the
+    /// new session (every part from 197 on comes out once, nothing of the
+    /// old session after it), and refuses at most the one stale object.
+    #[test]
+    fn a_4k_join_at_a_session_start_converges_whatever_the_order() {
+        use crate::client_compact::generation_of_epoch;
+        const OLD: u64 = 1_795_553_276_846_835;
+        const NEW: u64 = 1_795_553_340_807_636;
+        const OLD_LEN: usize = 2_400;
+        const NEW_LEN: usize = 3_000;
+        #[derive(Debug, Clone, Copy)]
+        enum Step {
+            Ok,
+            Stale,
+            New(u64),
+        }
+        fn orders(steps: &mut Vec<Step>, k: usize, out: &mut Vec<Vec<Step>>) {
+            if k <= 1 {
+                out.push(steps.clone());
+                return;
+            }
+            for i in 0..k {
+                orders(steps, k - 1, out);
+                let j = if k % 2 == 0 { i } else { 0 };
+                steps.swap(j, k - 1);
+            }
+        }
+        let cached = |epoch: u64, part: u64, len: usize| {
+            let object = PartObject {
+                generation: generation_of_epoch(epoch),
+                ..object(part, len)
+            };
+            encode_object(&object, DEFAULT_SYMBOL_SIZE, RepairPolicy::default()).unwrap()
+        };
+        let fast = |epoch: u64, part: u64, len: usize| {
+            fast_datagrams(&envelope(epoch, part, len), part, DEFAULT_SYMBOL_SIZE, 1)
+        };
+        let mut runs = 0;
+        for named in [1_233_u64, 197] {
+            for stale_fast in [false, true] {
+                for new_fast in [false, true] {
+                    let mut steps = vec![Step::Ok, Step::Stale, Step::New(197), Step::New(198)];
+                    let mut all = Vec::new();
+                    orders(&mut steps, 4, &mut all);
+                    for order in all {
+                        runs += 1;
+                        let name = format!("OK {named}, stale fast {stale_fast}, new fast {new_fast}, {order:?}");
+                        let mut receiver = ObjectReceiver::new();
+                        let mut out: Vec<(u64, usize)> = Vec::new();
+                        let mut push = |receiver: &mut ObjectReceiver, datagrams: Vec<Vec<u8>>| {
+                            for datagram in &datagrams {
+                                for object in receiver.push_all(LegId::FIRST, datagram) {
+                                    if object.kind == ObjectKind::Part {
+                                        out.push((object.part, object.payload.len()));
+                                    }
+                                }
+                            }
+                        };
+                        for step in &order {
+                            match *step {
+                                Step::Ok => {
+                                    receiver.expect(LegId::FIRST, 1, named, false);
+                                }
+                                Step::Stale if stale_fast => push(&mut receiver, fast(OLD, 1_233, OLD_LEN)),
+                                Step::Stale => push(&mut receiver, cached(OLD, 1_233, OLD_LEN)),
+                                Step::New(part) if new_fast => push(&mut receiver, fast(NEW, part, NEW_LEN)),
+                                Step::New(part) => push(&mut receiver, cached(NEW, part, NEW_LEN)),
+                            }
+                        }
+                        // Then the stream: the cache-fed lane, and the fast
+                        // lane too when it carries the new session.
+                        for part in 199..260 {
+                            if new_fast && part % 2 == 0 {
+                                push(&mut receiver, fast(NEW, part, NEW_LEN));
+                            }
+                            push(&mut receiver, cached(NEW, part, NEW_LEN));
+                        }
+                        let first_new = out
+                            .iter()
+                            .position(|(part, _)| *part == 197 || *part == 198)
+                            .unwrap_or_else(|| panic!("{name}: no new part: {out:?}"));
+                        let after: Vec<(u64, usize)> = out[first_new..]
+                            .iter()
+                            .copied()
+                            .filter(|(_, len)| *len == NEW_LEN)
+                            .collect();
+                        let parts: Vec<u64> = after.iter().map(|(part, _)| *part).collect();
+                        let mut sorted = parts.clone();
+                        sorted.sort_unstable();
+                        sorted.dedup();
+                        assert_eq!(sorted.len(), parts.len(), "{name}: a part came out twice: {out:?}");
+                        assert_eq!(sorted, (197..260).collect::<Vec<_>>(), "{name}: {out:?}");
+                        // Nothing of the old session once the tail runs.
+                        let tail_from = out.iter().position(|(part, _)| *part == 199).unwrap();
+                        assert!(
+                            out[tail_from..].iter().all(|(_, len)| *len == NEW_LEN),
+                            "{name}: {out:?}"
+                        );
+                        assert!(
+                            receiver.raptorq_refused.stale_generation <= 1,
+                            "{name}: {:?}",
+                            receiver.raptorq_refused,
+                        );
+                        assert_eq!(receiver.raptorq_refused.before_start, 0, "{name}");
+                    }
+                }
+            }
+        }
+        assert_eq!(runs, 8 * 24);
+    }
+
+    /// Stuck4k: once two parts of the new session have come, a late part of
+    /// the previous session (a stale slot of the edge's cache) is refused and
+    /// counted, and the session goes on; two in a row (an edge that sends
+    /// the old session) take the session, and two of the new one take it
+    /// back.
+    #[test]
+    fn a_late_part_of_the_previous_session_is_refused_and_counted() {
+        use crate::client_compact::generation_of_epoch;
+        let cached = |epoch: u64, part: u64| {
+            let object = PartObject {
+                generation: generation_of_epoch(epoch),
+                ..object(part, 2_000)
+            };
+            encode_object(&object, DEFAULT_SYMBOL_SIZE, RepairPolicy::default()).unwrap()
+        };
+        let mut receiver = ObjectReceiver::new();
+        let mut take = |receiver: &mut ObjectReceiver, epoch: u64, part: u64| {
+            cached(epoch, part)
+                .iter()
+                .flat_map(|datagram| receiver.push_all(LegId::FIRST, datagram))
+                .map(|object| object.part)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(take(&mut receiver, 2, 10), vec![10]);
+        assert_eq!(take(&mut receiver, 2, 11), vec![11]);
+        assert!(take(&mut receiver, 1, 1_145).is_empty());
+        assert_eq!(receiver.raptorq_refused.stale_generation, 1);
+        assert_eq!(take(&mut receiver, 2, 12), vec![12]);
+        let flows = receiver.flows;
+        assert!(take(&mut receiver, 1, 1_146).is_empty());
+        assert_eq!(take(&mut receiver, 1, 1_147), vec![1_147]);
+        assert_eq!(receiver.flows, flows + 1);
+        assert_eq!(take(&mut receiver, 2, 13), vec![13]);
+        assert_eq!(receiver.flows, flows + 2);
+        assert_eq!(take(&mut receiver, 2, 14), vec![14]);
+        assert_eq!(receiver.compact.generation(), Some(generation_of_epoch(2)));
+    }
+
     #[test]
     fn a_token_answer_is_shorter_than_the_request() {
         let request = Control::Subscribe {
@@ -2862,6 +3301,7 @@ mod tests {
             part,
             available_unix_us: 7,
             published_unix_us: 5,
+            generation: 0,
             payload: Bytes::from(
                 (0..len)
                     .map(|i| (i * 31 + part as usize) as u8)
