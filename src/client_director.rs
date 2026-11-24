@@ -132,8 +132,9 @@ pub struct LegStart {
 /// What the session knows of one leg now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LegView {
-    /// The leg brought a first arrival within the last max(20 ms, 8 part
-    /// intervals).
+    /// The leg brought a part (a first arrival or a duplicate) within the
+    /// last max(20 ms, 8 part intervals): a leg a fraction of a millisecond
+    /// behind the other delivers too.
     pub delivering: bool,
     /// The leg brought at least 28 of the session's last 32 delivered parts.
     pub steady: bool,
@@ -214,7 +215,10 @@ pub trait SessionLegs {
     /// `--first-double-ms`), or with `start.token`, the `SUB` with that token
     /// (doubled likewise). Every `SUB` of the leg, refreshes included,
     /// carries `o=` with the nodes of the session's other delivering legs.
-    /// The director never holds more than [`MAX_LEGS`] legs.
+    /// The director never holds more than [`MAX_LEGS`] legs. A leg added at
+    /// an address released less than 10 s ago (a hedge back at the spare,
+    /// the swap of a one-leg join) ends that address's `UNSUB` answers: its
+    /// datagrams are the new leg's.
     fn add_leg(
         &mut self,
         leg: LegKey,
@@ -420,11 +424,15 @@ pub struct DirectorLeg {
     pub leaving: Option<(String, Instant)>,
     /// Passed over for want of a token, since when.
     pub passed_over: Option<Instant>,
+    /// The leg this one was added for: a leg leaving or passed over. Only
+    /// it releases that leg (B 3.5 steps 5 and 6), and a rebalance's give-up
+    /// releases only it.
+    pub stands_for: Option<LegKey>,
     compact: bool,
-    /// The first key given after the `MOVE` or the pass-over: legs from it
-    /// on came after.
-    mark: u32,
     steady_since: Option<Instant>,
+    /// Every leg went silent then: the leg is not steady again until it
+    /// has brought media after it.
+    quiet_since: Option<Instant>,
     /// The spare this hedge leg was, given back when it is released.
     spare: Option<Spare>,
     /// The leg this one replaces, booked at its first media.
@@ -436,10 +444,18 @@ impl DirectorLeg {
         self.hedge_for.is_none() && self.leaving.is_none() && self.passed_over.is_none()
     }
 
+    fn leaving_for(&self, reason: &str) -> bool {
+        self.leaving.as_ref().is_some_and(|(why, _)| why == reason)
+    }
+
     fn rebalance(&self) -> bool {
-        self.leaving
-            .as_ref()
-            .is_some_and(|(reason, _)| reason == REBALANCE)
+        self.leaving_for(REBALANCE)
+    }
+
+    /// A leg whose place another leg is added for: leaving or passed over,
+    /// and not a hedge (a hedge holds no place of its own).
+    fn wants_replacement(&self) -> bool {
+        self.hedge_for.is_none() && (self.leaving.is_some() || self.passed_over.is_some())
     }
 }
 
@@ -535,6 +551,19 @@ struct Answer {
     spare: bool,
 }
 
+/// The end of one leaving leg's move.
+#[derive(Debug, Clone, Copy)]
+enum Handover {
+    /// `new`, added for `old`, takes over: `old` is released.
+    Release {
+        old: LegKey,
+        new: LegKey,
+        moved_at: Instant,
+    },
+    /// A rebalance not level by the give-up: `old` is taken back.
+    GiveUp { old: LegKey },
+}
+
 #[derive(Debug, Clone)]
 struct Silence {
     at: Instant,
@@ -574,8 +603,12 @@ pub struct Director {
     answered: Option<(Request, Instant)>,
     pending_answer: Option<(Answer, Option<usize>, Via)>,
     nonces: u64,
+    /// Assignment failures in a row with no leg held.
     failures: u32,
     retry_at: Option<Instant>,
+    /// The last `MOVE`, failure or pass-over that left a place to fill: an
+    /// answer to a request sent before it says nothing of that place.
+    changed_at: Instant,
     short_answers: usize,
     deferred_ask: Option<Instant>,
     delayed: Vec<(Instant, SocketAddr, Vec<u8>)>,
@@ -611,9 +644,12 @@ fn spread(session: &str, salt: u64, max: Duration) -> Duration {
     Duration::from_micros((hash >> 11) % (max.as_micros() as u64 + 1))
 }
 
-/// The host of `https://host[:port][/path]`.
+/// The host of `https://host[:port][/path]` (or `http://`, which the mesh
+/// takes too).
 fn url_host(url: &str) -> Option<String> {
-    let rest = url.strip_prefix("https://")?;
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
     let authority = rest.split('/').next()?;
     let host = if let Some(inner) = authority.strip_prefix('[') {
         inner.split(']').next()?
@@ -657,6 +693,7 @@ impl Director {
             nonces: 0,
             failures: 0,
             retry_at: None,
+            changed_at: now,
             short_answers: 0,
             deferred_ask: None,
             delayed: Vec::new(),
@@ -762,6 +799,72 @@ impl Director {
 
     fn held(&self) -> usize {
         self.legs.iter().filter(|leg| leg.counted()).count()
+    }
+
+    /// Legs asked for by a listener that holds none: `--paths`, or one once
+    /// the stream came as objects. Its answer sets [`Self::want`] again.
+    fn full_paths(&self) -> u8 {
+        if self.objects {
+            1
+        } else {
+            self.config.paths.clamp(1, MAX_PATHS)
+        }
+    }
+
+    /// Legs to ask for now (B 3.5 steps 2 and 8).
+    fn missing(&self) -> u8 {
+        let room = MAX_LEGS.saturating_sub(self.legs.len());
+        let held = self.held();
+        let wanted = if held == 0 {
+            self.full_paths() as usize
+        } else {
+            (self.want as usize).saturating_sub(held)
+        };
+        wanted.min(room) as u8
+    }
+
+    /// A place to fill appeared (a `MOVE`, a failure, a pass-over): an
+    /// answer to a request sent before now does not hold its request back.
+    fn place_opened(&mut self, now: Instant) {
+        self.retry_at = None;
+        self.changed_at = now;
+    }
+
+    /// Whether some leg was added for `key`.
+    fn replaced(&self, key: LegKey) -> bool {
+        self.legs.iter().any(|leg| leg.stands_for == Some(key))
+    }
+
+    /// The leg a new leg is added for: the leg leaving longest (then by
+    /// key) that has no replacement yet, else a leg passed over that has
+    /// none.
+    fn open_place(&self) -> Option<LegKey> {
+        let leaving = self
+            .legs
+            .iter()
+            .filter(|leg| leg.wants_replacement() && !self.replaced(leg.key))
+            .filter_map(|leg| leg.leaving.as_ref().map(|(_, at)| (*at, leg.key)))
+            .min()
+            .map(|(_, key)| key);
+        leaving.or_else(|| {
+            self.legs
+                .iter()
+                .find(|leg| {
+                    leg.wants_replacement() && leg.leaving.is_none() && !self.replaced(leg.key)
+                })
+                .map(|leg| leg.key)
+        })
+    }
+
+    /// Places with no leg of their own and no leg leaving or passed over
+    /// for them: what the records of failed legs ([`Pending`]) wait for.
+    fn empty_places(&self) -> usize {
+        let open = self
+            .legs
+            .iter()
+            .filter(|leg| leg.wants_replacement() && !self.replaced(leg.key))
+            .count();
+        (self.want as usize).saturating_sub(self.held() + open)
     }
 
     fn skipped_now(&self, node: &str, now: Instant) -> bool {
@@ -1054,10 +1157,9 @@ impl Director {
                     let leg = &mut self.legs[index];
                     if leg.passed_over.is_none() && !leg.tokened {
                         leg.passed_over = Some(now);
-                        leg.mark = self.next_key;
                         let node = leg.node.clone();
                         self.skip_node(&node, SkipCause::NoToken, now);
-                        self.retry_at = None;
+                        self.place_opened(now);
                     }
                 }
             }
@@ -1086,21 +1188,24 @@ impl Director {
         if self.swap_at.is_some() {
             self.swap_at = None;
         }
-        // A leg passed over answered: used if it answered first.
+        // A leg passed over answered: used if it answered before the leg
+        // added for it.
         if self.legs[index].passed_over.is_some() {
-            let mark = self.legs[index].mark;
-            let newer: Vec<(LegKey, bool)> = self
+            let beaten = self
                 .legs
                 .iter()
-                .filter(|leg| leg.counted() && leg.key.0 >= mark)
-                .map(|leg| (leg.key, leg.tokened))
-                .collect();
-            if newer.iter().any(|(_, tokened)| *tokened) {
+                .any(|leg| leg.stands_for == Some(key) && leg.tokened);
+            if beaten {
                 self.release(legs, key, now, out);
             } else {
                 self.legs[index].passed_over = None;
-                for (other, _) in newer {
-                    self.release(legs, other, now, out);
+                while let Some(newer) = self
+                    .legs
+                    .iter()
+                    .find(|leg| leg.stands_for == Some(key))
+                    .map(|leg| leg.key)
+                {
+                    self.release(legs, newer, now, out);
                 }
             }
         }
@@ -1149,17 +1254,16 @@ impl Director {
     }
 
     fn on_moved(&mut self, key: LegKey, reason: String, now: Instant) {
-        if reason == REGION_LOST && !self.failover.is_empty() {
-            let url = self.failover[0].clone();
-            self.go_to_region(&url, false, REGION_LOST, now);
-            return;
-        }
         let Some(index) = self.leg_index(key) else {
             return;
         };
         let leg = &mut self.legs[index];
         match &mut leg.leaving {
             // A drain re-marks a rebalanced leg; a repeat changes nothing.
+            // A leg leaving already is not in the region the listener is
+            // in, or is going already: a region-lost `MOVE` from it (every
+            // edge of a lost region sends one, each at its own tick) does
+            // not run the failover again.
             Some((old, at)) => {
                 if *old != reason {
                     *old = reason;
@@ -1167,15 +1271,18 @@ impl Director {
                 }
                 return;
             }
-            None => {
-                leg.leaving = Some((reason, now));
-                leg.mark = self.next_key;
+            // A leg of the current region: the whole region is left.
+            None if reason == REGION_LOST && !self.failover.is_empty() => {
+                let url = self.failover[0].clone();
+                self.go_to_region(&url, false, REGION_LOST, now);
+                return;
             }
+            None => leg.leaving = Some((reason, now)),
         }
         leg.passed_over = None;
         let node = leg.node.clone();
         self.skip_node(&node, SkipCause::Moved, now);
-        self.retry_at = None;
+        self.place_opened(now);
         self.deferred_ask = None;
     }
 
@@ -1233,6 +1340,12 @@ impl Director {
         let keys: Vec<LegKey> = self.legs.iter().map(|leg| leg.key).collect();
         for key in &keys {
             legs.reask_leg(*key, now, &mut sender(out));
+        }
+        // A leg's steadiness counts parts, and none came: it says nothing
+        // until the leg has delivered again.
+        for leg in self.legs.iter_mut() {
+            leg.quiet_since = Some(now);
+            leg.steady_since = None;
         }
         let hedged = self.legs.iter().any(|leg| leg.hedge_for.is_some());
         let spare_ready = self
@@ -1338,10 +1451,10 @@ impl Director {
             return;
         };
         let view = Self::view(legs, key, now);
-        let leg = self.legs.remove(index);
+        let mut leg = self.remove_at(index);
         legs.release_leg(key, now, &mut sender(out));
         self.skip_node(&leg.node, cause, now);
-        self.retry_at = None;
+        self.place_opened(now);
         self.deferred_ask = None;
         if self.hedge_due.is_some_and(|(_, cover)| cover == key) {
             self.hedge_due = None;
@@ -1372,6 +1485,12 @@ impl Director {
             });
             return;
         }
+        // A leg that never went live was itself filling a failed leg's
+        // place: that record still waits, not a second one.
+        if let Some(record) = leg.replaces.take() {
+            self.pending.insert(0, record);
+            return;
+        }
         if leg.leaving.is_some() || leg.passed_over.is_some() {
             return;
         }
@@ -1397,8 +1516,11 @@ impl Director {
         out: &mut Vec<Action>,
     ) -> Option<DirectorLeg> {
         let index = self.leg_index(key)?;
-        let leg = self.legs.remove(index);
+        let mut leg = self.remove_at(index);
         legs.release_leg(key, now, &mut sender(out));
+        if let Some(record) = leg.replaces.take() {
+            self.pending.insert(0, record);
+        }
         if leg.leaving.is_some() {
             if let Some(skip) = self.skip.get_mut(&leg.node) {
                 if skip.cause == SkipCause::Moved && skip.until.is_none() {
@@ -1417,6 +1539,23 @@ impl Director {
             }
         }
         Some(leg)
+    }
+
+    /// Take a leg out of the list. A leg added for it stands for what it
+    /// stood for, and takes over its record of a failed leg if it never went
+    /// live (the record stays in the returned leg when no leg was added for
+    /// it).
+    fn remove_at(&mut self, index: usize) -> DirectorLeg {
+        let mut leg = self.legs.remove(index);
+        for other in self.legs.iter_mut() {
+            if other.stands_for == Some(leg.key) {
+                other.stands_for = leg.stands_for;
+                if other.replaces.is_none() {
+                    other.replaces = leg.replaces.take();
+                }
+            }
+        }
+        leg
     }
 
     fn add<S: SessionLegs>(
@@ -1441,9 +1580,10 @@ impl Director {
             hedge_for: None,
             leaving: None,
             passed_over: None,
+            stands_for: None,
             compact: false,
-            mark: 0,
             steady_since: None,
+            quiet_since: None,
             spare: None,
             replaces: None,
         });
@@ -1467,6 +1607,12 @@ impl Director {
         let node = leg.node.clone();
         legs.takeback_leg(key, now, &mut sender(out));
         self.skip.remove(&node);
+        // It holds its place again: no leg stands for it.
+        for other in self.legs.iter_mut() {
+            if other.stands_for == Some(key) {
+                other.stands_for = None;
+            }
+        }
         self.stats.takebacks += 1;
         self.replacements.push(Replacement {
             at: now,
@@ -1568,7 +1714,6 @@ impl Director {
         for leg in self.legs.iter_mut() {
             if leg.leaving.is_none() {
                 leg.leaving = Some((reason.to_owned(), now));
-                leg.mark = self.next_key;
                 leg.passed_over = None;
                 left.push(leg.node.clone());
             }
@@ -1581,7 +1726,7 @@ impl Director {
         self.hedge_due = None;
         self.request = None;
         self.failures = 0;
-        self.retry_at = None;
+        self.place_opened(now);
         self.deferred_ask = None;
         self.short_answers = 0;
         // Only skips of legs still held matter in another region.
@@ -1661,23 +1806,45 @@ impl Director {
             .filter(|(node, _)| !held_nodes.contains(node))
             .collect();
         // No cache of the region for a listener with nothing left there:
-        // a failover region (a lost region; B:1152-1161).
+        // a failover region (step 9; a lost region, B:1152-1161). A leg
+        // leaving for a rebalance or lost parents is asked to stay instead
+        // (steps 5 and 6), so the listener does not leave the region.
         let all_leaving = self
             .legs
             .iter()
             .filter(|leg| leg.hedge_for.is_none())
-            .all(|leg| leg.leaving.is_some());
+            .all(|leg| leg.leaving.is_some() && !leg.rebalance() && !leg.leaving_for(PARENTS_LOST));
         if usable.is_empty() && all_leaving && !self.failover.is_empty() {
             let url = self.failover[0].clone();
             self.answered = Some((request, now + ANSWERED_KEPT));
             self.go_to_region(&url, false, REGION_LOST, now);
             return;
         }
+        let granted = answer.paths.min(request.paths) as usize;
+        // Step 1: want is what the entry granted for --paths. A short grant
+        // beside a cache the listener could take (the spare, an alternate)
+        // is the entry's choice (a stream over the two-path bit rate, or no
+        // edge under the gate): want is the grant, and nothing is asked
+        // again until the listener holds no leg. A short grant naming
+        // nothing more is for want of an edge: asked again on the backoff.
+        if request.kind != RequestKind::Silence
+            && request.hold.is_empty()
+            && request.paths == self.full_paths()
+        {
+            let offered = usable
+                .iter()
+                .filter(|(node, _)| !self.skipped_now(node, now))
+                .count();
+            self.want = if granted < request.paths as usize && offered > granted {
+                granted.max(1) as u8
+            } else {
+                self.full_paths()
+            };
+        }
         let need = match request.kind {
             RequestKind::Silence => request.paths as usize,
             _ => (self.want as usize).saturating_sub(self.held()),
         };
-        let granted = answer.paths.min(request.paths) as usize;
         let need = need.min(MAX_LEGS.saturating_sub(self.legs.len()));
         let limit = need.min(granted);
         let mut chosen: Vec<(String, SocketAddr)> = Vec::new();
@@ -1710,6 +1877,13 @@ impl Director {
             StartFrom::OldestHole
         };
         let token_wait = self.token_wait();
+        // Records of failed legs wait only for places that no leg leaving
+        // or passed over holds: the oldest beyond those go.
+        let places = self.empty_places();
+        if self.pending.len() > places {
+            let extra = self.pending.len() - places;
+            self.pending.drain(..extra);
+        }
         for (node, addr) in &chosen {
             // The spare named as a leg is promoted with its token.
             let token = match self.spare.take_if(|spare| spare.node == *node) {
@@ -1721,12 +1895,15 @@ impl Director {
                 token,
                 token_wait,
             };
+            // A new leg is for the leg leaving longest, else one passed
+            // over, else the place of a leg that failed.
+            let stands_for = self.open_place();
+            let record =
+                (stands_for.is_none() && !self.pending.is_empty()).then(|| self.pending.remove(0));
             let key = self.add(legs, node, *addr, start, now, out);
-            if !self.pending.is_empty() {
-                let pending = self.pending.remove(0);
-                let index = self.leg_index(key).expect("added");
-                self.legs[index].replaces = Some(pending);
-            }
+            let index = self.leg_index(key).expect("added");
+            self.legs[index].stands_for = stands_for;
+            self.legs[index].replaces = record;
         }
         // The cache after the legs is the spare (after a promoted spare's
         // node too).
@@ -1754,10 +1931,16 @@ impl Director {
         }
         let no_cache = usable.is_empty();
         if no_cache {
-            self.no_cache(legs, now, out);
+            self.no_cache(legs, &request, now, out);
         }
+        // An answer to a request that did not ask for every place missing
+        // now (one sent before the last MOVE or failure, or for the spare
+        // alone) holds nothing back: the loop asks at once for the rest.
+        let asked_all = request.started >= self.changed_at && request.paths as usize >= need;
         let short = chosen.len() < need || (request.spare && self.spare_wanted());
-        if no_cache || short {
+        if !asked_all {
+            self.retry_at = None;
+        } else if no_cache || short {
             let leaving = self.legs.iter().any(|leg| leg.leaving.is_some());
             let wait = if self.legs.is_empty() {
                 RETRY_ALONE
@@ -1776,20 +1959,32 @@ impl Director {
     }
 
     /// The answer named no cache of the region that the listener could take.
-    fn no_cache<S: SessionLegs>(&mut self, legs: &mut S, now: Instant, out: &mut Vec<Action>) {
+    /// It speaks for a leaving leg only when the request asked for its
+    /// replacement (it asked for a leg and was sent after the `MOVE`) and no
+    /// leg has been added for it: a spare's request answered empty says
+    /// nothing of a leg whose replacement is joining.
+    fn no_cache<S: SessionLegs>(
+        &mut self,
+        legs: &mut S,
+        request: &Request,
+        now: Instant,
+        out: &mut Vec<Action>,
+    ) {
+        if request.paths == 0 {
+            return;
+        }
         let leaving: Vec<(LegKey, bool, bool)> = self
             .legs
             .iter()
-            .filter(|leg| leg.leaving.is_some())
-            .map(|leg| {
-                (
-                    leg.key,
-                    leg.rebalance(),
-                    leg.leaving
+            .filter(|leg| {
+                leg.hedge_for.is_none()
+                    && leg
+                        .leaving
                         .as_ref()
-                        .is_some_and(|(reason, _)| reason == PARENTS_LOST),
-                )
+                        .is_some_and(|(_, at)| request.started >= *at)
+                    && !self.replaced(leg.key)
             })
+            .map(|leg| (leg.key, leg.rebalance(), leg.leaving_for(PARENTS_LOST)))
             .collect();
         for (key, rebalance, parents_lost) in leaving {
             if rebalance {
@@ -1992,7 +2187,12 @@ impl Director {
         };
         self.pending_answer = None;
         self.stats.assignment_failures += 1;
-        self.failures += 1;
+        // Only failures in a row with no leg count towards a failover.
+        if self.legs.is_empty() {
+            self.failures += 1;
+        } else {
+            self.failures = 0;
+        }
         for index in &request.pool[..request.asked.max(1).min(request.pool.len())] {
             self.entries[*index].failed_until = Some(now + ENTRY_FAILED_FOR);
         }
@@ -2123,144 +2323,181 @@ impl Director {
         }
     }
 
-    /// Handovers, hedges, extra legs and rebalance give-ups.
+    /// Handovers, hedges, extra legs and rebalance give-ups. It runs every
+    /// 5 ms while one is pending, for every listener of a load host at once
+    /// when an edge drains: it allocates nothing.
     fn check_legs<S: SessionLegs>(&mut self, legs: &mut S, now: Instant, out: &mut Vec<Action>) {
         for leg in self.legs.iter_mut() {
-            if leg.live && legs.leg(leg.key, now).is_some_and(|view| view.steady) {
+            let view = legs.leg(leg.key, now);
+            if leg.quiet_since.is_some_and(|quiet| {
+                view.and_then(|view| view.last_media)
+                    .is_some_and(|last| last > quiet)
+            }) {
+                leg.quiet_since = None;
+            }
+            if leg.live && leg.quiet_since.is_none() && view.is_some_and(|view| view.steady) {
                 leg.steady_since.get_or_insert(now);
             } else {
                 leg.steady_since = None;
             }
         }
-        // A leg that got MOVE: released when a leg added after the MOVE is
-        // level with it (or steady for the level wait, not for a
-        // rebalance), and no hole older than that leg's first part is open.
-        let leaving: Vec<(LegKey, Instant, u32, bool)> = self
+        // Each change releases a leaving leg or ends its move, so this ends.
+        let hole = legs.oldest_hole();
+        while let Some(change) = self.next_handover(legs, hole, now) {
+            match change {
+                Handover::Release { old, new, moved_at } => {
+                    let to = self
+                        .leg_index(new)
+                        .map(|index| self.legs[index].node.clone());
+                    if let Some(leg) = self.release(legs, old, now, out) {
+                        let reason = leg.leaving.map(|(reason, _)| reason).unwrap_or_default();
+                        self.replacements.push(Replacement {
+                            at: now,
+                            from: leg.node,
+                            to: to.unwrap_or_default(),
+                            reason,
+                            kind: ReplacementKind::Handover,
+                            handover: Some(now.saturating_duration_since(moved_at)),
+                            exposure: None,
+                        });
+                    }
+                }
+                // A rebalance not level by the give-up: the legs added for
+                // it go, and the old edge is asked to keep the listener.
+                Handover::GiveUp { old } => {
+                    while let Some(new) = self
+                        .legs
+                        .iter()
+                        .find(|leg| {
+                            leg.stands_for == Some(old)
+                                && leg.leaving.is_none()
+                                && leg.hedge_for.is_none()
+                        })
+                        .map(|leg| leg.key)
+                    {
+                        self.release(legs, new, now, out);
+                    }
+                    self.take_back(legs, old, now, out);
+                }
+            }
+        }
+        // A hedge whose leg came back is released once that leg has been
+        // steady for the level wait: it is the spare again, unless its edge
+        // sent it away.
+        while let Some(hedge) = self
             .legs
             .iter()
-            .filter_map(|leg| {
-                leg.leaving
-                    .as_ref()
-                    .map(|(_, at)| (leg.key, *at, leg.mark, leg.rebalance()))
+            .find(|leg| {
+                leg.hedge_for.is_some_and(|cover| {
+                    self.legs.iter().any(|covered| {
+                        covered.key == cover
+                            && covered
+                                .steady_since
+                                .is_some_and(|since| now >= since + self.config.level_wait)
+                    })
+                })
             })
-            .collect();
-        let hole = legs.oldest_hole();
-        for (old, moved_at, mark, rebalance) in leaving {
-            let replacements: Vec<(LegKey, Option<Instant>)> = self
+            .map(|leg| leg.key)
+        {
+            let Some(leg) = self.release(legs, hedge, now, out) else {
+                break;
+            };
+            self.stats.hedges_released += 1;
+            if self.spare.is_none() && leg.leaving.is_none() {
+                let mut spare = leg.spare.unwrap_or(Spare {
+                    node: leg.node,
+                    addr: leg.addr,
+                    token: None,
+                    asked_at: None,
+                    misses: 0,
+                    next_renew: now,
+                });
+                spare.asked_at = None;
+                spare.misses = 0;
+                spare.next_renew = spare.next_renew.max(now);
+                self.spare = Some(spare);
+            }
+        }
+        // More legs than wanted (legs asked for in a silence): the newest
+        // goes once the others are steady for the level wait.
+        let want = self.want as usize;
+        while self.legs.iter().filter(|leg| leg.counted()).count() > want {
+            let kept_steady = self
                 .legs
                 .iter()
-                .filter(|leg| {
-                    leg.key != old
-                        && leg.leaving.is_none()
-                        && leg.hedge_for.is_none()
-                        && leg.key.0 >= mark
-                })
-                .map(|leg| (leg.key, if leg.live { leg.steady_since } else { None }))
-                .collect();
-            let taker = replacements.iter().find(|(new, steady_since)| {
-                let Some(index) = self.leg_index(*new) else {
-                    return false;
-                };
-                if !self.legs[index].live {
+                .filter(|leg| leg.counted())
+                .take(want)
+                .all(|leg| {
+                    leg.steady_since
+                        .is_some_and(|since| now >= since + self.config.level_wait)
+                });
+            let newest = self
+                .legs
+                .iter()
+                .rev()
+                .find(|leg| leg.counted())
+                .map(|leg| leg.key);
+            match newest {
+                Some(newest) if kept_steady => {
+                    self.release(legs, newest, now, out);
+                }
+                _ => break,
+            }
+        }
+    }
+
+    /// The first leaving leg whose move can end: a leg added for it is
+    /// live and level with it (or steady for the level wait, not after a
+    /// rebalance), with no hole older than its first part open; or, for a
+    /// stream of objects, has brought its first object. Else a rebalance
+    /// past its give-up.
+    fn next_handover<S: SessionLegs>(
+        &self,
+        legs: &S,
+        hole: Option<u64>,
+        now: Instant,
+    ) -> Option<Handover> {
+        for old in &self.legs {
+            let Some((_, moved_at)) = old.leaving.as_ref() else {
+                continue;
+            };
+            let rebalance = old.rebalance();
+            let taker = self.legs.iter().find(|new| {
+                if new.stands_for != Some(old.key)
+                    || new.leaving.is_some()
+                    || new.hedge_for.is_some()
+                    || !new.live
+                {
                     return false;
                 }
                 if self.objects {
                     return true;
                 }
-                let first = Self::view(legs, *new, now).first_part;
+                let first = Self::view(legs, new.key, now).first_part;
                 let holes_ok = match (hole, first) {
                     (Some(hole), Some(first)) => hole >= first,
                     (Some(_), None) => false,
                     (None, _) => true,
                 };
                 holes_ok
-                    && (legs.level(*new, old)
+                    && (legs.level(new.key, old.key)
                         || (!rebalance
-                            && steady_since
+                            && new
+                                .steady_since
                                 .is_some_and(|since| now >= since + self.config.level_wait)))
             });
-            if let Some((new, _)) = taker.copied() {
-                let to = self
-                    .leg_index(new)
-                    .map(|index| self.legs[index].node.clone());
-                if let Some(leg) = self.release(legs, old, now, out) {
-                    let reason = leg.leaving.map(|(reason, _)| reason).unwrap_or_default();
-                    self.replacements.push(Replacement {
-                        at: now,
-                        from: leg.node,
-                        to: to.unwrap_or_default(),
-                        reason,
-                        kind: ReplacementKind::Handover,
-                        handover: Some(now.saturating_duration_since(moved_at)),
-                        exposure: None,
-                    });
-                }
-                continue;
+            if let Some(new) = taker {
+                return Some(Handover::Release {
+                    old: old.key,
+                    new: new.key,
+                    moved_at: *moved_at,
+                });
             }
-            // A rebalance not level by the give-up: the replacement goes,
-            // and the old edge is asked to keep the listener.
-            if rebalance && now >= moved_at + self.config.rebalance_giveup {
-                for (new, _) in replacements {
-                    self.release(legs, new, now, out);
-                }
-                self.take_back(legs, old, now, out);
+            if rebalance && now >= *moved_at + self.config.rebalance_giveup {
+                return Some(Handover::GiveUp { old: old.key });
             }
         }
-        // A hedge whose leg came back is released once that leg has been
-        // steady for the level wait: it is the spare again.
-        let hedges: Vec<(LegKey, LegKey)> = self
-            .legs
-            .iter()
-            .filter_map(|leg| leg.hedge_for.map(|cover| (leg.key, cover)))
-            .collect();
-        for (hedge, cover) in hedges {
-            let back = self.leg_index(cover).is_some_and(|index| {
-                self.legs[index]
-                    .steady_since
-                    .is_some_and(|since| now >= since + self.config.level_wait)
-            });
-            if back {
-                if let Some(leg) = self.release(legs, hedge, now, out) {
-                    self.stats.hedges_released += 1;
-                    if self.spare.is_none() {
-                        let mut spare = leg.spare.unwrap_or(Spare {
-                            node: leg.node,
-                            addr: leg.addr,
-                            token: None,
-                            asked_at: None,
-                            misses: 0,
-                            next_renew: now,
-                        });
-                        spare.asked_at = None;
-                        spare.misses = 0;
-                        spare.next_renew = spare.next_renew.max(now);
-                        self.spare = Some(spare);
-                    }
-                }
-            }
-        }
-        // More legs than wanted (a leg passed over that came back, legs
-        // asked for in a silence): the newest goes once the others are
-        // steady for the level wait.
-        loop {
-            let counted: Vec<(LegKey, Option<Instant>)> = self
-                .legs
-                .iter()
-                .filter(|leg| leg.counted())
-                .map(|leg| (leg.key, leg.steady_since))
-                .collect();
-            if counted.len() <= self.want as usize {
-                break;
-            }
-            let kept_steady = counted[..self.want as usize]
-                .iter()
-                .all(|(_, since)| since.is_some_and(|since| now >= since + self.config.level_wait));
-            if !kept_steady {
-                break;
-            }
-            let newest = counted.last().expect("not empty").0;
-            self.release(legs, newest, now, out);
-        }
+        None
     }
 
     fn request_timers(&mut self, now: Instant, out: &mut Vec<Action>) {
@@ -2307,8 +2544,7 @@ impl Director {
         if self.request.is_some() || self.pending_answer.is_some() {
             return;
         }
-        let room = MAX_LEGS.saturating_sub(self.legs.len());
-        let missing = (self.want as usize).saturating_sub(self.held()).min(room) as u8;
+        let missing = self.missing();
         let spare = self.spare_wanted();
         if missing == 0 && !spare {
             self.deferred_ask = None;
@@ -2319,7 +2555,7 @@ impl Director {
                 && now >= self.next_home_probe
             {
                 self.next_home_probe = now + HOME_PROBE_EVERY;
-                let paths = self.want;
+                let paths = self.full_paths();
                 self.send_request(
                     RequestKind::HomeProbe,
                     paths,
@@ -2405,9 +2641,7 @@ impl Director {
         if self.request.is_some() || self.pending_answer.is_some() {
             return None;
         }
-        let room = MAX_LEGS.saturating_sub(self.legs.len());
-        let missing = (self.want as usize).saturating_sub(self.held()).min(room);
-        if missing == 0 && !self.spare_wanted() {
+        if self.missing() == 0 && !self.spare_wanted() {
             return self
                 .away_since
                 .map(|since| self.next_home_probe.max(since + HOME_HOLD));
@@ -2509,6 +2743,16 @@ mod tests {
             node_id: format!("e{n}"),
             playback_base_url: format!("https://10.0.1.{n}:19444/live"),
             failover: false,
+        }
+    }
+
+    /// The failover entry a real entry appends to every answer
+    /// (`--failover-entries`, M:21135).
+    fn failover_entry() -> AssignedCache {
+        AssignedCache {
+            node_id: "new-dist-a".into(),
+            playback_base_url: "https://10.0.9.1:19444".into(),
+            failover: true,
         }
     }
 
@@ -3146,10 +3390,12 @@ mod tests {
             leg: e1,
             reason: "draining".into(),
         });
+        // A real entry appends its failover entries to every answer.
         let (to, nonce, _) = w.requests()[0].clone();
-        w.answer(to, nonce, Vec::new(), 1, false, None);
+        w.answer(to, nonce, vec![failover_entry()], 1, false, None);
         assert!(w.s.legs[&e1].released);
         assert_eq!(w.held(), ["e2"]);
+        assert_eq!(w.d.stats.failovers, 0);
         // A one-leg listener sent away for lost parents asks the edge to
         // take it back instead.
         let mut w = World::new("no-cache-2", 1, false);
@@ -3160,9 +3406,10 @@ mod tests {
             reason: "parents-lost".into(),
         });
         let (to, nonce, _) = w.requests()[0].clone();
-        w.answer(to, nonce, Vec::new(), 1, false, None);
+        w.answer(to, nonce, vec![failover_entry()], 1, false, None);
         assert!(!w.s.legs[&e1].released);
         assert_eq!(w.s.log.last().unwrap(), "takeback e1");
+        assert_eq!(w.d.stats.failovers, 0, "it stays in its region");
     }
 
     #[test]
@@ -3176,8 +3423,9 @@ mod tests {
         });
         assert!(w.d.skipped(w.now).contains(&"e1".to_owned()));
         let (to, nonce, _) = w.requests()[0].clone();
-        w.answer(to, nonce, Vec::new(), 1, false, None);
+        w.answer(to, nonce, vec![failover_entry()], 1, false, None);
         assert_eq!(w.s.log.last().unwrap(), "takeback e1");
+        assert_eq!(w.d.stats.failovers, 0);
         assert!(!w.leaving("e1"));
         assert!(!w.d.skipped(w.now).contains(&"e1".to_owned()));
         assert_eq!(w.d.stats.takebacks, 1);
@@ -3653,6 +3901,17 @@ mod tests {
                 ..
             }
         ));
+        // The other home edge says so too, at its own tick: nothing more.
+        w.run_to(w.ms() + 40);
+        w.event(LegEvent::Moved {
+            leg: e2,
+            reason: REGION_LOST.into(),
+        });
+        assert_eq!(w.d.stats.failovers, 1);
+        assert!(
+            w.requests().iter().all(|(_, repeat, _)| *repeat == nonce),
+            "the request out is kept"
+        );
         w.answer(to, nonce, vec![away(1), away(2), away(3)], 2, true, None);
         assert!(
             !w.s.legs[&e1].released && !w.s.legs[&e2].released,
@@ -3662,6 +3921,18 @@ mod tests {
         w.live("n2");
         let n1 = w.key("n1");
         let n2 = w.key("n2");
+        // Home edges repeat their MOVE every 250 ms: the new region's legs
+        // are not sent away, and the listener is not sent back home.
+        w.run_to(w.ms() + 250);
+        for leg in [e1, e2] {
+            w.event(LegEvent::Moved {
+                leg,
+                reason: REGION_LOST.into(),
+            });
+        }
+        assert!(!w.leaving("n1") && !w.leaving("n2"));
+        assert_eq!(w.d.stats.failovers, 1);
+        assert!(w.requests().iter().all(|(to, _, _)| *to == failover_addr));
         w.s.level.insert((n1, e1));
         w.s.level.insert((n2, e2));
         w.run_to(w.ms() + 5);
@@ -3700,8 +3971,29 @@ mod tests {
         w.answer(to, nonce, vec![cache(1), cache(2), cache(3)], 1, true, None);
         assert_eq!(w.held(), ["e1"]);
         assert_eq!(w.d.spare(), Some("e2"));
+        assert_eq!(
+            w.d.want(),
+            1,
+            "the entry's grant, beside caches it could name"
+        );
         w.live("e1");
         assert!(w.token_from(edge_addr(2), 0x22));
+        // No second leg is asked for, though the objects have not shown yet
+        // (a 4K stream's 16 parts take seconds).
+        for _ in 0..1_000 {
+            w.run_to(w.ms() + 10);
+            for (to, control, _) in w.controls() {
+                assert!(
+                    !matches!(control, Control::Assign { token: None, .. }),
+                    "asked at {} ms: {control:?}",
+                    w.ms()
+                );
+                if to == edge_addr(2) && matches!(control, Control::Subscribe { token: None, .. }) {
+                    assert!(w.token_from(edge_addr(2), 0x22));
+                }
+            }
+        }
+        assert_eq!(w.held(), ["e1"]);
         w.event(LegEvent::ObjectLane);
         assert_eq!(w.d.want(), 1);
         for _ in 0..30 {
@@ -3888,7 +4180,8 @@ mod tests {
         // its skip on the wire only.
         let mut w = World::new("silent-2", 2, false);
         w.join(&[1, 2], None);
-        w.run_to(w.ms() + 200);
+        // The legs were steady well before the silence.
+        w.run_to(w.ms() + 1_100);
         let silent = w.ms();
         w.event(LegEvent::AllSilent);
         let (to, nonce, request) = w.requests().pop().expect("asked at once");
@@ -3906,14 +4199,23 @@ mod tests {
         assert_eq!(w.held(), ["e1", "e2", "e4", "e5"]);
         w.live("e4");
         w.live("e5");
+        // The old legs still count as steady by their last parts, but have
+        // brought nothing since the silence: the new legs stay.
         w.run_to(silent + 50);
+        assert_eq!(w.held(), ["e1", "e2", "e4", "e5"]);
         let now = w.now;
-        w.view("e1", |view| view.last_datagram = Some(now));
+        w.view("e1", |view| {
+            view.last_datagram = Some(now);
+            view.last_media = Some(now);
+        });
         w.run_to(silent + 400);
         assert_eq!(w.held(), ["e1", "e4", "e5"]);
         // One leg more than wanted: the newest goes once the others are
-        // steady for the level wait.
-        w.run_to(silent + 1_500);
+        // steady for the level wait, counted from e1's media after the
+        // silence.
+        w.run_to(silent + 1_040);
+        assert_eq!(w.held(), ["e1", "e4", "e5"]);
+        w.run_to(silent + 1_100);
         assert_eq!(w.held(), ["e1", "e4"]);
     }
 
@@ -3941,6 +4243,17 @@ mod tests {
             .any(|(to, control, _)| *to == edge_addr(1)
                 && matches!(control, Control::Subscribe { token: None, .. })));
         assert!(w.token_from(edge_addr(1), 0x11));
+
+        // With --paths 2, a stream the entry gives one leg swaps the same.
+        let mut w = World::new("swap-3", 2, true);
+        w.poll();
+        let (to, nonce, _) = w.requests().pop().unwrap();
+        w.answer(to, nonce, vec![cache(1), cache(2), cache(3)], 1, true, None);
+        assert_eq!((w.held(), w.d.spare()), (vec!["e1".to_owned()], Some("e2")));
+        assert!(w.token_from(edge_addr(2), 0x22));
+        w.run_to(w.ms() + 11);
+        assert_eq!(w.held(), ["e2"]);
+        assert_eq!(w.d.spare(), Some("e1"));
 
         // The leg's token within 10 ms: it stays the leg.
         let mut w = World::new("swap-2", 1, true);
@@ -4008,5 +4321,387 @@ mod tests {
         assert_eq!(w.d.spare(), Some("e3"));
         assert_eq!(w.d.first_answer.map(|(_, via)| via), Some(Via::Https));
         assert_eq!(w.d.stats.answers_https, 1);
+    }
+
+    #[test]
+    fn the_spare_named_as_the_new_leg_keeps_the_old_one_until_level_whatever_the_spare_answer() {
+        for reason in ["draining", "rebalance"] {
+            let mut w = World::new(&format!("promoted-{reason}"), 2, true);
+            w.join(&[1, 2], Some(3));
+            let e1 = w.key("e1");
+            w.event(LegEvent::Moved {
+                leg: e1,
+                reason: reason.into(),
+            });
+            let (to, nonce, request) = w.requests().pop().unwrap();
+            assert!(matches!(
+                request,
+                Control::Assign {
+                    paths: 1,
+                    spare: false,
+                    ..
+                }
+            ));
+            // The entry names the spare: it is promoted, and a new spare is
+            // asked for at once (a leg is leaving).
+            w.answer(to, nonce, vec![cache(3)], 1, false, None);
+            assert_eq!(w.d.spare(), None);
+            let (to, nonce, request) = w.requests().pop().expect("a new spare is asked for");
+            let Control::Assign {
+                paths, spare, hold, ..
+            } = request
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                (paths, spare, hold),
+                (0, true, vec!["e2".to_owned(), "e3".to_owned()])
+            );
+            // A region of three edges: no other cache to name.
+            w.answer(to, nonce, vec![failover_entry()], 0, true, None);
+            assert!(
+                w.leaving("e1") && !w.s.legs[&e1].released,
+                "{reason}: {:?}",
+                w.s.log
+            );
+            assert!(
+                !w.s.log.iter().any(|line| line.starts_with("takeback")),
+                "{reason}: {:?}",
+                w.s.log
+            );
+            assert_eq!(w.d.stats.failovers, 0);
+            w.live("e3");
+            let e3 = w.key("e3");
+            w.view("e3", |view| view.steady = false);
+            w.run_to(w.ms() + 500);
+            assert!(
+                !w.s.legs[&e1].released && !w.s.legs[&e3].released,
+                "{reason}: {:?}",
+                w.s.log
+            );
+            w.view("e3", |view| view.steady = true);
+            w.s.level.insert((e3, e1));
+            w.run_to(w.ms() + 5);
+            assert!(w.s.legs[&e1].released, "{reason}");
+            assert_eq!(w.held(), ["e2", "e3"]);
+        }
+    }
+
+    #[test]
+    fn a_one_leg_rebalance_or_lost_parents_with_no_cache_stays_in_the_region() {
+        let failover_addr = entry_addr("https://10.0.9.1:19444");
+        for reason in ["rebalance", "parents-lost"] {
+            let mut w = World::new(&format!("one-leg-{reason}"), 1, true);
+            w.poll();
+            let (to, nonce, _) = w.requests().pop().unwrap();
+            w.answer(
+                to,
+                nonce,
+                vec![cache(1), cache(2), failover_entry()],
+                1,
+                true,
+                None,
+            );
+            w.live("e1");
+            assert!(w.token_from(edge_addr(2), 0x22));
+            let e1 = w.key("e1");
+            w.event(LegEvent::Moved {
+                leg: e1,
+                reason: reason.into(),
+            });
+            let (to, nonce, _) = w.requests().pop().unwrap();
+            assert_ne!(to, failover_addr);
+            // No receiver under the level: only the failover entry is named.
+            w.answer(to, nonce, vec![failover_entry()], 1, false, None);
+            assert_eq!(w.s.log.last().unwrap(), "takeback e1", "{reason}");
+            assert!(!w.leaving("e1"));
+            assert_eq!(w.d.stats.failovers, 0, "{reason}");
+            assert_eq!(w.d.away_since(), None);
+            assert!(w.requests().iter().all(|(to, _, _)| *to != failover_addr));
+        }
+        // A drain with nothing left in the region goes to the failover
+        // region (step 9), make before break.
+        let mut w = World::new("one-leg-drain", 1, false);
+        w.poll();
+        let (to, nonce, _) = w.requests().pop().unwrap();
+        w.answer(to, nonce, vec![cache(1), failover_entry()], 1, false, None);
+        w.live("e1");
+        let e1 = w.key("e1");
+        w.event(LegEvent::Moved {
+            leg: e1,
+            reason: "draining".into(),
+        });
+        let (to, nonce, _) = w.requests().pop().unwrap();
+        w.answer(to, nonce, vec![failover_entry()], 1, false, None);
+        assert_eq!(w.d.stats.failovers, 1);
+        assert!(!w.s.legs[&e1].released);
+        assert_eq!(w.requests().pop().unwrap().0, failover_addr);
+    }
+
+    #[test]
+    fn two_legs_moved_together_are_each_released_by_their_own_replacement() {
+        let mut w = World::new("two-drains", 2, false);
+        w.join(&[1, 2], None);
+        let (e1, e2) = (w.key("e1"), w.key("e2"));
+        w.event(LegEvent::Moved {
+            leg: e1,
+            reason: "draining".into(),
+        });
+        let (to, nonce, _) = w.requests().pop().unwrap();
+        w.event(LegEvent::Moved {
+            leg: e2,
+            reason: "draining".into(),
+        });
+        // One edge named: it is e1's replacement, and e2's is asked for.
+        w.answer(to, nonce, vec![cache(3)], 1, false, None);
+        let e3 = w.key("e3");
+        assert_eq!(
+            w.d.legs()
+                .iter()
+                .find(|leg| leg.key == e3)
+                .unwrap()
+                .stands_for,
+            Some(e1)
+        );
+        let (to, nonce, request) = w.requests().pop().expect("e2's replacement");
+        assert!(matches!(request, Control::Assign { paths: 1, .. }));
+        w.live("e3");
+        w.s.level.insert((e3, e1));
+        w.s.level.insert((e3, e2));
+        w.run_to(w.ms() + 5);
+        assert!(w.s.legs[&e1].released);
+        assert!(
+            !w.s.legs[&e2].released,
+            "e2 stays until a leg of its own is level"
+        );
+        w.run_to(w.ms() + 500);
+        assert!(!w.s.legs[&e2].released);
+        w.answer(to, nonce, vec![cache(4)], 1, false, None);
+        w.live("e4");
+        let e4 = w.key("e4");
+        w.s.level.insert((e4, e2));
+        w.run_to(w.ms() + 5);
+        assert!(w.s.legs[&e2].released);
+        assert_eq!(w.held(), ["e3", "e4"]);
+        let handovers: Vec<(&str, &str)> =
+            w.d.replacements
+                .iter()
+                .filter(|record| record.kind == ReplacementKind::Handover)
+                .map(|record| (record.from.as_str(), record.to.as_str()))
+                .collect();
+        assert_eq!(handovers, [("e1", "e3"), ("e2", "e4")]);
+    }
+
+    #[test]
+    fn a_rebalance_give_up_releases_only_the_leg_added_for_it() {
+        let mut w = World::new("giveup-2", 2, false);
+        w.join(&[1, 2], None);
+        let (e1, e2) = (w.key("e1"), w.key("e2"));
+        let moved = w.ms();
+        w.event(LegEvent::Moved {
+            leg: e1,
+            reason: "rebalance".into(),
+        });
+        let (to, nonce, _) = w.requests().pop().unwrap();
+        w.answer(to, nonce, vec![cache(3)], 1, false, None);
+        // Steady, never level.
+        w.live("e3");
+        let e3 = w.key("e3");
+        // A second later e2 dies; e4 takes its place.
+        w.run_to(moved + 1_000);
+        w.event(LegEvent::Failed {
+            leg: e2,
+            cause: LegFailure::Dead,
+        });
+        let (to, nonce, _) = w.requests().pop().expect("asked at once: a leg is leaving");
+        w.answer(to, nonce, vec![cache(4)], 1, false, None);
+        w.live("e4");
+        let e4 = w.key("e4");
+        w.run_to(moved + 3_005);
+        assert!(w.s.legs[&e3].released);
+        assert!(w.s.log.contains(&"takeback e1".to_owned()));
+        assert!(!w.s.legs[&e4].released, "e4 holds e2's place");
+        assert_eq!(w.held(), ["e1", "e4"]);
+        assert!(w.d.replacements.iter().any(|record| {
+            record.kind == ReplacementKind::Replace && record.from == "e2" && record.to == "e4"
+        }));
+    }
+
+    #[test]
+    fn a_move_while_another_request_is_out_is_asked_for_once_it_is_answered() {
+        for spare_answer in [vec![cache(5)], Vec::new()] {
+            let mut w = World::new("stale-1", 2, true);
+            // No spare named: one is asked for after the backoff.
+            w.join(&[1, 2], None);
+            let (to, nonce) = loop {
+                w.run_to(w.ms() + 1);
+                if let Some((to, nonce, request)) = w.requests().pop() {
+                    assert!(matches!(
+                        request,
+                        Control::Assign {
+                            paths: 0,
+                            spare: true,
+                            ..
+                        }
+                    ));
+                    break (to, nonce);
+                }
+                assert!(w.ms() < 2_000);
+            };
+            let e1 = w.key("e1");
+            w.event(LegEvent::Moved {
+                leg: e1,
+                reason: "draining".into(),
+            });
+            assert!(w.requests().is_empty(), "the request out is waited for");
+            w.run_to(w.ms() + 2);
+            w.answer(to, nonce, spare_answer.clone(), 0, true, None);
+            let requests = w.requests();
+            assert_eq!(
+                requests.len(),
+                1,
+                "e1's replacement is asked for at once: {requests:?}"
+            );
+            assert!(
+                matches!(&requests[0].2, Control::Assign { paths: 1, skip, .. } if skip == &["e1"]),
+                "{requests:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_legs_record_goes_only_to_a_leg_added_for_its_place() {
+        let mut w = World::new("record-1", 2, false);
+        w.join(&[1, 2], None);
+        let (e1, e2) = (w.key("e1"), w.key("e2"));
+        w.event(LegEvent::Failed {
+            leg: e2,
+            cause: LegFailure::Dead,
+        });
+        // No other edge in the region: nothing replaces e2.
+        let (to, nonce) = loop {
+            w.run_to(w.ms() + 1);
+            if let Some((to, nonce, _)) = w.requests().pop() {
+                break (to, nonce);
+            }
+        };
+        w.answer(to, nonce, Vec::new(), 0, false, None);
+        // Then e1 is drained, and a new edge comes for it.
+        w.event(LegEvent::Moved {
+            leg: e1,
+            reason: "draining".into(),
+        });
+        let (to, nonce, _) = w.requests().pop().unwrap();
+        w.answer(to, nonce, vec![cache(3)], 1, false, None);
+        w.live("e3");
+        let e3 = w.key("e3");
+        w.s.level.insert((e3, e1));
+        w.run_to(w.ms() + 5);
+        assert!(w.s.legs[&e1].released);
+        let records: Vec<(ReplacementKind, &str, &str)> =
+            w.d.replacements
+                .iter()
+                .map(|record| (record.kind, record.from.as_str(), record.to.as_str()))
+                .collect();
+        assert_eq!(records, [(ReplacementKind::Handover, "e1", "e3")]);
+    }
+
+    #[test]
+    fn a_hedge_whose_edge_sent_it_away_is_not_the_spare_again() {
+        let mut w = World::new("hedge-moved", 2, true);
+        w.join(&[1, 2], Some(3));
+        let e1 = w.key("e1");
+        w.view("e1", |view| {
+            view.delivering = false;
+            view.steady = false;
+        });
+        w.event(LegEvent::HedgeDue(e1));
+        w.run_to(w.ms() + 20);
+        w.live("e3");
+        let e3 = w.key("e3");
+        w.event(LegEvent::Moved {
+            leg: e3,
+            reason: "draining".into(),
+        });
+        assert!(w.requests().is_empty(), "a hedge holds no place");
+        w.view("e1", |view| {
+            view.delivering = true;
+            view.steady = true;
+        });
+        let back = w.ms();
+        w.run_to(back + 1_010);
+        assert!(w.s.legs[&e3].released);
+        assert_eq!(w.d.spare(), None);
+        assert_eq!(w.d.stats.hedges_released, 1);
+        // A new spare is asked for, the draining edge skipped.
+        let request = loop {
+            w.run_to(w.ms() + 1);
+            if let Some((_, _, request)) = w.requests().pop() {
+                break request;
+            }
+            assert!(w.ms() < back + 1_300);
+        };
+        assert!(
+            matches!(&request, Control::Assign { paths: 0, spare: true, skip, .. } if skip.contains(&"e3".to_owned())),
+            "{request:?}"
+        );
+    }
+
+    #[test]
+    fn entry_and_cache_urls_take_either_scheme() {
+        assert_eq!(
+            url_host("http://10.0.1.7:19444/live").as_deref(),
+            Some("10.0.1.7")
+        );
+        assert_eq!(url_host("https://[::1]:19444").as_deref(), Some("::1"));
+        assert_eq!(url_host("ftp://10.0.1.7"), None);
+        let mut w = World::with("http-1", 1, false, vec!["http://10.0.0.1:19444/".into()]);
+        w.poll();
+        let (to, nonce, _) = w.requests().pop().unwrap();
+        assert_eq!(to, entry_addr(E1));
+        w.answer(
+            to,
+            nonce,
+            vec![AssignedCache {
+                node_id: "e7".into(),
+                playback_base_url: "http://10.0.1.7:19444/live".into(),
+                failover: false,
+            }],
+            1,
+            false,
+            None,
+        );
+        assert_eq!(w.held(), ["e7"]);
+        assert_eq!(w.fake("e7").addr, edge_addr(7));
+    }
+
+    #[test]
+    fn only_failures_with_no_leg_send_the_listener_to_the_failover_region() {
+        let mut w = World::with("fail-1", 1, false, vec![E1.into()]);
+        w.poll();
+        let (to, nonce, _) = w.requests().pop().unwrap();
+        w.answer(to, nonce, vec![cache(1), failover_entry()], 1, false, None);
+        w.live("e1");
+        let e1 = w.key("e1");
+        w.event(LegEvent::Moved {
+            leg: e1,
+            reason: "draining".into(),
+        });
+        // Nobody answers while the leg still delivers.
+        let moved = w.ms();
+        w.run_to(moved + 1_000);
+        assert_eq!(w.d.stats.assignment_failures, 1);
+        // The edge's grace cuts the leg: no leg at all now.
+        w.event(LegEvent::Failed {
+            leg: e1,
+            cause: LegFailure::Dead,
+        });
+        let cut = w.ms();
+        w.run_to(cut + 1_000);
+        assert_eq!(w.d.stats.assignment_failures, 2);
+        assert_eq!(w.d.stats.failovers, 0, "one failure with no leg is not two");
+        w.run_to(cut + 2_300);
+        assert_eq!(w.d.stats.assignment_failures, 3);
+        assert_eq!(w.d.stats.failovers, 1);
     }
 }
