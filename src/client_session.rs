@@ -288,6 +288,8 @@ struct Leg {
     ok_at: Option<Instant>,
     live_at: Option<Instant>,
     token: Option<u64>,
+    /// When the edge last gave the token (`None` for one handed in by the
+    /// director, whose age the session does not know).
     token_at: Option<Instant>,
     /// With no `TOKEN` this long after its first request the leg is passed
     /// over.
@@ -870,7 +872,7 @@ impl UdpSession {
             ok_at: None,
             live_at: None,
             token,
-            token_at: token.map(|_| now),
+            token_at: None,
             token_wait,
             from_part,
             media_here: false,
@@ -1459,12 +1461,15 @@ impl UdpSession {
                 }
                 leg.repeats = leg.repeats.saturating_add(1);
             }
-            let renew = leg
-                .token_at
-                .is_some_and(|at| now.saturating_duration_since(at) >= TOKEN_RENEW_AFTER);
-            if renew {
-                leg.token_at = Some(now);
-            }
+            // The token is renewed while it is 45 s old or more (or of an
+            // age unknown, as the spare's handed to a hedge), at every
+            // refresh until the edge's TOKEN comes: a lost renewal is sent
+            // again 2 s later, not 45 s later.
+            let renew = live
+                && leg.token.is_some()
+                && leg
+                    .token_at
+                    .is_none_or(|at| now.saturating_duration_since(at) >= TOKEN_RENEW_AFTER);
             leg.next_refresh = now
                 + if live {
                     REFRESH
@@ -3731,9 +3736,17 @@ mod tests {
         let mut at = now;
         while at < now + Duration::from_secs(50) {
             at = session.next_wake();
+            let before = sent.len();
             session.poll(at, &mut |_, datagram| {
                 sent.push((at, Control::decode(datagram).unwrap()))
             });
+            // The edge answers a renewal with the token it holds.
+            if sent[before..]
+                .iter()
+                .any(|(_, control)| matches!(control, Control::Subscribe { token: None, .. }))
+            {
+                session.on_datagram(edge(), &token(5), at, &mut |_, _| {});
+            }
         }
         let tokenless: Vec<Instant> = sent
             .iter()
@@ -3765,6 +3778,58 @@ mod tests {
             &left[..],
             [Control::Unsubscribe { token: 99, .. }]
         ));
+    }
+
+    /// B X5 review (2.6): a renewal whose `TOKEN` is lost is sent again at
+    /// every refresh until one comes, so a leg never holds a token past its
+    /// 60 s; a token handed in by the director (the spare's, of an age the
+    /// session does not know) is renewed at the leg's first refresh.
+    #[test]
+    fn a_lost_renewal_is_sent_again_at_the_next_refresh() {
+        let now = Instant::now();
+        let mut session = subscribed(SessionConfig::new(1), now);
+        session.hold = true;
+        let tokenless = |session: &mut UdpSession, from: Instant, until: Instant| {
+            let mut renewals = Vec::new();
+            let mut at = from;
+            while at < until {
+                at = session.next_wake();
+                session.poll(at, &mut |_, datagram| {
+                    if matches!(
+                        Control::decode(datagram),
+                        Some(Control::Subscribe { token: None, .. })
+                    ) {
+                        renewals.push(at - now);
+                    }
+                });
+            }
+            renewals
+        };
+        let s = Duration::from_secs;
+        // Every renewal is lost: one at each refresh from 45 s on.
+        let lost = tokenless(&mut session, now, now + s(51));
+        assert_eq!(lost.len(), 3, "{lost:?}");
+        assert!(lost[0] >= TOKEN_RENEW_AFTER && lost[0] < TOKEN_RENEW_AFTER + REFRESH);
+        assert_eq!(lost[1] - lost[0], REFRESH);
+        assert_eq!(lost[2] - lost[1], REFRESH);
+        // The edge answers: no renewal for another 45 s.
+        let answered = now + lost[2] + Duration::from_millis(5);
+        session.on_datagram(edge(), &token(5), answered, &mut |_, _| {});
+        assert!(tokenless(&mut session, answered, answered + s(44)).is_empty());
+        // A hedge with the spare's token: renewed at its first refresh.
+        let mut hedged = UdpSession::new(SessionConfig::new(1), now);
+        hedged.hold = true;
+        let spare = LegStart {
+            token: Some(7),
+            ..start()
+        };
+        hedged.add_leg(A, "a", edge(), spare, now, &mut |_, _| {});
+        hedged.on_datagram(edge(), &ok(100), now, &mut |_, _| {});
+        hedged.on_datagram(edge(), &part(100), now, &mut |_, _| {});
+        let first = tokenless(&mut hedged, now, now + REFRESH);
+        assert_eq!(first, vec![REFRESH]);
+        hedged.on_datagram(edge(), &token(7), now + REFRESH, &mut |_, _| {});
+        assert!(tokenless(&mut hedged, now + REFRESH, now + s(40)).is_empty());
     }
 
     /// B X5: the answer to a request sent again only by the 3 ms double
