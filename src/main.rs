@@ -1563,6 +1563,16 @@ struct Args {
     )]
     relay_class_tee_capacity: usize,
 
+    /// MiB of the video class's tee ring, which a 4K stream's symbols fill
+    /// by their bytes long before its entries run out (192: about 5 s of
+    /// 300 Mbit/s); pinned with the other rings.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_VIDEO_TEE_MB",
+        default_value_t = fast_plane::relay::DEFAULT_VIDEO_TEE_BYTES >> 20
+    )]
+    relay_video_tee_mb: usize,
+
     /// Feed every cache-mesh playlist lease that this node serves on the
     /// fast plane as well: a forwarder with --relay-class-threads sends the
     /// contributor's RLS1 symbols of a leased stream to the child (an edge)
@@ -4299,6 +4309,7 @@ async fn main() -> Result<()> {
         cpus: args.relay_class_cpus.0,
         realtime: args.relay_class_realtime,
         tee_capacity: args.relay_class_tee_capacity,
+        video_tee_bytes: args.relay_video_tee_mb.saturating_mul(1 << 20),
         video_gso: args.relay_video_gso,
         video_gro: args.relay_video_gro,
         burst_copy_ms: args.relay_burst_copy_ms,
@@ -45841,6 +45852,7 @@ mod tests {
                 cpus: [None, None],
                 realtime: false,
                 tee_capacity: 1_024,
+                video_tee_bytes: 1_024 * 256,
                 video_gso: true,
                 lease: None,
                 edge_clients: None,

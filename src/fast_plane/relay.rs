@@ -14,7 +14,7 @@ use super::loss_report::{decode_ledger, LossMeter};
 use super::media_clock::{MediaClocks, ValidatedEpochs, Verdict};
 use super::parent_feeds::{FeedMisses, ParentFeeds};
 use super::sys::{self, RecvBatch, RECV_BATCH};
-use super::tee_ring::{tee_ring, Ready, TeeReceiver, TeeSender};
+use super::tee_ring::{self, tee_ring, tee_ring_with_bytes, Ready, TeeReceiver, TeeSender};
 use super::view::RlsView;
 use super::{class_addr, StreamClasses, TrafficClass};
 use crate::link_telemetry::LinkTelemetry;
@@ -50,6 +50,16 @@ use tracing::{debug, info, warn};
 /// ring also holds `tee_ring::BYTES_PER_ENTRY` bytes for each: 16 MB at
 /// this, pinned at start).
 pub const DEFAULT_TEE_CAPACITY: usize = 65_536;
+/// Bytes of the video class's tee ring (`--relay-video-tee-mb`): 192 MiB,
+/// about 5 s of a 300 Mbit/s 4K stream's symbols with their repair. The
+/// ring of [`DEFAULT_TEE_CAPACITY`] entries at 256 B each (16 MB) holds
+/// 12,000 symbols, half a second at 247 Mbit/s: a tee behind by that much
+/// (a busy worker) dropped its copies, and a dropped copy is a part missing
+/// from that node's cache. Local lab, 24 Nov, the referee's 247 Mbit/s
+/// clip, 40 s: 16 MB 1,875 to 110,868 tee_dropped at the distributors in
+/// every run; 48 MiB 31,591 to 178,300; 192 MiB none (one run). The old
+/// channel (65,536 entries of any size, unpinned) held as much.
+pub const DEFAULT_VIDEO_TEE_BYTES: usize = 192 << 20;
 /// Symbols the first-arrival table remembers per class.
 const DEDUP_CAPACITY: usize = 65_536;
 /// How often an idle class thread looks at the stop flag.
@@ -80,6 +90,8 @@ pub struct RelayClassConfig {
     /// Audio at SCHED_FIFO 10, video at nice -10, where the host allows.
     pub realtime: bool,
     pub tee_capacity: usize,
+    /// Bytes of the video class's tee ring.
+    pub video_tee_bytes: usize,
     /// `--relay-video-gso`: the video thread hands each child the symbols
     /// of a drained batch as UDP GSO messages (one pass through the stack
     /// for up to 64 symbols) instead of one `sendmmsg` entry per symbol.
@@ -139,6 +151,7 @@ impl Default for RelayClassConfig {
             cpus: [None, None],
             realtime: true,
             tee_capacity: DEFAULT_TEE_CAPACITY,
+            video_tee_bytes: DEFAULT_VIDEO_TEE_BYTES,
             video_gso: true,
             lease: None,
             edge_clients: None,
@@ -2615,7 +2628,15 @@ pub async fn run_relay_class_ingest(
             continue;
         }
         // Made, faulted in and locked here, before the thread runs.
-        let (tx, rx) = tee_ring(config.tee_capacity);
+        let (tx, rx) = match class {
+            TrafficClass::Video => tee_ring_with_bytes(
+                config.tee_capacity,
+                config
+                    .video_tee_bytes
+                    .max(config.tee_capacity.saturating_mul(tee_ring::BYTES_PER_ENTRY)),
+            ),
+            TrafficClass::Audio => tee_ring(config.tee_capacity),
+        };
         let thread = ClassThread {
             class,
             sockets: class_sockets,
