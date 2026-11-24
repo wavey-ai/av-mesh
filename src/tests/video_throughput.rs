@@ -437,7 +437,7 @@ fn run_client(
                         span.1 = now;
                     }
                 }
-                if let Some(object) = receiver.push(data) {
+                if let Some(object) = receiver.push(av_mesh::client_compact::LegId::FIRST, data) {
                     if object.kind == UdpObjectKind::Part {
                         received.complete.entry(object.part).or_insert(now);
                     }

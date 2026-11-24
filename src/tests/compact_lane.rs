@@ -24,7 +24,7 @@
 use super::fast_lane::LaneEdge;
 use super::fast_lease::loopback;
 use super::*;
-use av_mesh::client_compact::CompactPlan;
+use av_mesh::client_compact::{CompactPlan, LegId};
 use av_mesh::client_udp::{
     Control, ObjectKind as UdpObjectKind, ObjectReceiver, RepairPolicy, UNMEASURED_LOSS,
 };
@@ -432,7 +432,7 @@ pub(super) async fn listen(
     let mut run = ListenerRun::default();
     let mut subscribed = Some(subscribed);
     let mut receiver = ObjectReceiver::new();
-    receiver.compact.set_rtt(request_rtt);
+    receiver.compact.set_leg_rtt(LegId::FIRST, request_rtt);
     let mut path = Path::new(loss, seed);
     let mut estimate: Option<f64> = None;
     let mut smooth: Option<f64> = None;
@@ -454,7 +454,7 @@ pub(super) async fn listen(
         }
         if now >= next_loss_check {
             next_loss_check = now + Duration::from_millis(150);
-            if let Some(loss) = receiver.take_loss(repair) {
+            if let Some(loss) = receiver.take_loss(LegId::FIRST, repair) {
                 let value = match estimate {
                     Some(previous) if loss < previous => previous * 0.8 + loss * 0.2,
                     _ => loss,
@@ -462,7 +462,7 @@ pub(super) async fn listen(
                 estimate = Some(value);
                 let smoothed = av_mesh::client_compact::smoothed_loss(smooth, loss);
                 smooth = Some(smoothed);
-                if let Some(sample) = receiver.compact.take_burst() {
+                if let Some(sample) = receiver.compact.take_burst(LegId::FIRST) {
                     burst = Some(burst.map_or(sample, |previous| previous * 0.7 + sample * 0.3));
                 }
                 let wanted = RepairPolicy::for_loss(value, base);
@@ -483,7 +483,7 @@ pub(super) async fn listen(
                 .await;
         }
         if run.compact_confirmed {
-            let parts = receiver.nacks_due(now);
+            let parts = receiver.nacks_due(now).take(LegId::FIRST);
             if !parts.is_empty() {
                 run.nack_parts += parts.len() as u64;
                 let _ = socket
@@ -520,7 +520,7 @@ pub(super) async fn listen(
             {
                 if run.first.is_none() {
                     run.first = Some(next_part);
-                    receiver.expect(stream_id, next_part, compact);
+                    receiver.expect(LegId::FIRST, stream_id, next_part, compact);
                 }
                 run.compact_confirmed = compact;
                 // An edge that does not serve the compact lane: the RaptorQ
@@ -549,7 +549,7 @@ pub(super) async fn listen(
             run.lost_on_path += 1;
             continue;
         }
-        let objects = receiver.push_all(datagram);
+        let objects = receiver.push_all(LegId::FIRST, datagram);
         let fast = std::mem::take(&mut receiver.last_compact_fast_lane);
         for object in objects {
             match object.kind {

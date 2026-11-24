@@ -98,12 +98,13 @@
 //! (4K video), and the init segment, keep their RaptorQ blocks, with the
 //! repair of the `SUB`'s policy.
 //!
-//! One client socket carries one stream: block ids are per stream. A client
-//! that moves to another edge starts a new decoder ([`ObjectReceiver::new_flow`]):
-//! two edges encode one part into different symbols.
+//! One client socket carries one stream: block ids are per stream. Each leg
+//! of a client (its subscription at one edge) has its own decoders
+//! ([`ObjectReceiver::open_leg`]): two edges encode one part into different
+//! symbols. A new source epoch starts a new flow ([`ObjectReceiver::new_flow`]).
 
 pub use crate::client_compact::CompactPlan;
-use crate::client_compact::{self as compact, CompactReceiver};
+use crate::client_compact::{self as compact, CompactReceiver, LegId, LegStart};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use raptorq_datagram_fec::{DatagramFecDecoder, DatagramFecEncoder, DatagramFecHeader};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1074,14 +1075,16 @@ struct BlockCount {
     first_seen: Instant,
 }
 
-/// The receiving half of a client: datagrams in, objects out.
+/// What a receiver keeps of one leg's RaptorQ blocks: two edges encode one
+/// part into different symbols (and stamp different availability times),
+/// so each leg has its own decoders and block counts.
 #[derive(Debug, Default)]
-pub struct ObjectReceiver {
+struct LegBlocks {
     /// One decoder for each quarter of the block id space (cut-through,
     /// edge-encoded parts, init, fast lane): a decoder forgets blocks far
     /// below the last one it decoded, and the spaces must not prune each
-    /// other.
-    decoders: [DatagramFecDecoder; 4],
+    /// other. Made on the leg's first RaptorQ datagram.
+    decoders: Option<Box<[DatagramFecDecoder; 4]>>,
     blocks: HashMap<u32, BlockCount>,
     /// Blocks counted already, so that a late datagram does not count one
     /// again.
@@ -1089,6 +1092,44 @@ pub struct ObjectReceiver {
     settled_order: VecDeque<u32>,
     window_received: u64,
     window_sent: u64,
+}
+
+impl LegBlocks {
+    /// Remember a block as counted, so that a late datagram of it does not
+    /// count again.
+    fn settle(&mut self, block: u32) {
+        if self.settled.insert(block) {
+            self.settled_order.push_back(block);
+        }
+        if self.settled_order.len() > SETTLED_MEMORY {
+            if let Some(old) = self.settled_order.pop_front() {
+                self.settled.remove(&old);
+            }
+        }
+    }
+
+    /// The blocks of `part` on the lanes other than `except`: they will not
+    /// complete, and are not loss.
+    fn settle_other_lanes(&mut self, part: u64, except: Option<u32>) {
+        for other in [
+            cut_through_block_id(part),
+            block_id(ObjectKind::Part, part),
+            fast_block_id(part),
+        ] {
+            if Some(other) != except && self.blocks.remove(&other).is_some() {
+                self.settle(other);
+            }
+        }
+    }
+}
+
+/// The receiving half of a client: datagrams in, objects out. It holds one
+/// leg when made ([`LegId::FIRST`]); a listener on two edges opens more.
+/// The first arrival of a part number is delivered, whichever leg brought
+/// it.
+#[derive(Debug, Default)]
+pub struct ObjectReceiver {
+    legs: [LegBlocks; compact::MAX_LEGS],
     pub datagrams: u64,
     pub source_datagrams: u64,
     pub repair_datagrams: u64,
@@ -1099,6 +1140,7 @@ pub struct ObjectReceiver {
     pub errors: u64,
     pub lost_datagrams: u64,
     pub sent_datagrams: u64,
+    /// Source epochs received (a new one starts a new flow).
     pub flows: u64,
     /// Parts that came on the fast lane, and the bytes of their canonical
     /// envelopes.
@@ -1115,6 +1157,12 @@ pub struct ObjectReceiver {
     /// (a contributor restart: its part numbers start again).
     pub fast_epoch: Option<u64>,
     pub fast_epoch_changes: u64,
+    /// The last few epochs before [`Self::fast_epoch`], and the fast-lane
+    /// objects of one of them that came late and were dropped (two edges
+    /// see a new epoch a moment apart: the late one's objects of the old
+    /// epoch must not start the old flow again).
+    old_fast_epochs: VecDeque<u64>,
+    pub stale_fast_objects: u64,
     /// The compact lane's receiver.
     pub compact: CompactReceiver,
     /// The stream of this receiver, for the objects of the compact lane
@@ -1124,8 +1172,8 @@ pub struct ObjectReceiver {
     /// headers ([`compact::IP_UDP_HEADER_BYTES`] each): what they cost on
     /// the wire.
     pub wire_bytes: u64,
-    /// Decoded parts that another lane (or a copy) had delivered already,
-    /// and that `push` did not return again.
+    /// Decoded parts that another lane, a copy or another leg had
+    /// delivered already, and that `push` did not return again.
     pub duplicate_parts: u64,
     /// Objects that one datagram delivered beyond the one `push` returned
     /// (a window's repair recovers several): see [`Self::next_ready`].
@@ -1139,40 +1187,70 @@ const LOSS_SETTLE: Duration = Duration::from_millis(150);
 /// path may already be lossy.
 pub const UNMEASURED_LOSS: f64 = 0.02;
 const SETTLED_MEMORY: usize = 8_192;
+/// Source epochs remembered after they were replaced: a fast-lane object of
+/// one of them is late, not a new epoch.
+const OLD_FAST_EPOCHS: usize = 4;
 
 impl ObjectReceiver {
+    /// A receiver with its first leg open ([`LegId::FIRST`]).
     pub fn new() -> Self {
-        Self {
+        let mut receiver = Self {
             flows: 1,
             ..Self::default()
-        }
+        };
+        receiver.open_leg();
+        receiver
     }
 
-    /// Start receiving from another edge: its symbols of a part differ from
-    /// those of the last edge, and must not meet them in one decoder.
+    /// Another leg (another edge's subscription), if fewer than
+    /// [`compact::MAX_LEGS`] are open.
+    pub fn open_leg(&mut self) -> Option<LegId> {
+        let leg = self.compact.open_leg()?;
+        self.legs[leg.index()] = LegBlocks::default();
+        Some(leg)
+    }
+
+    /// Forget a leg's blocks and decoders (what it delivered stays
+    /// delivered).
+    pub fn close_leg(&mut self, leg: LegId) {
+        self.compact.close_leg(leg);
+        self.legs[leg.index()] = LegBlocks::default();
+    }
+
+    /// A new source epoch (its part numbers count again): every leg's
+    /// decoders and blocks, and the compact lane's parts, are forgotten.
     pub fn new_flow(&mut self) {
-        self.decoders = Default::default();
-        self.blocks.clear();
-        self.settled.clear();
-        self.settled_order.clear();
+        for leg in &mut self.legs {
+            *leg = LegBlocks::default();
+        }
         self.compact.new_flow();
         self.flows += 1;
     }
 
-    /// The edge's `OK`: the stream, the part that it sends first (the
+    /// A leg's `OK`: the stream, the part that its edge sends first (the
     /// reference for the compact lane's 32-bit part numbers) and whether it
     /// sends the compact lane (holes are then asked for with NACK).
-    pub fn expect(&mut self, stream_id: u64, next_part: u64, compact: bool) {
+    pub fn expect(
+        &mut self,
+        leg: LegId,
+        stream_id: u64,
+        next_part: u64,
+        compact: bool,
+    ) -> LegStart {
         self.stream_id = stream_id;
-        self.compact.expect_from(next_part, compact);
+        let start = self.compact.leg_expect(leg, next_part, compact);
+        if start == LegStart::Stale {
+            return start;
+        }
         // The short-form parts that came before the OK, read now (their
         // objects wait in `ready`, in the order they came: `push_compact`
         // returns the oldest object ready, which goes back to the front).
-        for datagram in self.compact.take_early() {
-            if let Some(object) = self.push_compact(&datagram) {
+        for datagram in self.compact.take_early(leg) {
+            if let Some(object) = self.push_compact(leg, &datagram) {
                 self.ready.push_front(object);
             }
         }
+        start
     }
 
     /// Whether objects wait in `ready` (see [`Self::next_ready`]).
@@ -1186,26 +1264,28 @@ impl ObjectReceiver {
         self.ready.pop_front()
     }
 
-    /// Push one datagram and take every object that it delivered.
-    pub fn push_all(&mut self, datagram: &[u8]) -> Vec<PartObject> {
-        let mut objects: Vec<PartObject> = self.push(datagram).into_iter().collect();
+    /// Push one datagram of `leg` and take every object that it delivered.
+    pub fn push_all(&mut self, leg: LegId, datagram: &[u8]) -> Vec<PartObject> {
+        let mut objects: Vec<PartObject> = self.push(leg, datagram).into_iter().collect();
         objects.extend(self.ready.drain(..));
         objects
     }
 
-    /// Parts to ask the edge for again now (compact lane), at most
+    /// Parts to ask the legs' edges for again now (compact lane), at most
     /// [`MAX_NACK_PARTS`].
-    pub fn nacks_due(&mut self, now: Instant) -> Vec<u64> {
+    pub fn nacks_due(&mut self, now: Instant) -> compact::NacksDue {
         self.compact.nacks_due(now, MAX_NACK_PARTS)
     }
 
-    /// The compact lane: push one compact datagram.
-    fn push_compact(&mut self, datagram: &[u8]) -> Option<PartObject> {
+    /// The compact lane: push one compact datagram of `leg`.
+    fn push_compact(&mut self, leg: LegId, datagram: &[u8]) -> Option<PartObject> {
         let now_unix_us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_micros() as u64);
         let before = self.compact.stats;
-        let parts = self.compact.push(datagram, Instant::now(), now_unix_us);
+        let parts = self
+            .compact
+            .push(leg, datagram, Instant::now(), now_unix_us);
         let after = self.compact.stats;
         self.errors += after.errors - before.errors;
         self.duplicate_parts += after.duplicates - before.duplicates;
@@ -1217,17 +1297,9 @@ impl ObjectReceiver {
             if part.fast_lane && part.kind == compact::Kind::Part {
                 self.last_compact_fast_lane.push(part.part);
             }
-            // The other lanes' blocks of the part will not complete, and are
-            // not loss.
-            for other in [
-                cut_through_block_id(part.part),
-                block_id(ObjectKind::Part, part.part),
-                fast_block_id(part.part),
-            ] {
-                if self.blocks.remove(&other).is_some() {
-                    self.settle(other);
-                }
-            }
+            // The leg's other lanes' blocks of the part will not complete,
+            // and are not loss.
+            self.legs[leg.index()].settle_other_lanes(part.part, None);
             self.ready.push_back(PartObject {
                 kind: match part.kind {
                     compact::Kind::Gap => ObjectKind::Gap,
@@ -1244,14 +1316,15 @@ impl ObjectReceiver {
         self.ready.pop_front()
     }
 
-    /// Push one media datagram. Returns the object that it completed.
-    pub fn push(&mut self, datagram: &[u8]) -> Option<PartObject> {
+    /// Push one media datagram of `leg`. Returns the object that it
+    /// completed, unless another leg or lane delivered that part first.
+    pub fn push(&mut self, leg: LegId, datagram: &[u8]) -> Option<PartObject> {
         self.datagrams += 1;
         self.wire_bytes += (datagram.len() + compact::IP_UDP_HEADER_BYTES) as u64;
         self.last_fast_envelope_bytes = None;
         self.last_compact_fast_lane.clear();
         if compact::is_compact(datagram) || compact::is_short(datagram) {
-            return self.push_compact(datagram);
+            return self.push_compact(leg, datagram);
         }
         let header = match DatagramFecHeader::decode(datagram) {
             Ok(header) => header,
@@ -1266,8 +1339,9 @@ impl ObjectReceiver {
         } else {
             self.repair_datagrams += 1;
         }
-        if !self.settled.contains(&header.block_id) {
-            let count = self.blocks.entry(header.block_id).or_insert(BlockCount {
+        let blocks = &mut self.legs[leg.index()];
+        if !blocks.settled.contains(&header.block_id) {
+            let count = blocks.blocks.entry(header.block_id).or_insert(BlockCount {
                 received: 0,
                 source_symbols: u32::from(header.source_symbols),
                 sent: None,
@@ -1276,52 +1350,50 @@ impl ObjectReceiver {
             });
             count.received += 1;
         }
-        let seen = self
+        let seen = blocks
             .blocks
             .get(&header.block_id)
             .map_or(0, |count| count.received);
         let space = block_space(header.block_id);
-        match self.decoders[space].push_datagram(datagram) {
+        let decoders = blocks.decoders.get_or_insert_with(Default::default);
+        match decoders[space].push_datagram(datagram) {
             Ok(Some(bytes)) => match decode_any_object(bytes) {
                 Ok((object, fast)) => {
-                    if let Some(fast) = fast {
-                        self.fast_decoded(header.block_id, fast);
-                    }
-                    self.objects += 1;
-                    if let Some(count) = self.blocks.get_mut(&header.block_id) {
+                    let stale =
+                        fast.is_some_and(|fast| !self.fast_decoded(leg, header.block_id, fast));
+                    let blocks = &mut self.legs[leg.index()];
+                    if let Some(count) = blocks.blocks.get_mut(&header.block_id) {
                         // A cut-through or fast-lane object does not say how
                         // many datagrams were sent (0): its source symbols and
                         // the repair of the client's own policy.
                         count.sent = Some(object.datagrams);
                         count.decoded = true;
                     }
+                    if stale {
+                        self.stale_fast_objects += 1;
+                        return None;
+                    }
+                    self.objects += 1;
+                    let blocks = &mut self.legs[leg.index()];
                     if seen < u32::from(header.source_symbols) || !source_symbol {
                         // Decoded with fewer than all source symbols, or
                         // completed by a repair symbol.
                         self.recovered_objects += 1;
                     }
                     if object.kind == ObjectKind::Part {
-                        // The part came on one lane: its blocks on the other
-                        // lanes (another parent's block decoded first, or the
-                        // edge sent the whole part again) will not complete,
-                        // and are not loss.
-                        for other in [
-                            cut_through_block_id(object.part),
-                            block_id(ObjectKind::Part, object.part),
-                            fast_block_id(object.part),
-                        ] {
-                            if other != header.block_id && self.blocks.remove(&other).is_some() {
-                                self.settle(other);
-                            }
-                        }
+                        // The part came on one lane: the leg's blocks on the
+                        // other lanes (another parent's block decoded first,
+                        // or the edge sent the whole part again) will not
+                        // complete, and are not loss.
+                        blocks.settle_other_lanes(object.part, Some(header.block_id));
                     }
                     if matches!(object.kind, ObjectKind::Part | ObjectKind::Gap)
                         && !self
                             .compact
-                            .delivered_elsewhere(object.part, Instant::now())
+                            .delivered_elsewhere(leg, object.part, Instant::now())
                     {
-                        // A part that the compact lane (or another block)
-                        // delivered already.
+                        // A part that the compact lane, another block or
+                        // another leg delivered already.
                         self.duplicate_parts += 1;
                         return None;
                     }
@@ -1340,51 +1412,51 @@ impl ObjectReceiver {
         }
     }
 
-    /// Remember a block as counted, so that a late datagram of it does not
-    /// count again.
-    fn settle(&mut self, block: u32) {
-        if self.settled.insert(block) {
-            self.settled_order.push_back(block);
-        }
-        if self.settled_order.len() > SETTLED_MEMORY {
-            if let Some(old) = self.settled_order.pop_front() {
-                self.settled.remove(&old);
-            }
-        }
-    }
-
     /// A fast-lane block decoded. A new source epoch (the contributor
     /// restarted, and counts its parts from 0 again) starts a new flow: the
     /// old epoch's blocks of the same numbers must not meet the new ones in
     /// a decoder, nor its completed blocks hide them. The block that showed
-    /// the new epoch stays completed in the new flow.
-    fn fast_decoded(&mut self, block: u32, fast: FastObject) {
-        if self.fast_epoch.is_some_and(|epoch| epoch != fast.epoch) {
+    /// the new epoch stays completed in the new flow. An object of one of
+    /// the last few epochs is late (another leg's edge saw the new epoch
+    /// first): `false`, and it is dropped.
+    fn fast_decoded(&mut self, leg: LegId, block: u32, fast: FastObject) -> bool {
+        if self.old_fast_epochs.contains(&fast.epoch) {
+            return false;
+        }
+        if let Some(epoch) = self.fast_epoch.filter(|epoch| *epoch != fast.epoch) {
+            self.old_fast_epochs.push_back(epoch);
+            if self.old_fast_epochs.len() > OLD_FAST_EPOCHS {
+                self.old_fast_epochs.pop_front();
+            }
             self.new_flow();
-            self.decoders[FAST_SPACE].expire_block(block);
-            self.settle(block);
+            let blocks = &mut self.legs[leg.index()];
+            blocks.decoders.get_or_insert_with(Default::default)[FAST_SPACE].expire_block(block);
+            blocks.settle(block);
             self.fast_epoch_changes += 1;
         }
         self.fast_epoch = Some(fast.epoch);
         self.fast_parts += 1;
         self.fast_envelope_bytes += fast.envelope_bytes as u64;
         self.last_fast_envelope_bytes = Some(fast.envelope_bytes);
+        true
     }
 
-    /// Count the blocks that have settled, and return the datagram loss
-    /// measured since the last call, if any datagram was due. A block that
-    /// was never decoded is counted as sent with the repair of `policy`.
-    pub fn take_loss(&mut self, policy: RepairPolicy) -> Option<f64> {
+    /// Count a leg's blocks that have settled, and return the datagram loss
+    /// that it measured since the last call, if any datagram was due. A
+    /// block that was never decoded is counted as sent with the repair of
+    /// `policy`.
+    pub fn take_loss(&mut self, leg: LegId, policy: RepairPolicy) -> Option<f64> {
         let now = Instant::now();
-        let settled: Vec<u32> = self
+        let blocks = &mut self.legs[leg.index()];
+        let settled: Vec<u32> = blocks
             .blocks
             .iter()
             .filter(|(_, count)| now.duration_since(count.first_seen) >= LOSS_SETTLE)
             .map(|(block, _)| *block)
             .collect();
         for block in settled {
-            let count = self.blocks.remove(&block).unwrap();
-            self.settle(block);
+            let count = blocks.blocks.remove(&block).unwrap();
+            blocks.settle(block);
             let expected = count.source_symbols + policy.repair_symbols(count.source_symbols);
             let sent = match count.sent {
                 Some(sent) if sent > 0 => sent,
@@ -1397,23 +1469,24 @@ impl ObjectReceiver {
                 }
             };
             let received = count.received.min(sent);
-            self.window_received += u64::from(received);
-            self.window_sent += u64::from(sent);
+            blocks.window_received += u64::from(received);
+            blocks.window_sent += u64::from(sent);
             self.sent_datagrams += u64::from(sent);
             self.lost_datagrams += u64::from(sent - received);
         }
         // The compact lane's parts and window repair.
-        let (received, sent) = self.compact.take_counts(now);
-        self.window_received += received;
-        self.window_sent += sent;
+        let (received, sent) = self.compact.take_counts(leg, now);
+        let blocks = &mut self.legs[leg.index()];
+        blocks.window_received += received;
+        blocks.window_sent += sent;
         self.sent_datagrams += sent;
         self.lost_datagrams += sent - received;
-        if self.window_sent == 0 {
+        if blocks.window_sent == 0 {
             return None;
         }
-        let loss = 1.0 - self.window_received as f64 / self.window_sent as f64;
-        self.window_received = 0;
-        self.window_sent = 0;
+        let loss = 1.0 - blocks.window_received as f64 / blocks.window_sent as f64;
+        blocks.window_received = 0;
+        blocks.window_sent = 0;
         Some(loss)
     }
 }
@@ -2468,7 +2541,7 @@ mod tests {
         let fast = fast_datagrams(&envelope, 500, 1_000, 2);
         let mut receiver = ObjectReceiver::new();
         for datagram in &fast[..10] {
-            assert!(receiver.push(datagram).is_none());
+            assert!(receiver.push(LegId::FIRST, datagram).is_none());
         }
         for part in 501..600 {
             let init = PartObject {
@@ -2479,7 +2552,7 @@ mod tests {
                 encode_object(&init, DEFAULT_SYMBOL_SIZE, RepairPolicy::default())
                     .unwrap()
                     .iter()
-                    .any(|datagram| receiver.push(datagram).is_some())
+                    .any(|datagram| receiver.push(LegId::FIRST, datagram).is_some())
             );
         }
         assert!(encode_object(
@@ -2489,14 +2562,55 @@ mod tests {
         )
         .unwrap()
         .iter()
-        .any(|datagram| receiver.push(datagram).is_some()));
+        .any(|datagram| receiver.push(LegId::FIRST, datagram).is_some()));
         let decoded = fast[10..]
             .iter()
-            .find_map(|datagram| receiver.push(datagram))
+            .find_map(|datagram| receiver.push(LegId::FIRST, datagram))
             .expect("the fast-lane block completes");
         assert_eq!(decoded.part, 500);
         assert_eq!(receiver.fast_parts, 1);
         assert_eq!(receiver.last_fast_envelope_bytes, Some(envelope.len()));
+    }
+
+    /// B X4 review: two legs see a new source epoch a moment apart. The
+    /// first object of the new epoch starts one new flow; an object of the
+    /// old epoch that the other leg decodes later is dropped, and the flow
+    /// does not go back to it.
+    #[test]
+    fn a_late_object_of_the_old_epoch_on_another_leg_is_dropped() {
+        let mut receiver = ObjectReceiver::new();
+        let b = receiver.open_leg().expect("a second leg");
+        let decode = |receiver: &mut ObjectReceiver, leg: LegId, epoch: u64, part: u64| {
+            fast_datagrams(&envelope(epoch, part, 300), part, 400, 1)
+                .iter()
+                .find_map(|datagram| receiver.push(leg, datagram))
+        };
+        for part in 1_000..1_004 {
+            assert_eq!(
+                decode(&mut receiver, LegId::FIRST, 1, part).unwrap().part,
+                part
+            );
+        }
+        let flows = receiver.flows;
+        // Leg A's edge has the new epoch, counting from 0.
+        for part in 0..4 {
+            assert_eq!(
+                decode(&mut receiver, LegId::FIRST, 2, part).unwrap().part,
+                part
+            );
+        }
+        assert_eq!(receiver.flows, flows + 1);
+        // Leg B's edge, a moment behind, still sends the old epoch.
+        assert!(decode(&mut receiver, b, 1, 1_004).is_none());
+        assert_eq!(receiver.stale_fast_objects, 1);
+        assert_eq!(receiver.fast_epoch, Some(2));
+        assert_eq!(receiver.fast_epoch_changes, 1);
+        assert_eq!(receiver.flows, flows + 1, "no flow back to the old epoch");
+        // Then B has the new epoch too: its parts are the new flow's, and
+        // those A delivered already are not delivered again.
+        assert!(decode(&mut receiver, b, 2, 3).is_none());
+        assert_eq!(decode(&mut receiver, b, 2, 4).unwrap().part, 4);
+        assert_eq!(receiver.flows, flows + 1);
     }
 
     #[test]
@@ -2505,7 +2619,7 @@ mod tests {
         let decode = |receiver: &mut ObjectReceiver, epoch: u64, part: u64| {
             fast_datagrams(&envelope(epoch, part, 300), part, 400, 1)
                 .iter()
-                .find_map(|datagram| receiver.push(datagram))
+                .find_map(|datagram| receiver.push(LegId::FIRST, datagram))
         };
         for part in 1_000..1_010 {
             assert_eq!(decode(&mut receiver, 1, part).unwrap().part, part);
@@ -2529,7 +2643,7 @@ mod tests {
         let late = fast_datagrams(&envelope(2, 0, 300), 0, 400, 1);
         assert!(late
             .iter()
-            .all(|datagram| receiver.push(datagram).is_none()));
+            .all(|datagram| receiver.push(LegId::FIRST, datagram).is_none()));
         assert_eq!(receiver.fast_parts, 20);
     }
 
@@ -2646,7 +2760,7 @@ mod tests {
                 if index % stride == 0 && index / stride < lose {
                     continue;
                 }
-                if let Some(object) = receiver.push(datagram) {
+                if let Some(object) = receiver.push(LegId::FIRST, datagram) {
                     decoded = Some(object);
                 }
             }
@@ -2683,26 +2797,68 @@ mod tests {
             .enumerate()
         {
             let _ = index;
-            if let Some(object) = receiver.push(datagram) {
+            if let Some(object) = receiver.push(LegId::FIRST, datagram) {
                 decoded = Some(object);
             }
         }
         if let Some(decoded) = decoded {
             assert_eq!(decoded.payload, a.payload);
         }
-        // The client starts a new flow when it moves, and then decodes the
-        // second edge's part.
+        // The second edge is another leg, with decoders of its own: it
+        // decodes its part.
         let mut receiver = ObjectReceiver::new();
         for datagram in from_a.iter().take(3) {
-            receiver.push(datagram);
+            receiver.push(LegId::FIRST, datagram);
         }
-        receiver.new_flow();
+        let second = receiver.open_leg().unwrap();
         let decoded = from_b
             .iter()
-            .find_map(|datagram| receiver.push(datagram))
+            .find_map(|datagram| receiver.push(second, datagram))
             .unwrap();
         assert_eq!(decoded.payload, b.payload);
         assert_eq!(decoded.available_unix_us, 2);
+    }
+
+    /// B X4: each leg decodes its own edge's symbols of a part: two edges'
+    /// symbols never meet in one decoder, no new flow is needed for the
+    /// second edge, and the part is delivered once.
+    #[test]
+    fn two_legs_blocks_of_one_part_use_two_decoders_and_deliver_once() {
+        let mut a = object(20, 6_000);
+        a.available_unix_us = 1;
+        let mut b = a.clone();
+        b.available_unix_us = 2;
+        let policy = RepairPolicy::default();
+        let from_a = encode_object(&a, DEFAULT_SYMBOL_SIZE, policy).unwrap();
+        let from_b = encode_object(&b, DEFAULT_SYMBOL_SIZE, policy).unwrap();
+        assert_eq!(from_a.len(), 7);
+        let mut receiver = ObjectReceiver::new();
+        let first = LegId::FIRST;
+        let second = receiver.open_leg().unwrap();
+        // Three of one edge's symbols and four of the other's would be
+        // enough for one decoder; each leg alone has too few.
+        for datagram in &from_a[..3] {
+            assert!(receiver.push(first, datagram).is_none());
+        }
+        for datagram in &from_b[3..] {
+            assert!(receiver.push(second, datagram).is_none());
+        }
+        let decoded = from_a[3..]
+            .iter()
+            .find_map(|datagram| receiver.push(first, datagram))
+            .expect("the first leg decodes its edge's part");
+        assert_eq!(decoded.payload, a.payload);
+        assert_eq!(decoded.available_unix_us, 1);
+        // The second leg completes its own block: a duplicate, not returned.
+        assert!(from_b[..3]
+            .iter()
+            .all(|datagram| receiver.push(second, datagram).is_none()));
+        assert_eq!(receiver.objects, 2);
+        assert_eq!(receiver.duplicate_parts, 1);
+        assert_eq!(receiver.errors, 0);
+        assert_eq!(receiver.compact.leg_stats(first).parts_first, 1);
+        assert_eq!(receiver.compact.leg_stats(second).parts_first, 0);
+        assert_eq!(receiver.flows, 1);
     }
 
     #[test]
@@ -2720,11 +2876,13 @@ mod tests {
                 if (part as usize * datagrams.len() + index) % 10 == 0 {
                     continue;
                 }
-                receiver.push(datagram);
+                receiver.push(LegId::FIRST, datagram);
             }
         }
         std::thread::sleep(LOSS_SETTLE);
-        let loss = receiver.take_loss(RepairPolicy::default()).unwrap();
+        let loss = receiver
+            .take_loss(LegId::FIRST, RepairPolicy::default())
+            .unwrap();
         assert!((0.08..0.12).contains(&loss), "{loss}");
         assert_eq!(receiver.objects, 200);
         // A late datagram of a counted block is not counted again.
@@ -2734,9 +2892,12 @@ mod tests {
             RepairPolicy::default(),
         )
         .unwrap();
-        receiver.push(&late[0]);
+        receiver.push(LegId::FIRST, &late[0]);
         std::thread::sleep(LOSS_SETTLE);
-        assert_eq!(receiver.take_loss(RepairPolicy::default()), None);
+        assert_eq!(
+            receiver.take_loss(LegId::FIRST, RepairPolicy::default()),
+            None
+        );
         assert_eq!(receiver.lost_objects, 0);
     }
 
@@ -2819,7 +2980,7 @@ mod tests {
                 if sent % 5 == 0 {
                     continue;
                 }
-                decoded = decoded.or(receiver.push(&datagram));
+                decoded = decoded.or(receiver.push(LegId::FIRST, &datagram));
             }
         }
         assert!(
@@ -2830,7 +2991,7 @@ mod tests {
         let repair = RepairPolicy::for_loss(0.2, RepairPolicy::default()).repair_symbols(sources);
         let encoded = encode_block(&frame, block, client, repair).unwrap();
         for datagram in &encoded[sources as usize..] {
-            decoded = decoded.or(receiver.push(datagram));
+            decoded = decoded.or(receiver.push(LegId::FIRST, datagram));
         }
         let decoded = decoded.expect("the repair completes the block");
         assert_eq!(decoded.part, 812);
@@ -2861,7 +3022,7 @@ mod tests {
         let cut = encode_block(&frame, cut_through_block_id(500), 1_000, 4).unwrap();
         let mut receiver = ObjectReceiver::new();
         for datagram in &cut[..10] {
-            assert!(receiver.push(datagram).is_none());
+            assert!(receiver.push(LegId::FIRST, datagram).is_none());
         }
         let init = PartObject {
             kind: ObjectKind::Init,
@@ -2871,7 +3032,7 @@ mod tests {
             encode_object(&init, DEFAULT_SYMBOL_SIZE, RepairPolicy::default())
                 .unwrap()
                 .iter()
-                .any(|datagram| receiver.push(datagram).is_some())
+                .any(|datagram| receiver.push(LegId::FIRST, datagram).is_some())
         );
         assert!(encode_object(
             &object(499, 900),
@@ -2880,10 +3041,10 @@ mod tests {
         )
         .unwrap()
         .iter()
-        .any(|datagram| receiver.push(datagram).is_some()));
+        .any(|datagram| receiver.push(LegId::FIRST, datagram).is_some()));
         let decoded = cut[10..]
             .iter()
-            .find_map(|datagram| receiver.push(datagram));
+            .find_map(|datagram| receiver.push(LegId::FIRST, datagram));
         assert_eq!(decoded.expect("the cut-through block completes").part, 500);
     }
 
