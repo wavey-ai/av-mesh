@@ -955,3 +955,80 @@ async fn an_edge_asks_for_a_hole_when_the_part_the_distance_later_arrives() {
     }
     edge.stop().await;
 }
+
+/// What needletail's tools read from an edge (integration 2): `mesh_ops`
+/// `status_of` and the roll's capacity gate from `/api/node` (state, build,
+/// boot id, args hash, `not_ready`, the drain reasons, `ingest`, and B's
+/// gauges in `client_udp`: `single_legs`, `leaving`, `legs_by_other` as an
+/// object), and the stall hunt's sampler from `/api/mesh/local` (the
+/// fan-out's counters under `client_udp.fast_lane`, the class thread's
+/// `relay_session.fast_plane.audio_loop_busy_max_us`), on an edge whose
+/// lane runs. Names and types, as the tools parse them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_fields_needletail_s_tools_read_are_served() {
+    let ip = loopback(230);
+    let edge = LaneEdge::start_at(ip, SocketAddr::from((ip, 0)), 64, |mut router| {
+        router.client_udp_port = Some(19_446);
+        router
+    })
+    .await;
+    let json = |response: HandlerResponse| -> serde_json::Value {
+        serde_json::from_slice(response.body.as_ref().unwrap()).unwrap()
+    };
+    let node = json(get_for_tests(&edge.router, NODE_STATUS_PATH).await);
+    for path in [
+        "/state",
+        "/build/git",
+        "/process/args_sha256",
+    ] {
+        assert!(node.pointer(path).is_some_and(|v| v.is_string()), "{path}: {node:#}");
+    }
+    for path in [
+        "/build/built_unix",
+        "/process/boot_id",
+        "/fast_plane/threads",
+        "/fast_plane/threads_expected",
+        "/ingest/audio_deadline_drops",
+        "/client_udp/subscribers",
+        "/client_udp/single_legs",
+        "/client_udp/leaving",
+        "/client_udp/load_permille",
+        "/client_udp/rebalance_moves",
+        "/client_udp/moves_expired",
+    ] {
+        assert!(node.pointer(path).is_some_and(|v| v.is_u64()), "{path}: {node:#}");
+    }
+    assert_eq!(node["build"]["git"], av_mesh::build::GIT);
+    assert!(node["not_ready"].is_array() && node["drain_reasons"].is_array());
+    assert!(node["client_udp"]["legs_by_other"].is_object(), "{node:#}");
+    let local = json(get_for_tests(&edge.router, "/api/mesh/local").await);
+    let lane = &local["client_udp"]["fast_lane"];
+    for field in [
+        "fanout_started",
+        "fanout_policies",
+        "fanout_cpus",
+        "fanout_threads",
+        "fanout_first_dispatch_faults",
+        "fanout_dispatch_max_us",
+        "fanout_shed",
+        "fanout_waited",
+        "class_plan_grows",
+        "class_compact_max_us",
+        "class_send_max_us",
+        "class_repair_max_us",
+        "class_arena_warm_bytes",
+    ] {
+        assert!(lane[field].is_u64(), "{field}: {lane:#}");
+    }
+    assert!(lane["class_arena_warm_bytes"].as_u64().unwrap() >= 32 << 20, "{lane:#}");
+    let plane = &local["relay_session"]["fast_plane"];
+    for field in [
+        "audio_loop_busy_max_us",
+        "audio_loop_busy_over_50ms",
+        "audio_thread_minflt",
+        "audio_thread_majflt",
+    ] {
+        assert!(plane[field].is_u64(), "{field}: {plane:#}");
+    }
+    edge.stop().await;
+}

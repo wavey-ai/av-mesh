@@ -76,7 +76,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::debug;
@@ -593,6 +593,9 @@ pub struct EdgeFastLane {
     /// The nice value of the fan-out threads (`--client-udp-fanout-nice`,
     /// wave 8; [`FANOUT_NICE_PROCESS`]: the process's, as in wave 7).
     fanout_nice: std::sync::atomic::AtomicI32,
+    /// What the audio class thread grows and touches of its heap before it
+    /// is made real-time (`--relay-class-arena-warm-mb`; 0: nothing).
+    class_arena_warm_bytes: AtomicUsize,
     /// The class thread hands its batches' window repair to a repair
     /// thread (`--client-udp-repair-thread`, wave 8 S1): window repair
     /// takes the subscriber table's lock, which ordinary tasks hold (SUB
@@ -661,6 +664,7 @@ impl EdgeFastLane {
             repair_jobs: OnceLock::new(),
             fanout_inline_shard: AtomicBool::new(DEFAULT_FANOUT_INLINE_SHARD),
             fanout_nice: std::sync::atomic::AtomicI32::new(DEFAULT_FANOUT_NICE),
+            class_arena_warm_bytes: AtomicUsize::new(CLASS_ARENA_WARM_BYTES),
             stats: FastLaneStats::default(),
         })
     }
@@ -844,6 +848,14 @@ impl EdgeFastLane {
     /// process's, as in wave 7). Read when the threads start.
     pub fn set_fanout_nice(&self, nice: i32) {
         self.fanout_nice.store(nice, Ordering::Relaxed);
+    }
+
+    /// How much of its heap the audio class thread grows and touches before
+    /// it is made real-time ([`CLASS_ARENA_WARM_BYTES`] by default; 0 turns
+    /// the warm-up off, the stall hunt's switch). Read when the class thread
+    /// starts.
+    pub fn set_class_arena_warm_bytes(&self, bytes: usize) {
+        self.class_arena_warm_bytes.store(bytes, Ordering::Relaxed);
     }
 
     fn fanout(&self) -> (usize, usize) {
@@ -2787,7 +2799,8 @@ fn run_fanout(
 }
 
 /// Memory that the audio class thread allocates, touches and frees before it
-/// is made real-time ([`warm_thread_arena`]).
+/// is made real-time ([`warm_thread_arena`]), by default
+/// (`--relay-class-arena-warm-mb` 32).
 pub const CLASS_ARENA_WARM_BYTES: usize = 32 << 20;
 /// The blocks it does so in: well under `--malloc-tune`'s mmap threshold
 /// (32 MB), so that they come from the thread's own heap.
@@ -2840,8 +2853,9 @@ impl ClientSender {
         let Some(lane) = lane else {
             return Self::default();
         };
-        if class == TrafficClass::Audio {
-            let warmed = warm_thread_arena(CLASS_ARENA_WARM_BYTES);
+        let arena = lane.class_arena_warm_bytes.load(Ordering::Relaxed);
+        if class == TrafficClass::Audio && arena > 0 {
+            let warmed = warm_thread_arena(arena);
             lane.stats
                 .class_arena_warm_bytes
                 .store(warmed as u64, Ordering::Relaxed);
@@ -3303,6 +3317,29 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    /// `--relay-class-arena-warm-mb` (D 7.8): the audio class thread warms
+    /// 32 MB of its heap by default, what it is set to, and nothing at 0
+    /// (the stall hunt's no_arena_warm arm), and `class_arena_warm_bytes`
+    /// says which.
+    #[test]
+    fn the_arena_warm_up_is_a_setting_and_zero_turns_it_off() {
+        let warmed = |bytes: Option<usize>| {
+            let lane = EdgeFastLane::new(0);
+            lane.set_fanout(0, 0);
+            if let Some(bytes) = bytes {
+                lane.set_class_arena_warm_bytes(bytes);
+            }
+            let _sender = ClientSender::new(Some(&lane), TrafficClass::Audio);
+            lane.snapshot_stats().class_arena_warm_bytes
+        };
+        assert!(warmed(None) >= CLASS_ARENA_WARM_BYTES as u64);
+        assert!(warmed(None) < (CLASS_ARENA_WARM_BYTES + 2 * ARENA_WARM_BLOCK) as u64);
+        let four = 4 << 20;
+        assert!(warmed(Some(four)) >= four as u64);
+        assert!(warmed(Some(four)) < (four + 2 * ARENA_WARM_BLOCK) as u64);
+        assert_eq!(warmed(Some(0)), 0);
     }
 
     /// Without fan-out threads (none asked for, the video class, or no

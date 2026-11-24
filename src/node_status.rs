@@ -292,7 +292,7 @@ pub struct CacheMeshPeerStatus {
     pub heard_age_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientUdpStatus {
     /// Null before the edge serves clients.
     pub subscribers: Option<u64>,
@@ -307,6 +307,19 @@ pub struct ClientUdpStatus {
     pub load_permille: u32,
     pub rebalance_moves: u64,
     pub parents_lost: bool,
+    /// B's gauges beside these (B 2.3, C 7): subscribers sent `MOVE` and
+    /// still served, those that name no other leg (`o=`), and the legs by
+    /// the node their listener's other leg is on (`""`: a node this region
+    /// does not advertise). Null before the edge serves clients. The roll's
+    /// capacity gate and `single_legs` wait read them here.
+    pub leaving: Option<u64>,
+    pub single_legs: Option<u64>,
+    #[serde(default)]
+    pub legs_by_other: std::collections::BTreeMap<String, u64>,
+    pub moves_completed: u64,
+    pub moves_expired: u64,
+    pub moves_taken_back: u64,
+    pub redundant_refusals: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1376,6 +1389,15 @@ mod tests {
                 load_permille: 310,
                 rebalance_moves: 0,
                 parents_lost: false,
+                leaving: Some(0),
+                single_legs: Some(4),
+                legs_by_other: [("lon-edge-2".to_owned(), 70), ("lon-edge-3".to_owned(), 46)]
+                    .into_iter()
+                    .collect(),
+                moves_completed: 0,
+                moves_expired: 0,
+                moves_taken_back: 0,
+                redundant_refusals: 0,
             }),
             entry: EntryStatus {
                 caches_fresh: 3,

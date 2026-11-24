@@ -2182,6 +2182,18 @@ struct Args {
     )]
     client_udp_fanout_nice: i32,
 
+    /// D 7.8 (the stall hunt's no_arena_warm arm): the MB of its heap that
+    /// an edge's audio class thread grows, touches and gives back before it
+    /// is made real-time (the fan-out fix's warm-up of its glibc arena). 0:
+    /// no warm-up; `class_arena_warm_bytes` then reads 0. Nodes without the
+    /// client fast lane warm nothing either way.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_CLASS_ARENA_WARM_MB",
+        default_value_t = (fast_plane::edge_clients::CLASS_ARENA_WARM_BYTES >> 20) as u64
+    )]
+    relay_class_arena_warm_mb: u64,
+
     /// The fast lane sends from send-only twins of the client sockets (the
     /// same address, in their SO_REUSEPORT group) that the runtime watches
     /// for reading only (wave 7 item 10). A socket that the runtime watches
@@ -3846,6 +3858,10 @@ async fn main() -> Result<()> {
         lane.set_repair_thread(args.client_udp_repair_thread);
         lane.set_fanout_inline_shard(args.client_udp_fanout_inline_shard);
         lane.set_fanout_nice(args.client_udp_fanout_nice);
+        lane.set_class_arena_warm_bytes(
+            usize::try_from(args.relay_class_arena_warm_mb.saturating_mul(1 << 20))
+                .unwrap_or(usize::MAX),
+        );
         lane.set_fanout(
             args.client_udp_fanout_threads,
             args.client_udp_fanout_inline_sends,
@@ -21708,7 +21724,24 @@ impl AppRouter {
             Some(_) => {
                 let stats = &self.edge_udp_stats;
                 let egress = self.edge_load.admission_snapshot();
+                // B's gauges beside C's (C 7, B 2.3): one pass over the
+                // subscription table.
+                let legs = stats.legs();
+                let (leaving, single_legs) = legs
+                    .as_ref()
+                    .map_or((None, None), |legs| (Some(legs.leaving), Some(legs.single)));
+                let legs_by_other = match legs {
+                    Some(legs) => self.legs_by_other(legs.by_other).await,
+                    None => BTreeMap::new(),
+                };
                 Some(ClientUdpStatus {
+                    leaving,
+                    single_legs,
+                    legs_by_other,
+                    moves_completed: stats.moves_completed.load(Ordering::Relaxed),
+                    moves_expired: stats.moves_expired.load(Ordering::Relaxed),
+                    moves_taken_back: stats.moves_taken_back.load(Ordering::Relaxed),
+                    redundant_refusals: stats.redundant_refusals.load(Ordering::Relaxed),
                     subscribers: stats.live_subscribers(),
                     hls_sessions: egress.active_sessions,
                     hls_moved_active: self.edge_load.moved_seen_within(1_000),
@@ -21762,7 +21795,7 @@ impl AppRouter {
             http_serving: true,
             threads: fast_plane.threads,
             threads_expected: fast_plane.threads_expected,
-            client_udp_running: client_udp.is_none_or(|udp| udp.subscribers.is_some()),
+            client_udp_running: client_udp.as_ref().is_none_or(|udp| udp.subscribers.is_some()),
             parent_heard_age_ms,
             parents_lost,
             regional_view,
@@ -41596,6 +41629,20 @@ mod tests {
         assert!(!args.client_udp_prompt_sender);
         assert!(!args.malloc_tune);
         assert!(!args.prefault);
+    }
+
+    /// D 7.8: `--relay-class-arena-warm-mb` keeps the fan-out fix's 32 MB by
+    /// default, and the stall hunt's arm passes 0.
+    #[test]
+    fn the_arena_warm_up_flag_defaults_to_32_mb_and_takes_0() {
+        let mb = |extra: &[&str]| {
+            Args::try_parse_from(["av-mesh"].iter().chain(extra))
+                .unwrap()
+                .relay_class_arena_warm_mb
+        };
+        assert_eq!(mb(&[]), 32);
+        assert_eq!(mb(&["--relay-class-arena-warm-mb", "0"]), 0);
+        assert_eq!(mb(&["--relay-class-arena-warm-mb", "8"]), 8);
     }
 
     #[test]

@@ -146,7 +146,17 @@
     "refusals": 0,
     "load_permille": 310,
     "rebalance_moves": 0,
-    "parents_lost": false
+    "parents_lost": false,
+    "leaving": 0,
+    "single_legs": 4,
+    "legs_by_other": {
+      "lon-edge-2": 70,
+      "lon-edge-3": 46
+    },
+    "moves_completed": 0,
+    "moves_expired": 0,
+    "moves_taken_back": 0,
+    "redundant_refusals": 0
   },
   "entry": {
     "caches_fresh": 3,
