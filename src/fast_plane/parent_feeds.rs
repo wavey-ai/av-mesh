@@ -437,9 +437,8 @@ impl Sample {
     }
 }
 
-/// A stream or track id longer than this is not recorded (counted in
-/// `untracked`) before its entry exists.
-const KEY_BYTES: usize = 40;
+/// The room of a held key's stream and track ids: any id the wire admits.
+const KEY_BYTES: usize = super::media_clock::ID_ROOM_BYTES;
 
 /// The (address, stream, track) of an entry to make, held without an
 /// allocation.
@@ -1249,6 +1248,36 @@ mod tests {
         feeds.book_misses(&mut misses);
         assert_eq!(misses.held(), 0);
         assert_eq!(feeds.snapshot(T0 + 400).len(), 2);
+    }
+
+    #[test]
+    fn the_longest_admitted_ids_are_held_without_allocating_and_get_their_entry() {
+        // D3 review 2: a held key has room for any id the wire admits
+        // (128 bytes), so such a stream gets its entry like any other.
+        static LONG: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+        let (stream, track) =
+            LONG.get_or_init(|| ("s".repeat(KEY_BYTES), "t".repeat(KEY_BYTES)));
+        assert_eq!(KEY_BYTES, relay_session::RelayLimits::HARD.max_identifier_bytes);
+        let feeds = ParentFeeds::default();
+        let mut misses = FeedMisses::new();
+        let ip = parent(33);
+        let mut long = source(40, T0 + SECOND);
+        long.stream = stream;
+        long.track = track;
+        // As the class thread does before it runs.
+        feeds.warm_up();
+        let before = allocations();
+        feeds.observe(ip, &long, T0 + 40, &mut misses);
+        assert_eq!(allocations() - before, 0, "allocations on the class thread");
+        assert_eq!(misses.held(), 1);
+        feeds.make_requested();
+        long.object = 41;
+        feeds.observe(ip, &long, T0 + 41, &mut misses);
+        assert_eq!(misses.held(), 0);
+        assert_eq!(feeds.untracked(), 0);
+        let feed = only(&feeds, T0 + 100);
+        assert_eq!((feed.stream.as_str(), feed.track.as_str()), (stream.as_str(), track.as_str()));
+        assert_eq!(feed.head_object, Some(41));
     }
 
     #[test]

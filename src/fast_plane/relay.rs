@@ -1282,9 +1282,10 @@ const MAX_DESCRIPTOR_STREAMS: usize = 1_024;
 /// receipt.
 const DESCRIPTOR_HOLD_US: u64 = 1_000_000;
 /// A whole part larger than this (an RLS1 datagram is at most 1,472 bytes)
-/// is not kept, nor a stream id longer than the key.
+/// is not kept.
 const DESCRIPTOR_BYTES: usize = 1_472;
-const DESCRIPTOR_KEY_BYTES: usize = 40;
+/// The room of a stream id: any id the wire admits.
+const DESCRIPTOR_KEY_BYTES: usize = super::media_clock::ID_ROOM_BYTES;
 /// The lease children of a stream that a part is remembered as sent to
 /// (twice `DEFAULT_MAX_LEASE_CHILDREN`: a child is one entry per role). A
 /// child beyond them gets no descriptor and reads the next whole part.
@@ -2739,6 +2740,17 @@ mod two_contributors;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lease_descriptor_takes_the_longest_admitted_stream_id() {
+        // D3 review 2: the table's key has room for any id the wire admits.
+        let mut descriptors = LeaseDescriptors::new();
+        let longest = "s".repeat(relay_session::RelayLimits::HARD.max_identifier_bytes);
+        assert!(descriptors.entry(&longest, false).is_none());
+        let entry = descriptors.entry(&longest, true).expect("an entry");
+        entry.len = 7;
+        assert_eq!(descriptors.entry(&longest, false).map(|entry| entry.len), Some(7));
+    }
 
     #[test]
     fn a_lane_reports_its_loss_only_while_its_ledgers_are_fresh() {
