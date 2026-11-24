@@ -2166,6 +2166,7 @@ async fn an_edge_whose_boot_check_failed_is_never_offered_listeners() {
                     configured: true,
                     complete,
                     verdict: if complete { "ok" } else { "steal" }.to_owned(),
+                    slow_host: false,
                     warm: None,
                     check: None,
                 }),

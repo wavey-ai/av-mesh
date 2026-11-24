@@ -176,6 +176,7 @@
     "configured": true,
     "complete": true,
     "verdict": "ok",
+    "slow_host": false,
     "warm": {
       "ran": true,
       "finished": true,

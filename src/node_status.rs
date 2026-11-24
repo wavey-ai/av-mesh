@@ -1449,6 +1449,7 @@ mod tests {
                 configured: true,
                 complete: true,
                 verdict: "ok".to_owned(),
+                slow_host: false,
                 warm: Some(serde_json::json!({"ran": true, "finished": true, "gib": 3.31})),
                 check: Some(serde_json::json!({"seconds": 60, "stops_over_20ms": 0})),
             }),
