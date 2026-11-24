@@ -397,12 +397,18 @@ pub fn assign(
             .then_with(|| left.2.node_id.cmp(&right.2.node_id))
     });
 
-    // Legs granted: one for a playlist over the two-path bit rate.
+    // Legs granted: one for a playlist over the two-path bit rate, and
+    // none more to a listener that holds a leg of it (B 3.9: no second edge
+    // is asked to send video; review of B Y1, finding 7).
     let wanted = if request
         .playlist_bps
         .is_some_and(|bps| bps > policy.two_path_max_bps)
     {
-        request.paths.min(1)
+        if request.redundant {
+            0
+        } else {
+            request.paths.min(1)
+        }
     } else {
         request.paths.min(MAX_PATHS)
     };

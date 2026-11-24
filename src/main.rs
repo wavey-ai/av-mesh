@@ -20639,12 +20639,41 @@ impl AppRouter {
         // a draining or lost one. Live is heard of lately (review of B Z3):
         // a killed edge over the target is no rebalance once its last
         // advertisement is older than one interval.
+        //
+        // B rule R3 (--client-udp-rebalance-to-mean; review of B Z1-Z2,
+        // finding 2): an edge also sheds when it is over its region's mean
+        // load by half the margin, under the target too. Its listeners are
+        // rebalanced ones (a receiver under the level, or none), not movers
+        // of a lost edge: the level is then the lower of the target and the
+        // mean of the region's live serving edges (the skipped one
+        // included, as the edge plans over them) plus half the margin.
+        let shed_level = {
+            let target = self.assignment_policy.rebalance_target_permille;
+            let region_mean = self.rebalance.filter(|config| config.to_mean).and_then(|config| {
+                let loads = candidates_all
+                    .iter()
+                    .filter(|cache| {
+                        cache.region == self.node.region
+                            && cache.serves_readers
+                            && cache.fresh
+                            && !cache.draining
+                            && heard_lately(&cache.node_id)
+                    })
+                    .map(|cache| f64::from(cache.load_permille))
+                    .collect::<Vec<_>>();
+                (!loads.is_empty()).then(|| {
+                    loads.iter().sum::<f64>() / loads.len() as f64
+                        + f64::from(config.margin_permille) / 2.0
+                })
+            });
+            region_mean.map_or(f64::from(target), |mean| mean.min(f64::from(target)))
+        };
         let rebalancing = moving
             && candidates_all.iter().any(|cache| {
                 skipped(&cache.node_id)
                     && cache.fresh
                     && !cache.draining
-                    && cache.load_permille >= self.assignment_policy.rebalance_target_permille
+                    && f64::from(cache.load_permille) >= shed_level
                     && heard_lately(&cache.node_id)
             });
         // The caches it has left are not assigned: for a rebalance
@@ -36046,6 +36075,18 @@ mod tests {
         assert_eq!(api["paths"], 1, "{api:#}");
         assert_eq!(api["assigned"][1]["reason"], "spare");
         assert_eq!(api["spare"], api["assigned"][1]["node_id"]);
+        // A listener that holds a leg of it is granted none more (B 3.9;
+        // the integration's join of Y1 finding 7 and Z3).
+        let held = api["assigned"][0]["node_id"].as_str().unwrap().to_owned();
+        let api: serde_json::Value = serde_json::from_str(&body_text(
+            get_for_tests(
+                &router,
+                &format!("/api/assignment?stream=801&sid=video-1&paths=1&hold={held}"),
+            )
+            .await,
+        ))
+        .unwrap();
+        assert_eq!(api["paths"], 0, "{api:#}");
         let (edge, _shutdown) =
             start_edge_udp_for_tests(&router, edge_udp::EdgeUdpConfig::with_defaults(1_200, 16))
                 .await;
@@ -36556,6 +36597,56 @@ mod tests {
         assert_eq!(api["paths"], 1, "{api:#}");
         assert_eq!(first_leg(&api).0, "edge-c", "{api:#}");
         mesh.shutdown();
+    }
+
+    /// B rule R3 at the entry (review of B Z1-Z2, finding 2): an edge under
+    /// the target but over its region's mean by half the margin sheds by
+    /// `MOVE rebalance`; its listener is a rebalanced one, so a two-path
+    /// listener's new leg must pass the receiver level (725), not the
+    /// redundant gate of a lost edge's mover (800). With R3 off the same
+    /// request is a mover's.
+    #[tokio::test]
+    async fn a_listener_shed_to_the_mean_is_a_rebalanced_one() {
+        let ask = |router: AppRouter, query: String| async move {
+            serde_json::from_str::<serde_json::Value>(&body_text(
+                get_for_tests(&router, &format!("/api/assignment?stream=801&{query}")).await,
+            ))
+            .unwrap()
+        };
+        // edge-a at 700 (under 800) sheds to the mean: (700 + 760 + 100) / 3
+        // + 75 = 595.
+        let snapshots = || {
+            vec![
+                audio_cache_snapshot_for_tests("edge-a", 700, Some(500)),
+                audio_cache_snapshot_for_tests("edge-b", 760, Some(500)),
+                audio_cache_snapshot_for_tests("edge-c", 100, Some(500)),
+            ]
+        };
+        let config = |to_mean| RebalanceConfig {
+            target_permille: 800,
+            margin_permille: 150,
+            interval: Duration::from_secs(3),
+            spread: Duration::from_millis(500),
+            to_mean,
+        };
+        for (to_mean, paths) in [(true, 0), (false, 1)] {
+            let (mut router, mesh) = entry_point_for_tests(snapshots()).await;
+            router.cache_mesh_role = CacheMeshRole::Distributor;
+            let router = router
+                .with_client_udp_port(Some(19_446))
+                .with_rebalance(Some(config(to_mean)));
+            // Its other leg is on edge-c: only edge-b (760) is left.
+            let api = ask(
+                router.clone(),
+                format!("sid=mean-{to_mean}&skip=edge-a&hold=edge-c"),
+            )
+            .await;
+            assert_eq!(api["paths"], paths, "to_mean {to_mean}: {api:#}");
+            if paths == 1 {
+                assert_eq!(first_leg(&api).0, "edge-b", "{api:#}");
+            }
+            mesh.shutdown();
+        }
     }
 
     /// B 3.6: two legs of one session replaced at once are two movers; a
