@@ -271,6 +271,44 @@ pub struct Counters {
     pub assignment_errors: u64,
     pub assignment_time: Histogram,
     pub fallbacks: u64,
+    /// B Y4. Gauges: live legs on this edge, and listeners by the legs that
+    /// delivered within max(20 ms, 8 part intervals) (two, one, none).
+    pub legs: u64,
+    pub paths_two: u64,
+    pub paths_one: u64,
+    pub paths_none: u64,
+    /// The time between consecutive parts delivered first at one listener
+    /// (kernel receive times, µs), and the longest silence still open at
+    /// the end of the interval (a gauge, µs).
+    pub part_gap: Histogram,
+    pub silent_now_max: u64,
+    /// Silences of `--interrupt-ms` or more (a silence counts once, open
+    /// or ended), the listeners that had one in the interval, and the
+    /// listener sessions that had their first (the run's distinct count).
+    pub interruptions: u64,
+    pub listeners_interrupted: u64,
+    pub interrupted_sessions: u64,
+    /// Listeners whose first missing part settled in the interval (each
+    /// session once: their sum is the run's distinct count).
+    pub listeners_with_missing: u64,
+    /// Leg replacements of the legs that left this edge, by reason and by
+    /// kind (B 2.8); `MOVE` to the old leg's release (µs); a leg's last
+    /// media to its replacement's first (µs).
+    pub leg_replacements_by_reason: BTreeMap<String, u64>,
+    pub leg_replacements_by_kind: BTreeMap<&'static str, u64>,
+    pub handover: Histogram,
+    pub exposure: Histogram,
+    /// The spans of a two-path listener on fewer than two delivering legs
+    /// that ended in the interval (µs).
+    pub single_path: Histogram,
+    /// Hedged `SUB`s sent, and hedges whose silent leg came back.
+    pub hedges: u64,
+    pub hedges_released: u64,
+    /// Listener time (on its home edge) and live-leg time (on each leg's
+    /// edge), µs: the denominators of the datagrams and bytes per listener
+    /// and per leg.
+    pub listener_us: u64,
+    pub leg_us: u64,
 }
 
 impl Counters {
@@ -321,6 +359,32 @@ impl Counters {
         self.assignment_errors += other.assignment_errors;
         self.assignment_time.merge(&other.assignment_time);
         self.fallbacks += other.fallbacks;
+        self.legs += other.legs;
+        self.paths_two += other.paths_two;
+        self.paths_one += other.paths_one;
+        self.paths_none += other.paths_none;
+        self.part_gap.merge(&other.part_gap);
+        self.silent_now_max = self.silent_now_max.max(other.silent_now_max);
+        self.interruptions += other.interruptions;
+        self.listeners_interrupted += other.listeners_interrupted;
+        self.interrupted_sessions += other.interrupted_sessions;
+        self.listeners_with_missing += other.listeners_with_missing;
+        for (reason, count) in &other.leg_replacements_by_reason {
+            *self
+                .leg_replacements_by_reason
+                .entry(reason.clone())
+                .or_default() += count;
+        }
+        for (kind, count) in &other.leg_replacements_by_kind {
+            *self.leg_replacements_by_kind.entry(kind).or_default() += count;
+        }
+        self.handover.merge(&other.handover);
+        self.exposure.merge(&other.exposure);
+        self.single_path.merge(&other.single_path);
+        self.hedges += other.hedges;
+        self.hedges_released += other.hedges_released;
+        self.listener_us += other.listener_us;
+        self.leg_us += other.leg_us;
     }
 
     /// Missing over all the parts that were due (received, missing, gaps).
@@ -329,7 +393,9 @@ impl Counters {
         (due > 0).then(|| self.missing as f64 * 100.0 / due as f64)
     }
 
-    pub fn to_json(&self, seconds: f64, gauges: bool) -> Value {
+    /// One interval's (or the final line's) counters; `buckets`: the
+    /// latency histogram with its buckets (`--interval-buckets`).
+    pub fn to_json(&self, seconds: f64, gauges: bool, buckets: bool) -> Value {
         let mut value = json!({
             "started": self.started,
             "stopped": self.stopped,
@@ -355,19 +421,61 @@ impl Counters {
             "first_parts": self.first_parts,
             "compact_fallbacks": self.compact_fallbacks,
             "short_header_dropped": self.short_header_dropped,
-            "latency_ms": self.latency.summary_ms(),
+            "latency_ms": if buckets {
+                self.latency.summary_with_buckets()
+            } else {
+                self.latency.summary_ms()
+            },
             "ttfp_ms": self.ttfp.summary_ms(),
             "ttok_ms": self.ttok.summary_ms(),
             "recv_lag_ms": self.recv_lag.summary_ms(),
         });
         self.am10_json(&mut value);
+        self.y4_json(&mut value, false);
+        value["listeners_interrupted"] = json!(self.listeners_interrupted);
         if gauges {
             value["active"] = json!(self.active);
             value["up"] = json!(self.up);
             value["stranded"] = json!(self.stranded);
             value["resuming"] = json!(self.resuming);
+            value["legs"] = json!(self.legs);
+            value["paths"] = json!({
+                "two": self.paths_two,
+                "one": self.paths_one,
+                "none": self.paths_none,
+            });
+            value["silent_now_max_ms"] = json!(self.silent_now_max as f64 / 1_000.0);
         }
         value
+    }
+
+    /// The B Y4 counters that an interval and the summary share, into
+    /// `value` (`summary`: over the run).
+    fn y4_json(&self, value: &mut Value, summary: bool) {
+        let ms = |us: u64| us as f64 / 1_000.0;
+        let per_second = |count: u64, us: u64| (us > 0).then(|| count as f64 * 1e6 / us as f64);
+        value["part_gap_ms"] = self.part_gap.summary_with_buckets();
+        value["longest_silence_ms"] = json!((self.part_gap.count() > 0).then(|| ms(self.part_gap.max())));
+        value["interruptions"] = json!(self.interruptions);
+        value["listeners_with_missing"] = json!(self.listeners_with_missing);
+        if summary {
+            value["listeners_interrupted"] = json!(self.interrupted_sessions);
+        }
+        value["leg_replacements"] = json!({
+            "by_reason": self.leg_replacements_by_reason,
+            "by_kind": self.leg_replacements_by_kind,
+        });
+        value["handover_ms"] = self.handover.summary_with_buckets();
+        value["exposure_ms"] = self.exposure.summary_with_buckets();
+        value["single_path_ms"] = self.single_path.summary_with_buckets();
+        value["hedges"] = json!(self.hedges);
+        value["hedges_released"] = json!(self.hedges_released);
+        value["listener_seconds"] = json!(self.listener_us as f64 / 1e6);
+        value["leg_seconds"] = json!(self.leg_us as f64 / 1e6);
+        value["datagrams_per_listener_s"] = json!(per_second(self.datagrams, self.listener_us));
+        value["wire_bytes_per_listener_s"] = json!(per_second(self.bytes_in, self.listener_us));
+        value["datagrams_per_leg_s"] = json!(per_second(self.datagrams, self.leg_us));
+        value["wire_bytes_per_leg_s"] = json!(per_second(self.bytes_in, self.leg_us));
     }
 
     /// The Phase AM item 10 counters, into `value`. The time to move has
@@ -428,6 +536,9 @@ struct PartTrack {
     /// Parts lost in moves, by the edge left, not yet booked (see
     /// [`PartTrack::book_left_lost`]).
     left_lost: Vec<(usize, u64)>,
+    /// The listener's missing parts (its first counts it in
+    /// `listeners_with_missing`).
+    missing: u64,
 }
 
 /// Interruptions whose parts a listener keeps track of.
@@ -445,6 +556,7 @@ impl PartTrack {
             moved_from: None,
             windows: VecDeque::new(),
             left_lost: Vec::new(),
+            missing: 0,
         })
     }
 
@@ -520,6 +632,10 @@ impl PartTrack {
                     counters.gaps += 1;
                 } else {
                     counters.missing += 1;
+                    if self.missing == 0 {
+                        counters.listeners_with_missing += 1;
+                    }
+                    self.missing += 1;
                     if self.moved_from.is_some_and(|from| part >= from) {
                         counters.missing_moved += 1;
                     }
@@ -599,6 +715,34 @@ impl PartTrack {
 
 /// Parts whose bytes a load listener keeps for window repair.
 pub const LOAD_KNOWN_PARTS: usize = 512;
+/// `--settle-ms`: just past the 3 s give-up of a hole (B 2.4).
+pub const DEFAULT_SETTLE_MS: u64 = 3_500;
+/// `--interrupt-ms`.
+pub const DEFAULT_INTERRUPT_MS: u64 = 30;
+
+/// The latency histograms of an interval line that carry their buckets, so
+/// that a window of intervals (of several load hosts) merges into a p99.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntervalBuckets {
+    /// The total's (the default).
+    Total,
+    /// The total's and each edge's.
+    Edges,
+    Off,
+}
+
+impl std::str::FromStr for IntervalBuckets {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, String> {
+        match text {
+            "total" => Ok(Self::Total),
+            "edges" => Ok(Self::Edges),
+            "off" => Ok(Self::Off),
+            other => Err(format!("{other:?}: total, edges or off")),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct LoadConfig {
@@ -627,7 +771,18 @@ pub struct LoadConfig {
     /// Local addresses to bind the listeners to, in turn (each address has
     /// about 28,000 ephemeral ports).
     pub bind_ips: Vec<IpAddr>,
-    pub settle_parts: u64,
+    /// A part is counted missing once it is this far behind its listener's
+    /// newest part (`--settle-ms`, past the 3 s give-up of a hole), in parts
+    /// of the stream's interval once a listener has measured it ...
+    pub settle: Duration,
+    /// ... or this many parts (`--settle-parts`, which overrides it).
+    pub settle_parts: Option<u64>,
+    /// A silence between two parts delivered first of this length or more
+    /// is an interruption (`--interrupt-ms`).
+    pub interrupt: Duration,
+    /// Which latency histograms of an interval line carry their buckets
+    /// (`--interval-buckets`).
+    pub interval_buckets: IntervalBuckets,
     pub kernel_timestamps: bool,
     /// After the duration, keep receiving this long (NACKs still recover
     /// the newest parts) before the parts are settled and the listeners
@@ -678,7 +833,10 @@ impl LoadConfig {
             start_rate: 2_000.0,
             interval: Duration::from_secs(1),
             bind_ips: vec![IpAddr::V4(Ipv4Addr::UNSPECIFIED)],
-            settle_parts: 1_500,
+            settle: Duration::from_millis(DEFAULT_SETTLE_MS),
+            settle_parts: None,
+            interrupt: Duration::from_millis(DEFAULT_INTERRUPT_MS),
+            interval_buckets: IntervalBuckets::Total,
             kernel_timestamps: true,
             drain: Duration::from_millis(600),
             out_dir: None,
@@ -918,6 +1076,8 @@ struct Seen {
     answers: u64,
     assignment_failures: u64,
     failovers: u64,
+    hedges: u64,
+    hedges_released: u64,
 }
 
 /// A leg of a listener as the load books it: its edge in the book, and when
@@ -964,9 +1124,121 @@ struct Listener {
     overflows: u32,
     highest_at_end: Option<u64>,
     arrivals: Option<BTreeMap<u64, (u64, usize, u64, u64)>>,
+    started_unix_us: u64,
+    /// A part settles this many parts behind the newest (`--settle-parts`,
+    /// or `--settle-ms` in parts of the interval measured from the
+    /// publication times of `interval_from` and a part 256 later; until
+    /// then, as far as the track reaches).
+    settle_parts: u64,
+    interval_from: Option<(u64, u64)>,
+    /// The open silence was counted as an interruption; one came in this
+    /// interval; one ever came.
+    silence_counted: bool,
+    interrupted_now: bool,
+    ever_interrupted: bool,
+    /// Its longest silence (µs) and when it ended (Unix µs).
+    longest_silence: (u64, u64),
+    /// Time on one path (B 2.8): it has had two delivering legs, until when
+    /// two legs delivered (the second newest leg media + the window, µs),
+    /// and the start of the open span on fewer.
+    two_paths_seen: bool,
+    two_until_us: u64,
+    single_since_us: Option<u64>,
+    /// When its time was last booked (listener and leg seconds).
+    booked_at: Instant,
 }
 
+/// A leg delivers while it brought media within max(20 ms, 8 part
+/// intervals) (B 2.8, as the session judges it).
+const DELIVERING_FLOOR: Duration = Duration::from_millis(20);
+const DELIVERING_PARTS: u32 = 8;
+/// Parts between the two whose publication times give a listener the
+/// stream's part interval (for `--settle-ms`).
+const INTERVAL_PARTS: u64 = 256;
+
 impl Listener {
+    /// max(20 ms, 8 part intervals), µs.
+    fn window_us(&self) -> u64 {
+        let interval = self
+            .session
+            .receiver
+            .compact
+            .part_interval()
+            .unwrap_or_default();
+        duration_us(DELIVERING_FLOOR.max(interval * DELIVERING_PARTS))
+    }
+
+    /// Its legs that delivered within the window of `now_us`.
+    fn delivering(&self, now_us: u64) -> usize {
+        let window = self.window_us();
+        self.legs
+            .iter()
+            .filter(|leg| leg.last_media_us > 0 && now_us.saturating_sub(leg.last_media_us) <= window)
+            .count()
+    }
+
+    /// Time on one path (B 2.8): a two-path listener's spans in which fewer
+    /// than two legs brought media within the window, booked as they end.
+    fn track_paths(&mut self, home: &mut Counters, now_us: u64) {
+        if self.director.want() < 2 {
+            self.end_single_path(home, now_us);
+            return;
+        }
+        let window = self.window_us();
+        let (mut newest, mut second) = (0, 0);
+        for leg in &self.legs {
+            if leg.last_media_us > newest {
+                second = newest;
+                newest = leg.last_media_us;
+            } else if leg.last_media_us > second {
+                second = leg.last_media_us;
+            }
+        }
+        if second > 0 && now_us.saturating_sub(second) <= window {
+            self.two_paths_seen = true;
+            self.two_until_us = second + window;
+            // It ended with the datagram that made the two again.
+            if let Some(since) = self.single_since_us.take() {
+                home.single_path.record(second.saturating_sub(since));
+            }
+        } else if self.two_paths_seen && self.single_since_us.is_none() {
+            self.single_since_us = Some(self.two_until_us.min(now_us));
+        }
+    }
+
+    fn end_single_path(&mut self, home: &mut Counters, now_us: u64) {
+        if let Some(since) = self.single_since_us.take() {
+            home.single_path.record(now_us.saturating_sub(since));
+        }
+    }
+
+    /// A silence of the interruption's length or more (counted once).
+    fn interrupted(&mut self, home: &mut Counters) {
+        home.interruptions += 1;
+        self.interrupted_now = true;
+        if !self.ever_interrupted {
+            self.ever_interrupted = true;
+            home.interrupted_sessions += 1;
+        }
+    }
+
+    /// The parts behind the newest at which its parts settle, once the
+    /// part interval is known from publication times 256 parts apart.
+    fn learn_interval(&mut self, settle: Duration, part: u64, published_us: u64) {
+        if published_us == 0 || self.settle_parts < TRACK - 1 {
+            return;
+        }
+        match self.interval_from {
+            None => self.interval_from = Some((part, published_us)),
+            Some((first, first_us)) if part >= first + INTERVAL_PARTS && published_us > first_us => {
+                let interval_us = (published_us - first_us) as f64 / (part - first) as f64;
+                self.settle_parts = ((settle.as_micros() as f64 / interval_us).ceil() as u64)
+                    .clamp(1, TRACK - 1);
+            }
+            Some(_) => {}
+        }
+    }
+
     /// When its session or its director must run next.
     fn wake(&self, draining: bool) -> Instant {
         let session = self.session.next_wake();
@@ -1216,13 +1488,29 @@ impl Drive<'_> {
         sync_legs(listener, self.book);
         ensure(counters, listener.home);
         for replacement in listener.director.replacements.drain(..) {
-            if replacement.kind == ReplacementKind::Takeback {
-                continue;
-            }
             let from = self
                 .book
                 .index_of_node(&replacement.from)
                 .unwrap_or(listener.home);
+            ensure(counters, from);
+            let left = &mut counters[from];
+            *left
+                .leg_replacements_by_reason
+                .entry(replacement.reason.clone())
+                .or_default() += 1;
+            *left
+                .leg_replacements_by_kind
+                .entry(replacement.kind.name())
+                .or_default() += 1;
+            if let Some(handover) = replacement.handover {
+                left.handover.record(duration_us(handover));
+            }
+            if let Some(exposure) = replacement.exposure {
+                left.exposure.record(duration_us(exposure));
+            }
+            if replacement.kind == ReplacementKind::Takeback {
+                continue;
+            }
             let to = self
                 .book
                 .index_of_node(&replacement.to)
@@ -1261,6 +1549,10 @@ impl Drive<'_> {
             listener.asking_since = None;
         }
         home.fallbacks += stats.failovers.saturating_sub(seen.failovers);
+        home.hedges += stats.hedges.saturating_sub(seen.hedges);
+        home.hedges_released += stats.hedges_released.saturating_sub(seen.hedges_released);
+        seen.hedges = stats.hedges;
+        seen.hedges_released = stats.hedges_released;
         if stats.requests > answers + stats.assignment_failures {
             listener.asking_since.get_or_insert(now);
         }
@@ -1321,6 +1613,7 @@ enum Report {
         edges: Vec<Counters>,
         never_first: u64,
         samples: Vec<Value>,
+        worst: Worst,
     },
 }
 
@@ -1370,12 +1663,10 @@ fn thread_cpu_ns() -> u64 {
         .unwrap_or(0)
 }
 
-/// A silence between two parts delivered first this long or longer is an
-/// interruption: the parts lost in it are the move's (`move_lost`, booked
-/// on the edge that delivered the part before it, `left_lost`).
-const INTERRUPT: Duration = Duration::from_millis(30);
-
-/// One datagram of a listener. The director takes its own (`ASSIGNED`, a
+/// One datagram of a listener (a silence of `--interrupt-ms` or more
+/// between two parts delivered first is an interruption, and the parts lost
+/// in it are the move's: `move_lost`, booked on the edge that delivered the
+/// part before it, `left_lost`). The director takes its own (`ASSIGNED`, a
 /// `TOKEN` of an entry point or of the spare), the session the rest; the
 /// datagram is booked on the edge that sent it, and each part it delivered
 /// first on that edge too.
@@ -1461,8 +1752,9 @@ fn handle_datagram(
         .receiver
         .duplicate_parts
         .saturating_sub(duplicates);
-    let settle_parts = drive.config.settle_parts;
+    let interrupt_us = duration_us(drive.config.interrupt);
     while let Some(object) = listener.session.next_object() {
+        let settle_parts = listener.settle_parts;
         match object.kind {
             ObjectKind::Init => {}
             ObjectKind::Gap => {
@@ -1483,11 +1775,26 @@ fn handle_datagram(
                             .latency
                             .record(arrival_us.saturating_sub(object.published_unix_us));
                     }
+                    listener.learn_interval(
+                        drive.config.settle,
+                        object.part,
+                        object.published_unix_us,
+                    );
+                    // The gap since the part delivered first before it.
                     if let Some((part, at_us, left)) = listener.last_first {
-                        if arrival_us.saturating_sub(at_us) >= duration_us(INTERRUPT) {
+                        let gap = arrival_us.saturating_sub(at_us);
+                        counters[home].part_gap.record(gap);
+                        if gap >= interrupt_us {
                             listener.track.interrupted(part + 1, object.part, left);
+                            if !listener.silence_counted {
+                                listener.interrupted(&mut counters[home]);
+                            }
+                        }
+                        if gap > listener.longest_silence.0 {
+                            listener.longest_silence = (gap, arrival_us);
                         }
                     }
+                    listener.silence_counted = false;
                     listener.last_first = Some((object.part, arrival_us, edge));
                     listener.last_part_at = Some(now);
                     if !listener.first_part {
@@ -1575,27 +1882,62 @@ fn service(
     drive.perform(listener, slot, counters, now);
 }
 
-/// A listener's counters since the last interval into its home edge's, with
-/// the gauges (`active`, `up`, `stranded`, `resuming`) when `gauges` (not
-/// for one that stops).
+/// A listener's counters since the last interval into its home edge's (its
+/// legs' time into their edges'), with the gauges (`active`, `up`,
+/// `stranded`, `resuming`, `legs`, `paths`, `silent_now_max`) when `gauges`
+/// (not for one that leaves). An open silence of `--interrupt-ms` is an
+/// interruption already.
 fn collect_one(
     listener: &mut Listener,
     counters: &mut Vec<Counters>,
-    gauges: Option<(Instant, Duration)>,
+    config: &LoadConfig,
+    now: Instant,
+    now_us: u64,
+    gauges: bool,
 ) {
-    ensure(counters, listener.home);
-    let edge = &mut counters[listener.home];
-    if let Some((now, stranded_after)) = gauges {
+    let home = listener.home;
+    ensure(counters, home);
+    let elapsed = duration_us(now.saturating_duration_since(listener.booked_at));
+    listener.booked_at = now;
+    counters[home].listener_us += elapsed;
+    for leg in listener.legs.iter().filter(|leg| leg.live) {
+        ensure(counters, leg.edge);
+        counters[leg.edge].leg_us += elapsed;
+        if gauges {
+            counters[leg.edge].legs += 1;
+        }
+    }
+    if let Some((_, at_us, _)) = listener.last_first {
+        let open = now_us.saturating_sub(at_us);
+        if gauges {
+            counters[home].silent_now_max = counters[home].silent_now_max.max(open);
+        }
+        if open >= duration_us(config.interrupt) && !listener.silence_counted {
+            listener.silence_counted = true;
+            listener.interrupted(&mut counters[home]);
+        }
+    }
+    listener.track_paths(&mut counters[home], now_us);
+    let edge = &mut counters[home];
+    if std::mem::take(&mut listener.interrupted_now) {
+        edge.listeners_interrupted += 1;
+    }
+    if gauges {
         edge.active += 1;
         if listener.session.is_subscribed() {
             edge.up += 1;
         }
         let quiet_since = listener.last_part_at.unwrap_or(listener.started);
-        if now.saturating_duration_since(quiet_since) >= stranded_after {
+        if now.saturating_duration_since(quiet_since) >= config.stranded_after {
             edge.stranded += 1;
         }
-        if listener.first_part && now.saturating_duration_since(quiet_since) >= INTERRUPT {
+        if listener.first_part && now.saturating_duration_since(quiet_since) >= config.interrupt {
             edge.resuming += 1;
+        }
+        match listener.delivering(now_us) {
+            0 => edge.paths_none += 1,
+            1 => edge.paths_one += 1,
+            _ => edge.paths_two += 1,
         }
     }
     let session = &listener.session;
@@ -1621,6 +1963,104 @@ fn collect_one(
         .short_header_dropped
         .saturating_sub(seen.short_header_dropped);
     listener.seen = now;
+}
+
+/// One of the listeners a run reports as its worst (B 2.9).
+#[derive(Debug, Clone)]
+struct WorstListener {
+    sid: String,
+    longest_silence_us: u64,
+    silence_end_unix_us: u64,
+    missing: u64,
+    legs: Vec<String>,
+    started_unix_us: u64,
+    ended_unix_us: u64,
+}
+
+impl WorstListener {
+    fn to_json(&self) -> Value {
+        json!({
+            "sid": self.sid,
+            "longest_silence_ms": self.longest_silence_us as f64 / 1_000.0,
+            "silence_end_unix_ms": (self.silence_end_unix_us > 0).then_some(self.silence_end_unix_us / 1_000),
+            "missing": self.missing,
+            "legs": self.legs,
+            "started_unix_ms": self.started_unix_us / 1_000,
+            "ended_unix_ms": self.ended_unix_us / 1_000,
+        })
+    }
+}
+
+/// Listeners kept by longest silence and by missing parts.
+const WORST: usize = 20;
+
+#[derive(Debug, Default)]
+struct Worst {
+    by_silence: Vec<WorstListener>,
+    by_missing: Vec<WorstListener>,
+}
+
+impl Worst {
+    /// Keep `entry` if it is among the worst so far.
+    fn offer(&mut self, entry: WorstListener) {
+        fn keep(list: &mut Vec<WorstListener>, entry: &WorstListener, key: fn(&WorstListener) -> u64) {
+            if key(entry) == 0 || (list.len() == WORST && key(&list[WORST - 1]) >= key(entry)) {
+                return;
+            }
+            let at = list.partition_point(|other| key(other) >= key(entry));
+            list.insert(at, entry.clone());
+            list.truncate(WORST);
+        }
+        keep(&mut self.by_silence, &entry, |entry| entry.longest_silence_us);
+        keep(&mut self.by_missing, &entry, |entry| entry.missing);
+    }
+
+    fn merge(&mut self, other: Worst) {
+        for entry in other.by_silence.into_iter().chain(other.by_missing) {
+            self.offer(entry);
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "by_longest_silence": self.by_silence.iter().map(WorstListener::to_json).collect::<Vec<_>>(),
+            "by_missing": self.by_missing.iter().map(WorstListener::to_json).collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// The end of a listener (it leaves, or the run ends): its open single-path
+/// span and silence are booked, its counters collected, and it is offered
+/// to the worst listeners.
+fn finish_listener(
+    listener: &mut Listener,
+    counters: &mut Vec<Counters>,
+    config: &LoadConfig,
+    worst: &mut Worst,
+    now: Instant,
+) {
+    let now_us = now_unix_us();
+    collect_one(listener, counters, config, now, now_us, false);
+    ensure(counters, listener.home);
+    listener.end_single_path(&mut counters[listener.home], now_us);
+    if let Some((_, at_us, _)) = listener.last_first {
+        let open = now_us.saturating_sub(at_us);
+        if open > listener.longest_silence.0 {
+            listener.longest_silence = (open, now_us);
+        }
+    }
+    let (silence, ended) = listener.longest_silence;
+    if silence > 0 || listener.track.missing > 0 {
+        worst.offer(WorstListener {
+            sid: listener.sid.clone(),
+            longest_silence_us: silence,
+            silence_end_unix_us: ended,
+            missing: listener.track.missing,
+            legs: listener.legs.iter().map(|leg| leg.node.clone()).collect(),
+            started_unix_us: listener.started_unix_us,
+            ended_unix_us: now_us,
+        });
+    }
 }
 
 impl Listener {
@@ -1668,6 +2108,17 @@ impl Listener {
             overflows: 0,
             highest_at_end: None,
             arrivals: (index < config.sample).then(BTreeMap::new),
+            started_unix_us: now_unix_us(),
+            settle_parts: config.settle_parts.unwrap_or(TRACK - 1),
+            interval_from: None,
+            silence_counted: false,
+            interrupted_now: false,
+            ever_interrupted: false,
+            longest_silence: (0, 0),
+            two_paths_seen: false,
+            two_until_us: 0,
+            single_since_us: None,
+            booked_at: now,
         }
     }
 }
@@ -1687,7 +2138,6 @@ fn worker(
 ) {
     let threads = config.threads;
     let edges = book.snapshot().len();
-    let stranded_after = config.stranded_after;
     let epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     assert!(epoll >= 0, "epoll_create1");
     let mut events: Vec<libc::epoll_event> = vec![libc::epoll_event { events: 0, u64: 0 }; 1_024];
@@ -1727,13 +2177,15 @@ fn worker(
     let mut busy_ns = 0_u64;
     let mut last_read = Instant::now();
     let mut cpu_before = thread_cpu_ns();
+    let mut worst = Worst::default();
 
     loop {
         let loop_start = Instant::now();
         let now = loop_start;
         if now >= next_flush {
+            let now_us = now_unix_us();
             for listener in listeners.iter_mut().flatten() {
-                collect_one(listener, &mut counters, Some((now, stranded_after)));
+                collect_one(listener, &mut counters, &config, now, now_us, true);
             }
             let cpu = thread_cpu_ns();
             let width = counters.len();
@@ -1762,7 +2214,7 @@ fn worker(
                 // again.
                 if listener
                     .last_part_at
-                    .is_some_and(|at| now.saturating_duration_since(at) >= INTERRUPT)
+                    .is_some_and(|at| now.saturating_duration_since(at) >= config.interrupt)
                 {
                     ensure(&mut counters, listener.home);
                     counters[listener.home].never_resumed += 1;
@@ -1834,6 +2286,9 @@ fn worker(
                 let mut listener = listeners[slot].take().expect("occupied");
                 free.push(slot);
                 live -= 1;
+                // What it received since the last interval counts too. The
+                // parts it had not settled were not due yet: not judged.
+                finish_listener(&mut listener, &mut counters, &config, &mut worst, now);
                 listener
                     .director
                     .leave(&mut listener.session, now, &mut drive.actions);
@@ -1846,14 +2301,8 @@ fn worker(
                         std::ptr::null_mut(),
                     );
                 }
-                // What it received since the last interval counts too.
-                collect_one(&mut listener, &mut counters, None);
-                let home = listener.home;
-                if let Some(highest) = listener.track.highest {
-                    listener.track.settle(highest + 1, &mut counters[home]);
-                }
                 listener.track.book_left_lost(&mut counters);
-                counters[home].stopped += 1;
+                counters[listener.home].stopped += 1;
             }
         }
         // The answers of the resolver (the HTTPS hedge, names).
@@ -1909,6 +2358,7 @@ fn worker(
             read_socket(listener, &mut bufs, &mut counters, &mut drive, &mut work, draining);
             let now = Instant::now();
             service(listener, slot, &mut counters, &mut drive, draining, now);
+            listener.track_paths(&mut counters[listener.home], now_unix_us());
             listener.scheduled = listener
                 .wake(draining)
                 .max(now + Duration::from_micros(50));
@@ -1945,6 +2395,7 @@ fn worker(
                 continue;
             };
             read_socket(listener, &mut bufs, &mut counters, &mut drive, &mut work, draining);
+            listener.track_paths(&mut counters[listener.home], now_unix_us());
             // The verdicts after the batch: the director reads what the
             // datagrams told the session, and a datagram can bring a NACK
             // forward.
@@ -1982,10 +2433,7 @@ fn worker(
         if !listener.first_part {
             never_first += 1;
         }
-        listener
-            .director
-            .leave(&mut listener.session, end_now, &mut drive.actions);
-        drive.perform(listener, slot, &mut counters, end_now);
+        finish_listener(listener, &mut counters, &config, &mut worst, end_now);
         if let Some(arrivals) = &listener.arrivals {
             let file = config.out_dir.as_ref().map(|dir| {
                 dir.join("arrivals")
@@ -2006,7 +2454,10 @@ fn worker(
                 "file": file.map(|path| path.display().to_string()),
             }));
         }
-        collect_one(listener, &mut counters, None);
+        listener
+            .director
+            .leave(&mut listener.session, end_now, &mut drive.actions);
+        drive.perform(listener, slot, &mut counters, end_now);
     }
     unsafe {
         libc::close(epoll);
@@ -2016,6 +2467,7 @@ fn worker(
         edges: counters,
         never_first,
         samples,
+        worst,
     });
 }
 
@@ -2215,6 +2667,28 @@ fn saturation(host: &HostInterval, lag_limit_us: u64) -> Vec<&'static str> {
     reasons
 }
 
+/// An interval line's `total` and `edges` (`gauges` for the run's lines,
+/// not the final one): the latency buckets where `buckets` says.
+fn interval_json(
+    book: &[BookEdge],
+    by_edge: &[Counters],
+    total: &Counters,
+    seconds: f64,
+    gauges: bool,
+    buckets: IntervalBuckets,
+) -> (Value, Map<String, Value>) {
+    let mut per_edge = Map::new();
+    for (edge, counters) in book.iter().zip(by_edge) {
+        let mut value = counters.to_json(seconds, gauges, buckets == IntervalBuckets::Edges);
+        value["node"] = json!(edge.node);
+        per_edge.insert(edge.name(), value);
+    }
+    (
+        total.to_json(seconds, gauges, buckets != IntervalBuckets::Off),
+        per_edge,
+    )
+}
+
 /// Run the listeners as `config` says; `on_interval` gets each interval's
 /// line (also written to `intervals.jsonl` in the output directory). Returns
 /// the summary (also written to `summary.json`).
@@ -2283,15 +2757,7 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
         );
     }
     drop(tx);
-    let edge_json = |book: &EdgeBook, by_edge: &[Counters], seconds: f64, gauges: bool| {
-        let mut per_edge = Map::new();
-        for (edge, counters) in book.snapshot().iter().zip(by_edge) {
-            let mut value = counters.to_json(seconds, gauges);
-            value["node"] = json!(edge.node);
-            per_edge.insert(edge.name(), value);
-        }
-        per_edge
-    };
+    let buckets = config.interval_buckets;
     let ticks = clock_ticks();
     let interval_s = config.interval.as_secs_f64();
     let mut host_before = host_sample();
@@ -2305,6 +2771,7 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
     let mut done = 0;
     let mut never_first = 0;
     let mut samples = Vec::new();
+    let mut worst = Worst::default();
     let mut peak_up = 0_u64;
     let mut peak_active = 0_u64;
     let mut cpu_cores = Histogram::new();
@@ -2348,7 +2815,9 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
                 edges,
                 never_first: none,
                 samples: mine,
+                worst: theirs,
             }) => {
+                worst.merge(theirs);
                 reported[worker] = Some(u64::MAX);
                 merge_edges(&mut total_by_edge, &edges);
                 merge_edges(&mut final_by_edge, &edges);
@@ -2438,11 +2907,12 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
                 lag_limit_us,
             );
             let t = (interval + 1) as f64 * interval_s;
-            let per_edge = edge_json(&book, &by_edge, interval_s, true);
+            let (total_json, per_edge) =
+                interval_json(&book.snapshot(), &by_edge, &total, interval_s, true, buckets);
             let rss_mb = rss_mb();
             rss_mb_max = rss_mb_max.max(rss_mb);
             let line = json!({
-                "schema": "needletail.load.interval.v1",
+                "schema": "needletail.load.interval.v2",
                 "label": config.label,
                 "phase": "run",
                 "t": t,
@@ -2450,7 +2920,7 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
                 "interval": interval,
                 "unix_ms": started_unix_us / 1_000 + (t * 1_000.0) as u64,
                 "target": config.target_at(Duration::from_secs_f64(t)),
-                "total": total.to_json(interval_s, true),
+                "total": total_json,
                 "edges": per_edge,
                 "load_host": {
                     "process_cpu_cores": process_cores,
@@ -2515,14 +2985,15 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
         for counters in &final_by_edge {
             last.merge(counters);
         }
-        let per_edge = edge_json(&book, &final_by_edge, 0.0, false);
+        let (total_json, per_edge) =
+            interval_json(&book.snapshot(), &final_by_edge, &last, 0.0, false, buckets);
         let line = json!({
-            "schema": "needletail.load.interval.v1",
+            "schema": "needletail.load.interval.v2",
             "label": config.label,
             "phase": "final",
             "t": shared.t0.elapsed().as_secs_f64(),
             "load_host_saturated": false,
-            "total": last.to_json(0.0, false),
+            "total": total_json,
             "edges": per_edge,
         });
         if let Some(out) = &mut intervals_out {
@@ -2568,6 +3039,7 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
             "recv_lag_ms": counters.recv_lag.summary_with_buckets(),
         });
         counters.am10_json(&mut summary);
+        counters.y4_json(&mut summary, true);
         summary
     };
     let mut per_edge = Map::new();
@@ -2580,7 +3052,7 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
     let edge_names: Vec<String> = edges_now.iter().map(BookEdge::name).collect();
     samples.sort_by_key(|sample| sample["listener"].as_u64());
     let summary = json!({
-        "schema": "needletail.load.v1",
+        "schema": "needletail.load.v2",
         "label": config.label,
         "stream_id": config.session.stream_id,
         "edges_used": edge_names,
@@ -2627,6 +3099,22 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
         },
         "load_host_saturated": first_saturated.is_some(),
         "samples": samples,
+        "listeners_interrupted": total.interrupted_sessions,
+        "listeners_with_missing": total.listeners_with_missing,
+        "longest_silence_ms": worst
+            .by_silence
+            .first()
+            .map(|listener| listener.longest_silence_us)
+            .max((total.part_gap.count() > 0).then(|| total.part_gap.max()))
+            .map(|us| us as f64 / 1_000.0),
+        "bytes_per_listener_second": (total.listener_us > 0)
+            .then(|| total.bytes_in as f64 * 1e6 / total.listener_us as f64),
+        "worst_listeners": worst.to_json(),
+        "interrupt_ms": config.interrupt.as_millis() as u64,
+        "settle": match config.settle_parts {
+            Some(parts) => json!({"parts": parts}),
+            None => json!({"ms": config.settle.as_millis() as u64}),
+        },
     });
     if let Some(dir) = &config.out_dir {
         std::fs::write(
@@ -2879,6 +3367,311 @@ mod tests {
             ..calm
         };
         assert!(saturation(&coalesced, 5_000 + 4_000).is_empty());
+    }
+
+    // ------------------------------------------------------- B Y4 accounting
+
+    const STREAM: u64 = 4001;
+
+    /// One listener of `--edges` alone on two edges, its two legs added by
+    /// its director, fed datagram by datagram with the kernel receive times
+    /// given (milliseconds from the start), as a worker feeds it.
+    struct Harness {
+        config: LoadConfig,
+        book: EdgeBook,
+        listener: Listener,
+        counters: Vec<Counters>,
+        edges: [SocketAddr; 2],
+        t0: Instant,
+        base_us: u64,
+    }
+
+    impl Harness {
+        fn new(paths: u8) -> Self {
+            let edges: [SocketAddr; 2] = ["127.0.0.1:41001".parse().unwrap(), "127.0.0.1:41002".parse().unwrap()];
+            let mut config = LoadConfig::new(SessionConfig::new(STREAM), edges.to_vec(), 1);
+            config.director.paths = paths;
+            let book = EdgeBook::new(&edges, false);
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            socket.set_nonblocking(true).unwrap();
+            let t0 = Instant::now();
+            let listener = Listener::new(&config, 1, 0, 0, socket, t0);
+            let mut harness = Self {
+                config,
+                book,
+                listener,
+                counters: vec![Counters::default(); 2],
+                edges,
+                t0,
+                base_us: now_unix_us(),
+            };
+            harness.service(0.0);
+            assert_eq!(harness.listener.legs.len(), paths as usize, "the director added its legs");
+            // Each edge: TOKEN, then OK from part 100 with the compact lane.
+            for from in 0..paths as usize {
+                let token = Control::Token {
+                    stream_id: STREAM,
+                    token: 7 + from as u64,
+                }
+                .encode();
+                harness.datagram(from, &token, 0.1);
+                let ok = Control::Subscribed {
+                    stream_id: STREAM,
+                    next_part: 100,
+                    compact: true,
+                }
+                .encode();
+                harness.datagram(from, &ok, 0.2);
+            }
+            harness
+        }
+
+        fn at(&self, ms: f64) -> (Instant, u64) {
+            let us = (ms * 1_000.0) as u64;
+            (self.t0 + Duration::from_micros(us), self.base_us + us)
+        }
+
+        fn drive<'a>(config: &'a LoadConfig, book: &'a EdgeBook) -> Drive<'a> {
+            Drive {
+                config,
+                book,
+                resolver: None,
+                worker: 0,
+                actions: Vec::new(),
+                doing: Vec::new(),
+            }
+        }
+
+        fn service(&mut self, ms: f64) {
+            let (now, _) = self.at(ms);
+            let mut drive = Self::drive(&self.config, &self.book);
+            service(&mut self.listener, 0, &mut self.counters, &mut drive, false, now);
+        }
+
+        /// A datagram from edge `from` at `ms`, then the director, and the
+        /// time on one path, as after a worker's batch.
+        fn datagram(&mut self, from: usize, bytes: &[u8], ms: f64) {
+            let (now, now_us) = self.at(ms);
+            let datagram = Datagram {
+                data: bytes,
+                peer: Some(self.edges[from]),
+                kernel_us: Some(now_us),
+                overflows: None,
+                truncated: false,
+            };
+            let mut drive = Self::drive(&self.config, &self.book);
+            handle_datagram(&mut self.listener, &mut self.counters, &mut drive, &datagram, false, now, now_us);
+            self.listener
+                .director
+                .poll(&mut self.listener.session, now, &mut drive.actions);
+            drive.perform(&mut self.listener, 0, &mut self.counters, now);
+            let home = self.listener.home;
+            self.listener.track_paths(&mut self.counters[home], now_us);
+        }
+
+        fn part(&mut self, from: usize, part: u64, ms: f64) {
+            let (_, now_us) = self.at(ms);
+            let datagram = crate::client_compact::encode_part(part, now_us - 300, &[part as u8; 56]).unwrap();
+            self.datagram(from, &datagram, ms);
+        }
+
+        fn collect(&mut self, ms: f64) -> Counters {
+            let (now, now_us) = self.at(ms);
+            let mut counters = vec![Counters::default(); 2];
+            collect_one(&mut self.listener, &mut counters, &self.config, now, now_us, true);
+            let mut total = Counters::default();
+            for edge in &counters {
+                total.merge(edge);
+            }
+            total
+        }
+
+        fn total(&self) -> Counters {
+            let mut total = Counters::default();
+            for edge in &self.counters {
+                total.merge(edge);
+            }
+            total
+        }
+    }
+
+    use crate::client_udp::Control;
+
+    #[test]
+    fn the_gap_histogram_takes_first_arrivals_only() {
+        let mut h = Harness::new(2);
+        // Twenty parts a millisecond apart, each from edge 0 and 0.3 ms
+        // later from edge 1.
+        for k in 0..20_u64 {
+            let ms = 10.0 + k as f64;
+            h.part(0, 100 + k, ms);
+            h.part(1, 100 + k, ms + 0.3);
+        }
+        let total = h.total();
+        assert_eq!(total.parts, 20);
+        assert_eq!(total.part_gap.count(), 19, "one gap between two first arrivals");
+        let p50 = total.part_gap.quantile(0.5).unwrap() as f64;
+        assert!((p50 - 1_000.0).abs() < 20.0, "{p50}");
+        assert!(total.part_gap.max() < 1_100);
+        // Booked by the edge that sent each datagram.
+        assert_eq!(h.counters[0].parts, 20);
+        assert_eq!(h.counters[1].parts, 0);
+        assert_eq!(h.counters[1].duplicates, 20);
+        assert_eq!(h.counters[0].datagrams, 20);
+        assert_eq!(h.counters[1].datagrams, 20);
+        // Edge 1 first this time: its arrival is the one measured.
+        h.part(1, 120, 30.5);
+        h.part(0, 120, 31.0);
+        let total = h.total();
+        assert_eq!(total.part_gap.count(), 20);
+        assert_eq!(h.counters[1].parts, 1);
+        assert_eq!(total.part_gap.max(), 1_500);
+        assert_eq!(total.interruptions, 0);
+    }
+
+    #[test]
+    fn a_silence_interrupts_a_listener_once() {
+        let mut h = Harness::new(2);
+        for k in 0..10_u64 {
+            h.part(0, 100 + k, 10.0 + k as f64);
+            h.part(1, 100 + k, 10.2 + k as f64);
+        }
+        // Silent since 19 ms: at 79 ms the silence is 60 ms and open.
+        let first = h.collect(79.0);
+        assert_eq!(first.interruptions, 1);
+        assert_eq!(first.listeners_interrupted, 1);
+        assert_eq!(first.interrupted_sessions, 1);
+        assert_eq!(first.silent_now_max, 60_000);
+        // Still silent in the next interval: nothing more.
+        let second = h.collect(99.0);
+        assert_eq!(second.interruptions, 0);
+        assert_eq!(second.listeners_interrupted, 0);
+        // The silence ends at 119 ms: a 100 ms gap, the same interruption.
+        h.part(0, 110, 119.0);
+        h.part(1, 110, 119.2);
+        let total = h.total();
+        assert_eq!(total.part_gap.max(), 100_000);
+        assert_eq!(total.interruptions, 0, "counted when it was open");
+        let third = h.collect(120.0);
+        assert_eq!((third.interruptions, third.listeners_interrupted), (0, 0));
+        // A second silence, 40 ms, seen only once it ended: one more
+        // interruption, the same listener session. 111 and 112 never come.
+        h.part(0, 113, 159.0);
+        let fourth = h.collect(160.0);
+        let total = h.total();
+        assert_eq!(total.interruptions, 1);
+        assert_eq!(total.interrupted_sessions, 0, "the session was counted at its first");
+        assert_eq!(fourth.listeners_interrupted, 1);
+        // A gap under the threshold is no interruption.
+        h.part(0, 114, 185.0);
+        assert_eq!(h.total().interruptions, 1);
+        // The parts of an interruption that never come are the move's,
+        // booked on the edge that delivered the part before it.
+        assert_eq!(h.listener.track.windows.back(), Some(&(111, 113, 0)));
+    }
+
+    #[test]
+    fn interval_lines_carry_latency_buckets() {
+        let book = vec![
+            BookEdge {
+                addr: Some("127.0.0.1:1".parse().unwrap()),
+                node: Some("a".into()),
+            },
+            BookEdge {
+                addr: Some("127.0.0.1:2".parse().unwrap()),
+                node: Some("b".into()),
+            },
+        ];
+        let mut by_edge = vec![Counters::default(), Counters::default()];
+        for value in 1..=1_000_u64 {
+            by_edge[0].latency.record(500 + value);
+            by_edge[1].latency.record(900 + 3 * value);
+        }
+        let mut total = Counters::default();
+        for edge in &by_edge {
+            total.merge(edge);
+        }
+        let has = |value: &Value| value["latency_ms"]["buckets_us"].is_array();
+        let (line, edges) = interval_json(&book, &by_edge, &total, 1.0, true, IntervalBuckets::Total);
+        assert!(has(&line));
+        assert!(!edges.values().any(has));
+        let (line, edges) = interval_json(&book, &by_edge, &total, 1.0, true, IntervalBuckets::Edges);
+        assert!(has(&line) && edges.values().all(has));
+        let (line, edges) = interval_json(&book, &by_edge, &total, 1.0, true, IntervalBuckets::Off);
+        assert!(!has(&line) && !edges.values().any(has));
+        // Two hosts' lines (here each edge's) merge into the window's p99:
+        // add the counts of equal lowest values, take the rank.
+        let (_, edges) = interval_json(&book, &by_edge, &total, 1.0, true, IntervalBuckets::Edges);
+        let mut merged: BTreeMap<u64, u64> = BTreeMap::new();
+        for edge in edges.values() {
+            for pair in edge["latency_ms"]["buckets_us"].as_array().unwrap() {
+                *merged.entry(pair[0].as_u64().unwrap()).or_default() += pair[1].as_u64().unwrap();
+            }
+        }
+        let count: u64 = merged.values().sum();
+        assert_eq!(count, 2_000);
+        let rank = (0.99 * count as f64).ceil() as u64;
+        let mut seen = 0;
+        let p99_low = merged
+            .iter()
+            .find(|(_, n)| {
+                seen += **n;
+                seen >= rank
+            })
+            .map(|(low, _)| *low)
+            .unwrap();
+        let p99 = total.latency.quantile(0.99).unwrap();
+        assert!((p99_low as f64 - p99 as f64).abs() / p99 as f64 <= 0.02, "{p99_low} {p99}");
+        // The other Y4 figures of a line: gap and single-path histograms
+        // with buckets, and the per-listener and per-leg rates.
+        let (line, _) = interval_json(&book, &by_edge, &total, 1.0, true, IntervalBuckets::Off);
+        for name in ["part_gap_ms", "handover_ms", "exposure_ms", "single_path_ms"] {
+            assert!(line[name]["buckets_us"].is_array(), "{name}");
+        }
+        for name in ["paths", "legs", "silent_now_max_ms", "listeners_interrupted", "listeners_with_missing", "datagrams_per_leg_s", "wire_bytes_per_listener_s"] {
+            assert!(line.get(name).is_some(), "{name}");
+        }
+    }
+
+    #[test]
+    fn time_on_one_path_is_a_span_per_listener() {
+        let mut h = Harness::new(2);
+        let mut part = 100;
+        let mut both = |h: &mut Harness, from: u64, to: u64, legs: &[usize]| {
+            for ms in from..to {
+                for leg in legs {
+                    h.part(*leg, part, ms as f64 + 0.1 * *leg as f64);
+                }
+                part += 1;
+            }
+        };
+        both(&mut h, 10, 60, &[0, 1]);
+        // Edge 1 silent from its part at 59 ms: one path from 79 ms (its
+        // window, 20 ms, ran out) until its part at 160 ms.
+        both(&mut h, 60, 160, &[0]);
+        assert_eq!(h.total().single_path.count(), 0, "open");
+        both(&mut h, 160, 200, &[0, 1]);
+        // Edge 0 silent from 199 ms: one path from 219 ms until 260 ms.
+        both(&mut h, 200, 260, &[1]);
+        both(&mut h, 260, 270, &[0, 1]);
+        let spans = &h.total().single_path;
+        assert_eq!(spans.count(), 2, "a span each time");
+        let (low, high) = (spans.quantile(0.0).unwrap(), spans.max());
+        assert!((40_000..=42_500).contains(&low), "{low}");
+        assert!((80_000..=82_500).contains(&high), "{high}");
+        // The gauge: two delivering legs now.
+        let line = h.collect(270.0);
+        assert_eq!((line.paths_two, line.paths_one, line.paths_none), (1, 0, 0));
+        assert_eq!(line.legs, 2);
+        assert!(line.listener_us > 0 && line.leg_us >= line.listener_us * 2 - 2);
+        // A one-path listener books no time on one path.
+        let mut one = Harness::new(1);
+        for k in 0..100_u64 {
+            one.part(0, 100 + k, 10.0 + k as f64);
+        }
+        assert_eq!(one.total().single_path.count(), 0);
+        let line = one.collect(110.0);
+        assert_eq!((line.paths_two, line.paths_one), (0, 1));
     }
 
     #[test]

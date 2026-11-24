@@ -18,9 +18,13 @@
 //! duplicates, NACKs, bytes in, publication-to-arrival, time-to-first-part
 //! and receive-lag percentiles, and the load host's CPU, worker busy time,
 //! timer lateness, UDP receive buffer errors and socket drops, with
-//! `load_host_saturated` and its reasons), `<out>/summary.json` (the same
+//! `load_host_saturated` and its reasons; B Y4: the gap between parts
+//! delivered first at each listener, interruptions and the listeners
+//! interrupted, listeners with missing parts, time on one path, leg
+//! replacements by reason and kind, datagrams and bytes per listener and
+//! per leg), `<out>/summary.json` (the same
 //! over the run, each histogram with its buckets so that the summaries of
-//! several load hosts merge), and for `--sample K` listeners
+//! several load hosts merge, and the worst listeners), and for `--sample K` listeners
 //! `<out>/arrivals/listener-<i>.csv` (the `needletail-udp-client --arrivals`
 //! columns, in part order). The summary also goes to standard output.
 //! SIGINT or SIGTERM ends the run early, with its drain and summary.
@@ -28,7 +32,7 @@
 use anyhow::{bail, Context, Result};
 use av_mesh::client_compact::NackTiming;
 use av_mesh::client_session::SessionConfig;
-use av_mesh::load::{parse_ramp, run, LoadConfig};
+use av_mesh::load::{parse_ramp, run, IntervalBuckets, LoadConfig};
 use av_mesh::load_assign::AssignConfig;
 use clap::Parser;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
@@ -164,11 +168,23 @@ struct Args {
     /// last parts are counted.
     #[arg(long, default_value_t = 600)]
     drain_ms: u64,
-    /// A part is counted missing once it is this many parts behind its
-    /// listener's newest part (at most 4,095; past the NACKs' give-up of a
-    /// second).
-    #[arg(long, default_value_t = 1_500)]
-    settle_parts: u64,
+    /// A part is counted missing once it is this long behind its listener's
+    /// newest part (in parts of the stream's interval; just past the 3 s
+    /// give-up of a hole). A listener that leaves has its parts not yet due
+    /// left unjudged.
+    #[arg(long, default_value_t = av_mesh::load::DEFAULT_SETTLE_MS)]
+    settle_ms: u64,
+    /// The same as a count of parts (1 to 4,095), over --settle-ms.
+    #[arg(long)]
+    settle_parts: Option<u64>,
+    /// A silence between two parts delivered first this long or longer
+    /// interrupts a listener (`interruptions`, `listeners_interrupted`).
+    #[arg(long, default_value_t = av_mesh::load::DEFAULT_INTERRUPT_MS)]
+    interrupt_ms: u64,
+    /// The latency histograms of an interval line that carry their buckets
+    /// (so a window's p99 merges across hosts): total, edges or off.
+    #[arg(long, default_value = "total")]
+    interval_buckets: IntervalBuckets,
     /// The load host counts as saturated in an interval whose timers or
     /// datagrams waited longer than this (p99) for the workers.
     #[arg(long, default_value_t = 5)]
@@ -285,8 +301,11 @@ fn config(args: &Args) -> Result<LoadConfig> {
     if !(1..=2).contains(&args.paths) {
         bail!("--paths must be 1 or 2");
     }
-    if args.settle_parts == 0 || args.settle_parts >= 4_096 {
+    if args.settle_parts.is_some_and(|parts| parts == 0 || parts >= 4_096) {
         bail!("--settle-parts must be 1 to 4095");
+    }
+    if args.settle_ms == 0 || args.interrupt_ms == 0 {
+        bail!("--settle-ms and --interrupt-ms must be above 0");
     }
     if !(args.interval_seconds > 0.0) {
         bail!("--interval-seconds must be above 0");
@@ -354,7 +373,10 @@ fn config(args: &Args) -> Result<LoadConfig> {
     config.bind_ips = args.bind.clone();
     config.kernel_timestamps = args.kernel_timestamps;
     config.drain = Duration::from_millis(args.drain_ms);
+    config.settle = Duration::from_millis(args.settle_ms);
     config.settle_parts = args.settle_parts;
+    config.interrupt = Duration::from_millis(args.interrupt_ms);
+    config.interval_buckets = args.interval_buckets;
     config.lag_limit = Duration::from_millis(args.lag_limit_ms);
     config.progress = !args.quiet;
     config.label = args.label.clone();
@@ -586,6 +608,25 @@ mod tests {
         .unwrap();
         assert_eq!((config.director.paths, config.director.spare), (1, false));
         assert!(config.director.entries.is_empty() && config.assign.is_none());
+    }
+
+    #[test]
+    fn the_accounting_flags_have_the_defaults_of_b_2_4() {
+        let config = config_of(&["needletail-load", "--stream", "1", "--edges", "127.0.0.1:1"]).unwrap();
+        assert_eq!(config.settle, Duration::from_millis(3_500));
+        assert_eq!(config.settle_parts, None);
+        assert_eq!(config.interrupt, Duration::from_millis(30));
+        assert_eq!(config.interval_buckets, IntervalBuckets::Total);
+        let config = config_of(&[
+            "needletail-load", "--stream", "1", "--edges", "127.0.0.1:1", "--settle-parts", "500",
+            "--interrupt-ms", "50", "--interval-buckets", "edges",
+        ])
+        .unwrap();
+        assert_eq!(config.settle_parts, Some(500));
+        assert_eq!(config.interrupt, Duration::from_millis(50));
+        assert_eq!(config.interval_buckets, IntervalBuckets::Edges);
+        assert!(config_of(&["needletail-load", "--stream", "1", "--edges", "127.0.0.1:1", "--settle-parts", "4096"]).is_err());
+        assert!(Args::try_parse_from(["needletail-load", "--stream", "1", "--interval-buckets", "x"]).is_err());
     }
 
     fn config_of(argv: &[&str]) -> Result<LoadConfig> {

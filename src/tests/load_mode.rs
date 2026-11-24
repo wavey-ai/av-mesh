@@ -83,6 +83,8 @@ struct Bench {
     /// either way, the second asked for again and again).
     paths: u8,
     spare: bool,
+    /// `--ramp` (none: `listeners` from the start).
+    ramp: Option<Vec<(Duration, usize)>>,
     seconds: u64,
     threads: usize,
     edge_threads: usize,
@@ -187,6 +189,9 @@ fn run_bench(bench: &Bench, ip: u8) -> BenchResult {
     let mut config = LoadConfig::new(session, vec![edge.client_port()], bench.listeners);
     config.director.paths = bench.paths;
     config.director.spare = bench.spare;
+    if let Some(ramp) = &bench.ramp {
+        config.ramp = ramp.clone();
+    }
     config.duration = Duration::from_secs(bench.seconds);
     config.threads = bench.threads;
     config.start_rate = 4_000.0;
@@ -308,6 +313,7 @@ fn counts_every_part(name: &str, paths: u8, spare: bool, ip: u8) {
     let bench = Bench {
         paths,
         spare,
+        ramp: None,
         listeners: 20,
         seconds: 4,
         threads: 2,
@@ -413,6 +419,7 @@ fn load_mode_cost_per_listener() {
     let bench = Bench {
         paths: 1,
         spare: false,
+        ramp: None,
         listeners,
         seconds,
         threads,
@@ -928,11 +935,43 @@ async fn fake_entry(name: &str, alive: Vec<(String, SocketAddr)>) -> FakeEntry {
     }
 }
 
+/// What happens 4 s into a run of [`change_one_edge`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Change {
+    /// The first edge is killed: the region no longer lists it, its stream
+    /// stops, it answers nothing.
+    Kill,
+    /// The first edge drains: it sends its listeners `MOVE draining` and
+    /// serves them until they leave; the region no longer lists it.
+    Drain,
+    /// The publisher stops for 400 ms at every edge, then goes on with the
+    /// next part (an upstream pause: no part is lost).
+    Pause,
+}
+
+/// The publisher's pause in [`Change::Pause`].
+const PAUSE: Duration = Duration::from_millis(400);
+
 /// Four edges of 2.5 ms Opus, 500 listeners spread over them by the entry
 /// point, with `--paths` and `--spare` as given; 4 s in, the first edge is
 /// killed. Returns the load's summary, its interval lines and the killed
 /// edge's address.
 fn kill_one_edge(name: &str, paths: u8, spare: bool, ip: u8) -> (Value, Vec<Value>, String) {
+    change_one_edge(name, paths, spare, ip, 500, Change::Kill)
+}
+
+/// Four edges of 2.5 ms Opus, `listeners` spread over them by the entry
+/// point, with `--paths` and `--spare` as given, and `change` 4 s in.
+/// Returns the load's summary, its interval lines and the first edge's
+/// address.
+fn change_one_edge(
+    name: &str,
+    paths: u8,
+    spare: bool,
+    ip: u8,
+    listeners: usize,
+    change: Change,
+) -> (Value, Vec<Value>, String) {
     let edge_rt = runtime("kill-edge-rt", 4);
     let pub_rt = runtime("kill-pub-rt", 2);
     let payload = Payload::Opus;
@@ -962,11 +1001,23 @@ fn kill_one_edge(name: &str, paths: u8, spare: bool, ip: u8) -> (Value, Vec<Valu
         edges.push((Arc::new(edge), 1));
     }
     let last = 1 + (seconds + 6) * 1_000_000 / payload.part_us();
+    // A pause holds the part due 4.3 s in (the listeners have started) for
+    // the pause's length at every edge.
+    let held = (change == Change::Pause).then_some(1 + 4_300_000 / payload.part_us());
     let publishers: Vec<_> = edges
         .iter()
         .map(|(edge, first)| {
             let (edge, first) = (Arc::clone(edge), *first);
-            pub_rt.spawn(async move { publish_paced(&edge, payload, stream_id, first, last).await })
+            pub_rt.spawn(async move {
+                match held {
+                    Some(held) => {
+                        publish_paced(&edge, payload, stream_id, first, held).await;
+                        tokio::time::sleep(PAUSE).await;
+                        publish_paced(&edge, payload, stream_id, held, last).await;
+                    }
+                    None => publish_paced(&edge, payload, stream_id, first, last).await,
+                }
+            })
         })
         .collect();
     let ports: Vec<SocketAddr> = edges.iter().map(|(edge, _)| edge.client_port()).collect();
@@ -981,7 +1032,7 @@ fn kill_one_edge(name: &str, paths: u8, spare: bool, ip: u8) -> (Value, Vec<Valu
     let dir = out_dir(name);
     let _ = std::fs::remove_dir_all(&dir);
     let session = SessionConfig::new(stream_id);
-    let mut config = LoadConfig::new(session, Vec::new(), 500);
+    let mut config = LoadConfig::new(session, Vec::new(), listeners);
     config.duration = Duration::from_secs(seconds);
     config.threads = 2;
     config.start_rate = 4_000.0;
@@ -1002,19 +1053,29 @@ fn kill_one_edge(name: &str, paths: u8, spare: bool, ip: u8) -> (Value, Vec<Valu
     });
     let load = std::thread::spawn(move || run(config, &mut |_| {}).unwrap());
     std::thread::sleep(Duration::from_secs(4));
-    // Kill edge 0: the region no longer lists it, its stream stops, it
-    // answers nothing.
-    entry.alive.lock().unwrap().retain(|(node, _)| node != "edge-0");
-    let mut publishers = publishers.into_iter();
-    let first = publishers.next().unwrap();
-    first.abort();
-    let _ = pub_rt.block_on(first);
-    let (killed, _) = edges.remove(0);
-    let killed = Arc::try_unwrap(killed).ok().expect("the killed edge is not shared");
-    let AnyEdge::Fast(killed) = killed else {
-        panic!("the edges here are fast-lane edges");
-    };
-    edge_rt.block_on(killed.kill());
+    let mut publishers: Vec<_> = publishers.into_iter().collect();
+    match change {
+        Change::Kill => {
+            entry.alive.lock().unwrap().retain(|(node, _)| node != "edge-0");
+            let first = publishers.remove(0);
+            first.abort();
+            let _ = pub_rt.block_on(first);
+            let (killed, _) = edges.remove(0);
+            let killed = Arc::try_unwrap(killed).ok().expect("the killed edge is not shared");
+            let AnyEdge::Fast(killed) = killed else {
+                panic!("the edges here are fast-lane edges");
+            };
+            edge_rt.block_on(killed.kill());
+        }
+        Change::Drain => {
+            entry.alive.lock().unwrap().retain(|(node, _)| node != "edge-0");
+            let AnyEdge::Fast(drained) = &*edges[0].0 else {
+                panic!("the edges here are fast-lane edges");
+            };
+            edge_rt.block_on(drained.router.lifecycle.set_draining(true));
+        }
+        Change::Pause => {}
+    }
     let summary = load.join().unwrap();
     for publisher in publishers {
         publisher.abort();
@@ -1114,4 +1175,175 @@ fn load_mode_moves_spread_over_the_edges_left_when_one_is_killed() {
             })
         );
     }
+}
+
+// ------------------------------------------------------- B Y4 accounting
+
+/// The interval lines of a run (not the final line) after second `from`.
+fn run_lines(lines: &[Value], from: f64) -> impl Iterator<Item = &Value> {
+    lines
+        .iter()
+        .filter(move |line| line["phase"] == "run" && line["t"].as_f64().unwrap_or(0.0) > from)
+}
+
+/// The count of a histogram of a summary block.
+fn count(block: &Value, name: &str) -> u64 {
+    block[name]["count"].as_u64().unwrap_or(0)
+}
+
+/// B Y4: two-path listeners (the defaults) of a killed edge lose nothing
+/// and none is interrupted: the other leg plays on, the spare takes the
+/// dead leg's place, and each one's time on one path is booked as a span.
+#[test]
+fn two_paths_lose_nothing_and_no_listener_is_interrupted_when_an_edge_is_killed() {
+    let (summary, lines, killed) = change_one_edge("y4-kill-two", 2, true, 81, 200, Change::Kill);
+    let total = &summary["total"];
+    assert_eq!(total["missing"], 0, "{summary:#}");
+    assert_eq!(summary["listeners_with_missing"], 0, "{summary:#}");
+    assert_eq!(summary["listeners_interrupted"], 0, "{summary:#}");
+    assert_eq!(total["interruptions"], 0, "{summary:#}");
+    let out = summary["per_edge"][&killed]["moves_out"].as_u64().unwrap();
+    assert!(out >= 50, "about half the listeners had a leg there: {out}");
+    // The spare took each dead leg's place, beside the leg that played on.
+    let kinds = &summary["per_edge"][&killed]["leg_replacements"]["by_kind"];
+    assert_eq!(kinds["hedge"].as_u64(), Some(out), "{kinds}");
+    let exposure = total["exposure_ms"]["p99"].as_f64().unwrap();
+    assert!(exposure <= 150.0, "exposure p99 {exposure} ms");
+    // Their time on one path: a span each, about the exposure.
+    let single = &total["single_path_ms"];
+    assert!(single["count"].as_u64().unwrap() >= out, "{single}");
+    assert!(single["max"].as_f64().unwrap() <= 200.0, "{single}");
+    assert!(total["hedges"].as_u64().unwrap() >= out);
+    // No interval had a listener without a delivering leg once all had
+    // started, and the longest silence stayed a few parts.
+    for line in run_lines(&lines, 2.0) {
+        assert_eq!(line["total"]["paths"]["none"], 0, "{line}");
+    }
+    let longest = summary["longest_silence_ms"].as_f64().unwrap();
+    assert!(longest < 30.0, "longest silence {longest} ms");
+    // A datagram a part from each of two legs (2.5 ms parts).
+    let per_listener = total["datagrams_per_listener_s"].as_f64().unwrap();
+    let per_leg = total["datagrams_per_leg_s"].as_f64().unwrap();
+    assert!((700.0..=900.0).contains(&per_listener), "{per_listener} a listener and second");
+    assert!((350.0..=450.0).contains(&per_leg), "{per_leg} a leg and second");
+    assert!(summary["bytes_per_listener_second"].as_f64().unwrap() > 0.0);
+}
+
+/// B Y4: one-path listeners of a killed edge (no spare) are each
+/// interrupted once, for about the silence (200 ms) and a round trip.
+#[test]
+fn one_path_reports_the_interruption_of_a_kill() {
+    let (summary, lines, killed) = change_one_edge("y4-kill-one", 1, false, 85, 200, Change::Kill);
+    let total = &summary["total"];
+    let out = summary["per_edge"][&killed]["moves_out"].as_u64().unwrap();
+    assert!((25..=80).contains(&out), "a quarter of them: {out}: {summary:#}");
+    let interrupted = summary["listeners_interrupted"].as_u64().unwrap();
+    assert!(
+        interrupted >= out && interrupted <= out + 3,
+        "{interrupted} interrupted, {out} moved"
+    );
+    assert!(total["interruptions"].as_u64().unwrap() >= out);
+    let by_line: u64 = lines
+        .iter()
+        .filter(|line| line["phase"] == "run")
+        .map(|line| line["total"]["listeners_interrupted"].as_u64().unwrap())
+        .sum();
+    assert!(by_line >= out, "the intervals saw them: {by_line}");
+    let longest = summary["longest_silence_ms"].as_f64().unwrap();
+    assert!((150.0..=1_000.0).contains(&longest), "longest silence {longest} ms");
+    let worst = &summary["worst_listeners"]["by_longest_silence"];
+    assert_eq!(worst.as_array().unwrap().len(), 20);
+    assert!(worst[0]["longest_silence_ms"].as_f64().unwrap() >= 150.0);
+    assert!(worst[0]["sid"].as_str().unwrap().starts_with("y4-kill-one-"));
+    // Nothing is lost: the new leg starts from the oldest hole.
+    assert_eq!(total["missing"], 0, "{summary:#}");
+    assert_eq!(count(total, "single_path_ms"), 0, "one path is no two-path session");
+    assert_eq!(count(total, "time_to_move_ms"), out);
+}
+
+/// B Y4: a drain moves every listener make-before-break, with one path or
+/// two: nobody is interrupted, nothing is missing, and two-path listeners
+/// never fall to one path.
+#[test]
+fn a_drain_interrupts_no_listener_with_one_path_or_two() {
+    for (name, paths, spare, ip) in [("y4-drain-one", 1, false, 89), ("y4-drain-two", 2, true, 93)] {
+        let (summary, _, drained) = change_one_edge(name, paths, spare, ip, 200, Change::Drain);
+        let total = &summary["total"];
+        assert_eq!(summary["listeners_interrupted"], 0, "{name}: {summary:#}");
+        assert_eq!(total["interruptions"], 0, "{name}: {summary:#}");
+        assert_eq!(total["missing"], 0, "{name}: {summary:#}");
+        let edge = &summary["per_edge"][&drained];
+        let moved = edge["moves_by_reason"]["draining"].as_u64().unwrap_or(0);
+        assert!(moved >= 25, "{name}: {moved} moved off the drained edge: {summary:#}");
+        assert_eq!(
+            edge["leg_replacements"]["by_kind"]["handover"].as_u64(),
+            Some(moved),
+            "{name}"
+        );
+        assert_eq!(count(edge, "handover_ms"), moved, "{name}");
+        if paths == 2 {
+            assert_eq!(count(total, "single_path_ms"), 0, "{name}: never on one path");
+        }
+    }
+}
+
+/// B Y4: the publisher pauses 400 ms: every listener sees the gap (an
+/// interruption nothing can spare it), and none moves or loses a part.
+#[test]
+fn a_pause_of_the_publisher_is_a_gap_at_listeners_that_do_not_move() {
+    let (summary, _, _) = change_one_edge("y4-pause", 2, true, 97, 120, Change::Pause);
+    let total = &summary["total"];
+    assert_eq!(total["moves"], 0, "{summary:#}");
+    assert_eq!(total["missing"], 0, "{summary:#}");
+    assert_eq!(summary["listeners_with_missing"], 0);
+    assert_eq!(summary["listeners_interrupted"], 120, "{summary:#}");
+    let pause = PAUSE.as_millis() as f64;
+    let longest = summary["longest_silence_ms"].as_f64().unwrap();
+    assert!(
+        longest >= pause * 0.85 && longest <= 1_000.0,
+        "longest silence {longest} ms"
+    );
+    // The pause is in the gap histogram, not in the latency (publication
+    // to arrival): the parts after it are published late.
+    assert!(total["part_gap_ms"]["max"].as_f64().unwrap() >= pause * 0.85);
+    let latency = &total["latency_ms"];
+    assert!(latency["p999"].as_f64().unwrap() < 100.0, "{latency}");
+}
+
+/// B Y4: listeners that leave (a falling ramp) leave their parts not yet
+/// due unjudged: nothing is booked missing.
+#[test]
+fn a_falling_ramp_books_nothing_missing() {
+    let dir = out_dir("y4-falling");
+    let _ = std::fs::remove_dir_all(&dir);
+    let bench = Bench {
+        paths: 2,
+        spare: true,
+        ramp: Some(vec![(Duration::ZERO, 40), (Duration::from_secs(3), 10)]),
+        listeners: 40,
+        seconds: 5,
+        threads: 2,
+        edge_threads: 2,
+        payload: Payload::Pcm,
+        sample: 0,
+        out_dir: dir.clone(),
+        measure_from: 1.0,
+    };
+    let result = run_bench(&bench, 101);
+    let summary = &result.summary;
+    let total = &summary["total"];
+    assert_eq!(total["listeners_started"], 40, "{summary:#}");
+    let lines: Vec<Value> = std::fs::read_to_string(dir.join("intervals.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let stopped: u64 = lines
+        .iter()
+        .map(|line| line["total"]["stopped"].as_u64().unwrap())
+        .sum();
+    assert_eq!(stopped, 30, "{summary:#}");
+    assert_eq!(total["missing"], 0, "{summary:#}");
+    assert_eq!(summary["listeners_with_missing"], 0, "{summary:#}");
+    assert_eq!(summary["listeners_interrupted"], 0, "{summary:#}");
 }
