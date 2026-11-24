@@ -2055,10 +2055,8 @@ impl ClassThread {
                 self.stats.tee_dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
-        if feed_misses.held() > 0 {
-            // The tee makes the entries the misses asked for.
-            tee.want_wake();
-        }
+        // The tee also makes the feed entries asked for in the batch: a
+        // key is asked for at a datagram that is teed with it.
         tee.wake();
     }
 }

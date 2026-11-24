@@ -176,12 +176,6 @@ impl<M: Copy> TeeSender<M> {
         true
     }
 
-    /// Wake the tee at the next [`Self::wake`] although nothing was pushed
-    /// (it has other work the thread asked of it).
-    pub fn want_wake(&mut self) {
-        self.unwoken = true;
-    }
-
     /// Wake the tee if anything was pushed since the last wake.
     pub fn wake(&mut self) {
         if std::mem::take(&mut self.unwoken) {

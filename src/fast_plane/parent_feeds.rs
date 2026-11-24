@@ -526,6 +526,7 @@ impl FeedMisses {
 
 impl FeedMisses {
     /// Keys held now.
+    #[cfg(test)]
     pub fn held(&self) -> usize {
         self.held
     }
