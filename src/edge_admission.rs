@@ -212,6 +212,39 @@ pub fn process_cpu_us() -> Option<u64> {
     )
 }
 
+/// The calling thread's CPU time so far, in microseconds; `None` when it
+/// cannot be read.
+pub fn thread_cpu_us() -> Option<u64> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes the timespec it is given.
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) } != 0 {
+        return None;
+    }
+    Some(
+        u64::try_from(time.tv_sec).ok()?.saturating_mul(1_000_000)
+            + u64::try_from(time.tv_nsec).ok()? / 1_000,
+    )
+}
+
+/// CPU time this process spent on work that one playlist costs whatever
+/// its listeners: the fast-plane tees' decode and commit of every symbol
+/// of the streams the node holds (4K: 60 to 115 % of a CPU at 247 to 300
+/// Mbit/s on a lab edge, with one listener or a hundred). The CPU term of
+/// the load leaves it out (`process_cpu_us_for_listeners`), so that a 4K
+/// edge does not read as full, leave assignment and shed its audio
+/// listeners because of its playlists; what a listener costs (its fan-out,
+/// its repair, its HTTP) stays in the term.
+pub static PLAYLIST_CPU_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The process's CPU time less [`PLAYLIST_CPU_US`]: the CPU counter of
+/// the load's CPU term.
+pub fn process_cpu_us_for_listeners() -> Option<u64> {
+    Some(process_cpu_us()?.saturating_sub(PLAYLIST_CPU_US.load(Ordering::Relaxed)))
+}
+
 /// The CPUs this process may run on: its affinity and its cgroup's quota
 /// (a lab node's CPUQuota, an instance's vCPUs).
 pub fn available_cpus() -> u32 {
@@ -1289,6 +1322,24 @@ mod tests {
         assert_eq!(admission.moved_seen_within_at(1_000, 2_500), 1);
         assert_eq!(admission.moved_seen_within_at(1_000, 3_401), 0);
         assert_eq!(admission.moved_seen_within(60_000), 2);
+    }
+
+    /// The CPU term's counter leaves out what the tees booked: a 4K edge
+    /// whose tee spends 1.2 CPUs on its playlist and 0.3 on its listeners
+    /// reads 0.3 of its 2 CPUs (176 at 85 %), not 1.5 (882).
+    #[test]
+    fn the_cpu_term_leaves_out_the_playlists_cpu() {
+        // The process has run for well under a second here, and other
+        // tests' tees book into the same counter: compare with what it
+        // holds now, not with fixed figures.
+        let all = process_cpu_us().unwrap();
+        let booked = PLAYLIST_CPU_US.load(Ordering::Relaxed);
+        let for_listeners = process_cpu_us_for_listeners().unwrap();
+        assert!(for_listeners <= all.max(process_cpu_us().unwrap()));
+        assert!(for_listeners <= process_cpu_us().unwrap().saturating_sub(booked));
+        assert!(thread_cpu_us().is_some());
+        assert_eq!(cpu_permille(1_500_000 - 1_200_000, 1_000_000, 2, 85), 176);
+        assert_eq!(cpu_permille(1_500_000, 1_000_000, 2, 85), 882);
     }
 
     #[test]

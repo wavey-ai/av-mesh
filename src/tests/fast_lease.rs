@@ -999,6 +999,168 @@ async fn an_edge_promotes_its_secondary_forwarder_for_video_when_the_primary_sto
     forwarder_2.stop().await;
 }
 
+/// 4K on Linode (24 Nov, cmpd6): a regional secondary forwarder that is
+/// fed the stream's sources but no repair (new-dist-b over the long haul)
+/// sends its secondary edge nothing for video, while it keeps every source
+/// in the edge's warm ring. The primary (new-dist-a) stopped for 2.7 s; the
+/// edge's controller, having never heard the secondary, never promoted it.
+/// Now the primary's silence alone promotes it: with F1 stopped, every part
+/// still reaches the edge's cache, none later than the silence (100 ms),
+/// the controller's heartbeat and the replay allow, for 3 s of 25 fps 4K.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_edge_promotes_a_secondary_that_sends_it_nothing_when_the_primary_stops() {
+    let edge_ip = loopback(3);
+    let (ports, sockets) = bind_edge_class_ports(edge_ip);
+    let lease_1 = lease_children(ports, &[edge_ip]);
+    let lease_2 = lease_children(ports, &[]);
+    for lease in [&lease_1, &lease_2] {
+        lease.rebuild(&[served(edge_ip, 1)]);
+    }
+    let forwarder_1 =
+        start_fast_relay_with(ParentPath::PromotedSecondary, &[], lease_config(&lease_1)).await;
+    let forwarder_2 =
+        start_fast_relay_with(ParentPath::PromotedSecondary, &[], lease_config(&lease_2)).await;
+    let lease_addr =
+        |lease: &LeaseChildren| SocketAddr::from((Ipv4Addr::LOCALHOST, lease.local_addr().port()));
+    let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let listener_addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    tokio::spawn(fast_control::run_lease_failover_listener(
+        listener,
+        Arc::clone(&lease_2),
+        TopologyGeneration::new(FAST_GENERATION).unwrap(),
+        SubscriptionId::new(FAST_SUBSCRIPTION).unwrap(),
+        shutdown_rx.clone(),
+    ));
+    let controller_args = Args::try_parse_from([
+        "av-mesh".to_owned(),
+        "--relay-failover-controller".to_owned(),
+        format!("{edge_ip}:0={listener_addr}"),
+        "--relay-topology-generation".to_owned(),
+        FAST_GENERATION.to_string(),
+        "--relay-subscription-id".to_owned(),
+        FAST_SUBSCRIPTION.to_string(),
+        "--relay-primary-silence-ms".to_owned(),
+        "100".to_owned(),
+    ])
+    .unwrap();
+    let controller = RelayFailoverController::bind(&controller_args)
+        .await
+        .unwrap()
+        .unwrap();
+    let edge_cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 256, 256).await;
+    let (edge_shutdown_tx, edge_shutdown_rx) = watch::channel(());
+    let edge_task = tokio::spawn(fast_plane::relay::run_relay_class_ingest(
+        sockets,
+        Arc::clone(&edge_cache),
+        edge_shutdown_rx,
+        RelayIngestRuntime {
+            dispatch: edge_dispatch(lease_addr(&lease_1), lease_addr(&lease_2)),
+            secondary_socket: None,
+            class_twins: Vec::new(),
+            forwarder: None,
+            audio_epochs: None,
+            failover_controller: Some(controller),
+            failover_heartbeat: Duration::from_millis(20),
+            link_telemetry: None,
+        },
+        RelayClassConfig {
+            port_offset: OFFSET,
+            cpus: [None, None],
+            realtime: false,
+            tee_capacity: 4_096,
+            ..Default::default()
+        },
+    ));
+
+    let deadline = now_unix_us() + 30_000_000;
+    let object = |sequence: u64| {
+        let envelope = encode_test_canonical_fmp4_bundle_with_duration(
+            1,
+            sequence,
+            None,
+            &deterministic_video_payload(6_000 + sequence as usize),
+            None,
+            sequence == 0,
+        );
+        fast_test_symbols(
+            &envelope,
+            relay_session::MediaPriority::VideoKey,
+            400,
+            48,
+            2,
+            deadline,
+        )
+    };
+    // F2 takes the sources only: it has no repair to give its secondary
+    // child, so it sends the edge nothing.
+    let sources_only = |(sources, _): (Vec<Vec<u8>>, Vec<Vec<u8>>)| (sources, Vec::new());
+    let frame = Duration::from_millis(40);
+    let mut sequence = 0_u64;
+    for _ in 0..25 {
+        send_video(&forwarder_1, &object(sequence)).await;
+        send_video(&forwarder_2, &sources_only(object(sequence))).await;
+        wait_for_part(&edge_cache, 1, sequence).await;
+        sequence += 1;
+        tokio::time::sleep(frame).await;
+    }
+    assert_eq!(lease_2.stats.snapshot().video_sent, 0, "F2 sends the edge nothing");
+    assert!(lease_2.stats.snapshot().warm_buffered > 0, "but keeps the sources warm");
+
+    // F1 stops; 3 s of frames go to F2 alone. Each part's time from its
+    // send to its commit at the edge.
+    forwarder_1.stop().await;
+    let first_after = sequence;
+    let mut sent_at = Vec::new();
+    let cache = Arc::clone(&edge_cache);
+    let watch_from = first_after;
+    let (done_tx, mut done_rx) = watch::channel(false);
+    let committed = tokio::spawn(async move {
+        let mut seen: Vec<(u64, Instant)> = Vec::new();
+        let mut next = watch_from;
+        loop {
+            while slot(&cache, 1, next).await.is_some() {
+                seen.push((next, Instant::now()));
+                next += 1;
+            }
+            if *done_rx.borrow_and_update() && next >= watch_from + 75 {
+                return seen;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    });
+    for _ in 0..75 {
+        sent_at.push((sequence, Instant::now()));
+        send_video(&forwarder_2, &sources_only(object(sequence))).await;
+        sequence += 1;
+        tokio::time::sleep(frame).await;
+    }
+    let _ = done_tx.send(true);
+    let seen = timeout(Duration::from_secs(5), committed)
+        .await
+        .expect("every part after the stop is committed")
+        .unwrap();
+    let worst = seen
+        .iter()
+        .map(|(part, at)| {
+            let sent = sent_at[(part - first_after) as usize].1;
+            at.saturating_duration_since(sent)
+        })
+        .max()
+        .unwrap();
+    assert_eq!(lease_2.stats.snapshot().promotions, 1);
+    assert!(lease_2.stats.snapshot().warm_replayed > 0);
+    // 100 ms of silence, a 20 ms heartbeat, the replay and the test's own
+    // 2 ms polling: 250 ms is the bound (before: the whole stop).
+    assert!(worst < Duration::from_millis(250), "worst part {worst:?} after the stop");
+    eprintln!("secondary that sent nothing: worst part {worst:?} after a primary stop");
+
+    let _ = shutdown_tx.send(());
+    let _ = edge_shutdown_tx.send(());
+    edge_task.await.unwrap().unwrap();
+    forwarder_2.stop().await;
+}
+
 /// B6: an edge whose cache mesh wrote parts of a stream (a lease's warm-up
 /// window) before the first part of the fast plane commits takes up their
 /// epoch and keeps them; a part of a new epoch still replaces the copy.

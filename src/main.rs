@@ -1563,6 +1563,16 @@ struct Args {
     )]
     relay_class_tee_capacity: usize,
 
+    /// MiB of the video class's tee ring, which a 4K stream's symbols fill
+    /// by their bytes long before its entries run out (192: about 5 s of
+    /// 300 Mbit/s); pinned with the other rings.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_VIDEO_TEE_MB",
+        default_value_t = fast_plane::relay::DEFAULT_VIDEO_TEE_BYTES >> 20
+    )]
+    relay_video_tee_mb: usize,
+
     /// Feed every cache-mesh playlist lease that this node serves on the
     /// fast plane as well: a forwarder with --relay-class-threads sends the
     /// contributor's RLS1 symbols of a leased stream to the child (an edge)
@@ -3991,6 +4001,21 @@ async fn main() -> Result<()> {
             )
         })
         .flatten();
+    // The quiet catch-up of the trigger (a stream that the fast plane left
+    // quiet is asked of the cache-mesh parents), off the live path.
+    let hole_quiet_task = hole_trigger.clone().map(|trigger| {
+        let mut shutdown = ingest_shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(25));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = shutdown.changed() => return,
+                    _ = tick.tick() => trigger.sweep_quiet(),
+                }
+            }
+        })
+    });
     let fast_ingest_planned =
         args.relay_class_threads && args.relay_controlled_local && fast_plane::sys::supported();
     let mesh_applied_task = tokio::spawn(run_mesh_applied_parts(
@@ -4287,6 +4312,7 @@ async fn main() -> Result<()> {
         cpus: args.relay_class_cpus.0,
         realtime: args.relay_class_realtime,
         tee_capacity: args.relay_class_tee_capacity,
+        video_tee_bytes: args.relay_video_tee_mb.saturating_mul(1 << 20),
         video_gso: args.relay_video_gso,
         video_gro: args.relay_video_gro,
         burst_copy_ms: args.relay_burst_copy_ms,
@@ -4516,7 +4542,10 @@ async fn main() -> Result<()> {
         // Wave 9 C2: the edge's CPU over its CPUs in its load.
         let cpus = edge_admission::available_cpus();
         router.edge_load.egress.set_cpu_counter(
-            Arc::new(edge_admission::process_cpu_us),
+            // Less the tees' decode and commit, which a playlist costs
+            // whatever its listeners (a 4K edge read as full and shed its
+            // audio listeners, wave 9 review).
+            Arc::new(edge_admission::process_cpu_us_for_listeners),
             cpus,
             args.cpu_load_full_percent,
             args.cpu_load_window_ms,
@@ -4764,6 +4793,9 @@ async fn main() -> Result<()> {
     }
     let _ = media_fec_ingest_task.await;
     let _ = mesh_applied_task.await;
+    if let Some(task) = hole_quiet_task {
+        let _ = task.await;
+    }
     let _ = playlist_demand_task.await;
     let _ = playlist_standby_task.await;
     if let Some(task) = upstream_demand_task {
@@ -7459,27 +7491,19 @@ impl RelayFailoverController {
                 if primary_recent && secondary_recent {
                     self.set_state(RelayFailoverControllerState::Healthy);
                 } else if self.last_primary_source.is_some() && !primary_recent {
-                    if secondary_recent {
-                        self.try_promote(now);
-                    } else {
-                        self.secondary_unavailable();
-                    }
+                    self.primary_silent(now, secondary_recent);
                 }
             }
             RelayFailoverControllerState::Healthy => {
                 if !primary_recent {
-                    if secondary_recent {
-                        self.try_promote(now);
-                    } else {
-                        self.secondary_unavailable();
-                    }
+                    self.primary_silent(now, secondary_recent);
                 }
             }
             RelayFailoverControllerState::SecondaryUnavailable => {
                 if primary_recent {
                     self.set_state(RelayFailoverControllerState::Healthy);
-                } else if secondary_recent && self.last_primary_source.is_some() {
-                    self.try_promote(now);
+                } else if self.last_primary_source.is_some() {
+                    self.primary_silent(now, secondary_recent);
                 }
             }
             RelayFailoverControllerState::Promoted | RelayFailoverControllerState::Recovering => {
@@ -7497,6 +7521,28 @@ impl RelayFailoverController {
         }
         self.refresh_ages(now);
         self.send_desired().await;
+    }
+
+    /// The primary has been silent past `silence`: promote the secondary
+    /// (once the backoff allows), whether or not it was heard lately.
+    ///
+    /// A secondary that sends nothing can still hold the sources: for a
+    /// video stream a lease forwarder sends its secondary children repair
+    /// only, and a forwarder that receives no repair itself (a regional
+    /// distributor fed sources over the long haul) sends them nothing at all
+    /// while it keeps every source in their warm ring (4K on Linode, 24 Nov:
+    /// new-dist-a stopped for 2.7 s, its edge saw no repair from new-dist-b,
+    /// never promoted it and took 41 parts 2.2 to 2.65 s late over the cache
+    /// mesh, while new-dist-b had committed each 35 ms after packaging).
+    /// Promoting a secondary that is gone costs one RLF1 command; not
+    /// promoting one that is there costs the stream for the primary's whole
+    /// stop. A silence with no recent secondary is still counted as
+    /// `secondary_unavailable` and shown as that state until the promotion.
+    fn primary_silent(&mut self, now: Instant, secondary_recent: bool) {
+        if !secondary_recent {
+            self.secondary_unavailable();
+        }
+        self.try_promote(now);
     }
 
     /// The primary silence that a promotion needs now: the configured
@@ -45949,6 +45995,7 @@ mod tests {
                 cpus: [None, None],
                 realtime: false,
                 tee_capacity: 1_024,
+                video_tee_bytes: 1_024 * 256,
                 video_gso: true,
                 lease: None,
                 edge_clients: None,

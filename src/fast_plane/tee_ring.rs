@@ -78,8 +78,19 @@ pub struct TeeReceiver<M> {
 /// A ring of `entries` datagrams and `entries * BYTES_PER_ENTRY` bytes,
 /// pinned now.
 pub fn tee_ring<M: Copy + Send>(entries: usize) -> (TeeSender<M>, TeeReceiver<M>) {
+    tee_ring_with_bytes(entries, entries.saturating_mul(BYTES_PER_ENTRY))
+}
+
+/// A ring of `entries` datagrams and `bytes` bytes (at least 64 KiB),
+/// pinned now: the video class's, whose datagrams are a symbol each
+/// (1,316 B and its headers), against the 256 B a datagram that
+/// [`tee_ring`] allows.
+pub fn tee_ring_with_bytes<M: Copy + Send>(
+    entries: usize,
+    bytes: usize,
+) -> (TeeSender<M>, TeeReceiver<M>) {
     let entries = entries.max(1);
-    let byte_len = entries.saturating_mul(BYTES_PER_ENTRY).max(64 * 1024);
+    let byte_len = bytes.max(64 * 1024);
     let mut entry_cells: Box<[UnsafeCell<Entry<M>>]> = (0..entries)
         .map(|_| {
             UnsafeCell::new(Entry {
@@ -302,6 +313,23 @@ mod tests {
         assert!(rx.peek().is_none());
         assert!(tx.push(5, b"again"));
         assert_eq!(rx.peek().unwrap(), (5, &b"again"[..]));
+    }
+
+    /// The video ring is bounded by its bytes: 4K symbols of 1,400 B fill
+    /// a ring of 256 B an entry after a fifth of its entries.
+    #[test]
+    fn a_ring_with_bytes_of_its_own_holds_that_many_symbols() {
+        let symbol = [7_u8; 1_400];
+        let count = |(mut tx, _rx): (TeeSender<u32>, TeeReceiver<u32>)| {
+            let mut pushed = 0_u32;
+            while tx.push(pushed, &symbol) {
+                pushed += 1;
+            }
+            pushed
+        };
+        assert_eq!(count(tee_ring::<u32>(1_000)), 182, "256,000 B / 1,400 B");
+        assert_eq!(count(tee_ring_with_bytes::<u32>(1_000, 1_000 * 1_400)), 1_000);
+        assert_eq!(count(tee_ring_with_bytes::<u32>(10, 1_000 * 1_400)), 10, "entries bound");
     }
 
     #[test]
