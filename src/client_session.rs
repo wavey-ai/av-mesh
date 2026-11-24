@@ -1697,15 +1697,27 @@ impl UdpSession {
                 next_part, compact, ..
             } => self.on_subscribed(index, next_part, compact, now),
             Control::Move { reason, .. } => {
-                // A MOVE within a round trip of a take-back, before its OK,
+                // A MOVE within a round trip of a take-back (the first
+                // retry's wait while the leg has none), before its OK,
                 // answers the SUB before it.
-                if leg.takeback_at.is_some_and(|at| {
-                    now.saturating_duration_since(at) <= leg.rtt.unwrap_or(Duration::ZERO)
-                }) {
+                let window = leg
+                    .rtt
+                    .unwrap_or_else(|| unanswered_wait(&self.config, leg));
+                if leg
+                    .takeback_at
+                    .is_some_and(|at| now.saturating_duration_since(at) <= window)
+                {
                     return Received::Control;
                 }
                 leg.takeback_at = None;
-                self.sample_refresh(index, now);
+                // A leaving leg's edge repeats its MOVE every 250 ms on its
+                // own: a MOVE then is no answer to the refresh, and gives no
+                // round trip.
+                if leg.leaving.is_some() {
+                    leg.refresh_sent_at = None;
+                } else {
+                    self.sample_refresh(index, now);
+                }
                 let leg = self.legs[index].as_mut().expect("an attributed leg");
                 if !leg.is_live() {
                     // The edge refuses a leg it never served.
@@ -3916,6 +3928,53 @@ mod tests {
             .compact
             .leg_rtt(only(&session).id)
             .is_some());
+    }
+
+    /// B X5 review: the `MOVE` a leaving leg's edge repeats on its own is
+    /// taken neither as the answer to a refresh (no round trip from it) nor,
+    /// within the first retry's wait of a take-back by a leg with no round
+    /// trip yet, as a new `MOVE`.
+    #[test]
+    fn a_move_reminder_gives_no_round_trip_and_keeps_a_take_back() {
+        let now = Instant::now();
+        let mut session = two_legs(SessionConfig::new(1), 100, now);
+        let mut send = |_: SocketAddr, _: &[u8]| {};
+        let moved = Control::Move {
+            stream_id: 1,
+            reason: "rebalance".into(),
+        }
+        .encode();
+        let ms = Duration::from_millis(1);
+        session.on_datagram(edge(), &moved, now, &mut send);
+        held_mut(&mut session, A).rtt = Some(ms * 40);
+        // A refresh of the leaving leg, and the edge's reminder 5 ms later.
+        let refresh = held(&session, A).next_refresh;
+        session.poll_legs(refresh, &mut send);
+        session.on_datagram(edge(), &moved, refresh + ms * 5, &mut send);
+        assert_eq!(held(&session, A).rtt, Some(ms * 40));
+        // A take-back by a leg with no round trip: a reminder 10 ms later is
+        // the answer to the SUB before it; its OK takes the leg back.
+        held_mut(&mut session, A).rtt = None;
+        let back = refresh + ms * 100;
+        session.takeback_leg(A, back, &mut send);
+        session.on_datagram(edge(), &moved, back + ms * 10, &mut send);
+        session.on_datagram(edge(), &ok(200), back + ms * 15, &mut send);
+        assert!(events(&mut session).contains(&LegEvent::TakenBack(A)));
+        assert_eq!(held(&session, A).state, State::Live);
+        // A MOVE past the wait is a new MOVE: its OK takes nothing back.
+        session.on_datagram(edge(), &moved, back + ms * 200, &mut send);
+        let later = back + ms * 300;
+        session.takeback_leg(A, later, &mut send);
+        session.on_datagram(
+            edge(),
+            &moved,
+            later + Duration::from_millis(DEFAULT_FIRST_RETRY_MS + 5),
+            &mut send,
+        );
+        session.on_datagram(edge(), &ok(200), later + ms * 40, &mut send);
+        let seen = events(&mut session);
+        assert!(!seen.contains(&LegEvent::TakenBack(A)), "{seen:?}");
+        assert_eq!(held(&session, A).state, State::Leaving);
     }
 
     /// B X5: a hole's first NACK goes to the leg with the shortest round
