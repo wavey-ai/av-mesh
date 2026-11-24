@@ -43928,6 +43928,7 @@ mod tests {
                 ranked_parents: Vec::new(),
                 lease_descriptors: true,
                 video_gro: true,
+                media_deadline_us: fast_plane::relay::DEFAULT_MEDIA_DEADLINE_US,
                 test_tee_panic: Some(fast_plane::TrafficClass::Audio),
             },
         )

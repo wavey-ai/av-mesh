@@ -20,6 +20,8 @@ pub mod edge_clients;
 pub mod lease;
 pub mod loss_report;
 pub mod parent_feeds;
+/// Compiled in the library, whose relay ingress keeps a table of them too.
+pub use av_mesh::media_clock;
 pub mod relay;
 pub mod sys;
 pub mod view;

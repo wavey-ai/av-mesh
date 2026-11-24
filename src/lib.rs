@@ -6,6 +6,11 @@ pub mod client_session;
 pub mod client_udp;
 pub mod load;
 pub mod load_assign;
+/// The media clocks of the fast plane (`fast_plane::media_clock` in the
+/// binary), here because the relay ingress of this library keeps a table of
+/// them too.
+#[path = "fast_plane/media_clock.rs"]
+pub mod media_clock;
 pub mod relay_ingress;
 pub mod replication;
 pub mod subscribe_authorization;
