@@ -1442,6 +1442,88 @@ async fn window_repair_does_not_wait_for_the_cache_fed_lane() {
     edge.stop().await;
 }
 
+/// D3 review 1: a window whose parts reach the edge in one burst (several
+/// in each receive batch, as after any queueing upstream) has its repair
+/// from the fast lane at once, though the tee keeps the parts in the
+/// compact ring later and on another thread. Each part the class thread
+/// sends to a window-repair client goes to the repair thread with its
+/// canonical datagram, in order, and is kept in the ring there before the
+/// window it completes is read. The cache-fed lane holds at a hole for the
+/// playout budget meanwhile, so it repairs nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_window_that_arrives_in_one_burst_is_repaired_by_the_fast_lane() {
+    let stream_id = 4005;
+    let payload = Payload::Opus;
+    let (edge, first) = AnyEdge::start(Feed::Fast, payload, stream_id, 28).await;
+    let AnyEdge::Fast(lane_edge) = &edge else {
+        unreachable!("a fast edge")
+    };
+    let shared = Shared::new();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let listener = tokio::spawn(listen(
+        edge.client_port(),
+        stream_id,
+        Mode::Compact,
+        true,
+        PathLoss::Clean,
+        18,
+        Arc::clone(&shared),
+        tx,
+    ));
+    let from = timeout(Duration::from_secs(5), rx).await.unwrap().unwrap();
+    let window = u64::from(CompactPlan::CLEAN.window);
+    // A hole early on: the cache-fed lane waits there (500 ms).
+    let hole = from + 3;
+    let bursts_from = (hole / window + 1) * window;
+    let bursts = 3;
+    let start = Instant::now();
+    for sequence in first..bursts_from {
+        let due = start + Duration::from_micros(payload.part_us() * (sequence - first));
+        tokio::time::sleep_until(due.into()).await;
+        if sequence != hole {
+            edge.publish(payload, stream_id, sequence).await;
+        }
+    }
+    let batches_before = lane_edge.cache.relay_ingress_snapshot().fast_plane.audio_batches;
+    let received_before = lane_edge.cache.relay_ingress_snapshot().fast_plane.audio_received;
+    for burst in 0..bursts {
+        // Each window's parts made first, then sent back to back.
+        let parts: Vec<_> = (0..window)
+            .map(|offset| {
+                let (envelope, _) = payload.envelope(stream_id, bursts_from + burst * window + offset);
+                payload.symbols(&envelope)
+            })
+            .collect();
+        for symbols in &parts {
+            lane_edge.send(false, symbols, false).await;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let held_for = start.elapsed();
+    let fast_plane = lane_edge.cache.relay_ingress_snapshot().fast_plane;
+    let repair = edge.stats().compact_window_repair.load(Ordering::Relaxed);
+    assert!(
+        held_for < Duration::from_millis(450),
+        "the run took {held_for:?}: the hole's wait is over"
+    );
+    let per_batch = (fast_plane.audio_received - received_before) as f64
+        / (fast_plane.audio_batches - batches_before).max(1) as f64;
+    assert!(
+        per_batch > 1.5,
+        "{per_batch:.2} datagrams a receive batch: the bursts were not batched"
+    );
+    assert!(
+        repair >= bursts,
+        "{repair} window repair datagrams within {held_for:?} for {bursts} windows sent in bursts"
+    );
+    // The edge's stop ends the listener (the hole is never filled).
+    shared.last.store(bursts_from + bursts * window - 1, Ordering::Relaxed);
+    edge.stop().await;
+    let run = listener.await.unwrap();
+    assert!(run.compact_confirmed);
+}
+
 /// Wave 8 S1: the class thread takes no lock that ordinary tasks hold. A
 /// task that holds the subscriber table's lock (a SUB, a NACK storm, the
 /// cache-fed lane) for 60 ms does not stop the fast lane: windows complete
