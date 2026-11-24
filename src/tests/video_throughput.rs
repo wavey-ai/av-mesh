@@ -76,7 +76,7 @@ fn env_switch(name: &str) -> Vec<bool> {
 
 /// Processor time of this process's threads whose names start with one of
 /// `prefixes`, in nanoseconds.
-fn threads_cpu_ns(prefixes: &[&str]) -> u64 {
+pub(super) fn threads_cpu_ns(prefixes: &[&str]) -> u64 {
     let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
         return 0;
     };
@@ -109,7 +109,7 @@ pub(super) struct Frame {
 }
 
 impl Frame {
-    fn wire_bytes(&self) -> u64 {
+    pub(super) fn wire_bytes(&self) -> u64 {
         self.datagrams
             .iter()
             .map(|datagram| datagram.len() as u64 + HEADER_BYTES)
@@ -118,8 +118,9 @@ impl Frame {
 }
 
 /// The canonical envelope of 4K frame `sequence` of `media_bytes`, as
-/// av-contrib's `build_fmp4_media_object` builds it.
-fn frame_envelope(stream_id: u64, sequence: u64, media_bytes: usize) -> Vec<u8> {
+/// av-contrib's `build_fmp4_media_object` builds it, at `fps` frames a
+/// second.
+fn frame_envelope(stream_id: u64, sequence: u64, media_bytes: usize, fps: u64) -> Vec<u8> {
     let mut media = vec![0_u8; media_bytes];
     for (index, byte) in media.iter_mut().enumerate() {
         *byte = ((index as u64 * 31 + sequence * 7) % 251) as u8;
@@ -156,12 +157,12 @@ fn frame_envelope(stream_id: u64, sequence: u64, media_bytes: usize) -> Vec<u8> 
         b"init",
     )
     .unwrap();
-    let part_us = 1_000_000 / FRAMES_PER_SECOND;
+    let part_us = 1_000_000 / fps;
     let mut builder = MediaObject::builder(key, ObjectKind::Media, payload.to_vec())
         .with_deadline(stamp(now_ns + 600_000_000_000))
         .with_stage_timestamp(StageTimestamp::new(Stage::Packaged, stamp(now_ns)))
         .with_stage_timestamp(StageTimestamp::new(Stage::Published, stamp(now_ns)))
-        .with_keyframe(sequence % FRAMES_PER_SECOND == 0)
+        .with_keyframe(sequence % fps == 0)
         .with_configuration_epoch(1)
         .with_dependency(init);
     for (name, value) in [
@@ -174,8 +175,8 @@ fn frame_envelope(stream_id: u64, sequence: u64, media_bytes: usize) -> Vec<u8> 
         ("video-codec", "avc1.640033".to_string()),
         ("video-width", "3840".to_string()),
         ("video-height", "2160".to_string()),
-        ("hls-msn", (sequence / FRAMES_PER_SECOND).to_string()),
-        ("hls-part", (sequence % FRAMES_PER_SECOND).to_string()),
+        ("hls-msn", (sequence / fps).to_string()),
+        ("hls-part", (sequence % fps).to_string()),
         ("hls-part-target-ms", part_us.div_ceil(1_000).to_string()),
         ("hls-part-target-us", part_us.to_string()),
         ("hls-target-duration-ms", "1000".to_string()),
@@ -194,7 +195,39 @@ pub(super) fn make_frames(
     count: usize,
     bits_per_second: u64,
 ) -> Vec<Frame> {
-    let media_bytes = (bits_per_second / 8 / FRAMES_PER_SECOND) as usize;
+    make_frames_shaped(
+        stream_id,
+        first,
+        count,
+        bits_per_second,
+        FrameShape {
+            fps: FRAMES_PER_SECOND,
+            symbol_bytes: SYMBOL_BYTES,
+            repair_per_sources: 20,
+        },
+    )
+}
+
+/// How a 4K source cuts its frames.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FrameShape {
+    /// Frames (parts) a second.
+    pub(super) fps: u64,
+    /// The RelaySession symbol.
+    pub(super) symbol_bytes: u16,
+    /// One repair symbol for this many sources (20: a twentieth).
+    pub(super) repair_per_sources: u32,
+}
+
+/// [`make_frames`] at any frame rate, symbol and repair.
+pub(super) fn make_frames_shaped(
+    stream_id: u64,
+    first: u64,
+    count: usize,
+    bits_per_second: u64,
+    shape: FrameShape,
+) -> Vec<Frame> {
+    let media_bytes = (bits_per_second / 8 / shape.fps) as usize;
     let deadline = now_unix_us() + 600_000_000;
     let threads = std::thread::available_parallelism()
         .map_or(4, |threads| threads.get())
@@ -206,18 +239,19 @@ pub(super) fn make_frames(
             scope.spawn(move || {
                 for (offset, slot) in slots.iter_mut().enumerate() {
                     let part = first + (chunk * per_thread + offset) as u64;
-                    let envelope = frame_envelope(stream_id, part, media_bytes);
-                    let sources = envelope.len().div_ceil(usize::from(SYMBOL_BYTES)) as u32;
+                    let envelope = frame_envelope(stream_id, part, media_bytes, shape.fps);
+                    let sources =
+                        envelope.len().div_ceil(usize::from(shape.symbol_bytes)) as u32;
                     let (source, repair) = fast_test_symbols(
                         &envelope,
-                        if part % FRAMES_PER_SECOND == 0 {
+                        if part % shape.fps == 0 {
                             relay_session::MediaPriority::VideoKey
                         } else {
                             relay_session::MediaPriority::VideoDelta
                         },
-                        SYMBOL_BYTES,
+                        shape.symbol_bytes,
                         u16::try_from(sources.max(400)).unwrap(),
-                        sources.div_ceil(20),
+                        sources.div_ceil(shape.repair_per_sources),
                         deadline,
                     );
                     let sources = source.len();
@@ -237,7 +271,7 @@ pub(super) fn make_frames(
 
 /// How the source spreads a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Spread {
+pub(super) enum Spread {
     /// In slices of a millisecond at 1.25 times the stream's rate, as the
     /// contributor's paced video lane sends.
     Paced,
@@ -263,7 +297,31 @@ fn send_frames(
     spread: Spread,
     start: Instant,
 ) -> Vec<Instant> {
-    let interval = Duration::from_nanos(1_000_000_000 / FRAMES_PER_SECOND);
+    send_frames_at(
+        fd,
+        target,
+        frames,
+        bits_per_second,
+        spread,
+        start,
+        FRAMES_PER_SECOND,
+        SYMBOL_BYTES,
+    )
+}
+
+/// [`send_frames`] at `fps` frames a second of `symbol_bytes` symbols.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn send_frames_at(
+    fd: RawFd,
+    target: SocketAddr,
+    frames: &[Frame],
+    bits_per_second: u64,
+    spread: Spread,
+    start: Instant,
+    fps: u64,
+    symbol_bytes: u16,
+) -> Vec<Instant> {
+    let interval = Duration::from_nanos(1_000_000_000 / fps);
     // A millisecond of 1.25 times the rate, in datagrams.
     let slice_bytes = (bits_per_second as f64 * 1.25 / 8.0 / 1_000.0) as usize;
     let mut sent_last = Vec::with_capacity(frames.len());
@@ -271,7 +329,7 @@ fn send_frames(
         let due = start + interval * index as u32;
         let per_slice = match spread {
             Spread::Burst => frame.datagrams.len(),
-            Spread::Paced => (slice_bytes / (usize::from(SYMBOL_BYTES) + 60)).max(1),
+            Spread::Paced => (slice_bytes / (usize::from(symbol_bytes) + 60)).max(1),
         };
         for (slice, datagrams) in frame.datagrams.chunks(per_slice).enumerate() {
             let slice_due = due + Duration::from_millis(slice as u64);
@@ -298,21 +356,21 @@ fn send_frames(
 
 /// What a child or client received: when each part was complete.
 #[derive(Debug, Default)]
-struct Received {
-    datagrams: u64,
+pub(super) struct Received {
+    pub(super) datagrams: u64,
     wire_bytes: u64,
     /// Wire bytes while the run measured.
     window_bytes: u64,
     /// When each part was complete (every datagram of it for a child, the
     /// decoded part for a client).
-    complete: HashMap<u64, Instant>,
+    pub(super) complete: HashMap<u64, Instant>,
     /// A client's first and last fast-lane datagram of each part.
     spans: HashMap<u64, (Instant, Instant)>,
     errors: u64,
 }
 
 /// A forwarder's child: counts each frame's datagrams until `stop`.
-fn run_child(
+pub(super) fn run_child(
     socket: std::net::UdpSocket,
     expected: Arc<HashMap<u64, usize>>,
     stop: Arc<AtomicBool>,
@@ -360,7 +418,7 @@ fn run_child(
 
 /// An edge's fast-lane client of `stream_id`: subscribes, then decodes each
 /// part until `stop`.
-fn run_client(
+pub(super) fn run_client(
     edge: SocketAddr,
     stream_id: u64,
     stop: Arc<AtomicBool>,

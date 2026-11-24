@@ -367,6 +367,20 @@ impl<M: Copy> TeeSender<M> {
         true
     }
 
+    /// What the ring could take now: free entries, and free bytes of the
+    /// part of the ring in use (its first part until it grows). A datagram
+    /// that would cross the end skips the bytes left there, so a run of
+    /// datagrams finds up to one datagram's bytes fewer.
+    pub fn room(&self) -> (u64, u64) {
+        let shared = &*self.shared;
+        let held = shared.head.load(Ordering::Relaxed) - shared.tail.load(Ordering::Acquire);
+        let entries = (shared.entries.len() as u64).saturating_sub(held);
+        let bytes = self
+            .capacity
+            .saturating_sub(self.at - shared.released.load(Ordering::Acquire));
+        (entries, bytes)
+    }
+
     /// Wake the tee if anything was pushed since the last wake.
     pub fn wake(&mut self) {
         if std::mem::take(&mut self.unwoken) {

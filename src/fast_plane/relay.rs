@@ -143,10 +143,17 @@ pub struct RelayClassConfig {
     /// Tests: the tee of this class panics on its first datagram.
     #[cfg(test)]
     pub test_tee_panic: Option<TrafficClass>,
+    /// Tests: the video tee spends this much more processor time on each
+    /// datagram (a tee short of processor time).
+    #[cfg(test)]
+    pub test_video_tee_spin_ns: u64,
     /// Tests: the audio thread counts its allocations and frees here once
     /// it runs (`alloc_count`).
     #[cfg(test)]
     pub test_alloc_counter: Option<&'static crate::alloc_count::AllocCounter>,
+    /// Tests: the same for the video thread.
+    #[cfg(test)]
+    pub test_video_alloc_counter: Option<&'static crate::alloc_count::AllocCounter>,
 }
 
 impl Default for RelayClassConfig {
@@ -171,7 +178,11 @@ impl Default for RelayClassConfig {
             #[cfg(test)]
             test_tee_panic: None,
             #[cfg(test)]
+            test_video_tee_spin_ns: 0,
+            #[cfg(test)]
             test_alloc_counter: None,
+            #[cfg(test)]
+            test_video_alloc_counter: None,
         }
     }
 }
@@ -320,6 +331,16 @@ pub struct FastPlaneStats {
     pub stale_media: AtomicU64,
     /// Datagrams of streams that found no media clock, per class.
     pub media_clock_overflow: [AtomicU64; 2],
+    /// Each class's tee (fix4-video): the wakes that took datagrams, its
+    /// processor time over them (µs, its thread's clock), and the longest
+    /// it took a datagram after the class thread read it (µs).
+    pub tee_batches: [AtomicU64; 2],
+    pub tee_cpu_us: [AtomicU64; 2],
+    pub tee_lag_max_us: [AtomicU64; 2],
+    /// Video parts the video thread did not tee because the ring had no
+    /// room for the whole part when its first symbol came (`TeeParts`);
+    /// their symbols count in `tee_dropped`.
+    pub tee_parts_shed: AtomicU64,
     /// Validated epochs that found no slot in the class threads' table
     /// (`ValidatedEpochs::unrecorded`): their streams are never stale.
     pub media_clock_unrecorded: AtomicU64,
@@ -640,6 +661,14 @@ pub struct FastPlaneSnapshot {
     /// The audio class's parent lanes (A 2.7).
     pub parent_lanes: [ParentLaneSnapshot; 2],
     pub media_clock: MediaClockSnapshot,
+    /// The tees (fix4-video): processor time (µs), the video tee's wakes,
+    /// its longest lag behind its thread (µs), and the video parts not
+    /// teed for want of room in the ring.
+    pub audio_tee_cpu_us: u64,
+    pub video_tee_cpu_us: u64,
+    pub video_tee_batches: u64,
+    pub video_tee_lag_max_us: u64,
+    pub video_tee_parts_shed: u64,
 }
 
 impl FastPlaneStats {
@@ -713,6 +742,11 @@ impl FastPlaneStats {
                 overflow: self.media_clock_overflow.iter().map(load).sum(),
                 unrecorded_streams: load(&self.media_clock_unrecorded),
             },
+            audio_tee_cpu_us: load(&self.tee_cpu_us[0]),
+            video_tee_cpu_us: load(&self.tee_cpu_us[1]),
+            video_tee_batches: load(&self.tee_batches[1]),
+            video_tee_lag_max_us: load(&self.tee_lag_max_us[1]),
+            video_tee_parts_shed: load(&self.tee_parts_shed),
         }
     }
 }
@@ -1471,12 +1505,98 @@ impl LeaseDescriptors {
 /// How often the audio thread looks at its loss meters.
 const LOSS_POLL: Duration = Duration::from_millis(100);
 
+/// Video parts under way that [`TeeParts`] remembers its verdict for.
+const TEE_PARTS: usize = 64;
+
+/// Tests: the video thread tees symbol by symbol, as before `TeeParts`
+/// (a measurement's baseline).
+#[cfg(test)]
+pub(crate) static TEE_PARTS_OFF: AtomicBool = AtomicBool::new(false);
+
+/// The video thread tees a part whole or not at all (fix4-video).
+///
+/// A full ring refused whichever symbol came, and took the next as soon as
+/// the tee released an entry: while the tee was behind, each part lost
+/// symbols here and there, more than its repair covers, so every part of
+/// the episode was lost (and the tee still spent its time on all of them).
+/// Now the verdict is made at a part's first symbol: the part is teed when
+/// the ring has room for all its symbols and as many again (the part before
+/// may still be arriving), else none of it is, and the parts after it find
+/// the room the tee frees. A tee short of processor time by a tenth loses
+/// about a tenth of the parts, not all of them.
+///
+/// A fixed table made before the thread runs: a verdict per (stream,
+/// part), the oldest replaced by a new part.
+struct TeeParts {
+    parts: [TeePart; TEE_PARTS],
+    next: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+struct TeePart {
+    stream: u64,
+    object: u64,
+    used: bool,
+    teed: bool,
+}
+
+/// What the tee needs of the ring for a part of `source_symbols` symbols
+/// of `len` bytes: its sources, an eighth more for repair, and a few more.
+fn tee_part_need(source_symbols: u64, len: u64) -> (u64, u64) {
+    let entries = source_symbols + source_symbols / 8 + 8;
+    (entries, entries.saturating_mul(len))
+}
+
+impl TeeParts {
+    fn new() -> Self {
+        Self {
+            parts: [TeePart::default(); TEE_PARTS],
+            next: 0,
+        }
+    }
+
+    /// Whether this symbol of part `object` of `stream` goes to the tee,
+    /// and whether the call shed a new part. `room` is the ring's
+    /// ([`TeeSender::room`]), read only for a part's first symbol.
+    fn admit(
+        &mut self,
+        stream: u64,
+        object: u64,
+        source_symbols: u64,
+        len: u64,
+        room: impl FnOnce() -> (u64, u64),
+    ) -> (bool, bool) {
+        if let Some(part) = self
+            .parts
+            .iter()
+            .find(|part| part.used && part.object == object && part.stream == stream)
+        {
+            return (part.teed, false);
+        }
+        let (entries, bytes) = tee_part_need(source_symbols, len);
+        let (free_entries, free_bytes) = room();
+        let teed =
+            free_entries >= entries.saturating_mul(2) && free_bytes >= bytes.saturating_mul(2);
+        self.parts[self.next] = TeePart {
+            stream,
+            object,
+            used: true,
+            teed,
+        };
+        self.next = (self.next + 1) % TEE_PARTS;
+        (teed, !teed)
+    }
+}
+
 struct Pending {
     message: usize,
     peer: SocketAddr,
     path: RelayIngressParentPath,
     rx_us: u64,
     admitted: Option<bool>,
+    /// A video part's symbol on the video thread: (stream key, part,
+    /// source symbols), for [`TeeParts`].
+    part: Option<(u64, u64, u64)>,
 }
 
 impl ClassThread {
@@ -1607,6 +1727,7 @@ impl ClassThread {
             && self.lease.is_some())
         .then(LeaseDescriptors::new);
         let mut feed_misses = FeedMisses::new();
+        let mut tee_parts = TeeParts::new();
         let mut last_loss_poll = Instant::now();
         let mut last_demand_report: Option<Instant> = None;
         // Loop lag (wave 9): the last wait's return that brought datagrams.
@@ -1694,6 +1815,7 @@ impl ClassThread {
                             meters.get_mut(index),
                             descriptors.as_mut(),
                             &mut tee,
+                            &mut tee_parts,
                             &mut feed_misses,
                         );
                         if !batch.next_window() {
@@ -1857,6 +1979,7 @@ impl ClassThread {
         mut meter: Option<&mut LossMeter>,
         mut descriptors: Option<&mut LeaseDescriptors>,
         tee: &mut TeeSender<TeeMeta>,
+        tee_parts: &mut TeeParts,
         feed_misses: &mut FeedMisses,
     ) {
         let now_us = now_unix_us();
@@ -1920,6 +2043,7 @@ impl ClassThread {
                 path,
                 rx_us,
                 admitted: None,
+                part: None,
             };
             if !is_relay_datagram(received.data) {
                 // A parent's ledger (RLL1) for the loss meter of this lane.
@@ -2030,8 +2154,16 @@ impl ClassThread {
             if let Some((lane, snapshot)) = &edge_clients {
                 clients.plan(lane, snapshot, message, &view);
             }
+            let video_part = class == TrafficClass::Video && view.is_video_kind();
             pending.push(Pending {
                 admitted: Some(view.is_video_kind()),
+                part: video_part.then(|| {
+                    (
+                        MediaClocks::key(view.tenant, view.stream).hash(),
+                        view.object,
+                        u64::from(view.source_symbols),
+                    )
+                }),
                 ..unchecked
             });
         }
@@ -2099,10 +2231,34 @@ impl ClassThread {
                 client_sent: clients.sent_to(entry.message),
                 kind,
             };
+            let data = batch.data(entry.message);
+            // A video part goes whole or not at all (`TeeParts`).
+            #[cfg(test)]
+            let part = entry
+                .part
+                .filter(|_| !TEE_PARTS_OFF.load(Ordering::Relaxed));
+            #[cfg(not(test))]
+            let part = entry.part;
+            let teed = match part {
+                Some((stream, object, source_symbols)) => {
+                    let (teed, shed) = tee_parts.admit(
+                        stream,
+                        object,
+                        source_symbols,
+                        data.len() as u64,
+                        || tee.room(),
+                    );
+                    if shed {
+                        self.stats.tee_parts_shed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    teed
+                }
+                None => true,
+            };
             // Into the pinned ring: no allocation, and nothing for the
             // class thread to free (stall follow-up). A full ring drops
             // the copy, as a full channel did.
-            if !tee.push(meta, batch.data(entry.message)) {
+            if !teed || !tee.push(meta, data) {
                 self.stats.tee_dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -2212,7 +2368,16 @@ struct Tee {
     /// Tests: the tee panics on its first datagram.
     #[cfg(test)]
     panic_on_item: bool,
+    /// Tests: processor time spent on each datagram besides its work.
+    #[cfg(test)]
+    spin_ns: u64,
 }
+
+/// Entries the tee takes in one wake before it publishes its snapshot and
+/// looks at its other work (fix4-video: was a receive batch, 65, so a tee
+/// behind by a second published and went round its loop 400 times a
+/// second more than it needed to).
+const TEE_WAKE_ENTRIES: usize = 1_024;
 
 impl Tee {
     /// Runs until the thread's channel closes. It waits on nothing but its
@@ -2232,13 +2397,18 @@ impl Tee {
                     // leaves it out (edge_admission::PLAYLIST_CPU_US).
                     let cpu_before = crate::edge_admission::thread_cpu_us();
                     let wall_before = Instant::now();
-                    for _ in 0..=RECV_BATCH {
+                    let mut lag_max_us = 0;
+                    for _ in 0..TEE_WAKE_ENTRIES {
                         let Some((meta, bytes)) = items.peek() else {
                             break;
                         };
+                        lag_max_us = lag_max_us.max(now_unix_us().saturating_sub(meta.woken_us));
                         self.process(meta, bytes).await;
                         items.release();
                     }
+                    let class = self.class.index();
+                    self.stats.tee_batches[class].fetch_add(1, Ordering::Relaxed);
+                    self.stats.tee_lag_max_us[class].fetch_max(lag_max_us, Ordering::Relaxed);
                     self.feeds.make_requested();
                     self.publish();
                     // The batch ran on one worker thread unless `process`
@@ -2251,6 +2421,7 @@ impl Tee {
                         let wall_us = wall_before.elapsed().as_micros() as u64;
                         let used = after.saturating_sub(before).min(wall_us);
                         crate::edge_admission::PLAYLIST_CPU_US.fetch_add(used, Ordering::Relaxed);
+                        self.stats.tee_cpu_us[class].fetch_add(used, Ordering::Relaxed);
                     }
                 }
                 () = expire.notified() => {
@@ -2335,6 +2506,10 @@ impl Tee {
         #[cfg(test)]
         assert!(!self.panic_on_item, "test: the tee panics");
         let started = Instant::now();
+        #[cfg(test)]
+        while (started.elapsed().as_nanos() as u64) < self.spin_ns {
+            std::hint::spin_loop();
+        }
         stall_tee(self.class, now_unix_us().saturating_sub(item.woken_us));
         match item.kind {
             TeeKind::Admitted {
@@ -2676,9 +2851,10 @@ pub async fn run_relay_class_ingest(
             media_deadline_us: config.media_deadline_us,
             epochs: Arc::clone(&epochs),
             #[cfg(test)]
-            test_alloc_counter: config
-                .test_alloc_counter
-                .filter(|_| class == TrafficClass::Audio),
+            test_alloc_counter: match class {
+                TrafficClass::Audio => config.test_alloc_counter,
+                TrafficClass::Video => config.test_video_alloc_counter,
+            },
         };
         match std::thread::Builder::new()
             .name(format!("needletail-fast-{}", class.as_str()))
@@ -2719,6 +2895,12 @@ pub async fn run_relay_class_ingest(
             feeds: Arc::clone(&feeds),
             #[cfg(test)]
             panic_on_item: config.test_tee_panic == Some(class),
+            #[cfg(test)]
+            spin_ns: if class == TrafficClass::Video {
+                config.test_video_tee_spin_ns
+            } else {
+                0
+            },
         };
         audio_tee |= class == TrafficClass::Audio;
         let nudge = Arc::new(Notify::new());
@@ -2819,6 +3001,31 @@ mod two_contributors;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_video_part_is_teed_whole_or_not_at_all() {
+        let mut parts = TeeParts::new();
+        let len = 1_400;
+        let (entries, bytes) = tee_part_need(1_000, len);
+        let roomy = || (2 * entries, 2 * bytes);
+        let tight = || (2 * entries - 1, 2 * bytes);
+        // A part's verdict is made at its first symbol and kept.
+        assert_eq!(parts.admit(7, 1, 1_000, len, roomy), (true, false));
+        assert_eq!(parts.admit(7, 1, 1_000, len, tight), (true, false));
+        // A part that finds too little room is not teed, nor are its later
+        // symbols when the room comes back.
+        assert_eq!(parts.admit(7, 2, 1_000, len, tight), (false, true));
+        assert_eq!(parts.admit(7, 2, 1_000, len, roomy), (false, false));
+        // Bytes count as entries do; other streams have verdicts of their own.
+        assert_eq!(parts.admit(8, 2, 1_000, len, || (2 * entries, bytes)), (false, true));
+        assert_eq!(parts.admit(9, 2, 1_000, len, roomy), (true, false));
+        // The table holds the last TEE_PARTS parts: the oldest is judged
+        // again (as a new part) once that many came after it.
+        for object in 100..100 + TEE_PARTS as u64 {
+            parts.admit(7, object, 10, len, roomy);
+        }
+        assert_eq!(parts.admit(7, 2, 1_000, len, roomy), (true, false));
+    }
 
     #[test]
     fn a_lease_descriptor_takes_the_longest_admitted_stream_id() {

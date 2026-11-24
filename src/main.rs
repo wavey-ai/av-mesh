@@ -44801,6 +44801,20 @@ mod tests {
         endpoints: &[RelayForwardEndpoint],
         config: fast_plane::relay::RelayClassConfig,
     ) -> FastRelay {
+        // Slots that hold the tests' 4K parts (up to 400 KB): the cache
+        // refuses a part larger than its slot.
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 512).await;
+        start_fast_relay_in(secondary_path, endpoints, config, cache).await
+    }
+
+    /// [`start_fast_relay_endpoints`] with a cache of the caller's (a 4K
+    /// part at the node's 2 MiB slots).
+    async fn start_fast_relay_in(
+        secondary_path: ParentPath,
+        endpoints: &[RelayForwardEndpoint],
+        config: fast_plane::relay::RelayClassConfig,
+        cache: Arc<LiveTsCache>,
+    ) -> FastRelay {
         let offset = config.port_offset;
         let primary_sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let secondary_sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -44847,9 +44861,6 @@ mod tests {
             fast_plane::TrafficClass::Video,
             RelayIngressParentPath::Secondary,
         );
-        // Slots that hold the tests' 4K parts (up to 400 KB): the cache
-        // refuses a part larger than its slot.
-        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 512).await;
         cache.set_hop_journal(Arc::new(HopJournal::new("relay-london", 4_096)));
         if let Some(forwarder) = &forwarder {
             forwarder.set_hop_journal(Arc::new(HopJournal::new("relay-london", 4_096)));
@@ -46011,7 +46022,9 @@ mod tests {
                 video_gro: true,
                 media_deadline_us: fast_plane::relay::DEFAULT_MEDIA_DEADLINE_US,
                 test_tee_panic: Some(fast_plane::TrafficClass::Audio),
+                test_video_tee_spin_ns: 0,
                 test_alloc_counter: None,
+                test_video_alloc_counter: None,
             },
         )
         .await;
@@ -46483,6 +46496,10 @@ mod tests {
     /// 4K past 164 Mbit/s: a forwarder's video thread and an edge's video
     /// clients, at 200 Mbit/s, and their processor time per Mbit/s.
     mod video_throughput;
+
+    /// The video tee at 247 and 300 Mbit/s of 4K (fix4-video): what it
+    /// drops, what it commits and its processor time.
+    mod video_tee;
 
     /// Edge capacity (wave 7, item 10): listeners of 1 ms parts per edge,
     /// and an ingest that never drops for the fan-out.

@@ -1037,19 +1037,41 @@ impl RelayObjectReceiver {
     fn ensure_controlled_announcement(
         &mut self,
         session_id: u64,
-        wire: &[u8],
+        symbol: &relay_session::RelayDatagram,
         now_us: u64,
     ) -> Result<(), RelayIngressError> {
-        let session = self.session(session_id)?.clone();
-        if !session.controlled_qualification {
-            return Err(RelayIngressError::AnnouncementRequired);
+        {
+            let session = self.session(session_id)?;
+            if !session.controlled_qualification {
+                return Err(RelayIngressError::AnnouncementRequired);
+            }
+            validate_session_symbol(session, symbol)?;
         }
-        let symbol = decode_datagram(wire, self.config.relay_limits)?;
-        validate_session_symbol(&session, &symbol)?;
+        // The object's symbols after its first (fix4-video): announced for
+        // this session already with the same fields, which is all the
+        // announcement below would find (it would only join the session to
+        // the object's parents, which it is in, and touch the assembly).
+        // No copy of the key, the session or the announcement. (Expired
+        // state first, as the announcement does: an assembly that went
+        // inactive is announced afresh.)
+        self.expire_if_due(now_us);
+        if let Some(active) = self.objects.get_mut(&symbol.object_key) {
+            if active.parent_sessions.contains(&session_id)
+                && derived_announcement_matches(&active.announcement, symbol)
+            {
+                active.last_activity_us = now_us;
+                return Ok(());
+            }
+        } else if self.completed.get(&symbol.object_key).is_some_and(|completed| {
+            completed.parent_sessions.contains(&session_id)
+                && derived_announcement_matches(&completed.announcement, symbol)
+        }) {
+            return Ok(());
+        }
         let announcement = ObjectAnnouncement {
             generation: symbol.generation,
             subscription_id: symbol.subscription_id,
-            key: symbol.object_key,
+            key: symbol.object_key.clone(),
             kind: symbol.object_kind,
             deadline: symbol.deadline,
             coding: symbol.coding,
@@ -1087,19 +1109,55 @@ impl RelayObjectReceiver {
         wire: &[u8],
         now_us: u64,
     ) -> Result<RelayIngressOutcome, RelayIngressError> {
-        let session = self.session(session_id)?.clone();
+        self.session(session_id)?;
         let symbol = decode_datagram(wire, self.config.relay_limits)?;
+        self.try_push_symbol(session_id, symbol, now_us)
+    }
 
+    /// [`Self::push_wire_datagram`] of a datagram already decoded (the
+    /// dispatch decodes each once, fix4-video).
+    fn push_decoded_datagram(
+        &mut self,
+        session_id: u64,
+        symbol: relay_session::RelayDatagram,
+        now_us: u64,
+    ) -> Result<RelayIngressOutcome, RelayIngressError> {
+        self.counters.datagrams_received = self.counters.datagrams_received.saturating_add(1);
+        let result = self.try_push_symbol(session_id, symbol, now_us);
+        if let Err(error) = &result {
+            self.record_rejection(error, true);
+        }
+        result
+    }
+
+    fn try_push_symbol(
+        &mut self,
+        session_id: u64,
+        symbol: relay_session::RelayDatagram,
+        now_us: u64,
+    ) -> Result<RelayIngressOutcome, RelayIngressError> {
         self.expire_if_due(now_us);
-        validate_session_symbol(&session, &symbol)?;
+        // Borrowed, not copied (its identity is two node names): what the
+        // checks below need of it is its path.
+        let parent_path = {
+            let session = self.session(session_id)?;
+            validate_session_symbol(session, &symbol)?;
+            session.parent_path
+        };
 
-        let logical = LogicalObjectIdentity::from(&symbol.object_key);
-        if self
-            .logical_keys
-            .get(&logical)
-            .is_some_and(|existing| existing != &symbol.object_key)
-        {
-            return Err(RelayIngressError::ObjectIdentityConflict);
+        // An object being assembled has its logical identity registered
+        // with its own key since its announcement (and an announcement of
+        // another key of that identity is refused), so only a symbol of an
+        // object not under way is looked up, which copies the key's names.
+        if !self.objects.contains_key(&symbol.object_key) {
+            let logical = LogicalObjectIdentity::from(&symbol.object_key);
+            if self
+                .logical_keys
+                .get(&logical)
+                .is_some_and(|existing| existing != &symbol.object_key)
+            {
+                return Err(RelayIngressError::ObjectIdentityConflict);
+            }
         }
 
         // A whole copy of a part that was rebuilt from its compact one is
@@ -1107,7 +1165,7 @@ impl RelayObjectReceiver {
         let duplicate = if self.completed_compact(&symbol.object_key)? {
             true
         } else if let Some(completed) = self.completed.get(&symbol.object_key) {
-            validate_completed_symbol(completed, &session, &symbol)?;
+            validate_completed_symbol(completed, self.session(session_id)?, &symbol)?;
             true
         } else {
             false
@@ -1169,8 +1227,7 @@ impl RelayObjectReceiver {
             .objects
             .get_mut(&symbol.object_key)
             .ok_or(RelayIngressError::AnnouncementRequired)?;
-        if !state.parent_sessions.contains(&session_id)
-            || !session.parent_path.permits(symbol.path_intent)
+        if !state.parent_sessions.contains(&session_id) || !parent_path.permits(symbol.path_intent)
         {
             return Err(RelayIngressError::UnauthorizedParent);
         }
@@ -1669,6 +1726,21 @@ fn validate_session_symbol(
     Ok(())
 }
 
+/// The announcement a controlled session's symbol makes of its object
+/// (`ensure_controlled_announcement`) equals `announcement`, its key aside.
+fn derived_announcement_matches(
+    announcement: &ObjectAnnouncement,
+    symbol: &relay_session::RelayDatagram,
+) -> bool {
+    announcement.generation == symbol.generation
+        && announcement.subscription_id == symbol.subscription_id
+        && announcement.kind == symbol.object_kind
+        && announcement.deadline == symbol.deadline
+        && announcement.coding == symbol.coding
+        && announcement.initial_repair_symbols == 0
+        && announcement.next_packet_sequence == 0
+}
+
 fn validate_completed_symbol(
     completed: &CompletedObject,
     session: &AuthenticatedRelayParentSession,
@@ -1859,19 +1931,38 @@ impl RelayUdpDispatch {
                 .push_compact_datagram(session_id, datagram, now_us)
                 .map(RelayUdpDispatchOutcome::Relay);
         }
-        if self.controlled_announcement_sessions.contains(&session_id) {
-            if let Err(error) = self
+        if !self.controlled_announcement_sessions.contains(&session_id) {
+            return self
                 .receiver
-                .ensure_controlled_announcement(session_id, datagram, now_us)
-            {
+                .push_wire_datagram(session_id, datagram, now_us)
+                .map(RelayUdpDispatchOutcome::Relay);
+        }
+        // A controlled session's datagram announces its object: decoded
+        // once for both (fix4-video: it was decoded for the announcement and
+        // again for the push).
+        let decoded = self
+            .receiver
+            .session(session_id)
+            .map(|_| ())
+            .and_then(|()| {
+                decode_datagram(datagram, self.receiver.config.relay_limits).map_err(Into::into)
+            })
+            .and_then(|symbol| {
+                self.receiver
+                    .ensure_controlled_announcement(session_id, &symbol, now_us)
+                    .map(|()| symbol)
+            });
+        let symbol = match decoded {
+            Ok(symbol) => symbol,
+            Err(error) => {
                 self.receiver.counters.datagrams_received =
                     self.receiver.counters.datagrams_received.saturating_add(1);
                 self.receiver.record_rejection(&error, true);
                 return Err(error);
             }
-        }
+        };
         self.receiver
-            .push_wire_datagram(session_id, datagram, now_us)
+            .push_decoded_datagram(session_id, symbol, now_us)
             .map(RelayUdpDispatchOutcome::Relay)
     }
 }
