@@ -2106,21 +2106,6 @@ struct Args {
     )]
     client_udp_compact_short_header: bool,
 
-    /// The fast lane makes a part's compact datagram on the class thread
-    /// from the contributor's envelope read in place (the part bytes and its
-    /// publication time, payload hash checked), before it sends: no decode,
-    /// no slot, no allocation but the datagram. That took about 20 µs at the
-    /// median and 45 µs at p99 of each part's send in the loopback bench
-    /// (wave 5, W1). `false` decodes the envelope and builds its slot, as
-    /// before. The bytes are the same either way.
-    #[arg(
-        long,
-        env = "NEEDLETAIL_CLIENT_UDP_COMPACT_FAST_PARSE",
-        default_value_t = true,
-        action = clap::ArgAction::Set
-    )]
-    client_udp_compact_fast_parse: bool,
-
     /// A one-symbol part that the edge's fast plane decoded from repair
     /// alone (its source symbol was lost upstream) goes to the compact
     /// clients at once, made from the decoded envelope (low-latency wave 5
@@ -3775,7 +3760,6 @@ async fn main() -> Result<()> {
         && fast_plane::sys::supported())
     .then(|| fast_plane::edge_clients::EdgeFastLane::new(args.client_udp_edge_rank));
     if let Some(lane) = &fast_lane {
-        lane.set_compact_fast_parse(args.client_udp_compact_fast_parse);
         lane.set_compact_top_up(args.client_udp_compact_top_up);
         lane.set_compact_mark(args.client_udp_compact_mark_fast_lane);
         lane.set_repair_thread(args.client_udp_repair_thread);

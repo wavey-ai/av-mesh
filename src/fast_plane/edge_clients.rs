@@ -563,10 +563,6 @@ pub struct EdgeFastLane {
     fds: [AtomicU64; 2],
     rank: u32,
     next_sequence: AtomicU32,
-    /// The compact datagram of a part is made from its envelope read in
-    /// place (`--client-udp-compact-fast-parse`), not from a full decode and
-    /// slot.
-    compact_fast_parse: AtomicBool,
     /// A one-symbol part decoded from repair alone goes to the compact
     /// clients at once from the decoded envelope
     /// (`--client-udp-compact-top-up`; `false`: the cache-fed lane sends
@@ -650,7 +646,6 @@ impl EdgeFastLane {
             fds: [AtomicU64::new(u64::MAX), AtomicU64::new(u64::MAX)],
             rank,
             next_sequence: AtomicU32::new(0),
-            compact_fast_parse: AtomicBool::new(true),
             compact_top_up: AtomicBool::new(true),
             compact_mark: AtomicBool::new(true),
             pace_percent: AtomicU32::new(0),
@@ -915,12 +910,6 @@ impl EdgeFastLane {
         self.txtime.store(state, Ordering::Release);
     }
 
-    /// Make compact datagrams from the envelope read in place (`true`, the
-    /// default) or from the full decode and slot, as before (`false`).
-    pub fn set_compact_fast_parse(&self, fast: bool) {
-        self.compact_fast_parse.store(fast, Ordering::Relaxed);
-    }
-
     /// Send a one-symbol part decoded from repair alone to the compact
     /// clients from the decoded envelope (`true`, the default), or leave it
     /// to the cache-fed lane, as before (`false`).
@@ -1154,12 +1143,10 @@ impl EdgeFastLane {
             compact::encode_part_into(view.object, published_us, slim.payload, out)?
         } else {
             let envelope = one_symbol_envelope(view)?;
-            // The part read in place: no decode, no slot. What it does not
-            // plainly read (or with --client-udp-compact-fast-parse false)
-            // gets no compact datagram here; the tee decodes it for the ring.
-            if !self.compact_fast_parse.load(Ordering::Relaxed) {
-                return None;
-            }
+            // The part read in place: no decode, no slot (the only way the
+            // class thread makes it: a full decode allocates). What it does
+            // not plainly read gets no compact datagram here; the tee
+            // decodes it for the ring (`keep_compact`).
             let part = av_mesh::canonical_slot::envelope_part(envelope)?;
             if part.stream_id != stream_id || part.object != view.object {
                 return None;
