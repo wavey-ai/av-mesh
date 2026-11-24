@@ -19923,7 +19923,11 @@ struct AppRouter {
     /// The physical host of this node (`--host-tag`), in its advertisement.
     host_tag: Option<String>,
     /// Answers to a listener whose redundant leg shares a host with its
-    /// other leg: no edge on another host was eligible (cumulative).
+    /// other leg: no edge on another host was eligible (cumulative). It
+    /// counts answers, not listeners: each UDP `ASSIGN` answered (its
+    /// source unproven) and each HTTPS answer naming a session, so a
+    /// listener that hedges over HTTPS or asks again counts again. Zero
+    /// means no listener was given two legs on one host.
     second_leg_same_host: Arc<AtomicU64>,
     /// Capacity that this entry point has given away at each cache since
     /// the advertisement of the cache that it last read: the time of that
@@ -38110,6 +38114,63 @@ mod tests {
                 "{caches:?}"
             );
         }
+        mesh.shutdown();
+    }
+
+    /// D 5 (seam to B): a listener that holds a leg and asks for another
+    /// (`hold=`) is given an edge on another host than the leg it holds;
+    /// with none eligible the same-host edge stands and
+    /// `second_leg_same_host` counts the listener's answer, not an
+    /// operator's look.
+    #[tokio::test]
+    async fn a_replacement_leg_avoids_the_host_of_the_leg_it_holds() {
+        let on_host = |mut snapshot: MeshSnapshot, host: &str| {
+            snapshot.edge_service.as_mut().unwrap().host = Some(host.to_owned());
+            snapshot
+        };
+        let edges = |other_host_load: u32| {
+            vec![
+                on_host(audio_cache_snapshot_for_tests("edge-b", 100, Some(500)), "host-a"),
+                on_host(audio_cache_snapshot_for_tests("edge-c", 100, Some(500)), "host-a"),
+                on_host(
+                    audio_cache_snapshot_for_tests("edge-d", other_host_load, Some(500)),
+                    "host-b",
+                ),
+            ]
+        };
+        let ask = |router: &AppRouter, query: String| {
+            let router = router.clone();
+            async move {
+                let api: serde_json::Value = serde_json::from_str(&body_text(
+                    get_for_tests(&router, &format!("/api/assignment?stream=801&{query}")).await,
+                ))
+                .unwrap();
+                api
+            }
+        };
+
+        // The entry point is a candidate too: on host-a with the held leg.
+        let (router, mesh) = entry_point_for_tests(edges(100)).await;
+        let router = router.with_host_tag(Some("host-a".into()));
+        for index in 0..20 {
+            let api = ask(&router, format!("sid=apart-{index}&hold=edge-b&paths=1")).await;
+            assert_eq!(assigned_names(&api)[0], "edge-d", "{api:#}");
+            assert_eq!(api["assigned"][0]["host"], "host-b", "{api:#}");
+            assert_eq!(api["second_leg_same_host"], 0, "{api:#}");
+        }
+        mesh.shutdown();
+
+        // The edge on the other host over the gate: the sibling stands.
+        let (router, mesh) = entry_point_for_tests(edges(990)).await;
+        let router = router.with_host_tag(Some("host-a".into()));
+        let api = ask(&router, "hold=edge-b&paths=1".into()).await;
+        assert_ne!(assigned_names(&api)[0], "edge-d", "{api:#}");
+        assert_eq!(api["assigned"][0]["host"], "host-a", "{api:#}");
+        assert_eq!(api["second_leg_same_host"], 0, "an operator's look: {api:#}");
+        let api = ask(&router, "sid=together-1&hold=edge-b&paths=1".into()).await;
+        assert_ne!(assigned_names(&api)[0], "edge-d", "{api:#}");
+        assert_eq!(api["assigned"][0]["host"], "host-a", "{api:#}");
+        assert_eq!(api["second_leg_same_host"], 1, "{api:#}");
         mesh.shutdown();
     }
 

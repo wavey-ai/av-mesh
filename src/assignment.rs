@@ -535,7 +535,10 @@ pub fn assign(
     // Redundant legs: only where the cache stays under the gate with the
     // listener counted, and never a spill. An edge on a host that no leg of
     // the listener is on first; when none is eligible, the same choice
-    // among them all.
+    // among them all. The host ranks above a remembered leg: a repeat of an
+    // answer that put both legs on one host moves its second leg once an
+    // edge on another host passes the gate, and the remembered leg's
+    // pending charge lapses at its next advertisement.
     let mut second_leg_same_host = false;
     'legs: while caches.len() < usize::from(wanted) {
         for apart in [true, false] {
