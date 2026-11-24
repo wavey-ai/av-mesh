@@ -2181,7 +2181,13 @@ impl Director {
                 self.confirm_to(&request, entry, token, now, out);
             }
         }
-        let no_cache = usable.is_empty();
+        // No cache named as a leg: none of the region, or none granted
+        // (the redundant gate refused every edge with room; a spare named
+        // alone is no leg). A drained leg with another delivering goes at
+        // once (step 5), a rebalanced one stays (step 6) (fix 4, F6a: a
+        // spare named alone kept two drained legs until their edge cut
+        // them, 7 s into the drain).
+        let no_cache = usable.is_empty() || (granted == 0 && chosen.is_empty());
         if no_cache {
             self.no_cache(legs, &request, now, out);
         }
@@ -3853,6 +3859,42 @@ mod tests {
         assert!(!w.s.legs[&e1].released);
         assert_eq!(w.s.log.last().unwrap(), "takeback e1");
         assert_eq!(w.d.stats.failovers, 0, "it stays in its region");
+    }
+
+    /// Fix 4, F6a: the redundant gate refused every edge with room, and
+    /// the answer names only a spare (no gate on a spare). That names no
+    /// cache for the leg: a drained leg goes at once beside the leg that
+    /// delivers (step 5), a rebalanced one is taken back (step 6). Before,
+    /// the spare counted as a cache named, the drained leg stayed until its
+    /// edge cut it (lp2c10-a-drain: two legs 7 s into the drain), and so
+    /// did the drain.
+    #[test]
+    fn an_answer_that_grants_no_leg_releases_a_drained_leg() {
+        for (reason, released) in [("draining", true), ("rebalance", false)] {
+            let mut w = World::new(&format!("gate-{reason}"), 2, true);
+            w.join(&[1, 2], Some(3));
+            let e1 = w.key("e1");
+            w.event(LegEvent::Moved {
+                leg: e1,
+                reason: reason.into(),
+            });
+            let (to, nonce, _) = w.requests()[0].clone();
+            w.answer_why(
+                to,
+                nonce,
+                vec![cache(4), failover_entry()],
+                0,
+                true,
+                None,
+                Some(ShortGrant::Gate),
+            );
+            assert_eq!(w.s.legs[&e1].released, released, "{reason}: {:?}", w.s.log);
+            if !released {
+                assert_eq!(w.s.log.last().unwrap(), "takeback e1");
+            }
+            assert_eq!(w.d.stats.failovers, 0, "{reason}: it stays in its region");
+            assert!(!w.held().iter().any(|node| node == "e4"), "{reason}: no leg at the spare's edge");
+        }
     }
 
     #[test]

@@ -1406,11 +1406,35 @@ async fn kill() {
 /// + r in section 6) at r of loopback, with this host's few ms.
 const KILL_BOUND_US: u64 = 100_000;
 
+/// The end of an edge's drain after it begins (fix 4, F6a; B 3.11 said
+/// housekeeping <= 1 s + spread 2 s + 3.5 r + 32 parts = 3.2 s). The edge's
+/// stream senders now see the drain at their next part, not at their next
+/// housekeeping tick of up to 1 s; its first moves wait for its
+/// advertisement (100 ms, wave 9); its moves are spread over 2 s (the last
+/// share at 1.95 s); a leg is released when its replacement is level (3.5 r
+/// + 32 parts: 37 ms in lp2) or, steady but not level, after the level
+/// wait (1 s); a leg with nowhere to go is released at the answer (r). So
+/// 0.1 + 2.0 + 1.0 = 3.1 s + 3.5 r at most, 2.1 s + 3.5 r + 32 parts when
+/// the replacements are level; asserted at 3.2 s with this host's margin.
+/// The hard bound is the advertisement, the spread and the grace: 12.1 s,
+/// inside the stop's 14 s (`--stop-drain-ms`).
+const DRAIN_BOUND: Duration = Duration::from_millis(3_200);
+
+/// Drain edge `index` and wait for its end: how long it took from the
+/// drain's start, which must be within [`DRAIN_BOUND`].
+async fn drain_timed(region: &Region, crowd: &Crowd, index: usize) -> Duration {
+    let began = Instant::now();
+    drain_watched(region, crowd, index, DRAIN_BOUND).await;
+    let took = began.elapsed();
+    assert!(took <= DRAIN_BOUND, "{} drained in {took:?}", region.node(index));
+    took
+}
+
 /// An edge drained under two-path listeners (B 3.11 "Edge drain"): each
 /// leg there moves make before break, released when its replacement is
 /// level. No time on one path, nothing cut at the edge's grace, every
-/// hand-over within the level wait and the drain's end within the drain's
-/// spread and the hand-overs (3.2 s + 3.5 r, asserted at 4 s).
+/// hand-over within the level wait and the drain's end within
+/// [`DRAIN_BOUND`].
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn drain() {
     let _serial = SERIAL.lock().await;
@@ -1420,7 +1444,8 @@ async fn drain() {
     let drained = region.node(0);
     let edge = region.edge(0);
     let start = now_us();
-    drain_watched(&region, &crowd, 0, Duration::from_secs(4)).await;
+    let took = drain_timed(&region, &crowd, 0).await;
+    eprintln!("drain: {drained} drained in {took:?}");
     let marks = Marks {
         start,
         end: now_us(),
@@ -1546,6 +1571,50 @@ fn assert_kill_replaced(name: &str, runs: &[ListenerRun], killed: &str, marks: M
                 run.sid
             );
         }
+    }
+}
+
+/// A drain when no other edge has room for a redundant leg (fix 4, F6a,
+/// lp2c10-a-drain): the entry grants the drained legs no replacement and
+/// names only a spare. Each drained leg is released at that answer beside
+/// the leg that delivers (B 3.5 step 5), so the drain ends within its
+/// bound, nothing is cut at the edge's grace and nothing is missing; the
+/// listeners are on one path until room comes (not claimed, B 3.11).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drain_with_no_room_elsewhere_ends_in_its_bound() {
+    let _serial = SERIAL.lock().await;
+    let region = Region::start(232, Payload::Pcm, [100; 4]).await;
+    let crowd = Crowd::join(&region, listeners("no-room", 8)).await;
+    steady(STEADY_BEFORE).await;
+    // The other edges over the redundant leg's gate (800 with the
+    // listener counted).
+    for index in 1..4 {
+        region.set_base(index, 790);
+    }
+    tokio::time::sleep(ADVERTISE_EVERY * 3).await;
+    let edge = region.edge(0);
+    assert!(region.legs_at(0) > 0, "{} holds legs", region.node(0));
+    let took = drain_timed(&region, &crowd, 0).await;
+    eprintln!("a_drain_with_no_room_elsewhere: drained in {took:?}");
+    assert_eq!(
+        edge.stats.moves_expired.load(Ordering::Relaxed),
+        0,
+        "nothing cut at the grace"
+    );
+    drop(edge);
+    region.set_draining(0, false).await;
+    for live in &crowd.lives {
+        live.stop.store(true, Ordering::Relaxed);
+    }
+    let runs = crowd.finish().await;
+    region.shutdown().await;
+    for run in &runs {
+        assert!(
+            !run.replacements.iter().any(|replacement| replacement.kind == ReplacementKind::Interrupt),
+            "{}: {:?}",
+            run.sid,
+            run.replacements
+        );
     }
 }
 
