@@ -1369,6 +1369,7 @@ async fn a_part_decoded_from_repair_alone_goes_to_compact_listeners_at_once() {
         .stats()
         .fast_lane
         .get()
+        .and_then(std::sync::Weak::upgrade)
         .expect("the fast lane")
         .snapshot_stats();
     assert!(

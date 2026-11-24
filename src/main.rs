@@ -22873,7 +22873,11 @@ impl AppRouter {
                     "nack_resent": stats.nack_resent.load(Ordering::Relaxed),
                     "nack_refused": stats.nack_refused.load(Ordering::Relaxed),
                     "nack_edge_capped": stats.nack_edge_capped.load(Ordering::Relaxed),
-                    "fast_lane": stats.fast_lane.get().map(|lane| lane.snapshot_stats()),
+                    "fast_lane": stats
+                        .fast_lane
+                        .get()
+                        .and_then(std::sync::Weak::upgrade)
+                        .map(|lane| lane.snapshot_stats()),
                 })
             }),
         });

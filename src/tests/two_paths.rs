@@ -17,6 +17,11 @@
 //! [`assert_the_rule`]); and the hand-over, exposure and single-path times
 //! of the change. The tests take turns ([`SERIAL`]); each runs 25 to 45 s,
 //! the token test up to two and a half minutes.
+//!
+//! The gap clause here is an in-process stand-in, not the referee's: the
+//! full clause (no gap in the window over the steady gap plus one part,
+//! anywhere, scored against the probe's own null windows, notes-stage2) is
+//! the lab's, with probes of 360 s or more (B section 6).
 
 use super::compact_lane::Payload;
 use super::fast_lane::LaneEdge;
@@ -59,7 +64,7 @@ struct Slot {
     node: String,
     client: SocketAddr,
     edge: Option<Arc<LaneEdge>>,
-    /// It has run (a later start is a restart, at another address).
+    /// It has run (a later start is a restart, at the same address).
     started: bool,
     draining: bool,
     /// Load besides its legs (permille), which a test may change, and what
@@ -398,39 +403,43 @@ impl Region {
     }
 
     /// The edge starts: an empty cache that the stream fills from now on,
-    /// new token keys, advertised under its name. An edge that ran before
-    /// comes back at another address of the region's port: in this process
-    /// a stopped edge's client socket is still bound for seconds (some
-    /// thread of the old edge holds it, and with SO_REUSEPORT a new socket
-    /// would share the address with it), where a restarted process binds a
-    /// free one.
+    /// new token keys, advertised under its name, at its address. An edge
+    /// that ran before comes back at the same address, as a restarted
+    /// process does, once the old edge's client sockets are closed (a
+    /// plain bind of the address succeeds): with SO_REUSEPORT a new socket
+    /// would otherwise share the address with a dead one.
     async fn start_edge(&self, index: usize) {
-        let (slot, client) = {
+        let (client, restart) = {
+            let slots = self.slots.lock().unwrap();
+            assert!(
+                slots[index].edge.is_none(),
+                "an edge that runs is not started"
+            );
+            (slots[index].client, slots[index].started)
+        };
+        if restart {
+            until(
+                "the stopped edge's client sockets are closed",
+                Duration::from_secs(10),
+                || std::net::UdpSocket::bind(client).is_ok(),
+            )
+            .await;
+        }
+        let slot = {
             let mut slots = self.slots.lock().unwrap();
             let slot = &mut slots[index];
-            assert!(slot.edge.is_none(), "an edge that runs is not started");
-            if slot.started {
-                let SocketAddr::V4(old) = slot.client else {
-                    unreachable!("loopback")
-                };
-                assert!(old.ip().octets()[3] < 200, "one restart an edge");
-                slot.client = SocketAddr::from((loopback(old.ip().octets()[3] + 80), old.port()));
-            }
             slot.started = true;
             slot.draining = false;
-            (
-                Slot {
-                    node: slot.node.clone(),
-                    client: slot.client,
-                    edge: None,
-                    started: true,
-                    draining: false,
-                    base_permille: Arc::clone(&slot.base_permille),
-                    leg_permille: Arc::clone(&slot.leg_permille),
-                    rebalance: slot.rebalance,
-                },
-                slot.client,
-            )
+            Slot {
+                node: slot.node.clone(),
+                client,
+                edge: None,
+                started: true,
+                draining: false,
+                base_permille: Arc::clone(&slot.base_permille),
+                leg_permille: Arc::clone(&slot.leg_permille),
+                rebalance: slot.rebalance,
+            }
         };
         let edge = Arc::new(start_edge(&slot, client).await);
         self.slots.lock().unwrap()[index].edge = Some(edge);
@@ -459,12 +468,6 @@ impl Region {
         self.slots.lock().unwrap()[index]
             .base_permille
             .store(base_permille, Ordering::Relaxed);
-    }
-
-    fn leg_cost(&self, index: usize) -> u32 {
-        self.slots.lock().unwrap()[index]
-            .leg_permille
-            .load(Ordering::Relaxed)
     }
 
     fn load(&self, index: usize) -> u32 {
@@ -1327,6 +1330,30 @@ async fn finish(region: &Region, crowd: Crowd, marks: Marks) -> (Vec<ListenerRun
     (runs, last, sent)
 }
 
+/// Each of `replacements` a hand-over within the level wait and this
+/// host's margin (1.5 s; B 3.11: level at 32 parts after 3.5 r).
+fn assert_handovers<'a>(
+    run: &ListenerRun,
+    replacements: impl IntoIterator<Item = &'a Replacement>,
+) {
+    for replacement in replacements {
+        assert_eq!(
+            replacement.kind,
+            ReplacementKind::Handover,
+            "{}: {replacement:?}",
+            run.sid
+        );
+        let handover = replacement
+            .handover
+            .unwrap_or_else(|| panic!("{}: no hand-over time: {replacement:?}", run.sid));
+        assert!(
+            handover <= Duration::from_millis(1_500),
+            "{}: {replacement:?}",
+            run.sid
+        );
+    }
+}
+
 /// The listeners that held a leg at `node` during the run.
 fn held_at<'a>(runs: &'a [ListenerRun], node: &str) -> Vec<&'a ListenerRun> {
     runs.iter()
@@ -1346,8 +1373,8 @@ fn listeners(prefix: &str, count: usize) -> Vec<ListenerConfig> {
 /// leg carries on, the spare is hedged at 50 to 70 ms, the dead leg is
 /// failed at 200 ms. Nothing missing, no gap over the steady gap plus one
 /// part, every listener that had a leg there on one path for at most
-/// 70 ms + r and a few ms of this host (asserted at 150 ms), its exposure
-/// likewise.
+/// 70 ms + r and a few ms of this host, its exposure likewise
+/// ([`assert_kill_replaced`]).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kill() {
     let _serial = SERIAL.lock().await;
@@ -1364,50 +1391,18 @@ async fn kill() {
     let (runs, last, sent) = finish(&region, crowd, marks).await;
     region.shutdown().await;
     assert_the_rule("kill", &runs, marks, last, &sent, Payload::Pcm.part_us());
-    let hit = held_at(&runs, &killed);
-    assert!(!hit.is_empty(), "a listener had a leg at {killed}");
-    for run in hit {
-        let (_, longest) = single_path_in(run, marks);
-        assert!(
-            longest <= 150_000,
-            "{}: {longest} us on one path: {:?}",
-            run.sid,
-            run.single_spans_us
-        );
-        let replaced = run
-            .replacements
-            .iter()
-            .filter(|replacement| replacement.from == killed)
-            .collect::<Vec<_>>();
-        assert!(
-            !replaced.is_empty(),
-            "{}: its leg at {killed} was replaced",
-            run.sid
-        );
-        for replacement in replaced {
-            assert!(
-                matches!(
-                    replacement.kind,
-                    ReplacementKind::Hedge | ReplacementKind::Replace
-                ),
-                "{}: {replacement:?}",
-                run.sid
-            );
-            let exposure = replacement.exposure.expect("an exposure");
-            assert!(
-                exposure <= Duration::from_millis(150),
-                "{}: {replacement:?}",
-                run.sid
-            );
-        }
-    }
+    assert_kill_replaced("kill", &runs, &killed, marks);
 }
+
+/// A kill's bound on one path and on each exposure: 70 ms + r (B 3.11; 80 ms
+/// + r in section 6) at r of loopback, with this host's few ms.
+const KILL_BOUND_US: u64 = 100_000;
 
 /// An edge drained under two-path listeners (B 3.11 "Edge drain"): each
 /// leg there moves make before break, released when its replacement is
 /// level. No time on one path, nothing cut at the edge's grace, every
 /// hand-over within the level wait and the drain's end within the drain's
-/// spread and the hand-overs (3 s + 3.5 r, asserted at 6 s).
+/// spread and the hand-overs (3.2 s + 3.5 r, asserted at 4 s).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn drain() {
     let _serial = SERIAL.lock().await;
@@ -1417,7 +1412,7 @@ async fn drain() {
     let drained = region.node(0);
     let edge = region.edge(0);
     let start = now_us();
-    drain_watched(&region, &crowd, 0, Duration::from_secs(6)).await;
+    drain_watched(&region, &crowd, 0, Duration::from_secs(4)).await;
     let marks = Marks {
         start,
         end: now_us(),
@@ -1450,25 +1445,21 @@ async fn drain() {
             .filter(|replacement| replacement.from == drained)
             .collect();
         assert!(!handovers.is_empty(), "{}: moved off {drained}", run.sid);
-        for handover in handovers {
-            assert_eq!(
-                handover.kind,
-                ReplacementKind::Handover,
-                "{}: {handover:?}",
-                run.sid
-            );
-            assert!(
-                handover.handover.unwrap() <= Duration::from_millis(1_500),
-                "{}: {handover:?}",
-                run.sid
-            );
-        }
+        assert_handovers(run, handovers);
     }
 }
 
-/// An edge killed and back 2 s later, empty, with new token keys (B 3.11
-/// "Edge crash-restart"): as a kill; the listeners skip it 30 s, and the
-/// region serves them throughout.
+/// An edge killed and back at its address 2 s later, empty, with new token
+/// keys (B 3.11 "Edge crash-restart"): as a kill. Every listener that had a
+/// leg there has it replaced from its spare beside its other leg, with an
+/// exposure and a time on one path within the kill's bound; the listeners
+/// skip the edge 30 s and the region serves them throughout; the restarted
+/// edge counts no request with a dead token.
+///
+/// A restart 2 s later does not reach the rules for an edge back within a
+/// leg's 200 ms (its refresh answered `TOKEN` and admitted as new at the
+/// head, B 4) or a hedge to a restarted spare (B 3.8): they are left to the
+/// lab's `udp-edge-crash-restart` under a supervisor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn crash_restart() {
     let _serial = SERIAL.lock().await;
@@ -1476,15 +1467,20 @@ async fn crash_restart() {
     let crowd = Crowd::join(&region, listeners("crash", 8)).await;
     steady(STEADY_BEFORE).await;
     let crashed = region.node(1);
+    let address = region.client(1);
     let start = now_us();
     region.kill(1).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     region.start_edge(1).await;
+    assert_eq!(region.client(1), address, "back at its address");
     let marks = Marks {
         start,
         end: now_us(),
     };
+    let restarted = region.edge(1);
     let (runs, last, sent) = finish(&region, crowd, marks).await;
+    let bad_tokens = restarted.stats.bad_tokens.load(Ordering::Relaxed);
+    drop(restarted);
     region.shutdown().await;
     assert_the_rule(
         "crash_restart",
@@ -1494,13 +1490,51 @@ async fn crash_restart() {
         &sent,
         Payload::Pcm.part_us(),
     );
-    for run in held_at(&runs, &crashed) {
+    assert_eq!(
+        bad_tokens, 0,
+        "no request with a dead token at the restarted edge"
+    );
+    assert_kill_replaced("crash_restart", &runs, &crashed, marks);
+}
+
+/// The kill clauses (B 3.11, section 6): a listener had a leg at `killed`;
+/// each such leg was replaced from the spare beside the other leg (a
+/// hedge), its exposure present and, like the listener's longest span on
+/// one path, within 70 ms + r and this host's few ms (asserted at 100 ms).
+fn assert_kill_replaced(name: &str, runs: &[ListenerRun], killed: &str, marks: Marks) {
+    let hit = held_at(runs, killed);
+    assert!(!hit.is_empty(), "{name}: a listener had a leg at {killed}");
+    for run in hit {
         let (_, longest) = single_path_in(run, marks);
-        assert!(longest <= 150_000, "{}: {longest} us on one path", run.sid);
-        for replacement in run.replacements.iter().filter(|r| r.from == crashed) {
+        assert!(
+            longest <= KILL_BOUND_US,
+            "{name}: {}: {longest} us on one path: {:?}",
+            run.sid,
+            run.single_spans_us
+        );
+        let replaced = run
+            .replacements
+            .iter()
+            .filter(|replacement| replacement.from == killed)
+            .collect::<Vec<_>>();
+        assert!(
+            !replaced.is_empty(),
+            "{name}: {}: its leg at {killed} was replaced",
+            run.sid
+        );
+        for replacement in replaced {
+            assert_eq!(
+                replacement.kind,
+                ReplacementKind::Hedge,
+                "{name}: {}: {replacement:?}",
+                run.sid
+            );
+            let exposure = replacement
+                .exposure
+                .unwrap_or_else(|| panic!("{name}: {}: no exposure: {replacement:?}", run.sid));
             assert!(
-                replacement.exposure.unwrap_or_default() <= Duration::from_millis(150),
-                "{}: {replacement:?}",
+                exposure <= Duration::from_micros(KILL_BOUND_US),
+                "{name}: {}: {replacement:?}",
                 run.sid
             );
         }
@@ -1559,14 +1593,7 @@ async fn two_drains() {
             run.sid,
             run.single_spans_us
         );
-        for replacement in &run.replacements {
-            assert_eq!(
-                replacement.kind,
-                ReplacementKind::Handover,
-                "{}: {replacement:?}",
-                run.sid
-            );
-        }
+        assert_handovers(run, &run.replacements);
     }
     // The listener whose two legs were drained replaced both.
     let both = &runs[0];
@@ -1629,6 +1656,7 @@ async fn roll_of_three_edges() {
             run.sid,
             run.single_spans_us
         );
+        assert_handovers(run, &run.replacements);
     }
 }
 
@@ -1640,17 +1668,110 @@ async fn roll_of_three_edges() {
 /// than the dead leg's verdict (200 ms) and its replacement's start.
 ///
 /// The listeners hold no spare here (`--spare false`): with a spare, a
-/// dead leg's place goes to the spare that the listener's join was given
-/// (a weighted rendezvous among the edges that are not its other leg; the
-/// kill test asserts that path), not to the entry's apportionment.
+/// dead leg's place goes to the spare that the listener's join was given,
+/// not to the entry's apportionment
+/// ([`the_36_legs_of_a_killed_edge_with_a_spare`]).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_36_legs_of_a_killed_edge() {
+    let killed = kill_the_busiest_of_72(160, false).await;
+    for ((index, _), (got, share)) in killed.survivors.iter().zip(killed.shares()) {
+        assert!(
+            got <= share * 1.3 && got >= share / 1.3,
+            "edge-{}: {got} legs against a share of {share:.1}: {:?}",
+            index + 1,
+            killed.landed
+        );
+    }
+    for replacement in &killed.replacements {
+        assert_eq!(
+            replacement.kind,
+            ReplacementKind::Replace,
+            "{replacement:?}"
+        );
+    }
+}
+
+/// The same kill with the client's defaults (a spare): each dead leg's
+/// place goes first to the listener's spare, a weighted rendezvous among
+/// the edges that are not its other leg, weighted by `FULL_LOAD - load`.
+/// That is not the entry's apportionment by headroom to the target, so the
+/// share clause is not claimed here (raised with the lead, review of B Y5,
+/// finding 4); what the design claims is: every leg replaced, as a hedge or,
+/// where the spare refused it, through the entry; no survivor over the
+/// rebalance target (800) after the kill; nothing missing; the time on one
+/// path within the dead leg's verdict and the new leg's start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_36_legs_of_a_killed_edge_with_a_spare() {
+    let killed = kill_the_busiest_of_72(196, true).await;
+    for replacement in &killed.replacements {
+        assert!(
+            matches!(
+                replacement.kind,
+                ReplacementKind::Hedge | ReplacementKind::Replace
+            ),
+            "{replacement:?}"
+        );
+    }
+    for ((index, _), peak) in killed.survivors.iter().zip(&killed.peaks) {
+        assert!(
+            *peak <= 800,
+            "edge-{} reached {peak} permille after the kill: {:?}",
+            index + 1,
+            killed.landed
+        );
+    }
+}
+
+/// What [`kill_the_busiest_of_72`] found: the killed edge's legs, each
+/// survivor's index and legs before the kill, its peak load after it, where
+/// the killed edge's legs went, and those replacements.
+struct BusiestKilled {
+    legs: u64,
+    survivors: Vec<(usize, u64)>,
+    bases: [u32; 4],
+    peaks: Vec<u32>,
+    landed: BTreeMap<String, u64>,
+    replacements: Vec<Replacement>,
+}
+
+impl BusiestKilled {
+    /// Each survivor's legs taken and its share of them by headroom to the
+    /// target (800) as the entries saw it.
+    fn shares(&self) -> Vec<(f64, f64)> {
+        let headroom: Vec<f64> = self
+            .survivors
+            .iter()
+            .map(|(index, before)| 800.0 - f64::from(self.bases[*index] + 5 * *before as u32))
+            .collect();
+        let total: f64 = headroom.iter().sum();
+        self.survivors
+            .iter()
+            .zip(&headroom)
+            .map(|((index, _), room)| {
+                let got = self
+                    .landed
+                    .get(&region_node_name(*index))
+                    .copied()
+                    .unwrap_or(0);
+                (got as f64, self.legs as f64 * room / total)
+            })
+            .collect()
+    }
+}
+
+/// 72 two-path listeners (`spare` or not) of 2.5 ms Opus on four edges at
+/// base loads 100/100/250/400 and 5 permille a leg; the edge with the most
+/// legs is killed. Asserts the rule, every leg of the killed edge replaced,
+/// and every such listener's time on one path and exposure within the dead
+/// leg's verdict (200 ms), the request beside a delivering leg spread over
+/// 250 ms (B 3.5 step 3) and the new leg's start (500 ms).
+async fn kill_the_busiest_of_72(base: u8, spare: bool) -> BusiestKilled {
     let _serial = SERIAL.lock().await;
     let bases = [100_u32, 100, 250, 400];
-    let region = Region::start(160, Payload::Opus, bases).await;
+    let region = Region::start(base, Payload::Opus, bases).await;
     let configs = (0..72)
         .map(|index| ListenerConfig {
-            spare: false,
+            spare,
             ..ListenerConfig::two_paths(format!("legs36-{index}"))
         })
         .collect();
@@ -1669,6 +1790,15 @@ async fn the_36_legs_of_a_killed_edge() {
         start,
         end: now_us(),
     };
+    // Each survivor's peak load over the window after the kill.
+    let mut peaks = vec![0_u32; survivors.len()];
+    let watched = Instant::now();
+    while watched.elapsed() < WINDOW_AFTER {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for ((index, _), peak) in survivors.iter().zip(peaks.iter_mut()) {
+            *peak = (*peak).max(region.load(*index));
+        }
+    }
     let (runs, last, sent) = finish(&region, crowd, marks).await;
     region.shutdown().await;
     assert_the_rule(
@@ -1680,54 +1810,49 @@ async fn the_36_legs_of_a_killed_edge() {
         Payload::Opus.part_us(),
     );
     let mut landed: BTreeMap<String, u64> = BTreeMap::new();
+    let mut replacements = Vec::new();
     for run in &runs {
         for replacement in run.replacements.iter().filter(|r| r.from == node) {
             *landed.entry(replacement.to.clone()).or_default() += 1;
+            replacements.push(replacement.clone());
         }
     }
-    // Each survivor's headroom to the target (800) as the entries saw it.
-    let headroom: Vec<f64> = survivors
-        .iter()
-        .map(|(index, before)| 800.0 - f64::from(bases[*index] + 5 * *before as u32))
-        .collect();
-    let total: f64 = headroom.iter().sum();
     let moved: u64 = landed.values().sum();
     eprintln!(
-        "the_36_legs: {legs} legs at {node}, {moved} replaced: {landed:?}, survivors {survivors:?}"
+        "the_36_legs (spare {spare}): {legs} legs at {node}, {moved} replaced: {landed:?}, survivors {survivors:?}, peaks {peaks:?}"
     );
     assert!(legs >= 30, "{legs} legs at the busiest edge");
     assert_eq!(
         moved, legs,
         "every leg of the killed edge was replaced: {landed:?}"
     );
-    for ((index, _), room) in survivors.iter().zip(&headroom) {
-        let share = moved as f64 * room / total;
-        let got = landed.get(&region_node_name(*index)).copied().unwrap_or(0) as f64;
-        assert!(
-            got <= share * 1.3 && got >= share / 1.3,
-            "edge-{}: {got} legs against a share of {share:.1}: {landed:?}",
-            index + 1
-        );
-    }
     for run in held_at(&runs, &node) {
         let (_, longest) = single_path_in(run, marks);
-        // The dead leg's verdict (200 ms), the request beside a delivering
-        // leg spread over 250 ms (B 3.5 step 3), the new leg's start.
         assert!(longest <= 500_000, "{}: {longest} us on one path", run.sid);
         for replacement in run.replacements.iter().filter(|r| r.from == node) {
-            assert_eq!(
-                replacement.kind,
-                ReplacementKind::Replace,
-                "{}: {replacement:?}",
-                run.sid
-            );
+            let exposure = replacement
+                .exposure
+                .unwrap_or_else(|| panic!("{}: no exposure: {replacement:?}", run.sid));
             assert!(
-                replacement.exposure.unwrap() <= Duration::from_millis(500),
+                exposure <= Duration::from_millis(500),
                 "{}: {replacement:?}",
                 run.sid
             );
         }
     }
+    let killed = BusiestKilled {
+        legs,
+        survivors,
+        bases,
+        peaks,
+        landed,
+        replacements,
+    };
+    eprintln!(
+        "the_36_legs (spare {spare}): taken and shares {:?}",
+        killed.shares()
+    );
+    killed
 }
 
 /// B 2.6: a token is good in the edge's minute of issue and the next. Four
@@ -1892,15 +2017,17 @@ async fn rebalance_at_850_500_780() {
     region.set_load(0, 850);
     region.set_load(1, 500);
     region.set_load(2, 780);
-    let receiver_cost = region.leg_cost(1);
-    // The legs are 10 s old, then three rounds of 3 s, and one more.
+    // The legs are 10 s old, then three rounds of 3 s, and one more; the
+    // receiver's load every 20 ms, for each landing.
     let mut peak = [0_u32; 3];
+    let mut receiver: Vec<(Instant, u32)> = Vec::new();
     let began = Instant::now();
     while began.elapsed() < Duration::from_secs(23) {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
         for (index, peak) in peak.iter_mut().enumerate() {
             *peak = (*peak).max(region.load(index));
         }
+        receiver.push((Instant::now(), region.load(1)));
     }
     let marks = Marks {
         start,
@@ -1935,12 +2062,22 @@ async fn rebalance_at_850_500_780() {
             "{handover:?}"
         );
     }
-    // Each leg it took arrived while it was under the receivers' level.
-    assert!(
-        peak[1] < 725 + receiver_cost,
-        "the receiver reached {} permille at {receiver_cost} a leg",
-        peak[1]
-    );
+    // Each leg it took was granted while the receiver was under the
+    // receivers' level: its load at the last sample before the move began
+    // (the hand-over ends at `at`).
+    for handover in &handovers {
+        let began = handover.at - handover.handover.expect("a hand-over time");
+        let load = receiver
+            .iter()
+            .take_while(|(at, _)| *at <= began)
+            .last()
+            .map(|(_, load)| *load)
+            .expect("a sample before the move");
+        assert!(
+            load < 725,
+            "a leg landed on the receiver at {load} permille: {handover:?}"
+        );
+    }
     let first = handovers.iter().map(|r| r.at).min().unwrap();
     let last_move = handovers.iter().map(|r| r.at).max().unwrap();
     assert!(
@@ -1948,7 +2085,7 @@ async fn rebalance_at_850_500_780() {
         "{handovers:?}"
     );
     assert!(
-        takebacks <= 1.max((handovers.len() + takebacks) / 5),
+        takebacks * 5 <= handovers.len() + takebacks,
         "{takebacks} take-backs in {} moves",
         handovers.len() + takebacks
     );
@@ -1959,7 +2096,10 @@ async fn rebalance_at_850_500_780() {
 /// listeners only to the other, which each of them holds. Nobody is marked.
 /// A `MOVE rebalance` forced on a listener (sent from the edge's address)
 /// is back at once: the entry names no cache (the listener holds the only
-/// other edge), and the edge takes it back within a round trip and 250 ms.
+/// other edge), and the director takes the leg back within a round trip and
+/// 250 ms. The edge keeps serving it: a second later every listener still
+/// holds both edges and delivers on both, and none is on one path from the
+/// forced mark to the end.
 ///
 /// `rebalance_ineffective` is not asserted (departure from the commit's
 /// list): a rebalance reckons a listener's cost as the median of load over
@@ -1983,18 +2123,36 @@ async fn rebalance_with_room_only_at_the_held_edge() {
     tokio::time::sleep(Duration::from_secs(17)).await;
     let marked = edge.stats.moves.load(Ordering::Relaxed) - moves_before;
 
-    // A forced mark, from the edge's address.
+    // A forced mark, from the edge's address: a socket that joins the
+    // edge's SO_REUSEPORT group for one send. Dropped at once, or the
+    // kernel would hash a share of the listeners' datagrams to it.
     let listener = crowd.lives[0].addr.lock().unwrap().expect("its address");
-    let forger = fast_plane::sys::bind_reuseport(region.client(0)).unwrap();
     let forced = Instant::now();
-    let datagram = av_mesh::client_udp::Control::Move {
-        stream_id: STREAM,
-        reason: "rebalance".into(),
+    let forced_us = now_us();
+    {
+        let forger = fast_plane::sys::bind_reuseport(region.client(0)).unwrap();
+        let datagram = av_mesh::client_udp::Control::Move {
+            stream_id: STREAM,
+            reason: "rebalance".into(),
+        }
+        .encode();
+        forger.send_to(&datagram, listener).unwrap();
     }
-    .encode();
-    forger.send_to(&datagram, listener).unwrap();
     drop(edge);
     tokio::time::sleep(Duration::from_secs(1)).await;
+    // Taken back at the edge: it still serves every listener's leg, and
+    // each listener delivers on both edges.
+    assert_eq!(region.legs_at(0), 6, "{}", crowd.describe());
+    assert!(crowd.all_on_two_paths(), "{}", crowd.describe());
+    assert!(
+        crowd.lives[0]
+            .legs
+            .lock()
+            .unwrap()
+            .contains(&region.node(0)),
+        "{}",
+        crowd.describe()
+    );
     let marks = Marks {
         start,
         end: now_us(),
@@ -2029,6 +2187,42 @@ async fn rebalance_with_room_only_at_the_held_edge() {
             run.sid,
             run.replacements
         );
+        assert!(
+            run.single_spans_us.iter().all(|(_, end)| *end < forced_us),
+            "{}: on one path after the forced mark: {:?}",
+            run.sid,
+            run.single_spans_us
+        );
+    }
+}
+
+/// Review of B Y5, finding 3: an edge killed or stopped lets go of its
+/// client address, so that it can come back there as a restarted process
+/// does. The armed fast lane held the edge's counters, and the counters
+/// held the lane: the cycle kept the lane, its copy of the client sockets
+/// and its repair thread alive after the edge had gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stopped_edge_lets_go_of_its_client_address() {
+    let _serial = SERIAL.lock().await;
+    let port = region_port(210);
+    for (round, kill) in [(0_u8, true), (1, false)] {
+        let client = SocketAddr::from((loopback(210 + round), port));
+        let edge = LaneEdge::start_at(loopback(210 + round), client, 16, |router| router).await;
+        assert!(
+            std::net::UdpSocket::bind(client).is_err(),
+            "the edge holds it"
+        );
+        if kill {
+            edge.kill().await;
+        } else {
+            edge.stop().await;
+        }
+        until(
+            "the edge's client sockets are closed",
+            Duration::from_secs(2),
+            || std::net::UdpSocket::bind(client).is_ok(),
+        )
+        .await;
     }
 }
 
