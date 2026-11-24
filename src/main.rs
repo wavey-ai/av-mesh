@@ -7353,27 +7353,19 @@ impl RelayFailoverController {
                 if primary_recent && secondary_recent {
                     self.set_state(RelayFailoverControllerState::Healthy);
                 } else if self.last_primary_source.is_some() && !primary_recent {
-                    if secondary_recent {
-                        self.try_promote(now);
-                    } else {
-                        self.secondary_unavailable();
-                    }
+                    self.primary_silent(now, secondary_recent);
                 }
             }
             RelayFailoverControllerState::Healthy => {
                 if !primary_recent {
-                    if secondary_recent {
-                        self.try_promote(now);
-                    } else {
-                        self.secondary_unavailable();
-                    }
+                    self.primary_silent(now, secondary_recent);
                 }
             }
             RelayFailoverControllerState::SecondaryUnavailable => {
                 if primary_recent {
                     self.set_state(RelayFailoverControllerState::Healthy);
-                } else if secondary_recent && self.last_primary_source.is_some() {
-                    self.try_promote(now);
+                } else if self.last_primary_source.is_some() {
+                    self.primary_silent(now, secondary_recent);
                 }
             }
             RelayFailoverControllerState::Promoted | RelayFailoverControllerState::Recovering => {
@@ -7391,6 +7383,28 @@ impl RelayFailoverController {
         }
         self.refresh_ages(now);
         self.send_desired().await;
+    }
+
+    /// The primary has been silent past `silence`: promote the secondary
+    /// (once the backoff allows), whether or not it was heard lately.
+    ///
+    /// A secondary that sends nothing can still hold the sources: for a
+    /// video stream a lease forwarder sends its secondary children repair
+    /// only, and a forwarder that receives no repair itself (a regional
+    /// distributor fed sources over the long haul) sends them nothing at all
+    /// while it keeps every source in their warm ring (4K on Linode, 24 Nov:
+    /// new-dist-a stopped for 2.7 s, its edge saw no repair from new-dist-b,
+    /// never promoted it and took 41 parts 2.2 to 2.65 s late over the cache
+    /// mesh, while new-dist-b had committed each 35 ms after packaging).
+    /// Promoting a secondary that is gone costs one RLF1 command; not
+    /// promoting one that is there costs the stream for the primary's whole
+    /// stop. A silence with no recent secondary is still counted as
+    /// `secondary_unavailable` and shown as that state until the promotion.
+    fn primary_silent(&mut self, now: Instant, secondary_recent: bool) {
+        if !secondary_recent {
+            self.secondary_unavailable();
+        }
+        self.try_promote(now);
     }
 
     /// The primary silence that a promotion needs now: the configured
