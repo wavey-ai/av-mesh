@@ -352,6 +352,10 @@ pub(crate) struct EdgeUdpStats {
     /// because they were.
     pub playout_skipped_parts: AtomicU64,
     pub holes_past_playout: AtomicU64,
+    /// Subscribers that the stream's new session found ahead of its head
+    /// (waiting for a part of the old numbering) and started at the head
+    /// (stuck4k).
+    pub session_restarts: AtomicU64,
     /// Clients kept (or taken back) within the move hold-down although the
     /// edge had lost its parents.
     pub moves_held_down: AtomicU64,
@@ -1423,6 +1427,11 @@ pub(crate) struct Subscriber {
     /// other legs that deliver now (`o=`), 0 for none: a rebalance does not
     /// send it to an edge it holds already (B rule R1).
     others: [u64; 2],
+    /// The source epoch of the stream's session that its next part is of
+    /// (0: not known yet, taken at the sender's next look). When the stream
+    /// starts a new session, a subscriber ahead of the new session's head
+    /// starts again at the head (`restart_in_session`, stuck4k).
+    epoch: u64,
 }
 
 /// `Subscriber::others` of a listener with no other leg.
@@ -2686,7 +2695,10 @@ pub(crate) async fn answer_nack_from_cache(
             .part_epoch_for_stream_id(stream_id, part, &bytes)
             .await
             .unwrap_or(0);
-        let object = part_object_with_times(stream_id, part, bytes, times);
+        let mut object = part_object_with_times(stream_id, part, bytes, times);
+        if epoch != 0 {
+            object.generation = compact::generation_of_epoch(epoch);
+        }
         if let Some(kept) = sockets.compact().of_object(&object, epoch) {
             if !charge_nack_bytes(table, stream_id, peer, kept.len() as u64) {
                 refused += 1;
@@ -2787,11 +2799,16 @@ async fn wait_for_head(
 }
 
 async fn head_part(router: &AppRouter, stream_id: u64) -> Option<u64> {
-    router
-        .cache
-        .stream_position_for_id(stream_id)
+    head_and_epoch(router, stream_id)
         .await
-        .map(|(_, last)| last as u64)
+        .map(|(head, _)| head)
+}
+
+/// The newest part of the stream's current session, never a late copy of
+/// an older session's part that the cache holds above it (stuck4k), and
+/// the session's source epoch (0 unknown).
+async fn head_and_epoch(router: &AppRouter, stream_id: u64) -> Option<(u64, u64)> {
+    router.cache.client_head_for_id(stream_id).await
 }
 
 /// The oldest part of a stream that a subscriber may still be sent, by its
@@ -3015,6 +3032,9 @@ async fn admit(
         .await;
         return;
     };
+    let epoch = head_and_epoch(&router, stream_id)
+        .await
+        .map_or(0, |(_, epoch)| epoch);
     let window = router.cache.window_parts_for(stream_id).await as u64;
     if mover_ahead_of_copy(from_part, head, window) {
         stats.refusals.fetch_add(1, Ordering::Relaxed);
@@ -3076,6 +3096,7 @@ async fn admit(
                 windows_repaired: VecDeque::new(),
                 leaving: None,
                 others,
+                epoch,
             },
         );
         let start = !std::mem::replace(&mut entry.running, true);
@@ -3238,6 +3259,7 @@ fn part_object_with_times(
         part,
         available_unix_us: times.as_ref().map_or(0, |times| times.available_unix_us),
         published_unix_us: times.and_then(|times| times.published_unix_us).unwrap_or(0),
+        generation: 0,
         payload: bytes,
     }
 }
@@ -3250,6 +3272,7 @@ fn gap_object(stream_id: u64, part: u64) -> PartObject {
         part,
         available_unix_us: 0,
         published_unix_us: 0,
+        generation: 0,
         payload: Bytes::new(),
     }
 }
@@ -3300,6 +3323,7 @@ async fn send_init_if_new(
         part,
         available_unix_us: 0,
         published_unix_us: 0,
+        generation: 0,
         payload: init,
     };
     send_object(out, config, stats, &object, &needing).await;
@@ -3595,14 +3619,16 @@ async fn deliver(
     if targets.is_empty() && compact_targets.is_empty() {
         return false;
     }
-    // The part's own epoch, for its compact datagram's generation.
+    // The part's own epoch, for its compact datagram's generation and its
+    // RaptorQ object's (stuck4k: a client tells the parts of two sessions
+    // apart by it).
     let epoch = match &bytes {
-        Some(bytes) if !compact_targets.is_empty() => router
+        Some(bytes) => router
             .cache
             .part_epoch_for_stream_id(stream_id, part, bytes)
             .await
             .unwrap_or(0),
-        _ => 0,
+        None => 0,
     };
     let object = match bytes {
         Some(bytes) => {
@@ -3620,7 +3646,11 @@ async fn deliver(
             )
             .await;
             stats.parts.fetch_add(1, Ordering::Relaxed);
-            part_object(router, stream_id, part, bytes).await
+            let mut object = part_object(router, stream_id, part, bytes).await;
+            if epoch != 0 {
+                object.generation = compact::generation_of_epoch(epoch);
+            }
+            object
         }
         None => {
             stats.gaps.fetch_add(1, Ordering::Relaxed);
@@ -3676,7 +3706,10 @@ async fn run_stream_sender(
         // The stream's class can become known after it started.
         let socket = Arc::clone(sockets.for_stream(stream_id));
         let out = sockets.out_for_stream(stream_id);
-        let head = head_part(&router, stream_id).await;
+        let (head, epoch) = match head_and_epoch(&router, stream_id).await {
+            Some((head, epoch)) => (Some(head), epoch),
+            None => (None, 0),
+        };
         let window = router.cache.window_parts_for(stream_id).await as u64;
         let oldest_wanted = {
             let guard = table.lock().unwrap();
@@ -3728,6 +3761,27 @@ async fn run_stream_sender(
                 sockets.compact().forget(stream_id);
                 debug!(stream_id, "edge client UDP sender stops: no subscriber");
                 return;
+            }
+            // A new session of the stream (its contributor restarted and
+            // numbers its parts again): a subscriber ahead of its head
+            // starts at the head, on a fresh fast-lane place.
+            if let Some(head) = head {
+                let mut fast_renewed = false;
+                if let Some(entry) = guard.get_mut(&stream_id) {
+                    for subscriber in entry.subscribers.values_mut() {
+                        if let SessionLook::New { restarted } =
+                            restart_in_session(subscriber, head, epoch)
+                        {
+                            fast_renewed |= subscriber.fast.is_some();
+                            if restarted {
+                                stats.session_restarts.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+                if fast_renewed {
+                    fast_lane_changed(&sockets, &guard);
+                }
             }
             let Some(entry) = guard.get_mut(&stream_id) else {
                 return;
@@ -3923,6 +3977,7 @@ async fn run_stream_sender(
                             &Control::Waiting {
                                 stream_id,
                                 next_part: part,
+                                head,
                             },
                         )
                         .await;
@@ -4231,6 +4286,50 @@ async fn housekeeping_moves(
     after
 }
 
+/// What a stream sender's look at a subscriber's session found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionLook {
+    /// The subscriber is in the stream's session (or neither is known).
+    Same,
+    /// The stream is in a new session (`epoch`): the subscriber is now in
+    /// it, with a fresh fast-lane place from its next part; `restarted` if
+    /// its next part was ahead of the new session's head (a part of the old
+    /// numbering, which the new one may not reach for minutes) and it
+    /// starts at the head.
+    New { restarted: bool },
+}
+
+/// A subscriber against the stream's session: `epoch` (0 unknown) and its
+/// `head`. A subscriber whose session is not known yet takes the stream's.
+/// When the stream has started a new session since the subscriber's next
+/// part was set, a next part ahead of the head goes to the head (stuck4k:
+/// a subscriber left waiting for the part after the old session's last
+/// waits until the new session's numbers pass it); and its fast-lane place
+/// is made again, since the claims of the old session's part numbers would
+/// keep the new session's off the fast lane.
+fn restart_in_session(subscriber: &mut Subscriber, head: u64, epoch: u64) -> SessionLook {
+    if epoch == 0 || subscriber.epoch == epoch {
+        return SessionLook::Same;
+    }
+    if subscriber.epoch == 0 {
+        subscriber.epoch = epoch;
+        return SessionLook::Same;
+    }
+    subscriber.epoch = epoch;
+    let restarted = subscriber.next_part > head.saturating_add(1);
+    if restarted {
+        subscriber.next_part = head;
+        subscriber.first_part = head;
+        subscriber.catching_up = false;
+        subscriber.cut_slots.clear();
+        subscriber.windows_repaired.clear();
+    }
+    if subscriber.fast.is_some() {
+        subscriber.fast = Some(FastClient::new(subscriber.next_part));
+    }
+    SessionLook::New { restarted }
+}
+
 /// A subscriber's next part against the stream's `head`: a part the window
 /// no longer holds jumps to the head, and one older than the playout
 /// `floor` to the floor, except for a client that moved here and is still
@@ -4299,6 +4398,7 @@ pub(crate) fn insert_test_subscribers(
                 windows_repaired: VecDeque::new(),
                 leaving: None,
                 others: NO_OTHER_LEGS,
+                epoch: 0,
             },
         );
     }
@@ -5687,6 +5787,7 @@ mod tests {
             part: 40,
             available_unix_us: 0,
             published_unix_us: 7,
+            generation: 0,
             payload: Bytes::from_static(b"late part"),
         };
         let kept = store.of_object(&part, 0).unwrap();
@@ -5717,10 +5818,12 @@ mod tests {
             part,
             available_unix_us: 0,
             published_unix_us: 0,
+            generation: 0,
             payload: Bytes::from_static(payload),
         };
         let gap = |part: u64| PartObject {
             kind: ObjectKind::Gap,
+            generation: 0,
             payload: Bytes::new(),
             ..object(part, b"")
         };
@@ -5771,6 +5874,7 @@ mod tests {
             part,
             available_unix_us: 0,
             published_unix_us: 0,
+            generation: 0,
             payload: Bytes::from_static(payload),
         };
         let old_epoch = 1_700_000_000_000_000;
@@ -5916,6 +6020,7 @@ mod tests {
             windows_repaired: VecDeque::new(),
             leaving: None,
             others: NO_OTHER_LEGS,
+            epoch: 0,
         }
     }
 

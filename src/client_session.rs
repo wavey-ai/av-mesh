@@ -386,6 +386,11 @@ struct Leg {
     datagrams: u64,
     wire_bytes: u64,
     longest_gap: Duration,
+    /// The stream's head that the edge's first `WAIT` since the leg's last
+    /// media named (`h=`, stuck4k), and when a later `WAIT` first named
+    /// another: from then the stream is live at the edge, and the edge
+    /// sends none of it.
+    wait_heads: Option<(u64, Option<Instant>)>,
 }
 
 impl Leg {
@@ -540,8 +545,12 @@ pub struct UdpSession {
     /// Legs failed because their edge's first part was 4,096 behind.
     pub stale_starts: u64,
     /// Legs failed because the receiver refused every datagram they brought
-    /// for [`REFUSING_FOR`] (fix 4, F2: a stuck receiver is not silent).
+    /// for [`REFUSING_FOR`] (fix 4, F2: a stuck receiver is not silent; and
+    /// stuck4k: on the RaptorQ lane, nothing taken for that long).
     pub refusing_legs: u64,
+    /// Legs failed because no media came for [`STALLED_FOR`] while their
+    /// edge said the stream went on (stuck4k).
+    pub stalled_legs: u64,
     /// The joint part loss of the legs (smoothed) and its mean run.
     joint_estimate: Option<f64>,
     joint_burst: Option<f64>,
@@ -587,6 +596,13 @@ pub const REFUSING_FOR: Duration = Duration::from_secs(1);
 /// The fewest media datagrams refused in a row that fail a leg (with
 /// [`REFUSING_FOR`]): a 20 ms stream sends 50 a second, a 1 ms one 1,000.
 pub const REFUSING_MIN_DATAGRAMS: u64 = 32;
+/// A live leg that has had no media for this long while its edge's `WAIT`s
+/// show the stream's head moving, and no other leg delivers, has failed
+/// (stuck4k: an edge waited 40 s for the part after the previous session's
+/// last, while the session ran, and its keepalives kept every silence rule
+/// from firing). It is replaced, and the generations refused are
+/// forgotten.
+pub const STALLED_FOR: Duration = Duration::from_secs(1);
 
 impl UdpSession {
     pub fn new(config: SessionConfig, now: Instant) -> Self {
@@ -625,6 +641,7 @@ impl UdpSession {
             compact_retries_unanswered: 0,
             stale_starts: 0,
             refusing_legs: 0,
+            stalled_legs: 0,
             joint_estimate: None,
             joint_burst: None,
             all_silent: false,
@@ -956,6 +973,7 @@ impl UdpSession {
             datagrams: 0,
             wire_bytes: 0,
             longest_gap: Duration::ZERO,
+            wait_heads: None,
         });
         if let Some(measured) = measured {
             let config = self.config;
@@ -1224,6 +1242,12 @@ impl UdpSession {
                     failed.push((index, LegFailure::Refusing, LegFailure::Refusing.reason().to_owned()));
                     continue;
                 }
+                // Stalled: the edge says the stream goes on and sends none
+                // of it (another leg that delivers judges it sooner).
+                if !other_delivers && Self::stalled(leg, now) {
+                    failed.push((index, LegFailure::Stalled, LegFailure::Stalled.reason().to_owned()));
+                    continue;
+                }
                 // Dead: silent while another leg sends, or without media
                 // while another delivers.
                 if quiet >= config.silence && other_datagram {
@@ -1273,11 +1297,30 @@ impl UdpSession {
             }
         }
         for (index, cause, reason) in failed {
-            if cause == LegFailure::Refusing {
-                self.refusing_legs += 1;
+            if matches!(cause, LegFailure::Refusing | LegFailure::Stalled) {
+                if cause == LegFailure::Refusing {
+                    self.refusing_legs += 1;
+                } else {
+                    self.stalled_legs += 1;
+                }
                 // Whatever the receiver took for old, its replacement is
                 // judged afresh.
-                self.receiver.compact.forget_generations();
+                self.receiver.forget_sessions();
+                // With no other leg delivering, what the session delivered
+                // says nothing of the stream now (stuck4k: the previous
+                // session's last part): its replacement starts at its edge's
+                // head, not after that part.
+                let failed_id = self.legs[index].as_ref().map(|leg| leg.id);
+                let others_deliver = self.legs_iter().any(|other| {
+                    Some(other.id) != failed_id
+                        && other.is_live()
+                        && other
+                            .last_first
+                            .is_some_and(|at| now.saturating_duration_since(at) < REFUSING_FOR)
+                });
+                if !others_deliver {
+                    self.receiver.new_flow();
+                }
             }
             if let Some(key) = self.legs[index].as_ref().map(|leg| leg.key) {
                 self.stop_leg(index, LegEvent::Failed { leg: key, cause }, reason);
@@ -1291,8 +1334,25 @@ impl UdpSession {
     /// judged by the silence rules.)
     fn refusing(&self, id: LegId, since: Instant, now: Instant) -> bool {
         let (run, accepted) = self.receiver.compact.leg_refused(id);
-        run >= REFUSING_MIN_DATAGRAMS
-            && now.saturating_duration_since(accepted.unwrap_or(since)) >= REFUSING_FOR
+        // The RaptorQ lane (stuck4k): its datagrams since a part of it was
+        // last taken, whether refused or never whole.
+        let (untaken, taken) = self.receiver.leg_untaken(id);
+        let last = match (accepted, taken) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        run.saturating_add(untaken) >= REFUSING_MIN_DATAGRAMS
+            && now.saturating_duration_since(last.unwrap_or(since)) >= REFUSING_FOR
+    }
+
+    /// Whether a live leg has stalled: its edge's `WAIT`s have shown the
+    /// stream's head moving for [`STALLED_FOR`], and no media came since
+    /// (a source that pauses names one head; one that restarts sends its
+    /// new parts within the second).
+    fn stalled(leg: &Leg, now: Instant) -> bool {
+        leg.wait_heads
+            .and_then(|(_, moved)| moved)
+            .is_some_and(|moved| now.saturating_duration_since(moved) >= STALLED_FOR)
     }
 
     /// The loss check of every leg: their repair, and the plans.
@@ -1631,6 +1691,9 @@ impl UdpSession {
                 continue;
             }
             let media = leg.media_since();
+            if let Some((_, Some(moved))) = leg.wait_heads {
+                verdict(&mut wake, moved + STALLED_FOR + ms);
+            }
             if live > 1 {
                 verdict(&mut wake, leg.last_datagram + self.config.silence);
                 verdict(&mut wake, media + self.config.silence);
@@ -1814,6 +1877,18 @@ impl UdpSession {
                 self.stop_leg(index, refused, reason.clone());
                 Received::Move(reason)
             }
+            Control::Waiting {
+                head: Some(head), ..
+            } => {
+                if leg.is_live() {
+                    leg.wait_heads = Some(match leg.wait_heads {
+                        None => (head, None),
+                        Some((first, None)) if first != head => (first, Some(now)),
+                        Some(heads) => heads,
+                    });
+                }
+                Received::Control
+            }
             _ => Received::Control,
         }
     }
@@ -1974,6 +2049,7 @@ impl UdpSession {
         leg.last_media = Some(now);
         leg.media_here = true;
         leg.hedge_due = false;
+        leg.wait_heads = None;
         leg.datagrams += 1;
         leg.wire_bytes += (datagram.len() + IP_UDP_HEADER_BYTES) as u64;
         self.all_silent = false;
@@ -2739,6 +2815,7 @@ mod tests {
         let wait = Control::Waiting {
             stream_id: 1,
             next_part: 10,
+            head: None,
         }
         .encode();
         while session.compact_asked() {
@@ -2940,6 +3017,7 @@ mod tests {
             part: 3,
             available_unix_us: 5,
             published_unix_us: 4,
+            generation: 0,
             payload: Bytes::from_static(&[9_u8; 2_000]),
         };
         let datagrams = encode_object(&object, 1_200, RepairPolicy::default()).unwrap();
@@ -3682,6 +3760,242 @@ mod tests {
         assert_eq!(held(&session, B).failure.as_deref(), Some("refused-1s"));
         assert!(session.receiver.compact.leg_stats(held(&session, B).id).stale_generation >= 1_000);
         assert_eq!(session.receiver.compact.leg_refused(held(&session, A).id).0, 0);
+    }
+
+    /// A 4K part's RaptorQ datagrams as an edge's cache-fed lane sends
+    /// them: `generation` stamped from its slot's epoch.
+    fn object_datagrams(part: u64, generation: u8, len: usize) -> Vec<Vec<u8>> {
+        let object = PartObject {
+            kind: ObjectKind::Part,
+            datagrams: 0,
+            stream_id: 1,
+            part,
+            available_unix_us: 0,
+            published_unix_us: 0,
+            generation,
+            payload: Bytes::from(vec![part as u8; len]),
+        };
+        encode_object(&object, 1_200, RepairPolicy::default()).unwrap()
+    }
+
+    fn wait(next_part: u64, head: Option<u64>) -> Vec<u8> {
+        Control::Waiting {
+            stream_id: 1,
+            next_part,
+            head,
+        }
+        .encode()
+    }
+
+    /// One 4K leg, live on a part.
+    fn lone_4k_leg(now: Instant) -> UdpSession {
+        let mut session = UdpSession::new(SessionConfig::new(1), now);
+        let mut send = |_: SocketAddr, _: &[u8]| {};
+        session.add_leg(A, "syd-edge-2", edge(), start(), now, &mut send);
+        session.on_datagram(edge(), &token(5), now, &mut send);
+        session.on_datagram(edge(), &ok(1_233), now, &mut send);
+        let mut parts = Vec::new();
+        for datagram in object_datagrams(1_233, 7, 12_000) {
+            session.on_datagram(edge(), &datagram, now, &mut send);
+            parts.extend(std::iter::from_fn(|| session.next_object()).map(|object| object.part));
+        }
+        assert_eq!(parts, vec![1_233]);
+        events(&mut session);
+        session
+    }
+
+    /// Stuck4k, syd-edge-2's sequence: a lone 4K leg had the previous
+    /// session's last part (1233) and then only `WAIT 1234` keepalives,
+    /// every 80 ms, for 40 s, which kept every silence rule from firing.
+    /// Now the `WAIT`s carry the stream's head (`h=`): while it names one
+    /// head (the source paused) nothing fails; once it moves and no media
+    /// comes for a second, the leg fails `stalled-1s`, counted, and the
+    /// session starts afresh (its replacement asks for the edge's head, not
+    /// for the part after 1233).
+    #[test]
+    fn a_lone_leg_whose_edge_waits_while_the_stream_goes_on_fails() {
+        let now = Instant::now();
+        let mut session = lone_4k_leg(now);
+        let mut send = |_: SocketAddr, _: &[u8]| {};
+        let ms = Duration::from_millis(1);
+        let mut failed_at = None;
+        for step in 1..=40_u32 {
+            let at = now + ms * (80 * step);
+            // The stale head for 400 ms, then the new session's, moving.
+            let head = if step <= 5 { 1_233 } else { 190 + u64::from(step) };
+            session.on_datagram(edge(), &wait(1_234, Some(head)), at, &mut send);
+            session.poll_legs(at, &mut send);
+            if events(&mut session).contains(&LegEvent::Failed {
+                leg: A,
+                cause: LegFailure::Stalled,
+            }) {
+                failed_at = Some(80 * step);
+                break;
+            }
+        }
+        // The head moved at 480 ms: failed a second later.
+        let failed_at = failed_at.expect("the leg fails");
+        assert!((1_480..1_600).contains(&failed_at), "{failed_at}");
+        assert_eq!(held(&session, A).failure.as_deref(), Some("stalled-1s"));
+        assert_eq!(session.stalled_legs, 1);
+        assert_eq!(session.refusing_legs, 0);
+        assert_eq!(session.receiver.compact.newest(), None);
+        assert_eq!(session.start_from(StartFrom::AfterNewest), None);
+    }
+
+    /// Stuck4k: `WAIT`s that name one head (a source that paused), or none
+    /// (an edge older than `h=`), fail no leg however long they last.
+    #[test]
+    fn a_lone_leg_whose_edge_waits_on_a_quiet_stream_is_kept() {
+        for head in [Some(1_233), None] {
+            let now = Instant::now();
+            let mut session = lone_4k_leg(now);
+            let mut send = |_: SocketAddr, _: &[u8]| {};
+            for step in 1..=60_u32 {
+                let at = now + Duration::from_millis(80 * u64::from(step));
+                session.on_datagram(edge(), &wait(1_234, head), at, &mut send);
+                session.poll_legs(at, &mut send);
+                let failed: Vec<LegEvent> = events(&mut session)
+                    .into_iter()
+                    .filter(|event| matches!(event, LegEvent::Failed { .. }))
+                    .collect();
+                assert!(failed.is_empty(), "{head:?} at step {step}: {failed:?}");
+            }
+            assert_eq!(session.stalled_legs, 0);
+        }
+    }
+
+    /// Stuck4k: a 4K part's repair symbols that come after it decoded (60
+    /// of them here) are no datagrams refused: a source that pauses after
+    /// it fails no leg.
+    #[test]
+    fn the_repair_after_a_part_is_not_refused_when_the_source_pauses() {
+        let now = Instant::now();
+        let mut session = UdpSession::new(SessionConfig::new(1), now);
+        let mut send = |_: SocketAddr, _: &[u8]| {};
+        session.add_leg(A, "syd-edge-2", edge(), start(), now, &mut send);
+        session.on_datagram(edge(), &token(5), now, &mut send);
+        session.on_datagram(edge(), &ok(197), now, &mut send);
+        let object = PartObject {
+            kind: ObjectKind::Part,
+            datagrams: 0,
+            stream_id: 1,
+            part: 197,
+            available_unix_us: 0,
+            published_unix_us: 0,
+            generation: 7,
+            payload: Bytes::from(vec![7_u8; 60_000]),
+        };
+        let repair = RepairPolicy {
+            permille: 1_200,
+            min_symbols: 60,
+            loss_ppm: 0,
+        };
+        let datagrams = encode_object(&object, 1_200, repair).unwrap();
+        assert!(datagrams.len() >= 110, "{}", datagrams.len());
+        let mut parts = 0;
+        for datagram in &datagrams {
+            session.on_datagram(edge(), datagram, now, &mut send);
+            parts += std::iter::from_fn(|| session.next_object()).count();
+        }
+        assert_eq!(parts, 1);
+        for step in 1..=40_u32 {
+            let at = now + Duration::from_millis(80 * u64::from(step));
+            session.on_datagram(edge(), &wait(198, Some(197)), at, &mut send);
+            session.poll_legs(at, &mut send);
+            assert!(
+                !events(&mut session)
+                    .iter()
+                    .any(|event| matches!(event, LegEvent::Failed { .. })),
+                "step {step}"
+            );
+        }
+        assert_eq!(session.refusing_legs, 0);
+    }
+
+    /// Stuck4k, a client held at a rate above what its edge sends it: a 4K
+    /// leg receives part of each part's datagrams, never enough to decode
+    /// one. It received datagrams and took nothing: after a second it fails
+    /// `refused-1s` (the RaptorQ lane's rule beside the compact lane's),
+    /// counted, and the session starts afresh.
+    #[test]
+    fn a_raptorq_leg_that_takes_nothing_for_a_second_fails() {
+        let now = Instant::now();
+        let mut session = UdpSession::new(SessionConfig::new(1), now);
+        let mut send = |_: SocketAddr, _: &[u8]| {};
+        session.add_leg(A, "syd-edge-2", edge(), start(), now, &mut send);
+        session.on_datagram(edge(), &token(5), now, &mut send);
+        session.on_datagram(edge(), &ok(197), now, &mut send);
+        let ms = Duration::from_millis(1);
+        let mut failed_at = None;
+        for step in 0..40_u32 {
+            let at = now + ms * (42 * step);
+            // All but three of each part's sources and repair.
+            let datagrams = object_datagrams(197 + u64::from(step), 7, 12_000);
+            for datagram in datagrams.iter().take(datagrams.len().saturating_sub(3)) {
+                session.on_datagram(edge(), datagram, at, &mut send);
+            }
+            assert!(session.next_object().is_none());
+            session.poll_legs(at, &mut send);
+            if events(&mut session).contains(&LegEvent::Failed {
+                leg: A,
+                cause: LegFailure::Refusing,
+            }) {
+                failed_at = Some(42 * step);
+                break;
+            }
+        }
+        let failed_at = failed_at.expect("the leg fails");
+        assert!((1_000..1_100).contains(&failed_at), "{failed_at}");
+        assert_eq!(held(&session, A).failure.as_deref(), Some("refused-1s"));
+        assert_eq!(session.refusing_legs, 1);
+        assert_eq!(session.stalled_legs, 0);
+    }
+
+    /// Stuck4k with two legs: one edge sends the new session, the other the
+    /// previous one's parts (its cache's stale copies), both for good. The
+    /// session holds the session established first; the other leg's objects
+    /// are refused, counted by reason, and it fails `refused-1s`; the leg
+    /// that delivers is untouched and the session is not restarted.
+    #[test]
+    fn a_leg_of_another_session_beside_a_delivering_leg_is_refused_and_fails() {
+        let now = Instant::now();
+        let mut session = two_legs(SessionConfig::new(1), 197, now);
+        let mut send = |_: SocketAddr, _: &[u8]| {};
+        let ms = Duration::from_millis(1);
+        let mut failed_at = None;
+        let mut delivered = Vec::new();
+        for step in 0..40_u32 {
+            let at = now + ms * (42 * step);
+            for datagram in object_datagrams(197 + u64::from(step), 9, 3_000) {
+                session.on_datagram(edge(), &datagram, at, &mut send);
+                while let Some(object) = session.next_object() {
+                    delivered.push(object.part);
+                }
+            }
+            for datagram in object_datagrams(1_145 + u64::from(step), 7, 3_000) {
+                session.on_datagram(edge_b(), &datagram, at, &mut send);
+                while let Some(object) = session.next_object() {
+                    delivered.push(object.part);
+                }
+            }
+            session.poll_legs(at, &mut send);
+            if events(&mut session).contains(&LegEvent::Failed {
+                leg: B,
+                cause: LegFailure::Refusing,
+            }) {
+                failed_at = Some(42 * step);
+                break;
+            }
+            assert!(held(&session, A).failure.is_none());
+        }
+        let failed_at = failed_at.expect("b fails");
+        assert!((1_000..1_100).contains(&failed_at), "{failed_at}");
+        assert!(delivered.iter().all(|part| *part < 1_000), "{delivered:?}");
+        assert_eq!(delivered.len() as u32, failed_at / 42 + 1);
+        assert!(session.receiver.raptorq_refused.stale_generation >= 24);
+        assert_eq!(session.refusing_legs, 1);
+        assert!(session.receiver.compact.newest().is_some());
     }
 
     /// B X5 review: a failed leg keeps its slot until the director
@@ -4450,6 +4764,7 @@ mod tests {
                 part: number,
                 available_unix_us: 5,
                 published_unix_us: 4,
+                generation: 0,
                 payload: Bytes::from_static(&[9_u8; 2_000]),
             };
             for datagram in encode_object(&object, 1_200, RepairPolicy::default()).unwrap() {

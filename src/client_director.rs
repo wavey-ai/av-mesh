@@ -187,8 +187,12 @@ pub enum LegFailure {
     /// newest, or its parts were shown that far behind (`stale_start`).
     Stale,
     /// The receiver refused every datagram of the leg for a second, at the
-    /// stream's rate (an old generation, parts before the session's start).
+    /// stream's rate (an old generation, parts before the session's start),
+    /// or, on the RaptorQ lane, took no part of them (stuck4k).
     Refusing,
+    /// No media for a second while the leg's edge said that the stream went
+    /// on (its `WAIT`s' heads moved), and no other leg delivered (stuck4k).
+    Stalled,
 }
 
 impl LegFailure {
@@ -198,6 +202,7 @@ impl LegFailure {
             Self::NoAnswer => "no-answer",
             Self::Stale => "stale-start",
             Self::Refusing => "refused-1s",
+            Self::Stalled => "stalled-1s",
         }
     }
 }
