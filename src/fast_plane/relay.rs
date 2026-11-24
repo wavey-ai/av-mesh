@@ -13,6 +13,9 @@ use super::lease::{LeaseChildren, LeaseSnapshot, LeaseSnapshotStats, LeaseTake};
 use super::loss_report::{decode_ledger, LossMeter};
 use super::media_clock::{MediaClocks, ValidatedEpochs, Verdict};
 use super::parent_feeds::{FeedMisses, ParentFeeds};
+use super::part_repair::{
+    Answer, PartKey, PartRepair, PartRepairSnapshot, Requester, SendSocket, StoredPart,
+};
 use super::sys::{self, RecvBatch, RECV_BATCH};
 use super::tee_ring::{self, tee_ring, tee_ring_growing, Ready, TeeReceiver, TeeSender};
 use super::view::RlsView;
@@ -155,6 +158,15 @@ pub struct RelayClassConfig {
     /// it as made.
     pub video_socket_buffer_ms: u64,
     pub video_socket_buffer_max_bytes: usize,
+    /// 4k-repair (`--relay-part-repair`, `--relay-link-repair`): asks for
+    /// what a video part lacks, answers to children, link repair.
+    pub part_repair: Option<Arc<PartRepair>>,
+    /// `--relay-trim-forwarded-repair` (4k-repair): a class thread forwards
+    /// the upstream repair of a part of at least `TRIM_MIN_SYMBOLS` to the
+    /// children that take this node's sources only up to what the part
+    /// lacks here and a margin (`RepairTrim`); repair-only children take
+    /// all of it.
+    pub trim_forwarded_repair: bool,
     /// Tests: the tee of this class panics on its first datagram.
     #[cfg(test)]
     pub test_tee_panic: Option<TrafficClass>,
@@ -193,6 +205,8 @@ impl Default for RelayClassConfig {
             socket_buffer_bytes: 8 << 20,
             video_socket_buffer_ms: DEFAULT_VIDEO_SOCKET_BUFFER_MS,
             video_socket_buffer_max_bytes: DEFAULT_VIDEO_SOCKET_BUFFER_MAX_BYTES,
+            part_repair: None,
+            trim_forwarded_repair: true,
             #[cfg(test)]
             test_tee_panic: None,
             #[cfg(test)]
@@ -376,6 +390,12 @@ pub struct FastPlaneStats {
     /// `lane_index`, against its parent's ledgers (4k-repair: the
     /// contributor's video lanes, and a forwarder's to its children).
     pub video_parent_loss_ppm: [AtomicU64; 2],
+    /// Upstream repair symbols not forwarded to source-taking
+    /// children: beyond what the part lacked here (`RepairTrim`).
+    pub repair_trimmed: AtomicU64,
+    /// The node's part repair (4k-repair), whose counters the snapshot
+    /// reports.
+    pub part_repair: OnceLock<Arc<PartRepair>>,
 }
 
 /// The counters of one parent lane (one receive socket) of the audio class.
@@ -396,7 +416,7 @@ pub struct ParentLaneStats {
     /// When the lane's parent last sent its ledger (RLL1), in Unix µs (zero:
     /// never), and the loss its meter measures.
     ledger_us: AtomicU64,
-    loss_ppm: AtomicU64,
+    pub(crate) loss_ppm: AtomicU64,
     /// The parent whose ledgers arrive on the lane: written when a ledger
     /// arrives (a few times a second), never per datagram.
     peer: StdMutex<Option<SocketAddr>>,
@@ -492,6 +512,15 @@ impl FastPlaneStats {
         }
         if let Some(gap_us) = gap_us {
             self.loop_gap_max_us[index].fetch_max(gap_us, Ordering::Relaxed);
+        }
+    }
+
+    /// The loss (ppm) measured on the parent lane `lane` (`lane_index`) of
+    /// `class`, against its parent's ledgers (4k-repair).
+    pub(crate) fn lane_loss_ppm(&self, class: TrafficClass, lane: usize) -> u64 {
+        match class {
+            TrafficClass::Audio => self.parent_lanes[lane].loss_ppm.load(Ordering::Relaxed),
+            TrafficClass::Video => self.video_parent_loss_ppm[lane].load(Ordering::Relaxed),
         }
     }
 
@@ -710,6 +739,9 @@ pub struct FastPlaneSnapshot {
     pub video_socket_buffer_bytes: u64,
     /// The loss the video thread measures on each parent lane (ppm).
     pub video_parent_loss_ppm: [u64; 2],
+    pub repair_trimmed: u64,
+    /// Part repair (4k-repair): asks, answers, link repair.
+    pub part_repair: PartRepairSnapshot,
 }
 
 impl FastPlaneStats {
@@ -800,6 +832,12 @@ impl FastPlaneStats {
                 load(&self.video_parent_loss_ppm[0]),
                 load(&self.video_parent_loss_ppm[1]),
             ],
+            repair_trimmed: load(&self.repair_trimmed),
+            part_repair: self
+                .part_repair
+                .get()
+                .map(|repair| repair.stats.snapshot())
+                .unwrap_or_default(),
         }
     }
 }
@@ -972,6 +1010,7 @@ fn plan_lease(
     view: &RlsView<'_>,
     plan: &mut ForwardPlan,
     now_us: u64,
+    trim: bool,
 ) {
     let mut object = None;
     let Some((children, fed_us)) = snapshot.children_and_clock_of(view.stream) else {
@@ -982,7 +1021,11 @@ fn plan_lease(
         fed_us.store(now_us, Ordering::Relaxed);
     }
     for &child in children {
-        match snapshot.children[usize::from(child)].takes(class, view.role) {
+        let entry = &snapshot.children[usize::from(child)];
+        if trim && (entry.primary || entry.is_promoted()) {
+            continue;
+        }
+        match entry.takes(class, view.role) {
             LeaseTake::Send => plan.lease.push(PlannedLease {
                 message: message as u16,
                 child,
@@ -1065,6 +1108,11 @@ fn send_lease_plan(
         let sent_us = now_unix_us();
         for send in &sends[..sent] {
             first[usize::from(send.message)].get_or_insert((target(send), sent_us));
+            if class == TrafficClass::Video {
+                snapshot.children[usize::from(send.child)]
+                    .video_sent
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
         let mut delivered = sent as u64;
         let (mut would_block, mut errors) = (0_u64, 0_u64);
@@ -1084,6 +1132,11 @@ fn send_lease_plan(
                 sys::RestOutcome::Sent => {
                     delivered += 1;
                     let send = &sends[index];
+                    if class == TrafficClass::Video {
+                        snapshot.children[usize::from(send.child)]
+                            .video_sent
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     first[usize::from(send.message)].get_or_insert((target(send), now_unix_us()));
                 }
                 sys::RestOutcome::WouldBlock => would_block += 1,
@@ -1130,7 +1183,14 @@ impl RelayDownstreamForwarder {
     /// its role, in compiled order. A source symbol held back from a warm
     /// repair-only child is noted, and kept for a later promotion only once
     /// the batch is sent (`buffer_fast_warm`), as `forward` keeps it.
-    fn plan_fast(&self, message: usize, view: &RlsView<'_>, plan: &mut ForwardPlan, now: Instant) {
+    fn plan_fast(
+        &self,
+        message: usize,
+        view: &RlsView<'_>,
+        plan: &mut ForwardPlan,
+        now: Instant,
+        trim: bool,
+    ) {
         let role = view.role;
         let mut object = None;
         // Renditions that a child's subtree does not read stay off its lane
@@ -1155,6 +1215,10 @@ impl RelayDownstreamForwarder {
                     self.filtered_datagrams.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
+            }
+            if trim && path.role != RelayForwardRole::Repair {
+                self.filtered_datagrams.fetch_add(1, Ordering::Relaxed);
+                continue;
             }
             let promoted = path.promoted.load(Ordering::Relaxed);
             let repair_lane_source =
@@ -1207,6 +1271,21 @@ impl RelayDownstreamForwarder {
             .iter()
             .filter(|path| path.role == RelayForwardRole::Repair)
             .count()
+    }
+
+    /// Each child's video ledger: the socket its video leaves from, where
+    /// it takes video, and the datagrams sent it so far (4k-repair).
+    pub(crate) fn video_ledgers(&self) -> Vec<(std::os::fd::RawFd, SocketAddr, u64)> {
+        self.paths
+            .iter()
+            .map(|path| {
+                (
+                    self.class_fd(TrafficClass::Video, path.group),
+                    path.video_target,
+                    path.video_sent.load(Ordering::Relaxed),
+                )
+            })
+            .collect()
     }
 
     fn class_fd(&self, class: TrafficClass, group: usize) -> std::os::fd::RawFd {
@@ -1296,6 +1375,12 @@ impl RelayDownstreamForwarder {
             stall_send(stats, class, elapsed.as_micros() as u64);
             let (mut sources, mut repairs, mut bytes) = (0_u64, 0_u64, 0_u64);
             for send in &sends[..sent] {
+                if class == TrafficClass::Video {
+                    // The child's ledger (4k-repair link repair).
+                    self.paths[usize::from(send.path)]
+                        .video_sent
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 bytes += batch.data(usize::from(send.message)).len() as u64;
                 match send.role {
                     MediaDatagramRole::Source => sources += 1,
@@ -1325,6 +1410,11 @@ impl RelayDownstreamForwarder {
             let started = Instant::now();
             match sys::send_batch(fd, 1, |_| (data, target)) {
                 Ok(1) => {
+                    if class == TrafficClass::Video {
+                        self.paths[usize::from(send.path)]
+                            .video_sent
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     self.record_forward_success(send.role, data.len(), started.elapsed());
                     stats.forwarded[class.index()].fetch_add(1, Ordering::Relaxed);
                     first[usize::from(send.message)].get_or_insert((target, now_unix_us()));
@@ -1375,6 +1465,8 @@ struct ClassThread {
     feeds: Arc<ParentFeeds>,
     /// The media budget (A 2.5), in µs.
     media_deadline_us: u64,
+    /// `RelayClassConfig::trim_forwarded_repair`.
+    trim_repair: bool,
     /// The epoch that the cache validated for each stream, which the
     /// thread's media clocks follow.
     epochs: Arc<ValidatedEpochs>,
@@ -1649,6 +1741,85 @@ impl TeeParts {
     }
 }
 
+/// Parts under way whose forwarded repair `RepairTrim` counts.
+const TRIM_PARTS: usize = 64;
+/// Parts of fewer source symbols are forwarded whole (`RepairTrim`): by
+/// size alone, so an audio part's one to three symbols and its copies are
+/// as before on the audio thread.
+const TRIM_MIN_SYMBOLS: u16 = 32;
+/// Parts of fewer source symbols take no part repair (asks, answers, link
+/// repair): a one-symbol part has its copies.
+const PART_REPAIR_MIN_SYMBOLS: u16 = 2;
+
+/// The upstream repair of a part that the children taking this
+/// node's sources need (4k-repair): the sources this node lacks of the part
+/// (they lack them too) and a margin. Without it every hop forwarded every
+/// upstream hop's repair on top of its own link repair, so the repair grew
+/// with each hop (in process at 1 % a link: 7, 13, 21 and 29 % of the
+/// sources on four links). A repair symbol that comes before the part's
+/// sources have (another lane's) is counted against the sources seen so
+/// far, so it errs towards forwarding. A fixed table made before the
+/// thread runs, the oldest part replaced by a new one.
+struct RepairTrim {
+    parts: [TrimPart; TRIM_PARTS],
+    next: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+struct TrimPart {
+    stream: u64,
+    object: u64,
+    used: bool,
+    sources: u32,
+    repair: u32,
+}
+
+impl RepairTrim {
+    fn new() -> Self {
+        Self {
+            parts: [TrimPart::default(); TRIM_PARTS],
+            next: 0,
+        }
+    }
+
+    /// A first arrival of symbol `esi` of part `object` of `stream` (K
+    /// `k`): whether it is upstream repair that the source-taking children
+    /// do not need.
+    fn beyond_need(&mut self, stream: u64, object: u64, k: u16, esi: u32) -> bool {
+        let at = match self
+            .parts
+            .iter()
+            .position(|part| part.used && part.object == object && part.stream == stream)
+        {
+            Some(at) => at,
+            None => {
+                let at = self.next;
+                self.parts[at] = TrimPart {
+                    stream,
+                    object,
+                    used: true,
+                    sources: 0,
+                    repair: 0,
+                };
+                self.next = (self.next + 1) % TRIM_PARTS;
+                at
+            }
+        };
+        let part = &mut self.parts[at];
+        let k = u32::from(k);
+        if esi < k {
+            part.sources += 1;
+            return false;
+        }
+        let lacking = k.saturating_sub(part.sources);
+        if part.repair < lacking + 2 + lacking / 8 {
+            part.repair += 1;
+            return false;
+        }
+        true
+    }
+}
+
 struct Pending {
     message: usize,
     peer: SocketAddr,
@@ -1792,6 +1963,7 @@ impl ClassThread {
         .then(LeaseDescriptors::new);
         let mut feed_misses = FeedMisses::new();
         let mut tee_parts = TeeParts::new();
+        let mut repair_trim = RepairTrim::new();
         let mut last_loss_poll = Instant::now();
         let mut last_demand_report: Option<Instant> = None;
         // Loop lag (wave 9): the last wait's return that brought datagrams.
@@ -1880,6 +2052,7 @@ impl ClassThread {
                             descriptors.as_mut(),
                             &mut tee,
                             &mut tee_parts,
+                            &mut repair_trim,
                             &mut feed_misses,
                         );
                         if !batch.next_window() {
@@ -2050,6 +2223,7 @@ impl ClassThread {
         mut descriptors: Option<&mut LeaseDescriptors>,
         tee: &mut TeeSender<TeeMeta>,
         tee_parts: &mut TeeParts,
+        repair_trim: &mut RepairTrim,
         feed_misses: &mut FeedMisses,
     ) {
         let now_us = now_unix_us();
@@ -2207,8 +2381,21 @@ impl ClassThread {
                     continue;
                 }
             }
+            // Upstream repair beyond the part's need here goes only to
+            // repair-only children (4k-repair).
+            let trim = self.trim_repair
+                && view.source_symbols >= TRIM_MIN_SYMBOLS
+                && repair_trim.beyond_need(
+                    MediaClocks::key(view.tenant, view.stream).hash(),
+                    view.object,
+                    view.source_symbols,
+                    view.esi,
+                );
+            if trim {
+                self.stats.repair_trimmed.fetch_add(1, Ordering::Relaxed);
+            }
             if let Some(forwarder) = &self.forwarder {
-                forwarder.plan_fast(message, &view, plan, now);
+                forwarder.plan_fast(message, &view, plan, now, trim);
             }
             if let (Some(descriptors), Some((children, snapshot))) =
                 (descriptors.as_deref_mut(), &descriptor_lease)
@@ -2224,7 +2411,7 @@ impl ClassThread {
                 );
             }
             if let Some((_, snapshot)) = &lease {
-                plan_lease(snapshot, class, message, &view, plan, now_us);
+                plan_lease(snapshot, class, message, &view, plan, now_us, trim);
             }
             if let Some((lane, snapshot)) = &edge_clients {
                 clients.plan(lane, snapshot, message, &view);
@@ -2446,6 +2633,17 @@ struct Tee {
     /// The parent feeds, whose new entries the class thread asks the tee
     /// to make.
     feeds: Arc<ParentFeeds>,
+    /// 4k-repair, for parts of several symbols of any stream: the node's
+    /// part repair (it keeps each such part decoded here for its children's
+    /// asks, and sends lossy children their link repair), the asks of this
+    /// node's own parts, the lease children (for link repair), and the tick
+    /// that polls the asks between datagrams.
+    part_repair: Option<Arc<PartRepair>>,
+    requester: Option<Requester>,
+    lease: Option<Arc<LeaseChildren>>,
+    repair_tick: Option<Arc<Notify>>,
+    /// The newest arrival (kernel µs) of a symbol the tee has taken.
+    last_rx_us: u64,
     /// Tests: the tee panics on its first datagram.
     #[cfg(test)]
     panic_on_item: bool,
@@ -2487,6 +2685,16 @@ impl Tee {
                         self.process(meta, bytes).await;
                         items.release();
                     }
+                    if let Some(requester) = self.requester.as_mut() {
+                        // A tee behind its ring judges a part's silence by
+                        // the arrivals it has taken, not by the clock.
+                        let now = if items.peek().is_none() {
+                            now_unix_us()
+                        } else {
+                            self.last_rx_us
+                        };
+                        requester.poll(now);
+                    }
                     let class = self.class.index();
                     self.stats.tee_batches[class].fetch_add(1, Ordering::Relaxed);
                     self.stats.tee_lag_max_us[class].fetch_max(lag_max_us, Ordering::Relaxed);
@@ -2507,6 +2715,21 @@ impl Tee {
                 }
                 () = expire.notified() => {
                     self.expire().await;
+                }
+                () = async {
+                    match &self.repair_tick {
+                        Some(tick) => tick.notified().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(requester) = self.requester.as_mut() {
+                        let now = if items.peek().is_none() {
+                            now_unix_us()
+                        } else {
+                            self.last_rx_us
+                        };
+                        requester.poll(now);
+                    }
                 }
             }
         }
@@ -2575,6 +2798,57 @@ impl Tee {
         }
     }
 
+    /// Whether this node feeds children (compiled or lease) on the fast
+    /// plane.
+    fn has_children(&self) -> bool {
+        self.forwarder
+            .as_ref()
+            .is_some_and(|forwarder| !forwarder.paths.is_empty())
+            || self.lease.is_some()
+    }
+
+    /// The children of `stream` that lose datagrams from this node, with
+    /// the socket to each and its loss (`loss` of the child's address): the
+    /// targets of link repair.
+    fn lossy_children(
+        &self,
+        stream: &str,
+        loss: &dyn Fn(SocketAddr) -> u32,
+    ) -> Vec<(Arc<dyn SendSocket>, SocketAddr, u32)> {
+        let mut out: Vec<(Arc<dyn SendSocket>, SocketAddr, u32)> = Vec::new();
+        if let Some(forwarder) = &self.forwarder {
+            for (index, path) in forwarder.paths.iter().enumerate() {
+                let target = forwarder.class_target(self.class, index);
+                let ppm = loss(target);
+                if ppm == 0 || out.iter().any(|(_, to, _)| *to == target) {
+                    continue;
+                }
+                let via: Arc<dyn SendSocket> =
+                    match (self.class, forwarder.video_sockets.get(path.group)) {
+                        (TrafficClass::Video, Some(twin)) => Arc::clone(twin) as Arc<dyn SendSocket>,
+                        _ => Arc::clone(&path.socket) as Arc<dyn SendSocket>,
+                    };
+                out.push((via, target, ppm));
+            }
+        }
+        if let Some(lease) = &self.lease {
+            let snapshot = lease.load();
+            if let Some((children, _)) = snapshot.children_and_clock_of(stream) {
+                for &child in children {
+                    let to = snapshot.children[usize::from(child)].targets[self.class.index()];
+                    let ppm = loss(to);
+                    if ppm == 0 || out.iter().any(|(_, target, _)| *target == to) {
+                        continue;
+                    }
+                    let via: Arc<dyn SendSocket> =
+                        Arc::new(super::part_repair::LeaseSocket(Arc::clone(lease), self.class));
+                    out.push((via, to, ppm));
+                }
+            }
+        }
+        out
+    }
+
     fn mark_class(&self, stream: &str, video_kind: bool) {
         if self.class == TrafficClass::Video || video_kind {
             if let Ok(stream_id) = stream.parse() {
@@ -2608,6 +2882,13 @@ impl Tee {
     }
 
     async fn process_unchecked(&mut self, item: &TeeMeta, bytes: &[u8]) {
+        // A parent's answer to an ask of this node's (4k-repair).
+        if let Some(answer) = Answer::decode(bytes) {
+            if let Some(requester) = self.requester.as_mut() {
+                requester.on_answer(&answer, item.peer, now_unix_us());
+            }
+            return;
+        }
         if item.path == RelayIngressParentPath::Primary {
             if let Some(socket) = self.reply_socket.as_deref() {
                 if self
@@ -2659,9 +2940,19 @@ impl Tee {
         // The symbol's header, read again in place, for the fast lane's
         // top-up (the upstream repair of the stream's objects) and the hole
         // trigger.
-        let fast_view = (self.edge_clients.is_some() || self.holes.is_some())
-            .then(|| RlsView::parse(bytes, self.limits).ok())
-            .flatten();
+        let fast_view = (self.edge_clients.is_some()
+            || self.holes.is_some()
+            || self.requester.is_some()
+            || self.part_repair.is_some())
+        .then(|| RlsView::parse(bytes, self.limits).ok())
+        .flatten();
+        // Part repair takes any part of several symbols, whatever its
+        // stream (4k-repair: by size, not by media kind).
+        let repair_view = fast_view
+            .as_ref()
+            .filter(|view| view.slim.is_none() && view.source_symbols >= PART_REPAIR_MIN_SYMBOLS);
+        let lane = lane_index(item.path);
+        self.last_rx_us = self.last_rx_us.max(item.rx_us);
         if let (Some(view), Some(lane)) = (&fast_view, &self.edge_clients) {
             if let Some(stream_id) = view.stream_id() {
                 self.upstream_repair
@@ -2680,6 +2971,9 @@ impl Tee {
         // waited in the tee is not judged by the wait.
         match self.dispatch.push(peer, bytes, item.rx_us) {
             Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Buffered { key, .. })) => {
+                if let (Some(requester), Some(view)) = (self.requester.as_mut(), repair_view) {
+                    requester.observe(view, peer, lane, item.rx_us);
+                }
                 journal_relay_symbol(&self.cache, &key, peer, item.rx_us);
                 journal_woken(&self.cache, &key, peer, item.woken_us);
                 journal_forward(&key);
@@ -2693,6 +2987,17 @@ impl Tee {
                 ..
             })) => {
                 let decoded_us = now_unix_us();
+                if let (Some(requester), Some(view)) = (self.requester.as_mut(), repair_view) {
+                    requester.done(PartKey::of(view), decoded_us);
+                }
+                // Kept for the children's asks and link repair, when this
+                // node has children (4k-repair).
+                let kept = match (&self.part_repair, repair_view) {
+                    (Some(_), Some(view)) if self.has_children() => {
+                        StoredPart::new(view, object.key().clone(), envelope.clone())
+                    }
+                    _ => None,
+                };
                 journal_relay_symbol(&self.cache, object.key(), peer, item.rx_us);
                 journal_woken(&self.cache, object.key(), peer, item.woken_us);
                 journal_forward(object.key());
@@ -2709,6 +3014,12 @@ impl Tee {
                     .as_ref()
                     .filter(|(lane, stream_id)| lane.load().streams.contains_key(stream_id))
                     .map(|_| envelope.clone());
+                if let (Some(part), Some(repair), Some(view)) =
+                    (kept, &self.part_repair, repair_view)
+                {
+                    let stream = view.stream;
+                    repair.keep(part, |loss| self.lossy_children(stream, loss));
+                }
                 match commit_relay_object(&self.cache, *object, envelope).await {
                     // Another copy came first (the cache mesh, or the other
                     // form of the part): its clients and the journal have
@@ -2768,6 +3079,9 @@ impl Tee {
                 }
             }
             Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Duplicate { key, .. })) => {
+                if let (Some(requester), Some(view)) = (self.requester.as_mut(), repair_view) {
+                    requester.observe_done(view, peer, lane, item.rx_us);
+                }
                 journal_forward(&key);
             }
             Ok(RelayUdpDispatchOutcome::Legacy) => {}
@@ -2950,9 +3264,14 @@ pub async fn run_relay_class_ingest(
         None => None,
     };
     let mut by_class: [Vec<(RelayIngressParentPath, std::net::UdpSocket)>; 2] = Default::default();
-    // The video sockets again (the same sockets), for their buffers.
+    // The video sockets again (the same sockets), for their buffers, and
+    // for the asks of part repair (4k-repair), which leave from the socket
+    // that the parent's symbols come to.
     let mut video_sockets = Vec::new();
+    let mut ask_sockets: [[Option<Arc<dyn SendSocket>>; 2]; 2] = Default::default();
     for socket in sockets {
+        ask_sockets[socket.class.index()][lane_index(socket.path)] =
+            Some(Arc::new(socket.socket.try_clone()?) as Arc<dyn SendSocket>);
         if socket.class == TrafficClass::Video {
             video_sockets.push((lane_index(socket.path), socket.socket.try_clone()?));
         }
@@ -2960,6 +3279,21 @@ pub async fn run_relay_class_ingest(
     }
     let video_buffers = (!video_sockets.is_empty())
         .then(|| VideoSocketBuffers::new(video_sockets, &config));
+    let part_repair = config.part_repair.clone();
+    if let Some(repair) = &part_repair {
+        let _ = stats.part_repair.set(Arc::clone(repair));
+        if let Some(forwarder) = &forwarder {
+            let _ = forwarder.part_repair.set(Arc::clone(repair));
+        }
+        if let Some(lease) = &config.lease {
+            let _ = lease.part_repair.set(Arc::clone(repair));
+        }
+    }
+    // One tick for each class's tee.
+    let repair_ticks: Option<[Arc<Notify>; 2]> = part_repair
+        .as_ref()
+        .filter(|repair| repair.config.requests)
+        .map(|_| [Arc::new(Notify::new()), Arc::new(Notify::new())]);
     let mut dispatches = [Some(dispatch), Some(video_dispatch)];
     let mut threads = Vec::new();
     let mut tees = tokio::task::JoinSet::new();
@@ -3013,6 +3347,7 @@ pub async fn run_relay_class_ingest(
             video_gro: config.video_gro,
             feeds: Arc::clone(&feeds),
             media_deadline_us: config.media_deadline_us,
+            trim_repair: config.trim_forwarded_repair,
             epochs: Arc::clone(&epochs),
             #[cfg(test)]
             test_alloc_counter: match class {
@@ -3057,6 +3392,23 @@ pub async fn run_relay_class_ingest(
             limits,
             holes: config.holes.clone(),
             feeds: Arc::clone(&feeds),
+            part_repair: part_repair.clone(),
+            requester: part_repair
+                .as_ref()
+                .filter(|repair| repair.config.requests)
+                .map(|repair| {
+                    Requester::new(
+                        Arc::clone(repair),
+                        ask_sockets[class.index()].clone(),
+                        Arc::clone(&stats),
+                        class,
+                    )
+                }),
+            lease: config.lease.clone(),
+            repair_tick: repair_ticks
+                .as_ref()
+                .map(|ticks| Arc::clone(&ticks[class.index()])),
+            last_rx_us: 0,
             #[cfg(test)]
             panic_on_item: config.test_tee_panic == Some(class),
             #[cfg(test)]
@@ -3082,6 +3434,23 @@ pub async fn run_relay_class_ingest(
         Arc::clone(&stats),
         shutdown_rx.clone(),
     ));
+    let repair_ticker = repair_ticks.map(|ticks| {
+        tokio::spawn(crate::fast_control::run_part_repair_tick(
+            ticks.to_vec(),
+            shutdown_rx.clone(),
+        ))
+    });
+    let child_ledgers = part_repair
+        .as_ref()
+        .filter(|repair| repair.config.link_repair)
+        .map(|repair| {
+            tokio::spawn(crate::fast_control::run_child_ledgers(
+                forwarder.clone(),
+                config.lease.clone(),
+                Arc::clone(repair),
+                shutdown_rx.clone(),
+            ))
+        });
     let video_buffers = video_buffers.map(|buffers| {
         tokio::spawn(crate::fast_control::run_video_socket_buffers(
             buffers,
@@ -3128,6 +3497,9 @@ pub async fn run_relay_class_ingest(
     }
     housekeeping.abort();
     sampler.abort();
+    for task in [&repair_ticker, &child_ledgers].into_iter().flatten() {
+        task.abort();
+    }
     if let Some(video_buffers) = &video_buffers {
         video_buffers.abort();
     }

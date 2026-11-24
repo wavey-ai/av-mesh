@@ -105,6 +105,9 @@ pub struct LeaseChild {
     pub targets: [SocketAddr; 2],
     promoted: AtomicBool,
     warm: StdMutex<WarmSourceReplayBuffer>,
+    /// Video datagrams the class thread handed the kernel for this child:
+    /// the count of its ledger (`RLL1`, 4k-repair link repair).
+    pub video_sent: AtomicU64,
 }
 
 impl LeaseChild {
@@ -332,6 +335,9 @@ pub struct LeaseChildren {
     /// lease (its promotion and warm ring), and the children refused.
     known: StdMutex<Known>,
     pub stats: LeaseStats,
+    /// The node's part repair (4k-repair): what children send to the lease
+    /// sockets (asks, loss reports) goes to it.
+    pub part_repair: std::sync::OnceLock<Arc<super::part_repair::PartRepair>>,
 }
 
 #[derive(Default)]
@@ -395,6 +401,7 @@ impl LeaseChildren {
             retired: super::retired::Retired::default(),
             known: StdMutex::new(Known::default()),
             stats: LeaseStats::default(),
+            part_repair: std::sync::OnceLock::new(),
         }))
     }
 
@@ -474,6 +481,7 @@ impl LeaseChildren {
             } else {
                 WarmSourceReplayBuffer::preallocated()
             }),
+            video_sent: AtomicU64::new(0),
         }))
     }
 

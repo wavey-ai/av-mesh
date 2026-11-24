@@ -607,7 +607,13 @@ async fn a_forwarder_s_video_thread_allocates_frees_and_faults_nothing_once_it_r
         .chain(&frames_b)
         .map(|frame| frame.datagrams.len() as u64)
         .sum();
-    assert!(all >= symbols, "{all} of {symbols} at the child of every symbol");
+    // Every symbol, but the upstream repair that the part did not need
+    // here (4k-repair's trim, which this thread runs too).
+    assert!(
+        all + stats.repair_trimmed >= symbols,
+        "{all} and {} trimmed of {symbols} at the child of every symbol",
+        stats.repair_trimmed
+    );
     assert!(repair > 0 && primary > 0 && warm > 0, "{repair} {primary} {warm}");
     assert!(stats.duplicates > 0, "{stats:?}");
     assert_eq!(stats.tee_dropped, 0, "{stats:?}");

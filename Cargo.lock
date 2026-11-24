@@ -208,6 +208,7 @@ dependencies = [
  "media-object",
  "message-packetizer",
  "playlists 0.2.0",
+ "raptorq",
  "raptorq-datagram-fec",
  "raptorq-fec-transport",
  "rcgen",
