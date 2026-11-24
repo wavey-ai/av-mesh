@@ -371,8 +371,13 @@ impl PathPlans {
 /// The loss estimate that a compact plan follows: an average of the
 /// samples (one each 150 ms), the first sample as it is.
 pub fn smoothed_loss(previous: Option<f64>, sample: f64) -> f64 {
+    smoothed_loss_by(previous, sample, 0.25)
+}
+
+/// [`smoothed_loss`] with the new sample weighed `weight`.
+pub fn smoothed_loss_by(previous: Option<f64>, sample: f64, weight: f64) -> f64 {
     match previous {
-        Some(previous) => previous * 0.75 + sample * 0.25,
+        Some(previous) => previous * (1.0 - weight) + sample * weight,
         None => sample,
     }
 }

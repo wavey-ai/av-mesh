@@ -318,6 +318,8 @@ impl Args {
             first_double: Duration::from_millis(self.first_double_ms),
             hedge_after: Duration::from_millis(self.hedge_after_ms),
             lone_hedge_after: Duration::from_millis(self.lone_hedge_after_ms),
+            plan_hold: av_mesh::client_session::PLAN_HOLD,
+            plan_smoothing: av_mesh::client_session::PLAN_SMOOTHING,
         }
     }
 

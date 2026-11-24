@@ -369,6 +369,8 @@ fn config(args: &Args) -> Result<LoadConfig> {
         first_double: Duration::from_millis(args.first_double_ms),
         hedge_after: Duration::from_millis(args.hedge_after_ms),
         lone_hedge_after: Duration::from_millis(args.lone_hedge_after_ms),
+        plan_hold: av_mesh::client_session::PLAN_HOLD,
+        plan_smoothing: av_mesh::client_session::PLAN_SMOOTHING,
     };
     let mut config = LoadConfig::new(session, edges, args.listeners);
     let director = &mut config.director;

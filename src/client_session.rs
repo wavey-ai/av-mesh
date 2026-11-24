@@ -33,7 +33,7 @@
 //! [`UdpSession::hold`] for the end-of-run drain.
 
 use crate::client_compact::{
-    smoothed_loss, CompactPlan, LegId, LegLoss, LegStart as Expected, LegStats, NackTiming,
+    smoothed_loss, smoothed_loss_by, CompactPlan, LegId, LegLoss, LegStart as Expected, LegStats, NackTiming,
     PathPlans, BURSTY, HOLE_GIVE_UP, IP_UDP_HEADER_BYTES, MAX_LEGS, RESIDUAL_TARGET,
 };
 use crate::client_director::{
@@ -102,11 +102,25 @@ pub const DEFAULT_LONE_HEDGE_AFTER_MS: u64 = 170;
 /// back from it (see [`SessionConfig::compact_retry`]).
 pub const COMPACT_RETRIES: u32 = 2;
 
-/// A plan that asks for less (fewer copies or rows) is asked for only
-/// after the estimate has wanted it this long; one that asks for more goes
-/// at once (B X3: the plan flapped under burst loss, hundreds of changes in
-/// 200 s, each a `SUB` and a regroup of the edge's fast lane).
-pub const PLAN_HOLD: Duration = Duration::from_secs(1);
+/// A plan that asks for less (fewer copies or rows) is taken only this long
+/// after the leg's last plan change; one that asks for more goes at once
+/// (B X3: the plan flapped under burst loss, hundreds of changes in 200 s,
+/// each a `SUB` and a regroup of the edge's fast lane). A rate limit, not a
+/// wait for the estimate to want less for this long: that held the copies
+/// of every short rise of a 0.2 to 0.5 % loss for a second more and cost
+/// 14 to 23 % more datagrams a part than no hold (lead, 24 Nov, after
+/// integration 2: less 1 s after the last change). With
+/// [`PLAN_SMOOTHING`] at 1/8 the estimate crosses a plan's edge less often,
+/// and 0.5 s holds the changes under 50 in 30 s at 0.2 to 0.5 % random loss
+/// at the base's cost (av-mesh-fix-3: 1 s and 1/4 cost 11 to 14 % more at
+/// 0.3 %; 0.5 s and 1/8, 3 % more at 0.3 %, 32 changes).
+pub const PLAN_HOLD: Duration = Duration::from_millis(500);
+/// The weight of a new 150 ms loss sample in the estimate that a compact
+/// plan follows ([`smoothed_loss_by`]): 1/8, a time constant of about
+/// 1.2 s. A loss that rises by more than a few tenths of a percent still
+/// asks for copies at its first sample (one sample of 5 % lifts the
+/// estimate to 0.6 %); a small rise waits a few samples, as NACK covers.
+pub const PLAN_SMOOTHING: f64 = 0.125;
 /// A path counted bursty stops being so below this mean burst (it becomes
 /// so at [`BURSTY`]).
 pub const BURSTY_UNTIL: f64 = 1.5;
@@ -192,6 +206,12 @@ pub struct SessionConfig {
     pub hedge_after: Duration,
     /// The only live leg, with no datagram this long, is due a hedge.
     pub lone_hedge_after: Duration,
+    /// A plan that asks for less waits this long after the leg's last plan
+    /// change ([`PLAN_HOLD`]).
+    pub plan_hold: Duration,
+    /// The weight of a new loss sample in the estimate a compact plan
+    /// follows ([`PLAN_SMOOTHING`]).
+    pub plan_smoothing: f64,
 }
 
 /// A move asks for a hole at most this many parts before the newest part
@@ -226,6 +246,8 @@ impl SessionConfig {
             first_double: Duration::from_millis(DEFAULT_FIRST_DOUBLE_MS),
             hedge_after: Duration::from_millis(DEFAULT_HEDGE_AFTER_MS),
             lone_hedge_after: Duration::from_millis(DEFAULT_LONE_HEDGE_AFTER_MS),
+            plan_hold: PLAN_HOLD,
+            plan_smoothing: PLAN_SMOOTHING,
         }
     }
 
@@ -357,8 +379,9 @@ struct Leg {
     /// The path counts as bursty (from [`BURSTY`] until under
     /// [`BURSTY_UNTIL`]).
     bursty: bool,
-    /// Since when the estimate has wanted a plan that asks for less.
-    lower_since: Option<Instant>,
+    /// When `plan` was last changed (or set at the leg's start): a plan
+    /// that asks for less waits until [`PLAN_HOLD`] after it.
+    plan_at: Instant,
     plan: CompactPlan,
     datagrams: u64,
     wire_bytes: u64,
@@ -853,6 +876,7 @@ impl UdpSession {
             for leg in self.legs.iter_mut().flatten() {
                 if leg.loss_samples < PLAN_SAMPLES && leg.plan != start {
                     leg.plan = start;
+                    leg.plan_at = now;
                     leg.next_refresh = now;
                 }
             }
@@ -915,7 +939,7 @@ impl UdpSession {
             burst_estimate: None,
             loss_samples: 0,
             bursty: false,
-            lower_since: None,
+            plan_at: now,
             plan: start,
             datagrams: 0,
             wire_bytes: 0,
@@ -1263,7 +1287,11 @@ impl UdpSession {
             });
             // The compact plan follows a smoother estimate: NACK covers
             // what a short rise of the loss leaves.
-            leg.compact_estimate = Some(smoothed_loss(leg.compact_estimate, loss));
+            leg.compact_estimate = Some(smoothed_loss_by(
+                leg.compact_estimate,
+                loss,
+                self.config.plan_smoothing,
+            ));
             if let Some(burst) = burst {
                 leg.burst_estimate = Some(match leg.burst_estimate {
                     Some(previous) => previous * 0.7 + burst * 0.3,
@@ -1373,22 +1401,21 @@ impl UdpSession {
     }
 
     /// Take `wanted` as a leg's plan: at once if it asks for as much or
-    /// more, after [`PLAN_HOLD`] of wanting less if it asks for less.
+    /// more; if it asks for less, once [`PLAN_HOLD`] has passed since the
+    /// leg's last plan change.
     fn offer_plan(&mut self, leg: LegId, wanted: CompactPlan, now: Instant) {
         let Some(leg) = self.legs[leg.index()].as_mut() else {
             return;
         };
         if wanted == leg.plan {
-            leg.lower_since = None;
             return;
         }
-        if plan_cost(wanted) < plan_cost(leg.plan) {
-            let since = *leg.lower_since.get_or_insert(now);
-            if now.saturating_duration_since(since) < PLAN_HOLD {
-                return;
-            }
+        if plan_cost(wanted) < plan_cost(leg.plan)
+            && now.saturating_duration_since(leg.plan_at) < self.config.plan_hold
+        {
+            return;
         }
-        leg.lower_since = None;
+        leg.plan_at = now;
         leg.plan = wanted;
         leg.next_refresh = now;
         self.plan_changes += 1;
@@ -2978,14 +3005,18 @@ mod tests {
         assert_eq!(UdpSession::new(config, now).plan().word(), "C1.16.2");
     }
 
-    /// B X3: a plan that asks for more goes at once; one that asks for less
-    /// only once the estimate has wanted less for a second; a path counts as
-    /// bursty from a mean burst of 2.0 until it falls below 1.5.
+    /// B X3 as the lead changed it after integration 2: a plan that asks for
+    /// more goes at once; one that asks for less [`PLAN_HOLD`] after the
+    /// leg's last plan change, however briefly the estimate has wanted
+    /// less; a path counts as bursty from a mean burst of 2.0 until it falls
+    /// below 1.5.
     #[test]
-    fn a_plan_that_asks_for_less_waits_a_second() {
+    fn a_plan_that_asks_for_less_waits_for_the_hold_after_the_last_change() {
         let now = Instant::now();
         let mut session = subscribed(SessionConfig::new(1), now);
         only_mut(&mut session).loss_samples = 2;
+        let hold = PLAN_HOLD.as_millis() as u64;
+        assert!(hold > 200);
         let ms = |ms: u64| now + Duration::from_millis(ms);
         let plan = |session: &mut UdpSession, loss: f64, burst: Option<f64>, at: Instant| {
             let leg = only_mut(session);
@@ -3001,21 +3032,30 @@ mod tests {
             "more goes at once"
         );
         assert_eq!(only(&session).next_refresh, ms(150));
-        plan(&mut session, 0.05, None, ms(300));
-        assert_eq!(plan(&mut session, 0.05, None, ms(800)), "C2.16.2.7");
-        // The estimate wants the plan again: the hold starts over.
-        plan(&mut session, 0.10, None, ms(900));
-        plan(&mut session, 0.05, None, ms(1_050));
-        assert_eq!(plan(&mut session, 0.05, None, ms(1_900)), "C2.16.2.7");
-        assert_eq!(plan(&mut session, 0.05, None, ms(2_050)), "C1.16.2.7");
+        assert_eq!(plan(&mut session, 0.05, None, ms(160)), "C2.16.2.7");
+        // The estimate wants the plan again: the wait does not start over,
+        // it runs from the change.
+        plan(&mut session, 0.10, None, ms(100 + hold));
+        assert_eq!(plan(&mut session, 0.05, None, ms(140 + hold)), "C2.16.2.7");
+        assert_eq!(
+            plan(&mut session, 0.05, None, ms(150 + hold)),
+            "C1.16.2.7",
+            "less the hold after the change, though wanted only since just before"
+        );
         assert_eq!(session.plan_changes, 2);
+        // More right after a change still goes at once; less again the
+        // hold after that.
+        assert_eq!(plan(&mut session, 0.10, None, ms(200 + hold)), "C2.16.2.7");
+        assert_eq!(plan(&mut session, 0.05, None, ms(190 + 2 * hold)), "C2.16.2.7");
+        assert_eq!(plan(&mut session, 0.05, None, ms(200 + 2 * hold)), "C1.16.2.7");
+        assert_eq!(session.plan_changes, 4);
         // The burst band: bursty at 2.0 (rows instead of a copy, which asks
         // for less: after the hold), still at 1.7, not at 1.4 (a copy
         // again, more: at once).
-        assert_eq!(plan(&mut session, 0.05, Some(2.0), ms(2_200)), "C1.16.2.7");
-        assert_eq!(plan(&mut session, 0.05, Some(2.0), ms(3_200)), "C0.16.4.7");
-        assert_eq!(plan(&mut session, 0.05, Some(1.7), ms(4_000)), "C0.16.4.7");
-        assert_eq!(plan(&mut session, 0.05, Some(1.4), ms(4_200)), "C1.16.2.7");
+        assert_eq!(plan(&mut session, 0.05, Some(2.0), ms(300 + 2 * hold)), "C1.16.2.7");
+        assert_eq!(plan(&mut session, 0.05, Some(2.0), ms(200 + 3 * hold)), "C0.16.4.7");
+        assert_eq!(plan(&mut session, 0.05, Some(1.7), ms(400 + 3 * hold)), "C0.16.4.7");
+        assert_eq!(plan(&mut session, 0.05, Some(1.4), ms(500 + 3 * hold)), "C1.16.2.7");
     }
 
     fn edge_b() -> SocketAddr {

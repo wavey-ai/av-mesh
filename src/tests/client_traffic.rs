@@ -7,7 +7,9 @@
 //!
 //! An ignored measurement: `cargo test --release client_wire_per_part --
 //! --ignored --nocapture --test-threads 1`, with CLIENT_TRAFFIC_SECONDS (30)
-//! and CLIENT_TRAFFIC_LOSS_PERMILLE (0, 10).
+//! and CLIENT_TRAFFIC_LOSS_PERMILLE (0, 10). The same file built on the base
+//! cdfeb5c (target/base-cdfeb5c) gives the base's figures, which
+//! [`BASE_DATAGRAMS_A_PART_AT_3_PER_MILLE`] records.
 
 use super::compact_lane::{publish_paced, AnyEdge, Feed, Payload};
 use super::*;
@@ -58,7 +60,17 @@ pub(super) async fn steady_listener(
 ) -> Wire {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let _ = SockRef::from(&socket).set_recv_buffer_size(16 << 20);
-    let mut session = UdpSession::new(SessionConfig::new(stream_id), Instant::now());
+    let mut config = SessionConfig::new(stream_id);
+    // A form of the plan hold to measure (CLIENT_TRAFFIC_FORM
+    // `<hold ms>:<smoothing>`), the defaults otherwise.
+    if let Some((hold, smoothing)) = std::env::var("CLIENT_TRAFFIC_FORM")
+        .ok()
+        .and_then(|form| form.split_once(':').map(|(a, b)| (a.to_owned(), b.to_owned())))
+    {
+        config.plan_hold = Duration::from_millis(hold.parse().unwrap());
+        config.plan_smoothing = smoothing.parse().unwrap();
+    }
+    let mut session = UdpSession::new(config, Instant::now());
     let mut wire = Wire::default();
     let mut outbox: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -141,9 +153,54 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// What [`measure_wire`] measured: the listener's side and the edge's
+/// counters over the same span.
+pub(super) struct Measured {
+    pub(super) wire: Wire,
+    /// compact_parts, copies, window_repair, nack_parts, nack_resent,
+    /// nack_refused.
+    pub(super) edge: Vec<u64>,
+}
+
+impl Measured {
+    pub(super) fn datagrams_a_part(&self) -> f64 {
+        self.wire.media_datagrams as f64 / self.wire.parts.max(1) as f64
+    }
+
+    pub(super) fn line(&self, feed: Feed, loss_permille: u64, seconds: u64) -> String {
+        let wire = &self.wire;
+        let parts = wire.parts.max(1) as f64;
+        let edge = &self.edge;
+        format!(
+            "feed {feed:?} loss {loss_permille}/1000 {seconds} s: parts {} dup {} lost_on_path {} plan_changes {} | \
+             media {} datagrams ({:.4}/part) {} B ({:.2} B/part) | control in {:?} | \
+             control out {:?} ({} B, {:.2} B/part) | edge compact_parts {} copies {} \
+             window_repair {} nack_parts {} nack_resent {} nack_refused {}",
+            wire.parts,
+            wire.duplicates,
+            wire.lost_on_path,
+            wire.plan_changes,
+            wire.media_datagrams,
+            wire.media_datagrams as f64 / parts,
+            wire.media_bytes,
+            wire.media_bytes as f64 / parts,
+            wire.control_in,
+            wire.control_out,
+            wire.control_out_bytes,
+            wire.control_out_bytes as f64 / parts,
+            edge[0],
+            edge[1],
+            edge[2],
+            edge[3],
+            edge[4],
+            edge[5],
+        )
+    }
+}
+
 /// Datagrams and bytes per part to a steady one-leg listener of 1 ms Opus
 /// Custom, and what it sends back, over `seconds` after a 3 s settle.
-pub(super) async fn measure_wire(feed: Feed, loss_permille: u64, seconds: u64) -> String {
+pub(super) async fn measure_wire(feed: Feed, loss_permille: u64, seconds: u64) -> Measured {
     let payload = Payload::Opus1;
     let stream_id = 7_301;
     let (edge, next) = AnyEdge::start(feed, payload, stream_id, 91).await;
@@ -188,36 +245,48 @@ pub(super) async fn measure_wire(feed: Feed, loss_permille: u64, seconds: u64) -
     stop.store(true, Ordering::Relaxed);
     let wire = listener.await.unwrap();
     edge.stop().await;
-    let parts = wire.parts.max(1) as f64;
-    let edge_delta: Vec<u64> = at_end
+    let edge = at_end
         .iter()
         .zip(at_start.iter())
         .map(|(end, start)| end - start)
         .collect();
-    format!(
-        "feed {feed:?} loss {loss_permille}/1000 {seconds} s: parts {} dup {} lost_on_path {} plan_changes {} | \
-         media {} datagrams ({:.4}/part) {} B ({:.2} B/part) | control in {:?} | \
-         control out {:?} ({} B, {:.2} B/part) | edge compact_parts {} copies {} \
-         window_repair {} nack_parts {} nack_resent {} nack_refused {}",
-        wire.parts,
-        wire.duplicates,
-        wire.lost_on_path,
-        wire.plan_changes,
-        wire.media_datagrams,
-        wire.media_datagrams as f64 / parts,
-        wire.media_bytes,
-        wire.media_bytes as f64 / parts,
-        wire.control_in,
-        wire.control_out,
-        wire.control_out_bytes,
-        wire.control_out_bytes as f64 / parts,
-        edge_delta[0],
-        edge_delta[1],
-        edge_delta[2],
-        edge_delta[3],
-        edge_delta[4],
-        edge_delta[5],
-    )
+    Measured { wire, edge }
+}
+
+/// Datagrams a part to the steady one-leg listener at 0.3 % loss on the
+/// base cdfeb5c (compact feed, 30 s): 1.231 to 1.245 in integration 2,
+/// 1.2376 in av-mesh-fix-3 (the same file built on target/base-cdfeb5c).
+pub(super) const BASE_DATAGRAMS_A_PART_AT_3_PER_MILLE: f64 = 1.238;
+
+/// The plan hold as the lead set it after integration 2 (B 2.7: less a
+/// second after the last change, not after a second of wanting less): at
+/// 0.3 % random loss a steady listener costs at most 12 % more datagrams a
+/// part than the base, which had no hold, and changes its plan at most 50
+/// times in 30 s (the hold of wanting cost 21 to 23 % for 20 changes; no
+/// hold 70 changes).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_plan_hold_costs_at_most_twelve_percent_over_the_base_at_three_per_mille() {
+    let seconds = 30;
+    let measured = measure_wire(Feed::FastCompact, 3, seconds).await;
+    println!("{}", measured.line(Feed::FastCompact, 3, seconds));
+    let ratio = measured.datagrams_a_part() / BASE_DATAGRAMS_A_PART_AT_3_PER_MILLE;
+    assert!(
+        measured.wire.parts >= seconds * 900,
+        "the listener got {} parts in {seconds} s",
+        measured.wire.parts
+    );
+    assert!(
+        ratio <= 1.12,
+        "{:.4} datagrams a part at 0.3 % loss, {:.1} % over the base's {}",
+        measured.datagrams_a_part(),
+        (ratio - 1.0) * 100.0,
+        BASE_DATAGRAMS_A_PART_AT_3_PER_MILLE
+    );
+    assert!(
+        measured.wire.plan_changes <= 50,
+        "{} plan changes in {seconds} s",
+        measured.wire.plan_changes
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -240,7 +309,8 @@ async fn client_wire_per_part() {
     };
     for feed in feeds {
         for loss in &losses {
-            println!("{}", measure_wire(feed, *loss, seconds).await);
+            let measured = measure_wire(feed, *loss, seconds).await;
+            println!("{}", measured.line(feed, *loss, seconds));
         }
     }
 }
