@@ -78,7 +78,10 @@ pub fn mode() -> LockMode {
 
 /// A region that `pin_region` faulted in and perhaps locked. Its lock ends
 /// when it is dropped: an owner keeps it as its first field, so that it
-/// drops (and unlocks) before the buffer it covers is freed.
+/// drops (and unlocks) before the buffer it covers is freed. Locks do not
+/// nest and a heap region need not start or end on a page, so a region
+/// shares its first and last pages with its neighbours: a drop unlocks only
+/// the pages wholly inside it, and never a live neighbour's page.
 #[derive(Debug)]
 pub struct Pinned {
     ptr: usize,
@@ -109,9 +112,13 @@ impl Drop for Pinned {
         }
         #[cfg(target_os = "linux")]
         {
-            // SAFETY: the range was locked by `pin_region` and its owner
-            // has not freed it yet (see the type's documentation).
-            unsafe { libc::munlock(self.ptr as *const libc::c_void, self.len) };
+            let start = self.ptr.next_multiple_of(PAGE);
+            let end = (self.ptr + self.len) / PAGE * PAGE;
+            if end > start {
+                // SAFETY: whole pages inside the range that `pin_region`
+                // locked, whose owner has not freed it yet (see above).
+                unsafe { libc::munlock(start as *const libc::c_void, end - start) };
+            }
         }
         LOCKED.fetch_sub(self.len as u64, Ordering::Relaxed);
     }
@@ -436,6 +443,72 @@ mod tests {
         assert!(report.vm_lck_kb >= (len / 1024) as u64, "{report:?}");
         assert!(report.prefaulted_bytes >= len as u64, "{report:?}");
         drop(pinned);
+    }
+
+    /// The kB that `/proc/self/smaps` shows locked in `start..start + len`.
+    fn locked_kb_in(start: usize, len: usize) -> u64 {
+        let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+        let mut inside = false;
+        let mut kb = 0;
+        for line in smaps.lines() {
+            let range = line.split_whitespace().next().unwrap_or("");
+            // A mapping's header line starts with its range; its fields
+            // follow, one per line.
+            if let Some((from, to)) = range.split_once('-') {
+                if let (Ok(from), Ok(to)) = (
+                    usize::from_str_radix(from, 16),
+                    usize::from_str_radix(to, 16),
+                ) {
+                    inside = from >= start && to <= start + len;
+                    continue;
+                }
+            }
+            if inside {
+                if let Some(rest) = line.strip_prefix("Locked:") {
+                    kb += rest
+                        .trim()
+                        .trim_end_matches("kB")
+                        .trim()
+                        .parse::<u64>()
+                        .unwrap_or(0);
+                }
+            }
+        }
+        kb
+    }
+
+    #[test]
+    fn a_dropped_region_leaves_the_page_it_shares_with_a_live_one_locked() {
+        // D3 review 10: two regions share page 1 of three. Dropping the
+        // second unlocks only its own page 2; page 1 stays locked for the
+        // first.
+        let len = 3 * PAGE;
+        if soft_limit().is_some_and(|limit| limit < 16 * PAGE as u64) {
+            eprintln!("skipped: RLIMIT_MEMLOCK below 16 pages");
+            return;
+        }
+        let block = Fresh::new(len);
+        let split = PAGE + 100;
+        // SAFETY: both halves are inside the owned mapping, which outlives
+        // the pins.
+        let first = unsafe { pin_region("test first half", block.0, split) };
+        // SAFETY: as above.
+        let second = unsafe { pin_region("test second half", block.0.add(split), len - split) };
+        assert!(first.is_locked() && second.is_locked());
+        let base = block.0 as usize;
+        assert_eq!(locked_kb_in(base, len), 12);
+        drop(second);
+        assert_eq!(
+            locked_kb_in(base, len),
+            8,
+            "page 1 is still the first region's"
+        );
+        drop(first);
+        assert_eq!(
+            locked_kb_in(base, len),
+            4,
+            "the shared page is left locked, not a neighbour's unlocked"
+        );
     }
 
     #[test]
