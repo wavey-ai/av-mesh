@@ -1336,7 +1336,7 @@ async fn main() -> Result<()> {
     let mut arrivals: BTreeMap<u64, Arrival> = BTreeMap::new();
     // The node names the arrivals and the time on one path refer to.
     let mut nodes: Vec<String> = Vec::new();
-    let mut single_path = SinglePath::default();
+    let mut single_path = SinglePath::new(Duration::from_millis(args.token_ms));
     // The last first arrival (kernel time where the host gives it), the
     // longest gap between two, and the gaps of INTERRUPTION or more.
     let mut last_first_us: Option<u64> = None;
@@ -2058,7 +2058,7 @@ mod tests {
         // v1's moves: one per leg replaced, take-backs left out.
         assert_eq!(moves.len(), 1);
         assert_eq!((moves[0].at_ms, moves[0].next_part), (3_950, None));
-        let mut path = SinglePath::default();
+        let mut path = SinglePath::new(Duration::from_millis(400));
         let window = Duration::from_millis(20);
         path.observe(ms(100), window, [ms(100), ms(100)], true);
         path.observe(ms(3_960), window, [ms(3_960), ms(3_900)], true);

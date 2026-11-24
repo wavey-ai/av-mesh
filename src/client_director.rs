@@ -2719,11 +2719,19 @@ impl Director {
 /// A two-path session's time on fewer than two delivering legs (B 2.8
 /// `single_path_ms`, `single_path_spans`), for the clients' reports. A leg
 /// delivers while its last media is at most `window` old (max(20 ms, 8
-/// part intervals), as [`LegView::delivering`]). Time is counted only once
-/// two legs have delivered together, and only while two legs are wanted.
-#[derive(Debug, Default, Clone)]
+/// part intervals), as [`LegView::delivering`]). Time is counted only while
+/// two legs are wanted, and from the session's first media plus a join
+/// allowance (the token wait: a clean join's second leg brings its first
+/// part within it), or from the moment two legs first deliver together if
+/// that is sooner. A session that never gets its second leg (a short grant
+/// for the gate or for one edge, a join whose second edge is dead in a
+/// region with no third) is on one path from the end of the allowance
+/// (review of B Y2, finding 5).
+#[derive(Debug, Clone)]
 pub struct SinglePath {
-    two_seen: bool,
+    allowance: Duration,
+    /// When time on one path begins to count.
+    counts_from: Option<Instant>,
     open: Option<Instant>,
     /// Each span, closed.
     pub spans: Vec<(Instant, Instant)>,
@@ -2731,11 +2739,23 @@ pub struct SinglePath {
 }
 
 impl SinglePath {
+    /// `allowance`: the join's own time after the first media, `--token-ms`.
+    pub fn new(allowance: Duration) -> Self {
+        Self {
+            allowance,
+            counts_from: None,
+            open: None,
+            spans: Vec::new(),
+            total: Duration::ZERO,
+        }
+    }
+
     /// Judge the session now from the last media of each leg it holds
     /// (live or leaving); `two_paths`: two legs are wanted now. Call it at
     /// every media datagram and every wake: a span ends at the datagram
     /// that brings a second leg back, and begins when the second-freshest
-    /// leg's media went stale.
+    /// leg's media went stale (or, with no second leg, when time begins to
+    /// count).
     pub fn observe(
         &mut self,
         now: Instant,
@@ -2757,15 +2777,20 @@ impl SinglePath {
             }
         }
         if delivering >= 2 {
-            self.two_seen = true;
+            self.counts_from = Some(self.counts_from.map_or(now, |from| from.min(now)));
+        } else if self.counts_from.is_none() {
+            self.counts_from = first.map(|first| first + self.allowance);
         }
         if delivering >= 2 || !two_paths {
             self.close(now);
             return;
         }
-        if self.two_seen && self.open.is_none() {
-            let since = second.map_or(now, |second| (second + window).min(now));
-            self.open = Some(since);
+        let Some(from) = self.counts_from.filter(|from| *from <= now) else {
+            return;
+        };
+        if self.open.is_none() {
+            let since = second.map_or(from, |second| (second + window).max(from));
+            self.open = Some(since.min(now));
         }
     }
 
@@ -5042,14 +5067,15 @@ mod tests {
     }
 
     /// The time on one path: from when the second-freshest leg's media went
-    /// stale to the datagram that brings a second leg back; nothing before
-    /// two legs first delivered together, nor while one leg is wanted.
+    /// stale to the datagram that brings a second leg back; nothing in the
+    /// join (before two legs first delivered together, within the
+    /// allowance), nor while one leg is wanted.
     #[test]
     fn single_path_spans_run_from_the_stale_leg_to_the_second_leg_back() {
         let t0 = Instant::now();
         let ms = |n: u64| t0 + Duration::from_millis(n);
         let window = Duration::from_millis(20);
-        let mut path = SinglePath::default();
+        let mut path = SinglePath::new(Duration::from_millis(400));
         // A join: one leg for 5 ms is not single-path time.
         path.observe(ms(0), window, [ms(0)], true);
         path.observe(ms(5), window, [ms(5), ms(5)], true);
@@ -5073,5 +5099,40 @@ mod tests {
         path.close(ms(410));
         assert_eq!(path.spans.len(), 2);
         assert_eq!(path.total, Duration::from_millis(55 + 40));
+    }
+
+    /// Review of B Y2, finding 5: a two-path session that never gets its
+    /// second leg is on one path from its first media plus the join's
+    /// allowance to the end, though two legs never delivered together.
+    #[test]
+    fn a_session_that_never_has_two_legs_is_on_one_path() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let window = Duration::from_millis(20);
+        let mut path = SinglePath::new(Duration::from_millis(400));
+        // Before any media: the join, nothing counted.
+        path.observe(ms(0), window, [], true);
+        assert!(!path.is_open());
+        // One leg from 10 ms, for 5 s, two legs wanted throughout.
+        for at in (10..5_010).step_by(5) {
+            path.observe(ms(at), window, [ms(at)], true);
+            assert_eq!(path.is_open(), at >= 410, "at {at} ms");
+        }
+        path.close(ms(5_010));
+        assert_eq!(path.spans, [(ms(410), ms(5_010))]);
+        assert_eq!(path.total, Duration::from_millis(4_600));
+        // A second leg that comes after the allowance ends the span; one
+        // that comes within it leaves nothing counted.
+        let mut late = SinglePath::new(Duration::from_millis(400));
+        late.observe(ms(0), window, [ms(0)], true);
+        late.observe(ms(600), window, [ms(600)], true);
+        late.observe(ms(1_000), window, [ms(1_000), ms(1_000)], true);
+        assert_eq!(late.spans, [(ms(400), ms(1_000))]);
+        let mut clean = SinglePath::new(Duration::from_millis(400));
+        clean.observe(ms(0), window, [ms(0)], true);
+        clean.observe(ms(300), window, [ms(300)], true);
+        clean.observe(ms(310), window, [ms(310), ms(310)], true);
+        clean.close(ms(2_000));
+        assert_eq!(clean.total, Duration::ZERO);
     }
 }

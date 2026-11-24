@@ -655,7 +655,7 @@ struct Live {
 }
 
 /// What a listener received and what its director did.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ListenerRun {
     sid: String,
     /// Each part's first arrival: its kernel receive time (Unix µs) and
@@ -792,7 +792,17 @@ async fn listen(
     let mut loss = Loss::new(director.config.nonce_seed, config.loss);
     let mut run = ListenerRun {
         sid: config.sid.clone(),
-        ..ListenerRun::default()
+        parts: BTreeMap::new(),
+        delivered_twice: 0,
+        gaps: 0,
+        replacements: Vec::new(),
+        stats: DirectorStats::default(),
+        single_path: SinglePath::new(director.config.token_wait),
+        single_spans_us: Vec::new(),
+        nodes_held: BTreeSet::new(),
+        abandoned: 0,
+        nacked: 0,
+        events_us: Vec::new(),
     };
     let mut nodes: Vec<String> = Vec::new();
     let mut lasts: Vec<(LegKey, Instant)> = Vec::new();
