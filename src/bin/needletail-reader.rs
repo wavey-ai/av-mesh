@@ -61,6 +61,7 @@ const DEFAULT_STREAMS_PER_CONNECTION: usize = 256;
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "needletail-reader",
+    version = av_mesh::build::VERSION,
     about = "Read an LL-HLS stream through a Needletail entry point and report continuity"
 )]
 struct Args {
@@ -2220,6 +2221,17 @@ fn part_after_a_hole(listed: &[(u64, u64)], wanted: u64, overdue: bool) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C CR3: every binary of the crate names the build it came from
+    /// (`--version`).
+    #[test]
+    fn the_version_names_the_build() {
+        use clap::CommandFactory;
+        assert_eq!(
+            Args::command().get_version(),
+            Some(av_mesh::build::VERSION)
+        );
+    }
 
     fn ms(millis: u64) -> Duration {
         Duration::from_millis(millis)

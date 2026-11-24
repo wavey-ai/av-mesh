@@ -35,6 +35,7 @@ use std::time::Duration;
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "needletail-load",
+    version = av_mesh::build::VERSION,
     about = "Simulated UDP listeners of a Needletail stream, thousands per host"
 )]
 struct Args {
@@ -374,6 +375,17 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C CR3: every binary of the crate names the build it came from
+    /// (`--version`).
+    #[test]
+    fn the_version_names_the_build() {
+        use clap::CommandFactory;
+        assert_eq!(
+            Args::command().get_version(),
+            Some(av_mesh::build::VERSION)
+        );
+    }
 
     #[test]
     fn the_flags_make_the_configuration() {

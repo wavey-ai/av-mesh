@@ -60,6 +60,7 @@ const BOOT_SCHEMA: &str = "needletail.node-warm.v2";
 #[derive(Debug, Parser)]
 #[command(
     name = "needletail-nodecheck",
+    version = av_mesh::build::VERSION,
     about = "Whether a node is run: a tick journal, a warm pass, touch and echo probes, a boot check"
 )]
 struct Cli {
@@ -1247,6 +1248,17 @@ fn boot_command(args: &BootArgs, started: impl FnOnce(&TickThreads)) -> ExitCode
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C CR3: every binary of the crate names the build it came from
+    /// (`--version`).
+    #[test]
+    fn the_version_names_the_build() {
+        use clap::CommandFactory;
+        assert_eq!(
+            Cli::command().get_version(),
+            Some(av_mesh::build::VERSION)
+        );
+    }
 
     const HOLD_MS: u64 = 300;
 

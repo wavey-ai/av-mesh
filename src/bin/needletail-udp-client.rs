@@ -65,6 +65,7 @@ const HOME_PROBE_EVERY: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "needletail-udp-client",
+    version = av_mesh::build::VERSION,
     about = "Receive a Needletail stream by RaptorQ FEC UDP from an assigned edge"
 )]
 struct Args {
@@ -1709,6 +1710,17 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use av_mesh::client_udp::{AssignedCache, Control};
+
+    /// C CR3: every binary of the crate names the build it came from
+    /// (`--version`).
+    #[test]
+    fn the_version_names_the_build() {
+        use clap::CommandFactory;
+        assert_eq!(
+            Args::command().get_version(),
+            Some(av_mesh::build::VERSION)
+        );
+    }
 
     /// Wave 9 D: with UDP GRO a sender's GSO run comes as one receive that
     /// names its datagrams' size; without it, one datagram per receive. GRO

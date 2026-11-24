@@ -54,6 +54,7 @@ impl From<ServerBackend> for H3Backend {
 #[derive(Debug, Parser)]
 #[command(
     name = "h3-static-capacity",
+    version = av_mesh::build::VERSION,
     about = "Isolate production H2H3Server TLS/QUIC/H3 static-response capacity"
 )]
 struct Args {
@@ -817,6 +818,17 @@ fn percentiles(mut values_ns: Vec<u64>) -> Percentiles {
 #[cfg(test)]
 mod tests {
     use super::rate_qualification;
+
+    /// C CR3: every binary of the crate names the build it came from
+    /// (`--version`).
+    #[test]
+    fn the_version_names_the_build() {
+        use clap::CommandFactory;
+        assert_eq!(
+            super::Args::command().get_version(),
+            Some(av_mesh::build::VERSION)
+        );
+    }
 
     #[test]
     fn strict_qualification_requires_every_request_and_no_pressure() {
