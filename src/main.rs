@@ -1564,8 +1564,11 @@ struct Args {
     relay_class_tee_capacity: usize,
 
     /// MiB of the video class's tee ring, which a 4K stream's symbols fill
-    /// by their bytes long before its entries run out (192: about 5 s of
-    /// 300 Mbit/s); pinned with the other rings.
+    /// by their bytes long before its entries run out at the old 16 MB.
+    /// Its first 16 MB (--relay-class-tee-capacity x 256 B) is pinned at
+    /// start with the other rings; the rest is faulted in and locked off
+    /// the class thread when the first video datagram comes, so a node
+    /// that carries no video never holds it.
     #[arg(
         long,
         env = "NEEDLETAIL_RELAY_VIDEO_TEE_MB",

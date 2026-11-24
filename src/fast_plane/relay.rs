@@ -14,7 +14,7 @@ use super::loss_report::{decode_ledger, LossMeter};
 use super::media_clock::{MediaClocks, ValidatedEpochs, Verdict};
 use super::parent_feeds::{FeedMisses, ParentFeeds};
 use super::sys::{self, RecvBatch, RECV_BATCH};
-use super::tee_ring::{self, tee_ring, tee_ring_with_bytes, Ready, TeeReceiver, TeeSender};
+use super::tee_ring::{self, tee_ring, tee_ring_growing, Ready, TeeReceiver, TeeSender};
 use super::view::RlsView;
 use super::{class_addr, StreamClasses, TrafficClass};
 use crate::link_telemetry::LinkTelemetry;
@@ -58,7 +58,12 @@ pub const DEFAULT_TEE_CAPACITY: usize = 65_536;
 /// from that node's cache. Local lab, 24 Nov, the referee's 247 Mbit/s
 /// clip, 40 s: 16 MB 1,875 to 110,868 tee_dropped at the distributors in
 /// every run; 48 MiB 31,591 to 178,300; 192 MiB none (one run). The old
-/// channel (65,536 entries of any size, unpinned) held as much.
+/// channel (65,536 entries of any size, unpinned) held as much. Only the
+/// first 16 MB is faulted in and locked at start; the rest when a video
+/// datagram first comes (`tee_ring::tee_ring_growing`). With the default
+/// 65,536 entries the entries bind first, at about 88 MB of 1,350-byte
+/// symbols, but the ring's bytes are written in turn, so all of them are
+/// resident once grown.
 pub const DEFAULT_VIDEO_TEE_BYTES: usize = 192 << 20;
 /// Symbols the first-arrival table remembers per class.
 const DEDUP_CAPACITY: usize = 65_536;
@@ -2627,14 +2632,20 @@ pub async fn run_relay_class_ingest(
         if class_sockets.is_empty() {
             continue;
         }
-        // Made, faulted in and locked here, before the thread runs.
+        // Made, faulted in and locked here, before the thread runs. The
+        // video ring only in part: the first `tee_capacity` entries' worth
+        // of bytes (16 MB), and the rest of its `--relay-video-tee-mb` once
+        // a video datagram comes, so that a node that carries no video
+        // never has it resident or locked (tee_ring's module docs).
         let (tx, rx) = match class {
-            TrafficClass::Video => tee_ring_with_bytes(
-                config.tee_capacity,
-                config
-                    .video_tee_bytes
-                    .max(config.tee_capacity.saturating_mul(tee_ring::BYTES_PER_ENTRY)),
-            ),
+            TrafficClass::Video => {
+                let initial = config.tee_capacity.saturating_mul(tee_ring::BYTES_PER_ENTRY);
+                tee_ring_growing(
+                    config.tee_capacity,
+                    initial,
+                    config.video_tee_bytes.max(initial),
+                )
+            }
             TrafficClass::Audio => tee_ring(config.tee_capacity),
         };
         let thread = ClassThread {
