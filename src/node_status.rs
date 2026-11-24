@@ -439,6 +439,13 @@ pub struct ReadinessInputs {
     pub node_warm_complete: Option<bool>,
 }
 
+impl ReadinessInputs {
+    /// The boot check passed, or none is configured (D 2.4).
+    pub fn boot_check_passed(&self) -> bool {
+        self.node_warm_complete != Some(false)
+    }
+}
+
 /// What the readiness evaluator decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Readiness {
@@ -500,7 +507,9 @@ impl Readiness {
                 ));
             }
         }
-        Self::decide(inputs, was_warm, inputs.ready_forced, conditions)
+        // A forced start serves cold, never past a failed boot check.
+        let forced = inputs.ready_forced && inputs.boot_check_passed();
+        Self::decide(inputs, was_warm, forced, conditions)
     }
 
     /// A forwarder's (a distributor's) readiness. `was_warm`: the warm-up
@@ -649,12 +658,15 @@ fn region_heads_condition(inputs: &ReadinessInputs, conditions: &mut Conditions)
     }
 }
 
-/// D 2.4: a node whose boot check is configured and not complete is not
-/// ready (a level condition: an edge's forced start does not pass it).
+/// D 2.4, 3.2: a node whose boot check is configured and not complete is
+/// never ready, and is never offered listeners: a warm-up condition that
+/// stays unmet (the record is read once, at start), so the start holds and
+/// an edge's start timeout does not force it ([`Readiness::edge`],
+/// `lifecycle::run_start`).
 fn node_warm_condition(inputs: &ReadinessInputs, conditions: &mut Conditions) {
-    if inputs.node_warm_complete == Some(false) {
+    if !inputs.boot_check_passed() {
         conditions
-            .level
+            .warm_up
             .push("node warm check not complete".to_owned());
     }
 }
@@ -967,26 +979,36 @@ mod tests {
     }
 
     #[test]
-    fn a_boot_check_not_complete_is_a_level_condition() {
+    fn a_boot_check_not_complete_is_never_met_and_never_forced() {
         let nodes: [(fn(&ReadinessInputs, bool) -> Readiness, ReadinessInputs); 2] = [
             (Readiness::edge, serving_edge()),
             (Readiness::forwarder, fed_forwarder()),
         ];
         for (evaluate, mut healthy) in nodes {
-            level(
-                evaluate,
-                &healthy,
-                |inputs| inputs.node_warm_complete = Some(false),
-                "node warm check not complete",
+            let mut failed = healthy.clone();
+            failed.node_warm_complete = Some(false);
+            let readiness = evaluate(&failed, false);
+            assert_eq!(readiness.state, NodeState::Starting, "{readiness:?}");
+            assert!(!readiness.warm);
+            assert_eq!(
+                readiness.not_ready,
+                vec!["node warm check not complete".to_owned()]
             );
             healthy.node_warm_complete = Some(true);
             ready(&evaluate(&healthy, false));
         }
-        // A forced edge serves cold, never past a failed check.
+        // A forced edge serves cold, never past a failed check: it is still
+        // starting (D 3.2: never offered listeners).
         let mut edge = serving_edge();
         edge.ready_forced = true;
         edge.node_warm_complete = Some(false);
-        assert!(!Readiness::edge(&edge, false).ready());
+        let readiness = Readiness::edge(&edge, false);
+        assert_eq!(readiness.state, NodeState::Starting, "{readiness:?}");
+        // Without a failed check the forced edge serves (cold).
+        edge.node_warm_complete = None;
+        edge.regional_view = false;
+        edge.uptime_ms = 0;
+        assert_ne!(Readiness::edge(&edge, false).state, NodeState::Starting);
     }
 
     #[test]

@@ -4223,6 +4223,7 @@ async fn main() -> Result<()> {
             .collect(),
         ),
         forwarder: relay_forwarder.clone(),
+        node_warm: node_warm::installed().cloned(),
         ..NodeStatusSource::default()
     };
     // C CR2's make-before-break release: a parent that left a ranked set
@@ -20442,6 +20443,9 @@ struct NodeStatusSource {
     /// permille, kept by `run_node_cpu_sampler`.
     cpu_permille: Arc<std::sync::atomic::AtomicU32>,
     memory: Arc<StdMutex<NodeStatusMemory>>,
+    /// D 2.4: the boot check's record read at start (`--node-warm-file`),
+    /// `None` when none is configured.
+    node_warm: Option<node_warm::NodeWarmStatus>,
 }
 
 /// How often `run_node_cpu_sampler` reads the process's CPU time.
@@ -21401,7 +21405,7 @@ impl AppRouter {
         snapshot.status = Some((*self.node_status().await).clone());
         snapshot.stall = stall_journal::installed().map(|journal| journal.snapshot());
         snapshot.memory = Some(memory::report());
-        snapshot.node_warm = node_warm::installed().cloned();
+        snapshot.node_warm = self.node_status.node_warm.clone();
         snapshot
     }
 
@@ -21780,7 +21784,7 @@ impl AppRouter {
             warm_copies,
             slot_streams: warm.slot_streams,
             ready_forced: self.lifecycle.ready_forced(),
-            node_warm_complete: node_warm::installed().map(|status| status.complete),
+            node_warm_complete: self.node_status.node_warm.as_ref().map(|status| status.complete),
         };
         let readiness = if edge {
             Readiness::edge(&inputs, memory.warm)
@@ -21824,7 +21828,7 @@ impl AppRouter {
             cache_mesh,
             client_udp,
             entry,
-            node_warm: node_warm::installed().cloned(),
+            node_warm: self.node_status.node_warm.clone(),
         });
         memory.cached = Some((now, Arc::clone(&status)));
         status
@@ -43139,7 +43143,13 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         let cache = LiveTsCache::new(1, Duration::from_millis(5), 2, 64, 64).await;
         let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
-        let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh));
+        // As main() builds the status source: the record read at start.
+        let router = app_router_for_tests(Arc::clone(&cache), Arc::clone(&mesh)).with_node_status(
+            NodeStatusSource {
+                node_warm: node_warm::installed().cloned(),
+                ..NodeStatusSource::default()
+            },
+        );
         let json = |response: HandlerResponse| -> serde_json::Value {
             serde_json::from_slice(response.body.as_ref().unwrap()).unwrap()
         };

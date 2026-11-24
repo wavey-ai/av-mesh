@@ -2141,3 +2141,75 @@ async fn an_idle_region_is_known_after_two_advertisements_of_its_nodes() {
     telemetry.ingest_snapshot(far).await;
     assert!(!heads.observe(&telemetry, &node, 3_000, at).await);
 }
+
+/// C 3.1 against D 2.4, 3.2 (integration 2): an edge whose boot check
+/// (`--node-warm-file`) did not complete is never offered listeners. Its
+/// start does not end at `--start-warm-ms`: it holds `start` (its hello and
+/// advertisement say it drains), `/api/node` says `starting` with "node
+/// warm check not complete", and it is never `ready_forced`. The same edge
+/// with a complete check takes its place as before, and both name the build
+/// that every binary of the crate names in `--version`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_edge_whose_boot_check_failed_is_never_offered_listeners() {
+    let edge = |complete: bool| async move {
+        let cache = LiveTsCache::new(1, Duration::from_millis(500), 2, 6, 64).await;
+        let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+        let lifecycle = NodeLifecycle::new(LifecycleConfig {
+            edge: true,
+            start_drained: true,
+            state_file: None,
+            warm_pass: false,
+        });
+        router_with("edge", cache, mesh, CacheMeshRole::Edge, lifecycle, 0).with_node_status(
+            NodeStatusSource {
+                node_warm: Some(node_warm::NodeWarmStatus {
+                    configured: true,
+                    complete,
+                    verdict: if complete { "ok" } else { "steal" }.to_owned(),
+                    warm: None,
+                    check: None,
+                }),
+                ..NodeStatusSource::default()
+            },
+        )
+    };
+    for complete in [false, true] {
+        let router = edge(complete).await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(());
+        let start = tokio::spawn(start_edge(
+            router.clone(),
+            Duration::from_millis(300),
+            shutdown_rx,
+        ));
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        tokio::time::sleep(NODE_STATUS_CACHE).await;
+        let status = router.node_status().await;
+        assert_eq!(status.build.git, av_mesh::build::GIT, "{status:?}");
+        if complete {
+            assert!(start.is_finished(), "the start ended");
+            assert!(!router.lifecycle.holds(DrainReason::Start));
+            assert!(!router.lifecycle.is_draining().await);
+            assert_ne!(status.state, NodeState::Starting, "{status:?}");
+            assert!(
+                !status
+                    .not_ready
+                    .contains(&"node warm check not complete".to_owned()),
+                "{status:?}"
+            );
+        } else {
+            assert!(!start.is_finished(), "the start holds past --start-warm-ms");
+            start.abort();
+            assert!(router.lifecycle.holds(DrainReason::Start));
+            assert!(router.lifecycle.is_draining().await, "advertised as draining");
+            assert!(!router.lifecycle.ready_forced());
+            assert_eq!(status.state, NodeState::Starting, "{status:?}");
+            assert!(!status.ready_forced && !status.warm, "{status:?}");
+            assert!(
+                status
+                    .not_ready
+                    .contains(&"node warm check not complete".to_owned()),
+                "{status:?}"
+            );
+        }
+    }
+}

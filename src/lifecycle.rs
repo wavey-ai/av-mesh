@@ -634,8 +634,11 @@ async fn run_start(
                 state = ?status.state,
                 "warm: the node takes its place (drain reason start dropped)"
             );
-        } else if let Some(bound) =
-            warm_bound.filter(|bound| Duration::from_millis(status.process.uptime_ms) >= *bound)
+        } else if let Some(bound) = warm_bound
+            .filter(|bound| Duration::from_millis(status.process.uptime_ms) >= *bound)
+            // D 2.4, 3.2: a node whose boot check failed is never offered
+            // listeners, so its start is never forced.
+            .filter(|_| status.node_warm.as_ref().is_none_or(|warm| warm.complete))
         {
             lifecycle.force_start();
             warn!(
