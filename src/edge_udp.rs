@@ -3619,6 +3619,8 @@ async fn run_stream_sender(
         held_while_lost: false,
         drain: None,
         demand_at: Instant::now(),
+        replica_at: Instant::now(),
+        draining: router.lifecycle.is_draining().await,
     };
     let mut last_sent = Instant::now();
     loop {
@@ -3709,6 +3711,13 @@ async fn run_stream_sender(
             )
         };
 
+        // A drain begun or lifted: the housekeeping now (an atomic load a
+        // part; the drain's first moves still wait for its advertisement).
+        let draining = router.lifecycle.is_draining().await;
+        if draining != house.draining {
+            house.draining = draining;
+            house.at = house.at.min(now);
+        }
         if now >= house.at {
             match housekeeping_moves(
                 &mut house, &sockets, &router, &table, &moved, config, &stats, &socket, stream_id,
@@ -3888,8 +3897,16 @@ struct Housekeeping {
     /// there were, those sent away so far).
     drain: Option<DrainPace>,
     /// The playlist's demand is kept once a second, also while a rebalance
-    /// round runs the housekeeping every tick.
+    /// round runs the housekeeping every tick, and while its subscribers
+    /// leave (B rule 2: a leaving subscriber is served until it goes).
     demand_at: Instant,
+    /// The replica is asked for once a second while no reason moves the
+    /// stream's subscribers.
+    replica_at: Instant,
+    /// The node drained when the housekeeping last looked: a change (a
+    /// drain begun or lifted) runs it at the stream's next part, not at
+    /// the next tick of up to [`HOUSEKEEPING`] (fix 4, F6a).
+    draining: bool,
 }
 
 /// What the stream sender does after its housekeeping.
@@ -3939,6 +3956,20 @@ async fn housekeeping_moves(
 ) -> AfterHousekeeping {
     house.at = now + HOUSEKEEPING;
     house.held_while_lost = false;
+    if now >= house.demand_at {
+        house.demand_at = now + HOUSEKEEPING;
+        // Keep the playlist held, as a reader's playlist reloads do (wave
+        // 9: without the wait for a playable copy, which held a cold
+        // edge's first subscribers' parts back), whatever the reason to
+        // move: a drain's leaving subscribers are served until they go
+        // (fix 4, F6a: the lease lapsed 7 s into a drain and starved the
+        // subscribers still there).
+        if config.prompt_sender {
+            router.open_playlist_demand(stream_id).await;
+        } else {
+            router.ensure_playlist_copy(stream_id).await;
+        }
+    }
     let reason = move_reason(router, stream_id).await;
     let paced = reason == Some("draining") && !config.drain_spread.is_zero();
     if !paced {
@@ -4053,17 +4084,8 @@ async fn housekeeping_moves(
         house.held_while_lost = held;
         after
     } else {
-        if now >= house.demand_at {
-            house.demand_at = now + HOUSEKEEPING;
-            // Keep the playlist held, as a reader's playlist reloads
-            // do (wave 9: without the wait for a playable copy,
-            // which held a cold edge's first subscribers' parts
-            // back).
-            if config.prompt_sender {
-                router.open_playlist_demand(stream_id).await;
-            } else {
-                router.ensure_playlist_copy(stream_id).await;
-            }
+        if house.replica_at <= now {
+            house.replica_at = now + HOUSEKEEPING;
             router
                 .request_replica_for_stream(stream_id, "udp-client-demand", None)
                 .await;

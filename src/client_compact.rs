@@ -1130,6 +1130,20 @@ pub const COMPARED_PARTS: usize = 16;
 /// A leg is level with another when its median lag is at most this much
 /// more than the other's.
 pub const LEVEL_MARGIN: Duration = Duration::from_micros(250);
+/// A datagram of an unseen generation that did not come on the fast lane
+/// does not start a new flow while the current generation came on the fast
+/// lane this recently (fix 4, F2): the fast lane stamps each part's own
+/// source epoch, the cache-fed lane its edge's recorded epoch, which can
+/// still be the stream's previous session's for a moment after a session
+/// starts (a cache-mesh copy writes the new parts before it records their
+/// epoch). A source restart leaves a silence longer than this.
+pub const GENERATION_QUIET: Duration = Duration::from_millis(20);
+/// A generation that the receiver refuses (an old one, or one held off by
+/// [`GENERATION_QUIET`]) is taken after this many of its datagrams in a row,
+/// with none of the current generation between them: the edges send it and
+/// nothing else, so it is the stream's (fix 4, F2: a listener that took a
+/// stale stamp for a new session refused the session for ever).
+pub const GENERATION_CHALLENGE: u32 = 16;
 
 /// One leg of a receiver: the parts that one edge sends one listener.
 /// Rows, loss and numbering are the leg's own; delivery is shared.
@@ -1176,6 +1190,20 @@ pub struct LegStats {
     pub duplicates: u64,
     /// Datagrams of parts below the session's first part: dropped.
     pub before_start: u64,
+    /// Datagrams of a generation that the receiver refused: dropped.
+    pub stale_generation: u64,
+}
+
+/// A generation other than the current one whose datagrams keep coming
+/// (see [`CompactReceiver::take_generation`]).
+#[derive(Debug, Clone, Copy)]
+struct Challenger {
+    generation: u8,
+    /// Its datagrams since the current generation's last.
+    datagrams: u32,
+    /// The lowest part among them: the flow it starts begins there, so the
+    /// parts refused meanwhile are holes, asked for again.
+    first_part: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1278,6 +1306,10 @@ struct LegRx {
     /// Its median lag as last measured (each loss check), which a hole's
     /// first NACK waits for.
     lag: Option<Duration>,
+    /// Datagrams refused in a row (an old generation, below the session's
+    /// first part) since the leg's last one taken, and when that was.
+    refused_run: u64,
+    accepted_at: Option<Instant>,
     stats: LegStats,
 }
 
@@ -1302,6 +1334,9 @@ pub struct CompactStats {
     /// of an older generation dropped.
     pub generation_changes: u64,
     pub stale_generation: u64,
+    /// Generations taken again after they had been refused (see
+    /// [`GENERATION_CHALLENGE`]), counted in `generation_changes` too.
+    pub generation_returns: u64,
     /// Datagrams of parts below the session's first part, dropped.
     pub before_start: u64,
     /// Windows whose recovery failed its check on bytes that another leg
@@ -1404,6 +1439,14 @@ pub struct CompactReceiver {
     /// the generations before it (their late datagrams are dropped).
     generation: Option<u8>,
     old_generations: VecDeque<u8>,
+    /// When the current generation last brought a datagram on the fast
+    /// lane, and the generation that would replace it (see
+    /// [`Self::take_generation`]).
+    generation_fast_at: Option<Instant>,
+    challenger: Option<Challenger>,
+    /// The first part of a flow that a challenger started (its parts that
+    /// were refused are holes), until its first part is delivered.
+    restart_from: Option<u64>,
     /// The publication time of the last long-form part (its 32 bits,
     /// extended by the local clock) and when it arrived: the reference of
     /// the short form's 24 bits, advanced by the time since.
@@ -1700,11 +1743,15 @@ impl CompactReceiver {
                 reference: rx.reference,
                 rtt: rx.rtt,
                 nack: rx.nack,
+                refused_run: rx.refused_run,
+                accepted_at: rx.accepted_at,
                 stats: rx.stats,
                 ..LegRx::default()
             };
         }
         self.time_anchor = None;
+        self.challenger = None;
+        self.restart_from = None;
     }
 
     /// A round trip of a leg's path to its edge (a request and its
@@ -1873,33 +1920,111 @@ impl CompactReceiver {
         }
     }
 
-    /// The source generation of a datagram: a new one (the contributor
-    /// restarted, and counts its parts again) starts a new flow, so that
-    /// the new parts are not taken for the old ones' duplicates and their
-    /// holes are NACKed; one of the last few generations is late, and
-    /// `false` drops its datagram. 0 (unknown) is always taken.
-    fn take_generation(&mut self, generation: u8) -> bool {
+    /// The source generation of a datagram (of `part`, on the fast lane or
+    /// not): a new one (the contributor restarted, and counts its parts
+    /// again) starts a new flow, so that the new parts are not taken for the
+    /// old ones' duplicates and their holes are NACKed; one of the last few
+    /// generations is late, and `false` drops its datagram. 0 (unknown) is
+    /// always taken.
+    ///
+    /// The byte is a digest: it says which session, not which is newer. So
+    /// no refusal is final (fix 4, F2). An unseen generation from the
+    /// cache-fed lane while the fast lane brought the current one within
+    /// [`GENERATION_QUIET`] is held off, as an old one is; and a refused
+    /// generation whose datagrams keep coming, [`GENERATION_CHALLENGE`] in a
+    /// row with none of the current one between them, is taken: whatever
+    /// order the old and new sessions' datagrams come in, the receiver ends
+    /// on the session that the edges send.
+    fn take_generation(
+        &mut self,
+        generation: u8,
+        fast_lane: bool,
+        part: u64,
+        now: Instant,
+    ) -> bool {
         if generation == 0 {
             return true;
         }
-        match self.generation {
-            Some(current) if current == generation => true,
-            _ if self.old_generations.contains(&generation) => false,
-            Some(current) => {
-                self.old_generations.push_back(current);
-                if self.old_generations.len() > 4 {
-                    self.old_generations.pop_front();
-                }
-                self.new_flow();
-                self.generation = Some(generation);
-                self.stats.generation_changes += 1;
-                true
+        let Some(current) = self.generation else {
+            self.generation = Some(generation);
+            if fast_lane {
+                self.generation_fast_at = Some(now);
             }
-            None => {
-                self.generation = Some(generation);
-                true
+            return true;
+        };
+        if current == generation {
+            if fast_lane {
+                self.generation_fast_at = Some(now);
+            }
+            self.challenger = None;
+            return true;
+        }
+        let known = self.old_generations.contains(&generation);
+        let held_off = !fast_lane
+            && self
+                .generation_fast_at
+                .is_some_and(|at| now.saturating_duration_since(at) < GENERATION_QUIET);
+        if !known && !held_off {
+            self.switch_generation(generation, None, fast_lane, now);
+            return true;
+        }
+        let mut challenger = match self.challenger {
+            Some(challenger) if challenger.generation == generation => challenger,
+            _ => Challenger {
+                generation,
+                datagrams: 0,
+                first_part: None,
+            },
+        };
+        challenger.datagrams += 1;
+        challenger.first_part = Some(challenger.first_part.map_or(part, |first| first.min(part)));
+        if challenger.datagrams >= GENERATION_CHALLENGE {
+            self.stats.generation_returns += 1;
+            self.switch_generation(generation, challenger.first_part, fast_lane, now);
+            return true;
+        }
+        self.challenger = Some(challenger);
+        false
+    }
+
+    /// Take `generation` as the current one: a new flow, from `from` (the
+    /// first of its parts refused before) if given.
+    fn switch_generation(&mut self, generation: u8, from: Option<u64>, fast_lane: bool, now: Instant) {
+        self.old_generations.retain(|old| *old != generation);
+        if let Some(current) = self.generation {
+            self.old_generations.push_back(current);
+            if self.old_generations.len() > 4 {
+                self.old_generations.pop_front();
             }
         }
+        self.new_flow();
+        self.generation = Some(generation);
+        self.generation_fast_at = fast_lane.then_some(now);
+        self.restart_from = from;
+        self.stats.generation_changes += 1;
+    }
+
+    /// Forget the generations refused (a leg refused everything for a
+    /// second, see `client_session`): the next datagram of any generation
+    /// is judged as if none had been seen but the current one.
+    pub fn forget_generations(&mut self) {
+        self.old_generations.clear();
+        self.challenger = None;
+        self.generation_fast_at = None;
+    }
+
+    /// A leg's datagrams refused in a row since the last it had taken, and
+    /// when that was (see [`LegStats::stale_generation`] and
+    /// [`LegStats::before_start`] for the reasons).
+    pub fn leg_refused(&self, leg: LegId) -> (u64, Option<Instant>) {
+        let rx = &self.legs[leg.index()];
+        (rx.refused_run, rx.accepted_at)
+    }
+
+    fn leg_accepted(&mut self, leg: LegId, now: Instant) {
+        let rx = &mut self.legs[leg.index()];
+        rx.refused_run = 0;
+        rx.accepted_at = Some(now);
     }
 
     /// A part came on a RaptorQ lane of `leg`: it is delivered (unless it
@@ -2032,7 +2157,12 @@ impl CompactReceiver {
             // way, or come after it).
             let first = self.legs[leg.index()]
                 .first_part
-                .filter(|first| *first <= part && part - *first <= STALE_PARTS);
+                .filter(|first| *first <= part && part - *first <= STALE_PARTS)
+                // A flow that a refused generation started: from its first
+                // part refused, whose parts are holes.
+                .or(self
+                    .restart_from
+                    .filter(|from| *from <= part && part - *from <= MAX_HOLE_RUN));
             self.floor = Some(first.unwrap_or(part));
             self.floor_leg = Some(leg);
         }
@@ -2099,8 +2229,12 @@ impl CompactReceiver {
                 self.highest = Some(part);
                 self.highest_at = Some(now);
                 // The first part after the OK: the parts from the one the OK
-                // named up to it were lost on the way.
-                if let Some(first) = self.legs[leg.index()].first_part {
+                // named up to it were lost on the way (or, in a flow that a
+                // refused generation started, were refused).
+                if let Some(first) = self.legs[leg.index()]
+                    .first_part
+                    .or(self.restart_from.take())
+                {
                     self.note_holes(first, part, now);
                 }
             }
@@ -2176,16 +2310,27 @@ impl CompactReceiver {
             self.stats.errors += 1;
             return Vec::new();
         };
-        if !self.take_generation(view.generation) {
+        let part = self.part_number(leg, view.part_low);
+        let flows = self.stats.generation_changes;
+        if !self.take_generation(view.generation, view.fast_lane, part, now) {
             self.stats.stale_generation += 1;
+            let rx = &mut self.legs[leg.index()];
+            rx.stats.stale_generation += 1;
+            rx.refused_run += 1;
             return Vec::new();
         }
         self.active = true;
-        let part = self.part_number(leg, view.part_low);
+        // A new flow numbers the leg's parts around its reference again.
+        let part = if self.stats.generation_changes == flows {
+            part
+        } else {
+            self.part_number(leg, view.part_low)
+        };
         let mut out = Vec::new();
         match view.kind {
             Kind::Repair => {
                 self.stats.repair_datagrams += 1;
+                self.leg_accepted(leg, now);
                 let [k, row, rows, _] = view.field;
                 if k == 0 || k > MAX_WINDOW || usize::from(row) >= MAX_ROWS {
                     self.stats.errors += 1;
@@ -2263,8 +2408,10 @@ impl CompactReceiver {
                     count.sent = 1 + view.copies;
                 }
                 if self.below_floor(leg, part) {
+                    self.legs[leg.index()].refused_run += 1;
                     return out;
                 }
+                self.leg_accepted(leg, now);
                 if !view.retransmit {
                     self.record_leg_arrival(leg, part, now);
                     if let Some(joint) = self.joint.get_mut(&part) {
@@ -4366,6 +4513,92 @@ mod tests {
         assert!(receiver.push(b, &stamped(1_009, old), start, 0).is_empty());
         assert_eq!(receiver.stats.stale_generation, 1);
         assert_eq!(receiver.push(b, &stamped(1, new), start, 0).len(), 1);
+    }
+
+    /// Fix 4, F2, as the lab showed it (lp2c10-b-kill, new-readers probe):
+    /// a listener joins two edges just after a session starts. Edge B's
+    /// `OK` part comes from its cache-fed lane stamped with the previous
+    /// session's generation (its cache had not yet recorded the new epoch),
+    /// a moment after edge A's part of the new session. Before the fix the
+    /// receiver took the stale stamp for a new session, put the true one
+    /// among the old generations and refused every datagram after it for
+    /// the rest of the run. Now the true generation comes back once its
+    /// datagrams keep coming, and the parts refused meanwhile are holes.
+    #[test]
+    fn a_stale_stamp_after_the_new_session_does_not_stick() {
+        let mut receiver = rx();
+        let b = receiver.open_leg().unwrap();
+        assert_eq!(receiver.leg_expect(L, 2_519, true), LegStart::Started);
+        assert_eq!(receiver.leg_expect(b, 2_496, true), LegStart::Started);
+        let start = Instant::now();
+        let old = generation_of_epoch(1_795_521_024_001_000);
+        let new = generation_of_epoch(1_795_521_472_001_000);
+        let stamped = |part: u64, generation: u8| {
+            let mut datagram = encode_part(part, 0, &payload(part, 10)).unwrap();
+            set_generation(&mut datagram, generation);
+            datagram
+        };
+        // A's OK part (the new session), then B's (the old stamp): both cache-fed.
+        assert_eq!(receiver.push(L, &stamped(2_519, new), start, 0).len(), 1);
+        assert_eq!(receiver.push(b, &stamped(2_496, old), start, 0).len(), 1);
+        // Then both edges send the new session at the stream's rate.
+        let mut delivered = 0;
+        for (index, part) in (2_520..2_620_u64).enumerate() {
+            let at = start + Duration::from_millis(index as u64 + 1);
+            delivered += receiver.push(L, &stamped(part, new), at, 0).len();
+            delivered += receiver.push(b, &stamped(part, new), at, 0).len();
+        }
+        assert_eq!(receiver.generation, Some(new));
+        assert_eq!(receiver.stats.generation_returns, 1);
+        // The first GENERATION_CHALLENGE datagrams (8 parts on two legs)
+        // were refused; the rest came out, and the refused ones are holes.
+        let refused = u64::from(GENERATION_CHALLENGE) - 1;
+        assert_eq!(receiver.stats.stale_generation, refused);
+        assert_eq!(delivered as u64, 100 - refused / 2);
+        assert_eq!(receiver.floor(), Some(2_520));
+        assert_eq!(receiver.holes(), (refused / 2) as usize);
+        for leg in [L, b] {
+            assert_eq!(receiver.leg_refused(leg).0, 0, "{leg:?} takes its datagrams");
+        }
+    }
+
+    /// Fix 4, F2: while the fast lane brings the current generation, an
+    /// unseen generation from the cache-fed lane does not start a new
+    /// flow (its edge may not have recorded the new epoch yet): it is
+    /// refused, and the stream goes on without a reset. A fast-lane
+    /// datagram of an unseen generation (a source restart) starts one at
+    /// once, as before; so does any datagram once the current generation
+    /// has been quiet for GENERATION_QUIET.
+    #[test]
+    fn a_cache_lane_stamp_beside_the_fast_lane_is_held_off() {
+        let (mut receiver, b) = two_legs(100);
+        let start = Instant::now();
+        let (old, new, next) = (7_u8, 9_u8, 11_u8);
+        let stamped = |part: u64, generation: u8, fast: bool| {
+            let mut datagram = encode_part(part, 0, &payload(part, 10)).unwrap();
+            set_generation(&mut datagram, generation);
+            if fast {
+                set_fast_lane(&mut datagram);
+            }
+            datagram
+        };
+        assert_eq!(receiver.push(L, &stamped(100, new, true), start, 0).len(), 1);
+        assert!(receiver.push(b, &stamped(100, old, false), start, 0).is_empty());
+        assert_eq!(receiver.stats.stale_generation, 1);
+        assert_eq!(receiver.leg_stats(b).stale_generation, 1);
+        assert_eq!(receiver.stats.generation_changes, 0);
+        assert_eq!(receiver.push(b, &stamped(101, new, false), start, 0).len(), 1);
+        assert_eq!(receiver.leg_refused(b).0, 0);
+        // A restart on the fast lane: at once.
+        let at = start + Duration::from_millis(1);
+        assert_eq!(receiver.push(L, &stamped(0, next, true), at, 0).len(), 1);
+        assert_eq!(receiver.stats.generation_changes, 1);
+        assert_eq!(receiver.generation, Some(next));
+        // The quiet rule: the fast lane silent for 20 ms, a cache-lane
+        // datagram of an unseen generation starts a new flow.
+        let quiet = at + GENERATION_QUIET;
+        assert_eq!(receiver.push(b, &stamped(5, 13, false), quiet, 0).len(), 1);
+        assert_eq!(receiver.stats.generation_changes, 2);
     }
 
     /// B X3: a hole is not abandoned after twelve NACKs: it is asked for

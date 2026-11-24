@@ -223,6 +223,19 @@ pub struct Counters {
     /// A listener's part numbers jumped (a contributor restart): its
     /// accounting began again.
     pub resets: u64,
+    /// Fix 4 (F2): datagrams received and not taken, by reason (an old or
+    /// held-off source generation, a part before the session's start; the
+    /// duplicates are `duplicates`); generations taken again after they
+    /// were refused; legs failed for refusing everything for a second.
+    pub refused_stale_generation: u64,
+    pub refused_before_start: u64,
+    pub generation_returns: u64,
+    pub refusing_legs: u64,
+    /// Fix 4 (F5): a listener's part numbers jumped ahead past its tracked
+    /// window (an outage of the source, a wide hole): each jump once, and
+    /// the parts it passed over, which are not counted as `missing`.
+    pub jumps: u64,
+    pub jump_parts: u64,
     pub first_parts: u64,
     /// Edges that did not answer a listener's compact `SUB` in 1.5 s and
     /// were asked without the compact lane (the RaptorQ lane from then on),
@@ -345,6 +358,12 @@ impl Counters {
         self.socket_drops += other.socket_drops;
         self.truncated += other.truncated;
         self.resets += other.resets;
+        self.refused_stale_generation += other.refused_stale_generation;
+        self.refused_before_start += other.refused_before_start;
+        self.generation_returns += other.generation_returns;
+        self.refusing_legs += other.refusing_legs;
+        self.jumps += other.jumps;
+        self.jump_parts += other.jump_parts;
         self.first_parts += other.first_parts;
         self.compact_fallbacks += other.compact_fallbacks;
         self.short_header_dropped += other.short_header_dropped;
@@ -434,6 +453,15 @@ impl Counters {
             "socket_drops": self.socket_drops,
             "truncated": self.truncated,
             "resets": self.resets,
+            "refused": {
+                "stale_generation": self.refused_stale_generation,
+                "before_start": self.refused_before_start,
+                "duplicate": self.duplicates,
+            },
+            "generation_returns": self.generation_returns,
+            "refusing_legs": self.refusing_legs,
+            "jumps": self.jumps,
+            "jump_parts": self.jump_parts,
             "first_parts": self.first_parts,
             "compact_fallbacks": self.compact_fallbacks,
             "short_header_dropped": self.short_header_dropped,
@@ -695,13 +723,26 @@ impl PartTrack {
         if self.start.is_none() {
             self.begin(part);
         }
-        // A contributor restart counts its parts again; a jump far ahead
-        // is one too (or a listener that was away): start again there, once
-        // a second far part confirms it. A single far part is a stray.
-        if part + TRACK < self.next_settle || part >= self.next_settle + 16 * TRACK {
+        // A contributor restart counts its parts again; a jump past the
+        // tracked window ahead is one too (an outage of the source, a
+        // listener that was away): start again there, once a second far
+        // part confirms it. A single far part is a stray. The parts that a
+        // jump ahead passed over are one gap of that length (`jumps`,
+        // `jump_parts`), not that many missing parts: what was missing
+        // before it is settled first (fix 4, F5: two number lines of a
+        // stream 40,000 apart settled 36,000 parts as missing at each of
+        // 1.8 million switches, 3.3e10 in all).
+        let ahead_from = self.highest.map_or(self.next_settle, |highest| highest + 1);
+        if part + TRACK < self.next_settle || part >= ahead_from.max(self.next_settle) + TRACK {
             match self.jump {
                 Some((first, first_gap)) if part > first && part - first <= JUMP_CONFIRM => {
                     counters.resets += 1;
+                    let settled = self.highest.map_or(self.next_settle, |highest| highest + 1);
+                    self.settle(settled, counters);
+                    if first > settled {
+                        counters.jumps += 1;
+                        counters.jump_parts += first - settled;
+                    }
                     self.reset(first);
                     self.set(first, first_gap);
                     self.jump = None;
@@ -1886,6 +1927,10 @@ fn handle_datagram(
         .kernel_us
         .map_or(0, |kernel_us| now_us.saturating_sub(kernel_us));
     let duplicates = listener.session.receiver.duplicate_parts;
+    let refused = {
+        let stats = &listener.session.receiver.compact.stats;
+        (stats.stale_generation, stats.before_start, stats.generation_returns)
+    };
     let socket = &listener.socket;
     let mut send = |to: SocketAddr, bytes: &[u8]| {
         // A full socket loses a request: the next refresh repeats it.
@@ -1921,6 +1966,13 @@ fn handle_datagram(
             }
         }
         Received::Move(_) | Received::Control | Received::Ignored => return,
+    }
+    {
+        let stats = &listener.session.receiver.compact.stats;
+        let sender = &mut counters[edge];
+        sender.refused_stale_generation += stats.stale_generation.saturating_sub(refused.0);
+        sender.refused_before_start += stats.before_start.saturating_sub(refused.1);
+        sender.generation_returns += stats.generation_returns.saturating_sub(refused.2);
     }
     counters[edge].duplicates += listener
         .session
@@ -2066,9 +2118,14 @@ fn service(
 ) {
     if now >= listener.session.next_wake() {
         let socket = &listener.socket;
+        let refusing = listener.session.refusing_legs;
         listener.session.poll_legs(now, &mut |to, bytes| {
             let _ = socket.send_to(bytes, to);
         });
+        if listener.session.refusing_legs > refusing {
+            ensure(counters, listener.home);
+            counters[listener.home].refusing_legs += listener.session.refusing_legs - refusing;
+        }
     }
     if !draining {
         listener
@@ -3429,6 +3486,15 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
             "socket_drops": counters.socket_drops,
             "truncated": counters.truncated,
             "resets": counters.resets,
+            "refused": {
+                "stale_generation": counters.refused_stale_generation,
+                "before_start": counters.refused_before_start,
+                "duplicate": counters.duplicates,
+            },
+            "generation_returns": counters.generation_returns,
+            "refusing_legs": counters.refusing_legs,
+            "jumps": counters.jumps,
+            "jump_parts": counters.jump_parts,
             "listeners_with_parts": counters.first_parts,
             "compact_fallbacks": counters.compact_fallbacks,
             "short_header_dropped": counters.short_header_dropped,
@@ -3724,6 +3790,51 @@ mod tests {
         assert_eq!(track.mark(4, false, 1_500, &mut counters), Mark::Late);
         assert_eq!(track.mark(10_000, false, 1_500, &mut counters), Mark::New);
         assert_eq!(counters.resets, 0);
+    }
+
+    /// Fix 4, F5: a jump of part numbers past the tracked window (an
+    /// outage of the source: 5b's 4,315 parts; a misread number line 2^31
+    /// ahead) is one gap of its length, not that many missing parts; the
+    /// holes before it still count, and the parts after it are tracked.
+    #[test]
+    fn a_jump_past_the_window_is_one_gap_of_its_length() {
+        for jump in [5_000_u64, 1 << 31] {
+            let mut track = PartTrack::new();
+            let mut counters = Counters::default();
+            track.begin(0);
+            for part in (0..2_000_u64).filter(|part| *part != 1_990) {
+                assert_eq!(track.mark(part, false, 1_500, &mut counters), Mark::New);
+            }
+            let resume = 2_000 + jump;
+            // The first part after the jump waits for a second to confirm it.
+            assert_eq!(track.mark(resume, false, 1_500, &mut counters), Mark::Late);
+            for part in resume + 1..resume + 3_000 {
+                assert_eq!(track.mark(part, false, 1_500, &mut counters), Mark::New, "{jump}");
+            }
+            track.settle(resume + 3_000, &mut counters);
+            assert_eq!(counters.jumps, 1, "{jump}");
+            assert_eq!(counters.jump_parts, jump, "{jump}");
+            assert_eq!(counters.missing, 1, "{jump}: only the hole before the jump");
+            assert_eq!(counters.listeners_with_missing, 1);
+        }
+        // Two number lines of one stream 40,000 apart, alternating (lp2's
+        // starved senders): each switch is a jump or a restart, never
+        // 36,000 missing parts.
+        let mut track = PartTrack::new();
+        let mut counters = Counters::default();
+        track.begin(0);
+        let mut low = 0_u64;
+        for round in 0..50_u64 {
+            for _ in 0..10 {
+                track.mark(low, false, 1_500, &mut counters);
+                low += 1;
+            }
+            for offset in 0..10 {
+                track.mark(40_000 + round * 10 + offset, false, 1_500, &mut counters);
+            }
+        }
+        assert!(counters.missing < 1_000, "{}", counters.missing);
+        assert!(counters.jumps >= 49, "{}", counters.jumps);
     }
 
     #[test]

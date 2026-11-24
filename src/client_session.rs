@@ -539,6 +539,9 @@ pub struct UdpSession {
     pub compact_retries_unanswered: u64,
     /// Legs failed because their edge's first part was 4,096 behind.
     pub stale_starts: u64,
+    /// Legs failed because the receiver refused every datagram they brought
+    /// for [`REFUSING_FOR`] (fix 4, F2: a stuck receiver is not silent).
+    pub refusing_legs: u64,
     /// The joint part loss of the legs (smoothed) and its mean run.
     joint_estimate: Option<f64>,
     joint_burst: Option<f64>,
@@ -576,6 +579,14 @@ const FIRST_ARRIVAL_WINDOW: Duration = Duration::from_millis(20);
 /// has had no media for max([`SUSPECT_AFTER`], this many part intervals).
 const SUSPECT_PARTS: u64 = 8;
 const SUSPECT_AFTER: Duration = Duration::from_millis(20);
+/// A live leg whose datagrams the receiver has refused for this long (an
+/// old generation, parts below the session's first), while they still
+/// come, has failed: it is replaced, and the generations refused are
+/// forgotten (fix 4, F2).
+pub const REFUSING_FOR: Duration = Duration::from_secs(1);
+/// The fewest media datagrams refused in a row that fail a leg (with
+/// [`REFUSING_FOR`]): a 20 ms stream sends 50 a second, a 1 ms one 1,000.
+pub const REFUSING_MIN_DATAGRAMS: u64 = 32;
 
 impl UdpSession {
     pub fn new(config: SessionConfig, now: Instant) -> Self {
@@ -613,6 +624,7 @@ impl UdpSession {
             compact_retries: 0,
             compact_retries_unanswered: 0,
             stale_starts: 0,
+            refusing_legs: 0,
             joint_estimate: None,
             joint_burst: None,
             all_silent: false,
@@ -1207,6 +1219,11 @@ impl UdpSession {
                         _ => false,
                     };
                 }
+                // Refusing: datagrams at the stream's rate, none taken.
+                if self.refusing(id, leg.ok_at.unwrap_or(leg.added_at), now) {
+                    failed.push((index, LegFailure::Refusing, LegFailure::Refusing.reason().to_owned()));
+                    continue;
+                }
                 // Dead: silent while another leg sends, or without media
                 // while another delivers.
                 if quiet >= config.silence && other_datagram {
@@ -1256,10 +1273,26 @@ impl UdpSession {
             }
         }
         for (index, cause, reason) in failed {
+            if cause == LegFailure::Refusing {
+                self.refusing_legs += 1;
+                // Whatever the receiver took for old, its replacement is
+                // judged afresh.
+                self.receiver.compact.forget_generations();
+            }
             if let Some(key) = self.legs[index].as_ref().map(|leg| leg.key) {
                 self.stop_leg(index, LegEvent::Failed { leg: key, cause }, reason);
             }
         }
+    }
+
+    /// Whether the receiver has refused every datagram of leg `id` for
+    /// [`REFUSING_FOR`] (from its last taken, else from `since`), at least
+    /// [`REFUSING_MIN_DATAGRAMS`] of them. (A leg whose datagrams stop is
+    /// judged by the silence rules.)
+    fn refusing(&self, id: LegId, since: Instant, now: Instant) -> bool {
+        let (run, accepted) = self.receiver.compact.leg_refused(id);
+        run >= REFUSING_MIN_DATAGRAMS
+            && now.saturating_duration_since(accepted.unwrap_or(since)) >= REFUSING_FOR
     }
 
     /// The loss check of every leg: their repair, and the plans.
@@ -3465,6 +3498,190 @@ mod tests {
         assert!(session.leg(B, at).is_none());
         assert!(view(&session, A, at).delivering);
         assert_eq!(held(&session, A).state, State::Live);
+    }
+
+    /// Fix 4, F2 in process: a listener subscribes just as a source
+    /// session starts, on one leg and on two. The new session's first parts
+    /// come before, between and after each leg's `OK`, in the short form on
+    /// the fast lane (kept until the `OK`) or the long form on the cache-fed
+    /// lane, and one edge's `OK` part carries the previous session's
+    /// generation (its cache had not recorded the new epoch yet, as in
+    /// lp2c10-b-kill and -h-null). Every order of those datagrams is run.
+    /// In each, the session ends on the new session on every leg: the
+    /// stream's later parts all come out, no leg refuses its datagrams, and
+    /// the datagrams refused on the way are bounded.
+    #[test]
+    fn a_join_at_a_session_start_converges_whatever_the_order() {
+        use crate::client_compact::{
+            encode_part, generation_of_epoch, set_fast_lane, set_generation, shorten,
+            GENERATION_CHALLENGE,
+        };
+        #[derive(Debug, Clone, Copy)]
+        enum Step {
+            Ok(usize),
+            New(usize, u64),
+            Stale(usize, u64),
+        }
+        let old = generation_of_epoch(1_795_521_024_001_000);
+        let new = generation_of_epoch(1_795_521_472_001_000);
+        let datagram = |part: u64, generation: u8, fast: bool| {
+            let mut long = encode_part(part, 1_795_521_472_001_000 + part * 1_000, b"pcm").unwrap();
+            set_generation(&mut long, generation);
+            if fast {
+                set_fast_lane(&mut long);
+                shorten(&long).unwrap_or(long)
+            } else {
+                long
+            }
+        };
+        /// Every order of `steps` (Heap's algorithm).
+        fn orders(steps: &mut Vec<Step>, k: usize, out: &mut Vec<Vec<Step>>) {
+            if k <= 1 {
+                out.push(steps.clone());
+                return;
+            }
+            for i in 0..k {
+                orders(steps, k - 1, out);
+                let j = if k % 2 == 0 { i } else { 0 };
+                steps.swap(j, k - 1);
+            }
+        }
+        use std::collections::BTreeSet;
+        const TAIL: u64 = 64;
+        let mut runs = 0;
+        for legs in [1_usize, 2] {
+            for stale_leg in 0..legs {
+                for fast in [true, false] {
+                    let mut steps = vec![Step::New(0, 100), Step::Stale(stale_leg, 99), Step::New(0, 101)];
+                    for leg in 0..legs {
+                        steps.push(Step::Ok(leg));
+                    }
+                    if legs == 2 {
+                        steps.push(Step::New(1, 100));
+                        steps.push(Step::New(1, 101));
+                    }
+                    let mut all = Vec::new();
+                    let k = steps.len();
+                    orders(&mut steps, k, &mut all);
+                    for order in all {
+                        runs += 1;
+                        let now = Instant::now();
+                        let mut session = UdpSession::new(SessionConfig::new(1), now);
+                        let mut send = |_: SocketAddr, _: &[u8]| {};
+                        let targets = [edge(), edge_b()];
+                        for (leg, key) in [A, B].into_iter().enumerate().take(legs) {
+                            session.add_leg(key, ["a", "b"][leg], targets[leg], start(), now, &mut send);
+                            session.on_datagram(targets[leg], &token(5 + leg as u64), now, &mut send);
+                        }
+                        let mut delivered: BTreeSet<u64> = BTreeSet::new();
+                        let mut take = |session: &mut UdpSession| {
+                            while let Some(object) = session.next_object() {
+                                delivered.insert(object.part);
+                            }
+                        };
+                        let step_at = Duration::from_micros(100);
+                        for (index, step) in order.iter().enumerate() {
+                            let at = now + step_at * index as u32;
+                            match *step {
+                                Step::Ok(leg) => {
+                                    let named = if leg == stale_leg { 99 } else { 100 };
+                                    session.on_datagram(targets[leg], &ok(named), at, &mut send);
+                                }
+                                Step::New(leg, part) => {
+                                    session.on_datagram(targets[leg], &datagram(part, new, fast), at, &mut send);
+                                }
+                                Step::Stale(leg, part) => {
+                                    session.on_datagram(targets[leg], &datagram(part, old, false), at, &mut send);
+                                }
+                            }
+                            take(&mut session);
+                        }
+                        // Then the stream, a part a millisecond on every leg.
+                        for (index, part) in (102..102 + TAIL).enumerate() {
+                            let at = now + Duration::from_millis(1 + index as u64);
+                            for target in targets.iter().take(legs) {
+                                session.on_datagram(*target, &datagram(part, new, fast), at, &mut send);
+                                take(&mut session);
+                            }
+                            session.poll_legs(at, &mut send);
+                        }
+                        let tail_from = 102 + TAIL - 40;
+                        let missing: Vec<u64> =
+                            (tail_from..102 + TAIL).filter(|part| !delivered.contains(part)).collect();
+                        assert!(missing.is_empty(), "{legs} legs, stale on {stale_leg}, fast {fast}, {order:?}: missing {missing:?}");
+                        for key in [A, B].into_iter().take(legs) {
+                            let id = held(&session, key).id;
+                            assert_eq!(
+                                session.receiver.compact.leg_refused(id).0,
+                                0,
+                                "{legs} legs, stale on {stale_leg}, fast {fast}, {order:?}: {key:?} refuses"
+                            );
+                        }
+                        let stats = session.receiver.compact.stats;
+                        assert!(
+                            stats.stale_generation <= 2 * u64::from(GENERATION_CHALLENGE),
+                            "{order:?}: {stats:?}"
+                        );
+                        assert_eq!(session.refusing_legs, 0);
+                    }
+                }
+            }
+        }
+        assert_eq!(runs, 2 * 24 + 4 * 5_040);
+    }
+
+    /// Fix 4, F2: a leg whose datagrams the receiver refuses for a second
+    /// at the stream's rate fails (`refused-1s`), counted, and the
+    /// generations refused are forgotten; the leg beside it delivers on.
+    /// Here edge B stamps another generation than A for good (on its
+    /// cache-fed lane): the challenger never wins while A's datagrams come
+    /// between B's.
+    #[test]
+    fn a_leg_that_refuses_everything_for_a_second_fails() {
+        use crate::client_compact::{encode_part, set_fast_lane, set_generation};
+        let now = Instant::now();
+        let mut session = two_legs(SessionConfig::new(1), 100, now);
+        let stamped = |part: u64, generation: u8, fast: bool| {
+            let mut datagram = encode_part(part, 0, b"pcm").unwrap();
+            set_generation(&mut datagram, generation);
+            if fast {
+                set_fast_lane(&mut datagram);
+            }
+            datagram
+        };
+        let mut send = |_: SocketAddr, _: &[u8]| {};
+        let ms = Duration::from_millis(1);
+        let mut failed_at = None;
+        for step in 0..1_200_u32 {
+            let at = now + ms * step;
+            let part = 100 + u64::from(step);
+            session.on_datagram(edge(), &stamped(part, 9, true), at, &mut send);
+            session.on_datagram(edge_b(), &stamped(part, 7, false), at, &mut send);
+            while session.next_object().is_some() {}
+            session.poll_legs(at, &mut send);
+            let failed = events(&mut session).into_iter().find(|event| {
+                matches!(event, LegEvent::Failed { leg: B, cause: LegFailure::Refusing })
+            });
+            if failed.is_some() {
+                failed_at = Some(step);
+                break;
+            }
+            assert!(held(&session, A).failure.is_none());
+        }
+        // A second after B's OK (its datagrams never taken), or about.
+        let failed_at = failed_at.unwrap_or_else(|| {
+            panic!(
+                "B failed for refusing: {:?} {:?} {:?}",
+                session.receiver.compact.leg_refused(held(&session, B).id),
+                session.receiver.compact.part_interval(),
+                held(&session, B).state
+            )
+        });
+        assert!((1_000..1_010).contains(&failed_at), "{failed_at}");
+        assert_eq!(session.refusing_legs, 1);
+        assert_eq!(held(&session, B).failure.as_deref(), Some("refused-1s"));
+        assert!(session.receiver.compact.leg_stats(held(&session, B).id).stale_generation >= 1_000);
+        assert_eq!(session.receiver.compact.leg_refused(held(&session, A).id).0, 0);
     }
 
     /// B X5 review: a failed leg keeps its slot until the director

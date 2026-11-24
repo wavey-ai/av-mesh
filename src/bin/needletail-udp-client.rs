@@ -746,6 +746,8 @@ struct LegFigures {
     longest_gap_ms: f64,
     plan: Option<String>,
     before_start: u64,
+    /// Its datagrams of a generation that the receiver refused.
+    stale_generation: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -802,6 +804,7 @@ fn leg_figures(logs: &[LegLog], nodes: &Nodes) -> BTreeMap<String, LegFigures> {
         entry.parts_first += report.stats.parts_first;
         entry.duplicates += report.stats.duplicates;
         entry.before_start += report.stats.before_start;
+        entry.stale_generation += report.stats.stale_generation;
         entry.datagrams += report.datagrams;
         entry.wire_bytes += report.wire_bytes;
         entry.loss = report.loss.or(entry.loss);
@@ -979,6 +982,88 @@ struct Report {
     stale_start: u64,
     cross_leg_mismatch: u64,
     short_grants: ShortGrantCounts,
+    /// Fix 4 (F2): datagrams received and not taken, by reason, so that a
+    /// receiver that takes nothing is never silent about it; the source
+    /// generations taken (a generation taken again after it was refused is
+    /// a return); and the legs failed for refusing everything for a second.
+    refused: RefusedCounts,
+    generation_changes: u64,
+    generation_returns: u64,
+    refusing_legs: u64,
+    /// Fix 4 (F5): jumps of the part numbers past the receiver's window
+    /// (an outage of the source), `[from, to]` the parts either side, and
+    /// the parts they passed over: one gap each, neither expected nor
+    /// missing.
+    jumps: Vec<[u64; 2]>,
+    jump_parts: u64,
+}
+
+/// A run of missing parts longer than this is a jump (an outage of the
+/// source; a NACK reaches no further back), not missing parts.
+const JUMP_PARTS: u64 = av_mesh::client_compact::STALE_PARTS;
+
+/// The parts of a session, from the first delivered (or gap) to the last.
+#[derive(Debug, Default, PartialEq)]
+struct PartAccount {
+    span: Option<(u64, u64)>,
+    /// The parts due in the span, less the jumps.
+    expected: u64,
+    missing: Vec<u64>,
+    jumps: Vec<[u64; 2]>,
+    jump_parts: u64,
+}
+
+/// Count the parts that never came between those that did, in one pass
+/// over the parts that came: a run of more than [`JUMP_PARTS`] is a jump,
+/// recorded with its ends (fix 4, F5: a jump of 2^31 numbers was 2^31
+/// missing parts, counted one at a time).
+fn account_parts(received: &BTreeMap<u64, usize>, gaps: &BTreeSet<u64>) -> PartAccount {
+    let mut account = PartAccount::default();
+    let mut came = received.keys().copied().peekable();
+    let mut gapped = gaps.iter().copied().peekable();
+    let mut previous: Option<u64> = None;
+    let mut first = None;
+    loop {
+        let next = match (came.peek(), gapped.peek()) {
+            (Some(a), Some(b)) if a == b => {
+                gapped.next();
+                came.next()
+            }
+            (Some(a), Some(b)) if a < b => came.next(),
+            (Some(_), Some(_)) | (None, Some(_)) => gapped.next(),
+            (Some(_), None) => came.next(),
+            (None, None) => break,
+        };
+        let Some(part) = next else { break };
+        first.get_or_insert(part);
+        if let Some(previous) = previous {
+            let run = part - previous - 1;
+            if run > JUMP_PARTS {
+                account.jumps.push([previous, part]);
+                account.jump_parts += run;
+            } else {
+                account.missing.extend(previous + 1..part);
+            }
+        }
+        previous = Some(part);
+    }
+    if let (Some(first), Some(last)) = (first, previous) {
+        account.span = Some((first, last));
+        account.expected = last - first + 1 - account.jump_parts;
+    }
+    account
+}
+
+/// Datagrams received and not taken, by reason.
+#[derive(Debug, Default, Serialize)]
+struct RefusedCounts {
+    /// Of a source generation that the receiver refused (an old one, or a
+    /// stale stamp held off).
+    stale_generation: u64,
+    /// Of parts below the session's first part.
+    before_start: u64,
+    /// Of parts delivered already (the other leg's copy, a copy, a repeat).
+    duplicate: u64,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -1427,13 +1512,10 @@ async fn main() -> Result<()> {
     let (spare_at_end, (repair, plan, compact_asked, compact_confirmed)) = loop {
         let now = Instant::now();
         if now >= deadline && drain_last.is_none() && session.is_subscribed() && !drain.is_zero() {
-            let last = received.keys().chain(gaps.iter()).max().copied();
-            let first = received.keys().chain(gaps.iter()).min().copied();
-            if let (Some(first), Some(last)) = (first, last) {
+            let accounted = account_parts(&received, &gaps);
+            if let Some((_, last)) = accounted.span {
                 drain_last = Some(last);
-                drain_missing = (first..=last)
-                    .filter(|part| !received.contains_key(part) && !gaps.contains(part))
-                    .collect();
+                drain_missing = accounted.missing.into_iter().collect();
             }
         }
         let draining = drain_last.is_some() && !drain_missing.is_empty() && now < deadline + drain;
@@ -1804,19 +1886,11 @@ async fn main() -> Result<()> {
     }
 
     // Missing parts are counted from the session's floor: its first part
-    // delivered (B 3.1).
-    let first = received.keys().chain(gaps.iter()).min().copied();
-    let last = received.keys().chain(gaps.iter()).max().copied();
-    let expected = match (first, last) {
-        (Some(first), Some(last)) => last - first + 1,
-        _ => 0,
-    };
-    let missing: Vec<u64> = match (first, last) {
-        (Some(first), Some(last)) => (first..=last)
-            .filter(|part| !received.contains_key(part) && !gaps.contains(part))
-            .collect(),
-        _ => Vec::new(),
-    };
+    // delivered (B 3.1); a jump past the receiver's window is one gap.
+    let accounted = account_parts(&received, &gaps);
+    let (first, last) = accounted.span.unzip();
+    let expected = accounted.expected;
+    let missing = accounted.missing;
     let span_s = match (first_published_us, last_published_us) {
         (Some(first), Some(last)) if last > first => Some((last - first) as f64 / 1e6),
         _ => None,
@@ -1926,6 +2000,16 @@ async fn main() -> Result<()> {
         stale_start: session.stale_starts,
         cross_leg_mismatch: stats.cross_leg_mismatch,
         short_grants: director.stats.short_grants.into(),
+        refused: RefusedCounts {
+            stale_generation: stats.stale_generation,
+            before_start: stats.before_start,
+            duplicate: stats.duplicates,
+        },
+        generation_changes: stats.generation_changes,
+        generation_returns: stats.generation_returns,
+        refusing_legs: session.refusing_legs,
+        jumps: accounted.jumps,
+        jump_parts: accounted.jump_parts,
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
@@ -1960,6 +2044,33 @@ mod tests {
 
     /// C CR3: every binary of the crate names the build it came from
     /// (`--version`).
+    /// Fix 4, F5: a jump past the receiver's window is one gap of its
+    /// length, neither expected nor missing; the holes beside it are.
+    #[test]
+    fn a_jump_past_the_window_is_one_gap() {
+        for jump in [5_000_u64, 1 << 31] {
+            let mut received: BTreeMap<u64, usize> = BTreeMap::new();
+            let mut gaps: BTreeSet<u64> = BTreeSet::new();
+            for part in (100..200).filter(|part| *part != 150) {
+                received.insert(part, 1);
+            }
+            gaps.insert(200);
+            let resume = 201 + jump;
+            for part in resume..resume + 100 {
+                if part != resume + 10 {
+                    received.insert(part, 1);
+                }
+            }
+            let account = account_parts(&received, &gaps);
+            assert_eq!(account.span, Some((100, resume + 99)));
+            assert_eq!(account.missing, vec![150, resume + 10]);
+            assert_eq!(account.jumps, vec![[200, resume]]);
+            assert_eq!(account.jump_parts, jump);
+            assert_eq!(account.expected, 201);
+        }
+        assert_eq!(account_parts(&BTreeMap::new(), &BTreeSet::new()), PartAccount::default());
+    }
+
     #[test]
     fn the_version_names_the_build() {
         use clap::CommandFactory;
@@ -2071,6 +2182,7 @@ mod tests {
                 parts_first: datagrams / 2,
                 duplicates: datagrams / 2,
                 before_start: 1,
+                stale_generation: 0,
             },
         }
     }

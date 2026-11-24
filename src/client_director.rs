@@ -89,6 +89,17 @@ const SHORT_BACKOFF: [Duration; 4] = [
     Duration::from_secs(4),
     Duration::from_secs(5),
 ];
+/// The same for a two-path listener left on one path (fix 4, F6b): a
+/// drain's movers, a rebalance or the entry's charges fading make room
+/// within a second or two, and every second asked later is a second on one
+/// path (lp2c6-g-edges: 3 to 4.1 s on one path, the backoff's 1 s and 2 s).
+const ONE_PATH_BACKOFF: [Duration; 5] = [
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+];
 /// How often a handover, a hedge or an extra leg is looked at.
 const CHECK_EVERY: Duration = Duration::from_millis(5);
 /// An answered request is kept this long for late answers of other entries.
@@ -175,6 +186,9 @@ pub enum LegFailure {
     /// The leg's `OK` named a part more than 4,096 behind the session's
     /// newest, or its parts were shown that far behind (`stale_start`).
     Stale,
+    /// The receiver refused every datagram of the leg for a second, at the
+    /// stream's rate (an old generation, parts before the session's start).
+    Refusing,
 }
 
 impl LegFailure {
@@ -183,6 +197,7 @@ impl LegFailure {
             Self::Dead => "silence",
             Self::NoAnswer => "no-answer",
             Self::Stale => "stale-start",
+            Self::Refusing => "refused-1s",
         }
     }
 }
@@ -674,6 +689,10 @@ pub struct Director {
     /// answer to a request sent before it says nothing of that place.
     changed_at: Instant,
     short_answers: usize,
+    /// A planned move released a leg for want of a cache: until the
+    /// listener holds its legs again, the missing one is asked for on
+    /// [`ONE_PATH_BACKOFF`] (fix 4, F6b).
+    lost_place: bool,
     deferred_ask: Option<Instant>,
     delayed: Vec<(Instant, SocketAddr, Vec<u8>)>,
     hedge_due: Option<(Instant, LegKey)>,
@@ -761,6 +780,7 @@ impl Director {
             retry_at: None,
             changed_at: now,
             short_answers: 0,
+            lost_place: false,
             deferred_ask: None,
             delayed: Vec::new(),
             hedge_due: None,
@@ -800,6 +820,25 @@ impl Director {
             .iter()
             .filter(|(_, skip)| skip.until.is_none_or(|until| now < until))
             .map(|(node, _)| node.clone())
+            .collect();
+        nodes.sort();
+        nodes
+    }
+
+    /// The skip set with each node's cause and time left (`None`: until
+    /// its leg is released), for a report or a test's message.
+    pub fn skip_detail(&self, now: Instant) -> Vec<(String, String, Option<Duration>)> {
+        let mut nodes: Vec<(String, String, Option<Duration>)> = self
+            .skip
+            .iter()
+            .filter(|(_, skip)| skip.until.is_none_or(|until| now < until))
+            .map(|(node, skip)| {
+                (
+                    node.clone(),
+                    format!("{:?}", skip.cause),
+                    skip.until.map(|until| until.saturating_duration_since(now)),
+                )
+            })
             .collect();
         nodes.sort();
         nodes
@@ -2177,9 +2216,19 @@ impl Director {
                 self.confirm_to(&request, entry, token, now, out);
             }
         }
-        let no_cache = usable.is_empty();
+        // No cache named as a leg: none of the region, or none granted
+        // (the redundant gate refused every edge with room; a spare named
+        // alone is no leg). A rebalanced leg stays where it was at once
+        // (step 6). A drained leg goes at once beside a delivering leg only
+        // when the region has no cache at all; with a cache that has no
+        // room now it is kept, served by its draining edge, and the leg is
+        // asked for again on ONE_PATH_BACKOFF (fix 4, F6a/F6b: released, the
+        // listener sat on one path for 3 to 25 s in rolls; kept with the
+        // old backoff, it stayed until its edge cut it).
+        let no_leg = granted == 0 && chosen.is_empty();
+        let no_cache = usable.is_empty() || no_leg;
         if no_cache {
-            self.no_cache(legs, &request, now, out);
+            self.no_cache(legs, &request, usable.is_empty(), now, out);
         }
         // An answer to a request that did not ask for every place missing
         // now (one sent before the last MOVE or failure, or for the spare
@@ -2194,18 +2243,37 @@ impl Director {
             self.retry_at = None;
         } else if no_cache || short {
             let leaving = self.legs.iter().any(|leg| leg.leaving.is_some());
+            // A drained (or lost-parents) leg kept for want of room waits
+            // for its replacement: asked again soon, as a lost place is.
+            let move_waits = self.legs.iter().any(|leg| {
+                leg.leaving.is_some() && !leg.rebalance() && !self.replaced(leg.key)
+            });
             let wait = if self.legs.is_empty() {
                 RETRY_ALONE
+            } else if usable.is_empty() && (leaving || self.held() == 0) {
+                RETRY_WITH_LEG
+            } else if move_waits {
+                let wait =
+                    ONE_PATH_BACKOFF[self.short_answers.min(ONE_PATH_BACKOFF.len() - 1)];
+                self.short_answers += 1;
+                wait
             } else if no_cache && (leaving || self.held() == 0) {
                 RETRY_WITH_LEG
             } else {
-                let wait = SHORT_BACKOFF[self.short_answers.min(SHORT_BACKOFF.len() - 1)];
+                let one_path = self.held() > 0 && self.held() < usize::from(self.want);
+                let backoff: &[Duration] = if one_path && self.lost_place {
+                    &ONE_PATH_BACKOFF
+                } else {
+                    &SHORT_BACKOFF
+                };
+                let wait = backoff[self.short_answers.min(backoff.len() - 1)];
                 self.short_answers += 1;
                 wait
             };
             self.retry_at = Some(now + wait);
         } else {
             self.short_answers = 0;
+            self.lost_place = false;
         }
         self.answered = Some((request, now + ANSWERED_KEPT));
     }
@@ -2219,6 +2287,7 @@ impl Director {
         &mut self,
         legs: &mut S,
         request: &Request,
+        region_empty: bool,
         now: Instant,
         out: &mut Vec<Action>,
     ) {
@@ -2242,8 +2311,13 @@ impl Director {
             if rebalance {
                 // A rebalance with nowhere to go returns at once.
                 self.take_back(legs, key, now, out);
+            } else if !region_empty {
+                // A cache of the region without room now: kept (see the
+                // caller), asked again soon.
+                continue;
             } else if self.any_delivering(legs, now, Some(key)) {
                 self.release(legs, key, now, out);
+                self.lost_place = true;
             } else if parents_lost {
                 self.take_back(legs, key, now, out);
             }
@@ -3849,6 +3923,79 @@ mod tests {
         assert!(!w.s.legs[&e1].released);
         assert_eq!(w.s.log.last().unwrap(), "takeback e1");
         assert_eq!(w.d.stats.failovers, 0, "it stays in its region");
+    }
+
+    /// Fix 4, F6a/F6b: the redundant gate refused every edge with room, and
+    /// the answer names only a spare (no gate on a spare). A rebalanced
+    /// leg is taken back at once (step 6). A drained leg is kept, served by
+    /// its draining edge (make before break: nobody on one path), and its
+    /// replacement asked for at 250 ms, 500 ms, 1 s, 2 s, then 5 s, not on
+    /// the 1 s, 2 s, 4 s backoff (lp2c10-a-drain: two such legs stayed until
+    /// their edge cut them; released at once instead, rolls left listeners
+    /// on one path 3 to 25 s). When room comes, the hand-over is as any.
+    #[test]
+    fn an_answer_that_grants_no_leg_keeps_a_drained_leg_and_asks_again_soon() {
+        for reason in ["draining", "rebalance"] {
+            let mut w = World::new(&format!("gate-{reason}"), 2, true);
+            w.join(&[1, 2], Some(3));
+            let e1 = w.key("e1");
+            w.event(LegEvent::Moved {
+                leg: e1,
+                reason: reason.into(),
+            });
+            let (to, nonce, _) = w.requests()[0].clone();
+            w.answer_why(
+                to,
+                nonce,
+                vec![cache(4), failover_entry()],
+                0,
+                true,
+                None,
+                Some(ShortGrant::Gate),
+            );
+            assert!(!w.s.legs[&e1].released, "{reason}: {:?}", w.s.log);
+            assert_eq!(w.d.stats.failovers, 0, "{reason}: it stays in its region");
+            assert!(!w.held().iter().any(|node| node == "e4"), "{reason}: no leg at the spare's edge");
+            if reason == "rebalance" {
+                assert_eq!(w.s.log.last().unwrap(), "takeback e1");
+                continue;
+            }
+            assert!(w.leaving("e1"));
+            let answered = w.ms();
+            let mut asked = Vec::new();
+            for round in 0..4 {
+                let at = loop {
+                    w.run_to(w.ms() + 1);
+                    if let Some((to, nonce, _)) = w.requests().first().cloned() {
+                        if round < 3 {
+                            w.answer_why(to, nonce, vec![cache(4)], 0, true, None, Some(ShortGrant::Gate));
+                        } else {
+                            // Room: the replacement is granted.
+                            w.answer(to, nonce, vec![cache(4)], 1, false, None);
+                        }
+                        break w.ms();
+                    }
+                    assert!(w.ms() < answered + 10_000, "asked again");
+                };
+                asked.push(at);
+                assert!(!w.s.legs[&e1].released, "kept while it waits: {:?}", w.s.log);
+            }
+            let waits: Vec<u64> = std::iter::once(answered)
+                .chain(asked.iter().copied())
+                .collect::<Vec<_>>()
+                .windows(2)
+                .map(|pair| pair[1] - pair[0])
+                .collect();
+            for (wait, backoff) in waits.iter().zip([250, 500, 1_000, 2_000]) {
+                assert!(wait.abs_diff(backoff) <= 2, "{waits:?}");
+            }
+            // The replacement joins and is level: the drained leg goes.
+            w.live("e4");
+            let e4 = w.key("e4");
+            w.s.level.insert((e4, e1));
+            w.run_to(w.ms() + 50);
+            assert!(w.s.legs[&e1].released, "{:?}", w.s.log);
+        }
     }
 
     #[test]
