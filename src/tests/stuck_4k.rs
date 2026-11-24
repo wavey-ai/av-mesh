@@ -223,14 +223,24 @@ async fn run_order(order: Order, fast_lane: bool, ip: u8) {
             .unwrap_or_else(|_| panic!("{name}: the viewer is live"));
         }
         if write_copy {
-            edge.cache
+            // The late copy, as the cache mesh wrote it on syd-edge-2. The
+            // stream's epoch floor refuses it now (integration 5): no stale
+            // part in the cache, and the watermark is the new session's.
+            let refused = edge
+                .cache
                 .chunk_cache
                 .add_for_stream_id(STREAM, OLD_LAST as usize, late_copy.clone())
-                .await
-                .unwrap();
-            // The edge holds the late copy above the new session, as
-            // syd-edge-2 did: its watermark is the old part.
-            assert_eq!(edge.head(STREAM).await, Some(OLD_LAST), "{name}");
+                .await;
+            assert!(refused.is_err(), "{name}: the late copy was written");
+            assert_eq!(edge.head(STREAM).await, Some(sequence), "{name}");
+            assert!(
+                edge.cache
+                    .chunk_cache
+                    .get_for_stream_id(STREAM, OLD_LAST as usize)
+                    .await
+                    .is_none(),
+                "{name}: a stale part in the cache"
+            );
             if order == Order::CopyThenJoin {
                 viewer = Some(join(&live, &stop));
             }
@@ -293,4 +303,68 @@ async fn a_4k_viewer_converges_on_a_restarted_session_whatever_the_order() {
             ip += 1;
         }
     }
+}
+
+/// Integration 5: late copies of the old session at the numbers the new
+/// session then reaches are refused on every cache write path (the stream's
+/// epoch floor), never lift the watermark, and do not block the new
+/// session's own parts at those numbers: these are committed and an LL-HLS
+/// reader is served them (stuck4k's probe on syd-edge-2 was served the old
+/// session's 1145-1150 and the new session's own were refused as identity
+/// conflicts).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_new_session_takes_the_numbers_the_old_session_s_late_copies_held() {
+    let edge = LaneEdge::start(loopback(244)).await;
+    let deadline_us = now_unix_us() + 120_000_000;
+    for sequence in 30..=45 {
+        publish(&edge, OLD_EPOCH, sequence, OLD_LEN, deadline_us).await;
+    }
+    let mut late = Vec::new();
+    for sequence in 40..=45_u64 {
+        let (bytes, _) = edge
+            .cache
+            .chunk_cache
+            .get_for_stream_id(STREAM, sequence as usize)
+            .await
+            .expect("an old part");
+        late.push((sequence, bytes));
+    }
+    for sequence in 0..=50_u64 {
+        publish(&edge, NEW_EPOCH, sequence, NEW_LEN, deadline_us).await;
+        if sequence == 5 || sequence == 39 {
+            for (part, bytes) in &late {
+                let id = *part as usize;
+                let added = edge.cache.chunk_cache.add_for_stream_id(STREAM, id, bytes.clone()).await;
+                assert!(added.is_err(), "part {part} after new {sequence}: written");
+                let put = edge
+                    .cache
+                    .chunk_cache
+                    .put_if_absent_for_stream_id(STREAM, id, bytes.clone())
+                    .await;
+                assert_eq!(put, Ok(PutIfAbsentResult::Superseded), "part {part}");
+                assert!(
+                    edge.cache.chunk_cache.get_for_stream_id(STREAM, id).await.is_none(),
+                    "part {part}: a stale part in the cache"
+                );
+            }
+            assert_eq!(edge.head(STREAM).await, Some(sequence), "the watermark");
+        }
+    }
+    // The new session's own parts at the old copies' numbers: committed,
+    // and served to an LL-HLS reader as the new session's.
+    for (part, _) in &late {
+        let (media, _, _, _) = edge
+            .cache
+            .read_part_for_stream_id(STREAM, *part)
+            .await
+            .unwrap_or_else(|| panic!("part {part} of the new session"));
+        assert_eq!(media.len(), NEW_LEN, "part {part}");
+        assert!(wait_for_part(&edge.cache, STREAM, *part).await.len() >= NEW_LEN);
+    }
+    let playlist = edge.cache.playlist_for_stream_id(STREAM).await;
+    // A valid playlist over the new session, from its first part.
+    assert!(assert_valid_ll_hls(&playlist) > 0, "{playlist}");
+    assert!(playlist.contains("#EXT-X-MEDIA-SEQUENCE:0\n"), "{playlist}");
+    assert_eq!(edge.head(STREAM).await, Some(50));
+    edge.stop().await;
 }

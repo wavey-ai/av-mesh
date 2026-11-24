@@ -9406,6 +9406,10 @@ impl LiveTsCache {
             .map(|_| AsyncMutex::new(()))
             .collect();
         let chunk_cache = Arc::new(ChunkCache::new(options));
+        // Every write judges a part's epoch against its stream's floor
+        // (integration 5, stuck4k): a late copy of a replaced session is
+        // refused on every path, whatever slot it lands on.
+        chunk_cache.set_epoch_reader(mesh_slot_epoch);
         chunk_cache.resolve_or_create_stream(stream_id).await;
         let (part_updates, _) = watch::channel(0);
         let mut state = LiveState::new();
@@ -10675,6 +10679,13 @@ impl LiveTsCache {
             // epoch is taken up without dropping them.
             let adopt_mesh_copy = previous_epoch.is_none()
                 && self.mesh_copy_epoch(stream_id).await == Some(source_epoch);
+            // The stream's current epoch is the floor of every write to it
+            // from now on: raised before the old session is hidden, so that
+            // no late copy of it lands between the hide and the release, nor
+            // in the new session's slots (stuck4k).
+            if previous_epoch != Some(source_epoch) {
+                self.chunk_cache.raise_epoch_floor(stream_id, source_epoch);
+            }
             if adopt_mesh_copy {
                 self.state
                     .write()
@@ -11042,7 +11053,10 @@ impl LiveTsCache {
             (Some(epoch), Some(previous)) if epoch > previous => {
                 // The source started a new publication, and its sequence
                 // starts again. Drop the copy of the old publication and keep
-                // the part that announced the new one.
+                // the part that announced the new one. The floor first: a
+                // late copy of the old publication is refused from here on,
+                // also in the slots the new one takes (stuck4k).
+                self.chunk_cache.raise_epoch_floor(stream_id, epoch);
                 let initialization = self.chunk_cache.stream_initialization(stream_id);
                 self.forget_mesh_stream(stream_id).await;
                 if let Some(initialization) = initialization {
@@ -11069,6 +11083,9 @@ impl LiveTsCache {
 
         if let Some(epoch) = record.epoch.filter(|epoch| previous_epoch != Some(*epoch)) {
             self.note_source_epoch(stream_id, epoch);
+        }
+        if let Some(epoch) = record.epoch.filter(|epoch| previous_epoch != Some(*epoch)) {
+            self.chunk_cache.raise_epoch_floor(stream_id, epoch);
         }
         let mut state = self.state.write().await;
         if let Some(epoch) = record.epoch {
