@@ -542,6 +542,30 @@ struct Requests {
     keys: [Option<(u64, InlineKey)>; REQUESTS],
 }
 
+impl Requests {
+    /// Whether the key is asked for and not yet taken by the tee.
+    fn asked(&self, hash: u64, key: &InlineKey) -> bool {
+        self.keys
+            .iter()
+            .flatten()
+            .any(|(other, asked)| *other == hash && asked.is(key.ip, key.stream(), key.track()))
+    }
+
+    /// Ask for the key's entry; `false` when the requests are full.
+    fn ask(&mut self, hash: u64, key: &InlineKey) -> bool {
+        if self.asked(hash, key) {
+            return true;
+        }
+        match self.keys.iter_mut().find(|slot| slot.is_none()) {
+            Some(slot) => {
+                *slot = Some((hash, *key));
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 /// The feed records of a node: one entry per (parent address, stream,
 /// track) that an admitted datagram came from.
 pub struct ParentFeeds {
@@ -650,20 +674,14 @@ impl ParentFeeds {
         sample: Sample,
         misses: &mut FeedMisses,
     ) {
+        // A key given up is freed after the pass (`book_misses`).
         let mut free = None;
         let mut found = None;
-        for (index, slot) in misses.misses.iter_mut().enumerate() {
+        for (index, slot) in misses.misses.iter().enumerate() {
             match slot {
                 Some(miss) if miss.hash == hash && miss.key.is(ip, view.stream, view.track) => {
                     found = Some(index);
                     break;
-                }
-                Some(miss) if sample.rx_us.saturating_sub(miss.first_us) > MISS_GIVE_UP_US => {
-                    self.untracked
-                        .fetch_add(miss.count as u64, Ordering::Relaxed);
-                    *slot = None;
-                    misses.held -= 1;
-                    free = free.or(Some(index));
                 }
                 None => free = free.or(Some(index)),
                 Some(_) => {}
@@ -707,45 +725,50 @@ impl ParentFeeds {
     }
 
     /// Ask the tee to make an entry; `false` when the requests are in use
-    /// or full (the next datagram of the key asks again).
+    /// or full (the key asks again after the pass, `book_misses`).
     fn request(&self, hash: u64, key: InlineKey) -> bool {
         let Ok(mut requests) = self.requests.try_lock() else {
             return false;
         };
-        if requests
-            .keys
-            .iter()
-            .flatten()
-            .any(|(other, asked)| *other == hash && asked.is(key.ip, key.stream(), key.track()))
-        {
-            return true;
-        }
-        match requests.keys.iter_mut().find(|slot| slot.is_none()) {
-            Some(slot) => {
-                *slot = Some((hash, key));
-                true
-            }
-            None => false,
-        }
+        requests.ask(hash, &key)
     }
 
-    /// Book what a class thread holds of keys whose entries now exist (after
-    /// each of its passes).
-    pub fn book_misses(&self, misses: &mut FeedMisses) {
+    /// After each of a class thread's passes: book what it holds of keys
+    /// whose entries now exist; give up (as untracked) a key whose entry has
+    /// not come [`MISS_GIVE_UP_US`] after its first datagram, whether the
+    /// tee was not asked, refused it (a full table) or is late; and ask
+    /// again for a key whose request the tee took without making its entry.
+    pub fn book_misses(&self, misses: &mut FeedMisses, now_us: u64) {
         if misses.held == 0 {
             return;
         }
         let table = self.table.load();
+        // The requests not yet taken by the tee (`None`: in use by another
+        // thread, so this pass asks for nothing).
+        let mut requests = self.requests.try_lock().ok();
         for index in 0..misses.misses.len() {
-            let Some(miss) = misses.misses[index] else {
+            let Some((hash, key, first_us, count, requested)) = misses.misses[index]
+                .as_ref()
+                .map(|miss| (miss.hash, miss.key, miss.first_us, miss.count, miss.requested))
+            else {
                 continue;
             };
-            let key = &miss.key;
-            if let Some(feed) = table.find(miss.hash, key.ip, key.stream(), key.track()) {
-                Self::book_held(feed, miss.hash, misses);
-            } else if !miss.requested {
+            if let Some(feed) = table.find(hash, key.ip, key.stream(), key.track()) {
+                Self::book_held(feed, hash, misses);
+                continue;
+            }
+            if now_us.saturating_sub(first_us) > MISS_GIVE_UP_US {
+                self.untracked.fetch_add(count as u64, Ordering::Relaxed);
+                misses.misses[index] = None;
+                misses.held -= 1;
+                continue;
+            }
+            let Some(requests) = requests.as_mut() else {
+                continue;
+            };
+            if !requested || !requests.asked(hash, &key) {
                 if let Some(held) = misses.misses[index].as_mut() {
-                    held.requested = self.request(miss.hash, miss.key);
+                    held.requested = requests.ask(hash, &key);
                 }
             }
         }
@@ -948,7 +971,7 @@ mod tests {
             let mut misses = misses.borrow_mut();
             feeds.observe(ip, view, rx_us, &mut misses);
             feeds.make_requested();
-            feeds.book_misses(&mut misses);
+            feeds.book_misses(&mut misses, rx_us);
         });
     }
 
@@ -1229,6 +1252,9 @@ mod tests {
         let feeds = ParentFeeds::default();
         let mut misses = FeedMisses::new();
         let ip = parent(31);
+        // As the class thread does before it runs (arc-swap registers a
+        // thread at its first load).
+        feeds.warm_up();
         let before = allocations();
         for object in [40, 41, 43] {
             feeds.observe(ip, &source(object, T0 + SECOND), T0 + object, &mut misses);
@@ -1252,7 +1278,7 @@ mod tests {
         let other = parent(32);
         feeds.observe(other, &source(7, T0 + SECOND), T0 + 300, &mut misses);
         feeds.make_requested();
-        feeds.book_misses(&mut misses);
+        feeds.book_misses(&mut misses, T0 + 301);
         assert_eq!(misses.held(), 0);
         assert_eq!(feeds.snapshot(T0 + 400).len(), 2);
     }
@@ -1285,6 +1311,37 @@ mod tests {
         let feed = only(&feeds, T0 + 100);
         assert_eq!((feed.stream.as_str(), feed.track.as_str()), (stream.as_str(), track.as_str()));
         assert_eq!(feed.head_object, Some(41));
+    }
+
+    #[test]
+    fn a_held_key_whose_entry_is_refused_is_asked_again_then_given_up() {
+        // D3 review 5: the tee took the request but the table filled first.
+        // The key is asked for again after the pass, and given up (its
+        // datagrams counted untracked) a second after its first datagram,
+        // so the thread stops holding it.
+        let feeds = ParentFeeds::default();
+        let mut misses = FeedMisses::new();
+        let ip = parent(51);
+        feeds.observe(ip, &source(1, T0 + SECOND), T0, &mut misses);
+        feeds.observe(ip, &source(2, T0 + SECOND), T0 + 1, &mut misses);
+        assert_eq!(misses.held(), 1);
+        for last in 0..MAX_FEEDS as u32 {
+            let other = IpAddr::V4(Ipv4Addr::from(0x0c00_0000 + last));
+            feeds.insert(feeds.hash(other, "3001", "opaque-audio"), other, "3001", "opaque-audio");
+        }
+        feeds.make_requested();
+        assert!(lock(&feeds.requests).keys.iter().all(Option::is_none));
+        feeds.book_misses(&mut misses, T0 + 10);
+        assert_eq!(misses.held(), 1);
+        assert!(
+            lock(&feeds.requests).keys.iter().flatten().count() == 1,
+            "asked again"
+        );
+        feeds.make_requested();
+        feeds.book_misses(&mut misses, T0 + MISS_GIVE_UP_US + 1);
+        assert_eq!(misses.held(), 0);
+        assert_eq!(feeds.untracked(), 2);
+        assert_eq!(feeds.snapshot(T0).len(), MAX_FEEDS);
     }
 
     #[test]

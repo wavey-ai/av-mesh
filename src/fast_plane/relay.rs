@@ -1657,7 +1657,7 @@ impl ClassThread {
                 }
             }
             // What the feeds held of new keys, once the tee made them.
-            self.feeds.book_misses(&mut feed_misses);
+            self.feeds.book_misses(&mut feed_misses, woke_us);
             if let Some(copies) = copies.as_mut() {
                 self.send_copies(copies);
             }
