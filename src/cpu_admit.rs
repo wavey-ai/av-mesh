@@ -414,6 +414,11 @@ struct State {
     /// asks again is admitted when it fits the measured room, whatever is
     /// pending (no viewer starves behind others' charges).
     refused: std::collections::HashMap<u64, Instant>,
+    /// When a re-asker was last admitted past what is pending: one a
+    /// window and a sample, so that each is measured before the next (a
+    /// wave of re-askers judged by the measured room alone took a proof's
+    /// edge from 277 legs to 376 in one step).
+    bypass_at: Option<Instant>,
     /// Over full since (measured term alone).
     over_since: Option<Instant>,
     /// Legs asked to leave lately: when, and their charge.
@@ -747,8 +752,14 @@ impl CpuAdmit {
         state.verdict.permille.saturating_add(self.pending_permille(&state, now)) >= 1_000
     }
 
+    /// A lone leg refused lately whose turn it is to be judged by the
+    /// measured room alone: at most one a window and a sample.
     fn reasker(&self, state: &State, key: Option<u64>, now: Instant) -> bool {
-        key.and_then(|key| state.refused.get(&key))
+        let turn = state.bypass_at.is_none_or(|at| {
+            now.saturating_duration_since(at) >= self.config.window + self.config.sample_every
+        });
+        turn && key
+            .and_then(|key| state.refused.get(&key))
             .is_some_and(|at| now.saturating_duration_since(*at) < REASK_MEMORY)
     }
 
@@ -836,6 +847,9 @@ impl CpuAdmit {
         }
         if let Some(key) = key {
             state.refused.remove(&key);
+        }
+        if reasker && load != state.verdict.permille.saturating_add(pending) {
+            state.bypass_at = Some(now);
         }
         state.charges.push_back((now, charge, true));
         self.stats.admitted.fetch_add(1, Ordering::Relaxed);
@@ -1229,8 +1243,11 @@ mod tests {
         assert_eq!(admit.admit_leg(1_000.0, Some(7)), Err(CpuRefusal::Pending));
         // ... asks again and fits the measured room: admitted.
         assert!(admit.admit_leg(1_000.0, Some(7)).is_ok());
-        // Another not refused before still waits for the samples.
+        // Another not refused before still waits for the samples; refused
+        // now, it is a re-asker, but one a window: its turn comes later.
         assert_eq!(admit.admit_leg(1_000.0, Some(8)), Err(CpuRefusal::Pending));
+        assert_eq!(admit.admit_leg(1_000.0, Some(8)), Err(CpuRefusal::Pending));
+        admit.state.lock().unwrap().bypass_at = Some(Instant::now() - Duration::from_secs(3));
         // Full by measurement: a re-asker is refused too.
         admit.force_verdict(verdict(1_000, "cpus"), None);
         assert!(admit.full_for(Some(8)));

@@ -996,6 +996,21 @@ fn a_ramp_is_refused_before_any_listener_misses_a_part() {
     println!("edge 1 at its first refusal (t, busiest send thread, CPUs busy): {refusal:?}");
     assert_eq!(result["missing_parts"], 0, "{result:#}");
     let refusal = refusal.expect("edge 1 refused a leg");
+    // rm/cpuadmit2: no wave of re-askers past full: after its first full
+    // refusal edge 1 never takes more than 25 legs within 2 s (one wave of
+    // them, judged by the lagging measured room, took 99).
+    let after: Vec<(f64, u64)> = samples
+        .iter()
+        .filter(|sample| sample["t"].as_f64().unwrap_or(0.0) >= refusal.0)
+        .map(|sample| (sample["t"].as_f64().unwrap_or(0.0), sample["edge1"]["legs"].as_u64().unwrap_or(0)))
+        .collect();
+    for (index, (t, legs)) in after.iter().enumerate() {
+        for (t2, legs2) in &after[index..] {
+            if t2 - t <= 2.0 {
+                assert!(legs2.saturating_sub(*legs) <= 25, "a wave past full at {t}: {legs} -> {legs2}");
+            }
+        }
+    }
     assert!(refusal.1 < 1_000, "a send thread was full before edge 1 refused: {refusal:?}");
     assert!(refusal.2 < 950, "edge 1's CPUs were full before it refused: {refusal:?}");
     let by_edge = &result["legs_by_edge_at_end"];
