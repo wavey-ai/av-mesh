@@ -2092,6 +2092,14 @@ impl ClassThread {
         // real-time and pinned, so that they inherit none of it and its
         // first client finds them running (wave 9 first-session stall).
         let mut client_sender = ClientSender::new(self.edge_clients.as_ref(), self.class);
+        // rm/cpuadmit: an edge's class thread is in its CPU admission term.
+        if let Some(lane) = &self.edge_clients {
+            lane.threads.register_current(
+                format!("class-{}", self.class.as_str()),
+                crate::cpu_admit::ThreadGroup::Class,
+                None,
+            );
+        }
         // Everything the loop uses is made (and touched) below, before the
         // thread is made real-time: once it runs, the loop allocates, frees
         // and first-touches nothing (stall follow-up; `alloc_free` tests).
@@ -2961,6 +2969,14 @@ impl Tee {
     async fn run(mut self, items: TeeReceiver<TeeMeta>, expire: Arc<Notify>) -> Result<()> {
         let mut decoded = self.decode_rx.take();
         let tick = self.requester_tick.clone();
+        // rm/cpuadmit: reported beside the send threads (not in the term).
+        if let Some(lane) = &self.edge_clients {
+            lane.threads.register_current(
+                format!("tee-{}", self.class.as_str()),
+                crate::cpu_admit::ThreadGroup::Tee,
+                None,
+            );
+        }
         // The thread's processor time is read at most every
         // `TEE_CPU_EVERY` (teeperf: it was two system calls a batch), and
         // what it used since is booked (its wakes included).

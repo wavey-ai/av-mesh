@@ -378,6 +378,7 @@ async fn a_two_leg_listener_is_charged_its_lane_on_both_edges() {
         compact_bps: 2_846_000,
         raptorq_bps: 13_248_000,
         http_bps: 4_032_000,
+        ..crate::charge::LaneCharges::default()
     };
     for node in ["edge-a", "edge-b", "edge-c"] {
         let mut snapshot = telemetry_snapshot_for_tests(

@@ -415,6 +415,11 @@ pub struct NodeStatus {
     /// counts room in it (needletail mesh_ops.byte_room).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heavy: Option<HeavyRoomStatus>,
+    /// rm/cpuadmit: the CPU admission term of an edge (its CPUs busy, each
+    /// send thread's busy permille, the binding term, the leg's price) and
+    /// its decisions (refused by reason, admitted, shed, spilled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_admit: Option<serde_json::Value>,
 }
 
 /// [`NodeStatus::heavy`].
@@ -1492,6 +1497,7 @@ mod tests {
             pulls: None,
             send_pacing: None,
             heavy: None,
+            cpu_admit: None,
         };
         let json = serde_json::to_string_pretty(&status).unwrap() + "\n";
         let golden = include_str!("tests/node_status.json");

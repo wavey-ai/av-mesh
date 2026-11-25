@@ -109,6 +109,11 @@ pub const REGION_LOST: &str = "region-lost";
 /// The reason of the legs left when the listener returns home.
 pub const HOME_REGION: &str = "home-region";
 const REBALANCE: &str = "rebalance";
+/// rm/cpuadmit: an edge over its CPU full point asks the listener to give
+/// up its leg there: replaced as for a rebalance where another edge has
+/// room; where none has, released if another leg delivers (it loses
+/// nothing), else kept (as a rebalance with nowhere to go).
+pub const SHED: &str = "shed";
 const PARENTS_LOST: &str = "parents-lost";
 /// The reason of a hedge leg's move to the edge the entry apportioned its
 /// place to (the lead's decision after integration 2): the hedge's edge is
@@ -597,8 +602,11 @@ impl DirectorLeg {
         self.leaving.as_ref().is_some_and(|(why, _)| why == reason)
     }
 
+    /// Leaving for a rebalance, or for an edge's CPU shed (rm/cpuadmit):
+    /// replaced only by a leg level with it, and never a reason to leave
+    /// the region.
     fn rebalance(&self) -> bool {
-        self.leaving_for(REBALANCE)
+        self.leaving_for(REBALANCE) || self.leaving_for(SHED)
     }
 
     /// A leg whose place another leg is added for: leaving or passed over,
@@ -1415,7 +1423,7 @@ impl Director {
             // edge's for longer.
             LegEvent::Refused { leg, reason } => {
                 let busy = BUSY_REFUSALS.contains(&reason.as_str());
-                let cause = if reason == REBALANCE || busy {
+                let cause = if reason == REBALANCE || reason == SHED || busy {
                     SkipCause::Busy
                 } else {
                     SkipCause::Failed
@@ -2517,7 +2525,7 @@ impl Director {
                 .is_some_and(|skip| skip.cause == SkipCause::Moved && skip.until.is_some())
         });
         let mut again = false;
-        let leaving: Vec<(LegKey, bool, bool)> = self
+        let leaving: Vec<(LegKey, bool, bool, bool)> = self
             .legs
             .iter()
             .filter(|leg| {
@@ -2528,10 +2536,14 @@ impl Director {
                         .is_some_and(|(_, at)| request.started >= *at)
                     && !self.replaced(leg.key)
             })
-            .map(|leg| (leg.key, leg.rebalance(), leg.leaving_for(PARENTS_LOST)))
+            .map(|leg| (leg.key, leg.rebalance(), leg.leaving_for(PARENTS_LOST), leg.leaving_for(SHED)))
             .collect();
-        for (key, rebalance, parents_lost) in leaving {
-            if rebalance {
+        for (key, rebalance, parents_lost, shed) in leaving {
+            if shed && self.any_delivering(legs, now, Some(key)) {
+                // rm/cpuadmit: no edge with room for it; another leg
+                // delivers, so the shedding edge's leg goes.
+                self.release(legs, key, now, out);
+            } else if rebalance {
                 // A rebalance with nowhere to go returns at once.
                 self.take_back(legs, key, now, out);
             } else if !region_empty {
@@ -2972,6 +2984,25 @@ impl Director {
                 // A rebalance not level by the give-up: the legs added for
                 // it go, and the old edge is asked to keep the listener.
                 Handover::GiveUp { old } => {
+                    // rm/cpuadmit: a shed leg whose replacement is not
+                    // level by the give-up goes all the same while
+                    // another leg (not its replacement) delivers.
+                    let shed = self
+                        .leg_index(old)
+                        .is_some_and(|index| self.legs[index].leaving_for(SHED));
+                    let others_deliver = shed
+                        && self.legs.iter().any(|leg| {
+                            leg.key != old
+                                && leg.stands_for != Some(old)
+                                && leg.live
+                                && leg.leaving.is_none()
+                                && leg.hedge_for.is_none()
+                                && Self::view(legs, leg.key, now).delivering
+                        });
+                    if others_deliver {
+                        self.release(legs, old, now, out);
+                        continue;
+                    }
                     while let Some(new) = self
                         .legs
                         .iter()
@@ -4299,6 +4330,51 @@ mod tests {
         w.run_to(w.ms() + 10_000);
         assert!(w.requests().is_empty());
         assert_eq!(w.held(), ["e1", "e2"]);
+    }
+
+    /// rm/cpuadmit: an edge over its CPU full point asks a two-leg
+    /// listener to give up its leg there (`MOVE shed`). With no edge of
+    /// room the leg goes and the other delivers on (no failover, nothing
+    /// taken back); with a one-leg listener it is taken back as a
+    /// rebalance's; with room it is replaced level, as a rebalance.
+    #[test]
+    fn a_shed_leg_goes_where_another_delivers_and_is_kept_where_none_does() {
+        let mut w = World::new("shed-1", 2, true);
+        w.join(&[1, 2], Some(3));
+        let e1 = w.key("e1");
+        w.event(LegEvent::Moved {
+            leg: e1,
+            reason: SHED.into(),
+        });
+        assert!(w.d.skipped(w.now).contains(&"e1".to_owned()));
+        let (to, nonce, _) = w.requests()[0].clone();
+        w.answer(to, nonce, vec![failover_entry()], 1, false, None);
+        assert!(w.s.legs[&e1].released, "{:?}", w.s.log);
+        assert!(!w.s.log.iter().any(|line| line.starts_with("takeback")), "{:?}", w.s.log);
+        assert_eq!(w.d.stats.failovers, 0);
+        assert_eq!(w.held(), ["e2"]);
+
+        // A replacement with room, level: as a rebalance.
+        let mut w = World::new("shed-2", 2, true);
+        w.join(&[1, 2], Some(3));
+        let e1 = w.key("e1");
+        let moved = w.ms();
+        w.event(LegEvent::Moved {
+            leg: e1,
+            reason: SHED.into(),
+        });
+        let (to, nonce, _) = w.requests()[0].clone();
+        w.answer(to, nonce, vec![cache(4)], 1, false, None);
+        w.live("e4");
+        let e4 = w.key("e4");
+        // Steady, never level: at the give-up the shed leg goes all the
+        // same (e2 delivers), the replacement stays.
+        w.run_to(moved + 2_995);
+        assert!(!w.s.legs[&e1].released && !w.s.legs[&e4].released);
+        w.run_to(moved + 3_005);
+        assert!(w.s.legs[&e1].released, "{:?}", w.s.log);
+        assert!(!w.s.legs[&e4].released, "{:?}", w.s.log);
+        assert!(!w.s.log.contains(&"takeback e1".to_owned()));
     }
 
     #[test]

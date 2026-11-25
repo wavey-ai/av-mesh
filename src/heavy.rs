@@ -136,7 +136,7 @@ pub(crate) struct DistressConfig {
     /// The memory guard at soft or hard (`--heavy-distress-memory`).
     pub(crate) memory: bool,
     /// The busiest of the node's CPUs over this (thousandths) for
-    /// `core_busy_for` (`--heavy-distress-core-permille`, 970; 0: not
+    /// `core_busy_for` (`--heavy-distress-core-permille`, 0 since rm/cpuadmit; 0: not
     /// judged).
     pub(crate) core_busy_permille: u32,
     pub(crate) core_busy_for: Duration,
@@ -147,7 +147,7 @@ pub(crate) struct DistressConfig {
 impl Default for DistressConfig {
     /// The rules on, but the busiest CPU's: in a test process on a shared
     /// box every CPU it may use is someone's busy CPU (the flag's default,
-    /// 970, turns it on for a node alone on its guest).
+    /// was 970 until rm/cpuadmit, which turned it off: see the flag).
     fn default() -> Self {
         Self {
             send_blocked_per_s: 20,
@@ -933,12 +933,21 @@ impl AppRouter {
         self.heavy_distress()
     }
 
-    /// The process's CPU over the last second, thousandths of one CPU.
+    /// The process's CPU over the last second, thousandths of one CPU; with
+    /// the CPU admission term (rm/cpuadmit), at least the node's CPUs' busy
+    /// time with the sends' softirq and the small legs admitted since its
+    /// samples: one budget for heavy and small sessions, so a crowded edge
+    /// takes no heavy viewer.
     fn heavy_measured_permille(&self, cpus: u32) -> u32 {
-        self.node_status
+        let process = self
+            .node_status
             .cpu_permille
             .load(Ordering::Relaxed)
-            .saturating_mul(cpus)
+            .saturating_mul(cpus);
+        self.edge_load
+            .egress
+            .cpu_admit()
+            .map_or(process, |admit| process.max(admit.one_cpu_permille()))
     }
 
     /// The heavy streams this edge holds with their sessions by lane, and
@@ -1079,6 +1088,11 @@ impl AppRouter {
         }
         if !add {
             return Ok(None);
+        }
+        // rm/cpuadmit: the small legs' admission sees the heavy session at
+        // once (its model cost), until the samples show it.
+        if let Some(admit) = self.edge_load.egress.cpu_admit() {
+            admit.charge_one_cpu_permille(cpu_add);
         }
         let id = self.heavy.next_reservation.fetch_add(1, Ordering::Relaxed);
         self.heavy
@@ -1308,7 +1322,11 @@ pub(crate) struct HeavyArgs {
     pub(crate) distress_tee_per_s: u64,
     #[arg(long = "heavy-distress-memory", default_value_t = true, action = clap::ArgAction::Set)]
     pub(crate) distress_memory: bool,
-    #[arg(long = "heavy-distress-core-permille", default_value_t = 970)]
+    /// rm/cpuadmit: off by default (0). The CPU admission term refuses and
+    /// sheds small legs before the CPUs fill, and placement reads it; on a
+    /// 2-vCPU 4K edge this rule fired often (integration 6) and moved
+    /// one-leg 4K viewers for a busy tee, which no move cures.
+    #[arg(long = "heavy-distress-core-permille", default_value_t = 0)]
     pub(crate) distress_core_permille: u32,
     #[arg(long = "heavy-distress-core-ms", default_value_t = 3_000)]
     pub(crate) distress_core_ms: u64,

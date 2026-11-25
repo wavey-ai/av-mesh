@@ -56,11 +56,18 @@ pub(crate) struct LaneCharges {
     pub(crate) compact_bps: u64,
     pub(crate) raptorq_bps: u64,
     pub(crate) http_bps: u64,
+    /// rm/cpuadmit: datagrams a second of one leg on the compact lane
+    /// (parts and their copies and window repair) and on the RaptorQ lane.
+    #[serde(default)]
+    pub(crate) compact_dps: u64,
+    #[serde(default)]
+    pub(crate) raptorq_dps: u64,
 }
 
-/// The wire bytes of one part of `part_bytes` on the RaptorQ lane, as the
-/// edge encodes it for a client at the lane's base repair.
-pub(crate) fn raptorq_part_wire_bytes(part_bytes: u64, symbol_size: u16) -> u64 {
+/// The wire bytes and datagrams of one part of `part_bytes` on the
+/// RaptorQ lane, as the edge encodes it for a client at the lane's base
+/// repair.
+pub(crate) fn raptorq_part_wire(part_bytes: u64, symbol_size: u16) -> (u64, u64) {
     let object = PartObject {
         kind: ObjectKind::Part,
         datagrams: 0,
@@ -74,12 +81,15 @@ pub(crate) fn raptorq_part_wire_bytes(part_bytes: u64, symbol_size: u16) -> u64 
     let repair = RepairPolicy::base_for_lane(false, None, None);
     encode_object(&object, symbol_size, repair)
         .map(|datagrams| {
-            datagrams
-                .iter()
-                .map(|datagram| datagram.len() as u64 + IP_UDP_BYTES)
-                .sum()
+            (
+                datagrams
+                    .iter()
+                    .map(|datagram| datagram.len() as u64 + IP_UDP_BYTES)
+                    .sum(),
+                datagrams.len() as u64,
+            )
         })
-        .unwrap_or(part_bytes + IP_UDP_BYTES)
+        .unwrap_or((part_bytes + IP_UDP_BYTES, 1))
 }
 
 /// The charges of a stream's lanes, from its sustained media, the edge's
@@ -88,15 +98,22 @@ pub(crate) fn raptorq_part_wire_bytes(part_bytes: u64, symbol_size: u16) -> u64 
 pub(crate) fn lane_charges(media: SustainedMedia, symbol_size: u16, compact_extra: f64) -> LaneCharges {
     let parts = media.parts_per_second.max(0.0);
     let per_part = |bytes: u64| (bytes as f64 * 8.0 * parts).round() as u64;
+    let (raptorq_bytes, raptorq_datagrams) = raptorq_part_wire(media.part_bytes, symbol_size);
     LaneCharges {
+        compact_dps: (parts * (1.0 + compact_extra.max(0.0))).round() as u64,
+        raptorq_dps: (parts * raptorq_datagrams as f64).round() as u64,
         media_bps: media.media_bps,
         compact_bps: (per_part(SHORT_HEADER_LEN as u64 + media.part_bytes + IP_UDP_BYTES) as f64
             * (1.0 + compact_extra.max(0.0)))
         .round() as u64,
-        raptorq_bps: per_part(raptorq_part_wire_bytes(media.part_bytes, symbol_size)),
+        raptorq_bps: per_part(raptorq_bytes),
         http_bps: media.media_bps + per_part(HTTP_PART_FRAMING_BYTES),
     }
 }
+
+/// rm/cpuadmit: a leg of a stream the edge has no figure for yet is
+/// reckoned at a part a millisecond.
+pub(crate) const UNKNOWN_LEG_DPS: f64 = 1_000.0;
 
 /// A charge with hysteresis: up at once, down only after [`FALL_AFTER`] of
 /// looks under it (then to the highest of those looks).
@@ -108,12 +125,19 @@ pub(crate) struct ChargeTracker {
 }
 
 impl ChargeTracker {
+    /// The charge now.
+    pub(crate) fn value(&self) -> LaneCharges {
+        self.value
+    }
+
     pub(crate) fn observe(&mut self, look: LaneCharges, now: Instant) -> LaneCharges {
         let max = |a: LaneCharges, b: LaneCharges| LaneCharges {
             media_bps: a.media_bps.max(b.media_bps),
             compact_bps: a.compact_bps.max(b.compact_bps),
             raptorq_bps: a.raptorq_bps.max(b.raptorq_bps),
             http_bps: a.http_bps.max(b.http_bps),
+            compact_dps: a.compact_dps.max(b.compact_dps),
+            raptorq_dps: a.raptorq_dps.max(b.raptorq_dps),
         };
         let raised = max(self.value, look);
         if raised != self.value {
@@ -161,6 +185,37 @@ impl crate::AppRouter {
         let look = lane_charges(media, self.heavy.client_symbol_size(), extra);
         let mut trackers = self.heavy.charges.lock().unwrap_or_else(|p| p.into_inner());
         Some(trackers.entry(stream_id).or_default().observe(look, Instant::now()))
+    }
+
+    /// rm/cpuadmit: datagrams a second that one more leg of `stream_id`
+    /// takes from this edge: its lane's (the RaptorQ lane's for a stream
+    /// classed heavy, else the compact lane's), from the last charge, or a
+    /// part a millisecond before the edge has one.
+    pub(crate) async fn leg_datagrams_per_s(&self, stream_id: u64) -> f64 {
+        let known = self
+            .heavy
+            .charges
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&stream_id)
+            .map(ChargeTracker::value);
+        let charges = match known {
+            Some(charges) => Some(charges),
+            None => self.stream_charges(stream_id).await,
+        };
+        let heavy = self.heavy_class(stream_id).await.heavy;
+        let dps = charges.map_or(0, |charges| {
+            if heavy {
+                charges.raptorq_dps
+            } else {
+                charges.compact_dps
+            }
+        });
+        if dps == 0 {
+            UNKNOWN_LEG_DPS
+        } else {
+            dps as f64
+        }
     }
 
     /// The compact lane's copies and window-repair datagrams per part sent,
@@ -242,6 +297,7 @@ mod tests {
             compact_bps: bps,
             raptorq_bps: bps,
             http_bps: bps,
+            ..LaneCharges::default()
         };
         assert_eq!(tracker.observe(look(100), at(0)).http_bps, 100);
         assert_eq!(tracker.observe(look(300), at(1)).http_bps, 300);

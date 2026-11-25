@@ -638,6 +638,9 @@ pub struct EdgeFastLane {
     /// gone): the class thread then drops what it kept for such clients at
     /// once (integration 6).
     departures: AtomicU64,
+    /// rm/cpuadmit: the send threads (class threads, fan-out) that the
+    /// CPU admission term reads; each registers itself when it starts.
+    pub threads: crate::cpu_admit::ThreadRegistry,
     pub stats: FastLaneStats,
 }
 
@@ -929,6 +932,7 @@ impl EdgeFastLane {
         crate::memory::touched_arc(Self {
             snapshot: ArcSwap::from_pointee(FastSnapshot::default()),
             departures: AtomicU64::new(0),
+            threads: crate::cpu_admit::ThreadRegistry::default(),
             retired: super::retired::Retired::default(),
             gone: super::retired::Retired::default(),
             eligible: DashMap::new(),
@@ -1078,9 +1082,15 @@ impl EdgeFastLane {
         // windows, above the runtime's threads.
         let nice = self.fanout_nice.load(Ordering::Relaxed);
         let nice = (nice != FANOUT_NICE_PROCESS).then_some(nice);
+        let registry = self.threads.clone();
         let spawned = std::thread::Builder::new()
             .name("nt-window-repair".into())
             .spawn(move || {
+                registry.register_current(
+                    "window-repair",
+                    crate::cpu_admit::ThreadGroup::Other,
+                    None,
+                );
                 if let Err(error) = sys::set_ordinary_at(nice) {
                     tracing::warn!(
                         error,
@@ -3271,9 +3281,17 @@ impl Fanout {
                                 .store(scheduling.nice, Ordering::Relaxed);
                         }
                         lane.stats.fanout_started.fetch_add(1, Ordering::Relaxed);
+                        // rm/cpuadmit: its wall time busy, kept a plan at a
+                        // time, for the CPU admission term.
+                        let busy = Arc::new(AtomicU64::new(0));
+                        lane.threads.register_current(
+                            format!("fanout-{}{index}", class.as_str()),
+                            crate::cpu_admit::ThreadGroup::Fanout,
+                            Some(Arc::clone(&busy)),
+                        );
                         let _ = ready.send(set);
                         drop(ready);
-                        run_fanout(work_rx, free_tx, &closed, &lane, class, &in_hand);
+                        run_fanout(work_rx, free_tx, &closed, &lane, class, &in_hand, &busy);
                     })?
             };
             let waker = Some(thread.thread().clone());
@@ -3421,6 +3439,7 @@ fn run_fanout(
     lane: &EdgeFastLane,
     class: TrafficClass,
     in_hand: &AtomicU32,
+    busy_ns: &AtomicU64,
 ) {
     loop {
         let Some(mut plan) = work.pop() else {
@@ -3432,8 +3451,11 @@ fn run_fanout(
             std::thread::park();
             continue;
         };
+        // One clock read at the plan's start (it was the lag's) and one at
+        // its end: the plan's wall time, softirq and preemption included.
+        let started = Instant::now();
         if let Some(at) = plan.dispatched_at.take() {
-            let lag = at.elapsed().as_micros() as u64;
+            let lag = started.saturating_duration_since(at).as_micros() as u64;
             lane.stats
                 .fanout_lag_max_us
                 .fetch_max(lag, Ordering::Relaxed);
@@ -3448,6 +3470,7 @@ fn run_fanout(
         // window repair itself.
         plan.window_repair(lane);
         plan.journal_sent(lane);
+        busy_ns.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         in_hand.fetch_sub(1, Ordering::AcqRel);
         // FANOUT_DEPTH plans in all, so the ring of free plans has room.
         let _ = free.push(plan);
