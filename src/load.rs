@@ -251,6 +251,9 @@ pub struct Counters {
     pub quality_over_budget: u64,
     pub quality_given_up: u64,
     pub distress_ignored: u64,
+    /// rm/cpuadmit: asks put off by the load back-off (a refusal for load,
+    /// no edge with room), on the home edge.
+    pub busy_reasks: u64,
     /// Each new part's lateness (arrival less publication, less the path's
     /// least over 10 s), µs, on the edge of the leg that brought it.
     pub lateness: Histogram,
@@ -394,6 +397,7 @@ impl Counters {
         self.quality_over_budget += other.quality_over_budget;
         self.quality_given_up += other.quality_given_up;
         self.distress_ignored += other.distress_ignored;
+        self.busy_reasks += other.busy_reasks;
         self.lateness.merge(&other.lateness);
         self.jumps += other.jumps;
         self.jump_parts += other.jump_parts;
@@ -504,6 +508,7 @@ impl Counters {
                 "given_up": self.quality_given_up,
                 "distress_ignored": self.distress_ignored,
             },
+            "busy_reasks": self.busy_reasks,
             "lateness_ms": self.lateness.summary_with_buckets(),
             "jumps": self.jumps,
             "jump_parts": self.jump_parts,
@@ -1444,7 +1449,7 @@ struct Listener {
     /// Its longest silence (µs) and when it ended (Unix µs).
     longest_silence: (u64, u64),
     /// Place240: its counts booked so far ([`quality_marks`]).
-    quality_booked: [u64; 8],
+    quality_booked: [u64; 9],
     /// Time on one path (B 2.8): it has had two delivering legs, until when
     /// two legs delivered (the second newest leg media + the window, µs),
     /// the start of the open span on fewer, and the spans ended so far (µs,
@@ -2285,13 +2290,14 @@ fn service(
         home.quality_over_budget += delta(5);
         home.quality_given_up += delta(6);
         home.distress_ignored += delta(7);
+        home.busy_reasks += delta(8);
     }
     drive.perform(listener, slot, counters, now);
 }
 
 /// A listener's place240 counts (cumulative): session restarts, lone legs
 /// late and missing, distress hints, and the moves not made.
-fn quality_marks(listener: &Listener) -> [u64; 8] {
+fn quality_marks(listener: &Listener) -> [u64; 9] {
     let session = &listener.session;
     let quality = &listener.director.stats.quality;
     [
@@ -2303,6 +2309,7 @@ fn quality_marks(listener: &Listener) -> [u64; 8] {
         quality.over_budget,
         quality.given_up,
         quality.distress_ignored,
+        listener.director.stats.busy_reasks,
     ]
 }
 
@@ -2594,7 +2601,7 @@ impl Listener {
             interrupted_now: false,
             ever_interrupted: false,
             longest_silence: (0, 0),
-            quality_booked: [0; 8],
+            quality_booked: [0; 9],
             two_paths_seen: false,
             two_until_us: 0,
             single_since_us: None,

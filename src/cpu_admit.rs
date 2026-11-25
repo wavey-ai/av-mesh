@@ -365,6 +365,11 @@ pub(crate) struct CpuAdmitAdvert {
     /// The edge is over its full point and sheds.
     #[serde(default)]
     pub(crate) shedding: bool,
+    /// Over its full point with nothing to shed (its listeners hold one
+    /// leg, or none was shed in its last rounds): only a new edge relieves
+    /// it. An autoscaler adds one now.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) nothing_to_shed: bool,
 }
 
 /// Counters of every decision (cumulative).
@@ -383,6 +388,9 @@ pub(crate) struct CpuAdmitStats {
     /// Rounds over full, and legs asked to leave (`MOVE shed`).
     pub(crate) shed_rounds: AtomicU64,
     pub(crate) shed_hints: AtomicU64,
+    /// Times the edge went over full with nothing to shed (no listener with
+    /// a second leg here, none shed lately): add an edge.
+    pub(crate) nothing_to_shed_episodes: AtomicU64,
     /// Entry: caches passed over for a new leg because their CPU term
     /// (with this entry's charges) was full.
     pub(crate) spilled: AtomicU64,
@@ -404,6 +412,12 @@ struct State {
     /// measured yet: the edge is cold).
     last_cost: Option<u64>,
     costs: VecDeque<u64>,
+    /// The last shed round that had a quota, and the last that asked a
+    /// leg to leave.
+    round_at: Option<Instant>,
+    shed_at: Option<Instant>,
+    /// Over full with nothing to shed now.
+    stuck: bool,
 }
 
 /// One edge's CPU admission.
@@ -539,6 +553,22 @@ impl CpuAdmit {
             }
             state.verdict = verdict;
         }
+        // Over full with nothing to shed: a round with a quota lately and
+        // no leg asked to leave since the window could show it.
+        let shown = self.config.window + self.config.sample_every * 2;
+        let stuck = self.shedding_locked(&state, now)
+            && state
+                .round_at
+                .is_some_and(|at| now.saturating_duration_since(at) < shown)
+            && state
+                .shed_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= shown);
+        if stuck && !state.stuck {
+            self.stats
+                .nothing_to_shed_episodes
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        state.stuck = stuck;
         let keep = self.config.window + self.config.sample_every * 2;
         while state
             .charges
@@ -819,13 +849,16 @@ impl CpuAdmit {
         (excess.div_ceil(leg) as usize).min(self.config.shed_per_round)
     }
 
-    /// `count` legs of `leg_permille` each were asked to leave.
+    /// A shed round with a quota asked `count` legs of `leg_permille` each
+    /// to leave (0: it found none with a second leg).
     pub(crate) fn shed_sent(&self, count: usize, leg_permille: u32) {
+        let now = Instant::now();
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.round_at = Some(now);
         if count == 0 {
             return;
         }
-        let now = Instant::now();
-        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.shed_at = Some(now);
         state.shed.push_back((now, leg_permille.saturating_mul(count as u32)));
         self.stats.shed_rounds.fetch_add(1, Ordering::Relaxed);
         self.stats
@@ -836,11 +869,20 @@ impl CpuAdmit {
     /// The measured term has been over full for the shed delay.
     pub(crate) fn shedding(&self) -> bool {
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        self.shedding_locked(&state, Instant::now())
+    }
+
+    fn shedding_locked(&self, state: &State, now: Instant) -> bool {
         self.enforcing()
             && !self.config.shed_after.is_zero()
             && state
                 .over_since
-                .is_some_and(|since| Instant::now().saturating_duration_since(since) >= self.config.shed_after)
+                .is_some_and(|since| now.saturating_duration_since(since) >= self.config.shed_after)
+    }
+
+    /// Over full with nothing to shed (see [`CpuAdmitAdvert::nothing_to_shed`]).
+    pub(crate) fn nothing_to_shed(&self) -> bool {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).stuck
     }
 
     pub(crate) fn advert(&self) -> CpuAdmitAdvert {
@@ -855,6 +897,7 @@ impl CpuAdmit {
                 self.floor_capacity_ns()
             },
             shedding: self.shedding(),
+            nothing_to_shed: self.nothing_to_shed(),
         }
     }
 
@@ -886,6 +929,8 @@ impl CpuAdmit {
             "admitted": load(&self.stats.admitted),
             "shed_rounds": load(&self.stats.shed_rounds),
             "shed_hints": load(&self.stats.shed_hints),
+            "nothing_to_shed": self.nothing_to_shed(),
+            "nothing_to_shed_episodes": load(&self.stats.nothing_to_shed_episodes),
             "spilled": load(&self.stats.spilled),
             "samples": load(&self.stats.samples),
         })
@@ -1084,6 +1129,29 @@ mod tests {
         admit.force_verdict(verdict(900, "cpus"), None);
         assert_eq!(admit.shed_quota(4), 0);
         assert_eq!(admit.stats.shed_hints.load(Ordering::Relaxed), 26);
+    }
+
+    /// Over full, a round that finds no listener with a second leg (and
+    /// none shed lately) says so, once an episode; a round that sheds ends
+    /// it.
+    #[test]
+    fn an_edge_over_full_with_nothing_to_shed_says_so() {
+        let admit = admit(2);
+        admit.force_verdict(verdict(1_100, "cpus"), Some(Duration::from_secs(3)));
+        admit.sample();
+        assert!(!admit.nothing_to_shed(), "no round yet");
+        admit.force_verdict(verdict(1_100, "cpus"), Some(Duration::from_secs(3)));
+        admit.shed_sent(0, 4);
+        admit.sample();
+        // The forced verdict is kept by a sample with too little wall time.
+        assert!(admit.nothing_to_shed());
+        assert!(admit.advert().nothing_to_shed);
+        admit.sample();
+        assert_eq!(admit.stats.nothing_to_shed_episodes.load(Ordering::Relaxed), 1);
+        admit.shed_sent(3, 4);
+        admit.sample();
+        assert!(!admit.nothing_to_shed(), "it shed");
+        assert_eq!(admit.status()["nothing_to_shed_episodes"], 1);
     }
 
     #[test]

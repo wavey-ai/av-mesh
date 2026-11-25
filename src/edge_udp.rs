@@ -5280,6 +5280,8 @@ async fn cpu_shed(
     }
     let leg = cpu.leg_charge(router.leg_datagrams_per_s(stream_id).await);
     let quota = cpu.shed_quota(leg);
+    // (A round with a quota that marks nobody is booked too: over full
+    // with nothing to shed, `CpuAdmit::nothing_to_shed`.)
     if quota == 0 {
         return;
     }

@@ -1107,6 +1107,10 @@ struct Report {
     session_restarts: u64,
     /// Place240 rules 3 and 4.
     quality: QualityReport,
+    /// rm/cpuadmit: asks put off by the load back-off (a refusal for load,
+    /// no edge with room) and the back-off at the end (0: none).
+    busy_reasks: u64,
+    backoff_ms: u64,
     /// Fix 4 (F5): jumps of the part numbers past the receiver's window
     /// (an outage of the source), `[from, to]` the parts either side, and
     /// the parts they passed over: one gap each, neither expected nor
@@ -2226,6 +2230,8 @@ async fn main() -> Result<()> {
         stalled_legs: session.stalled_legs,
         session_restarts: receiver.flows.saturating_sub(1),
         quality: QualityReport::of(&director.stats.quality, &session),
+        busy_reasks: director.stats.busy_reasks,
+        backoff_ms: director.stats.backoff_ms,
         jumps: accounted.jumps,
         jump_parts: accounted.jump_parts,
         output,
