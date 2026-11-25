@@ -9293,6 +9293,10 @@ struct LiveTsCache {
     /// Holes wider than the scan that the repair horizon released.
     wide_hole_releases: AtomicU64,
     part_updates: watch::Sender<u64>,
+    /// Bumped when a stream starts a new source session here (a higher
+    /// epoch): a request held for a part of the old session's numbering is
+    /// answered at once (joins), not when the new numbers pass it.
+    session_starts: watch::Sender<u64>,
     playlist_cache: Vec<StdRwLock<Option<CachedPlaylist>>>,
     /// The scan memo of the playlist in each playlist slot.
     playlist_scan_memos: Vec<StdMutex<Option<PlaylistScanMemo>>>,
@@ -9412,6 +9416,7 @@ impl LiveTsCache {
         chunk_cache.set_epoch_reader(mesh_slot_epoch);
         chunk_cache.resolve_or_create_stream(stream_id).await;
         let (part_updates, _) = watch::channel(0);
+        let (session_starts, _) = watch::channel(0);
         let mut state = LiveState::new();
         let started_unix_us = state.process_started_unix_us;
         state.segment_seed_parts = parts_per_segment.max(1) as u64;
@@ -9454,6 +9459,7 @@ impl LiveTsCache {
             wide_hole_resume: StdMutex::new(HashMap::new()),
             wide_hole_releases: AtomicU64::new(0),
             part_updates,
+            session_starts,
             playlist_cache,
             playlist_scan_memos,
             playlist_render_locks,
@@ -10749,6 +10755,8 @@ impl LiveTsCache {
                     ?previous_epoch,
                     "activated canonical media source epoch"
                 );
+                drop(state);
+                self.session_starts.send_modify(|starts| *starts += 1);
             }
 
             let seq = object.key().object();
@@ -11077,6 +11085,7 @@ impl LiveTsCache {
                     stream_id,
                     epoch, previous, "cache-mesh copy restarted for a new source publication"
                 );
+                self.session_starts.send_modify(|starts| *starts += 1);
             }
             _ => {}
         }
@@ -12250,6 +12259,20 @@ impl LiveTsCache {
             .and_then(|(bytes, _)| mesh_slot_epoch(&bytes))
             .is_some_and(|slot| slot < epoch);
         Some((if stale { recorded } else { last }, epoch))
+    }
+
+    /// The first part of a stream's current session that this node holds,
+    /// within `window` of `head` (joins: where a subscriber starts in a new
+    /// session); `head` when it holds none before it.
+    async fn session_first_part(&self, stream_id: u64, head: u64, window: u64) -> u64 {
+        let from = head.saturating_sub(window);
+        self.state
+            .read()
+            .await
+            .stream_parts
+            .get(&stream_id)
+            .and_then(|parts| parts.range(from..=head).next().map(|(part, _)| *part))
+            .unwrap_or(head)
     }
 
     async fn get_part_for_stream_id(&self, stream_id: u64, seq: u64) -> Option<(Bytes, u64)> {
@@ -14219,7 +14242,14 @@ impl LiveState {
     /// Whether `part` of a stream arrived at this node within `within_us`
     /// of `now_us`, or of four of the stream's parts if that is longer. A
     /// part without a record counts as fresh.
-    fn part_arrived_within(&self, stream_id: u64, part: u64, now_us: u64, within_us: u64) -> bool {
+    /// Whether part `part` of a stream is live: published by its source
+    /// within `within_us` (or four of the stream's parts, if longer) of
+    /// `now_us`, by the source's clock (the part's own publication stamp).
+    /// Arrival here says nothing of it (joins: a warm copy of a stopped
+    /// source's last parts arrives a moment ago); a part without a
+    /// publication stamp is judged by its arrival here, as before. A part
+    /// the node has no record of is live.
+    fn part_source_live(&self, stream_id: u64, part: u64, now_us: u64, within_us: u64) -> bool {
         let Some(record) = self
             .stream_parts
             .get(&stream_id)
@@ -14228,7 +14258,8 @@ impl LiveState {
             return true;
         };
         let limit = within_us.max(self.stream_part_target_us(stream_id).saturating_mul(4));
-        now_us.saturating_sub(record.available_unix_us) <= limit
+        let at = record.published_unix_us.unwrap_or(record.available_unix_us);
+        now_us.saturating_sub(at) <= limit
     }
 
     /// How far a part of a stream lies behind `head`, in microseconds of
@@ -26142,7 +26173,17 @@ impl Router for AppRouter {
                     self.request_replica_for_stream(stream_id, "playlist-part-demand", None)
                         .await;
                     let part = if self.cache.part_request_may_wait(stream_id, seq).await {
-                        match self.get_part_repairing_holes(stream_id, seq).await {
+                        // A new session of the stream while the request
+                        // waits: the number it asks for is of the old one,
+                        // answered at once (404) for the reader to take the
+                        // new playlist (joins), not when the new numbers
+                        // reach it.
+                        let mut sessions = self.cache.session_starts.subscribe();
+                        let waited = tokio::select! {
+                            waited = self.get_part_repairing_holes(stream_id, seq) => waited,
+                            _ = sessions.changed() => Ok(None),
+                        };
+                        match waited {
                             Ok(part) => part,
                             Err(ParentsLost) => {
                                 let reader = ReaderRequest {
@@ -41512,6 +41553,7 @@ mod tests {
                 stream_id: 77,
                 next_part: 0,
                 compact: false,
+                waiting: false,
             })
         );
         assert!(receiver.recovered_objects > 0);

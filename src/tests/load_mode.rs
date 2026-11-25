@@ -625,6 +625,7 @@ fn synthetic_sender(
                         stream_id,
                         next_part,
                         compact: true,
+                        waiting: false,
                     };
                     let _ = socket.send_to(&ok.encode(), peer);
                 }

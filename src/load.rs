@@ -283,6 +283,16 @@ pub struct Counters {
     pub stranded: u64,
     pub resuming: u64,
     pub never_resumed: u64,
+    /// Joins: of `never_resumed`, the listeners whose edges still sent them
+    /// datagrams (`WAIT`s) within the interruption's length of the newest
+    /// datagram: held, not dead, the subscription anchored at a part the
+    /// stream does not send (an old session's number).
+    pub anchored_stale: u64,
+    /// Joins: each listener's time from the start of a session of the
+    /// stream (its part 0's publication, from the first part's publication
+    /// and number and the part interval) to its first part of that session,
+    /// µs; one sample a session a listener.
+    pub session_join: Histogram,
     /// Assignment (`/api/assignment`, Phase AM item 10): answers, their
     /// time (µs), failures (no entry point answered), and listeners placed
     /// by rendezvous over the known edges for want of an answer.
@@ -374,6 +384,7 @@ impl Counters {
         self.short_header_dropped += other.short_header_dropped;
         self.latency.merge(&other.latency);
         self.ttfp.merge(&other.ttfp);
+        self.session_join.merge(&other.session_join);
         self.ttok.merge(&other.ttok);
         self.recv_lag.merge(&other.recv_lag);
         self.moves_out += other.moves_out;
@@ -390,6 +401,7 @@ impl Counters {
         self.stranded += other.stranded;
         self.resuming += other.resuming;
         self.never_resumed += other.never_resumed;
+        self.anchored_stale += other.anchored_stale;
         self.assignments += other.assignments;
         self.assignment_errors += other.assignment_errors;
         self.assignment_time.merge(&other.assignment_time);
@@ -477,6 +489,7 @@ impl Counters {
                 self.latency.summary_ms()
             },
             "ttfp_ms": self.ttfp.summary_ms(),
+            "session_join_ms": self.session_join.summary_ms(),
             "ttok_ms": self.ttok.summary_ms(),
             "recv_lag_ms": self.recv_lag.summary_ms(),
         });
@@ -554,6 +567,7 @@ impl Counters {
         value["missing_moved"] = json!(self.missing_moved);
         value["left_lost"] = json!(self.left_lost);
         value["never_resumed"] = json!(self.never_resumed);
+        value["anchored_stale"] = json!(self.anchored_stale);
         value["assignments"] = json!(self.assignments);
         value["assignment_errors"] = json!(self.assignment_errors);
         value["assignment_ms"] = self.assignment_time.summary_ms();
@@ -1379,6 +1393,10 @@ struct Listener {
     /// edge whose datagram delivered it.
     last_first: Option<(u64, u64, usize)>,
     last_part_at: Option<Instant>,
+    /// Its newest datagram of any kind (kernel time, µs), and the receiver's
+    /// flows (source sessions) when it last took a part (joins).
+    last_datagram_us: u64,
+    flows_seen: u64,
     scheduled: Instant,
     seen: Seen,
     overflows: u32,
@@ -2015,6 +2033,11 @@ fn handle_datagram(
     let (edge, leg) = listener.sender(peer);
     ensure(counters, edge);
     let arrival_us = datagram.kernel_us.unwrap_or(now_us);
+    // Every datagram the worker read, a WAIT too (joins: listeners held on
+    // WAITs and nothing else made the newest datagram their last part, and
+    // `never_resumed` never counted them).
+    drive.newest_us = drive.newest_us.max(arrival_us);
+    listener.last_datagram_us = listener.last_datagram_us.max(arrival_us);
     // The load host's own lag: the time from the kernel's receive timestamp
     // to now, which neither the latency nor the time to first part holds.
     let lag_us = datagram
@@ -2044,7 +2067,6 @@ fn handle_datagram(
             if let Some(leg) = leg {
                 listener.legs[leg].last_media_us = arrival_us;
             }
-            drive.newest_us = drive.newest_us.max(arrival_us);
         }
         Received::Subscribed { .. } => {
             if !listener.subscribed_once {
@@ -2091,6 +2113,25 @@ fn handle_datagram(
             ) {
                 Mark::New => {
                     counters[edge].parts += 1;
+                    // The first part of a session (the first, or the first
+                    // after the receiver took a new one): how long after
+                    // the session's start (joins).
+                    let flows = listener.session.receiver.flows;
+                    if (listener.last_first.is_none() || flows != listener.flows_seen)
+                        && object.published_unix_us > 0
+                    {
+                        let since_start_us = listener
+                            .interval_best_us
+                            .map_or(0, |interval| (object.part as f64 * interval) as u64);
+                        if since_start_us < 60_000_000 {
+                            counters[home].session_join.record(
+                                arrival_us
+                                    .saturating_sub(object.published_unix_us)
+                                    .saturating_add(since_start_us),
+                            );
+                        }
+                    }
+                    listener.flows_seen = flows;
                     if object.published_unix_us > 0 {
                         counters[edge]
                             .latency
@@ -2502,6 +2543,8 @@ impl Listener {
             track: PartTrack::new(),
             last_first: None,
             last_part_at: None,
+            last_datagram_us: 0,
+            flows_seen: 0,
             scheduled: now,
             seen: Seen::default(),
             overflows: 0,
@@ -2701,6 +2744,9 @@ fn worker(
                 {
                     ensure(&mut counters, listener.home);
                     counters[listener.home].never_resumed += 1;
+                    if drive.newest_us.saturating_sub(listener.last_datagram_us) < interrupt_us {
+                        counters[listener.home].anchored_stale += 1;
+                    }
                 }
             }
         }
@@ -3618,6 +3664,7 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
         "peak_subscribed": peak_up,
         "listeners_without_parts": never_first,
         "never_resumed": total.never_resumed,
+        "anchored_stale": total.anchored_stale,
         "assignment": entries.then(|| json!({
             "entries": config.director.entries,
             "udp_port": config.director.assignment_udp_port,
@@ -4058,6 +4105,7 @@ mod tests {
                     stream_id: STREAM,
                     next_part: 100,
                     compact: true,
+                    waiting: false,
                 }
                 .encode();
                 harness.datagram(from, &ok, 0.2);

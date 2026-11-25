@@ -356,6 +356,13 @@ pub enum Control {
         next_part: u64,
         /// The edge sends the compact lane (`C`).
         compact: bool,
+        /// The stream is not live at the edge (`w=1`, joins): its newest
+        /// part is old by the source's clock (a source that stopped, a warm
+        /// copy of its last parts). The subscriber is anchored to nothing:
+        /// its first part is the stream's next, whatever its number (the
+        /// head of the next session), and `next_part` names no part to
+        /// judge the leg by.
+        waiting: bool,
     },
     Waiting {
         stream_id: u64,
@@ -500,9 +507,11 @@ impl Control {
                 stream_id,
                 next_part,
                 compact,
+                waiting,
             } => format!(
-                "{CONTROL_PREFIX}OK {stream_id} {next_part}{}",
-                if *compact { " C" } else { "" }
+                "{CONTROL_PREFIX}OK {stream_id} {next_part}{}{}",
+                if *compact { " C" } else { "" },
+                if *waiting { " w=1" } else { "" }
             ),
             Self::Waiting {
                 stream_id,
@@ -711,10 +720,17 @@ impl Control {
                 if compact {
                     words.next();
                 }
+                let mut waiting = None;
+                for word in words.by_ref() {
+                    if let ("w", value) = field(word)? {
+                        once(&mut waiting, flag(value)?)?;
+                    }
+                }
                 Self::Subscribed {
                     stream_id,
                     next_part,
                     compact,
+                    waiting: waiting.unwrap_or(false),
                 }
             }
             "WAIT" => {
@@ -1476,6 +1492,19 @@ impl ObjectReceiver {
         start
     }
 
+    /// A leg's `OK` that names no part (`w=1`, joins): the stream, and the
+    /// short-form parts that came before it, read now; no part of it is a
+    /// reference or a start, so no leg is judged stale by it.
+    pub fn expect_waiting(&mut self, leg: LegId, stream_id: u64, compact: bool) {
+        self.stream_id = stream_id;
+        self.compact.leg_waiting(compact);
+        for datagram in self.compact.take_early(leg) {
+            if let Some(object) = self.push_compact(leg, &datagram) {
+                self.ready.push_front(object);
+            }
+        }
+    }
+
     /// Whether objects wait in `ready` (see [`Self::next_ready`]).
     pub fn has_ready(&self) -> bool {
         !self.ready.is_empty()
@@ -2048,11 +2077,13 @@ mod tests {
                 stream_id: 9,
                 next_part: 77,
                 compact: false,
+                waiting: false,
             },
             Control::Subscribed {
                 stream_id: 9,
                 next_part: 78,
                 compact: true,
+                waiting: false,
             },
             Control::Waiting {
                 stream_id: 9,
@@ -2093,7 +2124,8 @@ mod tests {
             Some(Control::Subscribed {
                 stream_id: 5,
                 next_part: 9,
-                compact: false
+                compact: false,
+                waiting: false,
             })
         );
         // The compact word comes after F1, once.
@@ -2670,11 +2702,13 @@ mod tests {
                 stream_id: 9,
                 next_part: 77,
                 compact: true,
+                waiting: false,
             },
             Control::Subscribed {
                 stream_id: 9,
                 next_part: 77,
                 compact: false,
+                waiting: false,
             },
             Control::Waiting {
                 stream_id: 9,
@@ -2784,6 +2818,7 @@ mod tests {
                 stream_id: 9,
                 next_part: 77,
                 compact: true,
+                waiting: false,
             })
         );
         // An unknown field stands among the known ones.

@@ -1706,6 +1706,14 @@ impl CompactReceiver {
         }
     }
 
+    /// A leg's `OK` that names no part (`w=1`, joins: the stream is not live
+    /// at its edge): the lane is the compact one if `compact`, and the leg
+    /// has no reference; its parts are numbered around the session's
+    /// newest, or from 0.
+    pub fn leg_waiting(&mut self, compact: bool) {
+        self.active |= compact;
+    }
+
     /// The short-form parts of a leg kept until its `OK` (see `early`), to
     /// push now.
     pub fn take_early(&mut self, leg: LegId) -> Vec<Vec<u8>> {
