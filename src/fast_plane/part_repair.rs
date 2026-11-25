@@ -966,6 +966,9 @@ pub struct PartRepairConfig {
     pub regenerate_sources: bool,
     /// `--relay-part-store-mb`: the bytes of kept parts at most.
     pub store_bytes: usize,
+    /// On a clean lane, how long a part that paused (its parent has not
+    /// moved on) is waited for before its first ask (0: as on any lane).
+    pub clean_pause_us: u64,
 }
 
 impl Default for PartRepairConfig {
@@ -978,6 +981,7 @@ impl Default for PartRepairConfig {
             deadline_us: 1_000_000,
             regenerate_sources: true,
             store_bytes: STORE_BYTES,
+            clean_pause_us: CLEAN_PAUSE_US,
         }
     }
 }
@@ -1584,6 +1588,11 @@ const LINK_REPAIR_WAIT_MAX_US: u64 = 30_000;
 const PROBE_EVERY_US: u64 = 500_000;
 /// Asks of one part at most.
 const MAX_ATTEMPTS: u8 = 10;
+/// A lane is clean below this measured loss (ppm): a part on it that has
+/// paused is asked for only once its parent has moved on to a later part,
+/// or after `PartRepairConfig::clean_pause_us` (CLEAN_PAUSE_US) of silence.
+const CLEAN_LANE_PPM: u32 = 1_000;
+pub const CLEAN_PAUSE_US: u64 = 10_000;
 
 #[derive(Debug, Clone, Copy)]
 struct OpenPart {
@@ -2063,7 +2072,21 @@ impl Requester {
                     let lane = lane_of(&part);
                     let expected = self.expected_link_repair(u32::from(part.k), lane);
                     let link_wait = self.repair_tail_us.min(LINK_REPAIR_WAIT_MAX_US);
-                    now_us >= part.last_us + jitter
+                    // On a clean lane a pause is not a loss: its parent
+                    // sends a part's datagrams in order, so until a later
+                    // part has come, what is missing may still be on its
+                    // way (the parent's sender paused: 1-4 ms mid-part in
+                    // the chain bench at 0 % loss, two to five times the
+                    // lane's jitter). The first ask waits for the parent to
+                    // move on, or CLEAN_PAUSE_US of silence.
+                    let clean = self.lanes.lane_loss_ppm(self.class, lane) < CLEAN_LANE_PPM as u64;
+                    let pause_us = self.repair.config.clean_pause_us;
+                    let paused = clean
+                        && pause_us > 0
+                        && part.moved_on_us == 0
+                        && now_us < part.last_us + pause_us.max(jitter);
+                    !paused
+                        && now_us >= part.last_us + jitter
                         && (expected == 0
                             || part.link_done_us != 0
                             || now_us >= part.last_source_us.max(part.first_us) + link_wait + jitter)
@@ -2526,6 +2549,56 @@ mod tests {
         plans.plan(8_000);
         assert_eq!(plans.plans.len(), 1);
         assert_eq!(plans.account.held(), 8_000 * PLAN_BYTES_PER_SYMBOL as u64);
+    }
+
+    #[test]
+    fn on_a_clean_lane_a_paused_part_is_asked_for_only_once_its_parent_moved_on() {
+        let lanes = Arc::new(super::super::relay::FastPlaneStats::default());
+        let mut requester = Requester::new(
+            repair_with(STORE_BYTES),
+            [None, None],
+            Arc::clone(&lanes),
+            TrafficClass::Video,
+        );
+        let peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let part = |object, moved_on_us| OpenPart {
+            key: PartKey {
+                stream: 7,
+                epoch: 1,
+                object,
+            },
+            k: 1_000,
+            held: 500,
+            first_us: 1_000,
+            last_us: 10_000,
+            last_source_us: 10_000,
+            gap_us: 500,
+            regenerated: 0,
+            link_done_us: 0,
+            moved_on_us,
+            parents: [Some(peer), None],
+            attempts: 0,
+            first_ask_us: 0,
+            next_due_us: 0,
+            missing_at: [false; 2],
+        };
+        let attempts = |requester: &Requester, object| {
+            requester.open.iter().find(|part| part.key.object == object).unwrap().attempts
+        };
+        // Part 1 paused (its parent has sent nothing later); part 2's
+        // parent moved on (a later part came at 11 ms).
+        requester.open_part(part(1, 0));
+        requester.open_part(part(2, 11_000));
+        requester.poll(15_000);
+        assert_eq!(attempts(&requester, 1), 0, "a pause on a clean lane is no loss");
+        assert_eq!(attempts(&requester, 2), 1, "moved on: what is missing is lost");
+        requester.poll(10_000 + CLEAN_PAUSE_US + 1);
+        assert_eq!(attempts(&requester, 1), 1, "the pause's limit of silence: asked");
+        // On a lossy lane, the pause is asked for after the jitter, as before.
+        lanes.video_parent_loss_ppm[0].store(10_000, Ordering::Relaxed);
+        requester.open_part(part(3, 0));
+        requester.poll(15_000);
+        assert_eq!(attempts(&requester, 3), 1);
     }
 
     #[test]

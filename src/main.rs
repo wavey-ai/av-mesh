@@ -4573,6 +4573,7 @@ async fn main() -> Result<()> {
                     deadline_us: args.relay_media_deadline_us(),
                     regenerate_sources: args.relay_regenerate_sources,
                     store_bytes: args.relay_part_store_mb.saturating_mul(1 << 20),
+                    clean_pause_us: fast_plane::part_repair::CLEAN_PAUSE_US,
                 },
                 relay_session::RelayLimits::default(),
             )

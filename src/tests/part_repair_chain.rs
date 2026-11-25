@@ -674,6 +674,11 @@ pub(super) fn run_chain(parts: &[Part], measured: std::ops::Range<usize>, case: 
         deadline_us: 1_000_000,
         regenerate_sources: case.requests,
         store_bytes: fast_plane::part_repair::STORE_BYTES,
+        // KR_CLEAN_PAUSE_US (the default's 10,000; 0: the rule before 5b).
+        clean_pause_us: std::env::var("KR_CLEAN_PAUSE_US")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(fast_plane::part_repair::CLEAN_PAUSE_US),
     };
     let mut links: Vec<Link> = (0..4).map(|_| Link::bind()).collect();
     let source = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
