@@ -49,6 +49,10 @@ use tracing::{debug, info, warn};
 /// How long a new subscription waits for the edge to hold parts of its
 /// stream before it is refused.
 const ADMIT_WAIT: Duration = Duration::from_secs(4);
+/// How long a subscription waits for a live part when the edge's newest is
+/// not live by the source's clock (a warm copy of a stopped source's last
+/// parts), before it is admitted anchored to nothing (joins).
+const STALE_HEAD_WAIT: Duration = Duration::from_millis(300);
 
 /// `--client-udp-fresh-head-ms`.
 pub(crate) const DEFAULT_FRESH_HEAD_MS: u64 = 1_000;
@@ -356,6 +360,11 @@ pub(crate) struct EdgeUdpStats {
     /// (waiting for a part of the old numbering) and started at the head
     /// (stuck4k).
     pub session_restarts: AtomicU64,
+    /// Subscribers admitted to a stream that was not live by the source's
+    /// clock, anchored to nothing (`OK ... w=1`, joins).
+    pub admitted_waiting: AtomicU64,
+    /// Those of them that the stream's next part then started.
+    pub waiting_anchored: AtomicU64,
     /// Clients kept (or taken back) within the move hold-down although the
     /// edge had lost its parents.
     pub moves_held_down: AtomicU64,
@@ -1584,6 +1593,10 @@ pub(crate) struct Subscriber {
     /// starts a new session, a subscriber ahead of the new session's head
     /// starts again at the head (`restart_in_session`, stuck4k).
     epoch: u64,
+    /// Admitted to a stream that was not live (joins): the stale head it
+    /// waits past. It is anchored to nothing: the stream's next part
+    /// starts it, whatever its number (`anchor_waiting`).
+    waiting_past: Option<u64>,
 }
 
 /// `Subscriber::others` of a listener with no other leg.
@@ -2193,6 +2206,8 @@ impl EdgeControl {
                     stream_id,
                     next_part,
                     compact: compact.is_some(),
+                    waiting: false,
+                    restarted: false,
                 },
                 RefreshAnswer::Move(reason) => Control::Move {
                     stream_id,
@@ -2919,19 +2934,25 @@ async fn move_reason(router: &AppRouter, stream_id: u64) -> Option<&'static str>
     None
 }
 
-/// The stream's newest part once the edge holds one that arrived within
-/// `fresh` (zero: any), woken by the parts' arrival; at `deadline`, a stale
-/// head if there is one, else `None`.
+/// The stream's newest part once the edge holds one that is live by the
+/// source's clock: published within `fresh` (or four of the stream's parts,
+/// if longer; arrival at this edge for a part that carries no publication
+/// time), woken by the parts' arrival; zero `fresh`: any part. A head that
+/// is not live (joins: a source that stopped, whose last parts a warm copy
+/// brought here a moment ago) is waited past for at most [`STALE_HEAD_WAIT`]
+/// and then returned with `false`: the subscriber is anchored to nothing
+/// (`Subscriber::waiting_past`). `None` at `deadline` with no part.
 async fn wait_for_head(
     router: &AppRouter,
     stream_id: u64,
     deadline: Instant,
     fresh: Duration,
-) -> Option<u64> {
+) -> Option<(u64, bool)> {
     let mut updates = router.cache.part_updates.subscribe();
     let fresh_us = u64::try_from(fresh.as_micros()).unwrap_or(u64::MAX);
-    let mut stale = None;
+    let mut stale_since: Option<Instant> = None;
     loop {
+        let now = Instant::now();
         if let Some(head) = head_part(router, stream_id).await {
             if fresh.is_zero()
                 || router
@@ -2939,20 +2960,21 @@ async fn wait_for_head(
                     .state
                     .read()
                     .await
-                    .part_arrived_within(stream_id, head, crate::now_unix_us(), fresh_us)
+                    .part_source_live(stream_id, head, crate::now_unix_us(), fresh_us)
             {
-                return Some(head);
+                return Some((head, true));
             }
-            stale = Some(head);
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            return stale;
+            let since = *stale_since.get_or_insert(now);
+            if now >= deadline || now.duration_since(since) >= STALE_HEAD_WAIT {
+                return Some((head, false));
+            }
+        } else if now >= deadline {
+            return None;
         }
         // A bound on the wait, in case an update is missed between the
         // look and the subscription's mark.
         let _ = tokio::time::timeout(
-            (deadline - now).min(Duration::from_millis(50)),
+            deadline.saturating_duration_since(now).min(Duration::from_millis(50)),
             updates.changed(),
         )
         .await;
@@ -3200,7 +3222,7 @@ async fn admit(
     } else {
         loop {
             if let Some(head) = head_part(&router, stream_id).await {
-                break Some(head);
+                break Some((head, true));
             }
             if Instant::now() >= deadline {
                 break None;
@@ -3208,7 +3230,7 @@ async fn admit(
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     };
-    let Some(head) = head else {
+    let Some((head, live)) = head else {
         stats.refusals.fetch_add(1, Ordering::Relaxed);
         send_control(
             &socket,
@@ -3249,7 +3271,14 @@ async fn admit(
     // Wave 8 S2: a client moving here resumes where it asks while the
     // cache holds the part, late rather than missing.
     let floor = floor.filter(|_| !(config.resume_from_request && from_part.is_some()));
-    let first_part = first_part_for(from_part, head, window, floor);
+    // A stream that is not live (joins): the subscriber waits past its
+    // stale head for the stream's next part, whatever its number, and is
+    // sent nothing of before (`OK ... w=1`).
+    let waiting_past = (!live).then_some(head);
+    let first_part = match waiting_past {
+        Some(stale) => stale.saturating_add(1),
+        None => first_part_for(from_part, head, window, floor),
+    };
     if let Some(part) = from_part.filter(|part| head.saturating_sub(*part) < window) {
         if first_part > part {
             stats
@@ -3286,6 +3315,7 @@ async fn admit(
                 leaving: None,
                 others,
                 epoch,
+                waiting_past,
             },
         );
         let start = !std::mem::replace(&mut entry.running, true);
@@ -3307,13 +3337,18 @@ async fn admit(
             stream_id,
             next_part: first_part,
             compact: compact.is_some(),
+            waiting: waiting_past.is_some(),
+            restarted: false,
         },
     )
     .await;
+    if waiting_past.is_some() {
+        stats.admitted_waiting.fetch_add(1, Ordering::Relaxed);
+    }
     // Its first part at once, not when the stream's sender next looks (it
     // may be waiting for the part after). Every lane takes a part for a
     // subscriber once, so no lane sends it again.
-    if config.first_part_at_once {
+    if config.first_part_at_once && waiting_past.is_none() {
         if let Some((bytes, _)) = router
             .cache
             .get_part_for_stream_id(stream_id, first_part)
@@ -3891,6 +3926,8 @@ async fn run_stream_sender(
         hinted: HashMap::new(),
     };
     let mut last_sent = Instant::now();
+    // The stream's session and head as the sender last saw them.
+    let mut seen: Option<(u64, u64)> = None;
     loop {
         let now = Instant::now();
         // The stream's class can become known after it started.
@@ -3901,6 +3938,25 @@ async fn run_stream_sender(
             None => (None, 0),
         };
         let window = router.cache.window_parts_for(stream_id).await as u64;
+        // Where a subscriber starts in a new session (joins): the session's
+        // first part that the edge holds, not its head (the parts that came
+        // before the sender looked are the session's too). Looked up only
+        // when the session or the numbering changed.
+        let start = match head {
+            Some(head)
+                if seen.is_none_or(|(seen_epoch, seen_head)| {
+                    seen_epoch != epoch || head < seen_head
+                }) =>
+            {
+                router
+                    .cache
+                    .session_first_part(stream_id, head, window)
+                    .await
+            }
+            Some(head) => head,
+            None => 0,
+        };
+        seen = head.map(|head| (epoch, head));
         let oldest_wanted = {
             let guard = table.lock().unwrap();
             guard.get(&stream_id).and_then(|entry| {
@@ -3922,6 +3978,9 @@ async fn run_stream_sender(
         // continues at the newest part, and one whose next part is past its
         // playout deadline (after a move, or a backlog) at the oldest part
         // within it.
+        // Subscribers started again at a new session's numbers, told so
+        // below (`OK ... s=1`); empty (no allocation) but at a restart.
+        let mut renumbered: Vec<(SocketAddr, u64, bool)> = Vec::new();
         let (oldest_next, newest_next, peers) = {
             let mut guard = table.lock().unwrap();
             let Some(entry) = guard.get_mut(&stream_id) else {
@@ -3953,18 +4012,29 @@ async fn run_stream_sender(
                 return;
             }
             // A new session of the stream (its contributor restarted and
-            // numbers its parts again): a subscriber ahead of its head
-            // starts at the head, on a fresh fast-lane place.
+            // numbers its parts again): every subscriber of an older one,
+            // waiting or mid-stream, starts at the new session's first part
+            // on a fresh fast-lane place; and one admitted to a stream that
+            // was not live starts at the stream's next part (joins).
             if let Some(head) = head {
                 let mut fast_renewed = false;
                 if let Some(entry) = guard.get_mut(&stream_id) {
-                    for subscriber in entry.subscribers.values_mut() {
+                    for (peer, subscriber) in entry.subscribers.iter_mut() {
+                        let stale = subscriber.waiting_past;
                         if let SessionLook::New { restarted } =
-                            restart_in_session(subscriber, head, epoch)
+                            restart_in_session(subscriber, start, epoch)
                         {
                             fast_renewed |= subscriber.fast.is_some();
                             if restarted {
                                 stats.session_restarts.fetch_add(1, Ordering::Relaxed);
+                                renumbered.push((*peer, start, subscriber.compact.is_some()));
+                            }
+                        }
+                        if anchor_waiting(subscriber, head, start) {
+                            fast_renewed |= subscriber.fast.is_some();
+                            stats.waiting_anchored.fetch_add(1, Ordering::Relaxed);
+                            if stale.is_some_and(|stale| head < stale) {
+                                renumbered.push((*peer, start, subscriber.compact.is_some()));
                             }
                         }
                     }
@@ -4002,6 +4072,24 @@ async fn run_stream_sender(
                 entry.subscribers.keys().copied().collect::<Vec<_>>(),
             )
         };
+        // Before the new session's first part: the client forgets the old
+        // session's parts and blocks, whose numbers the new one may reuse
+        // (a held 4K viewer's decoders took the new session's blocks for
+        // ones decoded already, and refused for a second at each restart).
+        for (peer, start, compact) in renumbered.drain(..) {
+            send_control(
+                &socket,
+                peer,
+                &Control::Subscribed {
+                    stream_id,
+                    next_part: start,
+                    compact,
+                    waiting: false,
+                    restarted: true,
+                },
+            )
+            .await;
+        }
 
         // A drain begun or lifted: the housekeeping now (an atomic load a
         // part; the drain's first moves still wait for its advertisement).
@@ -4124,7 +4212,14 @@ async fn run_stream_sender(
                         .max(Duration::from_millis(1)),
                 );
             }
-            tokio::time::timeout(slice, router.get_part_repairing_holes(stream_id, part)).await
+            // A new session of the stream ends the wait at once: its
+            // subscribers start at its first part before the fast lane
+            // sends them its next ones on their old places (joins).
+            let mut sessions = router.cache.session_starts.subscribe();
+            tokio::select! {
+                waited = tokio::time::timeout(slice, router.get_part_repairing_holes(stream_id, part)) => waited,
+                _ = sessions.changed() => continue,
+            }
         };
         match waited {
             Ok(Ok(Some((bytes, _)))) => {
@@ -4558,22 +4653,22 @@ enum SessionLook {
     /// The subscriber is in the stream's session (or neither is known).
     Same,
     /// The stream is in a new session (`epoch`): the subscriber is now in
-    /// it, with a fresh fast-lane place from its next part; `restarted` if
-    /// its next part was ahead of the new session's head (a part of the old
-    /// numbering, which the new one may not reach for minutes) and it
-    /// starts at the head.
+    /// it, at the session's first part, with a fresh fast-lane place;
+    /// `restarted` (always, since joins: a subscriber at an old session's
+    /// number is anchored there until the new numbers pass it).
     New { restarted: bool },
 }
 
-/// A subscriber against the stream's session: `epoch` (0 unknown) and its
-/// `head`. A subscriber whose session is not known yet takes the stream's.
-/// When the stream has started a new session since the subscriber's next
-/// part was set, a next part ahead of the head goes to the head (stuck4k:
-/// a subscriber left waiting for the part after the old session's last
-/// waits until the new session's numbers pass it); and its fast-lane place
-/// is made again, since the claims of the old session's part numbers would
-/// keep the new session's off the fast lane.
-fn restart_in_session(subscriber: &mut Subscriber, head: u64, epoch: u64) -> SessionLook {
+/// A subscriber against the stream's session: `epoch` (0 unknown) and the
+/// session's first part that the edge holds, `start`. A subscriber whose
+/// session is not known yet takes the stream's. When the stream has started
+/// a new session since the subscriber's next part was set, it starts again
+/// at `start`, whatever its next part was (stuck4k: one ahead of the new
+/// numbers waited until they passed it; joins: one behind them was sent the
+/// new session from an old number), anchored to the new session; its
+/// fast-lane place is made again, since the claims of the old session's
+/// part numbers would keep the new session's off the fast lane.
+fn restart_in_session(subscriber: &mut Subscriber, start: u64, epoch: u64) -> SessionLook {
     if epoch == 0 || subscriber.epoch == epoch {
         return SessionLook::Same;
     }
@@ -4582,18 +4677,46 @@ fn restart_in_session(subscriber: &mut Subscriber, head: u64, epoch: u64) -> Ses
         return SessionLook::Same;
     }
     subscriber.epoch = epoch;
-    let restarted = subscriber.next_part > head.saturating_add(1);
-    if restarted {
-        subscriber.next_part = head;
-        subscriber.first_part = head;
-        subscriber.catching_up = false;
-        subscriber.cut_slots.clear();
-        subscriber.windows_repaired.clear();
+    start_at(subscriber, start);
+    SessionLook::New { restarted: true }
+}
+
+/// A subscriber admitted to a stream that was not live (joins) against the
+/// stream's `head`: once the head is another part than the stale one it
+/// waited past, it is anchored there. The part after the stale one (the
+/// source went on) is its next part already; a part numbered below it (a
+/// new session, whose epoch the edge may not know) starts it at `start`.
+/// `true` when it was anchored now.
+fn anchor_waiting(subscriber: &mut Subscriber, head: u64, start: u64) -> bool {
+    let Some(stale) = subscriber.waiting_past else {
+        return false;
+    };
+    if head == stale {
+        return false;
     }
+    if head < stale {
+        start_at(subscriber, start);
+    } else {
+        subscriber.waiting_past = None;
+        if subscriber.fast.is_some() {
+            subscriber.fast = Some(FastClient::new(subscriber.next_part));
+        }
+    }
+    true
+}
+
+/// Start a subscriber at `part`, a session's first, anchored and on a
+/// fresh fast-lane place.
+fn start_at(subscriber: &mut Subscriber, part: u64) {
+    subscriber.next_part = part;
+    subscriber.first_part = part;
+    subscriber.catching_up = false;
+    subscriber.waiting_past = None;
+    subscriber.cut_slots.clear();
+    subscriber.windows_repaired.clear();
     if subscriber.fast.is_some() {
-        subscriber.fast = Some(FastClient::new(subscriber.next_part));
+        subscriber.fast = Some(FastClient::new(part));
     }
-    SessionLook::New { restarted }
 }
 
 /// A subscriber's next part against the stream's `head`: a part the window
@@ -4665,6 +4788,7 @@ pub(crate) fn insert_test_subscribers(
                 leaving: None,
                 others: NO_OTHER_LEGS,
                 epoch: 0,
+                waiting_past: None,
             },
         );
     }
@@ -6287,6 +6411,7 @@ mod tests {
             leaving: None,
             others: NO_OTHER_LEGS,
             epoch: 0,
+            waiting_past: None,
         }
     }
 

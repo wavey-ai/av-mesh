@@ -395,8 +395,10 @@ struct Leg {
     /// The stream's head that the edge's first `WAIT` since the leg's last
     /// media named (`h=`, stuck4k), and when a later `WAIT` first named
     /// another: from then the stream is live at the edge, and the edge
-    /// sends none of it.
-    wait_heads: Option<(u64, Option<Instant>)>,
+    /// sends none of it. And whether the latest `WAIT` waits for a part
+    /// beyond the part after the head (joins: anchored at a number of
+    /// another session).
+    wait_heads: Option<(u64, Option<Instant>, bool)>,
     /// Place240: the lateness of the parts this leg delivered.
     lateness: LatenessHistogram,
 }
@@ -562,6 +564,9 @@ pub struct UdpSession {
     /// Legs failed because no media came for [`STALLED_FOR`] while their
     /// edge said the stream went on (stuck4k).
     pub stalled_legs: u64,
+    /// Times an edge started a leg again at a new session of the stream
+    /// (`OK ... s=1`, joins).
+    pub session_restarts: u64,
     /// The joint part loss of the legs (smoothed) and its mean run.
     joint_estimate: Option<f64>,
     joint_burst: Option<f64>,
@@ -635,6 +640,11 @@ pub const REFUSING_MIN_DATAGRAMS: u64 = 32;
 /// from firing). It is replaced, and the generations refused are
 /// forgotten.
 pub const STALLED_FOR: Duration = Duration::from_secs(1);
+/// [`STALLED_FOR`] for a leg whose edge waits for a part beyond the part
+/// after the stream's head while the head moves (joins: a subscription
+/// anchored at a number of another session, which the moving session may
+/// not reach for minutes).
+pub const ANCHORED_FOR: Duration = Duration::from_millis(300);
 
 impl UdpSession {
     pub fn new(config: SessionConfig, now: Instant) -> Self {
@@ -674,6 +684,7 @@ impl UdpSession {
             stale_starts: 0,
             refusing_legs: 0,
             stalled_legs: 0,
+            session_restarts: 0,
             joint_estimate: None,
             joint_burst: None,
             all_silent: false,
@@ -1465,13 +1476,19 @@ impl UdpSession {
         let (run, accepted) = self.receiver.compact.leg_refused(id);
         // The RaptorQ lane (stuck4k): its datagrams since a part of it was
         // last taken, whether refused or never whole.
-        let (untaken, taken) = self.receiver.leg_untaken(id);
+        let (untaken, taken, untaken_since) = self.receiver.leg_untaken(id);
         let last = match (accepted, taken) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
         };
-        run.saturating_add(untaken) >= REFUSING_MIN_DATAGRAMS
-            && now.saturating_duration_since(last.unwrap_or(since)) >= REFUSING_FOR
+        let compact = run >= REFUSING_MIN_DATAGRAMS
+            && now.saturating_duration_since(last.unwrap_or(since)) >= REFUSING_FOR;
+        // The RaptorQ lane: a second from its first datagram not taken, so
+        // that a pause of the source between two parts is no refusal.
+        let raptorq = untaken >= REFUSING_MIN_DATAGRAMS
+            && untaken_since.is_some_and(|first| now.saturating_duration_since(first) >= REFUSING_FOR)
+            && now.saturating_duration_since(last.unwrap_or(since)) >= REFUSING_FOR;
+        compact || raptorq
     }
 
     /// Whether a live leg has stalled: its edge's `WAIT`s have shown the
@@ -1479,9 +1496,11 @@ impl UdpSession {
     /// (a source that pauses names one head; one that restarts sends its
     /// new parts within the second).
     fn stalled(leg: &Leg, now: Instant) -> bool {
-        leg.wait_heads
-            .and_then(|(_, moved)| moved)
-            .is_some_and(|moved| now.saturating_duration_since(moved) >= STALLED_FOR)
+        leg.wait_heads.is_some_and(|(_, moved, ahead)| {
+            moved.is_some_and(|moved| {
+                now.saturating_duration_since(moved) >= if ahead { ANCHORED_FOR } else { STALLED_FOR }
+            })
+        })
     }
 
     /// The loss check of every leg: their repair, and the plans.
@@ -1820,8 +1839,9 @@ impl UdpSession {
                 continue;
             }
             let media = leg.media_since();
-            if let Some((_, Some(moved))) = leg.wait_heads {
-                verdict(&mut wake, moved + STALLED_FOR + ms);
+            if let Some((_, Some(moved), ahead)) = leg.wait_heads {
+                let after = if ahead { ANCHORED_FOR } else { STALLED_FOR };
+                verdict(&mut wake, moved + after + ms);
             }
             if live > 1 {
                 verdict(&mut wake, leg.last_datagram + self.config.silence);
@@ -1957,8 +1977,24 @@ impl UdpSession {
                 Received::Control
             }
             Control::Subscribed {
-                next_part, compact, ..
-            } => self.on_subscribed(index, next_part, compact, now),
+                next_part,
+                compact,
+                waiting,
+                restarted,
+                ..
+            } => {
+                if restarted && leg.is_live() {
+                    // The edge started the leg again at a new session
+                    // (joins): what was delivered and every decoder's
+                    // blocks are of the old one, whose numbers the new one
+                    // may reuse.
+                    leg.wait_heads = None;
+                    self.receiver.new_flow();
+                    self.receiver.forget_sessions();
+                    self.session_restarts += 1;
+                }
+                self.on_subscribed(index, next_part, compact, waiting, now)
+            }
             // Place240 rule 4: an edge's distress hint. The edge keeps
             // serving the leg; the director decides.
             Control::Move { reason, .. } if reason.starts_with(DISTRESS_MOVE_PREFIX) => {
@@ -2019,13 +2055,16 @@ impl UdpSession {
                 Received::Move(reason)
             }
             Control::Waiting {
-                head: Some(head), ..
+                next_part,
+                head: Some(head),
+                ..
             } => {
                 if leg.is_live() {
+                    let ahead = next_part > head.saturating_add(1);
                     leg.wait_heads = Some(match leg.wait_heads {
-                        None => (head, None),
-                        Some((first, None)) if first != head => (first, Some(now)),
-                        Some(heads) => heads,
+                        None => (head, None, ahead),
+                        Some((first, None, _)) if first != head => (first, Some(now), ahead),
+                        Some((first, moved, _)) => (first, moved, ahead),
                     });
                 }
                 Received::Control
@@ -2066,6 +2105,7 @@ impl UdpSession {
         index: usize,
         next_part: u64,
         compact: bool,
+        waiting: bool,
         now: Instant,
     ) -> Received {
         let leg = self.legs[index].as_mut().expect("an attributed leg");
@@ -2104,12 +2144,26 @@ impl UdpSession {
             }
             let leg = self.legs[index].as_mut().expect("an attributed leg");
             leg.double_at = None;
-            match self
-                .receiver
-                .expect(id, self.config.stream_id, next_part, compact)
-            {
-                Expected::Started => {}
-                Expected::Stale => {
+            if waiting {
+                // The stream is not live at the edge (joins): the leg is
+                // anchored to nothing. Its first part is whatever the
+                // stream sends next, the head of the next session; the part
+                // the OK names judges no leg (an old session's number made
+                // a good leg `stale-start`).
+                self.receiver
+                    .expect_waiting(id, self.config.stream_id, compact);
+                self.first_subscribed_at.get_or_insert(now);
+                let leg = self.legs[index].as_mut().expect("an attributed leg");
+                leg.state = State::Live;
+                leg.ok_at = Some(now);
+            }
+            let started = (!waiting).then(|| {
+                self.receiver
+                    .expect(id, self.config.stream_id, next_part, compact)
+            });
+            match started {
+                None | Some(Expected::Started) => {}
+                Some(Expected::Stale) => {
                     self.stale_starts += 1;
                     let stale = LegEvent::Failed {
                         leg: key,
@@ -2118,7 +2172,7 @@ impl UdpSession {
                     self.stop_leg(index, stale, LegFailure::Stale.reason().to_owned());
                     return Received::Control;
                 }
-                Expected::Displaces(stale) => {
+                Some(Expected::Displaces(stale)) => {
                     self.stale_starts += 1;
                     if let Some(stale_key) = self.legs[stale.index()].as_ref().map(|leg| leg.key) {
                         let event = LegEvent::Failed {
@@ -2130,12 +2184,14 @@ impl UdpSession {
                     }
                 }
             }
-            self.first_subscribed_at.get_or_insert(now);
-            self.first_subscribed_part.get_or_insert(next_part);
-            let leg = self.legs[index].as_mut().expect("an attributed leg");
-            leg.first_part = Some(next_part);
-            leg.state = State::Live;
-            leg.ok_at = Some(now);
+            if !waiting {
+                self.first_subscribed_at.get_or_insert(now);
+                self.first_subscribed_part.get_or_insert(next_part);
+                let leg = self.legs[index].as_mut().expect("an attributed leg");
+                leg.first_part = Some(next_part);
+                leg.state = State::Live;
+                leg.ok_at = Some(now);
+            }
         }
         let leg = self.legs[index].as_mut().expect("an attributed leg");
         if !leg.is_live() {
@@ -2540,6 +2596,8 @@ mod tests {
             stream_id: 4001,
             next_part: 10,
             compact: true,
+            waiting: false,
+            restarted: false,
         }
         .encode();
         assert_eq!(
@@ -2650,6 +2708,8 @@ mod tests {
             stream_id: config.stream_id,
             next_part: 10,
             compact: true,
+            waiting: false,
+            restarted: false,
         }
         .encode();
         session.on_datagram(edge(), &ok, at, &mut send);
@@ -2689,6 +2749,8 @@ mod tests {
             stream_id: 1,
             next_part: 11,
             compact: true,
+            waiting: false,
+            restarted: false,
         }
         .encode();
         session.on_datagram(next, &ok, moved_at, &mut send);
@@ -2751,6 +2813,8 @@ mod tests {
                 stream_id: 3,
                 next_part: 70_000,
                 compact: true,
+                waiting: false,
+                restarted: false,
             }
             .encode();
             session.on_datagram(edge(), &ok, now, &mut send);
@@ -2787,6 +2851,8 @@ mod tests {
                 stream_id: 3,
                 next_part: 100,
                 compact: true,
+                waiting: false,
+                restarted: false,
             }
             .encode();
             session.on_datagram(edge(), &ok, now, &mut send);
@@ -2836,6 +2902,8 @@ mod tests {
             stream_id: 3,
             next_part: 70_000,
             compact: true,
+            waiting: false,
+            restarted: false,
         }
         .encode();
         assert!(matches!(
@@ -2954,6 +3022,8 @@ mod tests {
             stream_id: 1,
             next_part: 10,
             compact: false,
+            waiting: false,
+            restarted: false,
         }
         .encode();
         session.on_datagram(edge(), &ok, at, &mut send);
@@ -3098,6 +3168,8 @@ mod tests {
             stream_id: 5,
             next_part: 3,
             compact: false,
+            waiting: false,
+            restarted: false,
         }
         .encode();
         assert_eq!(
@@ -3146,6 +3218,8 @@ mod tests {
             stream_id: 2,
             next_part: 0,
             compact: true,
+            waiting: false,
+            restarted: false,
         }
         .encode();
         session.on_datagram(edge(), &ok, now, &mut send);
@@ -3210,6 +3284,8 @@ mod tests {
             stream_id: 1,
             next_part: 0,
             compact: true,
+            waiting: false,
+            restarted: false,
         }
         .encode();
         session.on_datagram(edge(), &ok, now, &mut send);
@@ -3350,6 +3426,8 @@ mod tests {
             stream_id: 1,
             next_part,
             compact: true,
+            waiting: false,
+            restarted: false,
         }
         .encode()
     }
@@ -3989,14 +4067,104 @@ mod tests {
                 break;
             }
         }
-        // The head moved at 480 ms: failed a second later.
+        // The head moved at 480 ms, below the part the edge waits for
+        // (joins: anchored at an old number): failed 300 ms later.
         let failed_at = failed_at.expect("the leg fails");
-        assert!((1_480..1_600).contains(&failed_at), "{failed_at}");
+        assert!((780..=880).contains(&failed_at), "{failed_at}");
         assert_eq!(held(&session, A).failure.as_deref(), Some("stalled-1s"));
         assert_eq!(session.stalled_legs, 1);
         assert_eq!(session.refusing_legs, 0);
         assert_eq!(session.receiver.compact.newest(), None);
         assert_eq!(session.start_from(StartFrom::AfterNewest), None);
+    }
+
+    /// Joins: a leg anchored at an old session's number (`WAIT 41284`)
+    /// while the stream's head moves in a new session (`h=` 5, 6, ...)
+    /// fails at 300 ms, not at the second of a stall: its edge waits for a
+    /// part the new session will not reach for minutes.
+    #[test]
+    fn a_leg_waiting_beyond_a_head_that_moves_fails_at_300_ms() {
+        let now = Instant::now();
+        let mut session = UdpSession::new(SessionConfig::new(1), now);
+        let mut send = |_: SocketAddr, _: &[u8]| {};
+        session.add_leg(A, "lon-edge-2", edge(), start(), now, &mut send);
+        session.on_datagram(edge(), &token(5), now, &mut send);
+        session.on_datagram(edge(), &ok(41_284), now, &mut send);
+        events(&mut session);
+        let mut failed_at = None;
+        for step in 1..=40_u32 {
+            let at = now + Duration::from_millis(20 * u64::from(step));
+            // The old head for 100 ms, then the new session's, moving.
+            let head = if step <= 5 { 41_283 } else { u64::from(step) };
+            session.on_datagram(edge(), &wait(41_284, Some(head)), at, &mut send);
+            session.poll_legs(at, &mut send);
+            if events(&mut session).contains(&LegEvent::Failed {
+                leg: A,
+                cause: LegFailure::Stalled,
+            }) {
+                failed_at = Some(20 * step);
+                break;
+            }
+        }
+        // The head moved at 120 ms.
+        let failed_at = failed_at.expect("the leg fails");
+        assert!((420..=460).contains(&failed_at), "{failed_at}");
+        assert_eq!(session.stalled_legs, 1);
+        assert_eq!(session.start_from(StartFrom::AfterNewest), None);
+    }
+
+    /// Joins: an edge whose stream is not live answers `OK ... w=1`: the
+    /// leg is live, anchored to nothing, and the part it names judges no
+    /// leg. Beside a leg that delivers the new session (parts 5 on), an old
+    /// session's number in it made the delivering leg `stale-start` (a
+    /// listener on one path for 7 to 8 s); the waiting leg takes the new
+    /// session's parts when they come.
+    #[test]
+    fn a_waiting_ok_judges_no_leg_by_its_number() {
+        let now = Instant::now();
+        let mut session = UdpSession::new(SessionConfig::new(1), now);
+        let mut send = |_: SocketAddr, _: &[u8]| {};
+        session.add_leg(A, "a", edge(), start(), now, &mut send);
+        session.add_leg(B, "b", edge_b(), start(), now, &mut send);
+        session.on_datagram(edge(), &token(5), now, &mut send);
+        session.on_datagram(edge(), &ok(5), now, &mut send);
+        for number in 5..20 {
+            session.on_datagram(edge(), &part(number), now, &mut send);
+        }
+        while session.next_object().is_some() {}
+        session.on_datagram(edge_b(), &token(6), now, &mut send);
+        let waiting = Control::Subscribed {
+            stream_id: 1,
+            next_part: 41_284,
+            compact: true,
+            waiting: true,
+            restarted: false,
+        }
+        .encode();
+        assert!(String::from_utf8_lossy(&waiting).ends_with(" C w=1"));
+        assert_eq!(
+            session.on_datagram(edge_b(), &waiting, now, &mut send),
+            Received::Subscribed {
+                next_part: 41_284,
+                first: true
+            }
+        );
+        let failed: Vec<LegEvent> = events(&mut session)
+            .into_iter()
+            .filter(|event| matches!(event, LegEvent::Failed { .. }))
+            .collect();
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(session.stale_starts, 0);
+        assert_eq!(held(&session, B).state, State::Live);
+        // B's edge sends the new session: taken (duplicates of A's, then
+        // first where A has not been).
+        let mut taken = Vec::new();
+        for number in 18..24 {
+            session.on_datagram(edge_b(), &part(number), now, &mut send);
+            taken.extend(std::iter::from_fn(|| session.next_object()).map(|object| object.part));
+        }
+        assert_eq!(taken, vec![20, 21, 22, 23]);
+        assert!(view(&session, A, now).delivering);
     }
 
     /// Stuck4k: `WAIT`s that name one head (a source that paused), or none

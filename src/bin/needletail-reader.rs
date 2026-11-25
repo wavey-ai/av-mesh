@@ -710,6 +710,9 @@ struct ReaderReport {
     last_part: u64,
     parts_received: u64,
     parts_missing: u64,
+    /// The stream's new sessions that the reader started again at (joins:
+    /// a playlist numbered from 0 again).
+    session_restarts: u64,
     bytes: u64,
     /// Parts that arrived later than the playout buffer allows, against a
     /// schedule that never moves.
@@ -1365,6 +1368,25 @@ impl Reader {
                         if let Some((_, duration)) = loaded.parts.last() {
                             default_duration_us = (*duration).max(1);
                         }
+                        if let Some(target) = restart_target(
+                            &loaded.parts,
+                            next,
+                            default_duration_us,
+                            self.args.start_back_parts,
+                        ) {
+                            for pending in inflight.drain(..) {
+                                pending.handle.abort();
+                            }
+                            self.report.session_restarts += 1;
+                            next = target;
+                            request_next = next;
+                            part_started = Instant::now();
+                            failed = 0;
+                            schedule = None;
+                            scheduled_us = 0;
+                            play_from_us = None;
+                            continue;
+                        }
                         durations.retain(|sequence, _| *sequence + 4_096 > next);
                         // A player plays what the playlist lists. When the
                         // part that the reader waits for is overdue, and the
@@ -1514,6 +1536,17 @@ impl Reader {
                                 // no connection anywhere.
                                 let within = by.min(end).saturating_duration_since(now);
                                 match self.load_playlist_within(next, within).await {
+                                    Ok(Some(loaded))
+                                        if restart_target(
+                                            &loaded.parts,
+                                            next,
+                                            default_duration_us,
+                                            self.args.start_back_parts,
+                                        )
+                                        .is_some() =>
+                                    {
+                                        break Waited::Hole(loaded)
+                                    }
                                     Ok(Some(loaded)) => {
                                         match playlist_verdict(&loaded.parts, next) {
                                             PlaylistVerdict::SkipTo(_) => {
@@ -1668,6 +1701,24 @@ impl Reader {
                         }
                         None => None,
                     };
+                    if let Some(target) = loaded.as_ref().and_then(|loaded| {
+                        restart_target(
+                            &loaded.parts,
+                            next,
+                            default_duration_us,
+                            self.args.start_back_parts,
+                        )
+                    }) {
+                        self.report.session_restarts += 1;
+                        next = target;
+                        request_next = next;
+                        part_started = Instant::now();
+                        failed = 0;
+                        schedule = None;
+                        scheduled_us = 0;
+                        play_from_us = None;
+                        continue;
+                    }
                     if let Some(loaded) = loaded {
                         match playlist_verdict(&loaded.parts, next) {
                             PlaylistVerdict::Stopped => {
@@ -1838,6 +1889,8 @@ struct Summary {
     buffer_ms: u64,
     parts_received: u64,
     parts_missing: u64,
+    /// New sessions of the stream that readers started again at (joins).
+    session_restarts: u64,
     underruns: u64,
     /// Readers that had at least one stall.
     readers_stalled: usize,
@@ -1932,6 +1985,7 @@ async fn main() -> Result<()> {
         buffer_ms: args.buffer_ms,
         parts_received: 0,
         parts_missing: 0,
+        session_restarts: 0,
         underruns: 0,
         readers_stalled: reports.iter().filter(|report| report.stalls > 0).count(),
         readers_pipeline_limited: reports
@@ -1962,6 +2016,7 @@ async fn main() -> Result<()> {
     for report in &reports {
         summary.parts_received += report.parts_received;
         summary.parts_missing += report.parts_missing;
+        summary.session_restarts += report.session_restarts;
         summary.underruns += report.underruns;
         summary.stalls += report.stalls;
         summary.stalled_ms += report.stalled_ms;
@@ -2243,6 +2298,29 @@ enum PlaylistVerdict {
     SkipTo(u64),
     /// It is listed.
     Listed,
+}
+
+/// The part a reader starts again from when the playlist shows that the
+/// stream started a new session (joins): every listed part is numbered so
+/// far below the part it waits for (more than the playlist's window and two
+/// seconds of parts) that its numbers counted from 0 again; the new
+/// session's newest parts, as at a join. A request held for the old
+/// number is answered at once by the edge when the session starts (404),
+/// and a blocking playlist reload for an old number is refused (400): the
+/// LL-HLS rules let a server refuse a position it will not reach, and a
+/// player that sees a playlist restart begins it again (the new session's
+/// parts are new media: no EXT-X-DISCONTINUITY joins them to the old).
+fn restart_target(
+    listed: &[(u64, u64)],
+    wanted: u64,
+    part_us: u64,
+    start_back: u64,
+) -> Option<u64> {
+    let newest = listed.iter().map(|(sequence, _)| *sequence).max()?;
+    let oldest = listed.iter().map(|(sequence, _)| *sequence).min()?;
+    let margin = listed.len() as u64 + parts_in_two_seconds(part_us) as u64;
+    (newest.saturating_add(margin) < wanted)
+        .then(|| newest.saturating_sub(start_back).max(oldest))
 }
 
 fn playlist_verdict(listed: &[(u64, u64)], wanted: u64) -> PlaylistVerdict {
@@ -2961,6 +3039,21 @@ mod tests {
         assert_eq!(parts_in_two_seconds(250), 8_000);
         assert_eq!(parts_in_two_seconds(2_000_000), 2);
         assert_eq!(parts_in_two_seconds(0), 2_000_000);
+    }
+
+    /// Joins: a reader waiting for part 41284 of an old session sees a
+    /// playlist numbered from 0 again (a new session): it starts again at
+    /// the new session's newest parts. A playlist just behind it (a cache
+    /// that lags, a pause) is no restart.
+    #[test]
+    fn a_reader_starts_again_at_a_new_session() {
+        let listed: Vec<(u64, u64)> = (0..40).map(|sequence| (sequence, 2_500)).collect();
+        assert_eq!(restart_target(&listed, 41_284, 2_500, 4), Some(35));
+        assert_eq!(restart_target(&listed, 41_284, 2_500, 100), Some(0));
+        let behind: Vec<(u64, u64)> = (41_000..41_280).map(|sequence| (sequence, 2_500)).collect();
+        assert_eq!(restart_target(&behind, 41_284, 2_500, 4), None);
+        assert_eq!(restart_target(&behind, 41_281, 2_500, 4), None);
+        assert_eq!(restart_target(&[], 41_284, 2_500, 4), None);
     }
 
     #[test]
