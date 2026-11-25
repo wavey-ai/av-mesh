@@ -390,6 +390,9 @@ pub(crate) struct EdgeUdpStats {
     /// clients moved for it (Phase AM item 11).
     pub region_lost_checks: AtomicU64,
     pub region_lost_moves: AtomicU64,
+    /// Integration 6: rebalance shares not taken from a heavy stream (its
+    /// viewers are place240's to move).
+    pub rebalance_heavy_skipped: AtomicU64,
     /// Wave 9 C1: rebalance rounds that found this edge over its target
     /// with room in its region, the listeners they planned to send away,
     /// and those sent (`MOVE rebalance`).
@@ -4391,7 +4394,18 @@ async fn housekeeping_moves(
         // edge's other streams do not take it too (wave 9 review);
         // what this one does not send is handed back.
         let (due, active, receivers) = router.rebalance_due(now).await;
-        if due > 0 {
+        // Integration 6: a heavy stream's viewers hold one leg and are
+        // placed and moved by place240's rules (cost, quality, distress);
+        // the load rebalance moved them between edges every 10-30 s in the
+        // local lab (4K at 247 beside a PCM crowd: 8-11 moves a viewer in
+        // 300 s, 494-580 parts lost). It sends only small sessions; the
+        // share is handed back.
+        let heavy = due > 0 && router.heavy_class(stream_id).await.heavy;
+        if heavy {
+            router.rebalance_sent(now, due, 0);
+            stats.rebalance_heavy_skipped.fetch_add(1, Ordering::Relaxed);
+        }
+        if due > 0 && !heavy {
             let marked = {
                 let mut guard = table.lock().unwrap();
                 let (marked, fast_removed) = match guard.get_mut(&stream_id) {
