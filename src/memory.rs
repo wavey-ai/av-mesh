@@ -265,6 +265,11 @@ pub fn locked() -> bool {
     LOCKED.load(Ordering::Relaxed) > 0 && REFUSED.load(Ordering::Relaxed) == 0
 }
 
+/// Bytes locked by `pin_region` now: the pinned rings.
+pub fn locked_bytes() -> u64 {
+    LOCKED.load(Ordering::Relaxed)
+}
+
 /// Whether `tune_allocator` set the thresholds.
 pub fn tuned() -> bool {
     TUNED.load(Ordering::Relaxed)

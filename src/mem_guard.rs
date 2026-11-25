@@ -284,7 +284,33 @@ pub struct Guard {
     idle_releases: AtomicU64,
     trims: AtomicU64,
     trimmed_bytes: AtomicU64,
+    /// Memory the node holds for good: the pinned rings (tee, journals,
+    /// dedup tables) and the cache's slot index.
+    fixed_bytes: AtomicU64,
+    /// RSS less the cache's parts and the fixed memory: the heap that no
+    /// store accounts for (mem2: a forwarder's 0.3-0.45 GB on cmpd8).
+    unaccounted_bytes: AtomicU64,
+    /// The least unaccounted RSS since the last trim.
+    unaccounted_floor: AtomicU64,
+    ticks: AtomicU64,
+    last_trim_tick: AtomicU64,
+    /// Trims for unaccounted growth (fragmentation), and the allocator's
+    /// free bytes (mallinfo2) before and after the last trim.
+    growth_trims: AtomicU64,
+    heap_free_before_trim: AtomicU64,
+    heap_free_after_trim: AtomicU64,
 }
+
+/// Unaccounted RSS above its floor since the last trim that makes the guard
+/// trim: 64 MB. On cmpd8 a forwarder's heap grew 0.1-1.1 MB/s with its
+/// parts' sizes and the cache mesh's encodings (glibc keeps freed chunks it
+/// cannot reuse); a trim gives their pages back.
+pub const TRIM_AFTER_GROWTH_BYTES: u64 = 64 * MB;
+/// The fewest ticks (seconds) between two trims for growth: a trim gives
+/// back the heap's free pages and the working set faults some of them in
+/// again (mem2 bench: about 200 MB a trim at 247 Mbit/s), so it is not
+/// repeated more often than this.
+pub const GROWTH_TRIM_TICKS: u64 = 120;
 
 /// The cache bytes released since the last trim that make the guard trim
 /// the allocator: 64 MB (two seconds of 4K at 247 Mbit/s).
@@ -295,6 +321,7 @@ const HYSTERESIS_PERMILLE: u64 = 900;
 impl Guard {
     pub fn new(soft_bytes: u64, hard_bytes: u64) -> Self {
         let guard = Self::default();
+        guard.unaccounted_floor.store(u64::MAX, Ordering::Relaxed);
         guard.soft_bytes.store(soft_bytes, Ordering::Relaxed);
         guard.hard_bytes.store(hard_bytes.max(soft_bytes), Ordering::Relaxed);
         guard
@@ -325,6 +352,39 @@ impl Guard {
     /// only below 90% of its limit, and asks for a trim after a release of
     /// [`TRIM_AFTER_RELEASE_BYTES`] or on entering a shed.
     pub fn tick(&self, rss_bytes: u64, cache_bytes: u64) -> GuardTick {
+        self.tick_with_fixed(rss_bytes, cache_bytes, 0)
+    }
+
+    /// [`Self::tick`] with the node's fixed memory, so that the heap no
+    /// store accounts for is watched too: when it has grown by
+    /// [`TRIM_AFTER_GROWTH_BYTES`] above its least since the last trim, and
+    /// at least [`GROWTH_TRIM_TICKS`] ticks after it, the tick asks for a
+    /// trim.
+    pub fn tick_with_fixed(&self, rss_bytes: u64, cache_bytes: u64, fixed_bytes: u64) -> GuardTick {
+        let tick = self.ticks.fetch_add(1, Ordering::Relaxed) + 1;
+        self.fixed_bytes.store(fixed_bytes, Ordering::Relaxed);
+        let unaccounted = rss_bytes.saturating_sub(cache_bytes).saturating_sub(fixed_bytes);
+        self.unaccounted_bytes.store(unaccounted, Ordering::Relaxed);
+        let floor = self
+            .unaccounted_floor
+            .fetch_min(unaccounted, Ordering::Relaxed)
+            .min(unaccounted);
+        let grown = unaccounted.saturating_sub(floor) >= TRIM_AFTER_GROWTH_BYTES
+            && tick.saturating_sub(self.last_trim_tick.load(Ordering::Relaxed)) >= GROWTH_TRIM_TICKS;
+        let mut result = self.tick_inner(rss_bytes, cache_bytes);
+        if grown && !result.trim {
+            self.growth_trims.fetch_add(1, Ordering::Relaxed);
+            result.trim = true;
+        }
+        if result.trim {
+            self.last_trim_tick.store(tick, Ordering::Relaxed);
+            // The floor starts again from what the trim leaves.
+            self.unaccounted_floor.store(u64::MAX, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn tick_inner(&self, rss_bytes: u64, cache_bytes: u64) -> GuardTick {
         self.rss_bytes.store(rss_bytes, Ordering::Relaxed);
         self.rss_peak_bytes.fetch_max(rss_bytes, Ordering::Relaxed);
         self.cache_bytes.store(cache_bytes, Ordering::Relaxed);
@@ -385,6 +445,15 @@ impl Guard {
         self.trimmed_bytes.fetch_add(returned_bytes, Ordering::Relaxed);
     }
 
+    /// [`Self::note_trim`] with the allocator's free bytes before and after.
+    pub fn note_trim_measured(&self, trimmed: Trimmed) {
+        self.note_trim(trimmed.returned_bytes);
+        self.heap_free_before_trim
+            .store(trimmed.heap_free_before_bytes, Ordering::Relaxed);
+        self.heap_free_after_trim
+            .store(trimmed.heap_free_after_bytes, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self, budgets: &Budgets, sockets: &SocketBudget) -> MemorySnapshot {
         MemorySnapshot {
             state: self.state(),
@@ -407,6 +476,11 @@ impl Guard {
             socket_budget_bytes: sockets.budget(),
             socket_asked_bytes: sockets.asked(),
             socket_clamped: sockets.clamped(),
+            fixed_bytes: self.fixed_bytes.load(Ordering::Relaxed),
+            unaccounted_bytes: self.unaccounted_bytes.load(Ordering::Relaxed),
+            growth_trims: self.growth_trims.load(Ordering::Relaxed),
+            heap_free_before_trim_bytes: self.heap_free_before_trim.load(Ordering::Relaxed),
+            heap_free_after_trim_bytes: self.heap_free_after_trim.load(Ordering::Relaxed),
         }
     }
 }
@@ -439,6 +513,21 @@ pub struct MemorySnapshot {
     pub socket_asked_bytes: u64,
     /// Socket growths cut short by the budget.
     pub socket_clamped: u64,
+    /// The pinned rings and the cache's slot index (mem2).
+    #[serde(default)]
+    pub fixed_bytes: u64,
+    /// RSS less the cache's parts and the fixed memory: the heap.
+    #[serde(default)]
+    pub unaccounted_bytes: u64,
+    /// Trims for the heap's growth (fragmentation), of `trims`.
+    #[serde(default)]
+    pub growth_trims: u64,
+    /// The allocator's free bytes (mallinfo2 `fordblks`) before and after
+    /// the last trim: what fragmentation held, and what stays in its bins.
+    #[serde(default)]
+    pub heap_free_before_trim_bytes: u64,
+    #[serde(default)]
+    pub heap_free_after_trim_bytes: u64,
 }
 
 /// The node's budgets and guard, installed once at start.
@@ -510,6 +599,40 @@ pub fn trim() -> u64 {
         libc::malloc_trim(TRIM_PAD_BYTES);
     }
     before.saturating_sub(rss_bytes())
+}
+
+/// What a measured trim did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Trimmed {
+    pub returned_bytes: u64,
+    pub heap_free_before_bytes: u64,
+    pub heap_free_after_bytes: u64,
+}
+
+/// The allocator's free bytes in its arenas' bins (mallinfo2 `fordblks`).
+/// Walks every arena: off the hot path.
+pub fn heap_free_bytes() -> u64 {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY: mallinfo2 takes nothing and returns a plain struct.
+        let info = unsafe { libc::mallinfo2() };
+        info.fordblks as u64
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        0
+    }
+}
+
+/// [`trim`], with the allocator's free bytes before and after.
+pub fn trim_measured() -> Trimmed {
+    let heap_free_before_bytes = heap_free_bytes();
+    let returned_bytes = trim();
+    Trimmed {
+        returned_bytes,
+        heap_free_before_bytes,
+        heap_free_after_bytes: heap_free_bytes(),
+    }
 }
 
 /// The growable receive buffers of the node's sockets share one budget: the
@@ -732,6 +855,53 @@ mod tests {
         // No soft limit: no guard.
         let off = Guard::new(0, 0);
         assert_eq!(off.tick(100 * GB, 0).state, GuardState::Ok);
+    }
+
+    #[test]
+    fn the_guard_trims_when_the_heap_grows_beyond_its_floor() {
+        let guard = Guard::new(2 * GB, 3 * GB);
+        let fixed = 400 * MB;
+        // 400 MB of parts, 400 MB fixed, 300 MB of heap.
+        assert!(!guard.tick_with_fixed(1_100 * MB, 400 * MB, fixed).trim);
+        // The heap grows 1 MB a second: no trim until it has grown 64 MB
+        // above its floor and 120 ticks have passed.
+        let mut trimmed_at = None;
+        for second in 1..=200_u64 {
+            let tick = guard.tick_with_fixed((1_100 + second) * MB, 400 * MB, fixed);
+            if tick.trim {
+                trimmed_at = Some(second);
+                break;
+            }
+        }
+        assert_eq!(trimmed_at, Some(119));
+        guard.note_trim_measured(Trimmed {
+            returned_bytes: 60 * MB,
+            heap_free_before_bytes: 90 * MB,
+            heap_free_after_bytes: 88 * MB,
+        });
+        // After the trim the floor is what it left; a growth within 120
+        // ticks waits for them.
+        assert!(!guard.tick_with_fixed(1_104 * MB, 400 * MB, fixed).trim);
+        for _ in 0..100 {
+            assert!(!guard.tick_with_fixed(1_200 * MB, 400 * MB, fixed).trim);
+        }
+        let mut later = false;
+        for _ in 0..20 {
+            later |= guard.tick_with_fixed(1_200 * MB, 400 * MB, fixed).trim;
+        }
+        assert!(later);
+        let snapshot = guard.snapshot(&Budgets::default(), &SocketBudget::default());
+        assert_eq!(snapshot.growth_trims, 2);
+        assert_eq!(snapshot.unaccounted_bytes, 400 * MB);
+        assert_eq!(snapshot.fixed_bytes, fixed);
+        assert_eq!(snapshot.heap_free_before_trim_bytes, 90 * MB);
+        // A cache that grows is accounted: no trim for it.
+        let steady = Guard::new(2 * GB, 3 * GB);
+        for second in 0..120_u64 {
+            assert!(!steady
+                .tick_with_fixed((800 + 3 * second) * MB, (100 + 3 * second) * MB, fixed)
+                .trim);
+        }
     }
 
     #[test]

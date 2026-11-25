@@ -9201,7 +9201,12 @@ fn spawn_memory_guard(cache: Arc<LiveTsCache>, idle_ms: u64) {
         loop {
             ticks.tick().await;
             let rss = av_mesh::mem_guard::rss_bytes();
-            let tick = memory.guard.tick(rss, cache.chunk_cache.held_bytes());
+            // The pinned rings and the cache's slot index are fixed; the
+            // heap beyond them and the parts is watched for growth (mem2).
+            let fixed = memory::locked_bytes().saturating_add(cache.ring_index_bytes());
+            let tick = memory
+                .guard
+                .tick_with_fixed(rss, cache.chunk_cache.held_bytes(), fixed);
             if tick.changed {
                 warn!(
                     state = ?tick.state,
@@ -9224,10 +9229,10 @@ fn spawn_memory_guard(cache: Arc<LiveTsCache>, idle_ms: u64) {
                 memory.guard.note_shed(released);
             }
             if tick.trim {
-                if let Ok(returned) =
-                    tokio::task::spawn_blocking(av_mesh::mem_guard::trim).await
+                if let Ok(trimmed) =
+                    tokio::task::spawn_blocking(av_mesh::mem_guard::trim_measured).await
                 {
-                    memory.guard.note_trim(returned);
+                    memory.guard.note_trim_measured(trimmed);
                 }
             }
         }
@@ -9473,6 +9478,17 @@ impl LiveTsCache {
             started_unix_us,
             memory_guard: OnceLock::new(),
         })
+    }
+
+    /// The bytes of the cache's slot index: every playlist's ring of slots,
+    /// allocated at start (mem2: 134 bytes a slot, measured; 261 MB for 16
+    /// playlists of 132,000 slots).
+    fn ring_index_bytes(&self) -> u64 {
+        let options = &self.chunk_cache.options;
+        (options.num_playlists as u64)
+            .saturating_mul(options.max_parts_per_segment as u64)
+            .saturating_mul(options.max_segments as u64)
+            .saturating_mul(RING_SLOT_INDEX_BYTES)
     }
 
     fn stream_classes(&self) -> &fast_plane::StreamClasses {
@@ -13658,6 +13674,10 @@ struct CacheByteBudget {
     /// streams that hold at least [`LARGE_STREAM_BYTES`].
     node: u64,
 }
+
+/// The bytes of one cache ring slot's index (its lock, its slot and its
+/// tag), as the memory bench measures them.
+const RING_SLOT_INDEX_BYTES: u64 = 134;
 
 /// Above the memory guard's soft limit, a new playlist whose first part is
 /// this large or larger is refused.
