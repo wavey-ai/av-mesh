@@ -385,6 +385,16 @@ pub(crate) struct EdgeUdpStats {
     /// New subscriptions refused because the edge's egress was overloaded
     /// (`--client-udp-admit-by-load`, Phase AM item 8).
     pub load_refusals: AtomicU64,
+    /// rm/cpuadmit: new subscriptions refused because the CPU admission
+    /// term (with the leg) passed full (they are in `refusals` too).
+    pub cpu_refusals: AtomicU64,
+    /// rm/cpuadmit: subscribers asked to give up their leg here because the
+    /// edge was over its CPU full point (`MOVE shed`).
+    pub cpu_shed_moves: AtomicU64,
+    /// rm/cpuadmit, entry: assignments of a UDP leg made while a cache of
+    /// the region was full by its CPU term (with this entry's charges) and
+    /// another was not: the leg spilled.
+    pub cpu_spills: AtomicU64,
     /// Times that the region was found lost (its silence held past
     /// --client-udp-region-hold-ms and a failover region fresh), and the
     /// clients moved for it (Phase AM item 11).
@@ -2590,7 +2600,7 @@ fn takes_back(
     now: Instant,
 ) -> bool {
     match leaving.reason {
-        "rebalance" => reason_now.is_none(),
+        "rebalance" | "shed" => reason_now.is_none(),
         "parents-lost" => {
             reason_now.is_none()
                 || (reason_now == Some("parents-lost")
@@ -3164,6 +3174,29 @@ async fn admit(
             .await;
             return;
             }
+        }
+    }
+    // rm/cpuadmit: the CPU admission term, with the legs admitted since
+    // its samples: a new leg that would take it past full is refused
+    // `edge-busy` as a byte-full edge refuses one (a lone leg that moves
+    // here is taken, and charged).
+    if let Some(cpu) = router.edge_load.egress.cpu_admit() {
+        let dps = router.leg_datagrams_per_s(stream_id).await;
+        if from_part.is_some() && others == NO_OTHER_LEGS {
+            cpu.charge_leg(dps);
+        } else if cpu.admit_leg(dps).is_err() {
+            stats.refusals.fetch_add(1, Ordering::Relaxed);
+            stats.cpu_refusals.fetch_add(1, Ordering::Relaxed);
+            send_control(
+                &socket,
+                peer,
+                &Control::Refused {
+                    stream_id,
+                    reason: "edge-busy".into(),
+                },
+            )
+            .await;
+            return;
         }
     }
     if hedge_over_gate(
@@ -4462,6 +4495,7 @@ async fn housekeeping_moves(
         if active {
             house.at = Instant::now() + DRAIN_TICK;
         }
+        cpu_shed(router, table, sockets, config, stats, socket, stream_id, now).await;
         distress_hints(house, router, table, socket, stream_id, now).await;
         AfterHousekeeping::Send
     };
@@ -5167,7 +5201,9 @@ fn mark_movable_aged(
         }
         let free = match subscriber.leaving {
             None => true,
-            Some(leaving) => reason == "draining" && leaving.reason == "rebalance",
+            Some(leaving) => {
+                reason == "draining" && matches!(leaving.reason, "rebalance" | "shed")
+            }
         };
         let age = now.saturating_duration_since(subscriber.admitted_at);
         if !free
@@ -5180,6 +5216,105 @@ fn mark_movable_aged(
         subscriber.leaving = Some(Leaving {
             since: now,
             reason,
+            reminded_at: now,
+        });
+        marked.push(*peer);
+    }
+    marked
+}
+
+/// rm/cpuadmit: subscribers are asked to give up their leg here (`MOVE
+/// shed`) only once admitted this long (not one that is catching up).
+pub(crate) const SHED_MIN_AGE: Duration = Duration::from_secs(2);
+
+/// rm/cpuadmit: over its CPU full point for the shed delay, the edge asks
+/// up to its quota of this stream's subscribers that hold another leg to
+/// give up their leg here (they lose nothing). One-leg listeners are moved
+/// by the load rebalance (wave 9 C1, which reads the same term) where
+/// another edge has room, and a heavy stream's viewers by place240's rules
+/// alone. Booked at once, so that the other streams' housekeeping and the
+/// next round count it and the edge stops as soon as it is back under.
+#[allow(clippy::too_many_arguments)]
+async fn cpu_shed(
+    router: &AppRouter,
+    table: &Table,
+    sockets: &EdgeSockets,
+    config: EdgeUdpConfig,
+    stats: &EdgeUdpStats,
+    socket: &UdpSocket,
+    stream_id: u64,
+    now: Instant,
+) {
+    let Some(cpu) = router.edge_load.egress.cpu_admit() else {
+        return;
+    };
+    if !cpu.shedding() {
+        return;
+    }
+    let leg = cpu.leg_charge(router.leg_datagrams_per_s(stream_id).await);
+    let quota = cpu.shed_quota(leg);
+    if quota == 0 {
+        return;
+    }
+    let marked = {
+        let mut guard = table.lock().unwrap();
+        let (marked, fast_removed) = match guard.get_mut(&stream_id) {
+            Some(entry) => {
+                let marked = mark_shed(entry, now, quota);
+                let fast_removed = config.move_grace.is_zero() && remove_subscribers(entry, &marked);
+                (marked, fast_removed)
+            }
+            None => (Vec::new(), false),
+        };
+        if fast_removed {
+            fast_lane_changed(sockets, &guard);
+        }
+        marked
+    };
+    cpu.shed_sent(marked.len(), leg);
+    if marked.is_empty() {
+        return;
+    }
+    stats.moves.fetch_add(marked.len() as u64, Ordering::Relaxed);
+    stats
+        .cpu_shed_moves
+        .fetch_add(marked.len() as u64, Ordering::Relaxed);
+    info!(
+        stream_id,
+        clients = marked.len(),
+        "edge client UDP over its CPU full point asks clients to give up their leg"
+    );
+    for peer in marked {
+        send_control(
+            socket,
+            peer,
+            &Control::Move {
+                stream_id,
+                reason: "shed".into(),
+            },
+        )
+        .await;
+    }
+}
+
+/// Mark up to `limit` subscribers leaving for `shed`: with another leg, not
+/// leaving already, admitted [`SHED_MIN_AGE`] ago and not catching up.
+fn mark_shed(entry: &mut StreamEntry, now: Instant, limit: usize) -> Vec<SocketAddr> {
+    let mut marked = Vec::new();
+    for (peer, subscriber) in &mut entry.subscribers {
+        if marked.len() >= limit {
+            break;
+        }
+        if subscriber.leaving.is_some()
+            || subscriber.catching_up
+            || subscriber.others == NO_OTHER_LEGS
+            || now.saturating_duration_since(subscriber.admitted_at) < SHED_MIN_AGE
+        {
+            continue;
+        }
+        subscriber.leaving = Some(Leaving {
+            since: now,
+            reason: "shed",
             reminded_at: now,
         });
         marked.push(*peer);

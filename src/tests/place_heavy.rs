@@ -57,6 +57,9 @@ const ADVERTISE_EVERY: Duration = Duration::from_millis(200);
 const ENTRY_OFFSET: u8 = 5;
 
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// The edges' `--client-udp-max-subscribers` (rm/cpuadmit's crowd needs
+/// more than the 64 of place240's scenes).
+static EDGE_CAPACITY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(64);
 
 /// The 4K rate of the test that runs (0: `PH_MBPS`, else 247 Mbit/s).
 static RATE_BPS: AtomicU64 = AtomicU64::new(0);
@@ -684,7 +687,7 @@ impl Region {
                 ip,
                 real,
                 Duration::ZERO,
-                64,
+                EDGE_CAPACITY.load(Ordering::Relaxed),
                 true,
                 // The deploy's tee rings: LaneEdge's 8,192 entries hold no
                 // 4K frame of these rates (hls_beside_4k).
@@ -1645,4 +1648,123 @@ async fn two_heavy_admissions_at_once_reserve_their_cost_and_one_is_refused() {
     assert_eq!(advert.committed_bps, 0);
     assert!(matches!(router.heavy_reserve(STREAM, heavy::Lane::UdpFast).await, Ok(Some(_))));
     mesh.shutdown();
+}
+
+/// rm/cpuadmit (b): 4K at 247 Mbit/s with a viewer at each of two edges
+/// (their tees and sends on two CPUs each), then a crowd of 1 ms Opus
+/// listeners that ask edge 1 first, then edge 2, as the lab's crowd did
+/// (`--edges`, no entry). The 4K viewers stay whole (no part missing, no
+/// gap over 500 ms) and the crowd is admitted only while the edges' CPU
+/// term has room: the rest is refused, counted. With `CPUADMIT_OFF=1`
+/// (the term measured, not enforced) the crowd is all admitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a 247 Mbit/s proof: run it alone (scripts/place240-proofs.sh's CPUs)"]
+async fn a_small_crowd_beside_4k_is_refused_before_4k_loses_a_part() {
+    use super::cpu_admission::{attach, crowd, enforced, pin_apart, tally};
+    let _turn = SERIAL.lock().await;
+    EDGE_CAPACITY.store(1_024, Ordering::Relaxed);
+    let first = super::cpu_admission::env_u64("CPUADMIT_FIRST_CPU", 16) as usize;
+    let rest: Vec<usize> = (first + 4..first + 8).collect();
+    let mut region = Region::start_with(170, 2, true, 600_000_000, Some(Payload::Opus1), false).await;
+    let admits: Vec<_> = (0..2)
+        .map(|index| attach(&region.edge(index), vec![first + 2 * index, first + 2 * index + 1]))
+        .collect();
+    let keep = ["ph-", "adm-load"];
+    pin_apart(&admits, &rest, &keep);
+    region.start_video();
+    until("the stream runs at every edge", Duration::from_secs(10), || {
+        region.published.load(Ordering::Relaxed) > 2 * FPS
+    })
+    .await;
+    // A viewer at each edge.
+    let sids: Vec<String> = (1..=2).map(|index| format!("cpu-4k-{index}")).collect();
+    let viewers = Crowd::join(&region, &sids, STREAM, true, Duration::from_millis(400)).await;
+    until("both viewers play", Duration::from_secs(15), || {
+        viewers.nodes().iter().all(Option::is_some)
+    })
+    .await;
+    for _ in 0..8 {
+        pin_apart(&admits, &rest, &keep);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let from_us = now_unix_us();
+    let ports = vec![region.edge(0).client_port, region.edge(1).client_port];
+    let listeners = super::cpu_admission::env_u64("CPUADMIT_B_LISTENERS", 500) as usize;
+    let rest_for_crowd = rest.clone();
+    let crowd = tokio::task::spawn_blocking(move || {
+        crowd(AUDIO, ports, listeners, 50, Duration::from_millis(1_000), 1, |_| vec![0, 1], 4, &rest_for_crowd)
+    })
+    .await
+    .unwrap();
+    let mut lines = Vec::new();
+    for _ in 0..40 {
+        pin_apart(&admits, &rest, &keep);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut line = serde_json::json!({});
+        for (index, admit) in admits.iter().enumerate() {
+            let edge = region.edge(index);
+            let verdict = admit.verdict();
+            line[format!("edge{}", index + 1)] = serde_json::json!({
+                "legs": edge.stats.legs().map_or(0, |legs| legs.subscribers),
+                "load": admit.load_permille(),
+                "term": verdict.term,
+                "cpus_busy": verdict.cpus_busy_permille,
+                "threads": verdict.threads,
+                "cpu_refusals": edge.stats.cpu_refusals.load(Ordering::Relaxed),
+                "tee_dropped": edge.cache.relay_ingress_snapshot().fast_plane.tee_dropped,
+            });
+        }
+        lines.push(line);
+    }
+    let to_us = now_unix_us() - 1_000_000;
+    let audio_head = region.edge(0).head(AUDIO).await.unwrap_or(0);
+    let listeners = tokio::task::spawn_blocking(move || crowd.finish()).await.unwrap();
+    let runs = viewers.finish().await;
+    let figures: Vec<Figures> = runs
+        .iter()
+        .map(|run| figures(run, region.source(), from_us, to_us, from_us))
+        .collect();
+    let mut result = tally(&listeners, 2, audio_head.saturating_sub(1_000));
+    result["enforced"] = enforced().into();
+    result["viewers"] = serde_json::Value::Array(
+        figures
+            .iter()
+            .map(|figure| {
+                serde_json::json!({
+                    "sid": figure.sid, "first": figure.first, "missing": figure.missing,
+                    "longest_gap_ms": figure.longest_gap_ms, "worst_late_ms": figure.worst_late_ms,
+                    "moves": figure.moves.len(),
+                })
+            })
+            .collect(),
+    );
+    result["edges"] = serde_json::Value::Array(admits.iter().map(|admit| admit.status()).collect());
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join("cpuadmit");
+    let _ = std::fs::create_dir_all(&dir);
+    let text: String = lines
+        .iter()
+        .chain(std::iter::once(&result))
+        .map(|line| serde_json::to_string(line).unwrap() + "\n")
+        .collect();
+    std::fs::write(dir.join(if enforced() { "b-4k-crowd.ndjson" } else { "b-4k-crowd-off.ndjson" }), text).unwrap();
+    println!("{}", serde_json::to_string(&result).unwrap());
+    region.shutdown().await;
+    EDGE_CAPACITY.store(64, Ordering::Relaxed);
+    for figure in &figures {
+        assert_eq!(figure.missing, 0, "{result:#}");
+        assert!(figure.longest_gap_ms <= 500.0, "{result:#}");
+        assert!(figure.moves.is_empty(), "no viewer had to move: {result:#}");
+    }
+    for index in 0..2 {
+        assert_eq!(lines.last().unwrap()[format!("edge{}", index + 1)]["tee_dropped"], 0, "{result:#}");
+    }
+    assert_eq!(result["missing_parts"], 0, "{result:#}");
+    let refused: u64 = admits
+        .iter()
+        .map(|admit| {
+            admit.stats.refused_cpus.load(Ordering::Relaxed)
+                + admit.stats.refused_thread.load(Ordering::Relaxed)
+        })
+        .sum();
+    assert!(refused > 0, "the crowd was refused at full: {result:#}");
 }

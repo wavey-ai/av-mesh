@@ -106,6 +106,12 @@ pub struct EdgeAdmissionSnapshot {
     /// thousandths of `--cpu-load-full-percent` of them. 0 without it.
     #[serde(default)]
     pub cpu_permille: u32,
+    /// rm/cpuadmit: the CPU admission term (the busiest of the node's CPUs
+    /// with the sends' softirq and its send threads, with the legs admitted
+    /// since its last samples), in thousandths of its full point. 0
+    /// without it.
+    #[serde(default)]
+    pub cpu_admit_permille: u32,
 }
 
 /// The process's CPU time so far (user and system), in microseconds;
@@ -306,6 +312,8 @@ struct EdgeAdmissionInner {
     counters: Mutex<Vec<CounterSource>>,
     /// The CPU term (wave 9 C2), once set.
     cpu: Mutex<Option<CpuSource>>,
+    /// rm/cpuadmit: the CPU admission term, once set.
+    cpu_admit: Mutex<Option<Arc<crate::cpu_admit::CpuAdmit>>>,
     overloaded: AtomicBool,
     rejected_requests: AtomicU64,
     admitted_sessions: AtomicU64,
@@ -346,6 +354,7 @@ impl EdgeAdmission {
                 window: Mutex::new(RollingEgressWindow::default()),
                 counters: Mutex::new(Vec::new()),
                 cpu: Mutex::new(None),
+                cpu_admit: Mutex::new(None),
                 overloaded: AtomicBool::new(false),
                 rejected_requests: AtomicU64::new(0),
                 admitted_sessions: AtomicU64::new(0),
@@ -419,6 +428,25 @@ impl EdgeAdmission {
             window_ms: window_ms.max(1_000),
             window,
         });
+    }
+
+    /// rm/cpuadmit: count `admit`'s term in the load (and so in the
+    /// advertised load, the entry's spill and the rebalance).
+    pub fn set_cpu_admit(&self, admit: Arc<crate::cpu_admit::CpuAdmit>) {
+        *self
+            .inner
+            .cpu_admit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(admit);
+    }
+
+    /// The CPU admission term, if set.
+    pub fn cpu_admit(&self) -> Option<Arc<crate::cpu_admit::CpuAdmit>> {
+        self.inner
+            .cpu_admit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// The CPU term now (a sample taken), 0 without a CPU counter.
@@ -796,6 +824,8 @@ impl EdgeAdmission {
         }
         let cpu_permille = self.cpu_permille_now();
         load_permille = load_permille.max(cpu_permille);
+        let cpu_admit_permille = self.cpu_admit().map_or(0, |admit| admit.load_permille());
+        load_permille = load_permille.max(cpu_admit_permille);
         if overloaded {
             load_permille = load_permille.max(1_000);
         }
@@ -815,6 +845,7 @@ impl EdgeAdmission {
             committed_bps,
             load_permille,
             cpu_permille,
+            cpu_admit_permille,
         }
     }
 
@@ -864,6 +895,12 @@ impl EdgeAdmission {
         }
         let session_limit = self.inner.config.session_limit;
         if session_limit > 0 && active_session_count(&sessions) >= session_limit as u64 {
+            return PlaybackAdmission::Rejected;
+        }
+        // rm/cpuadmit: a new reader is refused at the CPU term's full point,
+        // as at the bytes'.
+        if let Some(admit) = self.cpu_admit().filter(|admit| admit.full()) {
+            admit.stats.refused_http.fetch_add(1, Ordering::Relaxed);
             return PlaybackAdmission::Rejected;
         }
         // The session is entitled to the bit rate of its playlist. Admit it
@@ -1432,6 +1469,54 @@ mod tests {
         // Only the window and the sample before it stay.
         assert!(window.samples.front().unwrap().0 <= 20 * 250 - 5_000);
         assert!(window.samples.len() <= 22);
+    }
+
+    /// rm/cpuadmit: the CPU admission term is in the load (so in the
+    /// advertisement, the entry's spill and the rebalance), and at full a
+    /// new reader is refused, an admitted one kept.
+    #[test]
+    fn the_cpu_admission_term_is_in_the_load_and_refuses_new_readers_at_full() {
+        use crate::cpu_admit::{CpuAdmit, CpuAdmitConfig, CpuVerdict, ThreadRegistry};
+        let admission = admission();
+        let admit = Arc::new(CpuAdmit::new(
+            CpuAdmitConfig {
+                cpus: vec![0, 1],
+                ..CpuAdmitConfig::default()
+            },
+            ThreadRegistry::default(),
+            Arc::new(|| 0),
+        ));
+        admission.set_cpu_admit(Arc::clone(&admit));
+        assert_eq!(
+            admission.admit_playback_at(session("before"), false, 0),
+            PlaybackAdmission::Admitted
+        );
+        let verdict = |permille| CpuVerdict {
+            permille,
+            term: "cpus".into(),
+            ..CpuVerdict::default()
+        };
+        admit.force_verdict(verdict(640), None);
+        let snapshot = admission.snapshot();
+        assert_eq!(snapshot.cpu_admit_permille, 640);
+        assert_eq!(snapshot.load_permille, 640);
+        admit.force_verdict(verdict(1_000), None);
+        assert_eq!(admission.snapshot().load_permille, 1_000);
+        assert_eq!(
+            admission.admit_playback_at(session("after"), false, 1_000),
+            PlaybackAdmission::Rejected
+        );
+        assert_eq!(
+            admission.admit_playback_at(session("before"), false, 1_000),
+            PlaybackAdmission::Existing
+        );
+        // Measured, not enforced: admitted, still in the load.
+        admit.set_enforce(false);
+        assert_eq!(
+            admission.admit_playback_at(session("after"), false, 1_000),
+            PlaybackAdmission::Admitted
+        );
+        assert_eq!(admission.snapshot().load_permille, 1_000);
     }
 
     #[test]

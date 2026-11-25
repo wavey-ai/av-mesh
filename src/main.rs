@@ -11,6 +11,7 @@ mod fast_path;
 mod fast_plane;
 mod charge;
 mod heavy;
+mod cpu_admit;
 mod hop_journal;
 mod lifecycle;
 mod link_telemetry;
@@ -3205,6 +3206,8 @@ struct Args {
     /// edge, capped by its budget, moved off an edge in distress.
     #[command(flatten)]
     heavy: heavy::HeavyArgs,
+    #[command(flatten)]
+    cpu_admit: cpu_admit::CpuAdmitArgs,
 
     /// Wave 9 C4: a moving UDP client (one that names the edges it has
     /// just left: a drain, a kill, a rebalance) is assigned by each cache's
@@ -4905,6 +4908,32 @@ async fn main() -> Result<()> {
             "edge load counts the process's CPU"
         );
     }
+    // rm/cpuadmit: the CPU admission term of an edge that serves clients:
+    // its CPUs (with the sends' softirq) and its send threads, sampled
+    // here, off the class threads.
+    let _cpu_admit_task = match args.cpu_admit.config() {
+        Some(config) if cache_mesh_role == CacheMeshRole::Edge => {
+            let threads = fast_lane
+                .as_ref()
+                .map(|lane| lane.threads.clone())
+                .unwrap_or_default();
+            let stats = Arc::clone(&router.edge_udp_stats);
+            let admit = Arc::new(cpu_admit::CpuAdmit::new(
+                config,
+                threads,
+                Arc::new(move || stats.egress_datagrams()),
+            ));
+            info!(
+                cpus = ?admit.cpus(),
+                cpus_full_permille = admit.config.cpus_full_permille,
+                thread_full_permille = admit.config.thread_full_permille,
+                "edge admission counts its CPUs and send threads"
+            );
+            router.edge_load.egress.set_cpu_admit(Arc::clone(&admit));
+            Some(cpu_admit::spawn_sampler(admit, ingest_shutdown_rx.clone()))
+        }
+        _ => None,
+    };
     let edge_udp_task = if let Some(bind) = args.client_udp_bind {
         if args.client_udp_egress_load {
             // Phase AM item 8: the client lanes' bytes are this node's
@@ -15939,6 +15968,9 @@ struct EdgeServiceSnapshot {
     /// Place240: the edge's heavy work and room, and its distress.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     heavy: Option<heavy::HeavyAdvert>,
+    /// rm/cpuadmit: the CPU admission term and how a leg is priced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cpu_admit: Option<cpu_admit::CpuAdmitAdvert>,
 }
 
 /// The live gauges of a node's client UDP lane, on /api/mesh/local and
@@ -16126,6 +16158,7 @@ impl EdgeServiceSnapshot {
             udp_subscribers: None,
             host: None,
             heavy: None,
+            cpu_admit: None,
         }
     }
 
@@ -22678,6 +22711,11 @@ impl AppRouter {
                 })
             })
             .collect();
+        edge_service.cpu_admit = self
+            .edge_load
+            .egress
+            .cpu_admit()
+            .map(|admit| admit.advert());
         edge_service.heavy = self
             .heavy_advert(
                 snapshot
@@ -23236,9 +23274,26 @@ impl AppRouter {
                 .then(|| self.cache.pull_gate.snapshot()),
             send_pacing: fast_plane::send_pacing::NODE.get().map(|pacing| pacing.snapshot()),
             heavy: self.heavy_room_status(),
+            cpu_admit: self.cpu_admit_status(),
         });
         memory.cached = Some((now, Arc::clone(&status)));
         status
+    }
+
+    /// rm/cpuadmit: the CPU admission term and its decisions, with the
+    /// UDP lane's refusals and sheds by it and the entry's spills.
+    fn cpu_admit_status(&self) -> Option<serde_json::Value> {
+        let stats = &self.edge_udp_stats;
+        let spills = stats.cpu_spills.load(Ordering::Relaxed);
+        let mut status = match self.edge_load.egress.cpu_admit() {
+            Some(admit) => admit.status(),
+            None if spills > 0 => serde_json::json!({}),
+            None => return None,
+        };
+        status["udp_refusals"] = stats.cpu_refusals.load(Ordering::Relaxed).into();
+        status["udp_shed_moves"] = stats.cpu_shed_moves.load(Ordering::Relaxed).into();
+        status["entry_spills"] = spills.into();
+        Some(status)
     }
 
     /// The client UDP lane's live gauges (Phase AM item 8), when this node
@@ -24053,6 +24108,32 @@ impl AppRouter {
             candidates
         };
         let holds_nothing = reader.hold.is_empty();
+        // rm/cpuadmit: caches of the region a new UDP leg passes over because
+        // their CPU term (with this entry's charges) is full: a spill.
+        if reader.udp {
+            let full = candidates
+                .iter()
+                .filter(|cache| cache.serves_readers && !skipped(&cache.node_id))
+                .filter(|cache| {
+                    snapshots.iter().any(|snapshot| {
+                        snapshot.node.node_id == cache.node_id
+                            && snapshot
+                                .edge_service
+                                .as_ref()
+                                .and_then(|edge| edge.cpu_admit.as_ref())
+                                .is_some_and(|advert| {
+                                    advert.permille.saturating_add(cache.pending_permille)
+                                        >= assignment::FULL_LOAD_PERMILLE
+                                })
+                    })
+                })
+                .count();
+            if full > 0 && full < candidates.iter().filter(|cache| cache.serves_readers).count() {
+                self.edge_udp_stats
+                    .cpu_spills
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let mut assignment = assign(request, self.assignment_policy, &candidates);
         if rebalancing && holds_nothing && assignment.is_err() {
             // Departure from B 3.6 (review of B Z3): a rebalance with no
@@ -24131,6 +24212,7 @@ impl AppRouter {
                         playlist_bps,
                         moving,
                         mover.as_deref(),
+                        reader.udp.then_some(reader.stream_id),
                     );
                 } else if moving && !remember {
                     self.log_mover(&leg.node_id, mover.as_deref());
@@ -24176,6 +24258,7 @@ impl AppRouter {
         playlist_bps: Option<u64>,
         moving: bool,
         key: Option<&str>,
+        udp_stream: Option<u64>,
     ) {
         if moving {
             self.log_mover(node_id, key);
@@ -24209,10 +24292,35 @@ impl AppRouter {
             let admission = edge.egress_admission_bps;
             (admission > 0).then(|| u128::from(charge) as f64 * 1_000.0 / admission as f64)
         });
+        // rm/cpuadmit: a UDP leg at an edge that prices its legs in CPU
+        // (its datagrams at its measured cost a datagram, against its send
+        // capacity) is charged at least that, as the edge charges it.
+        let by_cpu = udp_stream.and_then(|stream_id| {
+            let edge = edge?;
+            let advert = edge.cpu_admit.as_ref()?;
+            let lanes = edge
+                .playlists
+                .iter()
+                .find(|playlist| playlist.stream_id == stream_id)
+                .and_then(|playlist| playlist.lane_bps);
+            let heavy = edge.heavy.as_ref().is_some_and(|heavy| {
+                heavy.streams.iter().any(|stream| stream.stream_id == stream_id)
+            });
+            let dps = lanes
+                .map(|lanes| if heavy { lanes.raptorq_dps } else { lanes.compact_dps })
+                .filter(|dps| *dps > 0)
+                .map_or(charge::UNKNOWN_LEG_DPS, |dps| dps as f64);
+            Some(f64::from(cpu_admit::leg_permille(
+                advert.datagram_ns,
+                advert.capacity_ns,
+                dps,
+            )))
+        });
         let permille = own
             .or_else(|| region_listener_permille(snapshots, &self.node.region))
             .or(by_bytes)
             .unwrap_or(0.0)
+            .max(by_cpu.unwrap_or(0.0))
             .round()
             .clamp(0.0, f64::from(u32::MAX)) as u32;
         if permille > 0 {
@@ -24306,6 +24414,7 @@ impl AppRouter {
                 playlist_bps,
                 !skip.is_empty(),
                 Some(&mover_key(&key, skip, place)),
+                Some(stream_id),
             );
         }
         true
@@ -25044,6 +25153,9 @@ impl AppRouter {
         body["cache_mesh"] = serde_json::to_value(self.cache_mesh_gauges()).unwrap_or_default();
         body["second_leg_same_host"] = self.second_leg_same_host.load(Ordering::Relaxed).into();
         body["heavy"] = self.heavy_counters();
+        if let Some(status) = self.cpu_admit_status() {
+            body["cpu_admit"] = status;
+        }
         if let Some(block) = body["client_udp"].as_object_mut() {
             // Wave 9 B: the UDP ASSIGN requests answered and dropped.
             let stats = &self.edge_udp_stats;
@@ -32690,6 +32802,7 @@ mod tests {
             udp_subscribers: None,
             host: None,
             heavy: None,
+            cpu_admit: None,
         });
         let mut snapshot = TelemetryAggregator::default().snapshot(local).await;
         assert!(!snapshot
@@ -48011,4 +48124,7 @@ mod tests {
     mod send_pacing;
     mod place_heavy;
     mod charge_wire;
+    /// rm/cpuadmit: the CPU admission term in process (pinned edges, 1 ms
+    /// listeners): its calibration ramp and proofs (a) and (c).
+    mod cpu_admission;
 }
