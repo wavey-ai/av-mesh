@@ -16,9 +16,10 @@ use raptorq_datagram_fec::{
     DatagramFecHeader, MediaDatagramRole, MediaDeadline, MediaObjectKind, MediaPathIntent,
 };
 use relay_session::{
-    decode_datagram, CarrierIdentity, CarrierKind, ObjectAnnouncement, ObjectAssembler, ParentPath,
-    RelayLimits, SubscriptionId, TopologyGeneration, TrustMode,
+    decode_datagram, CarrierIdentity, CarrierKind, CodingProfile, ObjectAnnouncement,
+    ObjectAssembler, ParentPath, RelayLimits, SubscriptionId, TopologyGeneration, TrustMode,
 };
+use xxhash_rust::xxh3::xxh3_64;
 use serde::{Deserialize, Serialize};
 
 use crate::media_clock::{MediaClocks, Verdict};
@@ -330,6 +331,59 @@ pub enum RelayIngressOutcome {
         deadline: MediaDeadline,
     },
 }
+
+/// One RLS1 symbol that its reader has read in place and checked as
+/// [`decode_datagram`] checks it (the fast plane's view): what the receiver
+/// needs of a symbol of a part it is assembling already, without the owned
+/// key, the copy of the RQD2 datagram and the hash that the full decode
+/// makes (teeperf).
+#[derive(Clone, Copy, Debug)]
+pub struct ParsedSymbol<'a> {
+    /// The RLS1 bytes of the object's key: from the tenant's length to the
+    /// end of the payload hash.
+    pub key_bytes: &'a [u8],
+    pub generation: u64,
+    pub subscription_id: u64,
+    pub deadline_us: u64,
+    pub role: MediaDatagramRole,
+    pub kind: MediaObjectKind,
+    pub path_intent: MediaPathIntent,
+    pub coding: CodingProfile,
+    /// The RQD2 datagram, its packet sequence, and its RaptorQ symbol's
+    /// encoding symbol id and bytes.
+    pub fec: &'a [u8],
+    pub packet_sequence: u32,
+    pub esi: u32,
+    pub symbol: &'a [u8],
+}
+
+/// What [`RelayUdpDispatch::push_parsed`] did with a symbol of a part under
+/// way (or just complete).
+#[derive(Debug)]
+pub enum ParsedOutcome {
+    /// Taken into its part's assembly.
+    Buffered,
+    /// A copy of a symbol the part has, or a symbol of a part complete.
+    Duplicate,
+    /// It completed its part.
+    Decoded(RelayIngressOutcome),
+    /// Not an RLS1 or compact datagram.
+    Legacy,
+}
+
+/// A part whose later symbols take the short path (teeperf): its key, and
+/// the bytes of the key as its datagrams carry it.
+#[derive(Debug)]
+struct HotPart {
+    hash: u64,
+    key_bytes: Vec<u8>,
+    key: ObjectKey,
+}
+
+/// Parts the short path knows at once: those under way on a lane, and the
+/// ones that just completed (their late repair symbols). Bounded: about
+/// 8 x 160 B.
+const HOT_PARTS: usize = 8;
 
 /// Snapshot of bounded receiver ownership.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -660,9 +714,13 @@ impl From<&ObjectKey> for LogicalObjectIdentity {
     }
 }
 
+/// What tells a replayed symbol from another copy of it: the RQD2
+/// datagram's 64-bit hash (teeperf: was its SHA-256, the tee's largest cost
+/// per datagram; nothing here is a security boundary, the part's payload
+/// hash is checked once it is whole) and its role.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SymbolFingerprint {
-    datagram_hash: PayloadHash,
+    datagram_hash: u64,
     role: MediaDatagramRole,
 }
 
@@ -781,6 +839,12 @@ pub struct RelayObjectReceiver {
     clocks: MediaClocks,
     /// Decodes ready to run off this thread (4k-repair).
     decode_jobs: Vec<DecodeJob>,
+    /// The parts whose later symbols take the short path (teeperf), and the
+    /// next entry to replace.
+    hot: Vec<HotPart>,
+    hot_next: usize,
+    /// Symbols the short path took.
+    short_path: u64,
 }
 
 impl fmt::Debug for RelayObjectReceiver {
@@ -822,6 +886,9 @@ impl RelayObjectReceiver {
             whole_done: HashSet::with_capacity(config.max_completed_objects),
             clocks: MediaClocks::new(MEDIA_CLOCK_STREAMS),
             decode_jobs: Vec::new(),
+            hot: Vec::with_capacity(HOT_PARTS),
+            hot_next: 0,
+            short_path: 0,
         })
     }
 
@@ -1255,7 +1322,7 @@ impl RelayObjectReceiver {
         let header =
             DatagramFecHeader::decode(&symbol.fec_datagram).map_err(relay_session::Error::from)?;
         let fingerprint = SymbolFingerprint {
-            datagram_hash: PayloadHash::digest(&symbol.fec_datagram),
+            datagram_hash: xxh3_64(&symbol.fec_datagram),
             role: symbol.role,
         };
         if let Some(existing) = state.symbols.get(&header.packet_sequence) {
@@ -1344,11 +1411,223 @@ impl RelayObjectReceiver {
         self.finish_decoded(object, envelope, symbol.role, symbol.deadline, now_us)
     }
 
+    /// Let the later symbols of `key` take the short path, when it is a part
+    /// assembled here (teeperf). `key_bytes` are its key as its datagrams
+    /// carry it.
+    fn remember_hot(&mut self, key_bytes: &[u8], key: &ObjectKey) {
+        if !self
+            .objects
+            .get(key)
+            .is_some_and(|state| state.deferred.is_some())
+        {
+            return;
+        }
+        let hash = xxh3_64(key_bytes);
+        if self
+            .hot
+            .iter()
+            .any(|hot| hot.hash == hash && hot.key_bytes == key_bytes)
+        {
+            return;
+        }
+        if self.hot.len() < HOT_PARTS {
+            self.hot.push(HotPart {
+                hash,
+                key_bytes: key_bytes.to_vec(),
+                key: key.clone(),
+            });
+            return;
+        }
+        let at = self.hot_next % HOT_PARTS;
+        self.hot_next = self.hot_next.wrapping_add(1);
+        let hot = &mut self.hot[at];
+        hot.hash = hash;
+        hot.key_bytes.clear();
+        hot.key_bytes.extend_from_slice(key_bytes);
+        hot.key = key.clone();
+    }
+
+    /// The short path of a symbol of a part under way here, or just complete
+    /// (teeperf): the same checks, counters and outcome as the full path
+    /// ([`Self::push_wire_datagram`], with a controlled session's
+    /// announcement), from the symbol as its reader parsed it, with no
+    /// allocation. `None` when the full path must take it: a part not known
+    /// here, or anything the full path would refuse or treat otherwise (it
+    /// then counts it as before).
+    fn try_push_parsed(
+        &mut self,
+        session_id: u64,
+        symbol: &ParsedSymbol<'_>,
+        now_us: u64,
+    ) -> Option<Result<ParsedOutcome, RelayIngressError>> {
+        let hash = xxh3_64(symbol.key_bytes);
+        let at = self
+            .hot
+            .iter()
+            .position(|hot| hot.hash == hash && hot.key_bytes == symbol.key_bytes)?;
+        let session = self.sessions.get(&session_id)?;
+        if symbol.generation != session.generation.get()
+            || symbol.subscription_id != session.subscription_id.get()
+            || !session.parent_path.permits(symbol.path_intent)
+        {
+            return None;
+        }
+        let controlled = session.controlled_qualification;
+        self.expire_if_due(now_us);
+        let announced = |announcement: &ObjectAnnouncement| {
+            announcement.generation.get() == symbol.generation
+                && announcement.subscription_id.get() == symbol.subscription_id
+                && announcement.kind == symbol.kind
+                && announcement.deadline.expires_at_us == symbol.deadline_us
+                && announcement.coding == symbol.coding
+                && (!controlled
+                    || (announcement.initial_repair_symbols == 0
+                        && announcement.next_packet_sequence == 0))
+        };
+        let key = &self.hot[at].key;
+        if !self.compact_completed.is_empty() && !matches!(self.completed_compact(key), Ok(false)) {
+            return None;
+        }
+        if let Some(done) = self.completed.get(key) {
+            if !done.parent_sessions.contains(&session_id) || !announced(&done.announcement) {
+                return None;
+            }
+            let counters = &mut self.counters;
+            counters.datagrams_received = counters.datagrams_received.saturating_add(1);
+            counters.duplicate_datagrams = counters.duplicate_datagrams.saturating_add(1);
+            match symbol.role {
+                MediaDatagramRole::Source => {
+                    counters.source_datagrams = counters.source_datagrams.saturating_add(1);
+                }
+                MediaDatagramRole::Repair => {
+                    counters.repair_datagrams = counters.repair_datagrams.saturating_add(1);
+                }
+            }
+            self.short_path += 1;
+            return Some(Ok(ParsedOutcome::Duplicate));
+        }
+        let state = self.objects.get(key)?;
+        if state.deferred.is_none()
+            || !state.parent_sessions.contains(&session_id)
+            || !announced(&state.announcement)
+        {
+            return None;
+        }
+        // The stream's clock, as the full path moves it. A symbol that is
+        // not fresh goes the full way, which judges it again (the same
+        // verdict: a stale one moved nothing) and ends the assembly if the
+        // stream has left it behind.
+        let clock = MediaClocks::key(key.tenant(), key.stream());
+        if self.clocks.observe(
+            clock,
+            key.epoch(),
+            symbol.deadline_us,
+            self.config.media_deadline_us,
+        ) != Verdict::Fresh
+        {
+            return None;
+        }
+        self.counters.datagrams_received = self.counters.datagrams_received.saturating_add(1);
+        self.short_path += 1;
+        let result = self.push_parsed_symbol(at, symbol, now_us);
+        if let Err(error) = &result {
+            self.record_rejection(error, true);
+        }
+        Some(result)
+    }
+
+    /// The assembly's part of [`Self::try_push_parsed`], for the part of hot
+    /// entry `at` (under way, checked).
+    fn push_parsed_symbol(
+        &mut self,
+        at: usize,
+        symbol: &ParsedSymbol<'_>,
+        now_us: u64,
+    ) -> Result<ParsedOutcome, RelayIngressError> {
+        let key = &self.hot[at].key;
+        let state = self
+            .objects
+            .get_mut(key)
+            .ok_or(RelayIngressError::AnnouncementRequired)?;
+        let fingerprint = SymbolFingerprint {
+            datagram_hash: xxh3_64(symbol.fec),
+            role: symbol.role,
+        };
+        if let Some(existing) = state.symbols.get(&symbol.packet_sequence) {
+            if existing != &fingerprint {
+                return Err(RelayIngressError::SymbolReplayConflict);
+            }
+            let counters = &mut self.counters;
+            counters.duplicate_datagrams = counters.duplicate_datagrams.saturating_add(1);
+            match symbol.role {
+                MediaDatagramRole::Source => {
+                    counters.source_datagrams = counters.source_datagrams.saturating_add(1);
+                }
+                MediaDatagramRole::Repair => {
+                    counters.repair_datagrams = counters.repair_datagrams.saturating_add(1);
+                }
+            }
+            return Ok(ParsedOutcome::Duplicate);
+        }
+        if state.symbols.len() >= self.config.max_datagrams_per_object {
+            return Err(RelayIngressError::DatagramLimitExceeded);
+        }
+        if self.buffered_datagrams >= self.config.max_buffered_datagrams {
+            return Err(RelayIngressError::BufferedDatagramLimitExceeded);
+        }
+        let Some(deferred) = state.deferred.as_mut() else {
+            return Err(RelayIngressError::AnnouncementRequired);
+        };
+        let step = deferred.push_symbol(symbol.esi, symbol.symbol, symbol.fec, key)?;
+        if state.symbols.capacity() == 0 {
+            // Its symbols' table once at its size: no growth per symbol.
+            state
+                .symbols
+                .reserve(usize::from(deferred.k) + usize::from(deferred.k) / 8 + 16);
+        }
+        state.symbols.insert(symbol.packet_sequence, fingerprint);
+        match symbol.role {
+            MediaDatagramRole::Source => {
+                state.source_symbols = state.source_symbols.saturating_add(1);
+                self.counters.source_datagrams = self.counters.source_datagrams.saturating_add(1);
+            }
+            MediaDatagramRole::Repair => {
+                state.repair_symbols = state.repair_symbols.saturating_add(1);
+                self.counters.repair_datagrams = self.counters.repair_datagrams.saturating_add(1);
+            }
+        }
+        state.last_activity_us = now_us;
+        self.buffered_datagrams = self.buffered_datagrams.saturating_add(1);
+        match step {
+            DeferredStep::Pending => Ok(ParsedOutcome::Buffered),
+            DeferredStep::Submit(job) => {
+                self.decode_jobs.push(job);
+                Ok(ParsedOutcome::Buffered)
+            }
+            DeferredStep::Whole(envelope) => {
+                let object = decode_part_envelope(
+                    &envelope,
+                    &state.announcement.key,
+                    self.config.relay_limits,
+                )?;
+                let deadline = state.announcement.deadline;
+                self.finish_decoded(object, envelope, symbol.role, deadline, now_us)
+                    .map(ParsedOutcome::Decoded)
+            }
+        }
+    }
+
     /// The decodes that the symbols taken so far made ready (4k-repair):
     /// run each off this thread ([`DecodeJob::run`]) and hand its result to
     /// [`Self::complete_decode`].
     pub fn take_decode_jobs(&mut self) -> Vec<DecodeJob> {
         std::mem::take(&mut self.decode_jobs)
+    }
+
+    /// The symbols that took the short path ([`RelayUdpDispatch::push_parsed`]).
+    #[must_use]
+    pub const fn short_path_datagrams(&self) -> u64 {
+        self.short_path
     }
 
     /// Whether a decode is ready for [`Self::take_decode_jobs`].
@@ -1940,13 +2219,24 @@ impl Deferred {
             return Err(RelayIngressError::Compact("short RaptorQ payload"));
         }
         let esi = u32::from_be_bytes([0, payload[1], payload[2], payload[3]]);
+        self.push_symbol(esi, &payload[4..], fec, key)
+    }
+
+    /// [`Self::push`] of a symbol already read: its ESI, its bytes and its
+    /// RQD2 datagram (kept for a repair symbol).
+    fn push_symbol(
+        &mut self,
+        esi: u32,
+        data: &[u8],
+        fec: &[u8],
+        key: &ObjectKey,
+    ) -> Result<DeferredStep, RelayIngressError> {
         let (k, t) = (usize::from(self.k), usize::from(self.t));
         if (esi as usize) < k {
             if self.sources.is_empty() {
                 self.sources = vec![0; k * t];
                 self.have = vec![false; k];
             }
-            let data = &payload[4..];
             if !self.have[esi as usize] && data.len() == t {
                 let at = esi as usize * t;
                 self.sources[at..at + t].copy_from_slice(data);
@@ -2240,6 +2530,37 @@ impl RelayUdpDispatch {
                 ))
             })
             .collect()
+    }
+
+    /// A symbol of an RLS1 datagram that its reader parsed (teeperf): a
+    /// symbol of a part under way here, or just complete, takes the short
+    /// path; any other goes [`Self::push`]'s way, which then lets the later
+    /// symbols of its part take the short path. The same outcome, counters
+    /// and errors as [`Self::push`], without its owned outcome for the
+    /// short path's symbols.
+    pub fn push_parsed(
+        &mut self,
+        peer: SocketAddr,
+        datagram: &[u8],
+        symbol: &ParsedSymbol<'_>,
+        now_us: u64,
+    ) -> Result<ParsedOutcome, RelayIngressError> {
+        if let Some(session_id) = self.sessions_by_peer.get(&peer).copied() {
+            if let Some(result) = self.receiver.try_push_parsed(session_id, symbol, now_us) {
+                return result;
+            }
+        }
+        match self.push(peer, datagram, now_us)? {
+            RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Buffered { key, .. }) => {
+                self.receiver.remember_hot(symbol.key_bytes, &key);
+                Ok(ParsedOutcome::Buffered)
+            }
+            RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Duplicate { .. }) => {
+                Ok(ParsedOutcome::Duplicate)
+            }
+            RelayUdpDispatchOutcome::Relay(decoded) => Ok(ParsedOutcome::Decoded(decoded)),
+            RelayUdpDispatchOutcome::Legacy => Ok(ParsedOutcome::Legacy),
+        }
     }
 
     /// Classify legacy RQD2 framing separately from RLS1 relay-session framing.

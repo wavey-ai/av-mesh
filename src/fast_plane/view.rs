@@ -11,6 +11,7 @@ use raptorq_datagram_fec::{
     DatagramFecHeader, MediaDatagramRole, MediaObjectKind, MediaPathIntent,
     DATAGRAM_AUDIO_SESSION_ID_LEN, DATAGRAM_FLAG_AUDIO_SESSION_ID, DATAGRAM_FLAG_PACKET_CRC32,
 };
+use av_mesh::relay_ingress::ParsedSymbol;
 use relay_session::{CodingProfile, RelayLimits, SubscriptionId, TopologyGeneration};
 
 const HEADER_LEN: usize = 8;
@@ -303,6 +304,41 @@ impl<'a> RlsView<'a> {
             source_symbols: 1,
             esi: header.esi,
             slim: Some(slim),
+        })
+    }
+
+    /// The symbol as the receiver's short path takes it (teeperf), with the
+    /// bytes of its key read from `datagram`, the datagram this view is of.
+    /// `None` for a compact datagram.
+    pub fn parsed_symbol(&self, datagram: &'a [u8]) -> Option<ParsedSymbol<'a>> {
+        if self.slim.is_some() {
+            return None;
+        }
+        // The key on the wire: from the tenant's length (two bytes before
+        // its name) to the end of the payload hash, all within `datagram`.
+        let base = datagram.as_ptr() as usize;
+        let start = (self.tenant.as_ptr() as usize).checked_sub(base + 2)?;
+        let end = (self.payload_hash.as_ptr() as usize + 32).checked_sub(base)?;
+        let key_bytes = datagram.get(start..end)?;
+        let header = DatagramFecHeader::decode(self.fec).ok()?;
+        let coding = CodingProfile::from_block(header.block_profile().ok()?);
+        let t = usize::from(header.symbol_size);
+        let symbol = self
+            .fec
+            .get(RQD2_HEADER_LEN + PAYLOAD_ID_LEN..RQD2_HEADER_LEN + PAYLOAD_ID_LEN + t)?;
+        Some(ParsedSymbol {
+            key_bytes,
+            generation: self.generation,
+            subscription_id: self.subscription_id,
+            deadline_us: self.deadline_us,
+            role: self.role,
+            kind: self.kind,
+            path_intent: self.path_intent,
+            coding,
+            fec: self.fec,
+            packet_sequence: self.packet_sequence,
+            esi: self.esi,
+            symbol,
         })
     }
 

@@ -32,7 +32,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use av_mesh::relay_ingress::{
-    is_relay_datagram, PeerAdmission, RelayIngressOutcome, RelayIngressSnapshot,
+    is_relay_datagram, ParsedOutcome, PeerAdmission, RelayIngressOutcome, RelayIngressSnapshot,
     RelayUdpDispatch, RelayUdpDispatchOutcome,
 };
 use av_mesh::stall_journal::{self, StallKind, StallThread};
@@ -2689,6 +2689,8 @@ struct Tee {
     repair_tick: Option<Arc<Notify>>,
     /// The newest arrival (kernel µs) of a symbol the tee has taken.
     last_rx_us: u64,
+    /// The part whose `relay_forward` the short path journaled last.
+    forward_journaled: (u64, u64),
     /// The node's decode pool, and this tee's channel back from it.
     decodes: Option<Arc<DecodePool>>,
     decode_tx: Option<tokio::sync::mpsc::UnboundedSender<DecodeDone>>,
@@ -3115,6 +3117,22 @@ impl Tee {
         out
     }
 
+    /// `relay_forward` of a part whose symbols take the receiver's short
+    /// path: once a part (the journal keeps the first anyway), without its
+    /// lock for each of the part's symbols.
+    fn journal_forward_once(&mut self, view: &RlsView<'_>, child: SocketAddr, sent_us: u64) {
+        let Some(stream) = view.stream_id() else {
+            return;
+        };
+        if self.forward_journaled == (stream, view.object) {
+            return;
+        }
+        self.forward_journaled = (stream, view.object);
+        if let Some(forwarder) = &self.forwarder {
+            forwarder.journal_forward_part(stream, view.object, child, sent_us);
+        }
+    }
+
     fn mark_class(&self, stream: &str, video_kind: bool) {
         if self.class == TrafficClass::Video || video_kind {
             if let Ok(stream_id) = stream.parse() {
@@ -3235,9 +3253,56 @@ impl Tee {
             }
         };
         // The receiver's clocks age on the arrival time: a symbol that
-        // waited in the tee is not judged by the wait.
-        match self.dispatch.push(peer, bytes, item.rx_us) {
-            Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Buffered { key, .. })) => {
+        // waited in the tee is not judged by the wait. A symbol of a part
+        // under way here takes the receiver's short path (teeperf): no
+        // owned decode, no allocation, and the part's journal and class
+        // were done at its first symbol.
+        let parsed = fast_view
+            .as_ref()
+            .and_then(|view| view.parsed_symbol(bytes));
+        let outcome = match &parsed {
+            Some(symbol) => self.dispatch.push_parsed(peer, bytes, symbol, item.rx_us),
+            None => self
+                .dispatch
+                .push(peer, bytes, item.rx_us)
+                .map(|outcome| match outcome {
+                    RelayUdpDispatchOutcome::Relay(outcome) => ParsedOutcome::Decoded(outcome),
+                    RelayUdpDispatchOutcome::Legacy => ParsedOutcome::Legacy,
+                }),
+        };
+        match outcome {
+            Ok(ParsedOutcome::Buffered) => {
+                if let (Some(requester), Some(view)) = (self.requester.as_mut(), &fast_view) {
+                    match repair_view {
+                        Some(view) => requester.observe(view, peer, lane, item.rx_us),
+                        None => requester.seen(view, peer, lane, item.rx_us),
+                    }
+                }
+                if let (Some(view), Some((child, sent_us))) = (&fast_view, forwarded) {
+                    self.journal_forward_once(view, child, sent_us);
+                }
+                if self.dispatch.receiver().has_decode_jobs() {
+                    let ctx = DecodedCtx {
+                        peer,
+                        rx_us: item.rx_us,
+                        woken_us: item.woken_us,
+                        forwarded,
+                        video_kind,
+                        meta: fast_view.as_ref().map(PartMeta::of),
+                        missing: Vec::new(),
+                    };
+                    self.start_decodes(&ctx).await;
+                }
+            }
+            Ok(ParsedOutcome::Duplicate) => {
+                if let (Some(requester), Some(view)) = (self.requester.as_mut(), &fast_view) {
+                    requester.observe_done(view, peer, lane, item.rx_us);
+                }
+                if let (Some(view), Some((child, sent_us))) = (&fast_view, forwarded) {
+                    self.journal_forward_once(view, child, sent_us);
+                }
+            }
+            Ok(ParsedOutcome::Decoded(RelayIngressOutcome::Buffered { key, .. })) => {
                 if let Some(requester) = self.requester.as_mut() {
                     match (repair_view, &fast_view) {
                         (Some(view), _) => requester.observe(view, peer, lane, item.rx_us),
@@ -3264,7 +3329,7 @@ impl Tee {
                     self.start_decodes(&ctx).await;
                 }
             }
-            Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Decoded {
+            Ok(ParsedOutcome::Decoded(RelayIngressOutcome::Decoded {
                 object,
                 envelope,
                 parent_count,
@@ -3283,13 +3348,13 @@ impl Tee {
                 self.on_decoded(ctx, object, envelope, parent_count, accepted_datagrams)
                     .await;
             }
-            Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Duplicate { key, .. })) => {
+            Ok(ParsedOutcome::Decoded(RelayIngressOutcome::Duplicate { key, .. })) => {
                 if let (Some(requester), Some(view)) = (self.requester.as_mut(), &fast_view) {
                     requester.observe_done(view, peer, lane, item.rx_us);
                 }
                 journal_forward(&key);
             }
-            Ok(RelayUdpDispatchOutcome::Legacy) => {}
+            Ok(ParsedOutcome::Legacy) => {}
             Err(error) => {
                 warn_relay_rejection(
                     &self.dispatch,
@@ -3633,6 +3698,7 @@ pub async fn run_relay_class_ingest(
                 .as_ref()
                 .map(|ticks| Arc::clone(&ticks[class.index()])),
             last_rx_us: 0,
+            forward_journaled: (u64::MAX, u64::MAX),
             decodes: config.decode_pool.clone(),
             decode_tx: Some(decode_tx),
             decode_rx: Some(decode_rx),

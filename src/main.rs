@@ -7172,6 +7172,14 @@ impl RelayDownstreamForwarder {
     /// Journal `relay_forward` for the first symbol of an object that left
     /// for a child.
     fn journal_forward(&self, object_key: &media_object::ObjectKey, child: SocketAddr, t_us: u64) {
+        let Ok(stream) = object_key.stream().parse::<u64>() else {
+            return;
+        };
+        self.journal_forward_part(stream, object_key.object(), child, t_us);
+    }
+
+    /// [`Self::journal_forward`] of part `object` of `stream`.
+    fn journal_forward_part(&self, stream: u64, object: u64, child: SocketAddr, t_us: u64) {
         let Some(journal) = self
             .hop_journal
             .get()
@@ -7179,12 +7187,8 @@ impl RelayDownstreamForwarder {
         else {
             return;
         };
-        let Ok(stream) = object_key.stream().parse::<u64>() else {
-            return;
-        };
         journal.record_first(
-            HopEvent::new(HopStage::RelayForward, stream, object_key.object(), t_us)
-                .with_peer(Some(child)),
+            HopEvent::new(HopStage::RelayForward, stream, object, t_us).with_peer(Some(child)),
         );
     }
 
@@ -47595,6 +47599,7 @@ mod tests {
     /// The video tee at 247 and 300 Mbit/s of 4K (fix4-video): what it
     /// drops, what it commits and its processor time.
     mod video_tee;
+    mod tee_paths;
 
     /// The node's memory at 4K (memory round, 24 Nov): the caches' byte
     /// bounds, the release of a replaced or quiet stream, the memory guard,
