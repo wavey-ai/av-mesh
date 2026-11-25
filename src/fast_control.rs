@@ -512,6 +512,32 @@ mod mesh_socket_buffer_tests {
     }
 }
 
+/// Wake each tee's part repair asks every 2 ms (4k-repair): an ask is
+/// due a few ms after its part's parent moved on, which a tee that has no
+/// datagram to take would not see. A tee whose batches poll its requester
+/// is not woken (teeperf): only one quiet since its `due_us`.
+pub(crate) async fn run_part_repair_tick(
+    ticks: Vec<Arc<crate::fast_plane::relay::RequesterTick>>,
+    mut shutdown_rx: watch::Receiver<()>,
+) {
+    let mut every = tokio::time::interval(Duration::from_millis(2));
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => return,
+            _ = every.tick() => {
+                let now_us = crate::now_unix_us();
+                for tick in &ticks {
+                    let due = tick.due_us.load(std::sync::atomic::Ordering::Relaxed);
+                    if due != 0 && now_us >= due {
+                        tick.notify.notify_one();
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// How often each child gets its ledger.
 const CHILD_LEDGER_EVERY: Duration = Duration::from_millis(250);
 

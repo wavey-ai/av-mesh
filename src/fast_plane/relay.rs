@@ -2686,9 +2686,9 @@ struct Tee {
     part_repair: Option<Arc<PartRepair>>,
     requester: Option<Requester>,
     lease: Option<Arc<LeaseChildren>>,
-    /// While the stream is quiet with parts open, the requester's poll
-    /// this often (part repair with asks on).
-    requester_poll_every: Option<Duration>,
+    /// The housekeeping tick that polls the requester while the stream is
+    /// quiet with parts open (part repair with asks on).
+    requester_tick: Option<Arc<RequesterTick>>,
     /// The newest arrival (kernel µs) of a symbol the tee has taken.
     last_rx_us: u64,
     /// The part whose `relay_forward` the short path journaled last.
@@ -2723,23 +2723,29 @@ const TEE_WAKE_ENTRIES: usize = 1_024;
 /// How often a tee books its thread's processor time (teeperf).
 const TEE_CPU_EVERY: Duration = Duration::from_millis(10);
 
-/// How long a tee with parts open waits in a quiet stream before its
-/// requester looks at them (the tick it had from the node runtime).
-const REQUESTER_QUIET_POLL: Duration = Duration::from_millis(2);
+/// A tee's requester tick (`fast_control::run_part_repair_tick`, every
+/// 2 ms): the tee says when its requester next needs a poll that no batch
+/// gives it (teeperf: the tick woke both tees 500 times a second, datagrams
+/// or not; now only a tee whose stream has been quiet a while).
+#[derive(Default)]
+pub(crate) struct RequesterTick {
+    pub(crate) notify: Notify,
+    /// Unix µs from which a tick is to wake the tee (0: none wanted).
+    pub(crate) due_us: AtomicU64,
+}
+
+/// A tick wakes a tee whose last batch or poll is this old.
+const REQUESTER_QUIET_US: u64 = 1_000;
 
 impl Tee {
-    /// Runs until the thread's channel closes. It waits on its datagrams,
-    /// the decode pool's results, the housekeeping task's nudge to expire
-    /// its state (`fast_control::run_tee_housekeeping`, which also rotates
-    /// the cache), and, while its stream is quiet with parts open, its
-    /// requester's poll (teeperf: was a 2 ms tick from the node runtime
-    /// that woke both tees 500 times a second, datagrams or not).
+    /// Runs until the thread's channel closes. It waits on nothing but its
+    /// datagrams, the decode pool's results and the housekeeping tasks'
+    /// nudges (`fast_control::run_tee_housekeeping`, which also rotates the
+    /// cache; `run_part_repair_tick`, for a requester in a quiet stream):
+    /// no timer of its own sits beside the datagrams.
     async fn run(mut self, items: TeeReceiver<TeeMeta>, expire: Arc<Notify>) -> Result<()> {
         let mut decoded = self.decode_rx.take();
-        let poll_every = self.requester_poll_every;
-        let quiet = tokio::time::sleep(Duration::from_secs(3_600));
-        tokio::pin!(quiet);
-        let mut quiet_armed = false;
+        let tick = self.requester_tick.clone();
         // The thread's processor time is read at most every
         // `TEE_CPU_EVERY` (teeperf: it was two system calls a batch), and
         // what it used since is booked (its wakes included).
@@ -2797,12 +2803,15 @@ impl Tee {
                             self.last_rx_us
                         };
                         requester.poll(now);
-                        // Its next poll: the next batch, or the quiet's.
-                        quiet_armed = poll_every.is_some() && requester.wants_poll(end_us);
-                        if let (true, Some(every)) = (quiet_armed, poll_every) {
-                            quiet
-                                .as_mut()
-                                .reset(tokio::time::Instant::from_std(taken) + every);
+                        // Its next poll: the next batch, or the tick's
+                        // once the stream has been quiet a while.
+                        if let Some(tick) = &tick {
+                            let due = if requester.wants_poll(end_us) {
+                                end_us + REQUESTER_QUIET_US
+                            } else {
+                                0
+                            };
+                            tick.due_us.store(due, Ordering::Relaxed);
                         }
                     }
                     let class = self.class.index();
@@ -2812,19 +2821,25 @@ impl Tee {
                     self.publish();
                     self.book_cpu(&mut cpu_mark, taken);
                 }
-                () = &mut quiet, if quiet_armed => {
-                    quiet_armed = false;
-                    if let (Some(requester), Some(every)) = (self.requester.as_mut(), poll_every) {
+                () = async {
+                    match &tick {
+                        Some(tick) => tick.notify.notified().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let (Some(requester), Some(tick)) = (self.requester.as_mut(), &tick) {
                         let now = if items.peek().is_none() {
                             now_unix_us()
                         } else {
                             self.last_rx_us
                         };
                         requester.poll(now);
-                        if requester.wants_poll(now) {
-                            quiet_armed = true;
-                            quiet.as_mut().reset(tokio::time::Instant::now() + every);
-                        }
+                        let due = if requester.wants_poll(now) {
+                            now_unix_us() + REQUESTER_QUIET_US
+                        } else {
+                            0
+                        };
+                        tick.due_us.store(due, Ordering::Relaxed);
                     }
                 }
                 () = expire.notified() => {
@@ -3625,12 +3640,11 @@ pub async fn run_relay_class_ingest(
             let _ = lease.part_repair.set(Arc::clone(repair));
         }
     }
-    // Each class's tee polls its requester itself while its stream is
-    // quiet (teeperf: no tick from the node runtime).
-    let requester_poll_every = part_repair
+    // One requester tick for each class's tee.
+    let requester_ticks: Option<[Arc<RequesterTick>; 2]> = part_repair
         .as_ref()
         .filter(|repair| repair.config.requests)
-        .map(|_| REQUESTER_QUIET_POLL);
+        .map(|_| [Arc::default(), Arc::default()]);
     // Parts of two symbols or more are assembled by the tees' receivers
     // (4k-repair): whole from their sources with no RaptorQ, a damaged one
     // decoded on the pool.
@@ -3752,7 +3766,9 @@ pub async fn run_relay_class_ingest(
                     )
                 }),
             lease: config.lease.clone(),
-            requester_poll_every,
+            requester_tick: requester_ticks
+                .as_ref()
+                .map(|ticks| Arc::clone(&ticks[class.index()])),
             last_rx_us: 0,
             forward_journaled: (u64::MAX, u64::MAX),
             decodes: config.decode_pool.clone(),
@@ -3825,6 +3841,12 @@ pub async fn run_relay_class_ingest(
         expire,
         shutdown_rx.clone(),
     ));
+    let requester_ticker = requester_ticks.map(|ticks| {
+        tokio::spawn(crate::fast_control::run_part_repair_tick(
+            ticks.to_vec(),
+            shutdown_rx.clone(),
+        ))
+    });
     let sampler = tokio::spawn(crate::fast_control::run_parent_feeds_sampler(
         feeds,
         Arc::clone(&stats),
@@ -3887,7 +3909,7 @@ pub async fn run_relay_class_ingest(
     }
     housekeeping.abort();
     sampler.abort();
-    for task in [&child_ledgers].into_iter().flatten() {
+    for task in [&requester_ticker, &child_ledgers].into_iter().flatten() {
         task.abort();
     }
     if let Some(video_buffers) = &video_buffers {
