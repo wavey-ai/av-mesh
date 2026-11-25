@@ -124,7 +124,7 @@ impl AdmitEdge {
             .await
             .unwrap()
         });
-        let lane = Arc::clone(&edge.lane);
+        let stats = Arc::clone(&edge.stats);
         let admit = Arc::new(CpuAdmit::new(
             CpuAdmitConfig {
                 cpus: cpus.clone(),
@@ -134,7 +134,7 @@ impl AdmitEdge {
                 ..CpuAdmitConfig::default()
             },
             edge.lane.threads.clone(),
-            Arc::new(move || lane.stats.fanout_sends.load(Ordering::Relaxed)),
+            Arc::new(move || stats.egress_datagrams()),
         ));
         admit.set_enforce(enforced());
         edge.router.edge_load.egress.set_cpu_admit(Arc::clone(&admit));
@@ -206,7 +206,7 @@ impl AdmitEdge {
 /// its registered threads on `cpus`, sampled every 500 ms on the caller's
 /// runtime.
 pub(super) fn attach(edge: &LaneEdge, cpus: Vec<usize>) -> Arc<CpuAdmit> {
-    let lane = Arc::clone(&edge.lane);
+    let stats = Arc::clone(&edge.stats);
     let admit = Arc::new(CpuAdmit::new(
         CpuAdmitConfig {
             cpus,
@@ -214,7 +214,7 @@ pub(super) fn attach(edge: &LaneEdge, cpus: Vec<usize>) -> Arc<CpuAdmit> {
             ..CpuAdmitConfig::default()
         },
         edge.lane.threads.clone(),
-        Arc::new(move || lane.stats.fanout_sends.load(Ordering::Relaxed)),
+        Arc::new(move || stats.egress_datagrams()),
     ));
     admit.set_enforce(enforced());
     edge.router.edge_load.egress.set_cpu_admit(Arc::clone(&admit));

@@ -3127,15 +3127,23 @@ async fn admit(
     // lab's crowd re-asked full edges 50-270 times a second, and each
     // refusal's lookups took the runtime's workers 0.2-0.6 of a core).
     let lone_mover = from_part.is_some() && others == NO_OTHER_LEGS;
-    if !lone_mover
-        && router
-            .edge_load
-            .egress
-            .cpu_admit()
-            .is_some_and(|cpu| cpu.full())
-    {
-        if let Some(cpu) = router.edge_load.egress.cpu_admit() {
-            cpu.note_full_refusal();
+    let cpu_admit = router.edge_load.egress.cpu_admit();
+    // rm/cpuadmit2: one gate a session. A stream the edge classes heavy
+    // (sustained rate over --heavy-session-bps) is admitted by place240's
+    // cost model and atomic reservation alone, which read the measured
+    // CPU; the small legs' term never refuses it.
+    let heavy = cpu_admit.is_some() && router.heavy_class(stream_id).await.heavy;
+    // A lone leg's (peer, stream): refused, it is judged by the measured
+    // room alone when it asks again.
+    let lone_key = (others == NO_OTHER_LEGS).then(|| {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (peer, stream_id).hash(&mut hasher);
+        hasher.finish()
+    });
+    if !lone_mover && !heavy && cpu_admit.as_ref().is_some_and(|cpu| cpu.full_for(lone_key)) {
+        if let Some(cpu) = &cpu_admit {
+            cpu.note_full_refusal(lone_key);
         }
         stats.refusals.fetch_add(1, Ordering::Relaxed);
         stats.cpu_refusals.fetch_add(1, Ordering::Relaxed);
@@ -3230,11 +3238,11 @@ async fn admit(
     // its samples: a new leg that would take it past full is refused
     // `edge-busy` as a byte-full edge refuses one (a lone leg that moves
     // here is taken, and charged).
-    if let Some(cpu) = router.edge_load.egress.cpu_admit() {
+    if let Some(cpu) = cpu_admit.as_ref().filter(|_| !heavy) {
         let dps = router.leg_datagrams_per_s(stream_id).await;
         if from_part.is_some() && others == NO_OTHER_LEGS {
             cpu.charge_leg(dps);
-        } else if cpu.admit_leg(dps).is_err() {
+        } else if cpu.admit_leg(dps, lone_key).is_err() {
             stats.refusals.fetch_add(1, Ordering::Relaxed);
             stats.cpu_refusals.fetch_add(1, Ordering::Relaxed);
             send_control(
@@ -3248,6 +3256,11 @@ async fn admit(
             .await;
             return;
         }
+    }
+    // A heavy session taken: its model cost in the CPU term until the
+    // samples show it (in the load, never in the small legs' cold cap).
+    if let (Some(cpu), Some(hold)) = (&cpu_admit, &_heavy_hold) {
+        cpu.charge_heavy(hold.cost_permille);
     }
     if hedge_over_gate(
         from_part,

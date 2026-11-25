@@ -1676,7 +1676,12 @@ async fn a_small_crowd_beside_4k_is_refused_before_4k_loses_a_part() {
         region.published.load(Ordering::Relaxed) > 2 * FPS
     })
     .await;
-    // A viewer at each edge.
+    // rm/cpuadmit2: the viewers join with the stream's class and rate
+    // known at both edges (the lab's sessions 2 and 3; joined before, as
+    // this proof did, they were charged as a 1,000 datagram/s small leg
+    // and the self-refusal of a known heavy leg never showed).
+    wait_heavy_and_rate(&region).await;
+    // The viewers.
     let sids: Vec<String> = (1..=2).map(|index| format!("cpu-4k-{index}")).collect();
     let viewers = Crowd::join(&region, &sids, STREAM, true, Duration::from_millis(400)).await;
     until("both viewers play", Duration::from_secs(15), || {
@@ -1767,4 +1772,118 @@ async fn a_small_crowd_beside_4k_is_refused_before_4k_loses_a_part() {
         })
         .sum();
     assert!(refused > 0, "the crowd was refused at full: {result:#}");
+}
+
+/// Both edges class the 4K stream heavy and know its lane charges.
+async fn wait_heavy_and_rate(region: &Region) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let mut known = true;
+        for index in 0..region.slots.len() {
+            let edge = region.edge(index);
+            known &= edge.router.heavy_class(STREAM).await.heavy
+                && edge.router.stream_charges(STREAM).await.is_some_and(|lanes| lanes.raptorq_dps > 0);
+        }
+        if known {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the edges never classed the stream heavy");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// rm/cpuadmit2 (lab int7k-s100-r1): the same two 4K viewers in three
+/// sessions at 247 Mbit/s with CPU admission on: the first joins before
+/// the stream's rate is known, as s100a did; then the source stops for 2 s
+/// and they join again with the class and rate known (s100b, s100c). Each
+/// session both are admitted and play within a second, nothing is refused
+/// for `pending`, nothing is missing. On 156fa2a sessions 2 and 3 were
+/// refused for ever: the session's own heavy reservation sat in the small
+/// legs' cold cap beside its 4K leg's charge, and the edge stayed cold
+/// (its cost was measured on the audio fan-out's sends alone).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a 247 Mbit/s proof: run it alone (scripts/place240-proofs.sh's CPUs)"]
+async fn heavy_viewers_are_admitted_in_every_session_with_the_rate_known() {
+    use super::cpu_admission::{attach, pin_apart};
+    let _turn = SERIAL.lock().await;
+    let first = super::cpu_admission::env_u64("CPUADMIT_FIRST_CPU", 16) as usize;
+    let rest: Vec<usize> = (first + 4..first + 8).collect();
+    let mut region = Region::start_with(180, 2, true, 600_000_000, None, false).await;
+    let admits: Vec<_> = (0..2)
+        .map(|index| attach(&region.edge(index), vec![first + 2 * index, first + 2 * index + 1]))
+        .collect();
+    let keep = ["ph-", "adm-load"];
+    pin_apart(&admits, &rest, &keep);
+    region.start_video();
+    until("the stream runs at every edge", Duration::from_secs(10), || {
+        region.published.load(Ordering::Relaxed) > 2 * FPS
+    })
+    .await;
+    let mut lines = Vec::new();
+    for session in 1..=3 {
+        if session > 1 {
+            // The source stops for 2 s between sessions; the class and the
+            // rate stay known.
+            region.source().stall(Duration::from_secs(2));
+            tokio::time::sleep(Duration::from_millis(2_500)).await;
+            wait_heavy_and_rate(&region).await;
+        }
+        let pending_before: u64 = admits
+            .iter()
+            .map(|admit| admit.stats.refused_pending.load(Ordering::Relaxed))
+            .sum();
+        let joined_us = now_unix_us();
+        let sids: Vec<String> = (1..=2).map(|index| format!("s{session}-4k-{index}")).collect();
+        let viewers = Crowd::join(&region, &sids, STREAM, true, Duration::from_millis(50)).await;
+        for _ in 0..12 {
+            pin_apart(&admits, &rest, &keep);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let to_us = now_unix_us() - 1_000_000;
+        let runs = viewers.finish().await;
+        let pending: u64 = admits
+            .iter()
+            .map(|admit| admit.stats.refused_pending.load(Ordering::Relaxed))
+            .sum::<u64>()
+            - pending_before;
+        let viewers_line: Vec<serde_json::Value> = runs
+            .iter()
+            .map(|run| {
+                let first_ms = run
+                    .parts
+                    .values()
+                    .map(|(at, _)| *at)
+                    .min()
+                    .map(|at| at.saturating_sub(joined_us) as f64 / 1_000.0);
+                let figure = figures(run, region.source(), joined_us + 1_500_000, to_us, joined_us);
+                serde_json::json!({
+                    "sid": run.sid, "first_part_ms": first_ms, "refused": run.refused,
+                    "missing": figure.missing, "longest_gap_ms": figure.longest_gap_ms,
+                    "busy_reasks": run.stats.busy_reasks,
+                })
+            })
+            .collect();
+        let line = serde_json::json!({
+            "session": session,
+            "refused_pending": pending,
+            "viewers": viewers_line,
+            "edges": admits.iter().map(|admit| admit.status()).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string(&line).unwrap());
+        lines.push(line);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join("cpuadmit");
+    let _ = std::fs::create_dir_all(&dir);
+    let text: String = lines.iter().map(|line| serde_json::to_string(line).unwrap() + "\n").collect();
+    std::fs::write(dir.join("heavy-sessions.ndjson"), text).unwrap();
+    region.shutdown().await;
+    for line in &lines {
+        assert_eq!(line["refused_pending"], 0, "{line:#}");
+        for viewer in line["viewers"].as_array().unwrap() {
+            let first = viewer["first_part_ms"].as_f64().unwrap_or(f64::MAX);
+            assert!(first <= 1_000.0, "admitted and playing within a second: {line:#}");
+            assert_eq!(viewer["missing"], 0, "{line:#}");
+        }
+    }
 }

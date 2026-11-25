@@ -667,6 +667,9 @@ const RESERVATION_TTL: Duration = Duration::from_secs(10);
 pub(crate) struct HeavyHold {
     heavy: Arc<Heavy>,
     id: u64,
+    /// The session's model cost (thousandths of one CPU), charged to the
+    /// CPU admission term once the session is admitted (rm/cpuadmit2).
+    pub(crate) cost_permille: u32,
 }
 
 impl Drop for HeavyHold {
@@ -1089,11 +1092,6 @@ impl AppRouter {
         if !add {
             return Ok(None);
         }
-        // rm/cpuadmit: the small legs' admission sees the heavy session at
-        // once (its model cost), until the samples show it.
-        if let Some(admit) = self.edge_load.egress.cpu_admit() {
-            admit.charge_one_cpu_permille(cpu_add);
-        }
         let id = self.heavy.next_reservation.fetch_add(1, Ordering::Relaxed);
         self.heavy
             .reservations
@@ -1109,6 +1107,7 @@ impl AppRouter {
         Ok(Some(HeavyHold {
             heavy: Arc::clone(&self.heavy),
             id,
+            cost_permille: cpu_add,
         }))
     }
 

@@ -65,11 +65,15 @@ pub(crate) const DEFAULT_PENDING_MAX_PERMILLE: u32 = 100;
 pub(crate) const DEFAULT_SHED_AFTER_MS: u64 = 2_000;
 /// Legs asked to leave in one round at most.
 pub(crate) const DEFAULT_SHED_PER_ROUND: usize = 32;
-/// A measured cost a datagram is taken from this many fan-out sends in the
+/// A measured cost a datagram is taken from this many client datagrams in the
 /// window at least (the lab's first look at 2,000, a window of a cold
 /// burst's first sends, read a few µs and let 86 legs past a cap that the
 /// next sample, at 22.7 µs, would have held).
 const MIN_DATAGRAMS_FOR_COST: u64 = 20_000;
+/// A lone leg refused within this long that asks again is a re-asker
+/// (judged by the measured room alone), and at most this many are kept.
+const REASK_MEMORY: Duration = Duration::from_secs(10);
+const REASK_KEYS: usize = 8_192;
 /// Legs are priced at the highest cost a datagram of this many of the
 /// latest measurements (a cost read low once does not open the edge).
 const COST_LOOKS: usize = 4;
@@ -402,8 +406,14 @@ pub(crate) struct CpuAdmitStats {
 struct State {
     samples: VecDeque<Sample>,
     verdict: CpuVerdict,
-    /// The legs admitted lately: when, and their charge.
-    charges: VecDeque<(Instant, u32)>,
+    /// The legs admitted lately: when, their charge, and whether it is a
+    /// small leg's (a heavy session's charge counts in the load, never in
+    /// the cold cap: place240's reservation is its gate).
+    charges: VecDeque<(Instant, u32, bool)>,
+    /// Lone legs this edge refused lately, by (peer, stream) key: one that
+    /// asks again is admitted when it fits the measured room, whatever is
+    /// pending (no viewer starves behind others' charges).
+    refused: std::collections::HashMap<u64, Instant>,
     /// Over full since (measured term alone).
     over_since: Option<Instant>,
     /// Legs asked to leave lately: when, and their charge.
@@ -455,7 +465,7 @@ pub(crate) enum CpuRefusal {
 
 impl CpuAdmit {
     /// `threads`: the edge's send threads (its fast lane's registry);
-    /// `datagrams`: the sends its fan-out threads made so far.
+    /// `datagrams`: the client datagrams it sent so far, every lane.
     pub(crate) fn new(config: CpuAdmitConfig, threads: ThreadRegistry, datagrams: Counter) -> Self {
         let cpus = if config.cpus.is_empty() {
             affinity_cpus()
@@ -573,10 +583,13 @@ impl CpuAdmit {
         while state
             .charges
             .front()
-            .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= keep)
+            .is_some_and(|(at, _, _)| now.saturating_duration_since(*at) >= keep)
         {
             state.charges.pop_front();
         }
+        state
+            .refused
+            .retain(|_, at| now.saturating_duration_since(*at) < REASK_MEMORY);
         while state
             .shed
             .front()
@@ -624,12 +637,14 @@ impl CpuAdmit {
                 continue;
             }
             send_threads += 1;
-            // The cost of a datagram: the fan-out pool's wall time over its
-            // sends (a class thread's time is mostly its receipt of the
-            // stream, whatever its few inline sends).
-            if thread.group == ThreadGroup::Fanout {
-                send_ns += ns;
-            }
+            // The cost of a datagram: every send path's time (the fan-out
+            // pool's wall time, the class threads' run and wait time: their
+            // inline sends and the heavy lane's batched sends) over every
+            // client datagram sent (rm/cpuadmit2: the fan-out's alone left
+            // a 4K edge cold for ever, its 247 Mbit/s sent by the video
+            // class thread). A class thread's receipt of its streams is in
+            // it too: an over-estimate, never an under one.
+            send_ns += ns;
             let thread_term = thread_permille.saturating_mul(1_000) / thread_full;
             if thread_term > permille {
                 permille = thread_term;
@@ -675,11 +690,20 @@ impl CpuAdmit {
     /// The legs admitted lately that the window does not show yet,
     /// thousandths: each fades as the window takes it in.
     fn pending_permille(&self, state: &State, now: Instant) -> u32 {
+        self.pending_of(state, now, false)
+    }
+
+    /// The small legs' charges alone (`small_only`), or every charge.
+    /// Each lapses linearly to nothing when the window and a sample have
+    /// passed since it (the samples then show what it costs): nothing older
+    /// counts for anything.
+    fn pending_of(&self, state: &State, now: Instant, small_only: bool) -> u32 {
         let fade = (self.config.window + self.config.sample_every).as_secs_f64();
         state
             .charges
             .iter()
-            .map(|(at, permille)| {
+            .filter(|(_, _, small)| *small || !small_only)
+            .map(|(at, permille, _)| {
                 let age = now.saturating_duration_since(*at).as_secs_f64();
                 f64::from(*permille) * (1.0 - age / fade).max(0.0)
             })
@@ -708,10 +732,43 @@ impl CpuAdmit {
         self.enforcing() && self.load_permille() >= 1_000
     }
 
+    /// A new small leg (`key`: a lone leg's peer and stream) is refused at
+    /// once: the term with what is pending is at full, unless it is a lone
+    /// leg refused lately and the measured term alone is under full.
+    pub(crate) fn full_for(&self, key: Option<u64>) -> bool {
+        if !self.enforcing() {
+            return false;
+        }
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        if self.reasker(&state, key, now) {
+            return state.verdict.permille >= 1_000;
+        }
+        state.verdict.permille.saturating_add(self.pending_permille(&state, now)) >= 1_000
+    }
+
+    fn reasker(&self, state: &State, key: Option<u64>, now: Instant) -> bool {
+        key.and_then(|key| state.refused.get(&key))
+            .is_some_and(|at| now.saturating_duration_since(*at) < REASK_MEMORY)
+    }
+
+    fn note_refused(state: &mut State, key: Option<u64>, now: Instant) {
+        if let Some(key) = key {
+            if state.refused.len() >= REASK_KEYS {
+                state.refused.retain(|_, at| now.saturating_duration_since(*at) < REASK_MEMORY);
+            }
+            if state.refused.len() < REASK_KEYS {
+                state.refused.insert(key, now);
+            }
+        }
+    }
+
     /// A new leg refused at full before it was priced: counted by the
     /// binding term.
-    pub(crate) fn note_full_refusal(&self) {
-        let cpus = self.state.lock().unwrap_or_else(|p| p.into_inner()).verdict.term == "cpus";
+    pub(crate) fn note_full_refusal(&self, key: Option<u64>) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        Self::note_refused(&mut state, key, Instant::now());
+        let cpus = state.verdict.term == "cpus";
         let counter = if cpus {
             &self.stats.refused_cpus
         } else {
@@ -730,12 +787,17 @@ impl CpuAdmit {
             .saturating_add(self.pending_permille(&state, Instant::now()))
     }
 
-    /// A new leg of `datagrams_per_s`: admitted and charged at once (so
-    /// that the next admission sees it), or refused when the term with it
-    /// would pass full.
-    pub(crate) fn admit_leg(&self, datagrams_per_s: f64) -> Result<u32, CpuRefusal> {
+    /// A new small leg of `datagrams_per_s` (`key`: a lone leg's peer and
+    /// stream): admitted and charged at once (so that the next admission
+    /// sees it), or refused when the term with it would pass full. While the
+    /// edge is cold (no measured cost), small legs pending may add at most
+    /// the cap; a leg whose own charge is over the cap is judged by the
+    /// room alone. A lone leg refused lately is admitted when it fits the
+    /// measured room, whatever is pending.
+    pub(crate) fn admit_leg(&self, datagrams_per_s: f64, key: Option<u64>) -> Result<u32, CpuRefusal> {
         let now = Instant::now();
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let reasker = self.reasker(&state, key, now);
         let charge = state.verdict.leg_permille(datagrams_per_s).max(
             leg_permille(
                 self.config.datagram_ns,
@@ -744,16 +806,27 @@ impl CpuAdmit {
             ),
         );
         let pending = self.pending_permille(&state, now);
-        let load = state.verdict.permille.saturating_add(pending);
+        let small_pending = self.pending_of(&state, now, true);
+        // A lone re-asker is judged by the measured room alone.
+        let load = if reasker {
+            state.verdict.permille
+        } else {
+            state.verdict.permille.saturating_add(pending)
+        };
+        let cap = self.config.pending_max_permille;
         if self.enforcing()
+            && !reasker
             && state.last_cost.is_none()
-            && pending.saturating_add(charge) > self.config.pending_max_permille.max(charge)
+            && charge < cap
+            && small_pending.saturating_add(charge) > cap
             && load.saturating_add(charge) <= 1_000
         {
             self.stats.refused_pending.fetch_add(1, Ordering::Relaxed);
+            Self::note_refused(&mut state, key, now);
             return Err(CpuRefusal::Pending);
         }
         if self.enforcing() && load.saturating_add(charge) > 1_000 {
+            Self::note_refused(&mut state, key, now);
             if state.verdict.term == "cpus" {
                 self.stats.refused_cpus.fetch_add(1, Ordering::Relaxed);
                 return Err(CpuRefusal::Cpus);
@@ -761,7 +834,10 @@ impl CpuAdmit {
             self.stats.refused_thread.fetch_add(1, Ordering::Relaxed);
             return Err(CpuRefusal::Thread);
         }
-        state.charges.push_back((now, charge));
+        if let Some(key) = key {
+            state.refused.remove(&key);
+        }
+        state.charges.push_back((now, charge, true));
         self.stats.admitted.fetch_add(1, Ordering::Relaxed);
         Ok(charge)
     }
@@ -775,7 +851,7 @@ impl CpuAdmit {
             self.floor_capacity_ns(),
             datagrams_per_s,
         ));
-        state.charges.push_back((Instant::now(), charge));
+        state.charges.push_back((Instant::now(), charge, true));
         self.stats.admitted.fetch_add(1, Ordering::Relaxed);
         charge
     }
@@ -804,8 +880,10 @@ impl CpuAdmit {
     }
 
     /// A heavy session admitted (place240's model cost, thousandths of one
-    /// CPU): charged against the CPUs until the samples show it.
-    pub(crate) fn charge_one_cpu_permille(&self, permille: u32) {
+    /// CPU): charged against the CPUs until the samples show it, in the
+    /// load (small legs see it) and never in the small legs' cold cap.
+    /// Charged once the session is admitted, never for one refused.
+    pub(crate) fn charge_heavy(&self, permille: u32) {
         if permille == 0 {
             return;
         }
@@ -815,7 +893,7 @@ impl CpuAdmit {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state
             .charges
-            .push_back((Instant::now(), term.min(u64::from(u32::MAX)) as u32));
+            .push_back((Instant::now(), term.min(u64::from(u32::MAX)) as u32, false));
     }
 
     /// The capacity a leg is priced against before any verdict: the CPUs'.
@@ -1084,18 +1162,18 @@ mod tests {
         // A burst at an edge with room waits for the samples past the cap.
         admit.force_verdict(verdict(0, "cpus"), None);
         let mut burst = 0;
-        while admit.admit_leg(1_000.0).is_ok() {
+        while admit.admit_leg(1_000.0, None).is_ok() {
             burst += 1;
         }
         assert_eq!(burst, DEFAULT_PENDING_MAX_PERMILLE / 4);
-        assert_eq!(admit.admit_leg(1_000.0), Err(CpuRefusal::Pending));
+        assert_eq!(admit.admit_leg(1_000.0, None), Err(CpuRefusal::Pending));
         // Measured, a leg is priced at its cost and only full refuses.
         admit.state.lock().unwrap().last_cost = Some(5_000);
-        assert!(admit.admit_leg(1_000.0).is_ok());
+        assert!(admit.admit_leg(1_000.0, None).is_ok());
         let admit = super::tests::admit(2);
         admit.force_verdict(verdict(900, "cpus"), None);
         let mut admitted = 0;
-        while admit.admit_leg(1_000.0).is_ok() {
+        while admit.admit_leg(1_000.0, None).is_ok() {
             admitted += 1;
             assert!(admitted < 1_000);
         }
@@ -1105,7 +1183,7 @@ mod tests {
         assert_eq!(admit.stats.refused_cpus.load(Ordering::Relaxed), 1);
         // A thread's term refuses as itself.
         admit.force_verdict(verdict(1_000, "nt-fanout-audio0"), None);
-        assert_eq!(admit.admit_leg(1_000.0), Err(CpuRefusal::Thread));
+        assert_eq!(admit.admit_leg(1_000.0, None), Err(CpuRefusal::Thread));
     }
 
     #[test]
@@ -1129,6 +1207,48 @@ mod tests {
         admit.force_verdict(verdict(900, "cpus"), None);
         assert_eq!(admit.shed_quota(4), 0);
         assert_eq!(admit.stats.shed_hints.load(Ordering::Relaxed), 26);
+    }
+
+    /// rm/cpuadmit2 (lab int7k-s100-r1): a heavy session's charge counts in
+    /// the load, never in the small legs' cold cap; a leg whose own charge
+    /// is over the cap is judged by the room alone; a lone leg refused once
+    /// is admitted when it fits the measured room, whatever is pending;
+    /// charges lapse once the window and a sample have passed.
+    #[test]
+    fn no_viewer_is_refused_for_ever_by_what_is_pending() {
+        let admit = admit(2);
+        admit.force_verdict(verdict(300, "cpus"), None);
+        // A heavy session admitted: in the load, not in the cold cap.
+        admit.charge_heavy(103);
+        assert!(admit.load_permille() > 300);
+        assert!(admit.admit_leg(1_000.0, None).is_ok(), "a small leg beside it");
+        // A big leg (charge over the cap) on a cold edge: room alone.
+        assert!(admit.admit_leg(30_000.0, None).is_ok(), "a 4K-rate leg fits the room");
+        // Small legs fill the cold cap; a lone one refused for pending...
+        while admit.admit_leg(1_000.0, None).is_ok() {}
+        assert_eq!(admit.admit_leg(1_000.0, Some(7)), Err(CpuRefusal::Pending));
+        // ... asks again and fits the measured room: admitted.
+        assert!(admit.admit_leg(1_000.0, Some(7)).is_ok());
+        // Another not refused before still waits for the samples.
+        assert_eq!(admit.admit_leg(1_000.0, Some(8)), Err(CpuRefusal::Pending));
+        // Full by measurement: a re-asker is refused too.
+        admit.force_verdict(verdict(1_000, "cpus"), None);
+        assert!(admit.full_for(Some(8)));
+        assert!(admit.admit_leg(1_000.0, Some(8)).is_err());
+        // Under full by measurement, the re-asker is not refused at once
+        // whatever is pending.
+        admit.force_verdict(verdict(500, "cpus"), None);
+        assert!(!admit.full_for(Some(8)));
+        // Charges lapse: after the window and a sample, nothing pending.
+        let mut state = admit.state.lock().unwrap();
+        let old = Instant::now() - (admit.config.window + admit.config.sample_every);
+        for charge in state.charges.iter_mut() {
+            charge.0 = old;
+        }
+        let pending = admit.pending_permille(&state, Instant::now());
+        drop(state);
+        assert_eq!(pending, 0);
+        assert!(admit.admit_leg(1_000.0, Some(9)).is_ok());
     }
 
     /// Over full, a round that finds no listener with a second leg (and
