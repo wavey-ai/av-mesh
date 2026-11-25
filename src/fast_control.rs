@@ -420,7 +420,11 @@ impl MeshSocketBuffers {
             );
             // The node's sockets share one budget (memory round).
             let target = if self.ms > 0 && target > state.asked {
-                av_mesh::mem_guard::SOCKETS.grow(state.asked, target)
+                av_mesh::mem_guard::SOCKETS.grow(
+                    av_mesh::mem_guard::SocketClass::CacheMesh,
+                    state.asked,
+                    target,
+                )
             } else {
                 target
             };

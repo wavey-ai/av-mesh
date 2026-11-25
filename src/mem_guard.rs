@@ -21,7 +21,8 @@
 //!   `--malloc-tune`'s 256 MB trim threshold a 4K edge stayed at 3.0 GB for
 //!   minutes after it released its copy).
 //! - [`SocketBudget`]: the growable receive buffers of the video class and
-//!   cache-mesh sockets share one node-level budget.
+//!   cache-mesh sockets share one node-level budget, each class with a
+//!   share of its own that no other class can take (send240, D).
 
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, OnceLock};
@@ -168,7 +169,41 @@ pub mod share {
     /// video sockets filling in a stall never push the host's UDP memory to
     /// where the kernel drops every socket's datagrams, audio's among them.
     pub const SOCKETS: u64 = 40;
+    /// send240 (D): what each socket class keeps of the sockets' budget for
+    /// itself, permille: the fast plane's video receive sockets half, the
+    /// cache mesh's receive sockets a quarter; the last quarter goes to
+    /// whichever asks first. On a 4 GB node (112 MB asked): 56 MB, 28 MB
+    /// and 28 MB. cmpd8: the video sockets asked all 118 MB and the cache
+    /// mesh's :30101 socket stayed at its floor and overflowed.
+    pub const SOCKETS_VIDEO_RECEIVE: u64 = 500;
+    pub const SOCKETS_CACHE_MESH: u64 = 250;
 }
+
+/// The socket classes of the sockets' budget (send240, D).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SocketClass {
+    /// The fast plane's video receive sockets (primary and secondary).
+    VideoReceive = 0,
+    /// The cache mesh's receive sockets (main and class lanes).
+    CacheMesh = 1,
+}
+
+impl SocketClass {
+    pub const ALL: [Self; 2] = [Self::VideoReceive, Self::CacheMesh];
+
+    /// Its share of the budget, permille.
+    pub const fn reserve_permille(self) -> u64 {
+        match self {
+            Self::VideoReceive => share::SOCKETS_VIDEO_RECEIVE,
+            Self::CacheMesh => share::SOCKETS_CACHE_MESH,
+        }
+    }
+}
+
+/// What the class threads' pools of kept datagrams hold, all together
+/// (send240, A: `fast_plane::send_defer`), for the memory's account.
+pub static SEND_DEFER_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// What the node may spend, resolved from its flags and its memory.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -407,6 +442,8 @@ impl Guard {
             socket_budget_bytes: sockets.budget(),
             socket_asked_bytes: sockets.asked(),
             socket_clamped: sockets.clamped(),
+            socket_classes: SocketClass::ALL.map(|class| sockets.class_snapshot(class)),
+            send_defer_bytes: SEND_DEFER_BYTES.load(Ordering::Relaxed),
         }
     }
 }
@@ -439,6 +476,22 @@ pub struct MemorySnapshot {
     pub socket_asked_bytes: u64,
     /// Socket growths cut short by the budget.
     pub socket_clamped: u64,
+    /// send240 (D): each socket class's own share of the budget and what
+    /// it asked (video receive, cache mesh).
+    #[serde(default)]
+    pub socket_classes: [SocketClassSnapshot; 2],
+    /// send240 (A): the class threads' pools of kept datagrams, made and
+    /// touched at start (in RSS).
+    #[serde(default)]
+    pub send_defer_bytes: u64,
+}
+
+/// One socket class of the sockets' budget.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SocketClassSnapshot {
+    pub reserve_bytes: u64,
+    pub asked_bytes: u64,
+    pub clamped: u64,
 }
 
 /// The node's budgets and guard, installed once at start.
@@ -514,13 +567,21 @@ pub fn trim() -> u64 {
 
 /// The growable receive buffers of the node's sockets share one budget: the
 /// sum of what they ask (the kernel books twice that). A socket asks for
-/// what its traffic needs; it is given what is left of the budget beside
-/// the others' current sizes, and never less than its floor.
+/// what its traffic needs; it is given what is left of its class's share
+/// and of the common rest beside the others' current sizes, and never less
+/// than its floor. Each class keeps its share ([`SocketClass`]): no class
+/// is squeezed to its floor by another (send240, D).
 #[derive(Debug, Default)]
 pub struct SocketBudget {
     budget: AtomicU64,
     asked: AtomicU64,
     clamped: AtomicU64,
+    /// What each class asked, and its growths cut short.
+    class_asked: [AtomicU64; 2],
+    class_clamped: [AtomicU64; 2],
+    /// Growths are rare (a socket's look, once a second, off the hot
+    /// path): one at a time.
+    lock: std::sync::Mutex<()>,
 }
 
 impl SocketBudget {
@@ -540,39 +601,65 @@ impl SocketBudget {
         self.clamped.load(Ordering::Relaxed)
     }
 
-    /// A socket asked `current` bytes so far and now wants `wanted`: what it
-    /// may ask the kernel for. The budget bounds the sockets' growth beyond
-    /// the sizes they were made with (each `--udp-socket-buffer-bytes` or
-    /// cache-mesh floor). A buffer never shrinks. No budget (0) gives what
-    /// is asked.
-    pub fn grow(&self, current: usize, wanted: usize) -> usize {
+    /// A class's own share of the budget.
+    pub fn reserve(&self, class: SocketClass) -> u64 {
+        self.budget().saturating_mul(class.reserve_permille()) / 1_000
+    }
+
+    /// The budget's rest, which no class keeps: whichever asks first.
+    fn common(&self) -> u64 {
+        self.budget().saturating_sub(
+            SocketClass::ALL
+                .iter()
+                .map(|class| self.reserve(*class))
+                .sum(),
+        )
+    }
+
+    pub fn class_snapshot(&self, class: SocketClass) -> SocketClassSnapshot {
+        SocketClassSnapshot {
+            reserve_bytes: self.reserve(class),
+            asked_bytes: self.class_asked[class as usize].load(Ordering::Relaxed),
+            clamped: self.class_clamped[class as usize].load(Ordering::Relaxed),
+        }
+    }
+
+    /// A socket of `class` asked `current` bytes so far and now wants
+    /// `wanted`: what it may ask the kernel for. The budget bounds the
+    /// sockets' growth beyond the sizes they were made with (each
+    /// `--udp-socket-buffer-bytes` or cache-mesh floor): first from the
+    /// class's own share, then from the common rest. A buffer never
+    /// shrinks. No budget (0) gives what is asked.
+    pub fn grow(&self, class: SocketClass, current: usize, wanted: usize) -> usize {
         if wanted <= current {
             return current;
         }
         let extra = (wanted - current) as u64;
         let budget = self.budget();
-        let mut asked = self.asked.load(Ordering::Relaxed);
-        loop {
-            let granted = if budget == 0 {
-                extra
-            } else {
-                extra.min(budget.saturating_sub(asked))
-            };
-            match self.asked.compare_exchange_weak(
-                asked,
-                asked.saturating_add(granted),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    if granted < extra {
-                        self.clamped.fetch_add(1, Ordering::Relaxed);
-                    }
-                    return current.saturating_add(usize::try_from(granted).unwrap_or(usize::MAX));
-                }
-                Err(seen) => asked = seen,
-            }
+        let _one = self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let granted = if budget == 0 {
+            extra
+        } else {
+            let asked = |class: SocketClass| self.class_asked[class as usize].load(Ordering::Relaxed);
+            let own = asked(class);
+            let from_reserve = extra.min(self.reserve(class).saturating_sub(own));
+            // What every class took beyond its own share is the common
+            // rest's.
+            let common_used: u64 = SocketClass::ALL
+                .iter()
+                .map(|other| asked(*other).saturating_sub(self.reserve(*other)))
+                .sum();
+            let from_common =
+                (extra - from_reserve).min(self.common().saturating_sub(common_used));
+            from_reserve + from_common
+        };
+        self.class_asked[class as usize].fetch_add(granted, Ordering::Relaxed);
+        self.asked.fetch_add(granted, Ordering::Relaxed);
+        if granted < extra {
+            self.clamped.fetch_add(1, Ordering::Relaxed);
+            self.class_clamped[class as usize].fetch_add(1, Ordering::Relaxed);
         }
+        current.saturating_add(usize::try_from(granted).unwrap_or(usize::MAX))
     }
 }
 
@@ -581,6 +668,9 @@ pub static SOCKETS: SocketBudget = SocketBudget {
     budget: AtomicU64::new(0),
     asked: AtomicU64::new(0),
     clamped: AtomicU64::new(0),
+    class_asked: [AtomicU64::new(0), AtomicU64::new(0)],
+    class_clamped: [AtomicU64::new(0), AtomicU64::new(0)],
+    lock: std::sync::Mutex::new(()),
 };
 
 #[cfg(test)]
@@ -745,22 +835,88 @@ mod tests {
 
     #[test]
     fn the_sockets_share_one_budget() {
+        use SocketClass::{CacheMesh, VideoReceive};
         let budget = SocketBudget::default();
         budget.set_budget(100 * MB);
         let floor = 8 * MB as usize;
-        // Growth beyond the sizes the sockets were made with shares it.
-        let a = budget.grow(floor, 88 * MB as usize);
-        assert_eq!(a, 88 * MB as usize);
-        let b = budget.grow(floor, 88 * MB as usize);
-        assert_eq!(b, 28 * MB as usize);
+        // Growth beyond the sizes the sockets were made with shares it: the
+        // video sockets take their half (50 MB) and the common quarter.
+        let a = budget.grow(VideoReceive, floor, 48 * MB as usize);
+        assert_eq!(a, 48 * MB as usize);
+        let b = budget.grow(VideoReceive, floor, 48 * MB as usize);
+        assert_eq!(b, floor + 35 * MB as usize, "10 of its share, 25 common");
         assert_eq!(budget.clamped(), 1);
         // Spent: the others keep what they were made with, and none shrinks.
-        assert_eq!(budget.grow(floor, 64 * MB as usize), floor);
-        assert_eq!(budget.grow(a, 120 * MB as usize), a);
-        assert_eq!(budget.grow(a, 10 * MB as usize), a);
-        assert_eq!(budget.asked(), 100 * MB);
+        assert_eq!(budget.grow(VideoReceive, floor, 64 * MB as usize), floor);
+        assert_eq!(budget.grow(VideoReceive, a, 120 * MB as usize), a);
+        assert_eq!(budget.grow(VideoReceive, a, 10 * MB as usize), a);
+        assert_eq!(budget.asked(), 75 * MB);
         let open = SocketBudget::default();
-        assert_eq!(open.grow(floor, 256 * MB as usize), 256 * MB as usize);
+        assert_eq!(
+            open.grow(VideoReceive, floor, 256 * MB as usize),
+            256 * MB as usize
+        );
+        // The cache mesh's share is its own: the video sockets took all
+        // they could, and its socket still grows by its quarter.
+        let mesh = budget.grow(CacheMesh, floor, 64 * MB as usize);
+        assert_eq!(mesh, floor + 25 * MB as usize);
+        assert_eq!(budget.asked(), 100 * MB);
+        let snapshot = budget.class_snapshot(CacheMesh);
+        assert_eq!((snapshot.reserve_bytes, snapshot.asked_bytes, snapshot.clamped), (25 * MB, 25 * MB, 1));
+    }
+
+    /// send240 (D): cmpd8's edge, whose two video receive sockets asked two
+    /// seconds of 4K (62 MB each at 247 Mbit/s) before the cache mesh's
+    /// asked anything: the cache mesh's socket still gets its share, in
+    /// whichever order they ask. A 4 GB node's shares are printed.
+    #[test]
+    fn a_4k_edge_s_video_sockets_leave_the_cache_mesh_its_share() {
+        use SocketClass::{CacheMesh, VideoReceive};
+        let budgets = Budgets::resolve(
+            four_gb(),
+            MemSetting::Auto,
+            MemSetting::Auto,
+            MemSetting::Auto,
+            MemSetting::Auto,
+            MemSetting::Auto,
+        );
+        let floor = 8 * MB as usize;
+        let two_seconds = 62 * MB as usize;
+        for video_first in [true, false] {
+            let budget = SocketBudget::default();
+            budget.set_budget(budgets.socket_bytes);
+            let (mut primary, mut secondary, mut mesh) = (floor, floor, floor);
+            for _ in 0..3 {
+                if video_first {
+                    primary = budget.grow(VideoReceive, primary, two_seconds);
+                    secondary = budget.grow(VideoReceive, secondary, two_seconds);
+                    mesh = budget.grow(CacheMesh, mesh, two_seconds);
+                } else {
+                    mesh = budget.grow(CacheMesh, mesh, two_seconds);
+                    primary = budget.grow(VideoReceive, primary, two_seconds);
+                    secondary = budget.grow(VideoReceive, secondary, two_seconds);
+                }
+            }
+            let reserve = budget.reserve(CacheMesh) as usize;
+            assert!(mesh >= floor + reserve, "the cache mesh keeps its share");
+            assert!(
+                primary - floor + secondary - floor >= budget.reserve(VideoReceive) as usize,
+                "the video sockets keep theirs"
+            );
+            assert!(budget.asked() <= budgets.socket_bytes);
+            println!(
+                "4 GB node, sockets {} MB asked: video receive share {} MB, cache mesh share {} MB, \
+                 common {} MB; {} first: video sockets grew to {} + {} MB, cache mesh to {} MB",
+                budgets.socket_bytes / MB,
+                budget.reserve(VideoReceive) / MB,
+                budget.reserve(CacheMesh) / MB,
+                budget.common() / MB,
+                if video_first { "video" } else { "cache mesh" },
+                primary as u64 / MB,
+                secondary as u64 / MB,
+                mesh as u64 / MB,
+            );
+        }
     }
 
     #[test]

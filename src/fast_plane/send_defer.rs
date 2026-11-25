@@ -246,8 +246,9 @@ impl DeferStats {
     }
 }
 
-/// The pools' bytes of the whole process, for the memory guard's account.
-pub static POOL_BYTES: AtomicU64 = AtomicU64::new(0);
+/// The pools' bytes of the whole process: the memory guard's account
+/// (`/api/node` `memory.send_defer_bytes`).
+use av_mesh::mem_guard::SEND_DEFER_BYTES as POOL_BYTES;
 
 /// One class thread's kept datagrams.
 pub struct SendDefer {

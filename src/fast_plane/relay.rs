@@ -2973,7 +2973,11 @@ impl VideoSocketBuffers {
             let target = video_socket_buffer_target(per_second, self.ms, self.floor, self.max);
             // The node's sockets share one budget (memory round).
             let target = if self.ms > 0 && target > self.asked[lane] {
-                av_mesh::mem_guard::SOCKETS.grow(self.asked[lane], target)
+                av_mesh::mem_guard::SOCKETS.grow(
+                    av_mesh::mem_guard::SocketClass::VideoReceive,
+                    self.asked[lane],
+                    target,
+                )
             } else {
                 target
             };
