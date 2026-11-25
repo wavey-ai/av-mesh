@@ -120,6 +120,12 @@ const BUSY_REFUSALS: [&str; 2] = ["edge-busy", "edge-full"];
 /// that its edge's distress asks for (rule 4).
 pub const LATE_PARTS: &str = "late-parts";
 pub const MISSING_PARTS: &str = "missing-parts";
+/// A leaving leg of a stream of objects is kept, after its replacement's
+/// first object, until the replacement has brought a part at least as new
+/// as the newest the leaving leg brought, or this long after the move
+/// (place240: parts the old leg completed during the overlap were lost
+/// with it when it went at the first object).
+pub const OBJECT_HANDOVER_MAX: Duration = Duration::from_secs(2);
 /// Defaults of `--quality-hold-off-ms` (a node left for late or missing
 /// parts is not taken again for this long), `--quality-moves-per-minute`,
 /// `--quality-no-better-ms` and `--quality-giveup-ms`.
@@ -194,6 +200,9 @@ pub struct LegView {
     /// The leg's median lag behind the first arrival over the last 32
     /// delivered parts (zero when it was first).
     pub lag: Option<Duration>,
+    /// The highest part the leg brought whole (a first arrival or a
+    /// duplicate).
+    pub highest: Option<u64>,
 }
 
 /// Why the session gave a leg up.
@@ -3083,7 +3092,17 @@ impl Director {
                     return false;
                 }
                 if self.objects {
-                    return true;
+                    // Until the new leg has caught up with what the old one
+                    // brought (bounded): what the old leg completes in the
+                    // overlap is taken, and none of its parts is lost
+                    // with it.
+                    let old_highest = Self::view(legs, old.key, now).highest;
+                    let new_highest = Self::view(legs, new.key, now).highest;
+                    return match (old_highest, new_highest) {
+                        (Some(old), Some(new)) => new >= old,
+                        (None, _) => true,
+                        (Some(_), None) => false,
+                    } || now >= *moved_at + OBJECT_HANDOVER_MAX;
                 }
                 let first = Self::view(legs, new.key, now).first_part;
                 let holes_ok = match (hole, first) {
@@ -6466,6 +6485,54 @@ mod tests {
             reason: "distress-tee-shed".into(),
         });
         assert!(w.leaving("e2"), "both legs said so");
+    }
+
+    /// Place240 follow-up 2: a leaving leg of a stream of objects is kept
+    /// after its replacement's first object until the replacement has
+    /// brought a part as new as the newest the old leg brought (what the
+    /// old leg completes in the overlap is taken, none is lost with it), or
+    /// OBJECT_HANDOVER_MAX after the move.
+    #[test]
+    fn an_objects_leg_is_released_once_its_replacement_has_caught_up() {
+        let mut w = one_leg_viewer("catch-up-1");
+        let e1 = w.key("e1");
+        w.view("e1", |view| view.highest = Some(1_000));
+        w.event(LegEvent::Degraded {
+            leg: e1,
+            reason: LATE_PARTS.into(),
+        });
+        let (to, nonce, _) = w.requests().pop().unwrap();
+        w.answer(to, nonce, vec![cache(3)], 1, false, None);
+        w.live("e3");
+        // The new leg's first object is part 990: the old leg's 991-1000
+        // may still come only from the old leg.
+        w.view("e3", |view| view.highest = Some(990));
+        w.run_to(w.ms() + 100);
+        assert!(!w.s.legs[&e1].released, "kept until the new leg caught up");
+        w.view("e1", |view| view.highest = Some(1_004));
+        w.view("e3", |view| view.highest = Some(1_003));
+        w.run_to(w.ms() + 100);
+        assert!(!w.s.legs[&e1].released);
+        w.view("e3", |view| view.highest = Some(1_004));
+        w.run_to(w.ms() + 10);
+        assert!(w.s.legs[&e1].released);
+        // A replacement that never catches up: released at the limit.
+        let mut w = one_leg_viewer("catch-up-2");
+        let e1 = w.key("e1");
+        w.view("e1", |view| view.highest = Some(1_000));
+        w.event(LegEvent::Degraded {
+            leg: e1,
+            reason: LATE_PARTS.into(),
+        });
+        let moved = w.ms();
+        let (to, nonce, _) = w.requests().pop().unwrap();
+        w.answer(to, nonce, vec![cache(3)], 1, false, None);
+        w.live("e3");
+        w.view("e3", |view| view.highest = Some(900));
+        w.run_to(moved + OBJECT_HANDOVER_MAX.as_millis() as u64 - 50);
+        assert!(!w.s.legs[&e1].released);
+        w.run_to(moved + OBJECT_HANDOVER_MAX.as_millis() as u64 + 10);
+        assert!(w.s.legs[&e1].released);
     }
 
     /// Place240 follow-up 3: an edge's own cap refuses `edge-busy` when two

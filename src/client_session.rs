@@ -2310,6 +2310,7 @@ impl SessionLegs for UdpSession {
             last_media: leg.last_media,
             last_datagram: leg.heard_at,
             lag: self.receiver.compact.leg_lag(leg.id),
+            highest: self.receiver.compact.leg_highest(leg.id),
         })
     }
 
