@@ -4917,12 +4917,16 @@ async fn main() -> Result<()> {
                 .as_ref()
                 .map(|lane| lane.threads.clone())
                 .unwrap_or_default();
-            let stats = Arc::clone(&router.edge_udp_stats);
-            let admit = Arc::new(cpu_admit::CpuAdmit::new(
-                config,
-                threads,
-                Arc::new(move || stats.egress_datagrams()),
-            ));
+            // What a datagram costs is measured on the fan-out threads'
+            // sends (their wall time over them).
+            let sends: cpu_admit::Counter = match fast_lane.as_ref() {
+                Some(lane) => {
+                    let lane = Arc::clone(lane);
+                    Arc::new(move || lane.stats.fanout_sends.load(Ordering::Relaxed))
+                }
+                None => Arc::new(|| 0),
+            };
+            let admit = Arc::new(cpu_admit::CpuAdmit::new(config, threads, sends));
             info!(
                 cpus = ?admit.cpus(),
                 cpus_full_permille = admit.config.cpus_full_permille,

@@ -55,10 +55,13 @@ pub(crate) const DEFAULT_SAMPLE_MS: u64 = 500;
 /// the measured cost (6-7 µs in process with the receivers' path on the
 /// edge's CPUs) replaces it once the edge has sent 2,000 datagrams.
 pub(crate) const DEFAULT_DATAGRAM_NS: u64 = 3_000;
-/// Legs admitted and not yet in the measured term may add at most this
-/// (thousandths of full): a burst of joins at a cold edge, priced at the
-/// floor, cannot fill it before the samples show what they cost.
-pub(crate) const DEFAULT_PENDING_MAX_PERMILLE: u32 = 300;
+/// While the edge has not measured what a datagram costs it (its fan-out
+/// has not sent 2,000 in a window), the legs admitted and not yet in the
+/// measured term may add at most this (thousandths of full): a burst of
+/// joins at a cold edge, priced at the floor, cannot fill it. The lab's
+/// veths cost 18-30 µs a datagram, ten times the floor: at 300 the cold
+/// burst of 150 legs an edge took both CPUs to 1,000.
+pub(crate) const DEFAULT_PENDING_MAX_PERMILLE: u32 = 100;
 pub(crate) const DEFAULT_SHED_AFTER_MS: u64 = 2_000;
 /// Legs asked to leave in one round at most.
 pub(crate) const DEFAULT_SHED_PER_ROUND: usize = 32;
@@ -76,7 +79,8 @@ pub(crate) struct CpuAdmitConfig {
     pub(crate) window: Duration,
     pub(crate) sample_every: Duration,
     pub(crate) datagram_ns: u64,
-    /// The legs admitted since the samples may add at most this.
+    /// Before the edge has measured a datagram's cost, the legs admitted
+    /// since the samples may add at most this.
     pub(crate) pending_max_permille: u32,
     /// Over full this long, the edge sheds (zero: it never does).
     pub(crate) shed_after: Duration,
@@ -428,7 +432,7 @@ pub(crate) enum CpuRefusal {
 
 impl CpuAdmit {
     /// `threads`: the edge's send threads (its fast lane's registry);
-    /// `datagrams`: its client datagrams sent so far.
+    /// `datagrams`: the sends its fan-out threads made so far.
     pub(crate) fn new(config: CpuAdmitConfig, threads: ThreadRegistry, datagrams: Counter) -> Self {
         let cpus = if config.cpus.is_empty() {
             affinity_cpus()
@@ -573,8 +577,13 @@ impl CpuAdmit {
             if !thread.group.in_term() {
                 continue;
             }
-            send_ns += ns;
             send_threads += 1;
+            // The cost of a datagram: the fan-out pool's wall time over its
+            // sends (a class thread's time is mostly its receipt of the
+            // stream, whatever its few inline sends).
+            if thread.group == ThreadGroup::Fanout {
+                send_ns += ns;
+            }
             let thread_term = thread_permille.saturating_mul(1_000) / thread_full;
             if thread_term > permille {
                 permille = thread_term;
@@ -674,6 +683,7 @@ impl CpuAdmit {
         let pending = self.pending_permille(&state, now);
         let load = state.verdict.permille.saturating_add(pending);
         if self.enforcing()
+            && state.last_cost.is_none()
             && pending.saturating_add(charge) > self.config.pending_max_permille.max(charge)
             && load.saturating_add(charge) <= 1_000
         {
@@ -902,8 +912,9 @@ pub(crate) struct CpuAdmitArgs {
     /// floor of a leg's charge before the edge has measured its own.
     #[arg(id = "cpu_admit_datagram_ns", long = "cpu-admit-datagram-ns", default_value_t = DEFAULT_DATAGRAM_NS)]
     pub(crate) datagram_ns: u64,
-    /// The legs admitted since the last samples may add at most this
-    /// (thousandths of full): a burst of joins waits for the samples.
+    /// Before the edge has measured what a datagram costs it, the legs
+    /// admitted since the last samples may add at most this (thousandths
+    /// of full): a burst of joins at a cold edge waits for the samples.
     #[arg(id = "cpu_admit_pending_max_permille", long = "cpu-admit-pending-max-permille", default_value_t = DEFAULT_PENDING_MAX_PERMILLE)]
     pub(crate) pending_max_permille: u32,
     /// Over full this long, the edge asks two-leg listeners to give up
@@ -1000,6 +1011,9 @@ mod tests {
         }
         assert_eq!(burst, DEFAULT_PENDING_MAX_PERMILLE / 4);
         assert_eq!(admit.admit_leg(1_000.0), Err(CpuRefusal::Pending));
+        // Measured, a leg is priced at its cost and only full refuses.
+        admit.state.lock().unwrap().last_cost = Some(5_000);
+        assert!(admit.admit_leg(1_000.0).is_ok());
         let admit = super::tests::admit(2);
         admit.force_verdict(verdict(900, "cpus"), None);
         let mut admitted = 0;
