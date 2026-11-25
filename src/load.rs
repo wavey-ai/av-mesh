@@ -302,10 +302,10 @@ pub struct Counters {
     pub stranded: u64,
     pub resuming: u64,
     pub never_resumed: u64,
-    /// Joins: of `never_resumed`, the listeners whose edges still sent them
-    /// datagrams (`WAIT`s) within the interruption's length of the newest
-    /// datagram: held, not dead, the subscription anchored at a part the
-    /// stream does not send (an old session's number).
+    /// Joins: listeners whose edges went on sending them datagrams
+    /// (`WAIT`s) for a second and more after their last part: held, not
+    /// dead, the subscription anchored at a part the stream does not send
+    /// (an old session's number).
     pub anchored_stale: u64,
     /// Joins: each listener's time from the start of a session of the
     /// stream (its part 0's publication, from the first part's publication
@@ -938,6 +938,9 @@ pub const LOAD_KNOWN_PARTS: usize = 512;
 pub const DEFAULT_SETTLE_MS: u64 = 3_500;
 /// `--interrupt-ms`.
 pub const DEFAULT_INTERRUPT_MS: u64 = 30;
+/// A listener whose edges sent it datagrams this long after its last part
+/// is `anchored_stale` (joins): held on WAITs, not a host's stall.
+pub const ANCHORED_STALE_US: u64 = 1_000_000;
 
 /// The latency histograms of an interval line that carry their buckets, so
 /// that a window of intervals (of several load hosts) merges into a p99.
@@ -2074,10 +2077,10 @@ fn handle_datagram(
     let (edge, leg) = listener.sender(peer);
     ensure(counters, edge);
     let arrival_us = datagram.kernel_us.unwrap_or(now_us);
-    // Every datagram the worker read, a WAIT too (joins: listeners held on
-    // WAITs and nothing else made the newest datagram their last part, and
-    // `never_resumed` never counted them).
-    drive.newest_us = drive.newest_us.max(arrival_us);
+    // Its newest datagram of any kind, a WAIT too (joins: `anchored_stale`).
+    // The worker's newest stays its newest media (`never_resumed`): every
+    // datagram made a host that lags in the suite count hundreds of
+    // listeners never resumed (integration 6, load_mode_moves_spread).
     listener.last_datagram_us = listener.last_datagram_us.max(arrival_us);
     // The load host's own lag: the time from the kernel's receive timestamp
     // to now, which neither the latency nor the time to first part holds.
@@ -2108,6 +2111,7 @@ fn handle_datagram(
             if let Some(leg) = leg {
                 listener.legs[leg].last_media_us = arrival_us;
             }
+            drive.newest_us = drive.newest_us.max(arrival_us);
         }
         Received::Subscribed { .. } => {
             if !listener.subscribed_once {
@@ -2821,9 +2825,18 @@ fn worker(
                 {
                     ensure(&mut counters, listener.home);
                     counters[listener.home].never_resumed += 1;
-                    if drive.newest_us.saturating_sub(listener.last_datagram_us) < interrupt_us {
-                        counters[listener.home].anchored_stale += 1;
-                    }
+                }
+                // Held, not dead (joins): its edges went on sending it
+                // datagrams (WAITs) for a second and more after its last
+                // part. Counted whether or not the worker's other
+                // listeners had media (a worker whose listeners were all
+                // held read no media to judge `never_resumed` by).
+                if listener.last_first.is_some_and(|(_, at_us, _)| {
+                    listener.last_datagram_us.saturating_sub(at_us)
+                        >= interrupt_us.max(ANCHORED_STALE_US)
+                }) {
+                    ensure(&mut counters, listener.home);
+                    counters[listener.home].anchored_stale += 1;
                 }
             }
         }
