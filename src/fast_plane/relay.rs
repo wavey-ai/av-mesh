@@ -2747,13 +2747,26 @@ impl Tee {
                     // leaves it out (edge_admission::PLAYLIST_CPU_US).
                     let cpu_before = crate::edge_admission::thread_cpu_us();
                     let wall_before = Instant::now();
+                    // One clock read an item (teeperf: there were four):
+                    // the time an item is taken is the batch's wall clock
+                    // and the time the items before it took; its processing
+                    // ends at the next read.
+                    let batch_unix_us = now_unix_us();
+                    let mut taken = wall_before;
                     let mut lag_max_us = 0;
                     for _ in 0..TEE_WAKE_ENTRIES {
                         let Some((meta, bytes)) = items.peek() else {
                             break;
                         };
-                        lag_max_us = lag_max_us.max(now_unix_us().saturating_sub(meta.woken_us));
-                        self.process(meta, bytes).await;
+                        let now_us = batch_unix_us
+                            + taken.saturating_duration_since(wall_before).as_micros() as u64;
+                        let lag_us = now_us.saturating_sub(meta.woken_us);
+                        lag_max_us = lag_max_us.max(lag_us);
+                        self.process(meta, bytes, lag_us).await;
+                        let done = Instant::now();
+                        self.cache
+                            .record_relay_processing(done.saturating_duration_since(taken));
+                        taken = done;
                         items.release();
                     }
                     if let Some(requester) = self.requester.as_mut() {
@@ -3143,15 +3156,19 @@ impl Tee {
         }
     }
 
-    async fn process(&mut self, item: TeeMeta, bytes: &[u8]) {
+    /// One item of the ring, `lag_us` after its batch's wake. The caller
+    /// records its processing time.
+    async fn process(&mut self, item: TeeMeta, bytes: &[u8], lag_us: u64) {
         #[cfg(test)]
         assert!(!self.panic_on_item, "test: the tee panics");
-        let started = Instant::now();
         #[cfg(test)]
-        while (started.elapsed().as_nanos() as u64) < self.spin_ns {
-            std::hint::spin_loop();
+        {
+            let started = Instant::now();
+            while (started.elapsed().as_nanos() as u64) < self.spin_ns {
+                std::hint::spin_loop();
+            }
         }
-        stall_tee(self.class, now_unix_us().saturating_sub(item.woken_us));
+        stall_tee(self.class, lag_us);
         match item.kind {
             TeeKind::Admitted {
                 forwarded,
@@ -3164,7 +3181,6 @@ impl Tee {
                 self.process_unchecked(&item, bytes).await;
             }
         }
-        self.cache.record_relay_processing(started.elapsed());
     }
 
     async fn process_unchecked(&mut self, item: &TeeMeta, bytes: &[u8]) {
@@ -3231,7 +3247,7 @@ impl Tee {
             || self.requester.is_some()
             || self.part_repair.is_some()
             || self.dispatch.receiver().defers_decode())
-        .then(|| RlsView::parse(bytes, self.limits).ok())
+        .then(|| RlsView::parse_admitted(bytes, self.limits).ok())
         .flatten();
         // Part repair takes any part of several symbols, whatever its
         // stream (4k-repair: by size, not by media kind).

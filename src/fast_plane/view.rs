@@ -114,7 +114,11 @@ impl<'a> Reader<'a> {
 /// `DatagramFecHeader::payload`, with the CRC taken in one pass over the
 /// wire bytes: the header prefix that the CRC covers is exactly the first 28
 /// bytes of a header that decoded.
-fn rqd2_payload<'a>(header: &DatagramFecHeader, fec: &'a [u8]) -> Result<&'a [u8], ViewError> {
+fn rqd2_payload<'a>(
+    header: &DatagramFecHeader,
+    fec: &'a [u8],
+    check_crc: bool,
+) -> Result<&'a [u8], ViewError> {
     let extension = if header.packet_flags & DATAGRAM_FLAG_AUDIO_SESSION_ID != 0 {
         DATAGRAM_AUDIO_SESSION_ID_LEN
     } else {
@@ -124,7 +128,7 @@ fn rqd2_payload<'a>(header: &DatagramFecHeader, fec: &'a [u8]) -> Result<&'a [u8
     if fec.len() - RQD2_HEADER_LEN != payload_len.saturating_add(extension) {
         return Err(ViewError("fec payload length"));
     }
-    if header.packet_flags & DATAGRAM_FLAG_PACKET_CRC32 != 0 {
+    if check_crc && header.packet_flags & DATAGRAM_FLAG_PACKET_CRC32 != 0 {
         let mut crc = crc32fast::Hasher::new();
         crc.update(&fec[..RQD2_HEADER_LEN - 4]);
         crc.update(&fec[RQD2_HEADER_LEN..]);
@@ -139,6 +143,22 @@ impl<'a> RlsView<'a> {
     /// Read an RLS1 datagram in place. Accepts exactly what
     /// `relay_session::decode_datagram(input, limits)` accepts.
     pub fn parse(input: &'a [u8], limits: RelayLimits) -> Result<Self, ViewError> {
+        Self::parse_checked(input, limits, true)
+    }
+
+    /// [`Self::parse`] of the bytes of a datagram that a class thread
+    /// parsed and admitted (the tee's copy in its ring, teeperf): the same
+    /// view, without computing the RQD2 CRC a second time.
+    pub fn parse_admitted(input: &'a [u8], limits: RelayLimits) -> Result<Self, ViewError> {
+        Self::parse_checked(input, limits, false)
+    }
+
+    #[inline(always)]
+    fn parse_checked(
+        input: &'a [u8],
+        limits: RelayLimits,
+        check_crc: bool,
+    ) -> Result<Self, ViewError> {
         if input.len() > limits.max_datagram_bytes {
             return Err(ViewError("datagram too long"));
         }
@@ -216,7 +236,7 @@ impl<'a> RlsView<'a> {
             return Err(ViewError("fec datagram too short"));
         }
         let header = DatagramFecHeader::decode(fec).map_err(|_| ViewError("fec header"))?;
-        let payload = rqd2_payload(&header, fec)?;
+        let payload = rqd2_payload(&header, fec, check_crc)?;
         if payload.len() < PAYLOAD_ID_LEN {
             return Err(ViewError("fec payload too short"));
         }

@@ -721,9 +721,110 @@ impl From<&ObjectKey> for LogicalObjectIdentity {
 }
 
 /// What tells a replayed symbol from another copy of it: the RQD2
-/// datagram's 64-bit hash (teeperf: was its SHA-256, the tee's largest cost
-/// per datagram; nothing here is a security boundary, the part's payload
-/// hash is checked once it is whole) and its role.
+/// datagram's fingerprint ([`datagram_fingerprint`]; teeperf: was its
+/// SHA-256, the tee's largest cost per datagram; nothing here is a security
+/// boundary, the part's payload hash is checked once it is whole) and its
+/// role.
+/// An RQD2 datagram's fingerprint: its packet CRC-32, which the decode (or
+/// the fast plane's view) verified over its header and payload, with its
+/// length; its xxh3-64 when it carries no CRC (teeperf: no pass over the
+/// datagram for this).
+fn datagram_fingerprint(fec: &[u8]) -> u64 {
+    const RQD2_HEADER_LEN: usize = 32;
+    match fec.get(..RQD2_HEADER_LEN) {
+        Some(header) if header[7] & raptorq_datagram_fec::DATAGRAM_FLAG_PACKET_CRC32 != 0 => {
+            u64::from(u32::from_le_bytes([header[28], header[29], header[30], header[31]]))
+                | (fec.len() as u64) << 32
+        }
+        _ => xxh3_64(fec),
+    }
+}
+
+/// The receiver's tables' hasher (teeperf): a multiply-rotate hash with a
+/// random seed for each table. Their keys come from authenticated parents
+/// only; SipHash of an object key (three names, four numbers and a 32-byte
+/// hash, written field by field) cost the tee about 0.3 µs a lookup, three
+/// lookups a datagram.
+#[derive(Clone, Copy, Debug)]
+pub struct FastState(u64);
+
+impl Default for FastState {
+    fn default() -> Self {
+        use std::hash::BuildHasher;
+        Self(std::collections::hash_map::RandomState::new().hash_one(0x7ee5_u64) | 1)
+    }
+}
+
+impl std::hash::BuildHasher for FastState {
+    type Hasher = FastHasher;
+
+    fn build_hasher(&self) -> FastHasher {
+        FastHasher(self.0)
+    }
+}
+
+/// [`FastState`]'s hasher.
+#[derive(Clone, Copy, Debug)]
+pub struct FastHasher(u64);
+
+impl FastHasher {
+    #[inline]
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
+impl std::hash::Hasher for FastHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            self.add(u64::from_le_bytes(chunk.try_into().expect("eight bytes")));
+        }
+        let rest = chunks.remainder();
+        let mut last = [0_u8; 8];
+        last[..rest.len()].copy_from_slice(rest);
+        self.add(u64::from_le_bytes(last) ^ ((rest.len() as u64) << 59));
+    }
+
+    #[inline]
+    fn write_u8(&mut self, value: u8) {
+        self.add(u64::from(value));
+    }
+
+    #[inline]
+    fn write_u16(&mut self, value: u16) {
+        self.add(u64::from(value));
+    }
+
+    #[inline]
+    fn write_u32(&mut self, value: u32) {
+        self.add(u64::from(value));
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.add(value);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.add(value as u64);
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        // The finaliser of MurmurHash3: every bit of the state in the low
+        // and the high bits the table uses.
+        let mut hash = self.0;
+        hash ^= hash >> 33;
+        hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        hash ^= hash >> 33;
+        hash = hash.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        hash ^ (hash >> 33)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SymbolFingerprint {
     datagram_hash: u64,
@@ -736,8 +837,8 @@ struct ActiveObject {
     assembler: ObjectAssembler,
     /// The assembly of a part decoded off the receiver's thread.
     deferred: Option<Deferred>,
-    parent_sessions: HashSet<u64>,
-    symbols: HashMap<u32, SymbolFingerprint>,
+    parent_sessions: HashSet<u64, FastState>,
+    symbols: HashMap<u32, SymbolFingerprint, FastState>,
     source_symbols: usize,
     repair_symbols: usize,
     reserved_bytes: usize,
@@ -747,7 +848,7 @@ struct ActiveObject {
 #[derive(Debug)]
 struct CompletedObject {
     announcement: ObjectAnnouncement,
-    parent_sessions: HashSet<u64>,
+    parent_sessions: HashSet<u64, FastState>,
 }
 
 /// The identity of a compact object, without its payload hash (a compact
@@ -823,10 +924,10 @@ const COMPACT_TEMPLATE_MAX_ENVELOPE: usize = 2_048;
 /// Bounded cross-parent object receiver.
 pub struct RelayObjectReceiver {
     config: RelayObjectReceiverConfig,
-    sessions: HashMap<u64, AuthenticatedRelayParentSession>,
-    objects: HashMap<ObjectKey, ActiveObject>,
-    logical_keys: HashMap<LogicalObjectIdentity, ObjectKey>,
-    completed: HashMap<ObjectKey, CompletedObject>,
+    sessions: HashMap<u64, AuthenticatedRelayParentSession, FastState>,
+    objects: HashMap<ObjectKey, ActiveObject, FastState>,
+    logical_keys: HashMap<LogicalObjectIdentity, ObjectKey, FastState>,
+    completed: HashMap<ObjectKey, CompletedObject, FastState>,
     completed_order: VecDeque<ObjectKey>,
     buffered_object_bytes: usize,
     buffered_datagrams: usize,
@@ -872,15 +973,21 @@ impl RelayObjectReceiver {
         config.validate()?;
         Ok(Self {
             config,
-            sessions: HashMap::new(),
-            objects: HashMap::new(),
+            sessions: HashMap::default(),
+            objects: HashMap::default(),
             // A completed object keeps its logical key until it is evicted:
             // both tables hold up to `max_completed_objects` and are sized
             // for that once, so they never grow under the tee (growing them
             // rehashed thousands of string keys, which held a 1 ms stream's
             // commits for 2-5 ms at its 1,792nd and 3,584th part).
-            logical_keys: HashMap::with_capacity(config.max_completed_objects),
-            completed: HashMap::with_capacity(config.max_completed_objects),
+            logical_keys: HashMap::with_capacity_and_hasher(
+                config.max_completed_objects,
+                FastState::default(),
+            ),
+            completed: HashMap::with_capacity_and_hasher(
+                config.max_completed_objects,
+                FastState::default(),
+            ),
             completed_order: VecDeque::with_capacity(config.max_completed_objects),
             buffered_object_bytes: 0,
             buffered_datagrams: 0,
@@ -1104,7 +1211,8 @@ impl RelayObjectReceiver {
         }
 
         let assembler = ObjectAssembler::new(announcement.clone(), self.config.relay_limits)?;
-        let mut parent_sessions = HashSet::with_capacity(self.config.max_parents_per_object);
+        let mut parent_sessions =
+            HashSet::with_capacity_and_hasher(self.config.max_parents_per_object, FastState::default());
         parent_sessions.insert(session_id);
         self.logical_keys.insert(logical, announcement.key.clone());
         self.objects.insert(
@@ -1116,7 +1224,7 @@ impl RelayObjectReceiver {
                 announcement,
                 assembler,
                 parent_sessions,
-                symbols: HashMap::new(),
+                symbols: HashMap::default(),
                 source_symbols: 0,
                 repair_symbols: 0,
                 reserved_bytes,
@@ -1328,7 +1436,7 @@ impl RelayObjectReceiver {
         let header =
             DatagramFecHeader::decode(&symbol.fec_datagram).map_err(relay_session::Error::from)?;
         let fingerprint = SymbolFingerprint {
-            datagram_hash: xxh3_64(&symbol.fec_datagram),
+            datagram_hash: datagram_fingerprint(&symbol.fec_datagram),
             role: symbol.role,
         };
         if let Some(existing) = state.symbols.get(&header.packet_sequence) {
@@ -1558,7 +1666,7 @@ impl RelayObjectReceiver {
             .get_mut(key)
             .ok_or(RelayIngressError::AnnouncementRequired)?;
         let fingerprint = SymbolFingerprint {
-            datagram_hash: xxh3_64(symbol.fec),
+            datagram_hash: datagram_fingerprint(symbol.fec),
             role: symbol.role,
         };
         if let Some(existing) = state.symbols.get(&symbol.packet_sequence) {
@@ -2082,8 +2190,8 @@ impl RelayObjectReceiver {
 }
 
 fn add_parent_to_set(
-    sessions: &HashMap<u64, AuthenticatedRelayParentSession>,
-    parent_sessions: &mut HashSet<u64>,
+    sessions: &HashMap<u64, AuthenticatedRelayParentSession, FastState>,
+    parent_sessions: &mut HashSet<u64, FastState>,
     candidate: &AuthenticatedRelayParentSession,
     max_parents: usize,
 ) -> Result<(), RelayIngressError> {
@@ -2499,16 +2607,16 @@ pub enum RelayUdpDispatchOutcome {
 #[derive(Debug)]
 pub struct RelayUdpDispatch {
     receiver: RelayObjectReceiver,
-    sessions_by_peer: HashMap<SocketAddr, u64>,
-    controlled_announcement_sessions: HashSet<u64>,
+    sessions_by_peer: HashMap<SocketAddr, u64, FastState>,
+    controlled_announcement_sessions: HashSet<u64, FastState>,
 }
 
 impl RelayUdpDispatch {
     pub fn new(receiver: RelayObjectReceiver) -> Self {
         Self {
             receiver,
-            sessions_by_peer: HashMap::new(),
-            controlled_announcement_sessions: HashSet::new(),
+            sessions_by_peer: HashMap::default(),
+            controlled_announcement_sessions: HashSet::default(),
         }
     }
 
