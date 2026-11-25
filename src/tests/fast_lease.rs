@@ -1176,7 +1176,7 @@ async fn an_edge_takes_up_the_epoch_of_its_cache_mesh_copy() {
             &[sequence as u8; 120],
         );
         let object = media_object::decode(&envelope).unwrap();
-        commit_relay_object(&cache, object, envelope.to_vec())
+        commit_relay_object(&cache, object, Bytes::copy_from_slice(&envelope), None)
             .await
             .unwrap();
     };

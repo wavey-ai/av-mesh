@@ -2876,7 +2876,8 @@ impl Tee {
         &mut self,
         ctx: DecodedCtx,
         object: Box<media_object::MediaObject>,
-        envelope: Vec<u8>,
+        envelope: bytes::Bytes,
+        slot: Option<bytes::Bytes>,
         parent_count: usize,
         accepted_datagrams: usize,
     ) {
@@ -2935,7 +2936,7 @@ impl Tee {
         let canonical = !av_mesh::canonical_slot::is_soundkit_v2_bundle(&object)
             && object.kind() == media_object::ObjectKind::Media;
         let media = object.kind() == media_object::ObjectKind::Media;
-        // A copy of the envelope only for a stream with clients.
+        // The envelope for a stream with clients (shared, not copied).
         let top_up_envelope = fast_lane
             .as_ref()
             .filter(|(lane, stream_id)| lane.load().streams.contains_key(stream_id))
@@ -2943,7 +2944,7 @@ impl Tee {
         if let (Some(part), Some(repair)) = (kept, &self.part_repair) {
             repair.keep(part, &missing, |loss| self.part_children(&stream, loss));
         }
-        match commit_relay_object(&self.cache, *object, envelope).await {
+        match commit_relay_object(&self.cache, *object, envelope, slot).await {
             // Another copy came first (the cache mesh, or the other form of
             // the part): its clients and the journal have it. The parent is
             // live all the same, and the stream commits canonical slots all
@@ -3049,11 +3050,12 @@ impl Tee {
             Ok(Some(RelayIngressOutcome::Decoded {
                 object,
                 envelope,
+                slot,
                 parent_count,
                 accepted_datagrams,
                 ..
             })) => {
-                self.on_decoded(ctx, object, envelope, parent_count, accepted_datagrams)
+                self.on_decoded(ctx, object, envelope, slot, parent_count, accepted_datagrams)
                     .await;
             }
             Ok(_) => {}
@@ -3332,6 +3334,7 @@ impl Tee {
             Ok(ParsedOutcome::Decoded(RelayIngressOutcome::Decoded {
                 object,
                 envelope,
+                slot,
                 parent_count,
                 accepted_datagrams,
                 ..
@@ -3345,7 +3348,7 @@ impl Tee {
                     meta: fast_view.as_ref().map(PartMeta::of),
                     missing: Vec::new(),
                 };
-                self.on_decoded(ctx, object, envelope, parent_count, accepted_datagrams)
+                self.on_decoded(ctx, object, envelope, slot, parent_count, accepted_datagrams)
                     .await;
             }
             Ok(ParsedOutcome::Decoded(RelayIngressOutcome::Duplicate { key, .. })) => {

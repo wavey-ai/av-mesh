@@ -154,7 +154,8 @@ async fn a_contributor_object_decodes_on_the_fast_lane_to_the_part_the_tee_commi
         commit_relay_object(
             &cache,
             media_object::decode(&envelope).unwrap(),
-            envelope.to_vec(),
+            Bytes::copy_from_slice(&envelope),
+            None,
         )
         .await
         .unwrap();

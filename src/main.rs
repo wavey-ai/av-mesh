@@ -8658,6 +8658,7 @@ async fn process_udp_fec_ingest_datagram_inner(
         Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Decoded {
             object,
             envelope,
+            slot,
             role,
             parent_count,
             accepted_datagrams,
@@ -8671,7 +8672,7 @@ async fn process_udp_fec_ingest_datagram_inner(
             let stream = object.key().stream().to_owned();
             let sequence = object.key().object();
             let publication_clock = relay_publication_clock(&object);
-            let decoded = match commit_relay_object(cache, *object, envelope).await {
+            let decoded = match commit_relay_object(cache, *object, envelope, slot).await {
                 // Another copy, or one refused and counted: nothing new.
                 Ok(Committed::AlreadyPresent(_)) => true,
                 Ok(Committed::Refused(_)) => false,
@@ -8942,10 +8943,14 @@ impl CommitRefusal {
     }
 }
 
+/// Commit a part the receiver decoded: its envelope, and the canonical
+/// live slot made in place around it when the receiver made one (teeperf:
+/// the cache takes those bytes, no copy).
 async fn commit_relay_object(
     cache: &LiveTsCache,
     object: MediaObject,
-    envelope: Vec<u8>,
+    envelope: Bytes,
+    slot: Option<Bytes>,
 ) -> Result<Committed> {
     let stream_id = object
         .key()
@@ -8953,7 +8958,7 @@ async fn commit_relay_object(
         .parse::<u64>()
         .context("RelaySession object stream identity must map to a local numeric stream")?;
     cache
-        .commit_validated_stream_payload(stream_id, Bytes::from(envelope), object)
+        .commit_stream_payload_inner(stream_id, envelope, Some(object), slot)
         .await
 }
 
@@ -10748,7 +10753,7 @@ impl LiveTsCache {
     }
 
     async fn commit_stream_payload(&self, stream_id: u64, payload: Bytes) -> Result<Committed> {
-        self.commit_stream_payload_inner(stream_id, payload, None)
+        self.commit_stream_payload_inner(stream_id, payload, None, None)
             .await
     }
 
@@ -10758,7 +10763,7 @@ impl LiveTsCache {
         payload: Bytes,
         object: MediaObject,
     ) -> Result<Committed> {
-        self.commit_stream_payload_inner(stream_id, payload, Some(object))
+        self.commit_stream_payload_inner(stream_id, payload, Some(object), None)
             .await
     }
 
@@ -10790,6 +10795,7 @@ impl LiveTsCache {
         stream_id: u64,
         payload: Bytes,
         validated_object: Option<MediaObject>,
+        made_slot: Option<Bytes>,
     ) -> Result<Committed> {
         let bytes = payload.len();
         self.make_room_for(stream_id, bytes).await?;
@@ -10979,8 +10985,23 @@ impl LiveTsCache {
                 .unwrap_or(seq);
             let subscription_base_object = usize::try_from(subscription_base_object)
                 .context("stream subscription base object is too large")?;
+            // A slot the receiver made in place is taken as it is, when its
+            // index is the one this commit would write (teeperf).
+            let made_slot = made_slot.filter(|slot| {
+                reboxed_audio.is_none()
+                    && slot.len() == CANONICAL_LIVE_SLOT_HEADER_LEN + payload.len()
+                    && av_mesh::canonical_slot::canonical_live_slot_header(
+                        stream_id,
+                        &object,
+                        payload.len(),
+                        media_kind,
+                    )
+                    .is_ok_and(|header| slot[..CANONICAL_LIVE_SLOT_HEADER_LEN] == header)
+            });
             let cached_payload = if let Some(reboxed) = &reboxed_audio {
                 encode_fmp4_slot(&reboxed.init, &reboxed.media)?
+            } else if let Some(slot) = made_slot {
+                slot
             } else {
                 encode_canonical_live_slot(stream_id, &object, payload, media_kind)?
             };

@@ -76,6 +76,37 @@ fn env_switch(name: &str) -> Vec<bool> {
 
 /// Processor time of this process's threads whose names start with one of
 /// `prefixes`, in nanoseconds.
+/// Minor page faults of the threads whose names start with one of
+/// `prefixes` (teeperf: a buffer that the allocator hands back fresh is
+/// faulted in again for every part).
+pub(super) fn threads_minor_faults(prefixes: &[&str]) -> u64 {
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return 0;
+    };
+    let mut total = 0;
+    for task in tasks.flatten() {
+        let path = task.path();
+        let Ok(comm) = std::fs::read_to_string(path.join("comm")) else {
+            continue;
+        };
+        if !prefixes.iter().any(|prefix| comm.starts_with(prefix)) {
+            continue;
+        }
+        // Field 10 of stat, after the command in parentheses.
+        if let Some(faults) = std::fs::read_to_string(path.join("stat")).ok().and_then(|stat| {
+            stat.rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .nth(7)?
+                .parse::<u64>()
+                .ok()
+        }) {
+            total += faults;
+        }
+    }
+    total
+}
+
 pub(super) fn threads_cpu_ns(prefixes: &[&str]) -> u64 {
     let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
         return 0;
@@ -1114,12 +1145,13 @@ async fn tee_cost_of_a_4k_frame() {
             if let RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Decoded {
                 object,
                 envelope,
+                slot,
                 ..
             }) = outcome
             {
                 decode_last += spent;
                 let started = Instant::now();
-                commit_relay_object(&cache, *object, envelope)
+                commit_relay_object(&cache, *object, envelope, slot)
                     .await
                     .unwrap();
                 commit += started.elapsed();

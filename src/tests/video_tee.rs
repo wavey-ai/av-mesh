@@ -28,8 +28,8 @@
 //! `--malloc-tune`).
 
 use super::video_throughput::{
-    make_frames_shaped, run_child, send_frames_at, threads_cpu_ns, Frame, FrameShape, Received,
-    Spread,
+    make_frames_shaped, run_child, send_frames_at, threads_cpu_ns, threads_minor_faults, Frame,
+    FrameShape, Received, Spread,
 };
 use super::*;
 use socket2::SockRef;
@@ -471,6 +471,7 @@ pub(super) fn tee_4k(options: TeeOptions) -> TeeRun {
         std::thread::sleep(from.saturating_duration_since(Instant::now()));
         measuring.store(true, Ordering::Relaxed);
         let stats = relay.stats();
+        let faults_before = threads_minor_faults(&tee_threads);
         let before = (
             threads_cpu_ns(&node_threads),
             threads_cpu_ns(&tee_threads),
@@ -484,6 +485,10 @@ pub(super) fn tee_4k(options: TeeOptions) -> TeeRun {
             threads_cpu_ns(&tee_threads),
             Instant::now(),
             stats.video_received,
+        );
+        println!(
+            "  tee threads' minor faults: {} over the window",
+            threads_minor_faults(&tee_threads).saturating_sub(faults_before)
         );
         measuring.store(false, Ordering::Relaxed);
         source.join().unwrap();
@@ -602,12 +607,13 @@ async fn video_tee_dispatch_cost() {
             if let RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Decoded {
                 object,
                 envelope,
+                slot,
                 ..
             }) = outcome
             {
                 decode += spent;
                 let started = Instant::now();
-                commit_relay_object(&cache, *object, envelope)
+                commit_relay_object(&cache, *object, envelope, slot)
                     .await
                     .unwrap();
                 commit += started.elapsed();

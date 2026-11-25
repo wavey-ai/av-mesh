@@ -133,25 +133,25 @@ pub fn live_media_kind(object: &MediaObject) -> LiveMediaKind {
     }
 }
 
-/// The slot of a canonical media object: the 40-byte index, then `envelope`
-/// (the object's exact wire bytes) unchanged.
-pub fn encode_canonical_live_slot(
+/// The 40-byte index of the slot of a canonical media object whose
+/// envelope (the object's exact wire bytes) is `envelope_len` bytes.
+pub fn canonical_live_slot_header(
     stream_id: u64,
     object: &MediaObject,
-    envelope: Bytes,
+    envelope_len: usize,
     media_kind: LiveMediaKind,
-) -> Result<Bytes, SlotError> {
+) -> Result<[u8; CANONICAL_LIVE_SLOT_HEADER_LEN], SlotError> {
     if object.kind() != ObjectKind::Media || object.payload().is_empty() {
         return Err(SlotError(
             "only non-empty canonical media objects can enter the live media cache",
         ));
     }
+    let envelope_bytes = envelope_len;
     let envelope_len =
-        u32::try_from(envelope.len()).map_err(|_| SlotError("canonical envelope is too large"))?;
+        u32::try_from(envelope_len).map_err(|_| SlotError("canonical envelope is too large"))?;
     let object_payload_offset = CANONICAL_LIVE_SLOT_HEADER_LEN
         .checked_add(
-            envelope
-                .len()
+            envelope_bytes
                 .checked_sub(object.payload().len())
                 .ok_or(SlotError(
                     "canonical payload is not contained in its envelope",
@@ -176,7 +176,7 @@ pub fn encode_canonical_live_slot(
         let media_end = media_start
             .checked_add(media_len)
             .ok_or(SlotError("canonical fMP4 media length overflow"))?;
-        if media_end != CANONICAL_LIVE_SLOT_HEADER_LEN + envelope.len() {
+        if media_end != CANONICAL_LIVE_SLOT_HEADER_LEN + envelope_bytes {
             return Err(SlotError(
                 "canonical fMP4 slot lengths do not match its envelope",
             ));
@@ -193,21 +193,33 @@ pub fn encode_canonical_live_slot(
     let field =
         |value: usize, what: &'static str| u32::try_from(value).map_err(|_| SlotError(what));
 
+    let mut header = BytesMut::with_capacity(CANONICAL_LIVE_SLOT_HEADER_LEN);
+    header.put_slice(CANONICAL_LIVE_SLOT_MAGIC);
+    header.put_u64(stream_id);
+    header.put_u8(media_kind.canonical_slot_tag());
+    header.put_bytes(0, 3);
+    header.put_u32(envelope_len);
+    header.put_u32(field(init_offset, "canonical init offset is too large")?);
+    header.put_u32(field(init_len, "canonical init is too large")?);
+    header.put_u32(field(media_offset, "canonical media offset is too large")?);
+    header.put_u32(field(media_len, "canonical media is too large")?);
+    let mut out = [0_u8; CANONICAL_LIVE_SLOT_HEADER_LEN];
+    out.copy_from_slice(&header);
+    Ok(out)
+}
+
+/// The slot of a canonical media object: the 40-byte index, then `envelope`
+/// (the object's exact wire bytes) unchanged.
+pub fn encode_canonical_live_slot(
+    stream_id: u64,
+    object: &MediaObject,
+    envelope: Bytes,
+    media_kind: LiveMediaKind,
+) -> Result<Bytes, SlotError> {
+    let header = canonical_live_slot_header(stream_id, object, envelope.len(), media_kind)?;
     let mut cached = BytesMut::with_capacity(CANONICAL_LIVE_SLOT_HEADER_LEN + envelope.len());
-    cached.put_slice(CANONICAL_LIVE_SLOT_MAGIC);
-    cached.put_u64(stream_id);
-    cached.put_u8(media_kind.canonical_slot_tag());
-    cached.put_bytes(0, 3);
-    cached.put_u32(envelope_len);
-    cached.put_u32(field(init_offset, "canonical init offset is too large")?);
-    cached.put_u32(field(init_len, "canonical init is too large")?);
-    cached.put_u32(field(media_offset, "canonical media offset is too large")?);
-    cached.put_u32(field(media_len, "canonical media is too large")?);
+    cached.put_slice(&header);
     cached.put_slice(&envelope);
-    debug_assert_eq!(
-        cached.len(),
-        CANONICAL_LIVE_SLOT_HEADER_LEN + envelope.len()
-    );
     Ok(cached.freeze())
 }
 

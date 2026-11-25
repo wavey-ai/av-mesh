@@ -6,6 +6,8 @@
 //! identity must be registered before live datagrams are admitted.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+
+use bytes::Bytes;
 use std::error::Error as StdError;
 use std::fmt;
 use std::net::SocketAddr;
@@ -312,7 +314,11 @@ pub enum RelayIngressOutcome {
         /// Exact bounded canonical envelope reconstructed and validated by the
         /// object assembler. Callers may commit these bytes directly instead
         /// of encoding and decoding the validated object again.
-        envelope: Vec<u8>,
+        envelope: Bytes,
+        /// The part's canonical live slot, made in place around `envelope`
+        /// (which is its tail), when the part was assembled here and is one
+        /// (teeperf): the cache takes it with no copy.
+        slot: Option<Bytes>,
         /// Role of the symbol that completed the object. Relay executables use
         /// this to preserve source/repair observability while forwarding the
         /// admitted wire datagram without changing its coding geometry.
@@ -1403,10 +1409,12 @@ impl RelayObjectReceiver {
         };
         let envelope = match whole_envelope {
             Some(envelope) => envelope,
-            None => state
-                .assembler
-                .take_completed_envelope()
-                .expect("a completed object must retain its validated canonical envelope"),
+            None => PartBuf::from(
+                state
+                    .assembler
+                    .take_completed_envelope()
+                    .expect("a completed object must retain its validated canonical envelope"),
+            ),
         };
         self.finish_decoded(object, envelope, symbol.role, symbol.deadline, now_us)
     }
@@ -1679,8 +1687,14 @@ impl RelayObjectReceiver {
         let object = decode_part_envelope(&envelope, &state.announcement.key, self.config.relay_limits)?;
         let deadline = state.announcement.deadline;
         self.counters.deferred_decodes = self.counters.deferred_decodes.saturating_add(1);
-        self.finish_decoded(object, envelope, MediaDatagramRole::Repair, deadline, now_us)
-            .map(Some)
+        self.finish_decoded(
+            object,
+            PartBuf::from(envelope),
+            MediaDatagramRole::Repair,
+            deadline,
+            now_us,
+        )
+        .map(Some)
     }
 
     /// The end of a part's assembly: the object is checked against its
@@ -1689,7 +1703,7 @@ impl RelayObjectReceiver {
     fn finish_decoded(
         &mut self,
         object: MediaObject,
-        envelope: Vec<u8>,
+        envelope: PartBuf,
         role: MediaDatagramRole,
         deadline: MediaDeadline,
         now_us: u64,
@@ -1742,9 +1756,11 @@ impl RelayObjectReceiver {
                 parent_sessions: active.parent_sessions,
             },
         );
+        let (envelope, slot) = envelope.into_envelope_and_slot(&object);
         Ok(RelayIngressOutcome::Decoded {
             object: Box::new(object),
             envelope,
+            slot,
             role,
             deadline,
             parent_count,
@@ -1892,7 +1908,8 @@ impl RelayObjectReceiver {
         count_role(&mut self.counters);
         Ok(RelayIngressOutcome::Decoded {
             object: Box::new(object),
-            envelope,
+            envelope: Bytes::from(envelope),
+            slot: None,
             role,
             deadline,
             parent_count: 1,
@@ -2191,7 +2208,63 @@ struct Deferred {
 enum DeferredStep {
     Pending,
     Submit(DecodeJob),
-    Whole(Vec<u8>),
+    Whole(PartBuf),
+}
+
+/// Room a part assembled here keeps before its bytes: the canonical live
+/// slot's index.
+const SLOT_HEAD: usize = crate::canonical_slot::CANONICAL_LIVE_SLOT_HEADER_LEN;
+
+/// A part's envelope in its buffer, after `head` bytes of room.
+#[derive(Debug)]
+struct PartBuf {
+    buf: Vec<u8>,
+    head: usize,
+}
+
+impl From<Vec<u8>> for PartBuf {
+    fn from(buf: Vec<u8>) -> Self {
+        Self { buf, head: 0 }
+    }
+}
+
+
+impl std::ops::Deref for PartBuf {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.buf[self.head..]
+    }
+}
+
+impl PartBuf {
+    /// The envelope, and the part's canonical live slot when its buffer
+    /// has the room for one and the object is one: made in place, the
+    /// envelope its tail. Nothing is copied either way.
+    fn into_envelope_and_slot(self, object: &MediaObject) -> (Bytes, Option<Bytes>) {
+        use crate::canonical_slot::{
+            canonical_live_slot_header, is_soundkit_v2_bundle, live_media_kind,
+        };
+        let Self { mut buf, head } = self;
+        let header = match (head, object.key().stream().parse::<u64>()) {
+            (SLOT_HEAD, Ok(stream_id)) if !is_soundkit_v2_bundle(object) => {
+                canonical_live_slot_header(
+                    stream_id,
+                    object,
+                    buf.len() - SLOT_HEAD,
+                    live_media_kind(object),
+                )
+                .ok()
+            }
+            _ => None,
+        };
+        if let Some(header) = header {
+            buf[..SLOT_HEAD].copy_from_slice(&header);
+        }
+        let bytes = Bytes::from(buf);
+        let envelope = bytes.slice(head..);
+        (envelope, header.map(|_| bytes))
+    }
 }
 
 impl Deferred {
@@ -2234,11 +2307,13 @@ impl Deferred {
         let (k, t) = (usize::from(self.k), usize::from(self.t));
         if (esi as usize) < k {
             if self.sources.is_empty() {
-                self.sources = vec![0; k * t];
+                // Room before the sources for the canonical live slot's
+                // index: the part's buffer becomes its slot (teeperf).
+                self.sources = vec![0; SLOT_HEAD + k * t];
                 self.have = vec![false; k];
             }
             if !self.have[esi as usize] && data.len() == t {
-                let at = esi as usize * t;
+                let at = SLOT_HEAD + esi as usize * t;
                 self.sources[at..at + t].copy_from_slice(data);
                 self.have[esi as usize] = true;
                 self.have_sources += 1;
@@ -2248,9 +2323,12 @@ impl Deferred {
         }
         self.held += 1;
         if self.have_sources == u32::from(self.k) {
-            let mut envelope = std::mem::take(&mut self.sources);
-            envelope.truncate(self.transfer_length as usize);
-            return Ok(DeferredStep::Whole(envelope));
+            let mut buf = std::mem::take(&mut self.sources);
+            buf.truncate(SLOT_HEAD + self.transfer_length as usize);
+            return Ok(DeferredStep::Whole(PartBuf {
+                buf,
+                head: SLOT_HEAD,
+            }));
         }
         if !self.in_flight && self.held >= self.submit_at {
             self.in_flight = true;
@@ -2259,7 +2337,7 @@ impl Deferred {
                 transfer_length: self.transfer_length,
                 k: self.k,
                 t: self.t,
-                sources: self.sources.clone(),
+                sources: self.sources.get(SLOT_HEAD..).unwrap_or_default().to_vec(),
                 have: self.have.clone(),
                 repairs: self.repairs.clone(),
             }));

@@ -395,7 +395,9 @@ pub struct StoredPart {
     profile: RaptorQBlockProfile,
     /// The object's packet sequence less its ESI.
     seq_base: u32,
-    envelope: Vec<u8>,
+    /// The part's envelope: shared with the cache's slot when the tee
+    /// made it in place (teeperf), so keeping it copies nothing.
+    envelope: bytes::Bytes,
     /// Made at the first answer (the RaptorQ intermediate symbols, from a
     /// cached plan of its K), then kept with the next ordinal to send: its
     /// cursor makes every answer's symbols new.
@@ -413,7 +415,7 @@ pub struct StoredPart {
 impl Drop for StoredPart {
     fn drop(&mut self) {
         if let Some(account) = &self.account {
-            account.sub(self.envelope.capacity() as u64 + self.encoder_bytes.load(Ordering::Relaxed));
+            account.sub(self.envelope.len() as u64 + self.encoder_bytes.load(Ordering::Relaxed));
         }
     }
 }
@@ -558,7 +560,7 @@ impl PartMeta {
 
 impl StoredPart {
     /// From its part's description and its decoded envelope.
-    pub fn new(meta: &PartMeta, object_key: ObjectKey, envelope: Vec<u8>) -> Option<Self> {
+    pub fn new(meta: &PartMeta, object_key: ObjectKey, envelope: bytes::Bytes) -> Option<Self> {
         let profile = RaptorQBlockProfile::from_datagram(&meta.fec).ok()?;
         if profile.transfer_length() as usize != envelope.len() {
             return None;
@@ -1060,7 +1062,7 @@ impl PartRepair {
         let mut part = part;
         part.account = Some(Arc::clone(&self.account));
         let part = Arc::new(part);
-        self.account.add(part.envelope.capacity() as u64);
+        self.account.add(part.envelope.len() as u64);
         let waiting = {
             let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
             // A part of an older session than the stream's current one is
@@ -1399,7 +1401,7 @@ impl Shed for PartRepair {
                     break;
                 };
                 held = held.saturating_sub(
-                    part.envelope.capacity() as u64 + part.encoder_bytes.load(Ordering::Relaxed),
+                    part.envelope.len() as u64 + part.encoder_bytes.load(Ordering::Relaxed),
                 );
                 dropped.push(part);
             }
@@ -2259,7 +2261,7 @@ pub fn stored_part_for_test(stream: u64, epoch: u64, object: u64, envelope: Vec<
         media_object::PayloadHash::from_bytes([0; 32]),
     )
     .unwrap();
-    StoredPart::new(&meta, key, envelope).unwrap()
+    StoredPart::new(&meta, key, envelope.into()).unwrap()
 }
 
 #[cfg(test)]
