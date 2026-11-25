@@ -3606,9 +3606,12 @@ pub async fn run_relay_class_ingest(
         }
         let (ended_tx, ended_rx) = tokio::sync::oneshot::channel();
         let nice = tee_nice(class);
+        // The tee logs where its caller logs.
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let started = std::thread::Builder::new()
             .name(format!("nt-tee-{}", class.as_str()))
             .spawn(move || {
+                let _log = tracing::dispatcher::set_default(&dispatch);
                 let _ = sys::set_nice(nice);
                 let result = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
