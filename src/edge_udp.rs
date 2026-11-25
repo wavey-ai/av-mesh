@@ -893,6 +893,27 @@ impl ClientOut<'_> {
         if datagrams.is_empty() {
             return (0, 0);
         }
+        // Tests (send240): a path a test stalls refuses its datagrams as a
+        // full socket does; they wait in the queue.
+        if crate::fast_plane::send_defer::any_blocked() {
+            use std::os::fd::AsRawFd;
+            let fd = self.socket.as_raw_fd();
+            if datagrams
+                .iter()
+                .any(|(_, peer)| crate::fast_plane::send_defer::blocked(fd, *peer))
+            {
+                let (stalled, free): (Vec<_>, Vec<_>) = datagrams
+                    .iter()
+                    .copied()
+                    .partition(|(_, peer)| crate::fast_plane::send_defer::blocked(fd, *peer));
+                let (queued, refused) = match self.queue {
+                    Some(queue) => queue.enqueue_many(&stalled, true),
+                    None => (0, stalled.len()),
+                };
+                let (sent, blocked) = self.send_batched(stats, gso, &free);
+                return (queued + sent, refused + blocked);
+            }
+        }
         let mut first = 0;
         if gso && !CLIENT_GSO_REFUSED.load(Ordering::Relaxed) {
             use std::os::fd::AsRawFd;
@@ -1257,11 +1278,21 @@ impl SendQueue {
                     }
                 }
                 clients.retain(|_, queue| !queue.is_empty());
-                // A datagram of each client in turn.
+                // A datagram of each client in turn (tests: not of a
+                // client whose path a test stalls).
+                let stalled_fd = crate::fast_plane::send_defer::any_blocked().then(|| {
+                    use std::os::fd::AsRawFd;
+                    self.socket.as_raw_fd()
+                });
                 let mut depth = 0;
                 while slice.len() < DRAIN_SLICE {
                     let before = slice.len();
                     for (peer, queue) in clients.iter() {
+                        if stalled_fd
+                            .is_some_and(|fd| crate::fast_plane::send_defer::blocked(fd, *peer))
+                        {
+                            continue;
+                        }
                         if let Some((_, datagram)) = queue.get(depth) {
                             slice.push((*peer, datagram.clone()));
                             if slice.len() == DRAIN_SLICE {
@@ -1346,11 +1377,108 @@ async fn drain_send_queue(queue: std::sync::Weak<SendQueue>) {
             let _ = tokio::time::timeout(Duration::from_secs(1), strong.wake.notified()).await;
             continue;
         }
+        if crate::fast_plane::send_defer::any_blocked() {
+            // Tests (send240): a stalled path is looked at again shortly.
+            strong.drain();
+            drop(strong);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            continue;
+        }
         if strong.drain() {
             // The socket is full: wait until it can take a datagram.
             let socket = Arc::clone(&strong.socket);
             drop(strong);
             let _ = tokio::time::timeout(Duration::from_millis(50), socket.writable()).await;
+        }
+    }
+}
+
+/// How often the cache-fed lane looks for the fast lane's hand-offs.
+const PARTIAL_TICK: Duration = Duration::from_millis(5);
+
+/// send240, A: the parts whose last symbols the fast lane could not send a
+/// client within their deadline share (its video thread kept them while
+/// the socket was full). For each, the client is sent the symbols it lacks,
+/// rebuilt from the cached part on the fast lane's block, and its policy's
+/// repair: never the whole part again. A part that has waited longer than
+/// the playout deadline is skipped (the client skips it too), and so is a
+/// client that left.
+async fn run_partial_sender(
+    lane: std::sync::Weak<crate::fast_plane::edge_clients::EdgeFastLane>,
+    sockets: EdgeSockets,
+    router: AppRouter,
+    table: Table,
+    config: EdgeUdpConfig,
+    stats: Arc<EdgeUdpStats>,
+    mut shutdown_rx: watch::Receiver<()>,
+) {
+    let mut tick = tokio::time::interval(PARTIAL_TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut jobs = Vec::new();
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => return,
+            _ = tick.tick() => {}
+        }
+        let Some(lane) = lane.upgrade() else {
+            return;
+        };
+        jobs.clear();
+        while let Some(job) = lane.take_partial() {
+            jobs.push(job);
+        }
+        if jobs.is_empty() {
+            continue;
+        }
+        // One send for a part of a client: from the first symbol it lacks.
+        jobs.sort_by_key(|job| (job.stream_id, job.part, job.peer, job.from_esi));
+        jobs.dedup_by(|later, first| {
+            (later.stream_id, later.part, later.peer) == (first.stream_id, first.part, first.peer)
+        });
+        let now_ns = crate::fast_plane::sys::monotonic_ns();
+        let playout_ns = u64::try_from(config.playout.as_nanos()).unwrap_or(u64::MAX);
+        for job in &jobs {
+            if now_ns.saturating_sub(job.kept_ns) > playout_ns {
+                lane.stats.partial_late.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let subscribed = table
+                .lock()
+                .unwrap()
+                .get(&job.stream_id)
+                .is_some_and(|entry| entry.subscribers.contains_key(&job.peer));
+            if !subscribed {
+                continue;
+            }
+            let Some(envelope) = router
+                .cache
+                .chunk_cache
+                .get_for_stream_id(job.stream_id, job.part as usize)
+                .await
+                .filter(|(slot, _)| {
+                    av_mesh::canonical_slot::decode_canonical_live_slot(slot, Some(job.stream_id))
+                        .is_some()
+                })
+                .map(|(slot, _)| slot.slice(av_mesh::canonical_slot::CANONICAL_LIVE_SLOT_HEADER_LEN..))
+            else {
+                lane.stats.partial_uncached.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            let Some(datagrams) = job.datagrams(&envelope, lane.rank()) else {
+                lane.stats.partial_uncached.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            let list: Vec<(&[u8], SocketAddr)> = datagrams
+                .iter()
+                .map(|datagram| (datagram.as_slice(), job.peer))
+                .collect();
+            let (delivered, _) = sockets
+                .out_for_stream(job.stream_id)
+                .send_many(&stats, true, true, &list);
+            lane.stats.partial_parts.fetch_add(1, Ordering::Relaxed);
+            lane.stats
+                .partial_datagrams
+                .fetch_add(delivered as u64, Ordering::Relaxed);
         }
     }
 }
@@ -1673,6 +1801,15 @@ pub(crate) async fn run_edge_udp(
             Arc::clone(&table),
             Arc::clone(&stats),
         );
+        tokio::spawn(run_partial_sender(
+            Arc::downgrade(lane),
+            sockets.clone().with_fast_lane(None),
+            router.clone(),
+            Arc::clone(&table),
+            config,
+            Arc::clone(&stats),
+            shutdown_rx.clone(),
+        ));
     }
     for cut in &cut_through {
         cut.arm(

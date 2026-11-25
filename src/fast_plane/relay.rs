@@ -155,6 +155,10 @@ pub struct RelayClassConfig {
     /// it as made.
     pub video_socket_buffer_ms: u64,
     pub video_socket_buffer_max_bytes: usize,
+    /// `--send-defer-ms` / `--send-defer-mb` (send240, A): the video thread
+    /// keeps what a full socket refused, for a client or a child, and sends
+    /// it first when the socket takes datagrams again (`send_defer`).
+    pub send_defer: Option<super::send_defer::DeferConfig>,
     /// Tests: the tee of this class panics on its first datagram.
     #[cfg(test)]
     pub test_tee_panic: Option<TrafficClass>,
@@ -193,6 +197,10 @@ impl Default for RelayClassConfig {
             socket_buffer_bytes: 8 << 20,
             video_socket_buffer_ms: DEFAULT_VIDEO_SOCKET_BUFFER_MS,
             video_socket_buffer_max_bytes: DEFAULT_VIDEO_SOCKET_BUFFER_MAX_BYTES,
+            send_defer: super::send_defer::DeferConfig::new(
+                super::send_defer::DEFAULT_SEND_DEFER_MS,
+                super::send_defer::DEFAULT_POOL_BYTES,
+            ),
             #[cfg(test)]
             test_tee_panic: None,
             #[cfg(test)]
@@ -273,6 +281,9 @@ pub fn bind_class_sockets(
 /// Counters of the fast plane, summed over its threads.
 #[derive(Debug, Default)]
 pub struct FastPlaneStats {
+    /// send240, A: the counters of the video thread's kept datagrams for
+    /// its children.
+    child_defer: std::sync::OnceLock<Arc<super::send_defer::DeferStats>>,
     pub received: [AtomicU64; 2],
     /// Receive batches (one `recvmmsg` that returned datagrams) per class:
     /// received / batches is what a wake-up reads, and what a send can join
@@ -704,9 +715,15 @@ pub struct FastPlaneSnapshot {
     /// The video sockets' receive buffers as the kernel reports them, the
     /// larger of the two (fix4-video: sized to two seconds of the stream).
     pub video_socket_buffer_bytes: u64,
+    /// send240, A: what the video thread kept for its children.
+    pub child_send_defer: super::send_defer::DeferSnapshot,
 }
 
 impl FastPlaneStats {
+    fn set_child_defer(&self, stats: Arc<super::send_defer::DeferStats>) {
+        let _ = self.child_defer.set(stats);
+    }
+
     pub fn snapshot(&self) -> FastPlaneSnapshot {
         let load = |value: &AtomicU64| value.load(Ordering::Relaxed);
         FastPlaneSnapshot {
@@ -790,6 +807,11 @@ impl FastPlaneStats {
                 .map(load)
                 .max()
                 .unwrap_or(0),
+            child_send_defer: self
+                .child_defer
+                .get()
+                .map(|stats| stats.snapshot())
+                .unwrap_or_default(),
         }
     }
 }
@@ -905,6 +927,8 @@ pub(crate) struct ForwardPlan {
     /// The UDP GSO runs of a send, worked out in place (fix4-video: a
     /// list made per send was the video thread's allocation per batch).
     runs: Vec<(usize, usize)>,
+    /// send240, A: what the children's sockets refused, kept per child.
+    defer: Option<Box<super::send_defer::SendDefer>>,
 }
 
 impl ForwardPlan {
@@ -924,6 +948,7 @@ impl ForwardPlan {
             first: [None; RECV_BATCH],
             // A run per send at most: the largest list of sends.
             runs: Vec::with_capacity(RECV_BATCH * paths.max(lease_children).max(1)),
+            defer: None,
         }
     }
 
@@ -939,6 +964,18 @@ impl ForwardPlan {
         crate::memory::touch_spare(&mut self.lease);
         crate::memory::touch_spare(&mut self.lease_warm);
         crate::memory::touch_spare(&mut self.runs);
+    }
+
+    /// send240, A: whether datagrams are kept for a child, and their drain
+    /// at a pass without a batch.
+    fn has_deferred(&self) -> bool {
+        self.defer.as_ref().is_some_and(|defer| !defer.is_empty())
+    }
+
+    fn drain_deferred(&mut self, gso: bool) {
+        if let Some(defer) = self.defer.as_deref_mut().filter(|defer| !defer.is_empty()) {
+            defer.drain(sys::monotonic_ns(), gso, |_| {});
+        }
     }
 
     fn clear(&mut self) {
@@ -1006,8 +1043,17 @@ fn send_lease_plan(
         lease_warm,
         first,
         runs,
+        defer,
         ..
     } = plan;
+    let now_ns = defer.is_some().then(sys::monotonic_ns).unwrap_or(0);
+    if let Some(defer) = defer.as_deref_mut() {
+        let fd = lease.fd(class);
+        defer.divert(sends, now_ns, |send| {
+            let child = &snapshot.children[usize::from(send.child)];
+            (fd, child.targets[class.index()], batch.data(usize::from(send.message)))
+        });
+    }
     if !sends.is_empty() {
         let fd = lease.fd(class);
         let target =
@@ -1076,10 +1122,25 @@ fn send_lease_plan(
                     let send = &sends[index];
                     first[usize::from(send.message)].get_or_insert((target(send), now_unix_us()));
                 }
-                sys::RestOutcome::WouldBlock => would_block += 1,
+                sys::RestOutcome::WouldBlock => {
+                    would_block += 1;
+                    // send240, A: kept for the child, sent when the socket
+                    // takes datagrams again.
+                    if let Some(defer) = defer.as_deref_mut() {
+                        let send = &sends[index];
+                        let tag = super::send_defer::Tag::UNTAGGED;
+                        let data = batch.data(usize::from(send.message));
+                        defer.keep(fd, target(send), data, tag, now_ns, |_| {});
+                    }
+                }
                 sys::RestOutcome::Error => errors += 1,
             },
         );
+        if would_block > 0 {
+            if let Some(defer) = defer.as_deref() {
+                defer.note_would_block();
+            }
+        }
         if would_block > 0 {
             lease
                 .stats
@@ -1230,9 +1291,24 @@ impl RelayDownstreamForwarder {
             retry,
             first,
             runs,
+            defer,
             ..
         } = plan;
         let use_gso = *gso && class == TrafficClass::Video;
+        // send240, A: what the children's sockets took of the kept
+        // datagrams; then a child with some still kept has the batch's
+        // datagrams kept behind them.
+        let now_ns = defer.is_some().then(sys::monotonic_ns).unwrap_or(0);
+        if let Some(defer) = defer.as_deref_mut() {
+            defer.drain(now_ns, use_gso, |_| {});
+            for (group, sends) in groups.iter_mut().enumerate() {
+                let fd = self.class_fd(class, group);
+                defer.divert(sends, now_ns, |send| {
+                    let data = batch.data(usize::from(send.message));
+                    (fd, self.class_target(class, usize::from(send.path)), data)
+                });
+            }
+        }
         for (group, sends) in groups.iter_mut().enumerate() {
             if sends.is_empty() {
                 continue;
@@ -1310,6 +1386,11 @@ impl RelayDownstreamForwarder {
             if full == Some(fd) {
                 self.errors.fetch_add(1, Ordering::Relaxed);
                 stats.would_block.fetch_add(1, Ordering::Relaxed);
+                // send240, A: kept for the child (4k.md fix 5 dropped it).
+                if let Some(defer) = defer.as_deref_mut() {
+                    let tag = super::send_defer::Tag::UNTAGGED;
+                    defer.keep(fd, target, data, tag, now_ns, |_| {});
+                }
                 continue;
             }
             let started = Instant::now();
@@ -1324,11 +1405,17 @@ impl RelayDownstreamForwarder {
                     stats.send_errors.fetch_add(1, Ordering::Relaxed);
                 }
                 _ => {
-                    // Counted, never waited for: the child's FEC or its
-                    // other parent covers the symbol.
+                    // Counted, never waited for: kept for the child when the
+                    // video thread keeps (send240, A), else the child's FEC
+                    // or its other parent covers the symbol.
                     self.errors.fetch_add(1, Ordering::Relaxed);
                     stats.would_block.fetch_add(1, Ordering::Relaxed);
                     full = Some(fd);
+                    if let Some(defer) = defer.as_deref_mut() {
+                        defer.note_would_block();
+                        let tag = super::send_defer::Tag::UNTAGGED;
+                        defer.keep(fd, target, data, tag, now_ns, |_| {});
+                    }
                 }
             }
         }
@@ -1368,6 +1455,8 @@ struct ClassThread {
     /// The epoch that the cache validated for each stream, which the
     /// thread's media clocks follow.
     epochs: Arc<ValidatedEpochs>,
+    /// send240, A: the video thread keeps what a full socket refused.
+    send_defer: Option<super::send_defer::DeferConfig>,
     /// Tests: the counter of this thread's allocations once it runs.
     #[cfg(test)]
     test_alloc_counter: Option<&'static crate::alloc_count::AllocCounter>,
@@ -1754,6 +1843,15 @@ impl ClassThread {
             },
         );
         plan.touch();
+        // send240, A: the pool of what the children's sockets refuse.
+        if self.forwarder.is_some() || self.lease.is_some() {
+            plan.defer = self
+                .send_defer
+                .map(|config| Box::new(super::send_defer::SendDefer::new(config)));
+            if let Some(defer) = &plan.defer {
+                self.stats.set_child_defer(Arc::clone(&defer.stats));
+            }
+        }
         let mut pending = Vec::with_capacity(RECV_BATCH);
         crate::memory::touch_spare(&mut pending);
         // UDP GSO for video until the host refuses it once (the edge's
@@ -1761,7 +1859,11 @@ impl ClassThread {
         let mut gso = self.video_gso && self.class == TrafficClass::Video;
         let mut clients = ClientPlan::new()
             .with_gso(gso)
-            .with_video(self.class == TrafficClass::Video);
+            .with_video(self.class == TrafficClass::Video)
+            .with_defer(
+                self.send_defer.filter(|_| self.edge_clients.is_some()),
+                self.edge_clients.as_deref(),
+            );
         let mut kernel_dropped = vec![0_u32; self.sockets.len()];
         // Burst copies of the audio sources for the compiled children.
         let mut copies = (self.class == TrafficClass::Audio && self.forwarder.is_some())
@@ -1802,11 +1904,14 @@ impl ClassThread {
         #[cfg(test)]
         crate::alloc_count::watch_this_thread(self.test_alloc_counter);
         while !self.stop.load(Ordering::Relaxed) {
-            // No longer than the next copy's due time.
+            // No longer than the next copy's due time, and a millisecond
+            // while datagrams are kept for a full socket (send240, A).
+            let deferred = plan.has_deferred() || clients.has_deferred();
             let timeout = copies
                 .as_ref()
                 .and_then(|copies| copies.wait_ms(now_unix_us()))
-                .map_or(STOP_POLL_MS, |wait| wait.min(STOP_POLL_MS));
+                .map_or(STOP_POLL_MS, |wait| wait.min(STOP_POLL_MS))
+                .min(if deferred { 1 } else { STOP_POLL_MS });
             let ready = match sys::wait_readable(&fds, timeout) {
                 Ok(ready) => ready,
                 Err(error) => {
@@ -1876,6 +1981,12 @@ impl ClassThread {
                     if received < RECV_BATCH {
                         break;
                     }
+                }
+            }
+            if deferred {
+                plan.drain_deferred(gso);
+                if let Some(lane) = &self.edge_clients {
+                    clients.drain_deferred(lane);
                 }
             }
             // What the feeds held of new keys, once the tee made them.
@@ -3001,6 +3112,7 @@ pub async fn run_relay_class_ingest(
             feeds: Arc::clone(&feeds),
             media_deadline_us: config.media_deadline_us,
             epochs: Arc::clone(&epochs),
+            send_defer: config.send_defer.filter(|_| class == TrafficClass::Video),
             #[cfg(test)]
             test_alloc_counter: match class {
                 TrafficClass::Audio => config.test_alloc_counter,

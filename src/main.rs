@@ -2466,6 +2466,21 @@ struct Args {
     #[arg(long, env = "NEEDLETAIL_SOCKET_BUFFER_MB", default_value = "auto")]
     socket_buffer_mb: av_mesh::mem_guard::MemSetting,
 
+    /// send240, A: the video class thread keeps what a full socket refused,
+    /// for each edge client and each child, and sends it first when the
+    /// socket takes datagrams again. A part's datagrams are kept at most
+    /// this long; what is still unsent then is handed to the cache-fed lane
+    /// as the symbols the client lacks (a child's repair covers its own).
+    /// 0: off (a refused symbol gives its part back, as before).
+    #[arg(long, env = "NEEDLETAIL_SEND_DEFER_MS", default_value_t = fast_plane::send_defer::DEFAULT_SEND_DEFER_MS)]
+    send_defer_ms: u64,
+
+    /// The kept datagrams' pool of the video class thread, in MB, made and
+    /// touched at start (a destination keeps at most half of it). `auto`:
+    /// 0.8% of the node's memory, 8 to 64 MB (31 MB on a 4 GB node).
+    #[arg(long, env = "NEEDLETAIL_SEND_DEFER_MB", default_value = "auto")]
+    send_defer_mb: av_mesh::mem_guard::MemSetting,
+
     /// A video stream with no part for this long keeps only its newest part
     /// in the cache, and its memory goes back to the system. 0: never.
     #[arg(long, env = "NEEDLETAIL_VIDEO_IDLE_RELEASE_MS", default_value_t = 30_000)]
@@ -4470,6 +4485,16 @@ async fn main() -> Result<()> {
         socket_buffer_bytes: args.udp_socket_buffer_bytes,
         video_socket_buffer_ms: args.relay_video_socket_buffer_ms,
         video_socket_buffer_max_bytes: args.relay_video_socket_buffer_max_mb.saturating_mul(1 << 20),
+        send_defer: fast_plane::send_defer::DeferConfig::new(
+            args.send_defer_ms,
+            fast_plane::send_defer::pool_bytes(
+                match args.send_defer_mb {
+                    av_mesh::mem_guard::MemSetting::Auto => None,
+                    av_mesh::mem_guard::MemSetting::Mb(mb) => Some(mb),
+                },
+                memory_budgets.node_memory_bytes,
+            ),
+        ),
         ..Default::default()
     };
     let fec_ingest_task = match (fec_socket, class_sockets) {
@@ -46955,6 +46980,7 @@ mod tests {
                 socket_buffer_bytes: 4 << 20,
                 video_socket_buffer_ms: 0,
                 video_socket_buffer_max_bytes: 0,
+                send_defer: None,
                 test_tee_panic: Some(fast_plane::TrafficClass::Audio),
                 test_video_tee_spin_ns: 0,
                 test_alloc_counter: None,
@@ -47474,4 +47500,7 @@ mod tests {
     /// A 4K viewer at an edge whose source session restarts, with a late
     /// copy of the old session in its cache (stuck4k).
     mod stuck_4k;
+    /// A send stall at an edge and a forwarder (send240, A): what the
+    /// class thread keeps, and what the cache-fed lane is handed.
+    mod send_stall;
 }

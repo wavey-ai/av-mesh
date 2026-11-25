@@ -279,6 +279,7 @@ impl Ingress {
             media_deadline_us: BUDGET,
             epochs: Arc::clone(&epochs),
             feeds: Arc::clone(&feeds),
+            send_defer: None,
             test_alloc_counter: None,
         };
         Self {
