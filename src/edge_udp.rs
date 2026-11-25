@@ -2046,6 +2046,7 @@ impl EdgeControl {
                     next_part,
                     compact: compact.is_some(),
                     waiting: false,
+                    restarted: false,
                 },
                 RefreshAnswer::Move(reason) => Control::Move {
                     stream_id,
@@ -3148,6 +3149,7 @@ async fn admit(
             next_part: first_part,
             compact: compact.is_some(),
             waiting: waiting_past.is_some(),
+            restarted: false,
         },
     )
     .await;
@@ -3786,6 +3788,9 @@ async fn run_stream_sender(
         // continues at the newest part, and one whose next part is past its
         // playout deadline (after a move, or a backlog) at the oldest part
         // within it.
+        // Subscribers started again at a new session's numbers, told so
+        // below (`OK ... s=1`); empty (no allocation) but at a restart.
+        let mut renumbered: Vec<(SocketAddr, u64, bool)> = Vec::new();
         let (oldest_next, newest_next, peers) = {
             let mut guard = table.lock().unwrap();
             let Some(entry) = guard.get_mut(&stream_id) else {
@@ -3824,18 +3829,23 @@ async fn run_stream_sender(
             if let Some(head) = head {
                 let mut fast_renewed = false;
                 if let Some(entry) = guard.get_mut(&stream_id) {
-                    for subscriber in entry.subscribers.values_mut() {
+                    for (peer, subscriber) in entry.subscribers.iter_mut() {
+                        let stale = subscriber.waiting_past;
                         if let SessionLook::New { restarted } =
                             restart_in_session(subscriber, start, epoch)
                         {
                             fast_renewed |= subscriber.fast.is_some();
                             if restarted {
                                 stats.session_restarts.fetch_add(1, Ordering::Relaxed);
+                                renumbered.push((*peer, start, subscriber.compact.is_some()));
                             }
                         }
                         if anchor_waiting(subscriber, head, start) {
                             fast_renewed |= subscriber.fast.is_some();
                             stats.waiting_anchored.fetch_add(1, Ordering::Relaxed);
+                            if stale.is_some_and(|stale| head < stale) {
+                                renumbered.push((*peer, start, subscriber.compact.is_some()));
+                            }
                         }
                     }
                 }
@@ -3872,6 +3882,24 @@ async fn run_stream_sender(
                 entry.subscribers.keys().copied().collect::<Vec<_>>(),
             )
         };
+        // Before the new session's first part: the client forgets the old
+        // session's parts and blocks, whose numbers the new one may reuse
+        // (a held 4K viewer's decoders took the new session's blocks for
+        // ones decoded already, and refused for a second at each restart).
+        for (peer, start, compact) in renumbered.drain(..) {
+            send_control(
+                &socket,
+                peer,
+                &Control::Subscribed {
+                    stream_id,
+                    next_part: start,
+                    compact,
+                    waiting: false,
+                    restarted: true,
+                },
+            )
+            .await;
+        }
 
         // A drain begun or lifted: the housekeeping now (an atomic load a
         // part; the drain's first moves still wait for its advertisement).
@@ -3994,7 +4022,14 @@ async fn run_stream_sender(
                         .max(Duration::from_millis(1)),
                 );
             }
-            tokio::time::timeout(slice, router.get_part_repairing_holes(stream_id, part)).await
+            // A new session of the stream ends the wait at once: its
+            // subscribers start at its first part before the fast lane
+            // sends them its next ones on their old places (joins).
+            let mut sessions = router.cache.session_starts.subscribe();
+            tokio::select! {
+                waited = tokio::time::timeout(slice, router.get_part_repairing_holes(stream_id, part)) => waited,
+                _ = sessions.changed() => continue,
+            }
         };
         match waited {
             Ok(Ok(Some((bytes, _)))) => {

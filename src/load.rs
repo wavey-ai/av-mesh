@@ -4107,6 +4107,7 @@ mod tests {
                     next_part: 100,
                     compact: true,
                     waiting: false,
+                    restarted: false,
                 }
                 .encode();
                 harness.datagram(from, &ok, 0.2);

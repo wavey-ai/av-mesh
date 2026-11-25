@@ -59,9 +59,16 @@ async fn publish(edge: &LaneEdge, epoch: u64, sequence: u64, len: usize, deadlin
 #[derive(Debug, Default)]
 struct Viewer {
     parts: Vec<(u64, usize)>,
+    /// When each of `parts` came.
+    at: Vec<Instant>,
     events: Vec<LegEvent>,
+    /// When each of `events` came.
+    event_at: Vec<Instant>,
     stalled_legs: u64,
     refusing_legs: u64,
+    /// What the receiver says: new sessions the edge announced, flows, and
+    /// the RaptorQ objects refused.
+    notes: String,
     raptorq_refused: av_mesh::client_udp::RaptorqRefused,
 }
 
@@ -121,6 +128,7 @@ async fn view(
                 _ => {}
             }
             run.events.push(event);
+            run.event_at.push(Instant::now());
         }
         if !outbox.is_empty() {
             continue;
@@ -139,6 +147,7 @@ async fn view(
         while let Some(object) = session.next_object() {
             if object.kind == UdpObjectKind::Part {
                 run.parts.push((object.part, object.payload.len()));
+                run.at.push(Instant::now());
                 last_part_at = Instant::now();
             }
         }
@@ -147,6 +156,15 @@ async fn view(
     for (to, datagram) in outbox.drain(..) {
         let _ = socket.send_to(&datagram, to).await;
     }
+    run.notes = format!(
+        "announced restarts {}, flows {}, refused {:?}, datagrams {}, objects {}, errors {}",
+        session.session_restarts,
+        session.receiver.flows,
+        session.receiver.raptorq_refused,
+        session.receiver.datagrams,
+        session.receiver.objects,
+        session.receiver.errors
+    );
     run.stalled_legs = session.stalled_legs;
     run.refusing_legs = session.refusing_legs;
     run.raptorq_refused = session.receiver.raptorq_refused;
@@ -367,4 +385,86 @@ async fn the_new_session_takes_the_numbers_the_old_session_s_late_copies_held() 
     assert!(playlist.contains("#EXT-X-MEDIA-SEQUENCE:0\n"), "{playlist}");
     assert_eq!(edge.head(STREAM).await, Some(50));
     edge.stop().await;
+}
+
+
+/// The integrator's three back-to-back 4K sessions on one mesh, in process:
+/// a RaptorQ-lane viewer connected throughout, three sessions of the
+/// stream (each numbered from 0, so the new session's numbers are the old
+/// one's), 300 kB frames at 24 fps (58 Mbit/s), a second's pause between
+/// them. In every session after the first, the viewer gets every part from
+/// the session's first, once, with no gap longer than 300 ms, and no leg
+/// fails or moves; the edge starts it at each new session
+/// (`session_restarts`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_4k_viewer_held_across_back_to_back_sessions_loses_no_part() {
+    let edge = LaneEdge::start(loopback(249)).await;
+    let deadline_us = now_unix_us() + 300_000_000;
+    let live = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    const SESSIONS: u64 = 3;
+    const PARTS: u64 = 72;
+    let len = |session: u64| 250_000 + session as usize * 10_000;
+    let base = now_unix_us();
+    let mut viewer = None;
+    let mut starts = Vec::new();
+    for session in 0..SESSIONS {
+        let epoch = base + session * 1_000_000;
+        let start = Instant::now();
+        starts.push(start);
+        for sequence in 0..PARTS {
+            tokio::time::sleep_until((start + PART * sequence as u32).into()).await;
+            publish(&edge, epoch, sequence, len(session), deadline_us).await;
+            if session == 0 && sequence == 5 {
+                viewer = Some(tokio::spawn(view(
+                    edge.client_port,
+                    true,
+                    Arc::clone(&live),
+                    Arc::clone(&stop),
+                )));
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    stop.store(true, Ordering::Relaxed);
+    let run = viewer.expect("a viewer").await.unwrap();
+    let restarts = edge.stats.session_restarts.load(Ordering::Relaxed);
+    edge.stop().await;
+    let per_session: Vec<usize> = (0..SESSIONS)
+        .map(|session| run.parts.iter().filter(|(_, got)| *got == len(session)).count())
+        .collect();
+    assert!(
+        !run.events.iter().any(|event| matches!(event, LegEvent::Failed { .. } | LegEvent::Moved { .. })),
+        "{:?} at {:?} ms from the first session; sessions at {:?} ms; edge restarts {restarts}; {}; parts by session {per_session:?}",
+        run.events,
+        run.event_at.iter().map(|at| at.saturating_duration_since(starts[0]).as_millis()).collect::<Vec<_>>(),
+        starts.iter().map(|at| at.saturating_duration_since(starts[0]).as_millis()).collect::<Vec<_>>(),
+        run.notes
+    );
+    for session in 1..SESSIONS {
+        let mine: Vec<(u64, Instant)> = run
+            .parts
+            .iter()
+            .zip(&run.at)
+            .filter(|((_, got), _)| *got == len(session))
+            .map(|((part, _), at)| (*part, *at))
+            .collect();
+        let mut numbers: Vec<u64> = mine.iter().map(|(part, _)| *part).collect();
+        numbers.sort_unstable();
+        let missing: Vec<u64> = (0..PARTS).filter(|part| numbers.binary_search(part).is_err()).collect();
+        let longest = mine
+            .windows(2)
+            .map(|pair| pair[1].1.saturating_duration_since(pair[0].1))
+            .max()
+            .unwrap_or_default();
+        assert!(missing.is_empty(), "session {session}: missing {missing:?}");
+        assert_eq!(numbers.len() as u64, PARTS, "session {session}: a part twice");
+        assert!(
+            longest <= Duration::from_millis(300),
+            "session {session}: a gap of {} ms",
+            longest.as_millis()
+        );
+    }
+    assert!(restarts >= SESSIONS - 1, "restarts {restarts}");
+    assert_eq!(run.stalled_legs + run.refusing_legs, 0);
 }

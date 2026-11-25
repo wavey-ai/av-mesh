@@ -363,6 +363,13 @@ pub enum Control {
         /// head of the next session), and `next_part` names no part to
         /// judge the leg by.
         waiting: bool,
+        /// The edge started the subscription again at a new session of the
+        /// stream (`s=1`, joins): its parts are numbered from the new
+        /// session's first, which can be the old session's numbers. The
+        /// client forgets what it delivered and its decoders' blocks: a
+        /// block of the new session with an old number would otherwise be
+        /// taken for one decoded already, and never decode.
+        restarted: bool,
     },
     Waiting {
         stream_id: u64,
@@ -508,10 +515,12 @@ impl Control {
                 next_part,
                 compact,
                 waiting,
+                restarted,
             } => format!(
-                "{CONTROL_PREFIX}OK {stream_id} {next_part}{}{}",
+                "{CONTROL_PREFIX}OK {stream_id} {next_part}{}{}{}",
                 if *compact { " C" } else { "" },
-                if *waiting { " w=1" } else { "" }
+                if *waiting { " w=1" } else { "" },
+                if *restarted { " s=1" } else { "" }
             ),
             Self::Waiting {
                 stream_id,
@@ -720,10 +729,12 @@ impl Control {
                 if compact {
                     words.next();
                 }
-                let mut waiting = None;
+                let (mut waiting, mut restarted) = (None, None);
                 for word in words.by_ref() {
-                    if let ("w", value) = field(word)? {
-                        once(&mut waiting, flag(value)?)?;
+                    match field(word)? {
+                        ("w", value) => once(&mut waiting, flag(value)?)?,
+                        ("s", value) => once(&mut restarted, flag(value)?)?,
+                        _ => {}
                     }
                 }
                 Self::Subscribed {
@@ -731,6 +742,7 @@ impl Control {
                     next_part,
                     compact,
                     waiting: waiting.unwrap_or(false),
+                    restarted: restarted.unwrap_or(false),
                 }
             }
             "WAIT" => {
@@ -1372,6 +1384,11 @@ pub struct RaptorqRefused {
 struct LegTakes {
     untaken: u64,
     taken_at: Option<Instant>,
+    /// When the first of `untaken` came: a leg judged by how long it has
+    /// received and taken nothing, not by how long since it last took a
+    /// part (a 4K viewer's leg failed at the new session's first datagrams
+    /// after a second's pause between sessions).
+    untaken_since: Option<Instant>,
 }
 
 /// A session that RaptorQ objects established (two of its objects, or one
@@ -1435,9 +1452,9 @@ impl ObjectReceiver {
     /// when that was: a leg whose datagrams come and decode to nothing that
     /// is taken (refused, or never whole) has failed (see
     /// `client_session::REFUSING_FOR`).
-    pub fn leg_untaken(&self, leg: LegId) -> (u64, Option<Instant>) {
+    pub fn leg_untaken(&self, leg: LegId) -> (u64, Option<Instant>, Option<Instant>) {
         let takes = &self.takes[leg.index()];
-        (takes.untaken, takes.taken_at)
+        (takes.untaken, takes.taken_at, takes.untaken_since)
     }
 
     /// A new source session that the compact lane or a RaptorQ object
@@ -1620,7 +1637,11 @@ impl ObjectReceiver {
             // taken; one of a decoded block (a repair symbol after its
             // sources) or a settled one does not.
             if !count.decoded {
-                self.takes[leg.index()].untaken += 1;
+                let takes = &mut self.takes[leg.index()];
+                takes.untaken += 1;
+                if takes.untaken_since.is_none() {
+                    takes.untaken_since = Some(Instant::now());
+                }
             }
         }
         let seen = blocks
@@ -1687,6 +1708,7 @@ impl ObjectReceiver {
                             self.takes[leg.index()] = LegTakes {
                                 untaken: 0,
                                 taken_at: Some(now),
+                                untaken_since: None,
                             };
                             return None;
                         }
@@ -1694,6 +1716,7 @@ impl ObjectReceiver {
                     self.takes[leg.index()] = LegTakes {
                         untaken: 0,
                         taken_at: Some(now),
+                        untaken_since: None,
                     };
                     self.last_lane = Some(lane);
                     Some(object)
@@ -2078,12 +2101,14 @@ mod tests {
                 next_part: 77,
                 compact: false,
                 waiting: false,
+                restarted: false,
             },
             Control::Subscribed {
                 stream_id: 9,
                 next_part: 78,
                 compact: true,
                 waiting: false,
+                restarted: false,
             },
             Control::Waiting {
                 stream_id: 9,
@@ -2126,6 +2151,7 @@ mod tests {
                 next_part: 9,
                 compact: false,
                 waiting: false,
+                restarted: false,
             })
         );
         // The compact word comes after F1, once.
@@ -2703,12 +2729,14 @@ mod tests {
                 next_part: 77,
                 compact: true,
                 waiting: false,
+                restarted: false,
             },
             Control::Subscribed {
                 stream_id: 9,
                 next_part: 77,
                 compact: false,
                 waiting: false,
+                restarted: false,
             },
             Control::Waiting {
                 stream_id: 9,
@@ -2819,6 +2847,7 @@ mod tests {
                 next_part: 77,
                 compact: true,
                 waiting: false,
+                restarted: false,
             })
         );
         // An unknown field stands among the known ones.

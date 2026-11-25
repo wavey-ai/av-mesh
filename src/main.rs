@@ -41557,6 +41557,7 @@ mod tests {
                 next_part: 0,
                 compact: false,
                 waiting: false,
+                restarted: false,
             })
         );
         assert!(receiver.recovered_objects > 0);

@@ -553,6 +553,9 @@ pub struct UdpSession {
     /// Legs failed because no media came for [`STALLED_FOR`] while their
     /// edge said the stream went on (stuck4k).
     pub stalled_legs: u64,
+    /// Times an edge started a leg again at a new session of the stream
+    /// (`OK ... s=1`, joins).
+    pub session_restarts: u64,
     /// The joint part loss of the legs (smoothed) and its mean run.
     joint_estimate: Option<f64>,
     joint_burst: Option<f64>,
@@ -649,6 +652,7 @@ impl UdpSession {
             stale_starts: 0,
             refusing_legs: 0,
             stalled_legs: 0,
+            session_restarts: 0,
             joint_estimate: None,
             joint_burst: None,
             all_silent: false,
@@ -1343,13 +1347,19 @@ impl UdpSession {
         let (run, accepted) = self.receiver.compact.leg_refused(id);
         // The RaptorQ lane (stuck4k): its datagrams since a part of it was
         // last taken, whether refused or never whole.
-        let (untaken, taken) = self.receiver.leg_untaken(id);
+        let (untaken, taken, untaken_since) = self.receiver.leg_untaken(id);
         let last = match (accepted, taken) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
         };
-        run.saturating_add(untaken) >= REFUSING_MIN_DATAGRAMS
-            && now.saturating_duration_since(last.unwrap_or(since)) >= REFUSING_FOR
+        let compact = run >= REFUSING_MIN_DATAGRAMS
+            && now.saturating_duration_since(last.unwrap_or(since)) >= REFUSING_FOR;
+        // The RaptorQ lane: a second from its first datagram not taken, so
+        // that a pause of the source between two parts is no refusal.
+        let raptorq = untaken >= REFUSING_MIN_DATAGRAMS
+            && untaken_since.is_some_and(|first| now.saturating_duration_since(first) >= REFUSING_FOR)
+            && now.saturating_duration_since(last.unwrap_or(since)) >= REFUSING_FOR;
+        compact || raptorq
     }
 
     /// Whether a live leg has stalled: its edge's `WAIT`s have shown the
@@ -1838,8 +1848,21 @@ impl UdpSession {
                 next_part,
                 compact,
                 waiting,
+                restarted,
                 ..
-            } => self.on_subscribed(index, next_part, compact, waiting, now),
+            } => {
+                if restarted && leg.is_live() {
+                    // The edge started the leg again at a new session
+                    // (joins): what was delivered and every decoder's
+                    // blocks are of the old one, whose numbers the new one
+                    // may reuse.
+                    leg.wait_heads = None;
+                    self.receiver.new_flow();
+                    self.receiver.forget_sessions();
+                    self.session_restarts += 1;
+                }
+                self.on_subscribed(index, next_part, compact, waiting, now)
+            }
             Control::Move { reason, .. } => {
                 // A MOVE within a round trip of a take-back (the first
                 // retry's wait while the leg has none), before its OK,
@@ -2418,6 +2441,7 @@ mod tests {
             next_part: 10,
             compact: true,
             waiting: false,
+            restarted: false,
         }
         .encode();
         assert_eq!(
@@ -2529,6 +2553,7 @@ mod tests {
             next_part: 10,
             compact: true,
             waiting: false,
+            restarted: false,
         }
         .encode();
         session.on_datagram(edge(), &ok, at, &mut send);
@@ -2569,6 +2594,7 @@ mod tests {
             next_part: 11,
             compact: true,
             waiting: false,
+            restarted: false,
         }
         .encode();
         session.on_datagram(next, &ok, moved_at, &mut send);
@@ -2632,6 +2658,7 @@ mod tests {
                 next_part: 70_000,
                 compact: true,
                 waiting: false,
+                restarted: false,
             }
             .encode();
             session.on_datagram(edge(), &ok, now, &mut send);
@@ -2669,6 +2696,7 @@ mod tests {
                 next_part: 100,
                 compact: true,
                 waiting: false,
+                restarted: false,
             }
             .encode();
             session.on_datagram(edge(), &ok, now, &mut send);
@@ -2719,6 +2747,7 @@ mod tests {
             next_part: 70_000,
             compact: true,
             waiting: false,
+            restarted: false,
         }
         .encode();
         assert!(matches!(
@@ -2838,6 +2867,7 @@ mod tests {
             next_part: 10,
             compact: false,
             waiting: false,
+            restarted: false,
         }
         .encode();
         session.on_datagram(edge(), &ok, at, &mut send);
@@ -2983,6 +3013,7 @@ mod tests {
             next_part: 3,
             compact: false,
             waiting: false,
+            restarted: false,
         }
         .encode();
         assert_eq!(
@@ -3032,6 +3063,7 @@ mod tests {
             next_part: 0,
             compact: true,
             waiting: false,
+            restarted: false,
         }
         .encode();
         session.on_datagram(edge(), &ok, now, &mut send);
@@ -3097,6 +3129,7 @@ mod tests {
             next_part: 0,
             compact: true,
             waiting: false,
+            restarted: false,
         }
         .encode();
         session.on_datagram(edge(), &ok, now, &mut send);
@@ -3238,6 +3271,7 @@ mod tests {
             next_part,
             compact: true,
             waiting: false,
+            restarted: false,
         }
         .encode()
     }
@@ -3948,6 +3982,7 @@ mod tests {
             next_part: 41_284,
             compact: true,
             waiting: true,
+            restarted: false,
         }
         .encode();
         assert!(String::from_utf8_lossy(&waiting).ends_with(" C w=1"));
