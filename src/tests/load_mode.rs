@@ -627,6 +627,7 @@ fn synthetic_sender(
                         compact: true,
                         waiting: false,
                         restarted: false,
+                        session: None,
                     };
                     let _ = socket.send_to(&ok.encode(), peer);
                 }

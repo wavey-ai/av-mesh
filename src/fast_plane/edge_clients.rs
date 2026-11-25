@@ -246,6 +246,11 @@ const fn claim_tag(part: u64, lane: u64) -> u64 {
 pub struct FastClient {
     /// The first part that this client takes on the fast lane.
     pub fast_from: u64,
+    /// The source session (epoch) it takes on the fast lane, 0 for any: a
+    /// part of another session is the cache-fed lane's to send once the
+    /// subscriber is started in it (joins: the claims of an old session's
+    /// numbers held a new session's part back and let a later one by).
+    pub epoch: u64,
     /// `(part + 1) << 2 | lane` of the lane that took each part, by part.
     ring: Box<[AtomicU64]>,
 }
@@ -255,9 +260,18 @@ impl FastClient {
     /// ring in: the class thread writes it at the client's first part (a
     /// zeroed allocation's pages are not mapped until written).
     pub fn new(fast_from: u64) -> Arc<Self> {
+        Self::for_session(fast_from, 0)
+    }
+
+    /// [`Self::new`] for the parts of the session of `epoch` (0: any).
+    pub fn for_session(fast_from: u64, epoch: u64) -> Arc<Self> {
         let mut ring: Box<[AtomicU64]> = (0..CLAIM_RING).map(|_| AtomicU64::new(0)).collect();
         crate::memory::touch_owned(&mut *ring);
-        Arc::new(Self { fast_from, ring })
+        Arc::new(Self {
+            fast_from,
+            epoch,
+            ring,
+        })
     }
 
     fn slot(&self, part: u64) -> &AtomicU64 {
@@ -2306,7 +2320,9 @@ impl ClientPlan {
             let first = (part % count.max(1) as u64) as usize;
             for index in 0..count {
                 let (peer, client) = &group.clients[(first + index) % count];
-                if part < client.fast_from {
+                if part < client.fast_from
+                    || (client.epoch != 0 && view.epoch != 0 && view.epoch != client.epoch)
+                {
                     continue;
                 }
                 let fresh = !client.has_fast(part);
