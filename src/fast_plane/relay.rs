@@ -2686,7 +2686,9 @@ struct Tee {
     part_repair: Option<Arc<PartRepair>>,
     requester: Option<Requester>,
     lease: Option<Arc<LeaseChildren>>,
-    repair_tick: Option<Arc<Notify>>,
+    /// While the stream is quiet with parts open, the requester's poll
+    /// this often (part repair with asks on).
+    requester_poll_every: Option<Duration>,
     /// The newest arrival (kernel µs) of a symbol the tee has taken.
     last_rx_us: u64,
     /// The part whose `relay_forward` the short path journaled last.
@@ -2718,14 +2720,30 @@ const fn tee_nice(class: TrafficClass) -> i32 {
 /// second more than it needed to).
 const TEE_WAKE_ENTRIES: usize = 1_024;
 
+/// How often a tee books its thread's processor time (teeperf).
+const TEE_CPU_EVERY: Duration = Duration::from_millis(10);
+
+/// How long a tee with parts open waits in a quiet stream before its
+/// requester looks at them (the tick it had from the node runtime).
+const REQUESTER_QUIET_POLL: Duration = Duration::from_millis(2);
+
 impl Tee {
-    /// Runs until the thread's channel closes. It waits on nothing but its
-    /// datagrams and the housekeeping task's nudge to expire its state
-    /// (`fast_control::run_tee_housekeeping`, which also rotates the cache):
-    /// no timer of its own sits beside the datagrams.
+    /// Runs until the thread's channel closes. It waits on its datagrams,
+    /// the decode pool's results, the housekeeping task's nudge to expire
+    /// its state (`fast_control::run_tee_housekeeping`, which also rotates
+    /// the cache), and, while its stream is quiet with parts open, its
+    /// requester's poll (teeperf: was a 2 ms tick from the node runtime
+    /// that woke both tees 500 times a second, datagrams or not).
     async fn run(mut self, items: TeeReceiver<TeeMeta>, expire: Arc<Notify>) -> Result<()> {
         let mut decoded = self.decode_rx.take();
-        let tick = self.repair_tick.clone();
+        let poll_every = self.requester_poll_every;
+        let quiet = tokio::time::sleep(Duration::from_secs(3_600));
+        tokio::pin!(quiet);
+        let mut quiet_armed = false;
+        // The thread's processor time is read at most every
+        // `TEE_CPU_EVERY` (teeperf: it was two system calls a batch), and
+        // what it used since is booked (its wakes included).
+        let mut cpu_mark = crate::edge_admission::thread_cpu_us().map(|cpu| (cpu, Instant::now()));
         loop {
             tokio::select! {
                 Some(done) = async {
@@ -2745,7 +2763,6 @@ impl Tee {
                     // processed, then one snapshot. Its CPU time is a
                     // playlist's, not a listener's: the load's CPU term
                     // leaves it out (edge_admission::PLAYLIST_CPU_US).
-                    let cpu_before = crate::edge_admission::thread_cpu_us();
                     let wall_before = Instant::now();
                     // One clock read an item (teeperf: there were four):
                     // the time an item is taken is the batch's wall clock
@@ -2769,54 +2786,75 @@ impl Tee {
                         taken = done;
                         items.release();
                     }
+                    let end_us = batch_unix_us
+                        + taken.saturating_duration_since(wall_before).as_micros() as u64;
                     if let Some(requester) = self.requester.as_mut() {
                         // A tee behind its ring judges a part's silence by
                         // the arrivals it has taken, not by the clock.
                         let now = if items.peek().is_none() {
-                            now_unix_us()
+                            end_us
                         } else {
                             self.last_rx_us
                         };
                         requester.poll(now);
+                        // Its next poll: the next batch, or the quiet's.
+                        quiet_armed = poll_every.is_some() && requester.wants_poll(end_us);
+                        if let (true, Some(every)) = (quiet_armed, poll_every) {
+                            quiet
+                                .as_mut()
+                                .reset(tokio::time::Instant::from_std(taken) + every);
+                        }
                     }
                     let class = self.class.index();
                     self.stats.tee_batches[class].fetch_add(1, Ordering::Relaxed);
                     self.stats.tee_lag_max_us[class].fetch_max(lag_max_us, Ordering::Relaxed);
                     self.feeds.make_requested();
                     self.publish();
-                    // The batch ran on one worker thread unless `process`
-                    // was parked on a lock and woke on another: then the
-                    // difference of two threads' clocks is no measure, and
-                    // what is booked never exceeds the batch's wall time.
-                    if let (Some(before), Some(after)) =
-                        (cpu_before, crate::edge_admission::thread_cpu_us())
-                    {
-                        let wall_us = wall_before.elapsed().as_micros() as u64;
-                        let used = after.saturating_sub(before).min(wall_us);
-                        crate::edge_admission::PLAYLIST_CPU_US.fetch_add(used, Ordering::Relaxed);
-                        self.stats.tee_cpu_us[class].fetch_add(used, Ordering::Relaxed);
-                    }
+                    self.book_cpu(&mut cpu_mark, taken);
                 }
-                () = expire.notified() => {
-                    self.expire().await;
-                }
-                () = async {
-                    match &tick {
-                        Some(tick) => tick.notified().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    if let Some(requester) = self.requester.as_mut() {
+                () = &mut quiet, if quiet_armed => {
+                    quiet_armed = false;
+                    if let (Some(requester), Some(every)) = (self.requester.as_mut(), poll_every) {
                         let now = if items.peek().is_none() {
                             now_unix_us()
                         } else {
                             self.last_rx_us
                         };
                         requester.poll(now);
+                        if requester.wants_poll(now) {
+                            quiet_armed = true;
+                            quiet.as_mut().reset(tokio::time::Instant::now() + every);
+                        }
                     }
+                }
+                () = expire.notified() => {
+                    self.expire().await;
                 }
             }
         }
+    }
+
+    /// Book the thread's processor time since `mark` once `TEE_CPU_EVERY`
+    /// has passed (`now`): never more than the wall time since. The tee is
+    /// a thread of its own, so its clock is its work.
+    fn book_cpu(&self, mark: &mut Option<(u64, Instant)>, now: Instant) {
+        let Some((cpu_then, wall_then)) = *mark else {
+            *mark = crate::edge_admission::thread_cpu_us().map(|cpu| (cpu, now));
+            return;
+        };
+        let wall = now.saturating_duration_since(wall_then);
+        if wall < TEE_CPU_EVERY {
+            return;
+        }
+        let Some(cpu_now) = crate::edge_admission::thread_cpu_us() else {
+            return;
+        };
+        let used = cpu_now
+            .saturating_sub(cpu_then)
+            .min(wall.as_micros() as u64);
+        crate::edge_admission::PLAYLIST_CPU_US.fetch_add(used, Ordering::Relaxed);
+        self.stats.tee_cpu_us[self.class.index()].fetch_add(used, Ordering::Relaxed);
+        *mark = Some((cpu_now, now));
     }
 
     fn publish(&self) {
@@ -3162,7 +3200,7 @@ impl Tee {
         #[cfg(test)]
         assert!(!self.panic_on_item, "test: the tee panics");
         #[cfg(test)]
-        {
+        if self.spin_ns > 0 {
             let started = Instant::now();
             while (started.elapsed().as_nanos() as u64) < self.spin_ns {
                 std::hint::spin_loop();
@@ -3587,11 +3625,12 @@ pub async fn run_relay_class_ingest(
             let _ = lease.part_repair.set(Arc::clone(repair));
         }
     }
-    // One tick for each class's tee.
-    let repair_ticks: Option<[Arc<Notify>; 2]> = part_repair
+    // Each class's tee polls its requester itself while its stream is
+    // quiet (teeperf: no tick from the node runtime).
+    let requester_poll_every = part_repair
         .as_ref()
         .filter(|repair| repair.config.requests)
-        .map(|_| [Arc::new(Notify::new()), Arc::new(Notify::new())]);
+        .map(|_| REQUESTER_QUIET_POLL);
     // Parts of two symbols or more are assembled by the tees' receivers
     // (4k-repair): whole from their sources with no RaptorQ, a damaged one
     // decoded on the pool.
@@ -3713,9 +3752,7 @@ pub async fn run_relay_class_ingest(
                     )
                 }),
             lease: config.lease.clone(),
-            repair_tick: repair_ticks
-                .as_ref()
-                .map(|ticks| Arc::clone(&ticks[class.index()])),
+            requester_poll_every,
             last_rx_us: 0,
             forward_journaled: (u64::MAX, u64::MAX),
             decodes: config.decode_pool.clone(),
@@ -3793,12 +3830,6 @@ pub async fn run_relay_class_ingest(
         Arc::clone(&stats),
         shutdown_rx.clone(),
     ));
-    let repair_ticker = repair_ticks.map(|ticks| {
-        tokio::spawn(crate::fast_control::run_part_repair_tick(
-            ticks.to_vec(),
-            shutdown_rx.clone(),
-        ))
-    });
     let child_ledgers = part_repair
         .as_ref()
         .filter(|repair| repair.config.link_repair)
@@ -3856,7 +3887,7 @@ pub async fn run_relay_class_ingest(
     }
     housekeeping.abort();
     sampler.abort();
-    for task in [&repair_ticker, &child_ledgers].into_iter().flatten() {
+    for task in [&child_ledgers].into_iter().flatten() {
         task.abort();
     }
     if let Some(video_buffers) = &video_buffers {

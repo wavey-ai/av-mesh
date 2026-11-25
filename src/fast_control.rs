@@ -512,27 +512,6 @@ mod mesh_socket_buffer_tests {
     }
 }
 
-/// Wake each tee's part repair asks every 2 ms (4k-repair): an ask is
-/// due a few ms after its part's parent moved on, which a tee that has no
-/// datagram to take would not see.
-pub(crate) async fn run_part_repair_tick(
-    ticks: Vec<Arc<tokio::sync::Notify>>,
-    mut shutdown_rx: watch::Receiver<()>,
-) {
-    let mut every = tokio::time::interval(Duration::from_millis(2));
-    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            _ = shutdown_rx.changed() => return,
-            _ = every.tick() => {
-                for tick in &ticks {
-                    tick.notify_one();
-                }
-            }
-        }
-    }
-}
-
 /// How often each child gets its ledger.
 const CHILD_LEDGER_EVERY: Duration = Duration::from_millis(250);
 

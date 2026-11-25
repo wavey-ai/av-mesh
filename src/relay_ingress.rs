@@ -1604,133 +1604,70 @@ impl RelayObjectReceiver {
         if !self.compact_completed.is_empty() && !matches!(self.completed_compact(key), Ok(false)) {
             return None;
         }
-        if let Some(done) = self.completed.get(key) {
-            if !done.parent_sessions.contains(&session_id) || !announced(&done.announcement) {
+        // The part under way (the common case): one lookup of its key.
+        if let Some(state) = self.objects.get_mut(key) {
+            if state.deferred.is_none()
+                || !state.parent_sessions.contains(&session_id)
+                || !announced(&state.announcement)
+            {
                 return None;
             }
-            let counters = &mut self.counters;
-            counters.datagrams_received = counters.datagrams_received.saturating_add(1);
-            counters.duplicate_datagrams = counters.duplicate_datagrams.saturating_add(1);
-            match symbol.role {
-                MediaDatagramRole::Source => {
-                    counters.source_datagrams = counters.source_datagrams.saturating_add(1);
-                }
-                MediaDatagramRole::Repair => {
-                    counters.repair_datagrams = counters.repair_datagrams.saturating_add(1);
-                }
+            // The stream's clock, as the full path moves it. A symbol that
+            // is not fresh goes the full way, which judges it again (the
+            // same verdict: a stale one moved nothing) and ends the
+            // assembly if the stream has left it behind.
+            let clock = MediaClocks::key(key.tenant(), key.stream());
+            if self.clocks.observe(
+                clock,
+                key.epoch(),
+                symbol.deadline_us,
+                self.config.media_deadline_us,
+            ) != Verdict::Fresh
+            {
+                return None;
             }
+            self.counters.datagrams_received = self.counters.datagrams_received.saturating_add(1);
             self.short_path += 1;
-            return Some(Ok(ParsedOutcome::Duplicate));
+            let step = push_active_symbol(
+                state,
+                key,
+                symbol,
+                &self.config,
+                &mut self.counters,
+                &mut self.buffered_datagrams,
+                &mut self.decode_jobs,
+                now_us,
+            );
+            let result = match step {
+                Ok(ActiveStep::Buffered) => Ok(ParsedOutcome::Buffered),
+                Ok(ActiveStep::Duplicate) => Ok(ParsedOutcome::Duplicate),
+                Ok(ActiveStep::Whole(object, envelope, deadline)) => self
+                    .finish_decoded(object, envelope, symbol.role, deadline, now_us)
+                    .map(ParsedOutcome::Decoded),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = &result {
+                self.record_rejection(error, true);
+            }
+            return Some(result);
         }
-        let state = self.objects.get(key)?;
-        if state.deferred.is_none()
-            || !state.parent_sessions.contains(&session_id)
-            || !announced(&state.announcement)
-        {
+        let done = self.completed.get(key)?;
+        if !done.parent_sessions.contains(&session_id) || !announced(&done.announcement) {
             return None;
         }
-        // The stream's clock, as the full path moves it. A symbol that is
-        // not fresh goes the full way, which judges it again (the same
-        // verdict: a stale one moved nothing) and ends the assembly if the
-        // stream has left it behind.
-        let clock = MediaClocks::key(key.tenant(), key.stream());
-        if self.clocks.observe(
-            clock,
-            key.epoch(),
-            symbol.deadline_us,
-            self.config.media_deadline_us,
-        ) != Verdict::Fresh
-        {
-            return None;
-        }
-        self.counters.datagrams_received = self.counters.datagrams_received.saturating_add(1);
-        self.short_path += 1;
-        let result = self.push_parsed_symbol(at, symbol, now_us);
-        if let Err(error) = &result {
-            self.record_rejection(error, true);
-        }
-        Some(result)
-    }
-
-    /// The assembly's part of [`Self::try_push_parsed`], for the part of hot
-    /// entry `at` (under way, checked).
-    fn push_parsed_symbol(
-        &mut self,
-        at: usize,
-        symbol: &ParsedSymbol<'_>,
-        now_us: u64,
-    ) -> Result<ParsedOutcome, RelayIngressError> {
-        let key = &self.hot[at].key;
-        let state = self
-            .objects
-            .get_mut(key)
-            .ok_or(RelayIngressError::AnnouncementRequired)?;
-        let fingerprint = SymbolFingerprint {
-            datagram_hash: datagram_fingerprint(symbol.fec),
-            role: symbol.role,
-        };
-        if let Some(existing) = state.symbols.get(&symbol.packet_sequence) {
-            if existing != &fingerprint {
-                return Err(RelayIngressError::SymbolReplayConflict);
-            }
-            let counters = &mut self.counters;
-            counters.duplicate_datagrams = counters.duplicate_datagrams.saturating_add(1);
-            match symbol.role {
-                MediaDatagramRole::Source => {
-                    counters.source_datagrams = counters.source_datagrams.saturating_add(1);
-                }
-                MediaDatagramRole::Repair => {
-                    counters.repair_datagrams = counters.repair_datagrams.saturating_add(1);
-                }
-            }
-            return Ok(ParsedOutcome::Duplicate);
-        }
-        if state.symbols.len() >= self.config.max_datagrams_per_object {
-            return Err(RelayIngressError::DatagramLimitExceeded);
-        }
-        if self.buffered_datagrams >= self.config.max_buffered_datagrams {
-            return Err(RelayIngressError::BufferedDatagramLimitExceeded);
-        }
-        let Some(deferred) = state.deferred.as_mut() else {
-            return Err(RelayIngressError::AnnouncementRequired);
-        };
-        let step = deferred.push_symbol(symbol.esi, symbol.symbol, symbol.fec, key)?;
-        if state.symbols.capacity() == 0 {
-            // Its symbols' table once at its size: no growth per symbol.
-            state
-                .symbols
-                .reserve(usize::from(deferred.k) + usize::from(deferred.k) / 8 + 16);
-        }
-        state.symbols.insert(symbol.packet_sequence, fingerprint);
+        let counters = &mut self.counters;
+        counters.datagrams_received = counters.datagrams_received.saturating_add(1);
+        counters.duplicate_datagrams = counters.duplicate_datagrams.saturating_add(1);
         match symbol.role {
             MediaDatagramRole::Source => {
-                state.source_symbols = state.source_symbols.saturating_add(1);
-                self.counters.source_datagrams = self.counters.source_datagrams.saturating_add(1);
+                counters.source_datagrams = counters.source_datagrams.saturating_add(1);
             }
             MediaDatagramRole::Repair => {
-                state.repair_symbols = state.repair_symbols.saturating_add(1);
-                self.counters.repair_datagrams = self.counters.repair_datagrams.saturating_add(1);
+                counters.repair_datagrams = counters.repair_datagrams.saturating_add(1);
             }
         }
-        state.last_activity_us = now_us;
-        self.buffered_datagrams = self.buffered_datagrams.saturating_add(1);
-        match step {
-            DeferredStep::Pending => Ok(ParsedOutcome::Buffered),
-            DeferredStep::Submit(job) => {
-                self.decode_jobs.push(job);
-                Ok(ParsedOutcome::Buffered)
-            }
-            DeferredStep::Whole(envelope) => {
-                let object = decode_part_envelope(
-                    &envelope,
-                    &state.announcement.key,
-                    self.config.relay_limits,
-                )?;
-                let deadline = state.announcement.deadline;
-                self.finish_decoded(object, envelope, symbol.role, deadline, now_us)
-                    .map(ParsedOutcome::Decoded)
-            }
-        }
+        self.short_path += 1;
+        Some(Ok(ParsedOutcome::Duplicate))
     }
 
     /// The decodes that the symbols taken so far made ready (4k-repair):
@@ -2291,6 +2228,92 @@ fn validate_completed_symbol(
         return Err(RelayIngressError::UnauthorizedParent);
     }
     Ok(())
+}
+
+/// What [`push_active_symbol`] did.
+enum ActiveStep {
+    Buffered,
+    Duplicate,
+    /// The part is whole: its object, its envelope and its deadline.
+    Whole(MediaObject, PartBuf, MediaDeadline),
+}
+
+/// The short path's assembly of a symbol of the part under way `state`
+/// (checked: deferred, its session a parent, its announcement the
+/// symbol's, its clock fresh): the duplicate and limit checks, counters and
+/// assembly of [`RelayObjectReceiver::push_wire_datagram`]'s full path, on
+/// the receiver's fields it needs.
+#[allow(clippy::too_many_arguments)]
+fn push_active_symbol(
+    state: &mut ActiveObject,
+    key: &ObjectKey,
+    symbol: &ParsedSymbol<'_>,
+    config: &RelayObjectReceiverConfig,
+    counters: &mut RelayIngressCounters,
+    buffered_datagrams: &mut usize,
+    decode_jobs: &mut Vec<DecodeJob>,
+    now_us: u64,
+) -> Result<ActiveStep, RelayIngressError> {
+    let fingerprint = SymbolFingerprint {
+        datagram_hash: datagram_fingerprint(symbol.fec),
+        role: symbol.role,
+    };
+    if let Some(existing) = state.symbols.get(&symbol.packet_sequence) {
+        if existing != &fingerprint {
+            return Err(RelayIngressError::SymbolReplayConflict);
+        }
+        counters.duplicate_datagrams = counters.duplicate_datagrams.saturating_add(1);
+        match symbol.role {
+            MediaDatagramRole::Source => {
+                counters.source_datagrams = counters.source_datagrams.saturating_add(1);
+            }
+            MediaDatagramRole::Repair => {
+                counters.repair_datagrams = counters.repair_datagrams.saturating_add(1);
+            }
+        }
+        return Ok(ActiveStep::Duplicate);
+    }
+    if state.symbols.len() >= config.max_datagrams_per_object {
+        return Err(RelayIngressError::DatagramLimitExceeded);
+    }
+    if *buffered_datagrams >= config.max_buffered_datagrams {
+        return Err(RelayIngressError::BufferedDatagramLimitExceeded);
+    }
+    let Some(deferred) = state.deferred.as_mut() else {
+        return Err(RelayIngressError::AnnouncementRequired);
+    };
+    let step = deferred.push_symbol(symbol.esi, symbol.symbol, symbol.fec, key)?;
+    if state.symbols.capacity() == 0 {
+        // Its symbols' table once at its size: no growth per symbol.
+        state
+            .symbols
+            .reserve(usize::from(deferred.k) + usize::from(deferred.k) / 8 + 16);
+    }
+    state.symbols.insert(symbol.packet_sequence, fingerprint);
+    match symbol.role {
+        MediaDatagramRole::Source => {
+            state.source_symbols = state.source_symbols.saturating_add(1);
+            counters.source_datagrams = counters.source_datagrams.saturating_add(1);
+        }
+        MediaDatagramRole::Repair => {
+            state.repair_symbols = state.repair_symbols.saturating_add(1);
+            counters.repair_datagrams = counters.repair_datagrams.saturating_add(1);
+        }
+    }
+    state.last_activity_us = now_us;
+    *buffered_datagrams = buffered_datagrams.saturating_add(1);
+    match step {
+        DeferredStep::Pending => Ok(ActiveStep::Buffered),
+        DeferredStep::Submit(job) => {
+            decode_jobs.push(job);
+            Ok(ActiveStep::Buffered)
+        }
+        DeferredStep::Whole(envelope) => {
+            let object =
+                decode_part_envelope(&envelope, &state.announcement.key, config.relay_limits)?;
+            Ok(ActiveStep::Whole(object, envelope, state.announcement.deadline))
+        }
+    }
 }
 
 /// The assembly of a part whose decode runs off the receiver's thread

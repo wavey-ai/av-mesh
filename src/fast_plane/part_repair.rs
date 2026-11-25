@@ -1791,6 +1791,17 @@ impl Requester {
         });
     }
 
+    /// Whether a poll at `now_us` may do anything: a part is open, or a
+    /// parent sent media in the last 2 s (its probes). A tee whose stream
+    /// is quiet polls only then (teeperf).
+    pub fn wants_poll(&self, now_us: u64) -> bool {
+        !self.open.is_empty()
+            || self
+                .parents
+                .iter()
+                .any(|parent| now_us.saturating_sub(parent.last_media_us) <= 2_000_000)
+    }
+
     /// A symbol of a part too small for part repair (one symbol, or a
     /// compact part): it follows its stream's head and is never a gap.
     pub fn seen(&mut self, view: &RlsView<'_>, peer: SocketAddr, lane: usize, now_us: u64) {
