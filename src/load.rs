@@ -29,6 +29,7 @@
 use crate::client_compact::IP_UDP_HEADER_BYTES;
 use crate::client_director::{Action, Director, DirectorConfig, LegKey, ReplacementKind, MAX_LEGS};
 use crate::client_session::{Received, SessionConfig, UdpSession};
+use crate::client_record::{OrderedOutput, ORDER_LIMITS};
 use crate::client_udp::ObjectKind;
 use crate::load_assign::{rendezvous_score, AssignConfig, Job, Reply, ResolveAnswer, ResolveRequest, Resolver};
 use serde_json::{json, Map, Value};
@@ -607,6 +608,94 @@ struct PartTrack {
 
 /// Interruptions whose parts a listener keeps track of.
 const MOVE_WINDOWS: usize = 8;
+
+/// A sampled listener's arrivals file (`--sample`), written as its parts
+/// come, in part order (`crate::client_record::OrderedOutput`): the parts
+/// were kept to the end of the run before (udp-client memory round: 1 ms
+/// parts for an hour were 3.6 million entries a listener). It is written
+/// beside its name (`.partial`) and named at the end of the run; a listener
+/// that leaves before the end writes no file, as before.
+struct ListenerArrivals {
+    output: OrderedOutput<std::io::BufWriter<std::fs::File>, std::io::Sink>,
+    /// The file's name, and its name while it is written.
+    path: Option<PathBuf>,
+    partial: Option<PathBuf>,
+    /// Parts taken (each once).
+    parts: u64,
+    failed: bool,
+}
+
+impl ListenerArrivals {
+    fn open(config: &LoadConfig, index: usize, session_no: u32) -> Self {
+        let path = config.out_dir.as_ref().map(|dir| {
+            dir.join("arrivals").join(match session_no {
+                0 => format!("listener-{index:05}.csv"),
+                n => format!("listener-{index:05}.{n}.csv"),
+            })
+        });
+        let partial = path
+            .as_ref()
+            .map(|path| path.with_extension("csv.partial"));
+        let file = partial.as_ref().and_then(|partial| {
+            let mut file =
+                std::io::BufWriter::with_capacity(16 << 10, std::fs::File::create(partial).ok()?);
+            file.write_all(b"part,arrival_unix_us,bytes,published_unix_us,available_unix_us\n")
+                .ok()?;
+            Some(file)
+        });
+        let failed = partial.is_some() && file.is_none();
+        Self {
+            output: OrderedOutput::new(file, None, ORDER_LIMITS),
+            path,
+            partial,
+            parts: 0,
+            failed,
+        }
+    }
+
+    fn push(
+        &mut self,
+        part: u64,
+        arrival: u64,
+        bytes: usize,
+        published: u64,
+        available: u64,
+        now: Instant,
+    ) {
+        self.parts += 1;
+        if self.failed || self.partial.is_none() {
+            return;
+        }
+        let line = format!("{part},{arrival},{bytes},{published},{available}\n");
+        if self.output.push(part, Some(line), None, now).is_err() {
+            self.failed = true;
+        }
+    }
+
+    /// The end of the run: the file is written and named; its name (as
+    /// before, also when it could not be written).
+    fn finish(&mut self) -> Option<PathBuf> {
+        if let Some(partial) = self.partial.take() {
+            if !self.failed && self.output.finish().is_ok() {
+                if let Some(path) = &self.path {
+                    let _ = std::fs::rename(&partial, path);
+                }
+            } else {
+                let _ = std::fs::remove_file(&partial);
+            }
+        }
+        self.path.clone()
+    }
+}
+
+impl Drop for ListenerArrivals {
+    fn drop(&mut self) {
+        // A listener that left before the end: no file.
+        if let Some(partial) = self.partial.take() {
+            let _ = std::fs::remove_file(partial);
+        }
+    }
+}
 
 impl PartTrack {
     fn new() -> Box<Self> {
@@ -1294,7 +1383,7 @@ struct Listener {
     seen: Seen,
     overflows: u32,
     highest_at_end: Option<u64>,
-    arrivals: Option<BTreeMap<u64, (u64, usize, u64, u64)>>,
+    arrivals: Option<ListenerArrivals>,
     started_unix_us: u64,
     /// A part settles this many parts behind the newest: `--settle-parts`,
     /// or (`learn_settle`) `--settle-ms` in parts of the shortest part
@@ -2059,14 +2148,13 @@ fn handle_datagram(
                         }
                     }
                     if let Some(arrivals) = &mut listener.arrivals {
-                        arrivals.insert(
+                        arrivals.push(
                             object.part,
-                            (
-                                arrival_us,
-                                object.payload.len(),
-                                object.published_unix_us,
-                                object.available_unix_us,
-                            ),
+                            arrival_us,
+                            object.payload.len(),
+                            object.published_unix_us,
+                            object.available_unix_us,
+                            now,
                         );
                     }
                 }
@@ -2418,7 +2506,8 @@ impl Listener {
             seen: Seen::default(),
             overflows: 0,
             highest_at_end: None,
-            arrivals: (index < config.sample).then(BTreeMap::new),
+            arrivals: (index < config.sample)
+                .then(|| ListenerArrivals::open(config, index, session_no)),
             started_unix_us: now_unix_us(),
             settle_parts: config.settle_parts.unwrap_or(TRACK - 1),
             learn_settle: config.settle_parts.is_none(),
@@ -2860,28 +2949,16 @@ fn worker(
             never_first += 1;
         }
         finish_listener(listener, &mut counters, &config, &mut worst, end_now);
-        if let Some(arrivals) = &listener.arrivals {
-            let file = config.out_dir.as_ref().map(|dir| {
-                dir.join("arrivals").join(match listener.session_no {
-                    0 => format!("listener-{:05}.csv", listener.index),
-                    n => format!("listener-{:05}.{n}.csv", listener.index),
-                })
-            });
-            if let Some(path) = &file {
-                let mut text =
-                    String::from("part,arrival_unix_us,bytes,published_unix_us,available_unix_us\n");
-                for (part, (arrival, bytes, published, available)) in arrivals {
-                    text.push_str(&format!("{part},{arrival},{bytes},{published},{available}\n"));
-                }
-                let _ = std::fs::write(path, text);
-            }
+        if let Some(arrivals) = &mut listener.arrivals {
+            let file = arrivals.finish();
+            let parts = arrivals.parts;
             let legs = &listener.legs;
             samples.push(json!({
                 "listener": listener.index,
                 // v1: its home edge; v2: every leg it held at the end.
                 "edge": legs.iter().find(|leg| leg.edge == listener.home).map(|leg| leg.node.clone()),
                 "edges": legs.iter().map(|leg| leg.node.clone()).collect::<Vec<_>>(),
-                "parts": arrivals.len(),
+                "parts": parts,
                 "file": file.map(|path| path.display().to_string()),
             }));
         }

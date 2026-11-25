@@ -32,6 +32,7 @@
 //! slowly, or that stops reading and keeps its connections open.
 
 use anyhow::{anyhow, bail, Context, Result};
+use av_mesh::client_record::BoundedSamples;
 use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use http::{header::HeaderValue, Request, StatusCode};
@@ -780,6 +781,19 @@ fn percentile(sorted: &[f64], percent: f64) -> Option<f64> {
     Some((sorted[index] * 1_000.0).round() / 1_000.0)
 }
 
+/// [`percentile`] of samples kept in bounded memory (the same value while
+/// they are kept exactly).
+fn sample_percentile(samples: &mut BoundedSamples, percent: f64) -> Option<f64> {
+    let count = samples.count();
+    if count == 0 {
+        return None;
+    }
+    let rank = ((count - 1) as f64 * percent / 100.0).round() as u64;
+    samples
+        .at_rank(rank)
+        .map(|value| (value * 1_000.0).round() / 1_000.0)
+}
+
 struct Reader {
     args: Args,
     http: HttpClient,
@@ -1262,8 +1276,11 @@ impl Reader {
         // When the player started, in microseconds after the first part.
         let mut play_from_us: Option<u64> = None;
         let mut last_arrival: Option<Instant> = None;
-        let mut latencies = Vec::new();
-        let mut publish_latencies = Vec::new();
+        // Each part's latencies, for the percentiles: kept exactly up to
+        // 65,536 parts, then in a fixed histogram (they grew by 16 bytes a
+        // part for the whole run: udp-client memory round).
+        let mut latencies = BoundedSamples::new();
+        let mut publish_latencies = BoundedSamples::new();
         let mut digest = 0xcbf2_9ce4_8422_2325_u64;
         let mut failed = 0_usize;
         let mut part_started = Instant::now();
@@ -1798,14 +1815,12 @@ impl Reader {
         self.report.round_trip_ms = self
             .round_trip
             .map(|value| (value.as_micros() as f64 / 1_000.0 * 10.0).round() / 10.0);
-        publish_latencies.sort_by(f64::total_cmp);
-        self.report.latency_p50_ms = percentile(&publish_latencies, 50.0);
-        self.report.latency_p99_ms = percentile(&publish_latencies, 99.0);
-        self.report.latency_max_ms = percentile(&publish_latencies, 100.0);
+        self.report.latency_p50_ms = sample_percentile(&mut publish_latencies, 50.0);
+        self.report.latency_p99_ms = sample_percentile(&mut publish_latencies, 99.0);
+        self.report.latency_max_ms = sample_percentile(&mut publish_latencies, 100.0);
         self.report.final_cache = self.current_name();
-        latencies.sort_by(f64::total_cmp);
-        self.report.cache_latency_p50_ms = percentile(&latencies, 50.0);
-        self.report.cache_latency_p99_ms = percentile(&latencies, 99.0);
+        self.report.cache_latency_p50_ms = sample_percentile(&mut latencies, 50.0);
+        self.report.cache_latency_p99_ms = sample_percentile(&mut latencies, 99.0);
         self.report.etag_digest = Some(format!("{digest:016x}"));
         if self.report.parts_received == 0 {
             bail!("no part was received");
@@ -2259,6 +2274,29 @@ fn part_after_a_hole(listed: &[(u64, u64)], wanted: u64, overdue: bool) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The latency percentiles of samples kept in bounded memory are those
+    /// of the sorted vector of before.
+    #[test]
+    fn latency_percentiles_are_those_of_every_part_kept() {
+        for count in [1_usize, 2, 51, 101, 1_000, 65_536] {
+            let values: Vec<f64> = (0..count)
+                .map(|index| ((index * 7_919) % 10_007) as f64 / 13.0 - 50.0)
+                .collect();
+            let mut samples = BoundedSamples::new();
+            values.iter().for_each(|value| samples.push(*value));
+            let mut sorted = values.clone();
+            sorted.sort_by(f64::total_cmp);
+            for percent in [50.0, 99.0, 100.0] {
+                assert_eq!(
+                    sample_percentile(&mut samples, percent),
+                    percentile(&sorted, percent),
+                    "{count} samples, p{percent}"
+                );
+            }
+        }
+        assert_eq!(sample_percentile(&mut BoundedSamples::new(), 50.0), None);
+    }
 
     /// C CR3: every binary of the crate names the build it came from
     /// (`--version`).
