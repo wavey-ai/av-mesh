@@ -65,8 +65,14 @@ pub(crate) const DEFAULT_PENDING_MAX_PERMILLE: u32 = 100;
 pub(crate) const DEFAULT_SHED_AFTER_MS: u64 = 2_000;
 /// Legs asked to leave in one round at most.
 pub(crate) const DEFAULT_SHED_PER_ROUND: usize = 32;
-/// A measured cost a datagram is taken from this many datagrams at least.
-const MIN_DATAGRAMS_FOR_COST: u64 = 2_000;
+/// A measured cost a datagram is taken from this many fan-out sends in the
+/// window at least (the lab's first look at 2,000, a window of a cold
+/// burst's first sends, read a few µs and let 86 legs past a cap that the
+/// next sample, at 22.7 µs, would have held).
+const MIN_DATAGRAMS_FOR_COST: u64 = 20_000;
+/// Legs are priced at the highest cost a datagram of this many of the
+/// latest measurements (a cost read low once does not open the edge).
+const COST_LOOKS: usize = 4;
 
 /// The `--cpu-admit-*` settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -394,7 +400,10 @@ struct State {
     over_since: Option<Instant>,
     /// Legs asked to leave lately: when, and their charge.
     shed: VecDeque<(Instant, u32)>,
+    /// The highest of the latest measured costs a datagram (`None`: none
+    /// measured yet: the edge is cold).
     last_cost: Option<u64>,
+    costs: VecDeque<u64>,
 }
 
 /// One edge's CPU admission.
@@ -517,7 +526,11 @@ impl CpuAdmit {
         if let Some((verdict, measured)) = verdict {
             // Only a measured cost (never the floor) ends the cold cap.
             if let Some(measured) = measured {
-                state.last_cost = Some(measured);
+                state.costs.push_back(measured);
+                while state.costs.len() > COST_LOOKS {
+                    state.costs.pop_front();
+                }
+                state.last_cost = state.costs.iter().copied().max();
             }
             if verdict.permille >= 1_000 {
                 state.over_since.get_or_insert(now);
@@ -596,7 +609,9 @@ impl CpuAdmit {
         let datagrams = last.datagrams.saturating_sub(first.datagrams);
         let measured = (datagrams >= MIN_DATAGRAMS_FOR_COST).then(|| send_ns / datagrams.max(1));
         let datagram_ns = measured
-            .or(state.last_cost)
+            .into_iter()
+            .chain(state.costs.iter().copied())
+            .max()
             .unwrap_or(0)
             .max(self.config.datagram_ns);
         let cpus_capacity = cpus * 1_000_000 * u64::from(cpus_full);
@@ -661,6 +676,18 @@ impl CpuAdmit {
     /// is at full, and refusals are on).
     pub(crate) fn full(&self) -> bool {
         self.enforcing() && self.load_permille() >= 1_000
+    }
+
+    /// A new leg refused at full before it was priced: counted by the
+    /// binding term.
+    pub(crate) fn note_full_refusal(&self) {
+        let cpus = self.state.lock().unwrap_or_else(|p| p.into_inner()).verdict.term == "cpus";
+        let counter = if cpus {
+            &self.stats.refused_cpus
+        } else {
+            &self.stats.refused_thread
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The node's load by this term now: the measured term and the legs

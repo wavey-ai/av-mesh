@@ -3100,6 +3100,33 @@ async fn admit(
     others: [u64; 2],
 ) {
     let admitted_in = Instant::now();
+    // rm/cpuadmit: at full a new leg is refused before any other work (the
+    // lab's crowd re-asked full edges 50-270 times a second, and each
+    // refusal's lookups took the runtime's workers 0.2-0.6 of a core).
+    let lone_mover = from_part.is_some() && others == NO_OTHER_LEGS;
+    if !lone_mover
+        && router
+            .edge_load
+            .egress
+            .cpu_admit()
+            .is_some_and(|cpu| cpu.full())
+    {
+        if let Some(cpu) = router.edge_load.egress.cpu_admit() {
+            cpu.note_full_refusal();
+        }
+        stats.refusals.fetch_add(1, Ordering::Relaxed);
+        stats.cpu_refusals.fetch_add(1, Ordering::Relaxed);
+        send_control(
+            &socket,
+            peer,
+            &Control::Refused {
+                stream_id,
+                reason: "edge-busy".into(),
+            },
+        )
+        .await;
+        return;
+    }
     let reason = match move_reason(&router, stream_id).await {
         // A client sent away for lost parents that comes back at once has
         // found no better edge: it is taken, not sent away again.
