@@ -9,6 +9,7 @@ mod edge_udp;
 mod fast_control;
 mod fast_path;
 mod fast_plane;
+mod heavy;
 mod hop_journal;
 mod lifecycle;
 mod link_telemetry;
@@ -3059,6 +3060,11 @@ struct Args {
     )]
     assignment_two_path_max_bps: u64,
 
+    /// Place240 (`heavy`): heavy sessions, placed by what they cost an
+    /// edge, capped by its budget, moved off an edge in distress.
+    #[command(flatten)]
+    heavy: heavy::HeavyArgs,
+
     /// Wave 9 C4: a moving UDP client (one that names the edges it has
     /// just left: a drain, a kill, a rebalance) is assigned by each cache's
     /// headroom alone, the caches under --rebalance-target-permille first,
@@ -4593,11 +4599,13 @@ async fn main() -> Result<()> {
             rebalance_target_permille: args.rebalance_target_permille,
             rebalance_margin_permille: args.client_udp_rebalance_margin_permille,
             two_path_max_bps: args.assignment_two_path_max_bps,
+            heavy_band_permille: args.heavy.band_permille,
         },
         args.steering_ttl_seconds.max(1),
         args.telemetry_interval_ms,
     )
-    .with_assignment_udp_in_region(args.assignment_udp_in_region);
+    .with_assignment_udp_in_region(args.assignment_udp_in_region)
+    .with_heavy(args.heavy.config());
     let rebalance_config = RebalanceConfig {
         target_permille: args.rebalance_target_permille,
         margin_permille: args.client_udp_rebalance_margin_permille,
@@ -15545,6 +15553,9 @@ struct EdgeServiceSnapshot {
     /// The physical host of the node (`--host-tag`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     host: Option<String>,
+    /// Place240: the edge's heavy work and room, and its distress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    heavy: Option<heavy::HeavyAdvert>,
 }
 
 /// The live gauges of a node's client UDP lane, on /api/mesh/local and
@@ -15728,6 +15739,7 @@ impl EdgeServiceSnapshot {
             parents_silent_ms: None,
             udp_subscribers: None,
             host: None,
+            heavy: None,
         }
     }
 
@@ -21344,6 +21356,9 @@ struct AppRouter {
     regional_view_ttl: Duration,
     /// What `GET /api/node` reads beyond the fields above.
     node_status: NodeStatusSource,
+    /// Place240: heavy sessions' settings, the entry's pending charges and
+    /// the edge's distress.
+    heavy: Arc<heavy::Heavy>,
 }
 
 /// How long one `GET /api/node` object serves.
@@ -21794,7 +21809,13 @@ impl AppRouter {
             // told how long one reading serves.
             regional_view_ttl: Duration::ZERO,
             node_status: NodeStatusSource::default(),
+            heavy: Arc::default(),
         }
+    }
+
+    fn with_heavy(mut self, config: heavy::HeavyConfig) -> Self {
+        self.heavy = Arc::new(heavy::Heavy::new(config));
+        self
     }
 
     fn with_node_status(mut self, source: NodeStatusSource) -> Self {
@@ -22267,6 +22288,13 @@ impl AppRouter {
                 })
             })
             .collect();
+        edge_service.heavy = self.heavy_advert(
+            snapshot
+                .streams
+                .iter()
+                .filter(|stream| stream.active() && !stream.stale())
+                .map(|stream| (stream.stream_id, stream.bitrate_bps)),
+        );
         snapshot.with_edge_service(edge_service)
     }
 
@@ -23062,6 +23090,8 @@ impl AppRouter {
             current: None,
             ..ReaderRequest::default()
         };
+        // Place240 rule 2: a new heavy reader beyond this edge's budget.
+        let admission = self.heavy_admits_reader(stream_id, session_id, admission);
         if admission == PlaybackAdmission::Rejected {
             let alternatives = self.alternate_cache_urls(reader, path, query).await;
             self.edge_load.record_rejection();
@@ -23301,6 +23331,12 @@ impl AppRouter {
                             Duration::from_secs(edge.egress_window_seconds.max(1)),
                         )
                     },
+                    heavy: self.heavy_room(
+                        &snapshot.node.node_id,
+                        edge.heavy.as_ref(),
+                        snapshot.updated_unix_ms,
+                        stream_id,
+                    ),
                 })
             })
             .collect()
@@ -23569,6 +23605,7 @@ impl AppRouter {
             spare_held: reader.spare_held,
             place_at: reader.place_at,
             left_hosts: &left_hosts,
+            heavy: self.heavy_session(playlist_bps, reader.udp),
         };
         // A rebalanced listener goes only to a cache heard of lately: an
         // edge that has just died still looks fresh, and empty, for a few
@@ -23609,6 +23646,15 @@ impl AppRouter {
                 &candidates,
             );
         }
+        // Place240 rule 2: a heavy session with no room in the region gets
+        // the busy answer: 429 for a reader, and for a UDP listener the
+        // spill below, whose edge refuses it `edge-busy` by its own cap.
+        if matches!(assignment, Err(AssignmentError::HeavyFull)) {
+            self.heavy_refused(reader.udp);
+            if reader.udp {
+                assignment = Err(AssignmentError::NoCacheAvailable);
+            }
+        }
         // Only a listener with nothing spills (B 3.6): a redundant leg that
         // finds no cache is not granted.
         if holds_nothing
@@ -23641,6 +23687,11 @@ impl AppRouter {
                 .iter()
                 .take(usize::from(assignment.legs))
                 .filter(|leg| !remembered.contains(&leg.node_id));
+            if let (Some(heavy), Some(key)) = (request.heavy, key.as_deref()) {
+                for leg in assignment.caches.iter().take(usize::from(assignment.legs)) {
+                    self.heavy_charge(&leg.node_id, key, reader.stream_id, heavy, reader.udp, remember);
+                }
+            }
             for (place, leg) in new_legs.enumerate() {
                 let mover = key
                     .as_deref()
@@ -23780,6 +23831,10 @@ impl AppRouter {
             return false;
         }
         let key = format!("{stream_id}/{session}");
+        // Place240: the heavy charges of its answer are proven now.
+        for node_id in &legs {
+            self.heavy.pending.confirm(node_id, &key);
+        }
         let now_ms = now_unix_ms();
         if self.remembered_assignments.len() >= MAX_REMEMBERED_ASSIGNMENTS {
             self.remembered_assignments
@@ -23940,7 +23995,11 @@ impl AppRouter {
                 )
                 .with_no_store();
             }
-            Err(AssignmentError::NoCacheAvailable | AssignmentError::NoLegGranted(_)) => Vec::new(),
+            Err(
+                AssignmentError::NoCacheAvailable
+                | AssignmentError::NoLegGranted(_)
+                | AssignmentError::HeavyFull,
+            ) => Vec::new(),
         };
         let alternatives = caches
             .iter()
@@ -24232,9 +24291,11 @@ impl AppRouter {
                 return response(StatusCode::NOT_FOUND, None, None).with_no_store();
             }
             // No cache admits a reader now. The player keeps its pathway.
-            Err(AssignmentError::NoCacheAvailable | AssignmentError::NoLegGranted(_)) => {
-                current.clone().into_iter().collect()
-            }
+            Err(
+                AssignmentError::NoCacheAvailable
+                | AssignmentError::NoLegGranted(_)
+                | AssignmentError::HeavyFull,
+            ) => current.clone().into_iter().collect(),
         };
         // The neighbouring regions stay last in every list, so that a reader
         // has somewhere to go when this region does not answer at all.
@@ -24459,6 +24520,10 @@ impl AppRouter {
             Err(error @ (AssignmentError::NoCacheAvailable | AssignmentError::NoLegGranted(_))) => {
                 (StatusCode::SERVICE_UNAVAILABLE, None, Some(error))
             }
+            // Place240 rule 2: the busy answer.
+            Err(error @ AssignmentError::HeavyFull) => {
+                (StatusCode::TOO_MANY_REQUESTS, None, Some(error))
+            }
         };
         let gauges = self.client_udp_gauges().await;
         let failover_entries: Vec<serde_json::Value> = self
@@ -24550,6 +24615,7 @@ impl AppRouter {
         body["fast_plane"] = serde_json::to_value(self.fast_plane_gauges()).unwrap_or_default();
         body["cache_mesh"] = serde_json::to_value(self.cache_mesh_gauges()).unwrap_or_default();
         body["second_leg_same_host"] = self.second_leg_same_host.load(Ordering::Relaxed).into();
+        body["heavy"] = self.heavy_counters();
         if let Some(block) = body["client_udp"].as_object_mut() {
             // Wave 9 B: the UDP ASSIGN requests answered and dropped.
             let stats = &self.edge_udp_stats;
@@ -32178,6 +32244,7 @@ mod tests {
             parents_silent_ms: None,
             udp_subscribers: None,
             host: None,
+            heavy: None,
         });
         let mut snapshot = TelemetryAggregator::default().snapshot(local).await;
         assert!(!snapshot

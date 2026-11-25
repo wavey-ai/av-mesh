@@ -91,6 +91,70 @@ pub struct CacheCandidate {
     /// The physical host the cache runs on, as its advertisement names it
     /// (`--host-tag`); `None` when it names none.
     pub host: Option<String>,
+    /// Its room for heavy sessions of the playlist (place240), with what
+    /// this entry placed there since its advertisement; `None` for a cache
+    /// that advertises none (an older node).
+    pub heavy: Option<HeavyRoom>,
+}
+
+/// A cache's room for heavy sessions (place240, `heavy::HeavyAdvert`): CPU
+/// in thousandths of one CPU, egress in bits a second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeavyRoom {
+    /// What heavy sessions may commit: the budget less the small
+    /// sessions' reserve.
+    pub cpu_budget: u32,
+    /// What they commit: the larger of the model's cost and the measured
+    /// CPU, and the sessions placed since the advertisement.
+    pub cpu_used: u32,
+    pub bps_max: u64,
+    pub bps_used: u64,
+    /// The cache pays the playlist's tee already (it holds it heavy, or a
+    /// session placed since pays it).
+    pub holds: bool,
+    /// The cache says it is in distress: no heavy session goes there.
+    pub distress: bool,
+}
+
+/// What one heavy session costs (place240): its rate, its CPU on a cache
+/// that holds the playlist and the tee's on one that does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeavySession {
+    pub bps: u64,
+    pub cpu: u32,
+    pub stream_cpu: u32,
+    /// The rate is measured: with no room anywhere the session is refused.
+    /// An estimate (no cache has measured the playlist yet) is placed by
+    /// room but never refused.
+    pub refuse: bool,
+}
+
+impl HeavyRoom {
+    /// What the session costs this cache.
+    pub fn cost(&self, session: &HeavySession) -> u32 {
+        session
+            .cpu
+            .saturating_add(if self.holds { 0 } else { session.stream_cpu })
+    }
+
+    /// The session fits the cache's budget and egress, and the cache is
+    /// not in distress.
+    pub fn fits(&self, session: &HeavySession) -> bool {
+        !self.distress
+            && self.cpu_used.saturating_add(self.cost(session)) <= self.cpu_budget
+            && self.bps_used.saturating_add(session.bps) <= self.bps_max
+    }
+
+    /// How full the cache is with the session (thousandths): the larger of
+    /// its CPU and its egress, each against its limit.
+    pub fn fill(&self, session: &HeavySession) -> u32 {
+        let cpu = u64::from(self.cpu_used.saturating_add(self.cost(session))) * 1_000
+            / u64::from(self.cpu_budget.max(1));
+        let bps = u128::from(self.bps_used.saturating_add(session.bps)) * 1_000
+            / u128::from(self.bps_max.max(1));
+        cpu.max(bps.min(u128::from(u64::MAX)) as u64)
+            .min(u64::from(u32::MAX)) as u32
+    }
 }
 
 impl CacheCandidate {
@@ -137,7 +201,16 @@ pub struct AssignmentPolicy {
     /// whatever the listener asks (`--assignment-two-path-max-bps`): a
     /// second copy of a 4K feed is not worth an edge fault.
     pub two_path_max_bps: u64,
+    /// Heavy sessions (place240): caches whose fill with the session is
+    /// within this (thousandths of their budget) of the emptiest are
+    /// comparable, and the session's rendezvous hash chooses among them
+    /// (`--heavy-place-band-permille`). One 240 Mbit/s session is 400 of a
+    /// 2-vCPU edge's egress: joins to it never share a band.
+    pub heavy_band_permille: u32,
 }
+
+/// Default of `--heavy-place-band-permille`.
+pub const DEFAULT_HEAVY_BAND_PERMILLE: u32 = 50;
 
 /// Default of `--assignment-two-path-max-bps`: 1 ms PCM is 2.6 Mbit/s a
 /// leg, 4K is hundreds.
@@ -156,6 +229,7 @@ impl Default for AssignmentPolicy {
             rebalance_target_permille: DEFAULT_REBALANCE_TARGET_PERMILLE,
             rebalance_margin_permille: DEFAULT_REBALANCE_MARGIN_PERMILLE,
             two_path_max_bps: DEFAULT_TWO_PATH_MAX_BPS,
+            heavy_band_permille: DEFAULT_HEAVY_BAND_PERMILLE,
         }
     }
 }
@@ -232,6 +306,9 @@ pub struct AssignmentRequest<'a> {
     /// `second_leg_same_host` counts it (hosttag review, finding 5: the
     /// dead leg's sibling on its stopped host still looks fresh).
     pub left_hosts: &'a [String],
+    /// The session is heavy (place240): it is placed by what it costs each
+    /// cache, not by the tiers.
+    pub heavy: Option<HeavySession>,
 }
 
 impl Default for AssignmentRequest<'_> {
@@ -256,6 +333,7 @@ impl Default for AssignmentRequest<'_> {
             spare_held: None,
             place_at: None,
             left_hosts: &[],
+            heavy: None,
         }
     }
 }
@@ -320,6 +398,9 @@ pub enum AssignmentError {
     /// region takes one (B 3.6: nothing spills), with the reason that
     /// `ASSIGNED` carries (`why=`, B Y2).
     NoLegGranted(ShortGrant),
+    /// A heavy session that no cache of the region has room for (place240
+    /// rule 2): the busy answer.
+    HeavyFull,
 }
 
 impl std::fmt::Display for AssignmentError {
@@ -331,6 +412,8 @@ impl std::fmt::Display for AssignmentError {
             Self::NoCacheAvailable => {
                 formatter.write_str("no cache of this region can take a new reader now")
             }
+            Self::HeavyFull => formatter
+                .write_str("no cache of this region has room for this heavy session now"),
             Self::NoLegGranted(why) => write!(
                 formatter,
                 "no cache of this region can take another leg of this listener now ({})",
@@ -404,6 +487,13 @@ pub fn assign(
             && cache.load_permille < FULL_LOAD_PERMILLE
             && has_room(cache)
     };
+
+    // Place240: a heavy session goes by what it costs each cache.
+    if let Some(heavy) = request.heavy {
+        if let Some(answer) = assign_heavy(request, policy, &regional, heavy, &healthy, &admits) {
+            return answer;
+        }
+    }
 
     let session = request.session.unwrap_or("");
     let moving = request.moving && policy.move_headroom;
@@ -793,6 +883,147 @@ pub fn assign(
     })
 }
 
+/// A heavy session's answer (place240 rules 1 and 2), or `None` to place it
+/// as any other (an estimated rate with no room anywhere).
+///
+/// The rule: the leg it depends on is the cache it uses (or was given
+/// lately) while that cache is healthy and not in distress, as before.
+/// Otherwise the caches that admit sessions and that the session fits (its
+/// CPU cost, the tee's too where the cache does not hold the playlist yet,
+/// within the cache's heavy budget; its rate within the cache's heavy
+/// egress; the cache not in distress) are ranked by their fill with it (the
+/// larger of CPU and egress against their limits, the sessions this entry
+/// placed since their advertisements counted at once); among those within
+/// `heavy_band_permille` of the emptiest, the session's rendezvous hash
+/// chooses, so that a session that asks again finds the same cache while
+/// the room is level. A region where a healthy cache advertises no room
+/// (an older node, a roll in progress) is placed as before. With no cache
+/// it fits, a measured session is
+/// refused ([`AssignmentError::HeavyFull`]). One leg; the spare and the
+/// failover order are the next caches it fits, emptiest first.
+fn assign_heavy(
+    request: AssignmentRequest<'_>,
+    policy: AssignmentPolicy,
+    regional: &[&CacheCandidate],
+    heavy: HeavySession,
+    healthy: &dyn Fn(&CacheCandidate) -> bool,
+    admits: &dyn Fn(&CacheCandidate) -> bool,
+) -> Option<Result<Assignment, AssignmentError>> {
+    // A region where a cache that could serve advertises no room (an
+    // older node, a roll in progress) is placed as before.
+    if regional
+        .iter()
+        .any(|cache| healthy(cache) && cache.heavy.is_none())
+    {
+        return None;
+    }
+    let session = request.session.unwrap_or("");
+    let fill = |cache: &CacheCandidate| {
+        cache
+            .heavy
+            .map_or(cache.effective_load_permille(), |room| room.fill(&heavy))
+    };
+    // (A cache without room here is unhealthy, and not admitted.)
+    let distressed = |cache: &CacheCandidate| cache.heavy.is_some_and(|room| room.distress);
+    let mut pool: Vec<&CacheCandidate> = regional
+        .iter()
+        .copied()
+        .filter(|cache| admits(cache) && cache.heavy.is_none_or(|room| room.fits(&heavy)))
+        .collect();
+    // The emptiest within the band, by the session's hash (salted for the
+    // spare, so that it is not the leg's order).
+    let choose = |pool: &[&CacheCandidate], salt: &str| -> Option<usize> {
+        let least = pool.iter().map(|cache| fill(cache)).min()?;
+        let band = least.saturating_add(policy.heavy_band_permille);
+        pool.iter()
+            .enumerate()
+            .filter(|(_, cache)| fill(cache) <= band)
+            .max_by(|(_, left), (_, right)| {
+                let score = |cache: &CacheCandidate| {
+                    if session.is_empty() {
+                        0
+                    } else {
+                        fnv1a64(format!("{session}{salt}").as_bytes(), cache.node_id.as_bytes())
+                    }
+                };
+                score(left)
+                    .cmp(&score(right))
+                    .then_with(|| fill(right).cmp(&fill(left)))
+                    .then_with(|| right.node_id.cmp(&left.node_id))
+            })
+            .map(|(index, _)| index)
+    };
+    let wanted = if request.redundant {
+        0
+    } else {
+        request.paths.min(1)
+    };
+    let mut caches: Vec<AssignedCache> = Vec::new();
+    if wanted > 0 {
+        let sticky = request
+            .current
+            .into_iter()
+            .chain(request.remembered.iter().map(String::as_str))
+            .find_map(|name| {
+                regional
+                    .iter()
+                    .copied()
+                    .find(|cache| cache.node_id == name && healthy(cache) && !distressed(cache))
+            });
+        match sticky {
+            Some(cache) => caches.push(assigned(cache, AssignmentReason::Sticky)),
+            None => {
+                let Some(index) = choose(&pool, "") else {
+                    return heavy.refuse.then_some(Err(AssignmentError::HeavyFull));
+                };
+                let cache = pool.remove(index);
+                let reason = if cache.holds_playlist() {
+                    AssignmentReason::HoldsPlaylist
+                } else {
+                    AssignmentReason::NewCopy
+                };
+                caches.push(assigned(cache, reason));
+            }
+        }
+        pool.retain(|cache| caches.iter().all(|leg| leg.node_id != cache.node_id));
+    }
+    let legs = u8::try_from(caches.len()).unwrap_or(MAX_PATHS);
+    let mut spare = false;
+    if request.spare {
+        if let Some(index) = choose(&pool, "/spare") {
+            let cache = pool.remove(index);
+            caches.push(assigned(cache, AssignmentReason::Spare));
+            spare = true;
+        }
+    }
+    pool.sort_by(|left, right| {
+        fill(left)
+            .cmp(&fill(right))
+            .then_with(|| left.node_id.cmp(&right.node_id))
+    });
+    for cache in pool.into_iter().take(policy.max_alternates) {
+        caches.push(assigned(cache, AssignmentReason::Alternate));
+    }
+    let other_serving = regional.iter().any(|cache| {
+        healthy(cache) && !caches.iter().take(usize::from(legs)).any(|leg| leg.node_id == cache.node_id)
+    });
+    let short = short_grant(request.paths, wanted, legs, other_serving);
+    if caches.is_empty() {
+        return Some(Err(match short {
+            Some(why) if request.redundant => AssignmentError::NoLegGranted(why),
+            _ => AssignmentError::NoCacheAvailable,
+        }));
+    }
+    Some(Ok(Assignment {
+        caches,
+        pinned: false,
+        legs,
+        spare,
+        second_leg_same_host: false,
+        short,
+    }))
+}
+
 /// Why a request for `asked` legs was granted `legs` (B Y2, the lead's
 /// decision): the bit rate cut the legs `wanted`; else no other edge of the
 /// region serves the stream (`other_serving`: fresh and not draining); else
@@ -1155,6 +1386,7 @@ mod tests {
             failover_rank: None,
             pending_permille: 0,
             host: None,
+            heavy: None,
         }
     }
 
@@ -2507,6 +2739,7 @@ mod tests {
             spare_held: None,
             place_at: None,
             left_hosts: &[],
+            heavy: None,
         }
     }
 
@@ -2799,5 +3032,278 @@ mod tests {
             .map(|cache| cache.node_id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(order, ["edge-2", "edge-1", "edge-3"]);
+    }
+
+    // Place240: heavy sessions.
+
+    /// A 2-vCPU edge's heavy room as cmpd8's edges were at a step's start:
+    /// the stream held (its tee paid), nothing else heavy.
+    fn heavy_room() -> HeavyRoom {
+        HeavyRoom {
+            cpu_budget: 1_500,
+            cpu_used: 200 + 650,
+            bps_max: 600_000_000,
+            bps_used: 0,
+            holds: true,
+            distress: false,
+        }
+    }
+
+    /// A UDP viewer of a 240 Mbit/s stream (the defaults of `heavy`).
+    const VIEWER_240: HeavySession = HeavySession {
+        bps: 240_000_000,
+        cpu: 100,
+        stream_cpu: 650,
+        refuse: true,
+    };
+
+    fn heavy_edges(count: usize) -> Vec<CacheCandidate> {
+        // cmpd8 b at 00:21:23: every edge at load 23 to 36.
+        (0..count)
+            .map(|index| CacheCandidate {
+                heavy: Some(heavy_room()),
+                ..cache(&format!("edge-{}", index + 1), 23 + 13 * index as u32 % 14, Some(100))
+            })
+            .collect()
+    }
+
+    /// The joins of `sessions`, one after another as an entry answers them
+    /// in one advertisement interval: each placed session counts at its
+    /// edge at once, as the entry's pending charges do (`heavy` off: the
+    /// advertisement as it was for every join, as before place240).
+    fn join_all(edges: &[CacheCandidate], sessions: &[String], heavy: bool) -> Vec<String> {
+        let mut edges = edges.to_vec();
+        let mut placed = Vec::new();
+        for session in sessions {
+            let ask = AssignmentRequest {
+                playlist_bps: Some(240_000_000),
+                heavy: heavy.then_some(VIEWER_240),
+                ..request(session)
+            };
+            let answer = assign(ask, AssignmentPolicy::default(), &edges).unwrap();
+            let node = answer.caches[0].node_id.clone();
+            assert_eq!(answer.legs, 1);
+            if let Some(room) = edges
+                .iter_mut()
+                .find(|edge| edge.node_id == node)
+                .and_then(|edge| edge.heavy.as_mut())
+            {
+                room.cpu_used += room.cost(&VIEWER_240);
+                room.bps_used += VIEWER_240.bps;
+                room.holds = true;
+            }
+            placed.push(node);
+        }
+        placed
+    }
+
+    fn counts(placed: &[String], edges: usize) -> Vec<usize> {
+        (1..=edges)
+            .map(|index| {
+                placed
+                    .iter()
+                    .filter(|node| **node == format!("edge-{index}"))
+                    .count()
+            })
+            .collect()
+    }
+
+    /// Sessions that the load-weighted hash alone puts on one edge, as it
+    /// put cmpd8 b's viewers (so that the test fails without the rule).
+    fn sessions_the_hash_puts_together(edges: &[CacheCandidate], wanted: usize) -> Vec<String> {
+        let mut by_edge: HashMap<String, Vec<String>> = HashMap::new();
+        for index in 0..10_000 {
+            let session = format!("viewer-{index}");
+            let placed = join_all(edges, std::slice::from_ref(&session), false);
+            let group = by_edge.entry(placed[0].clone()).or_default();
+            group.push(session);
+            if group.len() == wanted {
+                return group.clone();
+            }
+        }
+        panic!("no {wanted} sessions share an edge");
+    }
+
+    /// Place240 rule 1: two and four viewers of a 240 Mbit/s stream that
+    /// join together spread evenly over two and three edges by committed
+    /// bytes and cost, where the load-weighted hash put them all on one.
+    #[test]
+    fn simultaneous_heavy_joins_spread_evenly_by_committed_cost() {
+        for (edges, joins, expected) in [
+            (2, 2, vec![1, 1]),
+            (2, 4, vec![2, 2]),
+            (3, 2, vec![0, 1, 1]),
+            (3, 4, vec![1, 1, 2]),
+        ] {
+            let region = heavy_edges(edges);
+            let sessions = sessions_the_hash_puts_together(&region, joins);
+            let before = counts(&join_all(&region, &sessions, false), edges);
+            assert_eq!(before.iter().max(), Some(&joins), "{edges} edges: the hash put {before:?}");
+            let mut after = counts(&join_all(&region, &sessions, true), edges);
+            after.sort_unstable();
+            assert_eq!(after, expected, "{edges} edges, {joins} joins");
+        }
+    }
+
+    /// The same joins in any order from an entry that has counted them
+    /// spread the same way, and a session that asks again while the edges'
+    /// room is level gets its edge again (the rendezvous hash among
+    /// comparable edges).
+    #[test]
+    fn a_heavy_session_asking_again_keeps_its_edge_while_the_room_is_level() {
+        let region = heavy_edges(3);
+        for index in 0..200 {
+            let session = format!("again-{index}");
+            let first = join_all(&region, std::slice::from_ref(&session), true);
+            let again = join_all(&region, std::slice::from_ref(&session), true);
+            assert_eq!(first, again);
+        }
+        // Level within the band: a small difference does not move it.
+        let mut nudged = region.clone();
+        nudged[0].heavy.as_mut().unwrap().cpu_used += 20;
+        let mut kept = 0;
+        for index in 0..200 {
+            let session = format!("again-{index}");
+            kept += usize::from(
+                join_all(&region, std::slice::from_ref(&session), true)
+                    == join_all(&nudged, std::slice::from_ref(&session), true),
+            );
+        }
+        assert_eq!(kept, 200, "a 20-permille change is within the band");
+    }
+
+    /// Place240 rule 1: an edge whose committed cost would pass its budget
+    /// with the session takes none while another has room, though it is the
+    /// least loaded; one whose egress would pass its limit likewise.
+    #[test]
+    fn heavy_joins_to_an_edge_at_budget_are_sent_elsewhere() {
+        let mut region = heavy_edges(3);
+        region[0].load_permille = 0;
+        // Two viewers and a reader at 240 already (cmpd8 b's new-edge-1).
+        region[0].heavy.as_mut().unwrap().cpu_used = 200 + 650 + 2 * 100 + 240 + 300;
+        region[1].heavy.as_mut().unwrap().bps_used = 480_000_000;
+        for index in 0..100 {
+            let placed = join_all(&region, &[format!("busy-{index}")], true);
+            assert_eq!(placed, vec!["edge-3".to_owned()]);
+        }
+        // An edge that does not hold the stream pays its tee too.
+        let mut cold = heavy_edges(2);
+        cold[0].heavy = Some(HeavyRoom {
+            holds: false,
+            cpu_used: 200 + 650,
+            ..heavy_room()
+        });
+        assert!(!cold[0].heavy.unwrap().fits(&VIEWER_240));
+        assert_eq!(join_all(&cold, &["cold".to_owned()], true), vec!["edge-2".to_owned()]);
+    }
+
+    /// Place240 rule 2: with no edge of the region that fits, a heavy
+    /// session of a measured rate is refused; one of an estimated rate is
+    /// placed as before; a small session is never refused by it.
+    #[test]
+    fn a_heavy_session_with_no_room_in_the_region_is_refused() {
+        let mut region = heavy_edges(2);
+        for edge in &mut region {
+            edge.heavy.as_mut().unwrap().cpu_used = 1_450;
+        }
+        let ask = AssignmentRequest {
+            playlist_bps: Some(240_000_000),
+            heavy: Some(VIEWER_240),
+            ..request("late")
+        };
+        assert_eq!(
+            assign(ask, AssignmentPolicy::default(), &region),
+            Err(AssignmentError::HeavyFull)
+        );
+        let estimated = AssignmentRequest {
+            heavy: Some(HeavySession {
+                refuse: false,
+                ..VIEWER_240
+            }),
+            ..ask
+        };
+        assert!(assign(estimated, AssignmentPolicy::default(), &region).is_ok());
+        let audio = AssignmentRequest {
+            playlist_bps: Some(2_600_000),
+            ..request("audio")
+        };
+        assert!(assign(audio, AssignmentPolicy::default(), &region).is_ok());
+    }
+
+    /// Place240 rule 4: an edge in distress takes no heavy session, and a
+    /// heavy session that uses it is not kept there; one that uses a
+    /// healthy edge keeps it.
+    #[test]
+    fn an_edge_in_distress_takes_and_keeps_no_heavy_session() {
+        let mut region = heavy_edges(2);
+        region[0].heavy.as_mut().unwrap().distress = true;
+        region[0].load_permille = 0;
+        for index in 0..50 {
+            let session = format!("d-{index}");
+            assert_eq!(join_all(&region, std::slice::from_ref(&session), true), vec!["edge-2".to_owned()]);
+            let current = AssignmentRequest {
+                current: Some("edge-1"),
+                heavy: Some(VIEWER_240),
+                ..request(&session)
+            };
+            let answer = assign(current, AssignmentPolicy::default(), &region).unwrap();
+            assert_eq!(answer.caches[0].node_id, "edge-2");
+            let kept = AssignmentRequest {
+                current: Some("edge-2"),
+                heavy: Some(VIEWER_240),
+                ..request(&session)
+            };
+            let answer = assign(kept, AssignmentPolicy::default(), &region).unwrap();
+            assert_eq!(first(&answer), ("edge-2", AssignmentReason::Sticky));
+        }
+    }
+
+    /// Place240: a 1 ms audio crowd's placement does not change when the
+    /// edges advertise heavy work (the rule is for heavy sessions alone):
+    /// every one of 2,000 listeners gets exactly what the function gave
+    /// before, on the same inputs, and the spread is the old spread.
+    #[test]
+    fn an_audio_crowds_placement_is_what_it_was() {
+        let mut old_region = vec![
+            cache("edge-1", 120, Some(100)),
+            cache("edge-2", 300, Some(100)),
+            cache("edge-3", 450, Some(100)),
+        ];
+        old_region[1].pending_permille = 40;
+        let mut new_region = old_region.clone();
+        new_region[0].heavy = Some(HeavyRoom {
+            cpu_used: 1_400,
+            ..heavy_room()
+        });
+        new_region[1].heavy = Some(HeavyRoom {
+            distress: true,
+            ..heavy_room()
+        });
+        new_region[2].heavy = Some(heavy_room());
+        let mut old_counts = [0_usize; 3];
+        let mut new_counts = [0_usize; 3];
+        for index in 0..2_000 {
+            let session = format!("pcm-{index}");
+            for paths in [1, 2] {
+                let ask = AssignmentRequest {
+                    playlist_bps: Some(2_600_000),
+                    paths,
+                    spare: paths == 2,
+                    ..request(&session)
+                };
+                let old = assign(ask, AssignmentPolicy::default(), &old_region);
+                let new = assign(ask, AssignmentPolicy::default(), &new_region);
+                assert_eq!(old, new, "{session} p={paths}");
+                if let (Ok(old), Ok(new), 1) = (old, new, paths) {
+                    let at = |answer: &Assignment| {
+                        answer.caches[0].node_id[5..].parse::<usize>().unwrap() - 1
+                    };
+                    old_counts[at(&old)] += 1;
+                    new_counts[at(&new)] += 1;
+                }
+            }
+        }
+        assert_eq!(old_counts, new_counts);
+        assert!(old_counts.iter().all(|count| *count > 0), "{old_counts:?}");
     }
 }

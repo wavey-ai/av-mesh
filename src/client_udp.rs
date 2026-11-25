@@ -159,6 +159,12 @@ pub const MIN_ASSIGN_REQUEST_BYTES: usize = 512;
 /// entry point for an assignment over UDP unless told another.
 pub const DEFAULT_CLIENT_UDP_PORT: u16 = 19_446;
 
+/// The reason word of an edge's distress hint (place240 rule 4): `MOVE
+/// <stream> distress-<why>`. A hint, not a move the edge makes: the edge
+/// keeps serving the leg, and only a one-leg listener (or one whose every
+/// leg says so) moves.
+pub const DISTRESS_MOVE_PREFIX: &str = "distress-";
+
 /// Why an assignment granted fewer legs than asked (`why=` of `ASSIGNED`,
 /// `"why"` of `/api/assignment`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]

@@ -488,6 +488,27 @@ impl EdgeUdpStats {
             .collect()
     }
 
+    /// Subscribers now of each stream that has any, as (fast lane, other
+    /// lanes) (place240: what each costs the edge).
+    pub(crate) fn subscribers_by_stream_and_lane(&self) -> crate::heavy::LaneCounts {
+        let Some(table) = self.table.get() else {
+            return HashMap::new();
+        };
+        let table = table.0.lock().unwrap();
+        table
+            .iter()
+            .filter(|(_, entry)| !entry.subscribers.is_empty())
+            .map(|(stream_id, entry)| {
+                let fast = entry
+                    .subscribers
+                    .values()
+                    .filter(|subscriber| subscriber.fast.is_some())
+                    .count() as u64;
+                (*stream_id, (fast, entry.subscribers.len() as u64 - fast))
+            })
+            .collect()
+    }
+
     /// Bytes that the client lanes sent, every lane (cache-fed,
     /// cut-through, compact, NACK answers, window repair and the fast lane),
     /// with their IP and UDP headers.
@@ -2976,6 +2997,28 @@ async fn admit(
         )
         .await;
         return;
+    }
+    // Place240 rule 2: the edge's own cap of heavy sessions, by the cost
+    // model (a lone leg that moves here is taken, as above).
+    if !(from_part.is_some() && others == NO_OTHER_LEGS) {
+        let lane = if fast_lane && sockets.fast_lane().is_some_and(|lane| lane.is_armed()) {
+            crate::heavy::Lane::UdpFast
+        } else {
+            crate::heavy::Lane::UdpCache
+        };
+        if router.heavy_admits(stream_id, lane).is_err() {
+            stats.refusals.fetch_add(1, Ordering::Relaxed);
+            send_control(
+                &socket,
+                peer,
+                &Control::Refused {
+                    stream_id,
+                    reason: "edge-busy".into(),
+                },
+            )
+            .await;
+            return;
+        }
     }
     if hedge_over_gate(
         from_part,
