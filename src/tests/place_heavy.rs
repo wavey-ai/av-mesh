@@ -80,6 +80,34 @@ fn rate_bps() -> u64 {
 
 // ------------------------------------------------------------------ source
 
+/// The CPUs the source side (publisher, proxies) runs on, from
+/// `PH_SOURCE_CPUS` ("24-31" or "24,25"), so that the edges and viewers
+/// keep the rest of the process's CPUs (scripts/place240-proofs.sh).
+fn pin_source_thread() {
+    let Ok(list) = std::env::var("PH_SOURCE_CPUS") else {
+        return;
+    };
+    let mut cpus = Vec::new();
+    for part in list.split(',') {
+        match part.split_once('-') {
+            Some((from, to)) => {
+                if let (Ok(from), Ok(to)) = (from.trim().parse::<usize>(), to.trim().parse::<usize>()) {
+                    cpus.extend(from..=to);
+                }
+            }
+            None => cpus.extend(part.trim().parse::<usize>()),
+        }
+    }
+    // SAFETY: a zeroed cpu_set_t is valid; this thread's own affinity.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        for cpu in cpus {
+            libc::CPU_SET(cpu, &mut set);
+        }
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+}
+
 /// The canonical envelope of 4K frame `sequence` of `media_bytes`, as
 /// av-contrib builds it, packaged and published at `published_us`.
 fn frame_envelope(sequence: u64, media_bytes: usize, published_us: u64) -> Vec<u8> {
@@ -211,6 +239,7 @@ impl Source {
                 std::thread::Builder::new()
                     .name(format!("ph-maker-{maker}"))
                     .spawn(move || {
+                        pin_source_thread();
                         while running.load(Ordering::Relaxed) {
                             let sequence = next.fetch_add(1, Ordering::Relaxed);
                             let due = Self::due_us(start_us, sequence);
@@ -245,6 +274,7 @@ impl Source {
                 std::thread::Builder::new()
                     .name("ph-sender".into())
                     .spawn(move || {
+                        pin_source_thread();
                         let mut sequence = 0_u64;
                         while running.load(Ordering::Relaxed) {
                             let due = start + Duration::from_micros(sequence * Self::interval_us());
@@ -347,6 +377,7 @@ fn audio_publisher(
     std::thread::Builder::new()
         .name("ph-audio".into())
         .spawn(move || {
+            pin_source_thread();
             let start = Instant::now();
             let mut sequence = 0_u64;
             let mut held: Vec<Bytes> = Vec::new();
@@ -431,6 +462,7 @@ impl Proxy {
         std::thread::Builder::new()
             .name("ph-proxy".into())
             .spawn(move || {
+                pin_source_thread();
                 let mut upstreams: HashMap<SocketAddr, std::net::UdpSocket> = HashMap::new();
                 let mut buf = vec![0_u8; 65_536];
                 while running_in.load(Ordering::Relaxed) {
@@ -448,7 +480,10 @@ impl Proxy {
                         let (throttle, running) = (Arc::clone(&throttle_in), Arc::clone(&running_in));
                         std::thread::Builder::new()
                             .name("ph-proxy-down".into())
-                            .spawn(move || downstream(down, front, client, throttle, running))
+                            .spawn(move || {
+                                pin_source_thread();
+                                downstream(down, front, client, throttle, running)
+                            })
                             .unwrap();
                         upstream
                     });
