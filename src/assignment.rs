@@ -74,6 +74,9 @@ pub struct CacheCandidate {
     /// second: its bit rate, or the share of the cache that its requests
     /// take. `None` uses the bit rate of the playlist in the request.
     pub session_charge_bps: Option<u64>,
+    /// What one UDP leg of the playlist sends (rm/charge: the compact
+    /// lane's, or the RaptorQ lane's for a heavy stream), when known.
+    pub udp_charge_bps: Option<u64>,
     /// When the cache wrote the advertisement that this record comes from.
     pub updated_unix_ms: u64,
     /// Rank of the cache for the standby copy of the playlist
@@ -1419,6 +1422,7 @@ mod tests {
             pending_permille: 0,
             host: None,
             heavy: None,
+            udp_charge_bps: None,
         }
     }
 

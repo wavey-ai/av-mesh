@@ -314,6 +314,9 @@ struct EdgeAdmissionInner {
     /// never). A request prunes at most every SESSION_PRUNE_INTERVAL_MS.
     sessions_pruned_ms: AtomicU64,
     playlist_bps: Mutex<HashMap<u64, u64>>,
+    /// rm/charge: the playlists whose figure is their lane charge: the
+    /// stored slots' peak (`set_playlist_bps`) no longer moves it.
+    charged: Mutex<std::collections::HashSet<u64>>,
     /// Requests that a reader of each playlist makes in a second.
     playlist_request_rate: Mutex<HashMap<u64, u64>>,
 }
@@ -349,6 +352,7 @@ impl EdgeAdmission {
                 sessions: Mutex::new(HashMap::new()),
                 sessions_pruned_ms: AtomicU64::new(0),
                 playlist_bps: Mutex::new(HashMap::new()),
+                charged: Mutex::default(),
                 playlist_request_rate: Mutex::new(HashMap::new()),
             }),
         }
@@ -523,7 +527,14 @@ impl EdgeAdmission {
     /// The measured rate follows the content, and a session admitted during a
     /// quiet passage still needs the rate of a busy one.
     pub fn set_playlist_bps(&self, stream_id: u64, bps: u64) {
-        if bps == 0 {
+        if bps == 0
+            || self
+                .inner
+                .charged
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(&stream_id)
+        {
             return;
         }
         let mut playlist_bps = self
@@ -533,6 +544,25 @@ impl EdgeAdmission {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let peak = playlist_bps.entry(stream_id).or_insert(bps);
         *peak = (*peak).max(bps);
+    }
+
+    /// rm/charge: what one session of a playlist is charged, bits a second
+    /// (what its lane sends, with its hysteresis kept by the caller):
+    /// replaces the figure, where [`Self::set_playlist_bps`] keeps a peak.
+    pub fn set_playlist_charge(&self, stream_id: u64, bps: u64) {
+        if bps == 0 {
+            return;
+        }
+        self.inner
+            .charged
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(stream_id);
+        self.inner
+            .playlist_bps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(stream_id, bps);
     }
 
     /// Record how many requests a reader of a playlist makes in a second:
@@ -547,6 +577,11 @@ impl EdgeAdmission {
 
     /// Forget the bit rate of a playlist that this node no longer holds.
     pub fn clear_playlist_bps(&self, stream_id: u64) {
+        self.inner
+            .charged
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&stream_id);
         self.inner
             .playlist_bps
             .lock()
@@ -1257,6 +1292,23 @@ mod tests {
         assert_eq!(snapshot.load_permille, 988);
         assert_eq!(admission.sessions_by_playlist()[&1], 5);
         assert_eq!(admission.sessions_by_playlist()[&2001], 2);
+    }
+
+    /// rm/charge: a lane charge replaces the figure, falls as well as
+    /// rises, and the stored slots' peak no longer moves it.
+    #[test]
+    fn a_lane_charge_replaces_the_stored_peak() {
+        let admission = admission();
+        admission.set_playlist_bps(1, 16_000_000);
+        admission.set_playlist_charge(1, 4_000_000);
+        assert_eq!(admission.measured_playlist_bps(1), Some(4_000_000));
+        admission.set_playlist_bps(1, 9_000_000);
+        assert_eq!(admission.measured_playlist_bps(1), Some(4_000_000));
+        admission.set_playlist_charge(1, 3_000_000);
+        assert_eq!(admission.measured_playlist_bps(1), Some(3_000_000));
+        admission.clear_playlist_bps(1);
+        admission.set_playlist_bps(1, 9_000_000);
+        assert_eq!(admission.measured_playlist_bps(1), Some(9_000_000));
     }
 
     #[test]

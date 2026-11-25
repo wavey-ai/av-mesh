@@ -220,6 +220,7 @@ fn edge_snapshot(slot: &Slot, head: u64, subscribers: u64) -> MeshSnapshot {
         bitrate_bps: Some(2_600_000),
         sessions: subscribers,
         video: false,
+        lane_bps: None,
     }];
     snapshot.edge_service = Some(edge);
     snapshot
