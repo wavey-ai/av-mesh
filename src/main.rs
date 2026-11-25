@@ -14,6 +14,7 @@ mod lifecycle;
 mod link_telemetry;
 mod node_status;
 mod node_warm;
+mod pull_gate;
 
 use anyhow::{anyhow, bail, Context, Result};
 use assignment::{
@@ -2680,6 +2681,19 @@ struct Args {
     )]
     edge_hole_distance_ms: u64,
 
+    /// send240, C: what an edge may pull over the cache mesh (holes, the
+    /// quiet catch-up, a reader's backstop), all streams together, in
+    /// Mbit/s of parts (each ask charged its parts' size as they arrive);
+    /// parts of 64 KiB or less keep a quarter of it. A part the node shed
+    /// itself is never pulled, and a lane whose tee lags or sheds pulls
+    /// nothing, whatever this is. 0: no budget.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_EDGE_PULL_BUDGET_MBIT",
+        default_value_t = pull_gate::DEFAULT_PULL_BUDGET_MBIT
+    )]
+    edge_pull_budget_mbit: u64,
+
     /// An edge answers whether it has lost its parents from an answer at
     /// most this old (microseconds), instead of asking the cache mesh for
     /// every request. 0 asks for every request (the behaviour from before).
@@ -3837,6 +3851,7 @@ async fn main() -> Result<()> {
         "memory budgets"
     );
     spawn_memory_guard(Arc::clone(&cache), args.video_idle_release_ms);
+    cache.pull_gate.set_budget_mbit(args.edge_pull_budget_mbit);
     cache.set_canonical_gap_hold(Duration::from_millis(args.canonical_gap_hold_ms));
     cache.set_repair_horizon(args.canonical_repair_horizon);
     cache.set_repair_horizon_floor_for_burst_copy(Duration::from_millis(args.relay_burst_copy_ms));
@@ -9352,6 +9367,9 @@ struct LiveTsCache {
     /// The node's memory guard: a new video playlist is refused above its
     /// soft limit. Unset (tests), nothing is refused.
     memory_guard: OnceLock<Arc<av_mesh::mem_guard::Guard>>,
+    /// What the node may pull over the cache mesh (send240, C): the parts
+    /// it shed itself, its lanes' lag and its budget.
+    pull_gate: Arc<pull_gate::PullGate>,
 }
 
 impl LiveTsCache {
@@ -9496,6 +9514,7 @@ impl LiveTsCache {
             parent_feeds: OnceLock::new(),
             started_unix_us,
             memory_guard: OnceLock::new(),
+            pull_gate: Arc::default(),
         })
     }
 
@@ -12641,6 +12660,12 @@ impl LiveTsCache {
     /// that the playlist hints, and a reader on a far path asks several
     /// parts ahead. Any other part that the cache does not hold is unknown.
     async fn part_request_may_wait(&self, stream_id: u64, sequence: u64) -> bool {
+        // A part this node shed is not on its way: "not here" at once
+        // (send240, C).
+        if self.pull_gate.is_shed(stream_id, sequence) {
+            self.pull_gate.shed_answered.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
         let Some((_, last)) = self.stream_position_for_id(stream_id).await else {
             // No part of the stream yet: a copy is on its way to this cache.
             return true;
@@ -16740,10 +16765,11 @@ async fn run_mesh_applied_parts(
         journal_mesh_applied(&cache, &applied, committed_us);
         if let Some(holes) = &holes {
             holes
-                .arrived(
+                .arrived_sized(
                     applied.stream_id,
                     applied.slot_id as u64,
                     edge_holes::Arrival::CacheMesh,
+                    applied.bytes as u64,
                 )
                 .await;
         }
@@ -22836,6 +22862,8 @@ impl AppRouter {
             entry,
             node_warm: self.node_status.node_warm.clone(),
             memory: av_mesh::mem_guard::installed().map(|installed| installed.snapshot()),
+            pulls: (self.cache_mesh_role == CacheMeshRole::Edge)
+                .then(|| self.cache.pull_gate.snapshot()),
         });
         memory.cached = Some((now, Arc::clone(&status)));
         status
@@ -25285,6 +25313,11 @@ impl AppRouter {
                 .get_part_blocking_for_stream_id(stream_id, seq)
                 .await);
         }
+        // A part this edge shed is neither waited for nor pulled (send240).
+        if self.cache.pull_gate.is_shed(stream_id, seq) {
+            self.cache.pull_gate.shed_answered.fetch_add(1, Ordering::Relaxed);
+            return Ok(self.cache.get_part_for_stream_id(stream_id, seq).await);
+        }
         let deadline = Instant::now() + Duration::from_millis(PART_WAIT_MS);
         let mut requests = 0_u32;
         let mut part_us = None;
@@ -25395,9 +25428,21 @@ impl AppRouter {
         {
             count += 1;
         }
+        // send240, C: through the node's pull gate (shed parts, a lagging
+        // lane, the budget), and of one parent: the first at the first ask,
+        // the second alone after it.
+        let class = self.cache.stream_classes().class(stream_id);
+        if self
+            .cache
+            .pull_gate
+            .admit(class, stream_id, slot as u64, count)
+            .is_err()
+        {
+            return false;
+        }
         match self
             .mesh
-            .request_parts(stream_id, slot, count, parents)
+            .request_parts_from_rank(stream_id, slot, count, parents.saturating_sub(1).min(1))
             .await
         {
             Ok(_) => {
@@ -47503,4 +47548,7 @@ mod tests {
     /// A send stall at an edge and a forwarder (send240, A): what the
     /// class thread keeps, and what the cache-fed lane is handed.
     mod send_stall;
+    /// The pull loop (send240, C): an edge whose tee sheds never pulls the
+    /// parts it shed.
+    mod pull_loop;
 }

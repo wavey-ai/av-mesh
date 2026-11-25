@@ -258,7 +258,7 @@ pub(super) struct LaneEdge {
     pub(super) stats: Arc<edge_udp::EdgeUdpStats>,
     /// The edge's router, for its lifecycle (a drain).
     pub(super) router: AppRouter,
-    holes: Option<Arc<edge_holes::HoleTrigger>>,
+    pub(super) holes: Option<Arc<edge_holes::HoleTrigger>>,
     shutdown_tx: watch::Sender<()>,
     ingest: tokio::task::JoinHandle<Result<()>>,
     udp: tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -346,6 +346,26 @@ impl LaneEdge {
             true,
             |_| {},
             configure,
+            Duration::from_secs(5),
+        )
+        .await
+    }
+
+    /// send240 (C): an edge that finds its holes by part distance, its
+    /// class threads configured by `configure_class`.
+    pub(super) async fn start_with_holes(
+        ip: Ipv4Addr,
+        hole_distance: Duration,
+        configure_class: impl FnOnce(&mut RelayClassConfig),
+    ) -> Self {
+        Self::start_full(
+            ip,
+            SocketAddr::from((ip, 0)),
+            hole_distance,
+            64,
+            true,
+            configure_class,
+            |router| router,
             Duration::from_secs(5),
         )
         .await

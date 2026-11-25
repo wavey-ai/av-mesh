@@ -19,6 +19,15 @@
 //! cache mesh calls it for each part it applies, which counts for a stream
 //! that the fast plane has not fed for a while (an edge fed by the cache
 //! mesh alone, a lease refused, the forwarders down).
+//!
+//! send240 (C): every ask goes through the node's pull gate
+//! (`crate::pull_gate`): a part this node shed itself is never asked for, a
+//! lane whose tee lags or sheds asks for nothing, and the asks share a
+//! budget of bytes a second. A hole is asked of one parent at the first
+//! look and of the other alone at the second, which comes no sooner than
+//! twice the measured time a parent takes to answer. The quiet catch-up asks
+//! one parent for a few parts, from the stream's newest part (a new session
+//! starts it again from the new session's head).
 
 use crate::LiveTsCache;
 use playlists::mesh::CacheMeshHandle;
@@ -55,6 +64,11 @@ const QUIET_REPEAT: Duration = Duration::from_millis(50);
 /// A quiet stream is asked for no longer than this after its last part
 /// from anywhere: an ended stream costs a few small requests, no more.
 const QUIET_GIVE_UP: Duration = Duration::from_secs(5);
+/// Parts the quiet catch-up asks for at once (send240: it asked for 64, of
+/// both parents, every 50 ms).
+const QUIET_PARTS: u32 = 4;
+/// Asks whose answer the trigger times (the wait before a second parent).
+const TIMED_ASKS: usize = 256;
 
 /// Who saw a part arrive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,8 +90,12 @@ struct StreamHoles {
     /// The newest part seen from anywhere, and when it came.
     head: Option<u64>,
     head_at: Option<Instant>,
-    /// When the quiet catch-up last asked.
+    /// When the quiet catch-up last asked, and how often (its parent
+    /// alternates).
     quiet_asked: Option<Instant>,
+    quiet_asks: u32,
+    /// The parts' size (bytes) as they arrive: the pull gate charges it.
+    part_bytes: u64,
 }
 
 /// Which parts of each stream are due to be looked at.
@@ -85,6 +103,10 @@ struct StreamHoles {
 struct HoleScan {
     distance_us: u64,
     streams: HashMap<u64, StreamHoles>,
+    /// The time from an ask to its part (µs, smoothed; 0 until measured),
+    /// and the asks being timed.
+    fill_us: u64,
+    asked: std::collections::VecDeque<(u64, u64, Instant)>,
 }
 
 impl HoleScan {
@@ -113,6 +135,8 @@ impl HoleScan {
                             head: None,
                             head_at: None,
                             quiet_asked: None,
+                            quiet_asks: 0,
+                            part_bytes: 0,
                         },
                     );
                 }
@@ -149,8 +173,18 @@ impl HoleScan {
             head: None,
             head_at: None,
             quiet_asked: None,
+            quiet_asks: 0,
+            part_bytes: 0,
         });
-        // A part far behind the head is a new epoch that counts from 0.
+        // A part far behind the head is a new epoch that counts from 0: the
+        // quiet catch-up starts again from its head (send240).
+        if entry
+            .head
+            .is_some_and(|head| head > part.saturating_add(MAX_SCAN_PARTS))
+        {
+            entry.quiet_asked = None;
+            entry.quiet_asks = 0;
+        }
         if entry
             .head
             .is_none_or(|head| part > head || head > part.saturating_add(MAX_SCAN_PARTS))
@@ -164,9 +198,13 @@ impl HoleScan {
         }
         entry.arrivals = entry.arrivals.saturating_add(1);
         let distance = distance(entry.part_us);
+        // send240: the second look (the other parent) comes no sooner than
+        // twice the measured time an ask takes to be answered.
+        let answer = (2 * self.fill_us).div_ceil(entry.part_us.max(1));
+        let offsets = [distance, distance + distance.max(answer)];
         let mut due = [None; LOOKS];
         for (look, next) in entry.next.iter_mut().enumerate() {
-            let Some(upto) = part.checked_sub(distance.saturating_mul(look as u64 + 1)) else {
+            let Some(upto) = part.checked_sub(offsets[look]) else {
                 continue;
             };
             if *next == u64::MAX || *next > upto.saturating_add(MAX_SCAN_PARTS) {
@@ -186,12 +224,38 @@ impl HoleScan {
 }
 
 impl HoleScan {
+    /// An ask of `part` of `stream_id` went out: its answer is timed.
+    fn timing(&mut self, stream_id: u64, part: u64, now: Instant) {
+        if self.asked.len() == TIMED_ASKS {
+            self.asked.pop_front();
+        }
+        self.asked.push_back((stream_id, part, now));
+    }
+
+    /// Part `part` of `stream_id` came over the cache mesh: if it was
+    /// asked for, the time it took (the wait before a second parent).
+    fn answered(&mut self, stream_id: u64, part: u64, now: Instant) -> Option<u64> {
+        let at = self
+            .asked
+            .iter()
+            .position(|(stream, asked, _)| *stream == stream_id && *asked == part)?;
+        let (_, _, asked_at) = self.asked.remove(at)?;
+        let took = now.saturating_duration_since(asked_at).as_micros() as u64;
+        self.fill_us = if self.fill_us == 0 {
+            took
+        } else {
+            (self.fill_us * 7 + took) / 8
+        };
+        Some(self.fill_us)
+    }
+
     /// The streams to ask of the cache-mesh parents now, with the first
-    /// part to ask for: each stream that the fast plane fed and has left
-    /// quiet for [`QUIET_CATCH_UP`] (and four parts), again every
-    /// [`QUIET_REPEAT`] (and two parts) while it stays quiet, until
-    /// [`QUIET_GIVE_UP`] after its last part from anywhere.
-    fn quiet_due(&mut self, now: Instant) -> Vec<(u64, u64)> {
+    /// part to ask for and the parent's rank: each stream that the fast
+    /// plane fed and has left quiet for [`QUIET_CATCH_UP`] (and four
+    /// parts), again every [`QUIET_REPEAT`] (and two parts) while it stays
+    /// quiet, until [`QUIET_GIVE_UP`] after its last part from anywhere.
+    /// The parent alternates.
+    fn quiet_due(&mut self, now: Instant) -> Vec<(u64, u64, usize)> {
         let mut out = Vec::new();
         for (&stream_id, entry) in &mut self.streams {
             let (Some(fast_at), Some(head)) = (entry.fast_at, entry.head) else {
@@ -214,7 +278,8 @@ impl HoleScan {
                 continue;
             }
             entry.quiet_asked = Some(now);
-            out.push((stream_id, head + 1));
+            out.push((stream_id, head + 1, (entry.quiet_asks % 2) as usize));
+            entry.quiet_asks = entry.quiet_asks.wrapping_add(1);
         }
         out
     }
@@ -260,6 +325,8 @@ impl HoleTrigger {
                 scan: Mutex::new(HoleScan {
                     distance_us,
                     streams: HashMap::new(),
+                    fill_us: 0,
+                    asked: std::collections::VecDeque::with_capacity(TIMED_ASKS),
                 }),
                 requests: AtomicU64::new(0),
                 holes: AtomicU64::new(0),
@@ -273,10 +340,45 @@ impl HoleTrigger {
     /// `arrival`. Ask a parent for the parts the distance behind it that are
     /// missing, and both parents for those twice the distance behind it
     /// that are still missing.
-    pub(crate) async fn arrived(&self, stream_id: u64, part: u64, arrival: Arrival) {
+    /// [`Self::arrived`] from the fast plane's tee of `class`, which took
+    /// the symbol `lag_us` after its class thread (a lagging tee stops its
+    /// lane's pulls), of a part of about `part_bytes` (send240).
+    pub(crate) async fn arrived_from_tee(
+        &self,
+        stream_id: u64,
+        part: u64,
+        class: crate::fast_plane::TrafficClass,
+        lag_us: u64,
+        part_bytes: u64,
+    ) {
+        self.cache.pull_gate.note_tee_lag(class, lag_us);
+        self.arrived_sized(stream_id, part, Arrival::FastPlane, part_bytes)
+            .await;
+    }
+
+    /// [`Self::arrived`] of a part of `part_bytes` (0: unknown).
+    pub(crate) async fn arrived_sized(
+        &self,
+        stream_id: u64,
+        part: u64,
+        arrival: Arrival,
+        part_bytes: u64,
+    ) {
         let needs_part_us = {
             let mut scan = self.scan.lock().unwrap();
-            if !scan.counts(stream_id, arrival, Instant::now()) {
+            let now = Instant::now();
+            if arrival == Arrival::CacheMesh {
+                if let Some(fill_us) = scan.answered(stream_id, part, now) {
+                    self.cache.pull_gate.fill_us.store(fill_us, Ordering::Relaxed);
+                }
+            }
+            if let Some(entry) = scan.streams.get_mut(&stream_id) {
+                if part_bytes > 0 && entry.part_bytes != part_bytes {
+                    entry.part_bytes = part_bytes;
+                    self.cache.pull_gate.observe_part_bytes(stream_id, part_bytes);
+                }
+            }
+            if !scan.counts(stream_id, arrival, now) {
                 return;
             }
             scan.needs_part_us(stream_id)
@@ -301,12 +403,27 @@ impl HoleTrigger {
     /// for holes as the cache mesh's arrivals of a quiet stream are.
     pub(crate) fn sweep_quiet(&self) {
         let due = self.scan.lock().unwrap().quiet_due(Instant::now());
-        for (stream_id, from) in due {
+        for (stream_id, from, rank) in due {
+            // send240: a few parts, of one parent, through the gate (a
+            // lagging lane asks for nothing; the budget is shared).
+            let class = self.cache.stream_classes().class(stream_id);
+            if self
+                .cache
+                .pull_gate
+                .admit(class, stream_id, from, QUIET_PARTS)
+                .is_err()
+            {
+                continue;
+            }
             self.quiet_requests.fetch_add(1, Ordering::Relaxed);
+            self.cache
+                .pull_gate
+                .quiet_requests
+                .fetch_add(1, Ordering::Relaxed);
             let mesh = Arc::clone(&self.mesh);
             tokio::spawn(async move {
                 if let Err(error) = mesh
-                    .request_parts(stream_id, from as usize, MAX_SCAN_PARTS as u32, 2)
+                    .request_parts_from_rank(stream_id, from as usize, QUIET_PARTS, rank)
                     .await
                 {
                     debug!(stream_id, from, error = %error, "quiet catch-up request failed");
@@ -315,8 +432,10 @@ impl HoleTrigger {
         }
     }
 
-    /// Ask `parents` parents for the runs of parts from `from` to `upto`
-    /// that are missing.
+    /// Ask for the runs of parts from `from` to `upto` that are missing: at
+    /// the first look (`parents` 1) of the first parent, at the second (2)
+    /// of the second parent alone (send240: of both). Each run goes through
+    /// the pull gate: a part shed here splits the run and is not asked for.
     fn ask(&self, stream_id: u64, from: u64, upto: u64, parents: usize) {
         let chunk_cache = &self.cache.chunk_cache;
         // A stream this node holds nothing of yet has no holes.
@@ -330,27 +449,48 @@ impl HoleTrigger {
                     .is_none()
             })
         };
+        let gate = &self.cache.pull_gate;
+        let class = self.cache.stream_classes().class(stream_id);
+        let rank = parents.saturating_sub(1);
         let mut slot = from;
         while slot <= upto {
             if !missing(slot) {
                 slot += 1;
                 continue;
             }
+            if gate.is_shed(stream_id, slot) {
+                // Shed here: never asked for (the readers get a 404).
+                gate.not_requested_shed.fetch_add(1, Ordering::Relaxed);
+                slot += 1;
+                continue;
+            }
             let start = slot;
-            while slot <= upto && missing(slot) {
+            while slot <= upto && missing(slot) && !gate.is_shed(stream_id, slot) {
                 slot += 1;
             }
             let count = (slot - start) as u32;
             self.holes.fetch_add(u64::from(count), Ordering::Relaxed);
+            gate.holes.fetch_add(u64::from(count), Ordering::Relaxed);
+            if gate.admit(class, stream_id, start, count).is_err() {
+                continue;
+            }
             self.requests.fetch_add(1, Ordering::Relaxed);
             if parents > 1 {
                 self.rechecks.fetch_add(1, Ordering::Relaxed);
+                gate.second_parent.fetch_add(1, Ordering::Relaxed);
+            }
+            {
+                let mut scan = self.scan.lock().unwrap();
+                let now = Instant::now();
+                for part in start..slot {
+                    scan.timing(stream_id, part, now);
+                }
             }
             let mesh = Arc::clone(&self.mesh);
             // Sent beside the caller: the tee goes on with its datagrams.
             tokio::spawn(async move {
                 if let Err(error) = mesh
-                    .request_parts(stream_id, start as usize, count, parents)
+                    .request_parts_from_rank(stream_id, start as usize, count, rank)
                     .await
                 {
                     debug!(stream_id, start, count, error = %error, "hole request failed");
@@ -369,6 +509,8 @@ mod tests {
         let mut scan = HoleScan {
             distance_us: 15_000,
             streams: HashMap::new(),
+            fill_us: 0,
+            asked: std::collections::VecDeque::new(),
         };
         let mut first = |stream_id, part, part_us| scan.due(stream_id, part, part_us)[0];
         // 1 ms parts: 15 parts of distance.
@@ -396,6 +538,8 @@ mod tests {
         let mut scan = HoleScan {
             distance_us: 15_000,
             streams: HashMap::new(),
+            fill_us: 0,
+            asked: std::collections::VecDeque::new(),
         };
         assert_eq!(
             scan.due(7, 115, Some(1_000)),
@@ -415,6 +559,8 @@ mod tests {
         let mut scan = HoleScan {
             distance_us: 15_000,
             streams: HashMap::new(),
+            fill_us: 0,
+            asked: std::collections::VecDeque::new(),
         };
         let now = Instant::now();
         assert!(scan.counts(7, Arrival::CacheMesh, now), "never fed fast");
@@ -433,19 +579,21 @@ mod tests {
         let mut scan = HoleScan {
             distance_us: 15_000,
             streams: HashMap::new(),
+            fill_us: 0,
+            asked: std::collections::VecDeque::new(),
         };
         let start = Instant::now();
         assert!(scan.counts(1, Arrival::FastPlane, start));
         scan.due(1, 500, Some(41_667));
         let at = |ms| start + Duration::from_millis(ms);
         assert!(scan.quiet_due(at(100)).is_empty(), "four 42 ms parts not yet");
-        assert_eq!(scan.quiet_due(at(170)), vec![(1, 501)]);
+        assert_eq!(scan.quiet_due(at(170)), vec![(1, 501, 0)]);
         assert!(scan.quiet_due(at(200)).is_empty(), "two parts between asks");
-        assert_eq!(scan.quiet_due(at(255)), vec![(1, 501)]);
+        assert_eq!(scan.quiet_due(at(255)), vec![(1, 501, 1)]);
         // The cache mesh brings parts: the next ask starts beyond them.
         assert!(scan.counts(1, Arrival::CacheMesh, at(260)));
         scan.due(1, 506, None);
-        assert_eq!(scan.quiet_due(at(345)), vec![(1, 507)]);
+        assert_eq!(scan.quiet_due(at(345)), vec![(1, 507, 0)]);
         // The fast plane is back: nothing to ask.
         assert!(scan.counts(1, Arrival::FastPlane, at(350)));
         scan.due(1, 507, None);
@@ -455,6 +603,52 @@ mod tests {
         assert!(scan.quiet_due(Instant::now() + Duration::from_secs(6)).is_empty());
         // A stream never fed by the fast plane is not asked.
         scan.due(2, 10, Some(1_000));
-        assert!(scan.quiet_due(at(10_000)).iter().all(|(stream, _)| *stream != 2));
+        assert!(scan.quiet_due(at(10_000)).iter().all(|(stream, _, _)| *stream != 2));
+    }
+
+    /// send240: the second look (the other parent) waits for twice the
+    /// measured time a parent takes to answer, when that is longer than the
+    /// distance.
+    #[test]
+    fn the_second_parent_is_asked_after_twice_the_measured_answer() {
+        let mut scan = HoleScan {
+            distance_us: 15_000,
+            streams: HashMap::new(),
+            fill_us: 0,
+            asked: std::collections::VecDeque::new(),
+        };
+        let now = Instant::now();
+        // An ask of part 3 answered 40 ms later: 80 ms before the second.
+        scan.timing(7, 3, now);
+        assert_eq!(scan.answered(7, 3, now + Duration::from_millis(40)), Some(40_000));
+        assert_eq!(scan.answered(7, 3, now), None, "answered once");
+        // 1 ms parts: the first look 15 parts back, the second 15 + 80.
+        assert_eq!(scan.due(7, 115, Some(1_000)), [Some((100, 100)), Some((20, 20))]);
+        // 42 ms parts: 2 parts of distance, the second look 2 + 2 back.
+        assert_eq!(scan.due(9, 50, Some(41_667)), [Some((48, 48)), Some((46, 46))]);
+    }
+
+    /// send240: a new session (the part numbers start again far behind the
+    /// head) starts the quiet catch-up from the new session's head, never
+    /// from the old session's.
+    #[test]
+    fn a_new_session_starts_the_quiet_catch_up_from_its_own_head() {
+        let mut scan = HoleScan {
+            distance_us: 15_000,
+            streams: HashMap::new(),
+            fill_us: 0,
+            asked: std::collections::VecDeque::new(),
+        };
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        assert!(scan.counts(1, Arrival::FastPlane, start));
+        scan.due(1, 2_800, Some(41_667));
+        assert_eq!(scan.quiet_due(at(200)), vec![(1, 2_801, 0)]);
+        // The new session's first parts: the head is its own.
+        assert!(scan.counts(1, Arrival::FastPlane, at(300)));
+        scan.due(1, 3, None);
+        let asked = scan.quiet_due(at(700));
+        assert_eq!(asked, vec![(1, 4, 0)], "from the new head, the first parent");
+        assert!(asked.iter().all(|(_, from, _)| *from < 2_800));
     }
 }

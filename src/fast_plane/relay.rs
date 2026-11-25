@@ -1457,6 +1457,8 @@ struct ClassThread {
     epochs: Arc<ValidatedEpochs>,
     /// send240, A: the video thread keeps what a full socket refused.
     send_defer: Option<super::send_defer::DeferConfig>,
+    /// send240, C: the node's pull gate, told of each part shed here.
+    pull_gate: Arc<crate::pull_gate::PullGate>,
     /// Tests: the counter of this thread's allocations once it runs.
     #[cfg(test)]
     test_alloc_counter: Option<&'static crate::alloc_count::AllocCounter>,
@@ -1737,6 +1739,8 @@ struct Pending {
     /// A video part's symbol on the video thread: (stream key, part,
     /// source symbols), for [`TeeParts`].
     part: Option<(u64, u64, u64)>,
+    /// Its stream id, for the pull gate's record of a shed part (send240).
+    stream_id: Option<u64>,
 }
 
 impl ClassThread {
@@ -2211,6 +2215,7 @@ impl ClassThread {
                 rx_us,
                 admitted: None,
                 part: None,
+                stream_id: None,
             };
             if !is_relay_datagram(received.data) {
                 // A parent's ledger (RLL1) for the loss meter of this lane.
@@ -2323,6 +2328,7 @@ impl ClassThread {
             }
             let video_part = class == TrafficClass::Video && view.is_video_kind();
             pending.push(Pending {
+                stream_id: video_part.then(|| view.stream_id()).flatten(),
                 admitted: Some(view.is_video_kind()),
                 part: video_part.then(|| {
                     (
@@ -2426,6 +2432,11 @@ impl ClassThread {
             // class thread to free (stall follow-up). A full ring drops
             // the copy, as a full channel did.
             if !teed || !tee.push(meta, data) {
+                // send240, C: a part shed here is never pulled; its lane
+                // pulls nothing for a while.
+                if let (Some(stream_id), Some((_, object, _))) = (entry.stream_id, entry.part) {
+                    self.pull_gate.record_shed(class, stream_id, object);
+                }
                 self.stats.tee_dropped.fetch_add(1, Ordering::Relaxed);
                 if tee.growing() {
                     self.stats
@@ -2890,12 +2901,12 @@ impl Tee {
                     | raptorq_datagram_fec::MediaObjectKind::CodecConfig
             );
             if let Some(stream_id) = view.stream_id().filter(|_| media) {
+                // send240, C: the tee's lag (a lagging lane pulls nothing)
+                // and the part's size (the pull budget's charge).
+                let lag_us = now_unix_us().saturating_sub(item.woken_us);
+                let part_bytes = u64::from(view.source_symbols) * view.fec.len() as u64;
                 holes
-                    .arrived(
-                        stream_id,
-                        view.object,
-                        crate::edge_holes::Arrival::FastPlane,
-                    )
+                    .arrived_from_tee(stream_id, view.object, self.class, lag_us, part_bytes)
                     .await;
             }
         }
@@ -3113,6 +3124,7 @@ pub async fn run_relay_class_ingest(
             media_deadline_us: config.media_deadline_us,
             epochs: Arc::clone(&epochs),
             send_defer: config.send_defer.filter(|_| class == TrafficClass::Video),
+            pull_gate: Arc::clone(&cache.pull_gate),
             #[cfg(test)]
             test_alloc_counter: match class {
                 TrafficClass::Audio => config.test_alloc_counter,
