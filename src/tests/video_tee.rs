@@ -22,7 +22,10 @@
 //! `cargo test --release video_tee -- --ignored --nocapture --test-threads 1`.
 //! Env: VT_MBPS (247), VT_SECONDS (20), VT_FPS (24), VT_CHILDREN (4),
 //! VT_CPUS (none, or "a,b"), VT_TEE_NICE (0), VT_HOGS (0), VT_HOG_DUTY
-//! (0.5).
+//! (0.5), VT_LOSS_PERMILLE (0: datagrams the source drops, at random, before
+//! the node), VT_REPAIR_PER (20: one repair symbol per this many sources),
+//! VT_MALLOC_TUNE (1: the allocator tuned as the node tunes it,
+//! `--malloc-tune`).
 
 use super::video_throughput::{
     make_frames_shaped, run_child, send_frames_at, threads_cpu_ns, Frame, FrameShape, Received,
@@ -175,6 +178,23 @@ impl TeeRun {
     }
 }
 
+/// The source's loss: each datagram dropped with `permille` / 1,000
+/// chance (a fixed seed, so runs compare).
+fn drop_at_random(frames: &mut [Frame], permille: u64) {
+    if permille == 0 {
+        return;
+    }
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    for frame in frames {
+        frame.datagrams.retain(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % 1_000 >= permille
+        });
+    }
+}
+
 /// Pin the calling thread to `cpus`.
 fn pin_to(cpus: &[usize]) {
     // SAFETY: a zeroed cpu_set_t is the empty set; CPU_SET writes within it.
@@ -219,6 +239,9 @@ pub(super) fn tee_4k(options: TeeOptions) -> TeeRun {
         std::env::var_os("VT_SYMBOL_BY_SYMBOL").is_some(),
         Ordering::Relaxed,
     );
+    if env_u64("VT_MALLOC_TUNE", 1) == 1 {
+        let _ = crate::memory::tune_allocator(true);
+    }
     if std::env::var_os("VT_PTRACER").is_some() {
         // SAFETY: prctl with integer arguments only (eu-stack may sample).
         unsafe { libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY, 0, 0, 0) };
@@ -226,12 +249,13 @@ pub(super) fn tee_4k(options: TeeOptions) -> TeeRun {
     let shape = FrameShape {
         fps: options.fps,
         symbol_bytes: SYMBOL_BYTES,
-        repair_per_sources: 20,
+        repair_per_sources: env_u64("VT_REPAIR_PER", 20) as u32,
     };
     let bits_per_second = options.mbps * 1_000_000;
     let warmup = options.fps as usize;
     let measured = (options.seconds * options.fps) as usize;
-    let frames = make_frames_shaped(STREAM, 0, warmup + measured, bits_per_second, shape);
+    let mut frames = make_frames_shaped(STREAM, 0, warmup + measured, bits_per_second, shape);
+    drop_at_random(&mut frames, env_u64("VT_LOSS_PERMILLE", 0));
     let expected: Arc<HashMap<u64, usize>> = Arc::new(
         frames
             .iter()
@@ -784,4 +808,103 @@ fn a_large_part_lane_behind_does_not_delay_the_small_part_lanes_commits() {
     );
     assert!(dropped > 0, "the large-part lane's tee fell behind");
     assert!(loaded <= idle + 5.0, "idle {idle:.2} ms, loaded {loaded:.2} ms");
+}
+
+/// teeperf: the small-part lane's tee at `VT_STREAMS` (4) streams of 1,000
+/// one-symbol parts a second each, for `VT_SECONDS` (10): its processor
+/// time per part (the `nt-tee-audio` thread) and published-to-commit p50 /
+/// p99 (the source's send to the hop journal's `relay_decoded`). Run it
+/// alone, in release, with `--ignored`.
+#[test]
+#[ignore = "a measurement: run it alone, in release"]
+fn small_lane_tee_cost() {
+    if env_u64("VT_MALLOC_TUNE", 1) == 1 {
+        let _ = crate::memory::tune_allocator(true);
+    }
+    let streams = env_u64("VT_STREAMS", 4);
+    let seconds = env_u64("VT_SECONDS", 10);
+    let parts_per_second = env_u64("VT_PARTS_PER_SECOND", 1_000);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let relay = rt.block_on(async {
+        start_fast_relay_with(
+            ParentPath::PromotedSecondary,
+            &[],
+            fast_plane::relay::RelayClassConfig {
+                port_offset: OFFSET,
+                cpus: [None, None],
+                realtime: false,
+                ..Default::default()
+            },
+        )
+        .await
+    });
+    let deadline = now_unix_us() + 600_000_000;
+    let total = seconds * parts_per_second;
+    // Made before the clock starts: the source is another host.
+    let parts: Vec<Vec<Vec<u8>>> = (0..total)
+        .map(|sequence| {
+            (0..streams)
+                .map(|stream| {
+                    let mut symbols = fast_audio_symbols(5_001 + stream, sequence, deadline);
+                    assert_eq!(symbols.len(), 1, "one-symbol parts");
+                    symbols.pop().unwrap()
+                })
+                .collect()
+        })
+        .collect();
+    let fd = relay.primary_sender.as_raw_fd();
+    let target = relay.primary_audio;
+    let interval = Duration::from_nanos(1_000_000_000 / parts_per_second);
+    let warmup = parts_per_second;
+    let mut sent_us = vec![0_u64; total as usize];
+    let start = Instant::now() + Duration::from_millis(20);
+    let mut window = (0_u64, 0_u64, Instant::now(), Instant::now());
+    for (sequence, symbols) in parts.iter().enumerate() {
+        let due = start + interval * sequence as u32;
+        while Instant::now() < due {
+            std::hint::spin_loop();
+        }
+        if sequence as u64 == warmup {
+            window.0 = threads_cpu_ns(&["nt-tee-audio"]);
+            window.2 = Instant::now();
+        }
+        sent_us[sequence] = now_unix_us();
+        let _ = fast_plane::sys::send_batch(fd, symbols.len(), |index| {
+            (&symbols[index][..], target)
+        });
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    window.1 = threads_cpu_ns(&["nt-tee-audio"]);
+    window.3 = Instant::now();
+    let measured_parts = (total - warmup) * streams;
+    let tee_ns = window.1.saturating_sub(window.0);
+    let elapsed = window.3.duration_since(window.2).as_secs_f64();
+    let mut late: Vec<f64> = (0..streams)
+        .flat_map(|stream| hop_events(&relay.cache, HopStage::RelayDecoded, 5_001 + stream))
+        .filter_map(|event| {
+            sent_us
+                .get(event.seq as usize)
+                .map(|at| event.t_us.saturating_sub(*at) as f64 / 1_000.0)
+        })
+        .collect();
+    late.sort_by(f64::total_cmp);
+    let quantile = |q: f64| late.get(((late.len().max(1) - 1) as f64 * q) as usize).copied().unwrap_or(f64::NAN);
+    let decoded = relay.cache.relay_ingress_snapshot().decoded_objects;
+    println!(
+        "small-part lane: {streams} streams x {parts_per_second} one-symbol parts/s for {seconds} s: \
+         decoded {decoded} of {}; tee {:.1} % of a CPU, {:.2} us a part; published-to-commit \
+         p50 {:.3} ms, p99 {:.3} ms ({} parts in the journal); tee_dropped {}",
+        total * streams,
+        tee_ns as f64 / 1e9 / elapsed * 100.0,
+        tee_ns as f64 / 1e3 / measured_parts as f64,
+        quantile(0.5),
+        quantile(0.99),
+        late.len(),
+        relay.stats().tee_dropped,
+    );
+    rt.block_on(relay.stop());
 }
