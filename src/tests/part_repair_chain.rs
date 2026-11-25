@@ -665,6 +665,7 @@ pub(super) fn run_chain(parts: &[Part], measured: std::ops::Range<usize>, case: 
         window: fast_plane::part_repair::window_for(name),
         deadline_us: 1_000_000,
         regenerate_sources: case.requests,
+        store_bytes: fast_plane::part_repair::STORE_BYTES,
     };
     let mut links: Vec<Link> = (0..4).map(|_| Link::bind()).collect();
     let source = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -1051,4 +1052,81 @@ fn without_part_repair_the_same_links_lose_parts() {
     );
     println!("{HEADER}\n{}", run.row(None));
     assert!(!run.missing().is_empty());
+}
+
+/// 4k-repair review M2: a stream whose parts straddle one symbol (one-
+/// and two-symbol parts in turn), every part intact. A one-symbol part is
+/// too small for part repair, but it is a part of the stream: the
+/// requester must never take it for a gap, ask for it or give it up.
+#[test]
+fn a_stream_of_one_and_two_symbol_parts_is_never_asked_for() {
+    const DAMAGED: [u64; 3] = [101, 151, 201];
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let source = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let node = chain_node(
+            "m2-node",
+            source.local_addr().unwrap(),
+            None,
+            PartRepairConfig {
+                window: fast_plane::part_repair::window_for("m2-node"),
+                ..PartRepairConfig::default()
+            },
+        )
+        .await;
+        let deadline = now_unix_us() + 3_600_000_000;
+        let mut sizes = Vec::new();
+        for number in 0..300_u64 {
+            // The smallest media that makes a part of 1 (even) or 2 (odd)
+            // symbols.
+            let wanted = 1 + (number % 2) as usize;
+            let (mut datagrams, repair) = (1..)
+                .map(|step: usize| {
+                    let envelope = frame_envelope(STREAM, number, step * 64, FPS);
+                    fast_test_symbols(
+                        &envelope,
+                        relay_session::MediaPriority::VideoDelta,
+                        SYMBOL,
+                        400,
+                        1,
+                        deadline,
+                    )
+                })
+                .find(|(sources, _)| sources.len() >= wanted)
+                .unwrap();
+            sizes.push(datagrams.len());
+            // A one-symbol part comes alone (its copy on the other lane, as
+            // a node with one parent sees it); a two-symbol part with one
+            // repair symbol.
+            if datagrams.len() > 1 {
+                datagrams.extend(repair);
+            }
+            // The control: a few two-symbol parts lose a symbol and their
+            // repair (they are asked for; the test's source never answers).
+            if DAMAGED.contains(&number) {
+                datagrams.truncate(1);
+            }
+            for datagram in &datagrams {
+                source.send_to(datagram, node.video_in).unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(sizes.iter().filter(|k| **k == 1).count() >= 140, "{sizes:?}");
+        assert!(sizes.iter().filter(|k| **k == 2).count() >= 140, "{sizes:?}");
+        // Past the media deadline (1 s): any ask or give-up has happened.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let stats = node.repair_stats();
+        assert!(node.stats().video_received >= 590, "{:?}", node.stats().video_received);
+        let mut asked = node.repair.asked_parts();
+        asked.sort_unstable();
+        asked.dedup();
+        assert_eq!(asked, DAMAGED, "only the damaged parts are asked for: {stats:?}");
+        assert_eq!(stats.gap_parts, 0, "{stats:?}");
+        assert_eq!(stats.gave_up_parts, DAMAGED.len() as u64, "{stats:?}");
+        node.stop().await;
+    });
 }

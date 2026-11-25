@@ -212,6 +212,12 @@ impl LeaseSnapshot {
             .map(|stream| (&*stream.children, &*stream.fed_us))
     }
 
+    /// Whether `addr` is where this node sends a lease child one of its
+    /// lanes (4k-repair: only such an address is answered).
+    pub fn is_child_target(&self, addr: SocketAddr) -> bool {
+        self.children.iter().any(|child| child.targets.contains(&addr))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.streams.is_empty()
     }

@@ -4572,6 +4572,7 @@ async fn main() -> Result<()> {
                     window: fast_plane::part_repair::window_for(&node_id),
                     deadline_us: args.relay_media_deadline_us(),
                     regenerate_sources: args.relay_regenerate_sources,
+                    store_bytes: args.relay_part_store_mb.saturating_mul(1 << 20),
                 },
                 relay_session::RelayLimits::default(),
             )
@@ -7248,7 +7249,15 @@ impl RelayDownstreamForwarder {
                         if let Some(repair) = forwarder.part_repair.get() {
                             let via: Arc<dyn fast_plane::part_repair::SendSocket> =
                                 Arc::clone(&socket) as _;
-                            if repair.handle_child_datagram(&via, from, &buf[..len]) {
+                            // Only a child of this node, at the address
+                            // this node sends one of its lanes to.
+                            let admitted = |from: SocketAddr| {
+                                forwarder
+                                    .paths
+                                    .iter()
+                                    .any(|path| path.target == from || path.video_target == from)
+                            };
+                            if repair.handle_child_datagram(&via, from, &buf[..len], admitted) {
                                 continue;
                             }
                         }

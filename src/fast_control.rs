@@ -325,7 +325,9 @@ pub(crate) fn spawn_lease_inbound_drain(
                                 // A child's ask or loss report (4k-repair).
                                 if let Some(repair) = lease.part_repair.get() {
                                     let via: Arc<dyn SendSocket> = Arc::clone(&socket) as _;
-                                    repair.handle_child_datagram(&via, from, &buf[..len]);
+                                    repair.handle_child_datagram(&via, from, &buf[..len], |from| {
+                                        lease.load().is_child_target(from)
+                                    });
                                 }
                             } else {
                                 tokio::time::sleep(Duration::from_millis(50)).await;

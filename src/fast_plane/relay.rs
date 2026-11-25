@@ -2894,12 +2894,29 @@ impl Tee {
             }
         };
         let decoded_us = now_unix_us();
-        if let (Some(requester), Some(meta)) = (self.requester.as_mut(), repair_meta) {
-            requester.done(meta.key, decoded_us);
+        // Every part decoded here ends its asks and follows its stream's
+        // head, whatever its size (4k-repair review M2: a one-symbol part
+        // was otherwise a gap, asked for whole).
+        if let (Some(requester), Some(meta)) = (self.requester.as_mut(), meta.as_ref()) {
+            requester.committed(meta.key, peer, decoded_us);
         }
         // Kept for the children's asks and link repair, when this node has
         // children (4k-repair).
+        // A part of a session older than the stream's current one (the
+        // cache's epoch floor) is neither kept nor sent to children: the
+        // commit below refuses it too.
+        let stale = object
+            .key()
+            .stream()
+            .parse::<u64>()
+            .ok()
+            .and_then(|stream_id| self.cache.chunk_cache.epoch_floor(stream_id))
+            .is_some_and(|floor| object.key().epoch() < floor);
         let kept = match (&self.part_repair, repair_meta) {
+            (Some(repair), Some(_)) if stale => {
+                repair.stats.refused_stale.fetch_add(1, Ordering::Relaxed);
+                None
+            }
             (Some(_), Some(meta)) if self.has_children() => {
                 StoredPart::new(meta, object.key().clone(), envelope.clone())
             }
@@ -3221,8 +3238,14 @@ impl Tee {
         // waited in the tee is not judged by the wait.
         match self.dispatch.push(peer, bytes, item.rx_us) {
             Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Buffered { key, .. })) => {
-                if let (Some(requester), Some(view)) = (self.requester.as_mut(), repair_view) {
-                    requester.observe(view, peer, lane, item.rx_us);
+                if let Some(requester) = self.requester.as_mut() {
+                    match (repair_view, &fast_view) {
+                        (Some(view), _) => requester.observe(view, peer, lane, item.rx_us),
+                        // A part too small for part repair is still a part
+                        // of its stream: never a gap (4k-repair review M2).
+                        (None, Some(view)) => requester.seen(view, peer, lane, item.rx_us),
+                        (None, None) => {}
+                    }
                 }
                 journal_relay_symbol(&self.cache, &key, peer, item.rx_us);
                 journal_woken(&self.cache, &key, peer, item.woken_us);
@@ -3261,7 +3284,7 @@ impl Tee {
                     .await;
             }
             Ok(RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Duplicate { key, .. })) => {
-                if let (Some(requester), Some(view)) = (self.requester.as_mut(), repair_view) {
+                if let (Some(requester), Some(view)) = (self.requester.as_mut(), &fast_view) {
                     requester.observe_done(view, peer, lane, item.rx_us);
                 }
                 journal_forward(&key);
