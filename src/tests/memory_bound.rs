@@ -522,3 +522,535 @@ async fn memory_bench() {
         rss()
     );
 }
+
+/// glibc's arenas from `malloc_info`: (arenas, bytes they hold from the
+/// kernel, bytes free inside them, the largest arena's bytes).
+fn arena_stats() -> (usize, u64, u64, u64) {
+    let mut buffer: *mut libc::c_char = std::ptr::null_mut();
+    let mut size: libc::size_t = 0;
+    // SAFETY: open_memstream writes the pointer and size it is given; the
+    // stream is closed before the buffer is read and freed.
+    let text = unsafe {
+        let stream = libc::open_memstream(&mut buffer, &mut size);
+        if stream.is_null() {
+            return (0, 0, 0, 0);
+        }
+        libc::malloc_info(0, stream);
+        libc::fclose(stream);
+        let text = std::slice::from_raw_parts(buffer.cast::<u8>(), size).to_vec();
+        libc::free(buffer.cast());
+        String::from_utf8_lossy(&text).into_owned()
+    };
+    let attribute = |line: &str, name: &str| {
+        line.split(&format!("{name}=\""))
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .and_then(|value| value.parse::<u64>().ok())
+    };
+    let (mut arenas, mut system, mut free, mut largest) = (0, 0, 0, 0);
+    let mut in_heap = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("<heap ") {
+            arenas += 1;
+            in_heap = true;
+        } else if line.starts_with("</heap>") {
+            in_heap = false;
+        } else if in_heap && line.starts_with("<system type=\"current\"") {
+            let bytes = attribute(line, "size").unwrap_or(0);
+            system += bytes;
+            largest = largest.max(bytes);
+        } else if in_heap && line.starts_with("<total type=\"rest\"") {
+            free += attribute(line, "size").unwrap_or(0);
+        } else if in_heap && line.starts_with("<total type=\"fast\"") {
+            free += attribute(line, "size").unwrap_or(0);
+        }
+    }
+    (arenas, system, free, largest)
+}
+
+/// A forwarder in this process at 4K with N cache-mesh children (mem2): the
+/// forwarder's cache, its mesh split by class serving every child, a tee
+/// thread that assembles each frame from 1,316-byte symbols, and N edges
+/// whose caches are kept small (`MEM_EDGE_CACHE_MB`, 24) so that the
+/// forwarder's own memory shows. Real time (the mesh is): `MEM_SECONDS`
+/// (180), `MEM_MBPS` (247), `MEM_CHILDREN` (5), `MEM_TRIM_EVERY` (0: the
+/// guard's trims only; N: also a trim every N s). Every 10 s: RSS, the
+/// caches' bytes, live bytes by size class, the arenas.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement; run alone"]
+async fn forwarder_memory_bench() {
+    use playlists::mesh::{CacheMesh, CacheMeshConfig, CacheMeshRole as MeshRole};
+    let env = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let mbps = env("MEM_MBPS", 247);
+    let seconds = env("MEM_SECONDS", 180);
+    let children = env("MEM_CHILDREN", 5) as usize;
+    let edge_cache_mb = env("MEM_EDGE_CACHE_MB", 24);
+    let trim_every = env("MEM_TRIM_EVERY", 0);
+    let rate = mbps * 1_000_000 / 8;
+    let rss = || av_mesh::mem_guard::rss_bytes() / MB;
+    let node = || async {
+        LiveTsCache::with_ring(
+            1,
+            Duration::from_micros(2_500),
+            400,
+            12_000,
+            8_192,
+            16,
+            cache_ring_parts(2_500, 400, 12_000, DEFAULT_MIN_PART_US),
+        )
+        .await
+    };
+    let classify = |cache: &Arc<LiveTsCache>| {
+        let classes = cache.stream_classes().clone();
+        Arc::new(move |stream_id| classes.mesh_class(stream_id))
+            as playlists::mesh::CacheMeshStreamClassifier
+    };
+    let forwarder = node().await;
+    forwarder
+        .set_byte_budget(CacheByteBudget {
+            playlist: 392 * MB,
+            node: 392 * MB,
+        })
+        .await;
+    forwarder.stream_classes().mark_video(77);
+    let forwarder_addr = unused_loopback_addr();
+    let edge_addrs: Vec<SocketAddr> = (0..children).map(|_| unused_loopback_addr()).collect();
+    let mut config = CacheMeshConfig::new("dist-a", "uk", forwarder_addr)
+        .with_role(MeshRole::Distributor)
+        .with_announce_interval(Duration::from_millis(100))
+        .with_socket_buffer_bytes(32 << 20)
+        .with_class_port_offset(1_000)
+        .with_stream_classifier(classify(&forwarder));
+    for addr in &edge_addrs {
+        config = config.with_peer(*addr);
+    }
+    let forwarder_mesh = CacheMesh::new(Arc::clone(&forwarder.chunk_cache), config)
+        .start()
+        .await
+        .unwrap();
+    let mut edges = Vec::new();
+    for addr in &edge_addrs {
+        let edge = node().await;
+        edge.set_byte_budget(CacheByteBudget {
+            playlist: edge_cache_mb * MB,
+            node: edge_cache_mb * MB,
+        })
+        .await;
+        edge.stream_classes().mark_video(77);
+        let (applied_tx, mut applied_rx) = mpsc::unbounded_channel();
+        let mesh = CacheMesh::new(
+            Arc::clone(&edge.chunk_cache),
+            CacheMeshConfig::new("edge", "uk", *addr)
+                .with_peer(forwarder_addr)
+                .with_role(MeshRole::Edge)
+                .with_announce_interval(Duration::from_millis(100))
+                .with_applied_tx(applied_tx)
+                .with_socket_buffer_bytes(32 << 20)
+                .with_class_port_offset(1_000)
+                .with_stream_classifier(classify(&edge)),
+        )
+        .start()
+        .await
+        .unwrap();
+        // The edge records what the mesh applied, as a node does.
+        let recorder = Arc::clone(&edge);
+        tokio::spawn(async move {
+            while let Some(applied) = applied_rx.recv().await {
+                let _ = recorder
+                    .observe_mesh_part(applied.stream_id, applied.slot_id, None)
+                    .await;
+            }
+        });
+        edges.push((edge, mesh));
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The tee thread: frames as symbols, assembled, at 24 fps of real time.
+    let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel::<Bytes>(8);
+    let frames = seconds * FPS;
+    let tee = std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        for frame in 0..frames {
+            let due = start + Duration::from_micros(41_667 * frame);
+            if let Some(wait) = due.checked_duration_since(std::time::Instant::now()) {
+                std::thread::sleep(wait);
+            }
+            let encoded = encode_sized_part(77, 5, frame, frame_bytes(rate, frame));
+            let symbols: Vec<Vec<u8>> = encoded.chunks(1_316).map(<[u8]>::to_vec).collect();
+            let mut assembled = Vec::with_capacity(encoded.len());
+            for symbol in &symbols {
+                assembled.extend_from_slice(symbol);
+            }
+            drop(symbols);
+            if frames_tx.blocking_send(Bytes::from(assembled)).is_err() {
+                return;
+            }
+        }
+    });
+    println!(
+        "forwarder bench: {mbps} Mbit/s, {children} mesh children, {seconds} s, trim every {trim_every} s"
+    );
+    println!("  s  rss_mb  fwd_cache  edges_cache  live_mb(<4K/<64K/<1M/>=1M)  arenas  arena_sys_mb  arena_free_mb  largest_mb  edge_head  trimmed");
+    let mut frame = 0_u64;
+    let mut trimmed = 0;
+    let mut last_held = 0;
+    while let Some(payload) = frames_rx.recv().await {
+        forwarder.commit_stream_payload(77, payload).await.unwrap();
+        frame += 1;
+        if frame.is_multiple_of(FPS) {
+            let held = forwarder.chunk_cache.held_bytes();
+            if last_held >= held + av_mesh::mem_guard::TRIM_AFTER_RELEASE_BYTES {
+                trimmed += av_mesh::mem_guard::trim();
+                last_held = held;
+            }
+            last_held = last_held.max(held);
+            if trim_every > 0 && (frame / FPS).is_multiple_of(trim_every) {
+                trimmed += av_mesh::mem_guard::trim();
+            }
+        }
+        if frame.is_multiple_of(10 * FPS) {
+            let live = alloc_count::live_bytes_by_class();
+            let (arenas, system, free, largest) = arena_stats();
+            let mut edge_held = 0;
+            let mut heads = Vec::new();
+            for (edge, _) in &edges {
+                edge_held += edge.chunk_cache.held_bytes();
+                heads.push(edge.stream_position_for_id(77).await.map_or(0, |(_, last)| last));
+            }
+            println!(
+                "  {:4}  {:6}  {:9}  {:11}  {}/{}/{}/{}  {:6}  {:12}  {:13}  {:10}  {:?}  {}",
+                frame / FPS,
+                rss(),
+                forwarder.chunk_cache.held_bytes() / MB,
+                edge_held / MB,
+                live[0] / MB,
+                live[1] / MB,
+                live[2] / MB,
+                live[3] / MB,
+                arenas,
+                system / MB,
+                free / MB,
+                largest / MB,
+                heads.iter().min().zip(heads.iter().max()),
+                trimmed / MB,
+            );
+        }
+    }
+    tee.join().unwrap();
+    let before = rss();
+    let (_, _, free_before, _) = arena_stats();
+    let returned = av_mesh::mem_guard::trim();
+    let (_, _, free_after, _) = arena_stats();
+    println!(
+        "forwarder bench: end RSS {before} MB; a trim returned {} MB (arena free {} -> {} MB), RSS {} MB",
+        returned / MB,
+        free_before / MB,
+        free_after / MB,
+        rss()
+    );
+    forwarder_mesh.shutdown();
+    for (_, mesh) in edges {
+        mesh.shutdown();
+    }
+}
+
+/// A whole forwarder in this process at 4K (mem2): the fast plane's relay
+/// ingest (class threads, tee ring, assembly from 1,316-byte RelaySession
+/// symbols, commit), `MEM_CHILDREN` compiled children it forwards every
+/// symbol to (each drained by a thread), and its cache mesh split by class
+/// serving as many edge children (whose caches are kept at
+/// `MEM_EDGE_CACHE_MB`, 16). The forwarder's cache is a Linode node's (16
+/// playlists, 392 MB). Real time: `MEM_SECONDS` (600), `MEM_MBPS` (247),
+/// `MEM_TRIM_EVERY` (0). Every 10 s: RSS, the caches, live bytes by size
+/// class, the arenas.
+#[test]
+#[ignore = "a measurement; run alone"]
+fn whole_forwarder_memory_bench() {
+    use super::video_throughput::{make_frames_shaped, send_frames_at, FrameShape, Spread};
+    use playlists::mesh::{CacheMesh, CacheMeshConfig, CacheMeshRole as MeshRole};
+    use std::os::fd::AsRawFd;
+    let env = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let mbps = env("MEM_MBPS", 247);
+    let seconds = env("MEM_SECONDS", 600);
+    let children = env("MEM_CHILDREN", 5) as usize;
+    let edge_cache_mb = env("MEM_EDGE_CACHE_MB", 16);
+    let trim_every = env("MEM_TRIM_EVERY", 0);
+    // The allocator's thresholds as `--malloc-tune` sets them, or an mmap
+    // threshold of MEM_MMAP_KB.
+    let mmap_kb = env("MEM_MMAP_KB", 0);
+    if env("MEM_TUNE", 1) == 1 {
+        let _ = av_mesh::memory::tune_allocator(true);
+    }
+    if mmap_kb > 0 {
+        // SAFETY: mallopt takes plain integers.
+        unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, (mmap_kb * 1024) as i32) };
+    }
+    let trim_threshold_mb = env("MEM_TRIM_THRESHOLD_MB", 0);
+    if trim_threshold_mb > 0 {
+        // SAFETY: as above.
+        unsafe { libc::mallopt(libc::M_TRIM_THRESHOLD, (trim_threshold_mb << 20) as i32) };
+    }
+    const OFFSET: u16 = 1_000;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("fwd-rt")
+        .enable_all()
+        .build()
+        .unwrap();
+    let node = || async {
+        LiveTsCache::with_ring(
+            1,
+            Duration::from_micros(2_500),
+            400,
+            12_000,
+            8_192,
+            16,
+            cache_ring_parts(2_500, 400, 12_000, DEFAULT_MIN_PART_US),
+        )
+        .await
+    };
+    let classify = |cache: &Arc<LiveTsCache>| {
+        let classes = cache.stream_classes().clone();
+        Arc::new(move |stream_id| classes.mesh_class(stream_id))
+            as playlists::mesh::CacheMeshStreamClassifier
+    };
+    let rss = || av_mesh::mem_guard::rss_bytes() / MB;
+    let start_rss = rss();
+    let (relay, compiled, meshes, edges) = rt.block_on(async {
+        let mut compiled = Vec::new();
+        for _ in 0..children {
+            compiled.push(bind_class_pair(OFFSET).await);
+        }
+        let targets: Vec<RelayForwardEndpoint> = compiled
+            .iter()
+            .map(|(audio, _)| RelayForwardEndpoint {
+                bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                target: audio.local_addr().unwrap(),
+                role: RelayForwardRole::All,
+            })
+            .collect();
+        let cache = node().await;
+        cache
+            .set_byte_budget(CacheByteBudget {
+                playlist: 392 * MB,
+                node: 392 * MB,
+            })
+            .await;
+        cache.stream_classes().mark_video(1);
+        let relay = start_fast_relay_in(
+            ParentPath::PromotedSecondary,
+            &targets,
+            fast_plane::relay::RelayClassConfig {
+                port_offset: OFFSET,
+                cpus: [None, None],
+                realtime: false,
+                tee_capacity: fast_plane::relay::DEFAULT_TEE_CAPACITY,
+                video_gso: true,
+                ..Default::default()
+            },
+            Arc::clone(&cache),
+        )
+        .await;
+        if let Some(forwarder) = &relay.forwarder {
+            forwarder.configure_buffers(32 << 20);
+        }
+        // The forwarder's cache mesh, serving `children` edges.
+        let forwarder_addr = unused_loopback_addr();
+        let edge_addrs: Vec<SocketAddr> = (0..children).map(|_| unused_loopback_addr()).collect();
+        let mut config = CacheMeshConfig::new("dist-a", "uk", forwarder_addr)
+            .with_role(MeshRole::Distributor)
+            .with_announce_interval(Duration::from_millis(100))
+            .with_socket_buffer_bytes(32 << 20)
+            .with_class_port_offset(OFFSET)
+            .with_stream_classifier(classify(&cache));
+        for addr in &edge_addrs {
+            config = config.with_peer(*addr);
+        }
+        let mut meshes = vec![CacheMesh::new(Arc::clone(&cache.chunk_cache), config)
+            .start()
+            .await
+            .unwrap()];
+        let mut edges = Vec::new();
+        for addr in &edge_addrs {
+            let edge = node().await;
+            edges.push(Arc::clone(&edge));
+            edge.set_byte_budget(CacheByteBudget {
+                playlist: edge_cache_mb * MB,
+                node: edge_cache_mb * MB,
+            })
+            .await;
+            edge.stream_classes().mark_video(1);
+            let (applied_tx, mut applied_rx) = mpsc::unbounded_channel();
+            meshes.push(
+                CacheMesh::new(
+                    Arc::clone(&edge.chunk_cache),
+                    CacheMeshConfig::new("edge", "uk", *addr)
+                        .with_peer(forwarder_addr)
+                        .with_role(MeshRole::Edge)
+                        .with_announce_interval(Duration::from_millis(100))
+                        .with_applied_tx(applied_tx)
+                        .with_socket_buffer_bytes(32 << 20)
+                        .with_class_port_offset(OFFSET)
+                        .with_stream_classifier(classify(&edge)),
+                )
+                .start()
+                .await
+                .unwrap(),
+            );
+            tokio::spawn(async move {
+                while let Some(applied) = applied_rx.recv().await {
+                    let _ = edge
+                        .observe_mesh_part(applied.stream_id, applied.slot_id, None)
+                        .await;
+                }
+            });
+        }
+        (relay, compiled, meshes, edges)
+    });
+    // Drain the compiled children.
+    let stop = Arc::new(AtomicBool::new(false));
+    let drains: Vec<_> = compiled
+        .into_iter()
+        .map(|(audio, video)| {
+            let stop = Arc::clone(&stop);
+            let video = video.into_std().unwrap();
+            let _keep = audio.into_std().unwrap();
+            std::thread::spawn(move || {
+                let _keep = _keep;
+                video.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+                let mut buf = vec![0_u8; 65_536];
+                let mut bytes = 0_u64;
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok(n) = video.recv(&mut buf) {
+                        bytes += n as u64;
+                    }
+                }
+                bytes
+            })
+        })
+        .collect();
+    let shape = FrameShape {
+        fps: FPS,
+        symbol_bytes: 1_316,
+        repair_per_sources: 20,
+    };
+    let bits_per_second = mbps * 1_000_000;
+    let fd = relay.secondary_sender.as_raw_fd();
+    let _ = socket2::SockRef::from(&relay.secondary_sender).set_send_buffer_size(32 << 20);
+    let target = relay.secondary_video.unwrap();
+    println!(
+        "whole forwarder bench: {mbps} Mbit/s, {children} compiled + {children} mesh children, {seconds} s, trim every {trim_every} s, mmap threshold {} (start RSS {start_rss} MB)",
+        if mmap_kb > 0 { format!("{mmap_kb} KiB") } else { "32 MiB".to_owned() }
+    );
+    println!("     s  rss_mb  fwd_cache_mb  edge_caches_mb  live_mb(<4K/<64K/<1M/>=1M)  arenas  arena_sys_mb  arena_free_mb  largest_arena_mb  trimmed_mb");
+    // MEM_GUARD=1: the node's guard, ticking once a second on its own
+    // thread, trims for the cache's releases and for the heap's growth.
+    let guard_trimmed = Arc::new(AtomicU64::new(0));
+    let guard_thread = (env("MEM_GUARD", 0) == 1).then(|| {
+        let stop = Arc::clone(&stop);
+        let trimmed = Arc::clone(&guard_trimmed);
+        let mut caches: Vec<Arc<LiveTsCache>> = edges.clone();
+        caches.push(Arc::clone(&relay.cache));
+        std::thread::spawn(move || {
+            let guard = av_mesh::mem_guard::Guard::new(0, 0);
+            let fixed: u64 = caches.iter().map(|cache| cache.ring_index_bytes()).sum::<u64>()
+                + av_mesh::memory::locked_bytes();
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(1));
+                let held: u64 = caches.iter().map(|cache| cache.chunk_cache.held_bytes()).sum();
+                let tick = guard.tick_with_fixed(av_mesh::mem_guard::rss_bytes(), held, fixed);
+                if tick.trim {
+                    let result = av_mesh::mem_guard::trim_measured();
+                    trimmed.fetch_add(result.returned_bytes, Ordering::Relaxed);
+                    guard.note_trim_measured(result);
+                }
+            }
+            guard.snapshot(&Default::default(), &Default::default())
+        })
+    });
+    let start = Instant::now() + Duration::from_millis(50);
+    let mut trimmed = 0;
+    let mut last_held = 0;
+    for batch in 0..seconds / 10 {
+        let frames = make_frames_shaped(1, batch * 10 * FPS, (10 * FPS) as usize, bits_per_second, shape);
+        let at = start + Duration::from_secs(batch * 10);
+        send_frames_at(fd, target, &frames, bits_per_second, Spread::Paced, at, FPS, 1_316);
+        drop(frames);
+        let held = relay.cache.chunk_cache.held_bytes();
+        if last_held >= held + av_mesh::mem_guard::TRIM_AFTER_RELEASE_BYTES {
+            trimmed += av_mesh::mem_guard::trim();
+            last_held = held;
+        }
+        last_held = last_held.max(held);
+        if trim_every > 0 && ((batch + 1) * 10).is_multiple_of(trim_every) {
+            trimmed += av_mesh::mem_guard::trim();
+        }
+        let live = alloc_count::live_bytes_by_class();
+        let (arenas, system, free, largest) = arena_stats();
+        let edge_held: u64 = edges.iter().map(|edge| edge.chunk_cache.held_bytes()).sum();
+        println!(
+            "  {:4}  {:6}  {:12}  {:14}  {}/{}/{}/{}  {:6}  {:12}  {:13}  {:16}  {:10}",
+            (batch + 1) * 10,
+            rss(),
+            held / MB,
+            edge_held / MB,
+            live[0] / MB,
+            live[1] / MB,
+            live[2] / MB,
+            live[3] / MB,
+            arenas,
+            system / MB,
+            free / MB,
+            largest / MB,
+            (trimmed + guard_trimmed.load(Ordering::Relaxed)) / MB,
+        );
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let before = rss();
+    let (_, _, free_before, _) = arena_stats();
+    let returned = av_mesh::mem_guard::trim();
+    let (_, _, free_after, _) = arena_stats();
+    println!(
+        "whole forwarder bench: end RSS {before} MB; a trim returned {} MB (arena free {} -> {} MB), RSS {} MB; relay {:?}",
+        returned / MB,
+        free_before / MB,
+        free_after / MB,
+        rss(),
+        relay.stats().tee_dropped,
+    );
+    stop.store(true, Ordering::Relaxed);
+    if let Some(guard) = guard_thread {
+        let snapshot = guard.join().unwrap();
+        println!(
+            "whole forwarder bench: guard trims {} ({} for growth), last heap free {} -> {} MB",
+            snapshot.trims,
+            snapshot.growth_trims,
+            snapshot.heap_free_before_trim_bytes / MB,
+            snapshot.heap_free_after_trim_bytes / MB
+        );
+    }
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: getrusage writes the struct it is given.
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    println!(
+        "whole forwarder bench: process CPU {:.1} s, minor faults {}",
+        usage.ru_utime.tv_sec as f64 + usage.ru_stime.tv_sec as f64,
+        usage.ru_minflt
+    );
+    let forwarded: u64 = drains.into_iter().map(|drain| drain.join().unwrap()).sum();
+    println!("whole forwarder bench: forwarded {} MB to the compiled children", forwarded / MB);
+    for mesh in meshes {
+        mesh.shutdown();
+    }
+    rt.block_on(relay.stop());
+}
