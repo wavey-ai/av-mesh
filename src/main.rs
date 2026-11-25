@@ -2482,6 +2482,23 @@ struct Args {
     #[arg(long, env = "NEEDLETAIL_SEND_DEFER_MB", default_value = "auto")]
     send_defer_mb: av_mesh::mem_guard::MemSetting,
 
+    /// send240, B: pace the heavy (video) send sockets of a forwarder (its
+    /// children's, its lease children's) and of an edge (its clients') at
+    /// this many times the node's measured video egress (SO_MAX_PACING_RATE,
+    /// set once a second), so a part to every destination leaves over about
+    /// 1/k of its time at the stream's rate instead of at line rate. Needs
+    /// the fq qdisc on the NIC. 0: off (until a lab A/B).
+    #[arg(long, env = "NEEDLETAIL_SEND_PACING", default_value_t = 0)]
+    send_pacing: u64,
+
+    /// The least rate a paced socket is given, Mbit/s.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_SEND_PACING_FLOOR_MBIT",
+        default_value_t = fast_plane::send_pacing::DEFAULT_FLOOR_MBIT
+    )]
+    send_pacing_floor_mbit: u64,
+
     /// A video stream with no part for this long keeps only its newest part
     /// in the cache, and its memory goes back to the system. 0: never.
     #[arg(long, env = "NEEDLETAIL_VIDEO_IDLE_RELEASE_MS", default_value_t = 30_000)]
@@ -4011,6 +4028,21 @@ async fn main() -> Result<()> {
     // of its own, and with --client-udp-cut-through-thread each runs on a
     // thread of its own rather than inline on the receive task.
     let mesh_split = args.cache_mesh_class_port_offset > 0;
+    // send240, B: the heavy send sockets' pacing, set once a second.
+    let send_pacing =
+        fast_plane::send_pacing::SendPacing::new(args.send_pacing, args.send_pacing_floor_mbit);
+    if let Some(pacing) = &send_pacing {
+        let _ = fast_plane::send_pacing::NODE.set(Arc::clone(pacing));
+        let pacing = Arc::clone(pacing);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                pacing.turn();
+            }
+        });
+    }
     // A node whose class threads take RelaySession symbols feeds its UDP
     // clients the fast lane; cut-through is then off.
     let fast_lane = (args.client_udp_bind.is_some()
@@ -4037,6 +4069,7 @@ async fn main() -> Result<()> {
             percent: args.client_udp_video_pace_percent,
             max_delay_us: args.client_udp_video_pace_max_ms.saturating_mul(1_000),
         }));
+        lane.set_send_pacing(send_pacing.clone());
     }
     if fast_lane.is_some() && args.client_udp_cut_through {
         info!("edge client UDP: the fast lane runs, so cut-through is off (--client-udp-fast-lane false turns it back on)");
@@ -4500,6 +4533,7 @@ async fn main() -> Result<()> {
         socket_buffer_bytes: args.udp_socket_buffer_bytes,
         video_socket_buffer_ms: args.relay_video_socket_buffer_ms,
         video_socket_buffer_max_bytes: args.relay_video_socket_buffer_max_mb.saturating_mul(1 << 20),
+        send_pacing: send_pacing.clone(),
         send_defer: fast_plane::send_defer::DeferConfig::new(
             args.send_defer_ms,
             fast_plane::send_defer::pool_bytes(
@@ -22864,6 +22898,7 @@ impl AppRouter {
             memory: av_mesh::mem_guard::installed().map(|installed| installed.snapshot()),
             pulls: (self.cache_mesh_role == CacheMeshRole::Edge)
                 .then(|| self.cache.pull_gate.snapshot()),
+            send_pacing: fast_plane::send_pacing::NODE.get().map(|pacing| pacing.snapshot()),
         });
         memory.cached = Some((now, Arc::clone(&status)));
         status
@@ -47026,6 +47061,7 @@ mod tests {
                 video_socket_buffer_ms: 0,
                 video_socket_buffer_max_bytes: 0,
                 send_defer: None,
+                send_pacing: None,
                 test_tee_panic: Some(fast_plane::TrafficClass::Audio),
                 test_video_tee_spin_ns: 0,
                 test_alloc_counter: None,
@@ -47551,4 +47587,6 @@ mod tests {
     /// The pull loop (send240, C): an edge whose tee sheds never pulls the
     /// parts it shed.
     mod pull_loop;
+    /// Pacing of the heavy lane's sends under fq (send240, B).
+    mod send_pacing;
 }

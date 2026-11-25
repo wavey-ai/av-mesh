@@ -280,6 +280,7 @@ impl Ingress {
             epochs: Arc::clone(&epochs),
             feeds: Arc::clone(&feeds),
             send_defer: None,
+            send_pacing: None,
             pull_gate: Arc::default(),
             test_alloc_counter: None,
         };

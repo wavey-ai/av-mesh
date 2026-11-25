@@ -1054,6 +1054,38 @@ pub fn enable_txtime(socket: RawFd) -> io::Result<()> {
     }
 }
 
+/// Pace everything `socket` sends at `bytes_per_second` at most
+/// (`SO_MAX_PACING_RATE`; the `fq` qdisc keeps it, others ignore it).
+/// send240 (B).
+pub fn set_max_pacing_rate(socket: RawFd, bytes_per_second: u64) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: a setsockopt of a u64 on a live descriptor.
+        let result = unsafe {
+            libc::setsockopt(
+                socket,
+                libc::SOL_SOCKET,
+                libc::SO_MAX_PACING_RATE,
+                std::ptr::from_ref(&bytes_per_second).cast(),
+                std::mem::size_of::<u64>() as libc::socklen_t,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (socket, bytes_per_second);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "SO_MAX_PACING_RATE is Linux only",
+        ))
+    }
+}
+
 /// CLOCK_MONOTONIC now, in nanoseconds: the clock of `SCM_TXTIME`.
 pub fn monotonic_ns() -> u64 {
     #[cfg(target_os = "linux")]

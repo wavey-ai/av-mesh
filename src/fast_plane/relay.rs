@@ -159,6 +159,10 @@ pub struct RelayClassConfig {
     /// keeps what a full socket refused, for a client or a child, and sends
     /// it first when the socket takes datagrams again (`send_defer`).
     pub send_defer: Option<super::send_defer::DeferConfig>,
+    /// `--send-pacing` (send240, B): the heavy send sockets (the children's
+    /// video sockets, the lease children's) are paced by the kernel at k
+    /// times the node's measured video egress (`send_pacing`).
+    pub send_pacing: Option<Arc<super::send_pacing::SendPacing>>,
     /// Tests: the tee of this class panics on its first datagram.
     #[cfg(test)]
     pub test_tee_panic: Option<TrafficClass>,
@@ -201,6 +205,7 @@ impl Default for RelayClassConfig {
                 super::send_defer::DEFAULT_SEND_DEFER_MS,
                 super::send_defer::DEFAULT_POOL_BYTES,
             ),
+            send_pacing: None,
             #[cfg(test)]
             test_tee_panic: None,
             #[cfg(test)]
@@ -929,6 +934,9 @@ pub(crate) struct ForwardPlan {
     runs: Vec<(usize, usize)>,
     /// send240, A: what the children's sockets refused, kept per child.
     defer: Option<Box<super::send_defer::SendDefer>>,
+    /// send240, B: each socket group's sent bytes, then the lease socket's
+    /// (`--send-pacing`: a socket is paced at k times its own egress).
+    paced: Vec<Arc<AtomicU64>>,
 }
 
 impl ForwardPlan {
@@ -949,6 +957,7 @@ impl ForwardPlan {
             // A run per send at most: the largest list of sends.
             runs: Vec::with_capacity(RECV_BATCH * paths.max(lease_children).max(1)),
             defer: None,
+            paced: Vec::new(),
         }
     }
 
@@ -1044,6 +1053,7 @@ fn send_lease_plan(
         first,
         runs,
         defer,
+        paced,
         ..
     } = plan;
     let now_ns = defer.is_some().then(sys::monotonic_ns).unwrap_or(0);
@@ -1099,8 +1109,14 @@ fn send_lease_plan(
         };
         stall_send(stats, class, started.elapsed().as_micros() as u64);
         let sent_us = now_unix_us();
+        let mut bytes = 0;
         for send in &sends[..sent] {
             first[usize::from(send.message)].get_or_insert((target(send), sent_us));
+            bytes += batch.data(usize::from(send.message)).len() as u64;
+        }
+        // send240, B: the lease socket's egress, for its pacing.
+        if let Some(counter) = paced.last() {
+            counter.fetch_add(bytes, Ordering::Relaxed);
         }
         let mut delivered = sent as u64;
         let (mut would_block, mut errors) = (0_u64, 0_u64);
@@ -1292,6 +1308,7 @@ impl RelayDownstreamForwarder {
             first,
             runs,
             defer,
+            paced,
             ..
         } = plan;
         let use_gso = *gso && class == TrafficClass::Video;
@@ -1371,6 +1388,10 @@ impl RelayDownstreamForwarder {
                     .get_or_insert((self.class_target(class, usize::from(send.path)), sent_us));
             }
             self.record_forward_batch(sources, repairs, bytes, elapsed);
+            // send240, B: the group's socket's egress, for its pacing.
+            if let Some(counter) = paced.get(group) {
+                counter.fetch_add(bytes, Ordering::Relaxed);
+            }
             stats.forwarded[class.index()].fetch_add(sent as u64, Ordering::Relaxed);
             retry.extend(sends[sent..].iter().map(|send| (group, *send)));
         }
@@ -1457,6 +1478,8 @@ struct ClassThread {
     epochs: Arc<ValidatedEpochs>,
     /// send240, A: the video thread keeps what a full socket refused.
     send_defer: Option<super::send_defer::DeferConfig>,
+    /// send240, B: the heavy sockets' pacing.
+    send_pacing: Option<Arc<super::send_pacing::SendPacing>>,
     /// send240, C: the node's pull gate, told of each part shed here.
     pull_gate: Arc<crate::pull_gate::PullGate>,
     /// Tests: the counter of this thread's allocations once it runs.
@@ -1854,6 +1877,18 @@ impl ClassThread {
                 .map(|config| Box::new(super::send_defer::SendDefer::new(config)));
             if let Some(defer) = &plan.defer {
                 self.stats.set_child_defer(Arc::clone(&defer.stats));
+            }
+        }
+        // send240, B: the heavy sockets, each paced at k times its egress
+        // (its groups' counters, then the lease socket's).
+        if let Some(pacing) = self.send_pacing.as_ref().filter(|_| self.class == TrafficClass::Video) {
+            if let Some(forwarder) = &self.forwarder {
+                plan.paced = (0..forwarder.socket_groups.len())
+                    .map(|group| pacing.register_counted(forwarder.class_fd(self.class, group)))
+                    .collect();
+            }
+            if let Some(lease) = &self.lease {
+                plan.paced.push(pacing.register_counted(lease.fd(self.class)));
             }
         }
         let mut pending = Vec::with_capacity(RECV_BATCH);
@@ -3128,6 +3163,7 @@ pub async fn run_relay_class_ingest(
             media_deadline_us: config.media_deadline_us,
             epochs: Arc::clone(&epochs),
             send_defer: config.send_defer.filter(|_| class == TrafficClass::Video),
+            send_pacing: config.send_pacing.clone(),
             pull_gate: Arc::clone(&cache.pull_gate),
             #[cfg(test)]
             test_alloc_counter: match class {

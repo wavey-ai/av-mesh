@@ -405,6 +405,9 @@ pub struct NodeStatus {
     /// and the bytes a second charged to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pulls: Option<crate::pull_gate::PullSnapshot>,
+    /// send240 (B): the heavy send sockets' pacing (`--send-pacing`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_pacing: Option<crate::fast_plane::send_pacing::SendPacingSnapshot>,
 }
 
 /// The reasons a node drains, as `ReadinessInputs` takes them.
@@ -1464,6 +1467,7 @@ mod tests {
             }),
             memory: None,
             pulls: None,
+            send_pacing: None,
         };
         let json = serde_json::to_string_pretty(&status).unwrap() + "\n";
         let golden = include_str!("tests/node_status.json");

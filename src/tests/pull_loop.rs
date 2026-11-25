@@ -15,7 +15,9 @@ const FPS: u64 = 24;
 const SYMBOL: u16 = 1_088;
 const STREAM: u64 = 1;
 
+/// Fields printed (Debug) for the record, some asserted.
 #[derive(Debug)]
+#[allow(dead_code)]
 struct PullRun {
     shed_parts: u64,
     pulls: crate::pull_gate::PullSnapshot,

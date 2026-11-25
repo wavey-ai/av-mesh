@@ -632,6 +632,8 @@ pub struct EdgeFastLane {
     /// parts it hands the cache-fed lane with the symbols a client lacks.
     defer_stats: OnceLock<Arc<super::send_defer::DeferStats>>,
     partials: Arc<JobRing<PartialJob>>,
+    /// send240, B: the kernel's pacing of the video client sockets.
+    send_pacing: OnceLock<Arc<super::send_pacing::SendPacing>>,
     pub stats: FastLaneStats,
 }
 
@@ -940,6 +942,7 @@ impl EdgeFastLane {
             repair_jobs: OnceLock::new(),
             defer_stats: OnceLock::new(),
             partials: JobRing::with_empty(PARTIAL_QUEUE, PartialJob::EMPTY),
+            send_pacing: OnceLock::new(),
             fanout_inline_shard: AtomicBool::new(DEFAULT_FANOUT_INLINE_SHARD),
             fanout_nice: std::sync::atomic::AtomicI32::new(DEFAULT_FANOUT_NICE),
             class_arena_warm_bytes: AtomicUsize::new(CLASS_ARENA_WARM_BYTES),
@@ -1248,7 +1251,7 @@ impl EdgeFastLane {
     }
 
     /// Give the lane its client sockets and subscriber table.
-    pub fn arm(&self, sockets: EdgeSockets, table: Table, stats: Arc<EdgeUdpStats>) {
+    pub fn arm(self: &Arc<Self>, sockets: EdgeSockets, table: Table, stats: Arc<EdgeUdpStats>) {
         // The send-only twins of the client sockets when there are (no
         // runtime is woken by their sends), else the sockets themselves.
         let audio = sockets.send_fd(TrafficClass::Audio);
@@ -1265,6 +1268,7 @@ impl EdgeFastLane {
             self.fds[0].store(audio as u64, Ordering::Release);
             self.fds[1].store(video as u64, Ordering::Release);
             self.enable_txtime();
+            self.pace_sockets(self);
             if self.repair_thread.load(Ordering::Relaxed) {
                 self.start_repair_thread();
             }
@@ -1473,6 +1477,35 @@ impl EdgeFastLane {
                 .datagrams
                 .fetch_add(datagrams as u64, Ordering::Relaxed);
             self.stats.bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// send240, B: pace the video client sockets (the fast lane's and the
+    /// cache-fed lane's) at k times the lane's measured egress (the lane's
+    /// bytes, audio's included: an upper bound).
+    pub fn set_send_pacing(self: &Arc<Self>, pacing: Option<Arc<super::send_pacing::SendPacing>>) {
+        if let Some(pacing) = pacing {
+            let _ = self.send_pacing.set(pacing);
+            self.pace_sockets(self);
+        }
+    }
+
+    /// The fast lane's video socket, paced at k times the lane's bytes
+    /// (audio's included: an upper bound), and the cache-fed lane's at k
+    /// times the edge's client bytes.
+    fn pace_sockets(&self, this: &Arc<Self>) {
+        use std::os::fd::AsRawFd;
+        if let (Some(pacing), Some(armed)) = (self.send_pacing.get(), self.armed.get()) {
+            let lane = Arc::downgrade(this);
+            pacing.register(armed.sockets.send_fd(TrafficClass::Video), move || {
+                lane.upgrade()
+                    .map_or(0, |lane| lane.stats.bytes.load(Ordering::Relaxed))
+            });
+            let stats = Arc::downgrade(&armed.stats);
+            pacing.register(
+                armed.sockets.class_socket(TrafficClass::Video).as_raw_fd(),
+                move || stats.upgrade().map_or(0, |stats| stats.bytes.load(Ordering::Relaxed)),
+            );
         }
     }
 
