@@ -52,7 +52,19 @@ static POPULATE: std::sync::Once = std::sync::Once::new();
 
 /// The heap trim threshold set by `tune_allocator`: a heap's top is given
 /// back to the kernel only past this.
-pub const TRIM_THRESHOLD: i32 = 256 << 20;
+///
+/// 16 MiB (mem2; 256 MiB before). A thread's arena grows in heaps of at
+/// most 64 MiB, and glibc shrinks a heap's top only when the top reaches
+/// the threshold, so with 256 MiB no thread arena ever gave its top back,
+/// and `malloc_trim` does not trim a thread arena's top either: the
+/// forwarders' heaps on cmpd8 grew 0.1-1.1 MB/s and held 0.3-0.45 GB more
+/// than an edge's. In the mem2 bench (a forwarder, five compiled and five
+/// cache-mesh children, 247 Mbit/s) 256 MiB grew RSS by 0.9 GB in 280 s,
+/// 64 and 40 MiB by 0.7 and 0.6 GB; 16 MiB, with the guard's trims for
+/// growth, by 0.13 GB, and was flat from 180 s of 600. A class thread
+/// allocates nothing once it runs (tests::alloc_free), so the arena it
+/// warms beforehand (`--relay-class-arena-warm-mb`) need not stay.
+pub const TRIM_THRESHOLD: i32 = 16 << 20;
 /// Allocations from this size on are mmapped (glibc's largest: 32 MB on
 /// 64-bit), not the default 128 KB that rises only as such blocks are
 /// freed.

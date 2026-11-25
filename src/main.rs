@@ -2425,7 +2425,8 @@ struct Args {
     #[arg(long, env = "NEEDLETAIL_NODE_WARM_FILE")]
     node_warm_file: Option<PathBuf>,
 
-    /// Wave 9 (cold start): glibc's heap trim threshold fixed at 256 MB and
+    /// Wave 9 (cold start): glibc's heap trim threshold fixed (16 MiB since
+    /// mem2; 256 MiB kept every thread arena's freed top for good) and its
     /// mmap threshold at 32 MB, so freed memory stays in the heaps for the
     /// next allocation instead of going back to the kernel and returning as
     /// page faults. `false`: glibc's dynamic thresholds, as before.
