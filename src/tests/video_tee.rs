@@ -622,14 +622,25 @@ async fn video_tee_dispatch_cost() {
     );
     let cache = LiveTsCache::new(STREAM, Duration::from_millis(42), 2, WINDOW_PARTS, SLOT_KB).await;
     let (mut push, mut decode, mut commit) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+    // Minor faults of this thread (getrusage), in the decoding push and the
+    // commit (teeperf: where a part's fresh pages are touched).
+    let faults = || {
+        // SAFETY: getrusage writes the struct it is given.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) };
+        usage.ru_minflt as u64
+    };
+    let (mut decode_faults, mut commit_faults, mut push_faults) = (0_u64, 0_u64, 0_u64);
     let (mut datagrams, mut allocations) = (0_u64, 0_u64);
     for frame in &frames {
         let now_us = now_unix_us();
         for datagram in &frame.datagrams {
             let allocated = crate::alloc_count::allocations();
+            let faulted = faults();
             let started = Instant::now();
             let outcome = dispatch.push(peer, datagram, now_us).unwrap();
             let spent = started.elapsed();
+            let faulted = faults() - faulted;
             datagrams += 1;
             if let RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Decoded {
                 object,
@@ -639,12 +650,16 @@ async fn video_tee_dispatch_cost() {
             }) = outcome
             {
                 decode += spent;
+                decode_faults += faulted;
+                let faulted = faults();
                 let started = Instant::now();
                 commit_relay_object(&cache, *object, envelope, slot)
                     .await
                     .unwrap();
                 commit += started.elapsed();
+                commit_faults += faults() - faulted;
             } else {
+                push_faults += faulted;
                 push += spent;
                 allocations += crate::alloc_count::allocations() - allocated;
             }
@@ -662,6 +677,12 @@ async fn video_tee_dispatch_cost() {
         decode.as_secs_f64() * 1e6 / frames_n,
         commit.as_secs_f64() * 1e6 / frames_n,
         per_datagram(push + decode + commit),
+    );
+    println!(
+        "  minor faults a frame: in the pushes {:.1}, the decoding push {:.1}, the commit {:.1}",
+        push_faults as f64 / frames_n,
+        decode_faults as f64 / frames_n,
+        commit_faults as f64 / frames_n,
     );
 }
 
