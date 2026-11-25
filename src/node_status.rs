@@ -408,6 +408,29 @@ pub struct NodeStatus {
     /// send240 (B): the heavy send sockets' pacing (`--send-pacing`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_pacing: Option<crate::fast_plane::send_pacing::SendPacingSnapshot>,
+    /// place240's heavy room of an edge as it advertises it (integration
+    /// 6): the CPU heavy sessions may commit and what they commit (model
+    /// and measured, thousandths of one CPU), the heavy egress cap and what
+    /// is committed of it, and distress. The operations tools' drain check
+    /// counts room in it (needletail mesh_ops.byte_room).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heavy: Option<HeavyRoomStatus>,
+}
+
+/// [`NodeStatus::heavy`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeavyRoomStatus {
+    pub cpus: u32,
+    pub budget_permille: u32,
+    pub committed_permille: u32,
+    pub measured_permille: u32,
+    pub egress_max_bps: u64,
+    pub committed_bps: u64,
+    /// Heavy streams held, and heavy sessions (UDP fast, UDP cache-fed,
+    /// HTTP) on them.
+    pub heavy_streams: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distress: Option<String>,
 }
 
 /// The reasons a node drains, as `ReadinessInputs` takes them.
@@ -1468,6 +1491,7 @@ mod tests {
             memory: None,
             pulls: None,
             send_pacing: None,
+            heavy: None,
         };
         let json = serde_json::to_string_pretty(&status).unwrap() + "\n";
         let golden = include_str!("tests/node_status.json");

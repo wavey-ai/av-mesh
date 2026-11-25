@@ -1185,6 +1185,29 @@ impl AppRouter {
     }
 
     /// The counters for `/api/assignment`.
+    /// The heavy room as the last advertisement put it, for `/api/node`
+    /// (integration 6): edges only.
+    pub(crate) fn heavy_room_status(&self) -> Option<crate::node_status::HeavyRoomStatus> {
+        if self.cache_mesh_role != crate::CacheMeshRole::Edge {
+            return None;
+        }
+        let config = self.heavy.config;
+        let cpus = config.cpus();
+        let held = self.heavy.held.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let reserved = self.heavy.reserved(Instant::now());
+        let (_, committed, bytes) = self.heavy_streams(&held, &reserved);
+        Some(crate::node_status::HeavyRoomStatus {
+            cpus,
+            budget_permille: config.heavy_budget(cpus),
+            committed_permille: committed,
+            measured_permille: self.heavy_measured_permille(cpus),
+            egress_max_bps: config.egress_max_bps,
+            committed_bps: bytes,
+            heavy_streams: held.len() as u32,
+            distress: self.heavy_distress().map(str::to_owned),
+        })
+    }
+
     pub(crate) fn heavy_counters(&self) -> serde_json::Value {
         let stats = &self.heavy.stats;
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);

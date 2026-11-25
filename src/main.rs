@@ -23201,6 +23201,7 @@ impl AppRouter {
             pulls: (self.cache_mesh_role == CacheMeshRole::Edge)
                 .then(|| self.cache.pull_gate.snapshot()),
             send_pacing: fast_plane::send_pacing::NODE.get().map(|pacing| pacing.snapshot()),
+            heavy: self.heavy_room_status(),
         });
         memory.cached = Some((now, Arc::clone(&status)));
         status
