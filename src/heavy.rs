@@ -129,12 +129,15 @@ pub(crate) struct DistressConfig {
 }
 
 impl Default for DistressConfig {
+    /// The rules on, but the busiest CPU's: in a test process on a shared
+    /// box every CPU it may use is someone's busy CPU (the flag's default,
+    /// 970, turns it on for a node alone on its guest).
     fn default() -> Self {
         Self {
             send_blocked_per_s: 20,
             tee_dropped_per_s: 1_000,
             memory: true,
-            core_busy_permille: 970,
+            core_busy_permille: 0,
             core_busy_for: Duration::from_secs(3),
             clear_after: Duration::from_secs(3),
         }
@@ -839,10 +842,10 @@ impl AppRouter {
         if !config.is_heavy(bps) {
             return Ok(());
         }
-        if self.heavy_distress().is_some() {
-            self.heavy.stats.refused_distress.fetch_add(1, Ordering::Relaxed);
-            return Err(HeavyRefusal::Distress);
-        }
+        // An edge in distress is avoided by placement (its advertisement)
+        // and tells its one-leg clients to move; it does not refuse a
+        // session the entry sent it (a hedge, a move in a stale view):
+        // that made a loop of edge-busy refusals.
         let mut held = self.heavy.held.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let holds = held.iter().any(|(held, _)| *held == stream_id);
         if !holds {
