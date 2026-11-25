@@ -47439,6 +47439,10 @@ mod tests {
     /// bounds, the release of a replaced or quiet stream, the memory guard,
     /// and the in-process memory bench.
     mod memory_bound;
+    /// The UDP client's memory (udp-client memory round, 25 Nov): a 4K
+    /// viewer at 320 Mbit/s and a 1 ms audio listener for an hour through
+    /// the client's receive and write path, with flat live bytes.
+    mod udp_client_memory;
 
     /// Edge capacity (wave 7, item 10): listeners of 1 ms parts per edge,
     /// and an ingest that never drops for the fan-out.

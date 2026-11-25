@@ -26,9 +26,17 @@
 //! writes one line a part in part order, its seventh column the edge whose
 //! datagram was the first arrival; `--write-parts` the parts' bytes in the
 //! same order.
+//!
+//! Memory does not grow with the run (udp-client memory round, 25 Nov): each
+//! part goes to the files as it is taken, through a writer thread that puts
+//! the parts in order (`av_mesh::client_record`); the parts' account and the
+//! timing percentiles are kept in fixed-size state.
 
 use anyhow::{anyhow, bail, Context, Result};
 use av_mesh::client_compact::NackTiming;
+use av_mesh::client_record::{
+    BoundedSamples, Mark, PartLedger, PartsWriter, WriterReport, ORDER_LIMITS, QUEUE_BYTES,
+};
 use av_mesh::client_director::{
     Action, Director, DirectorConfig, LegEvent, LegKey, LegStart, LegView, Replacement,
     ReplacementKind, SessionLegs, ShortGrants, SinglePath,
@@ -45,6 +53,7 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpStream, UdpSocket};
@@ -692,18 +701,21 @@ struct Percentiles {
     max: f64,
 }
 
-fn percentiles(mut values: Vec<f64>) -> Percentiles {
-    if values.is_empty() {
+/// The report's percentiles of `samples`: the values of the sorted samples
+/// while they are kept exactly (a run of up to 65,536), a fixed histogram's
+/// (within 0.3 %) after.
+fn percentiles(mut samples: BoundedSamples) -> Percentiles {
+    if samples.is_empty() {
         return Percentiles::default();
     }
-    values.sort_by(f64::total_cmp);
-    let at = |p: f64| values[((values.len() - 1) as f64 * p).round() as usize];
+    let mut at = |p: f64| samples.quantile(p).unwrap_or_default();
+    let (p50, p95, p99, max) = (at(0.5), at(0.95), at(0.99), at(1.0));
     Percentiles {
-        count: values.len(),
-        p50: at(0.5),
-        p95: at(0.95),
-        p99: at(0.99),
-        max: *values.last().unwrap(),
+        count: samples.count() as usize,
+        p50,
+        p95,
+        p99,
+        max,
     }
 }
 
@@ -879,27 +891,26 @@ struct Arrival {
 /// The `--arrivals` file: the six columns of v1, then `edge` (B 2.8) and
 /// `lane` (stuck4k: `fast`, `cache`, `cut-through`, `compact` or
 /// `compact-fast`). The referee's `ntcmp udp-ingest` reads the first three
-/// by position; the lab's scripts read columns by name.
-fn arrivals_csv(arrivals: &BTreeMap<u64, Arrival>, nodes: &[String]) -> String {
-    let mut text = String::from(
-        "part,arrival_unix_us,bytes,published_unix_us,available_unix_us,kernel_unix_us,edge,lane\n",
-    );
-    for (part, arrival) in arrivals {
-        let edge = arrival
-            .edge
-            .and_then(|index| nodes.get(index))
-            .map_or("", String::as_str);
-        text.push_str(&format!(
-            "{part},{},{},{},{},{},{edge},{}\n",
-            arrival.arrival_us,
-            arrival.bytes,
-            arrival.published_us,
-            arrival.available_us,
-            arrival.kernel_us,
-            arrival.lane.word()
-        ));
-    }
-    text
+/// by position, and each part's bytes from the parts file by the lengths
+/// in order; the lab's scripts read columns by name.
+const ARRIVALS_HEADER: &str =
+    "part,arrival_unix_us,bytes,published_unix_us,available_unix_us,kernel_unix_us,edge,lane\n";
+
+/// One part's line of the `--arrivals` file.
+fn arrivals_line(part: u64, arrival: &Arrival, nodes: &[String]) -> String {
+    let edge = arrival
+        .edge
+        .and_then(|index| nodes.get(index))
+        .map_or("", String::as_str);
+    format!(
+        "{part},{},{},{},{},{},{edge},{}\n",
+        arrival.arrival_us,
+        arrival.bytes,
+        arrival.published_us,
+        arrival.available_us,
+        arrival.kernel_us,
+        arrival.lane.word()
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -1014,13 +1025,24 @@ struct Report {
     /// missing.
     jumps: Vec<[u64; 2]>,
     jump_parts: u64,
+    /// The `--arrivals` and `--write-parts` files: parts written, parts
+    /// that came after a later one was written (not in the files), parts
+    /// dropped because the disk did not keep up, and the most held.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<WriterReport>,
+    /// Parts (or gaps) that came more than 65,536 parts behind the newest:
+    /// not taken.
+    parts_beyond_window: u64,
 }
 
 /// A run of missing parts longer than this is a jump (an outage of the
 /// source; a NACK reaches no further back), not missing parts.
 const JUMP_PARTS: u64 = av_mesh::client_compact::STALE_PARTS;
 
-/// The parts of a session, from the first delivered (or gap) to the last.
+/// The parts of a session, from the first delivered (or gap) to the last
+/// (the old account from every part number kept, the reference of
+/// `av_mesh::client_record::PartLedger`).
+#[cfg(test)]
 #[derive(Debug, Default, PartialEq)]
 struct PartAccount {
     span: Option<(u64, u64)>,
@@ -1035,6 +1057,7 @@ struct PartAccount {
 /// over the parts that came: a run of more than [`JUMP_PARTS`] is a jump,
 /// recorded with its ends (fix 4, F5: a jump of 2^31 numbers was 2^31
 /// missing parts, counted one at a time).
+#[cfg(test)]
 fn account_parts(received: &BTreeMap<u64, usize>, gaps: &BTreeSet<u64>) -> PartAccount {
     let mut account = PartAccount::default();
     let mut came = received.keys().copied().peekable();
@@ -1129,9 +1152,43 @@ struct VerifyJob {
     payload: Bytes,
 }
 
-/// Parts kept waiting for the parts' extension at most; later ones are
-/// counted unverified.
+/// Parts kept waiting for the parts' extension at most, and their bytes;
+/// later ones are counted unverified.
 const VERIFY_WAITING_MAX: usize = 4_096;
+const VERIFY_WAITING_BYTES: usize = 32 << 20;
+/// Parts queued for verification at most, and the bytes of the parts queued
+/// or being fetched (each part's bytes go once its fetch is compared); past
+/// either, a part is counted unverified.
+const VERIFY_QUEUE: usize = 1_024;
+const VERIFY_BYTES: usize = 64 << 20;
+
+/// Count one verification's result.
+fn tally(report: &mut VerifyReport, part: u64, payload: &Bytes, result: Result<(StatusCode, Bytes)>) {
+    report.checked += 1;
+    match result {
+        Ok((StatusCode::OK, body)) if body == *payload => report.identical += 1,
+        Ok((StatusCode::OK, _)) => {
+            report.different += 1;
+            if report.different_examples.len() < 10 {
+                report.different_examples.push(part);
+            }
+        }
+        Ok((status, _)) => {
+            report.http_errors += 1;
+            if report.error_examples.len() < 10 {
+                report
+                    .error_examples
+                    .push(format!("part {part}: HTTP {status}"));
+            }
+        }
+        Err(error) => {
+            report.http_errors += 1;
+            if report.error_examples.len() < 10 {
+                report.error_examples.push(format!("part {part}: {error}"));
+            }
+        }
+    }
+}
 
 /// A failed playlist read is made again this often while the parts'
 /// extension is unknown.
@@ -1402,47 +1459,37 @@ async fn main() -> Result<()> {
         enable_gro(&socket);
     }
 
-    // Verification runs beside reception, with bounded concurrency.
-    let (verify_tx, mut verify_rx) = mpsc::unbounded_channel::<VerifyJob>();
+    // Verification runs beside reception, with bounded concurrency: a
+    // result is counted as it comes, and the part's bytes go then (they were
+    // all kept to the end of the run); the parts queued or being fetched hold
+    // at most VERIFY_BYTES.
+    let (verify_tx, mut verify_rx) = mpsc::channel::<VerifyJob>(VERIFY_QUEUE);
+    let verify_held = Arc::new(AtomicUsize::new(0));
     let verify_http = http.clone();
+    let held = Arc::clone(&verify_held);
     let verifier = tokio::spawn(async move {
         let limit = Arc::new(Semaphore::new(32));
-        let mut handles = Vec::new();
-        while let Some(job) = verify_rx.recv().await {
-            let permit = Arc::clone(&limit).acquire_owned().await.unwrap();
-            let http = verify_http.clone();
-            handles.push(tokio::spawn(async move {
-                let _permit = permit;
-                let result = http.get(&job.authority, &job.path).await;
-                (job.part, job.payload, result)
-            }));
-        }
+        let mut running = tokio::task::JoinSet::new();
         let mut report = VerifyReport::default();
-        for handle in handles {
-            let Ok((part, payload, result)) = handle.await else {
-                continue;
-            };
-            report.checked += 1;
-            match result {
-                Ok((StatusCode::OK, body)) if body == payload => report.identical += 1,
-                Ok((StatusCode::OK, _)) => {
-                    report.different += 1;
-                    if report.different_examples.len() < 10 {
-                        report.different_examples.push(part);
+        let mut open = true;
+        while open || !running.is_empty() {
+            tokio::select! {
+                job = verify_rx.recv(), if open => match job {
+                    Some(job) => {
+                        let permit = Arc::clone(&limit).acquire_owned().await.unwrap();
+                        let http = verify_http.clone();
+                        running.spawn(async move {
+                            let _permit = permit;
+                            let result = http.get(&job.authority, &job.path).await;
+                            (job.part, job.payload, result)
+                        });
                     }
-                }
-                Ok((status, _)) => {
-                    report.http_errors += 1;
-                    if report.error_examples.len() < 10 {
-                        report
-                            .error_examples
-                            .push(format!("part {part}: HTTP {status}"));
-                    }
-                }
-                Err(error) => {
-                    report.http_errors += 1;
-                    if report.error_examples.len() < 10 {
-                        report.error_examples.push(format!("part {part}: {error}"));
+                    None => open = false,
+                },
+                Some(done) = running.join_next(), if !running.is_empty() => {
+                    if let Ok((part, payload, result)) = done {
+                        held.fetch_sub(payload.len(), AtomicOrdering::Relaxed);
+                        tally(&mut report, part, &payload, result);
                     }
                 }
             }
@@ -1468,8 +1515,9 @@ async fn main() -> Result<()> {
     // The control datagrams that the session hands out, sent in order.
     let mut outbox: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
 
-    let mut received: BTreeMap<u64, usize> = BTreeMap::new();
-    let mut gaps: BTreeSet<u64> = BTreeSet::new();
+    // The parts received and the gaps, in a fixed window (the account of
+    // the run is settled from it as it goes).
+    let mut ledger = PartLedger::new(JUMP_PARTS);
     let mut duplicates = 0_u64;
     let mut init_objects = 0_u64;
     let mut payload_bytes = 0_u64;
@@ -1477,21 +1525,35 @@ async fn main() -> Result<()> {
     let mut compact_fast_lane_parts = 0_u64;
     let mut cache_lane_parts = 0_u64;
     let mut lanes: BTreeMap<&'static str, u64> = BTreeMap::new();
-    let mut fast_envelope_bytes = Vec::new();
-    let mut fast_envelope_overhead = Vec::new();
-    let mut publish_ms = Vec::new();
+    let mut fast_envelope_bytes = BoundedSamples::new();
+    let mut fast_envelope_overhead = BoundedSamples::new();
+    let mut publish_ms = BoundedSamples::new();
     // Datagram at the kernel -> at the client (the listener host's delay).
-    let mut host_ms = Vec::new();
-    let mut available_ms = Vec::new();
+    let mut host_ms = BoundedSamples::new();
+    let mut available_ms = BoundedSamples::new();
     let mut first_part_ms = None;
     let mut startup = Startup::default();
     let since_start = |started: Instant| started.elapsed().as_secs_f64() * 1_000.0;
-    let mut parts_out = match &args.write_parts {
-        Some(path) => Some(std::fs::File::create(path)?),
-        None => None,
+    // The --arrivals and --write-parts files, written as the parts come by
+    // a thread of their own, in part order (av_mesh::client_record).
+    let mut writer = {
+        use std::io::Write;
+        let create = |path: &PathBuf| {
+            std::fs::File::create(path)
+                .map(|file| std::io::BufWriter::with_capacity(1 << 20, file))
+                .with_context(|| format!("create {}", path.display()))
+        };
+        let mut arrivals = args.arrivals.as_ref().map(create).transpose()?;
+        if let Some(file) = arrivals.as_mut() {
+            file.write_all(ARRIVALS_HEADER.as_bytes())?;
+        }
+        let parts = args.write_parts.as_ref().map(create).transpose()?;
+        if arrivals.is_some() || parts.is_some() {
+            Some(PartsWriter::spawn(arrivals, parts, ORDER_LIMITS, QUEUE_BYTES)?)
+        } else {
+            None
+        }
     };
-    let mut written_parts: BTreeMap<u64, Bytes> = BTreeMap::new();
-    let mut arrivals: BTreeMap<u64, Arrival> = BTreeMap::new();
     // The node names the arrivals and the time on one path refer to.
     let mut nodes = Nodes::default();
     let mut single_path = SinglePath::new(Duration::from_millis(args.token_ms));
@@ -1508,6 +1570,7 @@ async fn main() -> Result<()> {
     let mut playlists_asked: BTreeSet<String> = BTreeSet::new();
     let mut extension: Option<String> = None;
     let mut verify_waiting: Vec<VerifyWaiting> = Vec::new();
+    let mut verify_waiting_bytes = 0_usize;
     let mut unverified = 0_u64;
     // Playlists to read again: a read failed while the extension was
     // unknown.
@@ -1521,6 +1584,8 @@ async fn main() -> Result<()> {
     let drain = Duration::from_millis(args.drain_ms);
     let mut drain_last: Option<u64> = None;
     let mut drain_missing: BTreeSet<u64> = BTreeSet::new();
+    // Parts missing too far behind to come: the drain waits its whole time.
+    let mut drain_older = false;
     // The datagrams of a GRO receive still to read: (next, end, size,
     // sender, kernel time) in `buf`.
     let mut pending: Option<(usize, usize, usize, SocketAddr, Option<u64>)> = None;
@@ -1541,13 +1606,16 @@ async fn main() -> Result<()> {
     let (spare_at_end, (repair, plan, compact_asked, compact_confirmed)) = loop {
         let now = Instant::now();
         if now >= deadline && drain_last.is_none() && session.is_subscribed() && !drain.is_zero() {
-            let accounted = account_parts(&received, &gaps);
+            let accounted = ledger.account();
             if let Some((_, last)) = accounted.span {
                 drain_last = Some(last);
-                drain_missing = accounted.missing.into_iter().collect();
+                drain_missing = accounted.window_missing.into_iter().collect();
+                drain_older = accounted.older_missing;
             }
         }
-        let draining = drain_last.is_some() && !drain_missing.is_empty() && now < deadline + drain;
+        let draining = drain_last.is_some()
+            && (drain_older || !drain_missing.is_empty())
+            && now < deadline + drain;
         // The drain waits for NACK answers: no verdict on a silence then.
         session.hold = draining;
         if now >= deadline && !draining {
@@ -1755,17 +1823,20 @@ async fn main() -> Result<()> {
                     if drain_last.is_some_and(|last| part > last) => {}
                 ObjectKind::Gap => {
                     drain_missing.remove(&part);
-                    gaps.insert(part);
+                    ledger.gap(part);
                 }
                 ObjectKind::Part => {
                     drain_missing.remove(&part);
-                    if received.contains_key(&part) {
-                        duplicates += 1;
-                        continue;
-                    }
                     // A part that came after its gap (the edge got it
                     // late) is received, not a gap.
-                    gaps.remove(&part);
+                    match ledger.receive(part) {
+                        Mark::New => {}
+                        Mark::Duplicate => {
+                            duplicates += 1;
+                            continue;
+                        }
+                        Mark::BeyondWindow => continue,
+                    }
                     if first_part_ms.is_none() {
                         first_part_ms = Some(since_start(started));
                         startup.first_part_ms = first_part_ms;
@@ -1801,7 +1872,6 @@ async fn main() -> Result<()> {
                         None => cache_lane_parts += 1,
                     }
                     *lanes.entry(lane.word()).or_default() += 1;
-                    received.insert(part, payload.len());
                     payload_bytes += payload.len() as u64;
                     if published_unix_us > 0 {
                         first_published_us = Some(
@@ -1819,10 +1889,9 @@ async fn main() -> Result<()> {
                         available_ms
                             .push(arrival_us.saturating_sub(available_unix_us) as f64 / 1_000.0);
                     }
-                    if args.arrivals.is_some() {
-                        arrivals.insert(
-                            part,
-                            Arrival {
+                    if let Some(writer) = writer.as_mut() {
+                        let line = args.arrivals.is_some().then(|| {
+                            let arrival = Arrival {
                                 arrival_us,
                                 bytes: payload.len(),
                                 published_us: published_unix_us,
@@ -1830,15 +1899,20 @@ async fn main() -> Result<()> {
                                 kernel_us: kernel_us.unwrap_or(0),
                                 edge,
                                 lane,
-                            },
-                        );
-                    }
-                    if parts_out.is_some() {
-                        written_parts.insert(part, payload.clone());
+                            };
+                            arrivals_line(part, &arrival, &nodes.names)
+                        });
+                        let bytes = args.write_parts.is_some().then(|| payload.clone());
+                        writer.send(part, line, bytes);
                     }
                     if args.verify_http {
                         match edge.map(|index| nodes.names[index].clone()) {
-                            Some(node) if verify_waiting.len() < VERIFY_WAITING_MAX => {
+                            Some(node)
+                                if verify_waiting.len() < VERIFY_WAITING_MAX
+                                    && verify_waiting_bytes + payload.len()
+                                        <= VERIFY_WAITING_BYTES =>
+                            {
+                                verify_waiting_bytes += payload.len();
                                 verify_waiting.push(VerifyWaiting {
                                     node,
                                     part,
@@ -1872,21 +1946,30 @@ async fn main() -> Result<()> {
         }
         // Parts to verify, once the parts' extension is known.
         if let Some(extension) = &extension {
+            verify_waiting_bytes = 0;
             for waiting in verify_waiting.drain(..) {
-                if let Some(url) = director
+                let held = verify_held.load(AtomicOrdering::Relaxed);
+                let url = director
                     .cache_url(&waiting.node)
-                    .and_then(|url| Url::parse(url).ok())
-                {
-                    let _ = verify_tx.send(VerifyJob {
-                        path: format!(
-                            "{}/{}/part{}.{extension}",
-                            url.path, args.stream, waiting.part
-                        ),
-                        authority: url.authority,
-                        part: waiting.part,
-                        payload: waiting.payload,
-                    });
-                } else {
+                    .and_then(|url| Url::parse(url).ok());
+                let Some(url) = url.filter(|_| held + waiting.payload.len() <= VERIFY_BYTES)
+                else {
+                    unverified += 1;
+                    continue;
+                };
+                let len = waiting.payload.len();
+                let job = VerifyJob {
+                    path: format!(
+                        "{}/{}/part{}.{extension}",
+                        url.path, args.stream, waiting.part
+                    ),
+                    authority: url.authority,
+                    part: waiting.part,
+                    payload: waiting.payload,
+                };
+                verify_held.fetch_add(len, AtomicOrdering::Relaxed);
+                if verify_tx.try_send(job).is_err() {
+                    verify_held.fetch_sub(len, AtomicOrdering::Relaxed);
                     unverified += 1;
                 }
             }
@@ -1913,23 +1996,18 @@ async fn main() -> Result<()> {
         report
     });
 
-    if let Some(path) = &args.arrivals {
-        std::fs::write(path, arrivals_csv(&arrivals, &nodes.names))
-            .with_context(|| format!("write {}", path.display()))?;
-    }
-    if let Some(file) = parts_out.as_mut() {
-        use std::io::Write;
-        for payload in written_parts.values() {
-            file.write_all(payload)?;
-        }
-    }
+    // The files: what the writer holds for order is written, and flushed.
+    let (output, output_error) = match writer.take().map(PartsWriter::finish) {
+        Some(Ok(report)) => (Some(report), None),
+        Some(Err(error)) => (None, Some(error)),
+        None => (None, None),
+    };
 
     // Missing parts are counted from the session's floor: its first part
     // delivered (B 3.1); a jump past the receiver's window is one gap.
-    let accounted = account_parts(&received, &gaps);
+    let accounted = ledger.account();
     let (first, last) = accounted.span.unzip();
     let expected = accounted.expected;
-    let missing = accounted.missing;
     let span_s = match (first_published_us, last_published_us) {
         (Some(first), Some(last)) if last > first => Some((last - first) as f64 / 1e6),
         _ => None,
@@ -1952,10 +2030,10 @@ async fn main() -> Result<()> {
         first_part: first,
         last_part: last,
         expected_parts: expected,
-        received_parts: received.len() as u64,
-        gap_parts: gaps.len() as u64,
-        missing_parts: missing.len() as u64,
-        missing_examples: missing.iter().take(20).copied().collect(),
+        received_parts: ledger.received(),
+        gap_parts: ledger.gaps(),
+        missing_parts: accounted.missing,
+        missing_examples: accounted.missing_examples,
         duplicate_parts: duplicates,
         init_objects,
         datagrams: receiver.datagrams,
@@ -2037,8 +2115,8 @@ async fn main() -> Result<()> {
             .saturating_sub(last_first_us.unwrap_or(started_unix_us)) as f64
             / 1_000.0,
         interruptions,
-        wire_bytes_per_part: (!received.is_empty())
-            .then(|| receiver.wire_bytes as f64 / received.len() as f64),
+        wire_bytes_per_part: (ledger.received() > 0)
+            .then(|| receiver.wire_bytes as f64 / ledger.received() as f64),
         before_start: stats.before_start,
         stale_start: session.stale_starts,
         cross_leg_mismatch: stats.cross_leg_mismatch,
@@ -2060,8 +2138,15 @@ async fn main() -> Result<()> {
         stalled_legs: session.stalled_legs,
         jumps: accounted.jumps,
         jump_parts: accounted.jump_parts,
+        output,
+        parts_beyond_window: ledger.beyond_window(),
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
+    // A file that could not be written fails the run, as before (after the
+    // report now).
+    if let Some(error) = output_error {
+        return Err(anyhow::Error::new(error).context("write the --arrivals or --write-parts file"));
+    }
     Ok(())
 }
 
@@ -2112,6 +2197,23 @@ mod tests {
                 }
             }
             let account = account_parts(&received, &gaps);
+            // The ledger of the client accounts the same.
+            let mut ledger = PartLedger::new(JUMP_PARTS);
+            let mut all: Vec<(u64, bool)> = received.keys().map(|part| (*part, false)).collect();
+            all.extend(gaps.iter().map(|part| (*part, true)));
+            all.sort_unstable();
+            for (part, gap) in all {
+                if gap {
+                    ledger.gap(part);
+                } else {
+                    ledger.receive(part);
+                }
+            }
+            let settled = ledger.account();
+            assert_eq!(settled.span, account.span);
+            assert_eq!(settled.missing_examples, account.missing);
+            assert_eq!(settled.jumps, account.jumps);
+            assert_eq!(settled.expected, account.expected);
             assert_eq!(account.span, Some((100, resume + 99)));
             assert_eq!(account.missing, vec![150, resume + 10]);
             assert_eq!(account.jumps, vec![[200, resume]]);
@@ -2382,6 +2484,184 @@ mod tests {
             assert_eq!(fields[1].parse::<i64>().unwrap(), 1_000 + part);
             assert_eq!(fields[2].parse::<i64>().unwrap(), 56);
         }
+    }
+
+    /// The old `--arrivals` file (before 25 Nov), verbatim: every part's
+    /// arrival kept to the end of the run, then written in part order.
+    fn arrivals_csv(arrivals: &BTreeMap<u64, Arrival>, nodes: &[String]) -> String {
+        let mut text = String::from(
+            "part,arrival_unix_us,bytes,published_unix_us,available_unix_us,kernel_unix_us,edge,lane\n",
+        );
+        for (part, arrival) in arrivals {
+            let edge = arrival
+                .edge
+                .and_then(|index| nodes.get(index))
+                .map_or("", String::as_str);
+            text.push_str(&format!(
+                "{part},{},{},{},{},{},{edge},{}\n",
+                arrival.arrival_us,
+                arrival.bytes,
+                arrival.published_us,
+                arrival.available_us,
+                arrival.kernel_us,
+                arrival.lane.word()
+            ));
+        }
+        text
+    }
+
+    /// The old percentiles: every value kept, sorted.
+    fn old_percentiles(mut values: Vec<f64>) -> (usize, f64, f64, f64, f64) {
+        values.sort_by(f64::total_cmp);
+        let at = |p: f64| values[((values.len() - 1) as f64 * p).round() as usize];
+        (values.len(), at(0.5), at(0.95), at(0.99), *values.last().unwrap())
+    }
+
+    /// A short run's parts as the client takes them: out of order, with
+    /// copies from the other leg, a gap later filled, a hole never filled,
+    /// a hole filled by NACK a second later, a lone gap, and a jump.
+    fn short_run() -> Vec<(u64, bool, usize, u64)> {
+        fn push(objects: &mut Vec<(u64, bool, usize, u64)>, part: u64, gap: bool, at_us: u64) {
+            objects.push((part, gap, 50 + (part as usize * 37) % 1_500, at_us));
+        }
+        let mut objects = Vec::new();
+        let mut at_us = 1_764_000_000_000_000_u64;
+        for part in 1_000..1_600_u64 {
+            at_us += 1_000;
+            match part % 97 {
+                // Never comes.
+                3 => continue,
+                // A gap, and the part after it.
+                5 => {
+                    push(&mut objects, part, true, at_us);
+                    push(&mut objects, part, false, at_us + 400);
+                }
+                // A lone gap.
+                7 => push(&mut objects, part, true, at_us),
+                _ => push(&mut objects, part, false, at_us),
+            }
+            // A copy from the other leg; a swapped pair; a part from ahead.
+            if part % 5 == 0 {
+                push(&mut objects, part, false, at_us + 300);
+            }
+            if part % 11 == 0 {
+                let len = objects.len();
+                objects.swap(len - 1, len - 2);
+            }
+            if part % 89 == 0 {
+                push(&mut objects, part + 1_000, false, at_us);
+            }
+        }
+        // A NACK answer, a second later, of a part that had not come (97 *
+        // 11 + 3).
+        push(&mut objects, 1_070, false, at_us + 1_000_000);
+        // The source restarts far ahead: a jump.
+        for part in 1_000_000..1_000_050_u64 {
+            at_us += 1_000;
+            push(&mut objects, part, false, at_us);
+        }
+        objects
+    }
+
+    /// The files of a short run are those of the code before 25 Nov, byte
+    /// for byte: the arrivals file and the parts file (that `ntcmp
+    /// udp-ingest` reads in step), and the report's account and
+    /// percentiles.
+    #[test]
+    fn a_short_run_writes_the_files_of_before() {
+        let nodes = vec!["lon-edge-1".to_owned(), "lon-edge-2".to_owned()];
+        let dir = std::env::temp_dir().join(format!(
+            "udp-client-golden-{}-{}",
+            std::process::id(),
+            now_unix_us()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (arrivals_path, parts_path) = (dir.join("a.arrivals.csv"), dir.join("a.parts.bin"));
+        let mut arrivals_file =
+            std::io::BufWriter::new(std::fs::File::create(&arrivals_path).unwrap());
+        std::io::Write::write_all(&mut arrivals_file, ARRIVALS_HEADER.as_bytes()).unwrap();
+        let parts_file = std::io::BufWriter::new(std::fs::File::create(&parts_path).unwrap());
+        let mut writer =
+            PartsWriter::spawn(Some(arrivals_file), Some(parts_file), ORDER_LIMITS, QUEUE_BYTES)
+                .unwrap();
+        let mut ledger = PartLedger::new(JUMP_PARTS);
+        let mut samples = BoundedSamples::new();
+        // The old path.
+        let mut received: BTreeMap<u64, usize> = BTreeMap::new();
+        let mut gaps: BTreeSet<u64> = BTreeSet::new();
+        let mut old_arrivals: BTreeMap<u64, Arrival> = BTreeMap::new();
+        let mut written_parts: BTreeMap<u64, Bytes> = BTreeMap::new();
+        let mut old_samples = Vec::new();
+        let (mut duplicates, mut old_duplicates) = (0, 0);
+        for (part, gap, bytes, at_us) in short_run() {
+            if gap {
+                ledger.gap(part);
+                gaps.insert(part);
+                continue;
+            }
+            let payload = Bytes::from(vec![(part % 251) as u8; bytes]);
+            let arrival = Arrival {
+                arrival_us: at_us,
+                bytes,
+                published_us: at_us - 30_000 - part % 700,
+                available_us: at_us - 2_000,
+                kernel_us: at_us - 15,
+                edge: Some((part % 2) as usize),
+                lane: if part % 3 == 0 { Lane::Compact } else { Lane::Fast },
+            };
+            // Old.
+            if received.contains_key(&part) {
+                old_duplicates += 1;
+            } else {
+                gaps.remove(&part);
+                received.insert(part, bytes);
+                old_arrivals.insert(part, arrival);
+                written_parts.insert(part, payload.clone());
+                old_samples.push((arrival.arrival_us - arrival.published_us) as f64 / 1_000.0);
+            }
+            // New.
+            match ledger.receive(part) {
+                Mark::Duplicate => duplicates += 1,
+                Mark::BeyondWindow => unreachable!(),
+                Mark::New => {
+                    samples.push((arrival.arrival_us - arrival.published_us) as f64 / 1_000.0);
+                    assert!(writer.send(
+                        part,
+                        Some(arrivals_line(part, &arrival, &nodes)),
+                        Some(payload)
+                    ));
+                }
+            }
+        }
+        let output = writer.finish().unwrap();
+        assert_eq!((output.output.late, output.queue_full), (0, 0));
+        assert_eq!(output.output.written, received.len() as u64);
+
+        let old_text = arrivals_csv(&old_arrivals, &nodes);
+        let old_bytes: Vec<u8> = written_parts.values().flat_map(|bytes| bytes.to_vec()).collect();
+        assert_eq!(std::fs::read_to_string(&arrivals_path).unwrap(), old_text);
+        assert_eq!(std::fs::read(&parts_path).unwrap(), old_bytes);
+        assert!(old_text.lines().count() > 600);
+
+        let old = account_parts(&received, &gaps);
+        let new = ledger.account();
+        assert_eq!(new.span, old.span);
+        assert_eq!(new.expected, old.expected);
+        assert_eq!(new.missing, old.missing.len() as u64);
+        assert_eq!(new.missing_examples, old.missing.iter().take(20).copied().collect::<Vec<_>>());
+        assert_eq!(new.jumps, old.jumps);
+        assert_eq!(new.jump_parts, old.jump_parts);
+        assert_eq!(ledger.received(), received.len() as u64);
+        assert_eq!(ledger.gaps(), gaps.len() as u64);
+        assert_eq!(duplicates, old_duplicates);
+        assert!(!old.jumps.is_empty() && !old.missing.is_empty() && !gaps.is_empty());
+
+        let figures = percentiles(samples);
+        assert_eq!(
+            (figures.count, figures.p50, figures.p95, figures.p99, figures.max),
+            old_percentiles(old_samples)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The lag histogram's quantiles are bucket edges; past the last

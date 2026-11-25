@@ -3,6 +3,7 @@ pub mod canonical_slot;
 pub mod client_compact;
 pub mod client_director;
 pub mod client_session;
+pub mod client_record;
 pub mod client_udp;
 pub mod load;
 pub mod load_assign;
