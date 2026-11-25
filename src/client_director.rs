@@ -79,6 +79,15 @@ pub const HOME_PROBE_EVERY: Duration = Duration::from_secs(10);
 /// and after [`RETRY_ALONE`] without one.
 pub const RETRY_WITH_LEG: Duration = Duration::from_secs(1);
 pub const RETRY_ALONE: Duration = Duration::from_millis(200);
+/// rm/cpuadmit: after a refusal for load (`edge-busy`, `edge-full`) or an
+/// answer with no edge of room, the listener asks again after a back-off
+/// that starts here, doubles to [`BUSY_BACKOFF_MAX`], has +-25 % jitter
+/// (by its session) and is reset by any admission; with or without a
+/// delivering leg. The first refusal is asked again at once (the entry
+/// places it on the next edge with room). A refused crowd re-asked full
+/// edges 10-80k times an edge in a lab run at a fixed 200 ms.
+pub const BUSY_BACKOFF_FIRST: Duration = Duration::from_millis(200);
+pub const BUSY_BACKOFF_MAX: Duration = Duration::from_secs(2);
 /// An unanswered `ASSIGN` is repeated at most this far apart.
 pub const REQUEST_REPEAT_MAX: Duration = Duration::from_millis(300);
 /// Legs missing for want of an edge are asked for again after these waits,
@@ -557,6 +566,10 @@ pub struct DirectorStats {
     pub short_grants: ShortGrants,
     /// Place240 rules 3 and 4.
     pub quality: QualityMoves,
+    /// rm/cpuadmit: asks put off by the load back-off (a refusal for load
+    /// or no edge with room), and the back-off set now (0: none).
+    pub busy_reasks: u64,
+    pub backoff_ms: u64,
 }
 
 /// A leg as the director holds it.
@@ -812,7 +825,10 @@ pub struct Director {
     quality_quiet_until: Option<Instant>,
     distress_seen: Vec<(LegKey, Instant)>,
     /// The last `edge-busy` refusal with no leg delivering (place240).
-    last_busy: Option<Instant>,
+    /// rm/cpuadmit: refusals for load (and answers with no edge of room)
+    /// since the last admission, and the back-off they set now.
+    busy_streak: u32,
+    busy_backoff: Duration,
 }
 
 fn sender(out: &mut Vec<Action>) -> impl FnMut(SocketAddr, &[u8]) + '_ {
@@ -904,7 +920,8 @@ impl Director {
             last_quality_move: None,
             quality_quiet_until: None,
             distress_seen: Vec::new(),
-            last_busy: None,
+            busy_streak: 0,
+            busy_backoff: Duration::ZERO,
         };
         let urls = director.config.entries.clone();
         director.home = urls.iter().map(|url| director.entry_index(url)).collect();
@@ -1050,6 +1067,35 @@ impl Director {
 
     /// A place to fill appeared (a `MOVE`, a failure, a pass-over): an
     /// answer to a request sent before now does not hold its request back.
+    /// rm/cpuadmit: the wait before the next ask after a refusal for load
+    /// or an answer with no edge of room: none for the first, then
+    /// [`BUSY_BACKOFF_FIRST`] doubling to [`BUSY_BACKOFF_MAX`], +-25 % by
+    /// the session's seed. Counted as a re-ask.
+    fn busy_wait(&mut self) -> Duration {
+        let streak = self.busy_streak;
+        self.busy_streak = streak.saturating_add(1);
+        if streak == 0 {
+            return Duration::ZERO;
+        }
+        let base = BUSY_BACKOFF_FIRST
+            .saturating_mul(1 << (streak - 1).min(8))
+            .min(BUSY_BACKOFF_MAX);
+        let mut z = self
+            .config
+            .nonce_seed
+            .wrapping_add(u64::from(streak).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        // 75 % to 125 % of the base.
+        let permille = 750 + z % 501;
+        let wait = base * permille as u32 / 1_000;
+        self.busy_backoff = wait;
+        self.stats.busy_reasks += 1;
+        self.stats.backoff_ms = wait.as_millis() as u64;
+        wait
+    }
+
     fn place_opened(&mut self, now: Instant) {
         self.retry_at = None;
         self.changed_at = now;
@@ -1435,17 +1481,16 @@ impl Director {
                 // asks again after the retry wait, not at once (an honest
                 // busy answer, not a loop of refusals); one with a leg
                 // that delivers asks at once, as before.
-                if busy && !self.any_delivering(legs, now, None) {
-                    // The first is asked again at once (the entry places
-                    // it on the next edge with room: one round trip more);
-                    // another within a second waits.
-                    if self
-                        .last_busy
-                        .is_some_and(|at| now.saturating_duration_since(at) < Duration::from_secs(1))
-                    {
-                        self.retry_at = Some(now + RETRY_ALONE);
+                // rm/cpuadmit: the first is asked again at once (the
+                // entry places it on the next edge with room: one round
+                // trip more); the next ones back off, with a delivering leg
+                // or without (a listener with one good leg does not hammer
+                // for its second).
+                if busy {
+                    let wait = self.busy_wait();
+                    if !wait.is_zero() {
+                        self.retry_at = Some(now + wait);
                     }
-                    self.last_busy = Some(now);
                 }
             }
             LegEvent::NoToken(key) => {
@@ -1590,6 +1635,10 @@ impl Director {
         now: Instant,
         out: &mut Vec<Action>,
     ) {
+        // rm/cpuadmit: an admission ends the back-off.
+        self.busy_streak = 0;
+        self.busy_backoff = Duration::ZERO;
+        self.stats.backoff_ms = 0;
         let Some(index) = self.leg_index(key) else {
             return;
         };
@@ -2487,6 +2536,15 @@ impl Director {
                 };
                 let wait = backoff[self.short_answers.min(backoff.len() - 1)];
                 self.short_answers += 1;
+                wait
+            };
+            // rm/cpuadmit: caches in the region but none with room for a
+            // place: the load back-off at least (a replacement that finds
+            // none does not ask every 200 ms). A region with no cache at
+            // all keeps its waits.
+            let wait = if no_cache && !usable.is_empty() {
+                wait.max(self.busy_wait())
+            } else {
                 wait
             };
             self.retry_at = Some(now + wait);
@@ -6640,5 +6698,65 @@ mod tests {
         assert!(w.requests().is_empty(), "a second refusal within a second waits");
         w.run_to(w.ms() + 250);
         assert!(!w.requests().is_empty());
+    }
+
+    /// rm/cpuadmit: refusals for load back off from 200 ms, doubling to 2
+    /// s with +-25 % jitter, with or without a delivering leg; an
+    /// admission resets it; the re-asks and the back-off are counted.
+    #[test]
+    fn refusals_for_load_back_off_to_two_seconds_and_an_admission_resets_it() {
+        // Ask, answer one edge, refuse it: the gap to the next ask.
+        fn refused_gaps(w: &mut World, count: usize) -> Vec<u64> {
+            let mut gaps = Vec::new();
+            for index in 0..count {
+                let asked = loop {
+                    if let Some((to, nonce, _)) = w.requests().pop() {
+                        break (to, nonce);
+                    }
+                    w.run_to(w.ms() + 5);
+                };
+                let refused_at = w.ms();
+                let node = 10 + index as u8;
+                w.answer(asked.0, asked.1, vec![cache(node)], 1, false, None);
+                let key = w.key(&format!("e{node}"));
+                w.event(LegEvent::Refused {
+                    leg: key,
+                    reason: "edge-busy".into(),
+                });
+                let next = loop {
+                    if !w.requests().is_empty() {
+                        break w.ms();
+                    }
+                    w.run_to(w.ms() + 5);
+                };
+                gaps.push(next - refused_at);
+            }
+            gaps
+        }
+        let mut w = World::new("backoff-1", 1, false);
+        w.poll();
+        let gaps = refused_gaps(&mut w, 8);
+        assert!(gaps[0] <= 5, "the first at once: {gaps:?}");
+        for (gap, base) in gaps[1..].iter().zip([200_u64, 400, 800, 1_600, 2_000, 2_000, 2_000]) {
+            assert!(*gap >= base * 3 / 4 && *gap <= base * 5 / 4 + 5, "{gaps:?}");
+        }
+        assert_eq!(w.d.stats.busy_reasks, 7);
+        assert!(w.d.stats.backoff_ms >= 1_500, "{:?}", w.d.stats);
+        // An admission resets it: the next refusal is asked again at once.
+        let (to, nonce, _) = loop {
+            if let Some(request) = w.requests().pop() {
+                break request;
+            }
+            w.run_to(w.ms() + 5);
+        };
+        w.answer(to, nonce, vec![cache(1)], 1, false, None);
+        w.live("e1");
+        assert_eq!(w.d.stats.backoff_ms, 0);
+
+        // A listener with one good leg backs off for its second as well.
+        let mut w = World::new("backoff-2", 2, false);
+        w.join(&[1], None);
+        let gaps = refused_gaps(&mut w, 4);
+        assert!(gaps[2] >= 300 && gaps[3] >= 600, "{gaps:?}");
     }
 }

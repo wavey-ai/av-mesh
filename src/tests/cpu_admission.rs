@@ -1105,3 +1105,137 @@ fn the_cpu_admission_flags_default_on_and_core_busy_distress_off() {
     assert_eq!(args.cpu_admit.cpus.0, vec![0, 1]);
     assert_eq!(args.heavy.distress_core_permille, 970);
 }
+
+/// rm/cpuadmit follow-up: what one refused `SUB` costs the edge's runtime
+/// (an ignored measurement). One edge, its CPU term forced: at full (the
+/// refusal before any other work, d1d5b89) and just under full with a leg
+/// that does not fit (the refusal at the priced check, after the move
+/// reason, the heavy cap and the leg's rate). One client asks again and
+/// again with a valid token; the edge's runtime threads' CPU time over the
+/// refusals. `CPUADMIT_REFUSALS` (20,000) a case.
+#[test]
+#[ignore = "a measurement: run it alone, in release"]
+fn cpu_admission_refusal_cost() {
+    use crate::cpu_admit::CpuVerdict;
+    let refusals = env_u64("CPUADMIT_REFUSALS", 20_000);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("rf-rt")
+        .enable_all()
+        .build()
+        .unwrap();
+    let payload = Payload::Opus1;
+    let edge = runtime.block_on(async move {
+        tokio::spawn(async move {
+            let edge = LaneEdge::start_with_capacity(loopback(91), Duration::ZERO, 64, true).await;
+            let (envelope, _) = payload.envelope(STREAM, 0);
+            edge.send(false, &payload.symbols(&envelope), false).await;
+            wait_for_part(&edge.cache, STREAM, 0).await;
+            edge
+        })
+        .await
+        .unwrap()
+    });
+    let admit = Arc::new(CpuAdmit::new(
+        CpuAdmitConfig::default(),
+        edge.lane.threads.clone(),
+        Arc::new(|| 0),
+    ));
+    edge.router.edge_load.egress.set_cpu_admit(Arc::clone(&admit));
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    let sub = |token: Option<u64>| {
+        Control::Subscribe {
+            stream_id: STREAM,
+            from_part: None,
+            repair: RepairPolicy::for_loss(UNMEASURED_LOSS, RepairPolicy::base_for_lane(true, None, None)),
+            token,
+            fast_lane: true,
+            compact: Some(CompactPlan::CLEAN),
+            others: Vec::new(),
+            resume: false,
+        }
+        .encode()
+    };
+    let mut buf = [0_u8; 2_048];
+    socket.send_to(&sub(None), edge.client_port).unwrap();
+    let token = loop {
+        let (len, _) = socket.recv_from(&mut buf).expect("a token");
+        if let Some(Control::Token { token, .. }) = Control::decode(&buf[..len]) {
+            break token;
+        }
+    };
+    let rt_ns = || -> u64 {
+        threads_named("rf-rt")
+            .iter()
+            .filter_map(|tid| {
+                std::fs::read_to_string(format!("/proc/self/task/{tid}/schedstat"))
+                    .ok()?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<u64>()
+                    .ok()
+            })
+            .sum()
+    };
+    let verdict = |permille| CpuVerdict {
+        permille,
+        term: "cpus".into(),
+        cpus: 2,
+        datagram_ns: 20_000,
+        capacity_ns: 1_600_000_000,
+        ..CpuVerdict::default()
+    };
+    let mut lines = Vec::new();
+    // Just under full, a leg priced at 200 µs a datagram (125 permille at
+    // 1,000 a second) does not fit: refused at the priced check.
+    for (case, permille, datagram_ns) in [("at-full-early", 1_000, 20_000), ("priced-late", 990, 200_000)] {
+        admit.force_verdict(CpuVerdict { datagram_ns, ..verdict(permille) }, None);
+        let refused_before = edge.stats.cpu_refusals.load(Ordering::Relaxed);
+        let before = rt_ns();
+        let started = Instant::now();
+        let request = sub(Some(token));
+        let mut answered = 0_u64;
+        let mut kinds: BTreeMap<String, u64> = BTreeMap::new();
+        // One at a time: each answered before the next.
+        while answered < refusals {
+            socket.send_to(&request, edge.client_port).unwrap();
+            loop {
+                let Ok((len, _)) = socket.recv_from(&mut buf) else {
+                    *kinds.entry("timeout".into()).or_default() += 1;
+                    break;
+                };
+                let kind = match Control::decode(&buf[..len]) {
+                    Some(Control::Refused { reason, .. }) => format!("refused-{reason}"),
+                    Some(Control::Subscribed { .. }) => "subscribed".into(),
+                    Some(other) => format!("{other:?}").chars().take(12).collect(),
+                    None => "media".into(),
+                };
+                let done = kind.starts_with("refused") || kind == "subscribed";
+                *kinds.entry(kind).or_default() += 1;
+                if done {
+                    answered += 1;
+                    break;
+                }
+            }
+        }
+        let wall = started.elapsed().as_secs_f64();
+        let used = rt_ns() - before;
+        let refused = edge.stats.cpu_refusals.load(Ordering::Relaxed) - refused_before;
+        let line = serde_json::json!({
+            "case": case,
+            "refusals": refused,
+            "answers": answered,
+            "answers_by_kind": kinds,
+            "wall_s": wall,
+            "edge_runtime_cpu_s": used as f64 / 1e9,
+            "us_per_refusal": used as f64 / 1e3 / refused.max(1) as f64,
+            "refusals_per_s": refused as f64 / wall,
+            "load": std::fs::read_to_string("/proc/loadavg").unwrap_or_default().trim().to_owned(),
+        });
+        println!("{}", serde_json::to_string(&line).unwrap());
+        lines.push(line);
+    }
+    out("refusal-cost", &lines, &serde_json::json!({"refusals_per_case": refusals}));
+    runtime.block_on(Arc::try_unwrap(Arc::new(edge)).ok().unwrap().stop());
+}
