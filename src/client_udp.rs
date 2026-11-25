@@ -376,6 +376,12 @@ pub enum Control {
         /// block of the new session with an old number would otherwise be
         /// taken for one decoded already, and never decode.
         restarted: bool,
+        /// The source epoch of the session that `restarted` announces
+        /// (`e=`): the client drops what is older than it and keeps a flow
+        /// of it that its data opened already (an announcement can come
+        /// after the data it describes). `None` from an edge older than it,
+        /// whose bare `s=1` the client takes as before.
+        session: Option<u64>,
     },
     Waiting {
         stream_id: u64,
@@ -522,11 +528,16 @@ impl Control {
                 compact,
                 waiting,
                 restarted,
+                session,
             } => format!(
-                "{CONTROL_PREFIX}OK {stream_id} {next_part}{}{}{}",
+                "{CONTROL_PREFIX}OK {stream_id} {next_part}{}{}{}{}",
                 if *compact { " C" } else { "" },
                 if *waiting { " w=1" } else { "" },
-                if *restarted { " s=1" } else { "" }
+                if *restarted { " s=1" } else { "" },
+                match session {
+                    Some(epoch) => format!(" e={epoch}"),
+                    None => String::new(),
+                }
             ),
             Self::Waiting {
                 stream_id,
@@ -735,11 +746,12 @@ impl Control {
                 if compact {
                     words.next();
                 }
-                let (mut waiting, mut restarted) = (None, None);
+                let (mut waiting, mut restarted, mut session) = (None, None, None);
                 for word in words.by_ref() {
                     match field(word)? {
                         ("w", value) => once(&mut waiting, flag(value)?)?,
                         ("s", value) => once(&mut restarted, flag(value)?)?,
+                        ("e", value) => once(&mut session, value.parse::<u64>().ok()?)?,
                         _ => {}
                     }
                 }
@@ -749,6 +761,7 @@ impl Control {
                     compact,
                     waiting: waiting.unwrap_or(false),
                     restarted: restarted.unwrap_or(false),
+                    session,
                 }
             }
             "WAIT" => {
@@ -1330,6 +1343,12 @@ pub struct ObjectReceiver {
     /// generation's objects in a row with none of it between (see
     /// [`Self::object_session`]).
     session_seen: Option<(u8, u32, LegId)>,
+    /// The newest session an edge announced (`OK … s=1 e=`), by its epoch.
+    announced_epoch: Option<u64>,
+    /// The part of the challenging session that was refused while the
+    /// current one held: delivered first when its session takes over, so
+    /// that the new session comes in order (joins).
+    challenger_object: Option<PartObject>,
     object_challenger: Option<(u8, u32)>,
 }
 
@@ -1477,6 +1496,43 @@ impl ObjectReceiver {
             blocks.settle(block);
         }
         self.flows += 1;
+    }
+
+    /// An edge's announcement that `leg` starts again at the session of
+    /// source epoch `epoch` (`OK … s=1 e=`). It means "drop what is older
+    /// than this session", and is idempotent, whatever its order against
+    /// the session's data (over UDP it can come after them, and the fast
+    /// lane forwards them before the edge's commit that announces): a flow
+    /// of this session that its data opened already is kept, with its
+    /// blocks and the parts it delivered (no part is taken twice when the
+    /// cache-fed lane sends the session from its first part); one of an
+    /// older session is dropped and a flow of this one begun, which the
+    /// session's data then join; an announcement of a session older than
+    /// the current one, or announced already, changes nothing. `true` when
+    /// it began a flow.
+    pub fn announce_session(&mut self, leg: LegId, epoch: u64, now: Instant) -> bool {
+        if self.announced_epoch.is_some_and(|announced| epoch <= announced)
+            || self.fast_epoch.is_some_and(|current| epoch <= current)
+        {
+            return false;
+        }
+        self.announced_epoch = Some(epoch);
+        let generation = compact::generation_of_epoch(epoch);
+        let same = self.compact.generation() == Some(generation);
+        if !same {
+            self.new_flow();
+            self.compact.adopt_generation(generation, true, now);
+        }
+        if let Some(current) = self.fast_epoch.replace(epoch) {
+            self.old_fast_epochs.push_back(current);
+            if self.old_fast_epochs.len() > OLD_FAST_EPOCHS {
+                self.old_fast_epochs.pop_front();
+            }
+        }
+        // Held against a stray part of the old session (two objects).
+        self.session_seen = Some((generation, 2, leg));
+        self.object_challenger = None;
+        !same
     }
 
     /// A new source epoch (its part numbers count again): every leg's
@@ -1670,6 +1726,13 @@ impl ObjectReceiver {
                         }
                         None => ObjectSession::Taken,
                     };
+                    // The refused part of a session that now takes over goes
+                    // first; any other is forgotten.
+                    let challenger = self.challenger_object.take().filter(|first| {
+                        session == ObjectSession::NewFlow
+                            && first.generation == object.generation
+                            && first.part < object.part
+                    });
                     if session == ObjectSession::NewFlow {
                         self.forget_blocks(leg, Some((space, header.block_id)));
                     }
@@ -1683,8 +1746,14 @@ impl ObjectReceiver {
                     }
                     if session == ObjectSession::Refused {
                         self.raptorq_refused.stale_generation += 1;
+                        if object.kind == ObjectKind::Part && object.generation != 0 {
+                            self.challenger_object = Some(object);
+                        }
                         return None;
                     }
+                    let first = challenger.filter(|first| {
+                        self.compact.delivered_elsewhere(leg, first.part, now)
+                    });
                     self.objects += 1;
                     let blocks = &mut self.legs[leg.index()];
                     if seen < u32::from(header.source_symbols) || !source_symbol {
@@ -1704,7 +1773,7 @@ impl ObjectReceiver {
                         if !self.compact.delivered_elsewhere(leg, object.part, now) {
                             if self.compact.stats.before_start != before_start {
                                 self.raptorq_refused.before_start += 1;
-                                return None;
+                                return first;
                             }
                             // A part that the compact lane, another block or
                             // another leg delivered already: the leg is on
@@ -1716,7 +1785,7 @@ impl ObjectReceiver {
                                 taken_at: Some(now),
                                 untaken_since: None,
                             };
-                            return None;
+                            return first;
                         }
                     }
                     self.takes[leg.index()] = LegTakes {
@@ -1725,7 +1794,14 @@ impl ObjectReceiver {
                         untaken_since: None,
                     };
                     self.last_lane = Some(lane);
-                    Some(object)
+                    match first {
+                        Some(first) => {
+                            self.objects += 1;
+                            self.ready.push_front(object);
+                            Some(first)
+                        }
+                        None => Some(object),
+                    }
                 }
                 Err(_) => {
                     self.errors += 1;
@@ -2108,6 +2184,7 @@ mod tests {
                 compact: false,
                 waiting: false,
                 restarted: false,
+                session: None,
             },
             Control::Subscribed {
                 stream_id: 9,
@@ -2115,6 +2192,7 @@ mod tests {
                 compact: true,
                 waiting: false,
                 restarted: false,
+                session: None,
             },
             Control::Waiting {
                 stream_id: 9,
@@ -2158,6 +2236,7 @@ mod tests {
                 compact: false,
                 waiting: false,
                 restarted: false,
+                session: None,
             })
         );
         // The compact word comes after F1, once.
@@ -2736,6 +2815,7 @@ mod tests {
                 compact: true,
                 waiting: false,
                 restarted: false,
+                session: None,
             },
             Control::Subscribed {
                 stream_id: 9,
@@ -2743,6 +2823,7 @@ mod tests {
                 compact: false,
                 waiting: false,
                 restarted: false,
+                session: None,
             },
             Control::Waiting {
                 stream_id: 9,
@@ -2854,6 +2935,7 @@ mod tests {
                 compact: true,
                 waiting: false,
                 restarted: false,
+                session: None,
             })
         );
         // An unknown field stands among the known ones.
@@ -3283,7 +3365,8 @@ mod tests {
         assert_eq!(take(&mut receiver, 2, 12), vec![12]);
         let flows = receiver.flows;
         assert!(take(&mut receiver, 1, 1_146).is_empty());
-        assert_eq!(take(&mut receiver, 1, 1_147), vec![1_147]);
+        // The session that takes over comes whole: its refused part first.
+        assert_eq!(take(&mut receiver, 1, 1_147), vec![1_146, 1_147]);
         assert_eq!(receiver.flows, flows + 1);
         assert_eq!(take(&mut receiver, 2, 13), vec![13]);
         assert_eq!(receiver.flows, flows + 2);

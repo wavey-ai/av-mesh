@@ -1981,17 +1981,29 @@ impl UdpSession {
                 compact,
                 waiting,
                 restarted,
+                session,
                 ..
             } => {
                 if restarted && leg.is_live() {
                     // The edge started the leg again at a new session
-                    // (joins): what was delivered and every decoder's
-                    // blocks are of the old one, whose numbers the new one
-                    // may reuse.
+                    // (joins). Named (`e=`): what is older than it goes,
+                    // and a flow of it that its data opened already stays
+                    // (the announcement can come after them). Unnamed (an
+                    // older edge): everything goes, as before.
                     leg.wait_heads = None;
-                    self.receiver.new_flow();
-                    self.receiver.forget_sessions();
-                    self.session_restarts += 1;
+                    let id = leg.id;
+                    match session {
+                        Some(epoch) => {
+                            if self.receiver.announce_session(id, epoch, now) {
+                                self.session_restarts += 1;
+                            }
+                        }
+                        None => {
+                            self.receiver.new_flow();
+                            self.receiver.forget_sessions();
+                            self.session_restarts += 1;
+                        }
+                    }
                 }
                 self.on_subscribed(index, next_part, compact, waiting, now)
             }
@@ -2598,6 +2610,7 @@ mod tests {
             compact: true,
             waiting: false,
             restarted: false,
+            session: None,
         }
         .encode();
         assert_eq!(
@@ -2710,6 +2723,7 @@ mod tests {
             compact: true,
             waiting: false,
             restarted: false,
+            session: None,
         }
         .encode();
         session.on_datagram(edge(), &ok, at, &mut send);
@@ -2751,6 +2765,7 @@ mod tests {
             compact: true,
             waiting: false,
             restarted: false,
+            session: None,
         }
         .encode();
         session.on_datagram(next, &ok, moved_at, &mut send);
@@ -2815,6 +2830,7 @@ mod tests {
                 compact: true,
                 waiting: false,
                 restarted: false,
+                session: None,
             }
             .encode();
             session.on_datagram(edge(), &ok, now, &mut send);
@@ -2853,6 +2869,7 @@ mod tests {
                 compact: true,
                 waiting: false,
                 restarted: false,
+                session: None,
             }
             .encode();
             session.on_datagram(edge(), &ok, now, &mut send);
@@ -2904,6 +2921,7 @@ mod tests {
             compact: true,
             waiting: false,
             restarted: false,
+            session: None,
         }
         .encode();
         assert!(matches!(
@@ -3024,6 +3042,7 @@ mod tests {
             compact: false,
             waiting: false,
             restarted: false,
+            session: None,
         }
         .encode();
         session.on_datagram(edge(), &ok, at, &mut send);
@@ -3170,6 +3189,7 @@ mod tests {
             compact: false,
             waiting: false,
             restarted: false,
+            session: None,
         }
         .encode();
         assert_eq!(
@@ -3220,6 +3240,7 @@ mod tests {
             compact: true,
             waiting: false,
             restarted: false,
+            session: None,
         }
         .encode();
         session.on_datagram(edge(), &ok, now, &mut send);
@@ -3286,6 +3307,7 @@ mod tests {
             compact: true,
             waiting: false,
             restarted: false,
+            session: None,
         }
         .encode();
         session.on_datagram(edge(), &ok, now, &mut send);
@@ -3428,6 +3450,7 @@ mod tests {
             compact: true,
             waiting: false,
             restarted: false,
+            session: None,
         }
         .encode()
     }
@@ -4113,6 +4136,85 @@ mod tests {
         assert_eq!(session.start_from(StartFrom::AfterNewest), None);
     }
 
+    /// Joins, order-proof: an edge announces a new session (`OK … s=1 e=`)
+    /// before, between or after the session's first parts, which come on
+    /// the fast lane or the cache-fed lane, and after the announcement the
+    /// cache-fed lane sends the session again from its first part (as the
+    /// edge does at a restart). Whatever the order, the client delivers the
+    /// new session's every part once, in order, on the compact lane and on
+    /// the RaptorQ lane; and an announcement repeated, or of the old
+    /// session after the new one, changes nothing.
+    #[test]
+    fn an_announced_session_delivers_the_same_whatever_its_order() {
+        use crate::client_compact::{encode_part, generation_of_epoch, set_generation};
+        const OLD: u64 = 1_795_553_276_846_835;
+        const NEW: u64 = 1_795_553_340_807_636;
+        let datagrams = |raptorq: bool, epoch: u64, part: u64| -> Vec<Vec<u8>> {
+            let generation = generation_of_epoch(epoch);
+            if raptorq {
+                object_datagrams(part, generation, 3_000)
+            } else {
+                let mut datagram = encode_part(part, 0, b"pcm").unwrap();
+                set_generation(&mut datagram, generation);
+                vec![datagram]
+            }
+        };
+        let announce = |epoch: u64| {
+            Control::Subscribed {
+                stream_id: 1,
+                next_part: 0,
+                compact: true,
+                waiting: false,
+                restarted: true,
+                session: Some(epoch),
+            }
+            .encode()
+        };
+        assert!(String::from_utf8_lossy(&announce(NEW)).ends_with(" C s=1 e=1795553340807636"));
+        for raptorq in [false, true] {
+            for at in 0..=5_u64 {
+                let name = format!("raptorq {raptorq}, announced before new part {at}");
+                let now = Instant::now();
+                let mut session = UdpSession::new(SessionConfig::new(1), now);
+                let mut send = |_: SocketAddr, _: &[u8]| {};
+                session.add_leg(A, "a", edge(), start(), now, &mut send);
+                session.on_datagram(edge(), &token(5), now, &mut send);
+                session.on_datagram(edge(), &ok(100), now, &mut send);
+                let mut delivered = Vec::new();
+                let mut feed = |session: &mut UdpSession, datagram: &[u8], delivered: &mut Vec<u64>| {
+                    session.on_datagram(edge(), datagram, now, &mut send);
+                    delivered.extend(std::iter::from_fn(|| session.next_object()).map(|object| object.part));
+                };
+                for part in 100..110 {
+                    for datagram in datagrams(raptorq, OLD, part) {
+                        feed(&mut session, &datagram, &mut delivered);
+                    }
+                }
+                assert_eq!(delivered, (100..110).collect::<Vec<_>>(), "{name}");
+                delivered.clear();
+                for part in 0..20_u64 {
+                    if part == at {
+                        feed(&mut session, &announce(NEW), &mut delivered);
+                        // The edge sends the session again from its first
+                        // part on the cache-fed lane; a repeat and a late
+                        // announcement of the old session change nothing.
+                        for again in 0..at {
+                            for datagram in datagrams(raptorq, NEW, again) {
+                                feed(&mut session, &datagram, &mut delivered);
+                            }
+                        }
+                        feed(&mut session, &announce(NEW), &mut delivered);
+                        feed(&mut session, &announce(OLD), &mut delivered);
+                    }
+                    for datagram in datagrams(raptorq, NEW, part) {
+                        feed(&mut session, &datagram, &mut delivered);
+                    }
+                }
+                assert_eq!(delivered, (0..20).collect::<Vec<_>>(), "{name}");
+            }
+        }
+    }
+
     /// Joins: an edge whose stream is not live answers `OK ... w=1`: the
     /// leg is live, anchored to nothing, and the part it names judges no
     /// leg. Beside a leg that delivers the new session (parts 5 on), an old
@@ -4139,6 +4241,7 @@ mod tests {
             compact: true,
             waiting: true,
             restarted: false,
+            session: None,
         }
         .encode();
         assert!(String::from_utf8_lossy(&waiting).ends_with(" C w=1"));

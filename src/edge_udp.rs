@@ -2218,6 +2218,7 @@ impl EdgeControl {
                     compact: compact.is_some(),
                     waiting: false,
                     restarted: false,
+                    session: None,
                 },
                 RefreshAnswer::Move(reason) => Control::Move {
                     stream_id,
@@ -2664,7 +2665,7 @@ fn refresh_subscriber(
                 subscriber.catching_up = true;
                 subscriber.first_part = subscriber.first_part.min(part);
                 if subscriber.fast.is_some() {
-                    subscriber.fast = Some(FastClient::new(part));
+                    subscriber.fast = Some(FastClient::for_session(part, subscriber.epoch));
                     regroup = true;
                 }
             }
@@ -3351,7 +3352,7 @@ async fn admit(
     // the snapshot below, and the cache-fed lane every part that they do not
     // (older parts, a part already on its way).
     let fast = (fast_lane && sockets.fast_lane().is_some_and(|lane| lane.is_armed()))
-        .then(|| FastClient::new(first_part));
+        .then(|| FastClient::for_session(first_part, epoch));
     let start_sender = {
         let mut table = table.lock().unwrap();
         let entry = table.entry(stream_id).or_default();
@@ -3399,6 +3400,7 @@ async fn admit(
             compact: compact.is_some(),
             waiting: waiting_past.is_some(),
             restarted: false,
+            session: None,
         },
     )
     .await;
@@ -4082,7 +4084,7 @@ async fn run_stream_sender(
                     for (peer, subscriber) in entry.subscribers.iter_mut() {
                         let stale = subscriber.waiting_past;
                         if let SessionLook::New { restarted } =
-                            restart_in_session(subscriber, start, epoch)
+                            restart_in_session(subscriber, start, head, epoch)
                         {
                             fast_renewed |= subscriber.fast.is_some();
                             if restarted {
@@ -4146,6 +4148,10 @@ async fn run_stream_sender(
                     compact,
                     waiting: false,
                     restarted: true,
+                    // The session it starts again at: the client keeps a
+                    // flow of it that the new parts opened already (the fast
+                    // lane forwards them before this edge's commit).
+                    session: (epoch != 0).then_some(epoch),
                 },
             )
             .await;
@@ -4729,7 +4735,12 @@ enum SessionLook {
 /// new session from an old number), anchored to the new session; its
 /// fast-lane place is made again, since the claims of the old session's
 /// part numbers would keep the new session's off the fast lane.
-fn restart_in_session(subscriber: &mut Subscriber, start: u64, epoch: u64) -> SessionLook {
+fn restart_in_session(
+    subscriber: &mut Subscriber,
+    start: u64,
+    head: u64,
+    epoch: u64,
+) -> SessionLook {
     if epoch == 0 || subscriber.epoch == epoch {
         return SessionLook::Same;
     }
@@ -4739,6 +4750,16 @@ fn restart_in_session(subscriber: &mut Subscriber, start: u64, epoch: u64) -> Se
     }
     subscriber.epoch = epoch;
     start_at(subscriber, start);
+    // The cache-fed lane sends the session's parts up to the one after the
+    // head (those the fast lane passed by before this look, and the one on
+    // its way); the fast lane takes the next, so that the new session comes
+    // in order rather than its third part on the fast lane before its first
+    // two on the cache-fed lane (with the tee on its own thread, the commit
+    // that starts this comes a part or two after the fast lane's symbols).
+    if subscriber.fast.is_some() {
+        let fast_from = start.max(head.saturating_add(2));
+        subscriber.fast = Some(FastClient::for_session(fast_from, epoch));
+    }
     SessionLook::New { restarted: true }
 }
 
@@ -4760,7 +4781,7 @@ fn anchor_waiting(subscriber: &mut Subscriber, head: u64, start: u64) -> bool {
     } else {
         subscriber.waiting_past = None;
         if subscriber.fast.is_some() {
-            subscriber.fast = Some(FastClient::new(subscriber.next_part));
+            subscriber.fast = Some(FastClient::for_session(subscriber.next_part, subscriber.epoch));
         }
     }
     true
@@ -4776,7 +4797,7 @@ fn start_at(subscriber: &mut Subscriber, part: u64) {
     subscriber.cut_slots.clear();
     subscriber.windows_repaired.clear();
     if subscriber.fast.is_some() {
-        subscriber.fast = Some(FastClient::new(part));
+        subscriber.fast = Some(FastClient::for_session(part, subscriber.epoch));
     }
 }
 

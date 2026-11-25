@@ -42188,6 +42188,7 @@ mod tests {
                 compact: false,
                 waiting: false,
                 restarted: false,
+                session: None,
             })
         );
         assert!(receiver.recovered_objects > 0);

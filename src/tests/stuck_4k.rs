@@ -281,8 +281,26 @@ async fn run_order(order: Order, fast_lane: bool, ip: u8) {
         "{name}: the old session after the new: {:?}",
         run.parts
     );
-    let from = new[0];
-    assert_eq!(new, (from..=NEW_LAST).collect::<Vec<_>>(), "{name}: {run:?}");
+    // Every part once. In order, but for the restart's catch-up: the
+    // cache-fed lane sends the new session's first parts after the edge
+    // commits them (the tee runs on its own thread), while the fast lane
+    // forwards the next part as its symbols arrive, so a part may come one
+    // place late among the session's first few (a player's buffer holds
+    // more than a part).
+    let mut sorted = new.clone();
+    sorted.sort_unstable();
+    let from = sorted[0];
+    assert_eq!(sorted, (from..=NEW_LAST).collect::<Vec<_>>(), "{name}: {run:?}");
+    let late: Vec<(usize, u64)> = new
+        .iter()
+        .enumerate()
+        .filter(|(at, part)| **part != from + *at as u64)
+        .map(|(at, part)| (at, *part))
+        .collect();
+    assert!(
+        late.iter().all(|(at, part)| *at < 8 && part.abs_diff(from + *at as u64) <= 1),
+        "{name}: out of order beyond the restart's catch-up: {late:?}"
+    );
     match order {
         Order::WatchingAtRestart => {
             // From the new session's first part or so (the cache-fed
