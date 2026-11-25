@@ -391,6 +391,22 @@ async fn memory_bench() {
     let before = env("MEM_BEFORE", 0) == 1;
     let trim = env("MEM_TRIM", 1) == 1;
     let cache_mb = env("MEM_CACHE_MB", 392);
+    // 4k-repair (integration 5b): each part kept in a forwarder's part
+    // store (48 MiB) and, at MEM_REPAIR_LOSS_PPM (10,000) of one child's
+    // loss, link repair made from it (its encoder: about twice the part),
+    // as a forwarder with one lossy child. 0: no part repair.
+    let repair_on = env("MEM_REPAIR", 1) == 1;
+    let repair_loss_ppm = u32::try_from(env("MEM_REPAIR_LOSS_PPM", 10_000)).unwrap();
+    let repair = repair_on.then(|| {
+        fast_plane::part_repair::PartRepair::start(
+            fast_plane::part_repair::PartRepairConfig::default(),
+            relay_session::RelayLimits::default(),
+        )
+    });
+    let sink = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let sink_addr = sink.local_addr().unwrap();
+    let via: Arc<dyn fast_plane::part_repair::SendSocket> =
+        Arc::new(std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap());
     LEGACY_HIDE.store(before, Ordering::Relaxed);
     let rate = mbps * 1_000_000 / 8;
     let rss = || av_mesh::mem_guard::rss_bytes() / MB;
@@ -459,7 +475,7 @@ async fn memory_bench() {
         if before { "BEFORE (df6414c)" } else { "bounded" },
         ring_slots * 130 / MB as usize,
     );
-    println!("  sim_s  rss_mb  cache_mb  retained_mb  malloc_os_mb  in_use_mb  free_in_heap_mb  live<4K  <64K  <1M  >=1M  trimmed_mb");
+    println!("  sim_s  rss_mb  cache_mb  retained_mb  malloc_os_mb  in_use_mb  free_in_heap_mb  live<4K  <64K  <1M  >=1M  trimmed_mb  store_mb  plans_mb  link_parts");
     let mut last_held = 0;
     let mut trimmed = 0;
     let mut peak_rss = 0;
@@ -467,6 +483,13 @@ async fn memory_bench() {
     while let Some((epoch, sequence, payload)) = frames_rx.recv().await {
         // A forwarder and a fast-plane-fed edge (a lease child) commit a
         // part alike; their other structures are fixed (see the report).
+        if let Some(repair) = &repair {
+            let part = fast_plane::part_repair::stored_part_for_test(77, epoch, sequence, payload.to_vec(), 1_316);
+            repair.keep(part, &[], |_| fast_plane::part_repair::Children {
+                lossy: vec![(Arc::clone(&via), sink_addr, repair_loss_ppm)],
+                sources: Vec::new(),
+            });
+        }
         cache.commit_stream_payload(77, payload).await.unwrap();
         let frame = (epoch - 5) * per_epoch + sequence;
         if (frame + 1) % FPS == 0 {
@@ -489,7 +512,7 @@ async fn memory_bench() {
                 after_first_window.push(now_rss);
             }
             println!(
-                "  {sim_s:5}  {now_rss:6}  {:8}  {:11}  {:12}  {:9}  {:15}  {:7}  {:4}  {:4}  {:4}  {:10}",
+                "  {sim_s:5}  {now_rss:6}  {:8}  {:11}  {:12}  {:9}  {:15}  {:7}  {:4}  {:4}  {:4}  {:10}  {:8}  {:8}  {}",
                 cache.chunk_cache.held_bytes() / MB,
                 retained_bytes(&cache, 77).await / MB,
                 os / MB,
@@ -500,6 +523,9 @@ async fn memory_bench() {
                 live[2] / MB,
                 live[3] / MB,
                 trimmed / MB,
+                av_mesh::mem_guard::store_totals().part_store_bytes / MB,
+                av_mesh::mem_guard::store_totals().plans_bytes / MB,
+                repair.as_ref().map_or(0, |repair| repair.stats.link_repair_parts.load(Ordering::Relaxed)),
             );
         }
     }

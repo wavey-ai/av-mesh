@@ -998,6 +998,9 @@ pub struct PartRepair {
     /// Tests: the parts this node asked for.
     #[cfg(test)]
     asked: StdMutex<Vec<u64>>,
+    /// Tests: each first ask, as the requester saw the part then.
+    #[cfg(test)]
+    pub ask_log: StdMutex<Vec<AskNote>>,
 }
 
 impl std::fmt::Debug for PartRepair {
@@ -1026,6 +1029,8 @@ impl PartRepair {
             extra_sent: Arc::clone(&extra_sent),
             #[cfg(test)]
             asked: StdMutex::new(Vec::new()),
+            #[cfg(test)]
+            ask_log: StdMutex::new(Vec::new()),
         });
         let weak: std::sync::Weak<dyn Shed> = Arc::downgrade(&repair) as _;
         av_mesh::mem_guard::register_store(weak);
@@ -1630,6 +1635,21 @@ struct Parent {
     window: Option<u32>,
 }
 
+/// Tests: what the requester knew of a part when it first asked for it.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub struct AskNote {
+    pub object: u64,
+    pub held: u32,
+    pub k: u16,
+    pub silence_us: u64,
+    pub since_first_us: u64,
+    pub gap_us: u64,
+    pub lane_gap_us: u64,
+    pub moved_on: bool,
+    pub link_done: bool,
+}
+
 /// The child side, owned by a class's tee.
 pub struct Requester {
     repair: Arc<PartRepair>,
@@ -2128,6 +2148,17 @@ impl Requester {
         #[cfg(test)]
         if sent && part.attempts == 0 {
             self.repair.asked.lock().unwrap().push(part.key.object);
+            self.repair.ask_log.lock().unwrap().push(AskNote {
+                object: part.key.object,
+                held: part.held,
+                k: part.k,
+                silence_us: now_us.saturating_sub(part.last_us),
+                since_first_us: now_us.saturating_sub(part.first_us),
+                gap_us: part.gap_us,
+                lane_gap_us: self.lane_gap_us[lane_of(&part)],
+                moved_on: part.moved_on_us != 0,
+                link_done: part.link_done_us != 0,
+            });
         }
         let stats = self.stats();
         if sent {
@@ -2169,6 +2200,45 @@ const fn lane_of(part: &OpenPart) -> usize {
     }
 }
 
+/// Tests and benches: a kept part of `envelope`, in symbols of `t` bytes.
+#[cfg(test)]
+pub fn stored_part_for_test(stream: u64, epoch: u64, object: u64, envelope: Vec<u8>, t: u16) -> StoredPart {
+    let bytes = envelope.len();
+    let k = u16::try_from(bytes.div_ceil(usize::from(t))).unwrap();
+    let packet = raptorq::EncodingPacket::new(raptorq::PayloadId::new(0, 0), vec![0; usize::from(t)]).serialize();
+    let header = DatagramFecHeader::raptorq(9, u32::try_from(bytes).unwrap(), 0, k, t, &packet).unwrap();
+    let mut fec = vec![0_u8; HEADER_LEN];
+    header.encode(&mut fec).unwrap();
+    fec.extend_from_slice(&packet);
+    let meta = PartMeta {
+        key: PartKey {
+            stream,
+            epoch,
+            object,
+        },
+        generation: 1,
+        subscription_id: 1,
+        kind: MediaObjectKind::VideoDelta,
+        deadline_us: 0,
+        fec,
+        seq_base: 0,
+        source_symbols: k,
+        slim: false,
+    };
+    let key = ObjectKey::new(
+        "t",
+        "7",
+        "v",
+        epoch,
+        0,
+        object,
+        0,
+        media_object::PayloadHash::from_bytes([0; 32]),
+    )
+    .unwrap();
+    StoredPart::new(&meta, key, envelope).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2179,41 +2249,7 @@ mod tests {
 
     /// A kept part of `stream` at `epoch`, `object`, of `bytes` bytes.
     fn stored(stream: u64, epoch: u64, object: u64, bytes: usize) -> StoredPart {
-        let k = u16::try_from(bytes.div_ceil(usize::from(T))).unwrap();
-        let packet = raptorq::EncodingPacket::new(raptorq::PayloadId::new(0, 0), vec![0; usize::from(T)])
-            .serialize();
-        let header =
-            DatagramFecHeader::raptorq(9, u32::try_from(bytes).unwrap(), 0, k, T, &packet).unwrap();
-        let mut fec = vec![0_u8; HEADER_LEN];
-        header.encode(&mut fec).unwrap();
-        fec.extend_from_slice(&packet);
-        let meta = PartMeta {
-            key: PartKey {
-                stream,
-                epoch,
-                object,
-            },
-            generation: 1,
-            subscription_id: 1,
-            kind: MediaObjectKind::VideoDelta,
-            deadline_us: 0,
-            fec,
-            seq_base: 0,
-            source_symbols: k,
-            slim: false,
-        };
-        let key = ObjectKey::new(
-            "t",
-            "7",
-            "v",
-            epoch,
-            0,
-            object,
-            0,
-            media_object::PayloadHash::from_bytes([0; 32]),
-        )
-        .unwrap();
-        StoredPart::new(&meta, key, vec![1_u8; bytes]).unwrap()
+        stored_part_for_test(stream, epoch, object, vec![1_u8; bytes], T)
     }
 
     fn repair_with(store_bytes: usize) -> Arc<PartRepair> {

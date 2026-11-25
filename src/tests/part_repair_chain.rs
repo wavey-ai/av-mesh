@@ -366,6 +366,7 @@ pub(super) async fn chain_node(
     parent: SocketAddr,
     child: Option<SocketAddr>,
     config: PartRepairConfig,
+    pool_only: bool,
 ) -> ChainNode {
     let generation = TopologyGeneration::new(FAST_GENERATION).unwrap();
     let subscription_id = SubscriptionId::new(FAST_SUBSCRIPTION).unwrap();
@@ -446,7 +447,7 @@ pub(super) async fn chain_node(
             trim_to_margin: std::env::var("KR_TRIM_TO_MARGIN").is_ok(),
             // Each node's own pool (KR_DECODE_WORKERS, default 1: a
             // 2-vCPU node's), when part repair is on.
-            decode_pool: if trim {
+            decode_pool: if trim || pool_only {
                 fast_plane::decode_pool::DecodePool::start(
                     std::env::var("KR_DECODE_WORKERS")
                         .ok()
@@ -457,7 +458,10 @@ pub(super) async fn chain_node(
             } else {
                 None
             },
-            part_repair: Some(Arc::clone(&repair)),
+            // pool_only: --relay-part-repair false --relay-link-repair
+            // false (no part repair at all) with the decode pool: the
+            // cheap tee and the tee per lane alone.
+            part_repair: (!pool_only).then(|| Arc::clone(&repair)),
             ..Default::default()
         },
     ));
@@ -619,6 +623,8 @@ pub(super) struct Case {
     /// Part repair: asks and answers, and link repair.
     pub(super) requests: bool,
     pub(super) link_repair: bool,
+    /// No part repair, the decode pool on (see `chain_node`).
+    pub(super) pool_only: bool,
 }
 
 pub(super) struct ChainRun {
@@ -635,6 +641,8 @@ pub(super) struct ChainRun {
     pub(super) source_datagrams: u64,
     pub(super) media_bytes: u64,
     pub(super) repair: Vec<(String, PartRepairSnapshot)>,
+    /// Each node's first asks, as its requester saw each part then.
+    pub(super) ask_notes: Vec<(String, Vec<fast_plane::part_repair::AskNote>)>,
     pub(super) kernel_dropped: u64,
     pub(super) tee_dropped: u64,
     pub(super) fast: Vec<fast_plane::relay::FastPlaneSnapshot>,
@@ -692,6 +700,7 @@ pub(super) fn run_chain(parts: &[Part], measured: std::ops::Range<usize>, case: 
                 parents[index],
                 children[index],
                 config(NODES[index]),
+                case.pool_only,
             ))
         })
         .collect::<Vec<_>>()
@@ -757,6 +766,11 @@ pub(super) fn run_chain(parts: &[Part], measured: std::ops::Range<usize>, case: 
         .map(|(node, name)| (name.to_string(), node.repair_stats()))
         .collect();
     let fast: Vec<_> = nodes.iter().map(ChainNode::stats).collect();
+    let ask_notes = nodes
+        .iter()
+        .zip(NODES)
+        .map(|(node, name)| (name.to_string(), node.repair.ask_log.lock().unwrap().clone()))
+        .collect();
     let (kernel_dropped, tee_dropped) = nodes.iter().fold((0, 0), |(kernel, tee), node| {
         let stats = node.stats();
         (kernel + stats.kernel_dropped, tee + stats.tee_dropped)
@@ -777,6 +791,7 @@ pub(super) fn run_chain(parts: &[Part], measured: std::ops::Range<usize>, case: 
         source_datagrams: parts.iter().map(|part| part.sources as u64).sum(),
         media_bytes: parts.iter().map(|part| part.media_bytes as u64).sum(),
         repair,
+        ask_notes,
         kernel_dropped,
         tee_dropped,
         fast,
@@ -968,6 +983,7 @@ fn part_repair_chain_bench() {
                     loss: loss_of(&loss),
                     requests: on,
                     link_repair: on,
+                    pool_only: false,
                 },
             );
             let row = run.row(base.as_ref());
@@ -989,6 +1005,25 @@ fn part_repair_chain_bench() {
                         f.decode_pool.inline,
                         f.decode_pool.failures
                     );
+                }
+                let sources = run.source_datagrams.max(1) as f64;
+                for ((name, s), f) in run.repair.iter().zip(&run.fast) {
+                    println!(
+                        "  cost {name}: tee cpu {:.1} % ({:.0} us/part), pool cpu {:.1} %, repair sent {:.2} % of the stream's sources (answers {} link {} regenerated {}), asks {}",
+                        f.video_tee_cpu_us as f64 / 1e4 / run.seconds,
+                        f.video_tee_cpu_us as f64 / run.first_us.len().max(1) as f64,
+                        f.decode_pool.decode_us as f64 / 1e4 / run.seconds,
+                        (s.answer_symbols + s.link_repair_symbols + s.regenerated_symbols) as f64 * 100.0 / sources,
+                        s.answer_symbols,
+                        s.link_repair_symbols,
+                        s.regenerated_symbols,
+                        s.requests
+                    );
+                }
+                for (name, notes) in &run.ask_notes {
+                    for note in notes.iter().take(12) {
+                        println!("  ask {name}: {note:?}");
+                    }
                 }
                 for (name, s) in &run.repair {
                     println!(
@@ -1026,6 +1061,7 @@ fn parts_that_links_damage_are_asked_for_and_reach_the_viewer() {
                 loss,
                 requests: true,
                 link_repair: true,
+                pool_only: false,
             },
         );
         println!("{HEADER}\n{}", run.row(None));
@@ -1048,6 +1084,7 @@ fn without_part_repair_the_same_links_lose_parts() {
             loss: Loss::Random(0.02),
             requests: false,
             link_repair: false,
+            pool_only: false,
         },
     );
     println!("{HEADER}\n{}", run.row(None));
@@ -1076,6 +1113,7 @@ fn a_stream_of_one_and_two_symbol_parts_is_never_asked_for() {
                 window: fast_plane::part_repair::window_for("m2-node"),
                 ..PartRepairConfig::default()
             },
+            false,
         )
         .await;
         let deadline = now_unix_us() + 3_600_000_000;
@@ -1129,4 +1167,44 @@ fn a_stream_of_one_and_two_symbol_parts_is_never_asked_for() {
         assert_eq!(stats.gave_up_parts, DAMAGED.len() as u64, "{stats:?}");
         node.stop().await;
     });
+}
+
+/// The cheap tee alone, as a lab may run it before the full repair:
+/// --relay-part-repair false --relay-link-repair false
+/// --relay-trim-forwarded-repair false, the decode pool on (its default).
+/// A part that comes with all its sources is their bytes (no RaptorQ), a
+/// damaged one is decoded on the pool from the contributor's repair, and
+/// nothing asks, answers or adds link repair.
+#[test]
+fn the_cheap_tee_alone_without_asks_or_link_repair() {
+    // The contributor's repair as before 4k-repair: 5 % of K, at most 16.
+    let (parts, measured) = bench_parts(2, 10, |k| (k / 20).clamp(1, 16));
+    for (loss, damaged) in [(Loss::None, false), (Loss::Random(0.002), true)] {
+        let run = run_chain(
+            &parts,
+            measured.clone(),
+            Case {
+                rtt_ms: 30,
+                loss,
+                requests: false,
+                link_repair: false,
+                pool_only: true,
+            },
+        );
+        println!("{HEADER}\n{}", run.row(None));
+        assert!(run.missing().is_empty(), "{loss:?}: missing {:?}", run.missing());
+        assert_eq!(run.total(|s| s.requests), 0, "{loss:?}: asked");
+        assert_eq!(run.total(|s| s.asks), 0, "{loss:?}: answered");
+        assert_eq!(run.total(|s| s.link_repair_symbols), 0, "{loss:?}: link repair");
+        let decodes: u64 = run.fast.iter().map(|f| f.decode_pool.decodes).sum();
+        let inline: u64 = run.fast.iter().map(|f| f.decode_pool.inline).sum();
+        if damaged {
+            assert!(decodes > 0, "a damaged part was decoded on the pool");
+        } else {
+            assert_eq!(decodes + inline, 0, "a whole part took RaptorQ");
+        }
+        for f in &run.fast[1..] {
+            assert!(f.decode_pool.workers > 0, "the pool is on");
+        }
+    }
 }

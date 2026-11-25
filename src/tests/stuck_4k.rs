@@ -368,3 +368,56 @@ async fn the_new_session_takes_the_numbers_the_old_session_s_late_copies_held() 
     assert_eq!(edge.head(STREAM).await, Some(50));
     edge.stop().await;
 }
+
+/// Integration 5b (part repair's epoch floor): an answer to an ask of the
+/// old session (repair symbols that complete one of its parts, with the
+/// sources the asker held) that arrives after the new session started is
+/// decoded at the tee and refused: it is neither written nor lifts the
+/// watermark, and the new session's own parts at those numbers follow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_for_the_old_session_never_lifts_the_new_session_s_watermark() {
+    let edge = LaneEdge::start(loopback(245)).await;
+    let deadline_us = now_unix_us() + 120_000_000;
+    for sequence in 30..=39 {
+        publish(&edge, OLD_EPOCH, sequence, OLD_LEN, deadline_us).await;
+    }
+    for sequence in 0..=20_u64 {
+        publish(&edge, NEW_EPOCH, sequence, NEW_LEN, deadline_us).await;
+    }
+    // The old session's parts 40-45, as an asker held half their sources
+    // and its parent's answer completed them with repair.
+    for sequence in 40..=45_u64 {
+        let (envelope, _) = packaged_envelope(Packaging::Fmp4Video, STREAM, OLD_EPOCH, sequence, OLD_LEN);
+        let (sources, repairs) = fast_test_symbols(
+            &envelope,
+            relay_session::MediaPriority::VideoKey,
+            1_088,
+            400,
+            u32::try_from(OLD_LEN / 1_088 + 4).unwrap(),
+            deadline_us,
+        );
+        let half = sources.len() / 2;
+        edge.send(true, &(sources[..half].to_vec(), repairs), false).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(edge.head(STREAM).await, Some(20), "the watermark");
+    for sequence in 40..=45_usize {
+        assert!(
+            edge.cache.chunk_cache.get_for_stream_id(STREAM, sequence).await.is_none(),
+            "part {sequence}: the old session's answer was written"
+        );
+    }
+    for sequence in 21..=45_u64 {
+        publish(&edge, NEW_EPOCH, sequence, NEW_LEN, deadline_us).await;
+    }
+    for sequence in 40..=45_u64 {
+        let (media, _, _, _) = edge
+            .cache
+            .read_part_for_stream_id(STREAM, sequence)
+            .await
+            .unwrap_or_else(|| panic!("part {sequence} of the new session"));
+        assert_eq!(media.len(), NEW_LEN, "part {sequence}");
+    }
+    assert_eq!(edge.head(STREAM).await, Some(45));
+    edge.stop().await;
+}

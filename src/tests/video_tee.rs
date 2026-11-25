@@ -285,6 +285,17 @@ pub(super) fn tee_4k(options: TeeOptions) -> TeeRun {
                     cpus: node_cpus.map_or([None, None], |cpus| [Some(cpus[0]), Some(cpus[1])]),
                     realtime: false,
                     test_video_tee_spin_ns: options.tee_spin_ns,
+                    // VT_POOL=1 (4k-repair): a decode pool, so the tees
+                    // assemble whole parts from their sources (no RaptorQ),
+                    // as the node does by default; 0: the decode on the
+                    // tee, as before (df00f0a).
+                    decode_pool: (env_u64("VT_POOL", 0) == 1).then(|| {
+                        fast_plane::decode_pool::DecodePool::start(
+                            1,
+                            fast_plane::decode_pool::DECODE_QUEUE_BYTES,
+                        )
+                    })
+                    .flatten(),
                     ..Default::default()
                 },
                 cache,
