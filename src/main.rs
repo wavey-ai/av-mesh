@@ -47516,4 +47516,7 @@ mod tests {
     /// A 4K viewer at an edge whose source session restarts, with a late
     /// copy of the old session in its cache (stuck4k).
     mod stuck_4k;
+    /// Listeners that join around a source restart, at an edge whose copy
+    /// the join itself warms (local proof 3, step 2).
+    mod joins;
 }
