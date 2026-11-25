@@ -296,6 +296,14 @@ pub(super) fn tee_4k(options: TeeOptions) -> TeeRun {
                         )
                     })
                     .flatten(),
+                    // VT_REPAIR=1: part repair on, as the deploy runs it
+                    // (asks, link repair, the requester on each tee).
+                    part_repair: (env_u64("VT_REPAIR", 0) == 1).then(|| {
+                        fast_plane::part_repair::PartRepair::start(
+                            fast_plane::part_repair::PartRepairConfig::default(),
+                            relay_session::RelayLimits::default(),
+                        )
+                    }),
                     ..Default::default()
                 },
                 cache,
