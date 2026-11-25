@@ -3000,14 +3000,28 @@ impl Tee {
                     Some(pool) => super::decode_pool::decode(&job, &pool.stats),
                     None => job.run(),
                 };
-                self.on_decode_done(DecodeDone { job, ctx, envelope }).await;
+                self.on_decode_done(DecodeDone {
+                    job,
+                    ctx,
+                    envelope,
+                    bytes: 0,
+                })
+                .await;
             }
         }
     }
 
     /// A decode finished: commit the part, unless it completed meanwhile.
     async fn on_decode_done(&mut self, done: DecodeDone) {
-        let DecodeDone { job, ctx, envelope } = done;
+        let DecodeDone {
+            job,
+            ctx,
+            envelope,
+            bytes,
+        } = done;
+        if let (Some(pool), true) = (&self.decodes, bytes > 0) {
+            pool.taken(bytes);
+        }
         match self
             .dispatch
             .receiver_mut()

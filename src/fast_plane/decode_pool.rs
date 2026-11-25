@@ -20,6 +20,7 @@
 //! it inline (`inline` counts them).
 
 use super::part_repair::PartMeta;
+use av_mesh::mem_guard::{Shed, StoreAccount, StoreKind};
 use av_mesh::relay_ingress::DecodeJob;
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -32,6 +33,12 @@ use tracing::{info, warn};
 
 /// Decodes waiting at most; past it a tee decodes inline.
 pub const DECODE_QUEUE: usize = 32;
+/// The bytes the queue and its results not yet taken back may hold by
+/// default (`--relay-decode-queue-mb`); past it a tee decodes inline. Each
+/// job is counted twice (its symbols, and the envelope its decode makes)
+/// from its submission until its tee takes the result: 64 MiB is about 24
+/// parts of 4K at 247 Mbit/s, or 5 key frames of 6 MB.
+pub const DECODE_QUEUE_BYTES: usize = 64 << 20;
 /// The workers' nice value: the tee's.
 pub const DECODE_NICE: i32 = 10;
 
@@ -54,12 +61,16 @@ pub struct DecodeDone {
     pub job: DecodeJob,
     pub ctx: DecodedCtx,
     pub envelope: Option<Vec<u8>>,
+    /// What the job counts in the pool's account (0 for an inline decode):
+    /// given back by [`DecodePool::taken`] when its tee takes it.
+    pub bytes: u64,
 }
 
 struct Task {
     job: DecodeJob,
     ctx: DecodedCtx,
     done: UnboundedSender<DecodeDone>,
+    bytes: u64,
 }
 
 #[derive(Debug, Default)]
@@ -70,6 +81,9 @@ pub struct DecodePoolStats {
     pub decode_us_max: AtomicU64,
     pub inline: AtomicU64,
     pub queued_max: AtomicU64,
+    /// Decodes run inline because the queue's bytes were at their limit
+    /// (in `inline` too).
+    pub inline_bytes_limited: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -82,6 +96,9 @@ pub struct DecodePoolSnapshot {
     pub decode_us_max: u64,
     pub inline: u64,
     pub queued_max: u64,
+    pub inline_bytes_limited: u64,
+    pub queue_bytes: u64,
+    pub queue_budget_bytes: u64,
 }
 
 struct Shared {
@@ -94,6 +111,20 @@ pub struct DecodePool {
     shared: Arc<Shared>,
     workers: usize,
     pub stats: Arc<DecodePoolStats>,
+    /// The queue's bytes and its results' in the memory guard's account.
+    account: Arc<StoreAccount>,
+}
+
+impl Shed for DecodePool {
+    fn account(&self) -> &StoreAccount {
+        &self.account
+    }
+
+    /// Nothing is dropped: a queued decode is a part. Its limit only sends
+    /// new decodes back to their tees, inline, until the queue drains.
+    fn shed_to_limit(&self) -> u64 {
+        0
+    }
 }
 
 impl std::fmt::Debug for DecodePool {
@@ -115,8 +146,9 @@ pub fn default_workers() -> usize {
 }
 
 impl DecodePool {
-    /// `None` for no workers (the tees decode inline).
-    pub fn start(workers: usize) -> Option<Arc<Self>> {
+    /// `None` for no workers (the tees decode inline). `queue_bytes`: the
+    /// bytes the queue and its untaken results may hold.
+    pub fn start(workers: usize, queue_bytes: usize) -> Option<Arc<Self>> {
         if workers == 0 {
             return None;
         }
@@ -126,12 +158,14 @@ impl DecodePool {
             stop: AtomicBool::new(false),
         });
         let stats = Arc::new(DecodePoolStats::default());
+        let account = Arc::new(StoreAccount::new(StoreKind::DecodeQueue, queue_bytes as u64));
         let mut started = 0;
         for index in 0..workers {
-            let (shared, stats) = (Arc::clone(&shared), Arc::clone(&stats));
+            let (shared, stats, account) =
+                (Arc::clone(&shared), Arc::clone(&stats), Arc::clone(&account));
             match std::thread::Builder::new()
                 .name(format!("needletail-decode-{index}"))
-                .spawn(move || run_worker(&shared, &stats))
+                .spawn(move || run_worker(&shared, &stats, &account))
             {
                 Ok(_) => started += 1,
                 Err(error) => warn!(error = %error, "a decode worker did not start"),
@@ -139,11 +173,15 @@ impl DecodePool {
         }
         info!(workers = started, "RaptorQ decodes run off the tees");
         (started > 0).then(|| {
-            Arc::new(Self {
+            let pool = Arc::new(Self {
                 shared,
                 workers: started,
                 stats,
-            })
+                account,
+            });
+            let weak: std::sync::Weak<dyn Shed> = Arc::downgrade(&pool) as _;
+            av_mesh::mem_guard::register_store(weak);
+            pool
         })
     }
 
@@ -154,15 +192,23 @@ impl DecodePool {
         ctx: DecodedCtx,
         done: &UnboundedSender<DecodeDone>,
     ) -> Result<(), (DecodeJob, DecodedCtx)> {
+        let bytes = 2 * job.bytes() as u64;
+        if self.account.held() + bytes > self.account.limit() {
+            self.stats.inline.fetch_add(1, Ordering::Relaxed);
+            self.stats.inline_bytes_limited.fetch_add(1, Ordering::Relaxed);
+            return Err((job, ctx));
+        }
         let mut queue = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
         if queue.len() >= DECODE_QUEUE {
             self.stats.inline.fetch_add(1, Ordering::Relaxed);
             return Err((job, ctx));
         }
+        self.account.add(bytes);
         queue.push_back(Task {
             job,
             ctx,
             done: done.clone(),
+            bytes,
         });
         self.stats
             .queued_max
@@ -170,6 +216,11 @@ impl DecodePool {
         drop(queue);
         self.shared.ready.notify_one();
         Ok(())
+    }
+
+    /// A tee took a result back: its bytes leave the account.
+    pub fn taken(&self, bytes: u64) {
+        self.account.sub(bytes);
     }
 
     pub fn snapshot(&self) -> DecodePoolSnapshot {
@@ -182,6 +233,9 @@ impl DecodePool {
             decode_us_max: load(&self.stats.decode_us_max),
             inline: load(&self.stats.inline),
             queued_max: load(&self.stats.queued_max),
+            inline_bytes_limited: load(&self.stats.inline_bytes_limited),
+            queue_bytes: self.account.held(),
+            queue_budget_bytes: self.account.budget(),
         }
     }
 }
@@ -207,7 +261,7 @@ pub fn decode(job: &DecodeJob, stats: &DecodePoolStats) -> Option<Vec<u8>> {
     envelope
 }
 
-fn run_worker(shared: &Shared, stats: &DecodePoolStats) {
+fn run_worker(shared: &Shared, stats: &DecodePoolStats, account: &StoreAccount) {
     let _ = super::sys::set_nice(DECODE_NICE);
     loop {
         let task = {
@@ -223,10 +277,15 @@ fn run_worker(shared: &Shared, stats: &DecodePoolStats) {
             }
         };
         let envelope = decode(&task.job, stats);
-        let _ = task.done.send(DecodeDone {
+        if let Err(lost) = task.done.send(DecodeDone {
             job: task.job,
             ctx: task.ctx,
             envelope,
-        });
+            bytes: task.bytes,
+        }) {
+            // Its tee is gone: nobody gives the bytes back but here.
+            drop(lost);
+            account.sub(task.bytes);
+        }
     }
 }

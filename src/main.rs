@@ -1587,6 +1587,21 @@ struct Args {
     #[arg(long, env = "NEEDLETAIL_RELAY_DECODE_WORKERS")]
     relay_decode_workers: Option<usize>,
 
+    /// 4k-repair: the bytes of decoded parts a node keeps to answer its
+    /// children's asks (MB). 48 holds a 4K stream's repair horizon (the 1 s
+    /// deadline) with margin: 1.6 s at 247 Mbit/s, 1.26 s at 320. Counted
+    /// in `/api/node` `memory.part_store_bytes`; the memory guard halves it
+    /// above its soft limit and cuts it to an eighth above its hard limit.
+    #[arg(long, env = "NEEDLETAIL_RELAY_PART_STORE_MB", default_value_t = 48)]
+    relay_part_store_mb: usize,
+
+    /// 4k-repair: the bytes the decode pool's queue and its results not
+    /// yet taken back by their tee may hold (MB); past it a tee decodes
+    /// inline. Counted in `memory.decode_queue_bytes`, limited like the
+    /// part store by the memory guard.
+    #[arg(long, env = "NEEDLETAIL_RELAY_DECODE_QUEUE_MB", default_value_t = 64)]
+    relay_decode_queue_mb: usize,
+
     /// Wave 7 item 5: renditions of one source, `;`-separated groups of
     /// `,`-separated stream ids (the DAW lane's FLAC, Opus and PCM from base
     /// stream 2001 are "2001,3001,4001"). A forwarder sends a rendition of a
@@ -4566,7 +4581,9 @@ async fn main() -> Result<()> {
         decode_pool: fast_plane::decode_pool::DecodePool::start(
             args.relay_decode_workers
                 .unwrap_or_else(fast_plane::decode_pool::default_workers),
+            args.relay_decode_queue_mb.saturating_mul(1 << 20),
         ),
+        small_lane_tee_slice_us: args.reader_slice_us,
         ..Default::default()
     };
     let fec_ingest_task = match (fec_socket, class_sockets) {
@@ -9335,7 +9352,10 @@ fn spawn_memory_guard(cache: Arc<LiveTsCache>, idle_ms: u64) {
             if released > 0 && tick.state != av_mesh::mem_guard::GuardState::Ok {
                 memory.guard.note_shed(released);
             }
-            if tick.trim {
+            // The repair stores (4k-repair: kept parts, the decode queue)
+            // follow the state too, shed here on the guard's own task.
+            let repair_shed = av_mesh::mem_guard::stores_pass(tick.state);
+            if tick.trim || repair_shed >= av_mesh::mem_guard::TRIM_AFTER_RELEASE_BYTES {
                 if let Ok(returned) =
                     tokio::task::spawn_blocking(av_mesh::mem_guard::trim).await
                 {

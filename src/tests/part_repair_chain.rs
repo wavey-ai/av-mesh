@@ -452,6 +452,7 @@ pub(super) async fn chain_node(
                         .ok()
                         .and_then(|value| value.parse().ok())
                         .unwrap_or(1),
+                    fast_plane::decode_pool::DECODE_QUEUE_BYTES,
                 )
             } else {
                 None

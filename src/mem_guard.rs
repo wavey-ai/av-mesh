@@ -386,7 +386,15 @@ impl Guard {
     }
 
     pub fn snapshot(&self, budgets: &Budgets, sockets: &SocketBudget) -> MemorySnapshot {
+        let stores = store_totals();
         MemorySnapshot {
+            part_store_bytes: stores.part_store_bytes,
+            part_store_budget_bytes: stores.part_store_budget_bytes,
+            decode_queue_bytes: stores.decode_queue_bytes,
+            decode_queue_budget_bytes: stores.decode_queue_budget_bytes,
+            repair_plans_bytes: stores.plans_bytes,
+            repair_plans_budget_bytes: stores.plans_budget_bytes,
+            repair_shed_bytes: stores.repair_shed_bytes,
             state: self.state(),
             rss_bytes: self.rss_bytes.load(Ordering::Relaxed),
             rss_peak_bytes: self.rss_peak_bytes.load(Ordering::Relaxed),
@@ -439,6 +447,23 @@ pub struct MemorySnapshot {
     pub socket_asked_bytes: u64,
     /// Socket growths cut short by the budget.
     pub socket_clamped: u64,
+    /// The repair stores (4k-repair): decoded parts kept for children's
+    /// asks, and the decode pool's queue with its results not yet taken;
+    /// their budgets, and the bytes the guard had them shed.
+    #[serde(default)]
+    pub part_store_bytes: u64,
+    #[serde(default)]
+    pub part_store_budget_bytes: u64,
+    #[serde(default)]
+    pub decode_queue_bytes: u64,
+    #[serde(default)]
+    pub decode_queue_budget_bytes: u64,
+    #[serde(default)]
+    pub repair_plans_bytes: u64,
+    #[serde(default)]
+    pub repair_plans_budget_bytes: u64,
+    #[serde(default)]
+    pub repair_shed_bytes: u64,
 }
 
 /// The node's budgets and guard, installed once at start.
@@ -574,6 +599,182 @@ impl SocketBudget {
             }
         }
     }
+}
+
+/// Which repair store an account belongs to (4k-repair).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreKind {
+    /// Decoded parts a node keeps to answer its children's asks.
+    PartStore,
+    /// Decodes queued on the decode pool and their results not yet taken
+    /// back by their tee.
+    DecodeQueue,
+    /// RaptorQ encoding plans the repair thread keeps by K.
+    Plans,
+}
+
+/// The bytes a store of the repair work (4k-repair) holds outside the
+/// chunk cache, its budget, and the limit the guard sets from its state:
+/// the budget while ok, half of it above the soft limit, an eighth above
+/// the hard limit. Each store keeps itself under [`StoreAccount::limit`];
+/// the guard counts them in `/api/node`'s `memory` and has them shed to
+/// their limit on its own task (never on a tee or class thread).
+#[derive(Debug)]
+pub struct StoreAccount {
+    kind: StoreKind,
+    held: AtomicU64,
+    budget: AtomicU64,
+    limit: AtomicU64,
+    shed: AtomicU64,
+}
+
+impl StoreAccount {
+    pub fn new(kind: StoreKind, budget_bytes: u64) -> Self {
+        Self {
+            kind,
+            held: AtomicU64::new(0),
+            budget: AtomicU64::new(budget_bytes),
+            limit: AtomicU64::new(budget_bytes),
+            shed: AtomicU64::new(0),
+        }
+    }
+
+    pub fn kind(&self) -> StoreKind {
+        self.kind
+    }
+
+    pub fn held(&self) -> u64 {
+        self.held.load(Ordering::Relaxed)
+    }
+
+    pub fn budget(&self) -> u64 {
+        self.budget.load(Ordering::Relaxed)
+    }
+
+    /// What the store may hold now.
+    pub fn limit(&self) -> u64 {
+        self.limit.load(Ordering::Relaxed)
+    }
+
+    pub fn shed_bytes(&self) -> u64 {
+        self.shed.load(Ordering::Relaxed)
+    }
+
+    pub fn add(&self, bytes: u64) {
+        self.held.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn sub(&self, bytes: u64) {
+        let _ = self
+            .held
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                Some(held.saturating_sub(bytes))
+            });
+    }
+
+    /// Set the limit from the guard's state.
+    pub fn apply(&self, state: GuardState) {
+        let budget = self.budget();
+        self.limit.store(
+            match state {
+                GuardState::Ok => budget,
+                GuardState::Soft => budget / 2,
+                GuardState::Hard => budget / 8,
+            },
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn note_shed(&self, bytes: u64) {
+        self.shed.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+/// A repair store the guard sheds: it gives up what it holds above its
+/// account's limit and says how much that was.
+pub trait Shed: Send + Sync {
+    fn account(&self) -> &StoreAccount;
+    fn shed_to_limit(&self) -> u64;
+}
+
+/// A store that its owner keeps under the limit itself (the repair
+/// thread's plans: evicted at its next plan): the guard counts it and sets
+/// its limit.
+impl Shed for StoreAccount {
+    fn account(&self) -> &StoreAccount {
+        self
+    }
+
+    fn shed_to_limit(&self) -> u64 {
+        0
+    }
+}
+
+static STORES: std::sync::Mutex<Vec<std::sync::Weak<dyn Shed>>> = std::sync::Mutex::new(Vec::new());
+
+/// Count a repair store in the guard's account (held weakly: a store that
+/// is dropped leaves it).
+pub fn register_store(store: std::sync::Weak<dyn Shed>) {
+    let mut stores = STORES.lock().unwrap_or_else(|e| e.into_inner());
+    stores.retain(|store| store.strong_count() > 0);
+    stores.push(store);
+}
+
+fn live_stores() -> Vec<Arc<dyn Shed>> {
+    let mut stores = STORES.lock().unwrap_or_else(|e| e.into_inner());
+    stores.retain(|store| store.strong_count() > 0);
+    stores.iter().filter_map(std::sync::Weak::upgrade).collect()
+}
+
+/// The guard's pass over the repair stores (its own task): each store's
+/// limit follows `state`, and what a store holds above it is shed now.
+/// Returns the bytes shed.
+pub fn stores_pass(state: GuardState) -> u64 {
+    let mut shed = 0;
+    for store in live_stores() {
+        store.account().apply(state);
+        let released = store.shed_to_limit();
+        if released > 0 {
+            store.account().note_shed(released);
+            shed += released;
+        }
+    }
+    shed
+}
+
+/// The repair stores' bytes held, budgets and bytes shed, by kind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoreTotals {
+    pub part_store_bytes: u64,
+    pub part_store_budget_bytes: u64,
+    pub decode_queue_bytes: u64,
+    pub decode_queue_budget_bytes: u64,
+    pub plans_bytes: u64,
+    pub plans_budget_bytes: u64,
+    pub repair_shed_bytes: u64,
+}
+
+pub fn store_totals() -> StoreTotals {
+    let mut totals = StoreTotals::default();
+    for store in live_stores() {
+        let account = store.account();
+        match account.kind() {
+            StoreKind::PartStore => {
+                totals.part_store_bytes += account.held();
+                totals.part_store_budget_bytes += account.budget();
+            }
+            StoreKind::DecodeQueue => {
+                totals.decode_queue_bytes += account.held();
+                totals.decode_queue_budget_bytes += account.budget();
+            }
+            StoreKind::Plans => {
+                totals.plans_bytes += account.held();
+                totals.plans_budget_bytes += account.budget();
+            }
+        }
+        totals.repair_shed_bytes += account.shed_bytes();
+    }
+    totals
 }
 
 /// The node's socket budget, set once at start (`--socket-buffer-mb`).

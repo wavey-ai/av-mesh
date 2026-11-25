@@ -2001,6 +2001,15 @@ impl DecodeJob {
         self.k
     }
 
+    /// The bytes the job holds: its sources, its repair symbols and its
+    /// table of which sources came.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.sources.capacity()
+            + self.have.capacity()
+            + self.repairs.iter().map(Vec::capacity).sum::<usize>()
+    }
+
     /// The source symbols this node lacked (and the decode regenerates).
     #[must_use]
     pub fn missing_sources(&self) -> Vec<u32> {
