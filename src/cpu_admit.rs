@@ -514,9 +514,10 @@ impl CpuAdmit {
             state.samples.pop_front();
         }
         let verdict = self.judge(&state, &threads);
-        if let Some(verdict) = verdict {
-            if verdict.datagram_ns > 0 {
-                state.last_cost = Some(verdict.datagram_ns);
+        if let Some((verdict, measured)) = verdict {
+            // Only a measured cost (never the floor) ends the cold cap.
+            if let Some(measured) = measured {
+                state.last_cost = Some(measured);
             }
             if verdict.permille >= 1_000 {
                 state.over_since.get_or_insert(now);
@@ -542,7 +543,9 @@ impl CpuAdmit {
         }
     }
 
-    fn judge(&self, state: &State, threads: &[TrackedThread]) -> Option<CpuVerdict> {
+    /// The verdict over the window, and the cost of a datagram measured in
+    /// it (`None`: too few sends to tell).
+    fn judge(&self, state: &State, threads: &[TrackedThread]) -> Option<(CpuVerdict, Option<u64>)> {
         let first = state.samples.front()?;
         let last = state.samples.back()?;
         let wall_ns = last.at.saturating_duration_since(first.at).as_nanos() as u64;
@@ -602,15 +605,18 @@ impl CpuAdmit {
         } else {
             u64::MAX
         };
-        Some(CpuVerdict {
-            permille,
-            term,
-            cpus_busy_permille,
-            cpus: cpus as u32,
-            threads: busy,
-            datagram_ns,
-            capacity_ns: cpus_capacity.min(threads_capacity),
-        })
+        Some((
+            CpuVerdict {
+                permille,
+                term,
+                cpus_busy_permille,
+                cpus: cpus as u32,
+                threads: busy,
+                datagram_ns,
+                capacity_ns: cpus_capacity.min(threads_capacity),
+            },
+            measured,
+        ))
     }
 
     pub(crate) fn verdict(&self) -> CpuVerdict {
@@ -1075,6 +1081,7 @@ mod tests {
         // As if the thread had been busy 0.6 s of the 0.5 s: over its 70 %.
         busy_ns.store(600_000_000, Ordering::Relaxed);
         admit.sample();
+        assert_eq!(admit.state.lock().unwrap().last_cost, None, "the floor is not a measurement");
         let verdict = admit.verdict();
         assert_eq!(verdict.term, "spinner", "{verdict:?}");
         assert!(verdict.permille >= 1_000, "{verdict:?}");
