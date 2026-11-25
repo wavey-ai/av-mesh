@@ -884,34 +884,34 @@ pub(crate) struct CpuAdmitArgs {
     /// rm/cpuadmit: an edge's load counts the busiest of its CPUs (with the
     /// sends' softirq) and its send threads, sampled off the class threads;
     /// at full a new leg is refused `edge-busy` and the entry spills it.
-    #[arg(long = "cpu-admit", env = "NEEDLETAIL_CPU_ADMIT", default_value_t = true, action = clap::ArgAction::Set)]
+    #[arg(id = "cpu_admit", long = "cpu-admit", env = "NEEDLETAIL_CPU_ADMIT", default_value_t = true, action = clap::ArgAction::Set)]
     pub(crate) enabled: bool,
     /// The node's CPUs' mean busy percent at which the term is full.
-    #[arg(long = "cpu-admit-cpus-full-percent", default_value_t = DEFAULT_CPUS_FULL_PERCENT,
+    #[arg(id = "cpu_admit_cpus_full_percent", long = "cpu-admit-cpus-full-percent", default_value_t = DEFAULT_CPUS_FULL_PERCENT,
           value_parser = clap::value_parser!(u32).range(1..=100))]
     pub(crate) cpus_full_percent: u32,
     /// A send thread's busy percent of one core at which the term is full.
-    #[arg(long = "cpu-admit-thread-full-percent", default_value_t = DEFAULT_THREAD_FULL_PERCENT,
+    #[arg(id = "cpu_admit_thread_full_percent", long = "cpu-admit-thread-full-percent", default_value_t = DEFAULT_THREAD_FULL_PERCENT,
           value_parser = clap::value_parser!(u32).range(1..=100))]
     pub(crate) thread_full_percent: u32,
-    #[arg(long = "cpu-admit-window-ms", default_value_t = DEFAULT_WINDOW_MS)]
+    #[arg(id = "cpu_admit_window_ms", long = "cpu-admit-window-ms", default_value_t = DEFAULT_WINDOW_MS)]
     pub(crate) window_ms: u64,
-    #[arg(long = "cpu-admit-sample-ms", default_value_t = DEFAULT_SAMPLE_MS)]
+    #[arg(id = "cpu_admit_sample_ms", long = "cpu-admit-sample-ms", default_value_t = DEFAULT_SAMPLE_MS)]
     pub(crate) sample_ms: u64,
     /// A client datagram costs the send threads at least this (ns): the
     /// floor of a leg's charge before the edge has measured its own.
-    #[arg(long = "cpu-admit-datagram-ns", default_value_t = DEFAULT_DATAGRAM_NS)]
+    #[arg(id = "cpu_admit_datagram_ns", long = "cpu-admit-datagram-ns", default_value_t = DEFAULT_DATAGRAM_NS)]
     pub(crate) datagram_ns: u64,
     /// The legs admitted since the last samples may add at most this
     /// (thousandths of full): a burst of joins waits for the samples.
-    #[arg(long = "cpu-admit-pending-max-permille", default_value_t = DEFAULT_PENDING_MAX_PERMILLE)]
+    #[arg(id = "cpu_admit_pending_max_permille", long = "cpu-admit-pending-max-permille", default_value_t = DEFAULT_PENDING_MAX_PERMILLE)]
     pub(crate) pending_max_permille: u32,
     /// Over full this long, the edge asks two-leg listeners to give up
     /// their leg here (`MOVE shed`); 0: never.
-    #[arg(long = "cpu-admit-shed-after-ms", default_value_t = DEFAULT_SHED_AFTER_MS)]
+    #[arg(id = "cpu_admit_shed_after_ms", long = "cpu-admit-shed-after-ms", default_value_t = DEFAULT_SHED_AFTER_MS)]
     pub(crate) shed_after_ms: u64,
     /// The node's CPUs (`0,1`); empty: the process's affinity.
-    #[arg(long = "cpu-admit-cpus", default_value = "", value_parser = parse_cpu_list)]
+    #[arg(id = "cpu_admit_cpus", long = "cpu-admit-cpus", default_value = "", value_parser = parse_cpu_list)]
     pub(crate) cpus: CpuList,
 }
 
