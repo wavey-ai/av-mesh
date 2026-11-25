@@ -584,6 +584,11 @@ async fn a_forwarder_keeps_a_stalled_child_s_symbols_in_order() {
             tee_capacity: 4_096,
             video_gso: true,
             send_defer: DeferConfig::new(200, 8 << 20),
+            // Integration 6: every upstream symbol is forwarded, as the
+            // headline renders it (--relay-trim-forwarded-repair false);
+            // with the repair integration's trim the children would get
+            // only the repair the part lacks here.
+            trim_forwarded_repair: false,
             ..Default::default()
         },
     )
