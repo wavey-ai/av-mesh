@@ -235,6 +235,25 @@ pub struct Counters {
     /// Legs failed because no media came for a second while their edge
     /// said the stream went on (stuck4k).
     pub stalled_legs: u64,
+    /// New source sessions the listeners took after their first (cmpd8:
+    /// absent from the client report before), booked on the home edge.
+    pub session_restarts: u64,
+    /// Place240 rules 3 and 4, on the home edge: lone legs judged late or
+    /// missing parts, the edges' distress hints heard, and the moves not
+    /// made (the new edge no better, over the minute's budget, a
+    /// replacement given up, a hint of one leg beside a delivering one).
+    /// The moves made are `moves_by_reason` (`late-parts`,
+    /// `missing-parts`, `distress-*`).
+    pub degraded_late: u64,
+    pub degraded_missing: u64,
+    pub distress_hints: u64,
+    pub quality_no_better: u64,
+    pub quality_over_budget: u64,
+    pub quality_given_up: u64,
+    pub distress_ignored: u64,
+    /// Each new part's lateness (arrival less publication, less the path's
+    /// least over 10 s), µs, on the edge of the leg that brought it.
+    pub lateness: Histogram,
     /// Fix 4 (F5): a listener's part numbers jumped ahead past its tracked
     /// window (an outage of the source, a wide hole): each jump once, and
     /// the parts it passed over, which are not counted as `missing`.
@@ -367,6 +386,15 @@ impl Counters {
         self.generation_returns += other.generation_returns;
         self.refusing_legs += other.refusing_legs;
         self.stalled_legs += other.stalled_legs;
+        self.session_restarts += other.session_restarts;
+        self.degraded_late += other.degraded_late;
+        self.degraded_missing += other.degraded_missing;
+        self.distress_hints += other.distress_hints;
+        self.quality_no_better += other.quality_no_better;
+        self.quality_over_budget += other.quality_over_budget;
+        self.quality_given_up += other.quality_given_up;
+        self.distress_ignored += other.distress_ignored;
+        self.lateness.merge(&other.lateness);
         self.jumps += other.jumps;
         self.jump_parts += other.jump_parts;
         self.first_parts += other.first_parts;
@@ -466,6 +494,17 @@ impl Counters {
             "generation_returns": self.generation_returns,
             "refusing_legs": self.refusing_legs,
             "stalled_legs": self.stalled_legs,
+            "session_restarts": self.session_restarts,
+            "quality": {
+                "degraded_late": self.degraded_late,
+                "degraded_missing": self.degraded_missing,
+                "distress_hints": self.distress_hints,
+                "no_better": self.quality_no_better,
+                "over_budget": self.quality_over_budget,
+                "given_up": self.quality_given_up,
+                "distress_ignored": self.distress_ignored,
+            },
+            "lateness_ms": self.lateness.summary_with_buckets(),
             "jumps": self.jumps,
             "jump_parts": self.jump_parts,
             "first_parts": self.first_parts,
@@ -1404,6 +1443,8 @@ struct Listener {
     ever_interrupted: bool,
     /// Its longest silence (µs) and when it ended (Unix µs).
     longest_silence: (u64, u64),
+    /// Place240: its counts booked so far ([`quality_marks`]).
+    quality_booked: [u64; 8],
     /// Time on one path (B 2.8): it has had two delivering legs, until when
     /// two legs delivered (the second newest leg media + the window, µs),
     /// the start of the open span on fewer, and the spans ended so far (µs,
@@ -2091,6 +2132,9 @@ fn handle_datagram(
             ) {
                 Mark::New => {
                     counters[edge].parts += 1;
+                    if let Some(late) = listener.session.last_lateness_us {
+                        counters[edge].lateness.record(late);
+                    }
                     if object.published_unix_us > 0 {
                         counters[edge]
                             .latency
@@ -2227,7 +2271,39 @@ fn service(
             .director
             .poll(&mut listener.session, now, &mut drive.actions);
     }
+    let quality_after = quality_marks(listener);
+    let quality_before = std::mem::replace(&mut listener.quality_booked, quality_after);
+    if quality_after != quality_before {
+        ensure(counters, listener.home);
+        let home = &mut counters[listener.home];
+        let delta = |at: usize| quality_after[at].saturating_sub(quality_before[at]);
+        home.session_restarts += delta(0);
+        home.degraded_late += delta(1);
+        home.degraded_missing += delta(2);
+        home.distress_hints += delta(3);
+        home.quality_no_better += delta(4);
+        home.quality_over_budget += delta(5);
+        home.quality_given_up += delta(6);
+        home.distress_ignored += delta(7);
+    }
     drive.perform(listener, slot, counters, now);
+}
+
+/// A listener's place240 counts (cumulative): session restarts, lone legs
+/// late and missing, distress hints, and the moves not made.
+fn quality_marks(listener: &Listener) -> [u64; 8] {
+    let session = &listener.session;
+    let quality = &listener.director.stats.quality;
+    [
+        session.receiver.flows.saturating_sub(1),
+        session.degraded_late,
+        session.degraded_missing,
+        session.distress_hints,
+        quality.no_better,
+        quality.over_budget,
+        quality.given_up,
+        quality.distress_ignored,
+    ]
 }
 
 /// A listener's counters since the last interval into its home edge's (its
@@ -2518,6 +2594,7 @@ impl Listener {
             interrupted_now: false,
             ever_interrupted: false,
             longest_silence: (0, 0),
+            quality_booked: [0; 8],
             two_paths_seen: false,
             two_until_us: 0,
             single_since_us: None,

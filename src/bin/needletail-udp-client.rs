@@ -766,6 +766,71 @@ struct LegFigures {
     before_start: u64,
     /// Its datagrams of a generation that the receiver refused.
     stale_generation: u64,
+    /// Place240: the lateness of the parts it delivered (arrival less
+    /// publication, less the path's least over 10 s), ms.
+    lateness_ms: LatenessFigures,
+}
+
+/// A leg's lateness, ms (the upper edges of power-of-two buckets; `max`
+/// exact).
+#[derive(Debug, Default, Serialize)]
+struct LatenessFigures {
+    parts: u64,
+    p50: Option<u64>,
+    p95: Option<u64>,
+    p99: Option<u64>,
+    max: Option<f64>,
+}
+
+impl From<&av_mesh::client_quality::LatenessHistogram> for LatenessFigures {
+    fn from(histogram: &av_mesh::client_quality::LatenessHistogram) -> Self {
+        Self {
+            parts: histogram.count,
+            p50: histogram.quantile_ms(0.5),
+            p95: histogram.quantile_ms(0.95),
+            p99: histogram.quantile_ms(0.99),
+            max: (histogram.count > 0).then(|| histogram.max_us as f64 / 1_000.0),
+        }
+    }
+}
+
+/// Place240: the listener's own moves by reason and those it did not make,
+/// and the lone legs judged late or missing parts.
+#[derive(Debug, Default, Serialize)]
+struct QualityReport {
+    moves: BTreeMap<&'static str, u64>,
+    no_better: u64,
+    over_budget: u64,
+    given_up: u64,
+    distress_hints: u64,
+    distress_ignored: u64,
+    degraded_late: u64,
+    degraded_missing: u64,
+    parts_late: u64,
+    parts_missing: u64,
+}
+
+impl QualityReport {
+    fn of(moves: &av_mesh::client_director::QualityMoves, session: &UdpSession) -> Self {
+        Self {
+            moves: [
+                ("late-parts", moves.late_parts),
+                ("missing-parts", moves.missing_parts),
+                ("distress", moves.distress),
+            ]
+            .into_iter()
+            .collect(),
+            no_better: moves.no_better,
+            over_budget: moves.over_budget,
+            given_up: moves.given_up,
+            distress_hints: session.distress_hints,
+            distress_ignored: moves.distress_ignored,
+            degraded_late: session.degraded_late,
+            degraded_missing: session.degraded_missing,
+            parts_late: session.quality.late_total,
+            parts_missing: session.quality.missing_total,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -809,6 +874,8 @@ fn ms_of(duration: Duration) -> f64 {
 /// lags.
 fn leg_figures(logs: &[LegLog], nodes: &Nodes) -> BTreeMap<String, LegFigures> {
     let mut figures: BTreeMap<String, LegFigures> = BTreeMap::new();
+    let mut lateness: BTreeMap<String, av_mesh::client_quality::LatenessHistogram> =
+        BTreeMap::new();
     for log in logs {
         let entry = figures.entry(log.node.clone()).or_default();
         entry.legs += 1;
@@ -829,6 +896,15 @@ fn leg_figures(logs: &[LegLog], nodes: &Nodes) -> BTreeMap<String, LegFigures> {
         entry.rtt_ms = report.rtt.map(ms_of).or(entry.rtt_ms);
         entry.longest_gap_ms = entry.longest_gap_ms.max(ms_of(report.longest_gap));
         entry.plan = Some(report.plan.word());
+        lateness
+            .entry(log.node.clone())
+            .or_insert_with(av_mesh::client_quality::LatenessHistogram::default)
+            .merge(&report.lateness);
+    }
+    for (node, histogram) in &lateness {
+        if let Some(entry) = figures.get_mut(node) {
+            entry.lateness_ms = histogram.into();
+        }
     }
     for (node, histogram) in nodes.names.iter().zip(&nodes.lags) {
         if let Some(entry) = figures.get_mut(node) {
@@ -1025,6 +1101,12 @@ struct Report {
     /// Legs failed because no media came for a second while their edge
     /// said the stream went on (stuck4k).
     stalled_legs: u64,
+    /// New source sessions the client took after its first (cmpd8: the
+    /// field the edge counts was absent here): the receiver's flows less
+    /// one.
+    session_restarts: u64,
+    /// Place240 rules 3 and 4.
+    quality: QualityReport,
     /// Fix 4 (F5): jumps of the part numbers past the receiver's window
     /// (an outage of the source), `[from, to]` the parts either side, and
     /// the parts they passed over: one gap each, neither expected nor
@@ -2142,6 +2224,8 @@ async fn main() -> Result<()> {
         generation_returns: stats.generation_returns,
         refusing_legs: session.refusing_legs,
         stalled_legs: session.stalled_legs,
+        session_restarts: receiver.flows.saturating_sub(1),
+        quality: QualityReport::of(&director.stats.quality, &session),
         jumps: accounted.jumps,
         jump_parts: accounted.jump_parts,
         output,

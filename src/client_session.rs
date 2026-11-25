@@ -594,6 +594,8 @@ pub struct UdpSession {
     pub degraded_late: u64,
     pub degraded_missing: u64,
     pub distress_hints: u64,
+    /// The lateness of the last part [`Self::next_object`] gave, µs.
+    pub last_lateness_us: Option<u64>,
 }
 
 /// A released leg's second `UNSUB` goes this long after the first.
@@ -685,6 +687,7 @@ impl UdpSession {
             degraded_late: 0,
             degraded_missing: 0,
             distress_hints: 0,
+            last_lateness_us: None,
         }
     }
 
@@ -1417,6 +1420,7 @@ impl UdpSession {
             self.quality_flows = self.receiver.flows;
             self.quality.new_flow();
         }
+        self.last_lateness_us = None;
         let Some((index, at)) = self.media_from else {
             return;
         };
@@ -1428,6 +1432,7 @@ impl UdpSession {
                 let late = self
                     .quality
                     .on_part(object.part, object.published_unix_us, arrival_us, at);
+                self.last_lateness_us = late;
                 if let (Some(late), Some(leg)) = (late, self.legs[index].as_mut()) {
                     leg.lateness.record(late);
                 }
