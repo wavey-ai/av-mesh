@@ -274,7 +274,7 @@ pub(super) fn tee_4k(options: TeeOptions) -> TeeRun {
         .enable_all()
         .build()
         .unwrap();
-    let (relay, sockets) = rt.block_on(async {
+    let (mut relay, sockets) = rt.block_on(async {
         tokio::spawn(async move {
             let mut sockets = Vec::new();
             for _ in 0..options.children {
@@ -433,8 +433,24 @@ pub(super) fn tee_4k(options: TeeOptions) -> TeeRun {
             })
         })
     };
-    let fd = relay.secondary_sender.as_raw_fd();
+    // The source is another host (teeperf): its socket off the node
+    // runtime's reactor, whose writable edges at 25,000 sends a second
+    // woke the runtime's workers (VT_SOURCE_ON_NODE=1: as before).
+    let source_socket = if env_u64("VT_SOURCE_ON_NODE", 0) == 1 {
+        None
+    } else {
+        let placeholder = rt.block_on(UdpSocket::bind("127.0.0.1:0")).unwrap();
+        let socket = std::mem::replace(&mut relay.secondary_sender, placeholder);
+        let _guard = rt.enter();
+        Some(socket.into_std().unwrap())
+    };
+    let fd = source_socket
+        .as_ref()
+        .map_or_else(|| relay.secondary_sender.as_raw_fd(), AsRawFd::as_raw_fd);
     let _ = SockRef::from(&relay.secondary_sender).set_send_buffer_size(32 << 20);
+    if let Some(socket) = &source_socket {
+        let _ = SockRef::from(socket).set_send_buffer_size(32 << 20);
+    }
     let target = relay.secondary_video.unwrap();
     let start = Instant::now() + Duration::from_millis(50);
     let node_threads = ["needletail-fast"];
@@ -471,7 +487,12 @@ pub(super) fn tee_4k(options: TeeOptions) -> TeeRun {
         std::thread::sleep(from.saturating_duration_since(Instant::now()));
         measuring.store(true, Ordering::Relaxed);
         let stats = relay.stats();
-        let faults_before = threads_minor_faults(&tee_threads);
+        let faults_before = (
+            threads_minor_faults(&["nt-tee-video"]),
+            threads_minor_faults(&["vtee-rt"]),
+            threads_cpu_ns(&["nt-tee-video"]),
+            threads_cpu_ns(&["vtee-rt"]),
+        );
         let before = (
             threads_cpu_ns(&node_threads),
             threads_cpu_ns(&tee_threads),
@@ -486,9 +507,15 @@ pub(super) fn tee_4k(options: TeeOptions) -> TeeRun {
             Instant::now(),
             stats.video_received,
         );
+        let window_s = Instant::now().duration_since(before.2).as_secs_f64();
         println!(
-            "  tee threads' minor faults: {} over the window",
-            threads_minor_faults(&tee_threads).saturating_sub(faults_before)
+            "  apart: the video tee thread (nt-tee-video) {:.1} % of a CPU, {} minor faults; \
+             the node runtime's workers (vtee-rt: housekeeping, ticks) {:.1} %, {} minor faults",
+            threads_cpu_ns(&["nt-tee-video"]).saturating_sub(faults_before.2) as f64 / 1e7
+                / window_s,
+            threads_minor_faults(&["nt-tee-video"]).saturating_sub(faults_before.0),
+            threads_cpu_ns(&["vtee-rt"]).saturating_sub(faults_before.3) as f64 / 1e7 / window_s,
+            threads_minor_faults(&["vtee-rt"]).saturating_sub(faults_before.1),
         );
         measuring.store(false, Ordering::Relaxed);
         source.join().unwrap();
