@@ -1262,7 +1262,15 @@ async fn heavy_viewers_spread_and_move_off_a_stalled_edge() {
     assert_eq!(sorted, vec![1, 1, 2], "spread by committed cost");
     let throttled = format!("edge-{}", stalled + 1);
     for figure in &after {
-        if figure.first.as_deref() == Some(throttled.as_str()) {
+        // The edge it was placed on: its first move's origin, else its first
+        // live leg (integration 6: a viewer of the throttled edge can move
+        // before the test's 20 ms poll has seen that leg live).
+        let placed_on = figure
+            .moves
+            .first()
+            .map(|(from, ..)| from.as_str())
+            .or(figure.first.as_deref());
+        if placed_on == Some(throttled.as_str()) {
             assert_eq!(figure.moves.len(), 1, "{figure:?}");
             let (from, to, reason, at_ms) = &figure.moves[0];
             assert_eq!((from.as_str(), reason.as_str()), (throttled.as_str(), "late-parts"));
