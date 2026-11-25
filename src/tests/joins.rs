@@ -370,7 +370,10 @@ async fn join_at(lane: Lane, offset_ms: i64) -> Result<String, String> {
     if longest > BOUND {
         problems.push(format!("silent {} ms after the new session came", longest.as_millis()));
     }
-    let new: Vec<u64> = run.parts[first_new..].iter().map(|(part, ..)| *part).collect();
+    // Every part once, in any order (a part repaired by NACK comes after
+    // later ones).
+    let mut new: Vec<u64> = run.parts[first_new..].iter().map(|(part, ..)| *part).collect();
+    new.sort_unstable();
     let start = new[0];
     let last = *new.iter().max().unwrap();
     if new != (start..=last).collect::<Vec<_>>() || last + 1 < new_parts {

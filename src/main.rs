@@ -14248,14 +14248,17 @@ impl LiveState {
     /// Arrival here says nothing of it (joins: a warm copy of a stopped
     /// source's last parts arrives a moment ago); a part without a
     /// publication stamp is judged by its arrival here, as before. A part
-    /// the node has no record of is live.
+    /// the node has no record of is not live.
     fn part_source_live(&self, stream_id: u64, part: u64, now_us: u64, within_us: u64) -> bool {
+        // Not recorded yet (the cache mesh writes a part before it records
+        // it): not live until its record says so (local proof 3 rerun: a
+        // probe was admitted at a warm copy's part in that moment).
         let Some(record) = self
             .stream_parts
             .get(&stream_id)
             .and_then(|parts| parts.get(&part))
         else {
-            return true;
+            return false;
         };
         let limit = within_us.max(self.stream_part_target_us(stream_id).saturating_mul(4));
         let at = record.published_unix_us.unwrap_or(record.available_unix_us);

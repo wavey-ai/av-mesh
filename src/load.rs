@@ -3631,6 +3631,7 @@ pub fn run(config: LoadConfig, on_interval: &mut dyn FnMut(&Value)) -> std::io::
             "short_header_dropped": counters.short_header_dropped,
             "latency_ms": counters.latency.summary_with_buckets(),
             "ttfp_ms": counters.ttfp.summary_with_buckets(),
+            "session_join_ms": counters.session_join.summary_with_buckets(),
             "ttok_ms": counters.ttok.summary_with_buckets(),
             "recv_lag_ms": counters.recv_lag.summary_with_buckets(),
         });
