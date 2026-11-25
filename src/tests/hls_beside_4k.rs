@@ -170,6 +170,13 @@ fn deploy_nice(name: &str) -> Option<i32> {
         Some(fast_plane::edge_clients::DEFAULT_FANOUT_NICE)
     } else if name.starts_with("needletail-http") {
         Some(reader_nice_in_deploy())
+    } else if name.starts_with("nt-tee-audio") || name.starts_with("needletail-rep") {
+        // Since 4k-repair each lane's tee is a thread of its own: the
+        // small-part lane's at nice 0, as the repair thread.
+        Some(0)
+    } else if name.starts_with("nt-tee-video") || name.starts_with("needletail-dec") {
+        // The large-part lane's tee and the decode pool: nice 10.
+        Some(10)
     } else if ["edge-rt", "cache-mesh", "needletail-cut", "nt-window", "needletail-tee"]
         .iter()
         .any(|prefix| name.starts_with(prefix))
@@ -242,7 +249,16 @@ fn place_node_threads(node: [usize; 2]) {
         if !name.starts_with("needletail-fast") {
             pin(tid, &node);
         }
-        if !name.starts_with("needletail-http") {
+        if name.starts_with("nt-tee-audio") {
+            // The deploy gives the small-part lane's tee the readers'
+            // slice (--reader-slice-us), so that it keeps its precedence.
+            // (HB_TEE_SLICE_US to try another: 1,500 is the guest's.)
+            let slice = env_u64("HB_TEE_SLICE_US", reader_slice_us());
+            set_slice_of(tid, match slice {
+                0 => guest_slice_us(),
+                slice => slice,
+            });
+        } else if !name.starts_with("needletail-http") {
             set_slice_of(tid, guest_slice_us());
         }
     }
