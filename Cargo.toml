@@ -38,7 +38,7 @@ linode = { git = "https://github.com/wavey-ai/linode.git", rev = "df7374666fa153
 message-packetizer = "0.1.0"
 media-object = "0.1.1"
 media-capability = "0.1.1"
-playlists = { git = "https://github.com/wavey-ai/playlists.git", rev = "da3a677e4598f40a4fdab231c24e4d1d73eb1f00", features = ["mesh", "compact-object"] }
+playlists = { git = "https://github.com/wavey-ai/playlists.git", rev = "68f235be997e34b06d4cf1b97a33e1742022cb9c", features = ["mesh", "compact-object"] }
 raptorq = "2.0.1"
 raptorq-datagram-fec = "0.1.6"
 raptorq-fec-transport = "0.1.4"

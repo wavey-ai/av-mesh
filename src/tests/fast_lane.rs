@@ -259,7 +259,7 @@ pub(super) struct LaneEdge {
     pub(super) stats: Arc<edge_udp::EdgeUdpStats>,
     /// The edge's router, for its lifecycle (a drain).
     pub(super) router: AppRouter,
-    holes: Option<Arc<edge_holes::HoleTrigger>>,
+    pub(super) holes: Option<Arc<edge_holes::HoleTrigger>>,
     shutdown_tx: watch::Sender<()>,
     ingest: tokio::task::JoinHandle<Result<()>>,
     udp: tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -297,6 +297,7 @@ impl LaneEdge {
             send_twins,
             |_| {},
             |router| router,
+            Duration::from_secs(5),
         )
         .await
     }
@@ -324,6 +325,7 @@ impl LaneEdge {
             send_twins,
             configure,
             |router| router,
+            Duration::from_secs(5),
         )
         .await
     }
@@ -345,6 +347,48 @@ impl LaneEdge {
             true,
             |_| {},
             configure,
+            Duration::from_secs(5),
+        )
+        .await
+    }
+
+    /// send240 (C): an edge that finds its holes by part distance, its
+    /// class threads configured by `configure_class`.
+    pub(super) async fn start_with_holes(
+        ip: Ipv4Addr,
+        hole_distance: Duration,
+        configure_class: impl FnOnce(&mut RelayClassConfig),
+    ) -> Self {
+        Self::start_full(
+            ip,
+            SocketAddr::from((ip, 0)),
+            hole_distance,
+            64,
+            true,
+            configure_class,
+            |router| router,
+            Duration::from_secs(5),
+        )
+        .await
+    }
+
+    /// send240: an edge as a node runs it, its cache-fed lane skipping a
+    /// part past `playout` (the node's 500 ms), the class threads
+    /// configured by `configure_class`.
+    pub(super) async fn start_with_playout(
+        ip: Ipv4Addr,
+        playout: Duration,
+        configure_class: impl FnOnce(&mut RelayClassConfig),
+    ) -> Self {
+        Self::start_full(
+            ip,
+            SocketAddr::from((ip, 0)),
+            Duration::ZERO,
+            64,
+            true,
+            configure_class,
+            |router| router,
+            playout,
         )
         .await
     }
@@ -358,6 +402,7 @@ impl LaneEdge {
         send_twins: bool,
         configure_class: impl FnOnce(&mut RelayClassConfig),
         configure: impl FnOnce(AppRouter) -> AppRouter,
+        playout: Duration,
     ) -> Self {
         let (ports, sockets) = bind_edge_class_ports(ip);
         let forwarders = [
@@ -432,8 +477,9 @@ impl LaneEdge {
         // The edge's counters are its router's, as a node's are.
         let stats = Arc::clone(&router.edge_udp_stats);
         let mut config = edge_udp::EdgeUdpConfig::with_defaults(1_200, max_subscribers);
-        // A host stall must not make the cache-fed lane skip a part it owes.
-        config.playout = Duration::from_secs(5);
+        // A host stall must not make the cache-fed lane skip a part it owes
+        // (5 s, unless the test runs the node's own).
+        config.playout = playout;
         let udp = tokio::spawn(edge_udp::run_edge_udp(
             client_sockets,
             router.clone(),

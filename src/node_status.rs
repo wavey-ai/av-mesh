@@ -400,6 +400,14 @@ pub struct NodeStatus {
     /// sheds, trims and the sockets' budget (memory round, 24 Nov).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<av_mesh::mem_guard::MemorySnapshot>,
+    /// send240 (C): an edge's pulls over the cache mesh: holes found and
+    /// asked, those not asked (shed here, lane lagging, budget), the budget
+    /// and the bytes a second charged to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pulls: Option<crate::pull_gate::PullSnapshot>,
+    /// send240 (B): the heavy send sockets' pacing (`--send-pacing`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_pacing: Option<crate::fast_plane::send_pacing::SendPacingSnapshot>,
 }
 
 /// The reasons a node drains, as `ReadinessInputs` takes them.
@@ -1458,6 +1466,8 @@ mod tests {
                 check: Some(serde_json::json!({"seconds": 60, "stops_over_20ms": 0})),
             }),
             memory: None,
+            pulls: None,
+            send_pacing: None,
         };
         let json = serde_json::to_string_pretty(&status).unwrap() + "\n";
         let golden = include_str!("tests/node_status.json");

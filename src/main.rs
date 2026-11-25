@@ -14,6 +14,7 @@ mod lifecycle;
 mod link_telemetry;
 mod node_status;
 mod node_warm;
+mod pull_gate;
 
 use anyhow::{anyhow, bail, Context, Result};
 use assignment::{
@@ -2560,6 +2561,38 @@ struct Args {
     #[arg(long, env = "NEEDLETAIL_SOCKET_BUFFER_MB", default_value = "auto")]
     socket_buffer_mb: av_mesh::mem_guard::MemSetting,
 
+    /// send240, A: the video class thread keeps what a full socket refused,
+    /// for each edge client and each child, and sends it first when the
+    /// socket takes datagrams again. A part's datagrams are kept at most
+    /// this long; what is still unsent then is handed to the cache-fed lane
+    /// as the symbols the client lacks (a child's repair covers its own).
+    /// 0: off (a refused symbol gives its part back, as before).
+    #[arg(long, env = "NEEDLETAIL_SEND_DEFER_MS", default_value_t = fast_plane::send_defer::DEFAULT_SEND_DEFER_MS)]
+    send_defer_ms: u64,
+
+    /// The kept datagrams' pool of the video class thread, in MB, made and
+    /// touched at start (a destination keeps at most half of it). `auto`:
+    /// 0.8% of the node's memory, 8 to 64 MB (31 MB on a 4 GB node).
+    #[arg(long, env = "NEEDLETAIL_SEND_DEFER_MB", default_value = "auto")]
+    send_defer_mb: av_mesh::mem_guard::MemSetting,
+
+    /// send240, B: pace the heavy (video) send sockets of a forwarder (its
+    /// children's, its lease children's) and of an edge (its clients') at
+    /// this many times the node's measured video egress (SO_MAX_PACING_RATE,
+    /// set once a second), so a part to every destination leaves over about
+    /// 1/k of its time at the stream's rate instead of at line rate. Needs
+    /// the fq qdisc on the NIC. 0: off (until a lab A/B).
+    #[arg(long, env = "NEEDLETAIL_SEND_PACING", default_value_t = 0)]
+    send_pacing: u64,
+
+    /// The least rate a paced socket is given, Mbit/s.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_SEND_PACING_FLOOR_MBIT",
+        default_value_t = fast_plane::send_pacing::DEFAULT_FLOOR_MBIT
+    )]
+    send_pacing_floor_mbit: u64,
+
     /// A video stream with no part for this long keeps only its newest part
     /// in the cache, and its memory goes back to the system. 0: never.
     #[arg(long, env = "NEEDLETAIL_VIDEO_IDLE_RELEASE_MS", default_value_t = 30_000)]
@@ -2758,6 +2791,19 @@ struct Args {
         default_value_t = edge_holes::DEFAULT_EDGE_HOLE_DISTANCE_MS
     )]
     edge_hole_distance_ms: u64,
+
+    /// send240, C: what an edge may pull over the cache mesh (holes, the
+    /// quiet catch-up, a reader's backstop), all streams together, in
+    /// Mbit/s of parts (each ask charged its parts' size as they arrive);
+    /// parts of 64 KiB or less keep a quarter of it. A part the node shed
+    /// itself is never pulled, and a lane whose tee lags or sheds pulls
+    /// nothing, whatever this is. 0: no budget.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_EDGE_PULL_BUDGET_MBIT",
+        default_value_t = pull_gate::DEFAULT_PULL_BUDGET_MBIT
+    )]
+    edge_pull_budget_mbit: u64,
 
     /// An edge answers whether it has lost its parents from an answer at
     /// most this old (microseconds), instead of asking the cache mesh for
@@ -3916,6 +3962,7 @@ async fn main() -> Result<()> {
         "memory budgets"
     );
     spawn_memory_guard(Arc::clone(&cache), args.video_idle_release_ms);
+    cache.pull_gate.set_budget_mbit(args.edge_pull_budget_mbit);
     cache.set_canonical_gap_hold(Duration::from_millis(args.canonical_gap_hold_ms));
     cache.set_repair_horizon(args.canonical_repair_horizon);
     cache.set_repair_horizon_floor_for_burst_copy(Duration::from_millis(args.relay_burst_copy_ms));
@@ -4075,6 +4122,21 @@ async fn main() -> Result<()> {
     // of its own, and with --client-udp-cut-through-thread each runs on a
     // thread of its own rather than inline on the receive task.
     let mesh_split = args.cache_mesh_class_port_offset > 0;
+    // send240, B: the heavy send sockets' pacing, set once a second.
+    let send_pacing =
+        fast_plane::send_pacing::SendPacing::new(args.send_pacing, args.send_pacing_floor_mbit);
+    if let Some(pacing) = &send_pacing {
+        let _ = fast_plane::send_pacing::NODE.set(Arc::clone(pacing));
+        let pacing = Arc::clone(pacing);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                pacing.turn();
+            }
+        });
+    }
     // A node whose class threads take RelaySession symbols feeds its UDP
     // clients the fast lane; cut-through is then off.
     let fast_lane = (args.client_udp_bind.is_some()
@@ -4101,6 +4163,7 @@ async fn main() -> Result<()> {
             percent: args.client_udp_video_pace_percent,
             max_delay_us: args.client_udp_video_pace_max_ms.saturating_mul(1_000),
         }));
+        lane.set_send_pacing(send_pacing.clone());
     }
     if fast_lane.is_some() && args.client_udp_cut_through {
         info!("edge client UDP: the fast lane runs, so cut-through is off (--client-udp-fast-lane false turns it back on)");
@@ -4587,6 +4650,17 @@ async fn main() -> Result<()> {
             args.relay_decode_queue_mb.saturating_mul(1 << 20),
         ),
         small_lane_tee_slice_us: args.reader_slice_us,
+        send_pacing: send_pacing.clone(),
+        send_defer: fast_plane::send_defer::DeferConfig::new(
+            args.send_defer_ms,
+            fast_plane::send_defer::pool_bytes(
+                match args.send_defer_mb {
+                    av_mesh::mem_guard::MemSetting::Auto => None,
+                    av_mesh::mem_guard::MemSetting::Mb(mb) => Some(mb),
+                },
+                memory_budgets.node_memory_bytes,
+            ),
+        ),
         ..Default::default()
     };
     let fec_ingest_task = match (fec_socket, class_sockets) {
@@ -9495,6 +9569,9 @@ struct LiveTsCache {
     /// replaced stream's bytes are spawned there, never on the runtime of
     /// a tee thread that commits the new session's first part.
     node_runtime: Option<tokio::runtime::Handle>,
+    /// What the node may pull over the cache mesh (send240, C): the parts
+    /// it shed itself, its lanes' lag and its budget.
+    pull_gate: Arc<pull_gate::PullGate>,
 }
 
 impl LiveTsCache {
@@ -9640,6 +9717,7 @@ impl LiveTsCache {
             started_unix_us,
             memory_guard: OnceLock::new(),
             node_runtime: tokio::runtime::Handle::try_current().ok(),
+            pull_gate: Arc::default(),
         })
     }
 
@@ -12819,6 +12897,12 @@ impl LiveTsCache {
     /// that the playlist hints, and a reader on a far path asks several
     /// parts ahead. Any other part that the cache does not hold is unknown.
     async fn part_request_may_wait(&self, stream_id: u64, sequence: u64) -> bool {
+        // A part this node shed is not on its way: "not here" at once
+        // (send240, C).
+        if self.pull_gate.is_shed(stream_id, sequence) {
+            self.pull_gate.shed_answered.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
         let Some((_, last)) = self.stream_position_for_id(stream_id).await else {
             // No part of the stream yet: a copy is on its way to this cache.
             return true;
@@ -16922,10 +17006,11 @@ async fn run_mesh_applied_parts(
         journal_mesh_applied(&cache, &applied, committed_us);
         if let Some(holes) = &holes {
             holes
-                .arrived(
+                .arrived_sized(
                     applied.stream_id,
                     applied.slot_id as u64,
                     edge_holes::Arrival::CacheMesh,
+                    applied.bytes as u64,
                 )
                 .await;
         }
@@ -23018,6 +23103,9 @@ impl AppRouter {
             entry,
             node_warm: self.node_status.node_warm.clone(),
             memory: av_mesh::mem_guard::installed().map(|installed| installed.snapshot()),
+            pulls: (self.cache_mesh_role == CacheMeshRole::Edge)
+                .then(|| self.cache.pull_gate.snapshot()),
+            send_pacing: fast_plane::send_pacing::NODE.get().map(|pacing| pacing.snapshot()),
         });
         memory.cached = Some((now, Arc::clone(&status)));
         status
@@ -25467,6 +25555,11 @@ impl AppRouter {
                 .get_part_blocking_for_stream_id(stream_id, seq)
                 .await);
         }
+        // A part this edge shed is neither waited for nor pulled (send240).
+        if self.cache.pull_gate.is_shed(stream_id, seq) {
+            self.cache.pull_gate.shed_answered.fetch_add(1, Ordering::Relaxed);
+            return Ok(self.cache.get_part_for_stream_id(stream_id, seq).await);
+        }
         let deadline = Instant::now() + Duration::from_millis(PART_WAIT_MS);
         let mut requests = 0_u32;
         let mut part_us = None;
@@ -25577,9 +25670,21 @@ impl AppRouter {
         {
             count += 1;
         }
+        // send240, C: through the node's pull gate (shed parts, a lagging
+        // lane, the budget), and of one parent: the first at the first ask,
+        // the second alone after it.
+        let class = self.cache.stream_classes().class(stream_id);
+        if self
+            .cache
+            .pull_gate
+            .admit(class, stream_id, slot as u64, count)
+            .is_err()
+        {
+            return false;
+        }
         match self
             .mesh
-            .request_parts(stream_id, slot, count, parents)
+            .request_parts_from_rank(stream_id, slot, count, parents.saturating_sub(1).min(1))
             .await
         {
             Ok(_) => {
@@ -47167,6 +47272,8 @@ mod tests {
                 trim_to_margin: false,
                 trim_forwarded_repair: true,
                 small_lane_tee_slice_us: 0,
+                send_defer: None,
+                send_pacing: None,
                 test_tee_panic: Some(fast_plane::TrafficClass::Audio),
                 test_tees_on_caller_runtime: false,
                 test_video_tee_spin_ns: 0,
@@ -47693,4 +47800,12 @@ mod tests {
     /// A 4K viewer at an edge whose source session restarts, with a late
     /// copy of the old session in its cache (stuck4k).
     mod stuck_4k;
+    /// A send stall at an edge and a forwarder (send240, A): what the
+    /// class thread keeps, and what the cache-fed lane is handed.
+    mod send_stall;
+    /// The pull loop (send240, C): an edge whose tee sheds never pulls the
+    /// parts it shed.
+    mod pull_loop;
+    /// Pacing of the heavy lane's sends under fq (send240, B).
+    mod send_pacing;
 }

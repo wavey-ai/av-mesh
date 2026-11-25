@@ -539,11 +539,27 @@ async fn a_forwarder_s_video_thread_allocates_frees_and_faults_nothing_once_it_r
     let (primary_video, secondary_video) =
         (relay.primary_video.unwrap(), relay.secondary_video.unwrap());
     let repair_target = repair_child.local_addr().unwrap();
+    // send240: the child of every symbol and a lease child stall for 120 ms
+    // from frame 20 (their ports alone): the video thread keeps what their
+    // sockets refuse and sends it after, allocating nothing.
+    let _stall = fast_plane::send_defer::stall::LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let all_video_port = all_child.local_addr().unwrap().port() + offset;
     let start = Instant::now();
     let interval = Duration::from_micros(41_667);
     let (mut primary_sent, mut secondary_sent) = (0_u64, 0_u64);
     for (index, frame) in frames_a.iter().enumerate() {
         tokio::time::sleep_until((start + interval * index as u32).into()).await;
+        if index == 20 {
+            fast_plane::send_defer::stall::set_port(all_video_port, 120);
+        }
+        if index == 24 {
+            fast_plane::send_defer::stall::set_port(primary_port + offset, 120);
+        }
+        if index == 28 {
+            fast_plane::send_defer::stall::clear();
+        }
         // The primary lane takes the sources, the promoted secondary all.
         send_all(primary_fd, primary_video, &frame.datagrams[..frame.sources]).await;
         send_all(secondary_fd, secondary_video, &frame.datagrams).await;
@@ -624,6 +640,9 @@ async fn a_forwarder_s_video_thread_allocates_frees_and_faults_nothing_once_it_r
     assert!(snapshot.warm_source_replayed_datagrams > 0, "{snapshot:?}");
     assert_eq!(snapshot.warm_source_refused_datagrams, 0, "{snapshot:?}");
     assert!(stats.loss_reports > 0, "the video lanes were measured: {stats:?}");
+    let defer = stats.child_send_defer;
+    assert!(defer.deferred > 0, "the stalls kept datagrams: {defer:?}");
+    assert_eq!(defer.deferred_sent, defer.deferred, "{defer:?}");
     watched.assert_nothing(72);
 }
 
@@ -675,10 +694,23 @@ fn an_edge_s_video_thread_allocates_frees_and_faults_nothing_once_it_runs() {
     };
     let (reader_a, first_a) = client(stream_a);
     let mut reader_b = None;
+    // send240: a stall of the clients' path for 120 ms from frame 20: the
+    // video thread keeps what the socket refuses and sends it after, on
+    // the same thread, with nothing allocated, freed or first touched.
+    let _stall = fast_plane::send_defer::stall::LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let stall_fds = edge.lane.video_fds_for_test();
     let start = Instant::now();
     let interval = Duration::from_micros(41_667);
     for (index, frame) in frames_a.iter().enumerate().skip(1) {
         std::thread::sleep((start + interval * index as u32).saturating_duration_since(Instant::now()));
+        if index == 20 {
+            fast_plane::send_defer::stall::set(&stall_fds, 0, 120);
+        }
+        if index == 24 {
+            fast_plane::send_defer::stall::clear();
+        }
         send(frame);
         if index >= 36 {
             send(&frames_b[index - 36]);
@@ -720,6 +752,9 @@ fn an_edge_s_video_thread_allocates_frees_and_faults_nothing_once_it_runs() {
     );
     let stats = edge.cache.relay_ingress_snapshot().fast_plane;
     assert_eq!(stats.tee_dropped, 0, "{stats:?}");
+    let defer = edge.lane.snapshot_stats().send_defer;
+    assert!(defer.deferred > 0, "the stall kept datagrams: {defer:?}");
+    assert_eq!(defer.deferred_sent, defer.deferred, "{defer:?}");
     rt.block_on(edge.stop());
     watched.assert_nothing(72);
 }

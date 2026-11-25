@@ -1016,7 +1016,7 @@ fn video_throughput_of_an_edge() {
 /// SO_TXTIME departures only under fq). Returns `true` inside it, `false`
 /// outside once the inner run passed; skips (with a note) where the host
 /// allows no user namespace.
-fn in_fq_namespace(name: &str) -> bool {
+pub(super) fn in_fq_namespace(name: &str) -> bool {
     if std::env::var_os("W3_IN_FQ_NAMESPACE").is_some() {
         return true;
     }

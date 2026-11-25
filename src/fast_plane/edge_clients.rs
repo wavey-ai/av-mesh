@@ -459,6 +459,17 @@ pub struct FastLaneStats {
     /// The audio class thread's allocator heap grown and touched before it
     /// was made real-time (bytes).
     pub class_arena_warm_bytes: AtomicU64,
+    /// send240, A: parts handed to the cache-fed lane with the symbols a
+    /// client lacks, those symbols, and hand-offs the ring refused; the
+    /// cache-fed lane's sends of them: parts and datagrams sent, parts past
+    /// the playout deadline (skipped), parts it no longer held.
+    pub handed_parts: AtomicU64,
+    pub handed_symbols: AtomicU64,
+    pub handed_dropped: AtomicU64,
+    pub partial_parts: AtomicU64,
+    pub partial_datagrams: AtomicU64,
+    pub partial_late: AtomicU64,
+    pub partial_uncached: AtomicU64,
 }
 
 /// What `/api/mesh` reports of the fast client lane.
@@ -536,6 +547,18 @@ pub struct FastLaneSnapshot {
     pub class_send_max_us: u64,
     #[serde(default)]
     pub class_arena_warm_bytes: u64,
+    /// send240, A: the video thread's kept datagrams, and the cache-fed
+    /// lane's sends of what a client lacked past their deadline.
+    #[serde(default)]
+    pub send_defer: super::send_defer::DeferSnapshot,
+    #[serde(default)]
+    pub partial_parts: u64,
+    #[serde(default)]
+    pub partial_datagrams: u64,
+    #[serde(default)]
+    pub partial_late: u64,
+    #[serde(default)]
+    pub partial_uncached: u64,
 }
 
 struct Armed {
@@ -605,8 +628,120 @@ pub struct EdgeFastLane {
     /// The jobs to the repair thread (made, touched and the thread started
     /// when the lane is armed).
     repair_jobs: OnceLock<Arc<RepairRing>>,
+    /// send240, A: the video thread's kept datagrams' counters, and the
+    /// parts it hands the cache-fed lane with the symbols a client lacks.
+    defer_stats: OnceLock<Arc<super::send_defer::DeferStats>>,
+    partials: Arc<JobRing<PartialJob>>,
+    /// send240, B: the kernel's pacing of the video client sockets.
+    send_pacing: OnceLock<Arc<super::send_pacing::SendPacing>>,
     pub stats: FastLaneStats,
 }
+
+/// send240, A: a part whose last symbols the fast lane could not send a
+/// client within the part's deadline share. The cache-fed lane sends the
+/// client those source symbols (from `from_esi`, the fast lane's block,
+/// rebuilt from the cached envelope) and the repair of its policy, never
+/// the whole part again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartialJob {
+    pub stream_id: u64,
+    pub part: u64,
+    pub peer: SocketAddr,
+    pub from_esi: u32,
+    pub k: u16,
+    pub repair: u16,
+    pub transfer_length: u32,
+    pub symbol_size: u16,
+    /// CLOCK_MONOTONIC ns when the first of its symbols was kept (the
+    /// part had waited since then).
+    pub kept_ns: u64,
+}
+
+impl PartialJob {
+    const EMPTY: Self = Self {
+        stream_id: 0,
+        part: 0,
+        peer: SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0)),
+        from_esi: 0,
+        k: 0,
+        repair: 0,
+        transfer_length: 0,
+        symbol_size: 0,
+        kept_ns: 0,
+    };
+
+    /// The datagrams that the client lacks: its source symbols from
+    /// `from_esi`, rebuilt from the part's envelope on the fast lane's
+    /// block (the bytes the contributor's own symbols carry), and the
+    /// repair of the client's policy from the edge's own repair ordinals
+    /// (past those of its top-up). `None` when the envelope is not the
+    /// part's object.
+    pub fn datagrams(&self, envelope: &[u8], rank: u32) -> Option<Vec<Vec<u8>>> {
+        use raptorq_datagram_fec::HEADER_LEN;
+        let symbol = usize::from(self.symbol_size);
+        let k = u32::from(self.k);
+        if symbol == 0
+            || envelope.len() != self.transfer_length as usize
+            || envelope.len() > symbol * usize::from(self.k)
+            || self.from_esi >= k
+        {
+            return None;
+        }
+        let block_id = fast_block_id(self.part);
+        let mut out = Vec::with_capacity((k - self.from_esi) as usize + usize::from(self.repair));
+        let mut payload = Vec::with_capacity(4 + symbol);
+        for esi in self.from_esi..k {
+            let start = esi as usize * symbol;
+            let end = (start + symbol).min(envelope.len());
+            payload.clear();
+            payload.extend_from_slice(&[0, (esi >> 16) as u8, (esi >> 8) as u8, esi as u8]);
+            payload.extend_from_slice(envelope.get(start..end)?);
+            payload.resize(4 + symbol, 0);
+            let header = DatagramFecHeader::raptorq(
+                block_id,
+                self.transfer_length,
+                EDGE_PARTIAL_SEQUENCE_BASE | esi,
+                self.k,
+                self.symbol_size,
+                &payload,
+            )
+            .ok()?;
+            let mut datagram = vec![0_u8; HEADER_LEN];
+            header.encode(&mut datagram).ok()?;
+            datagram.extend_from_slice(&payload);
+            out.push(datagram);
+        }
+        if self.repair > 0 {
+            let profile = RaptorQBlockProfile::new(
+                block_id,
+                self.transfer_length,
+                self.k,
+                self.symbol_size,
+            )
+            .ok()?;
+            let first_ordinal = EDGE_REPAIR_ORDINAL_BASE
+                .saturating_add(rank.saturating_mul(EDGE_REPAIR_ORDINALS_PER_RANK))
+                .saturating_add(EDGE_REPAIR_ORDINALS_PER_RANK / 2);
+            let repair = u32::from(self.repair).min(EDGE_REPAIR_ORDINALS_PER_RANK / 2);
+            let datagrams = RaptorQRepairEncoder::new(
+                envelope,
+                profile,
+                first_ordinal,
+                EDGE_PARTIAL_SEQUENCE_BASE,
+            )
+            .and_then(|mut encoder| encoder.encode_additional(repair))
+            .ok()?;
+            out.extend(datagrams);
+        }
+        Some(out)
+    }
+}
+
+/// The packet sequences of the cache-fed lane's partial parts.
+const EDGE_PARTIAL_SEQUENCE_BASE: u32 = 0xD000_0000;
+
+/// Hand-offs waiting for the cache-fed lane, at most.
+const PARTIAL_QUEUE: usize = 1_024;
 
 /// The window repair of one part, for the repair thread.
 #[derive(Debug, Clone, Copy)]
@@ -654,8 +789,8 @@ const REPAIR_IDLE_WAKE: Duration = Duration::from_millis(100);
 /// waits for the repair thread, and one class thread never retries. The
 /// repair thread is woken once per batch that pushed (a futex wake only
 /// when it sleeps), as a fan-out thread is.
-struct RepairRing {
-    slots: Box<[RepairSlot]>,
+struct JobRing<T: Copy> {
+    slots: Box<[RepairSlot<T>]>,
     /// The next place a producer claims, and the next the consumer reads.
     tail: AtomicUsize,
     head: AtomicUsize,
@@ -663,27 +798,36 @@ struct RepairRing {
     thread: OnceLock<std::thread::Thread>,
 }
 
-struct RepairSlot {
+struct RepairSlot<T> {
     /// `place` when free for the push of that place, `place + 1` when it
     /// holds that place's job.
     sequence: AtomicUsize,
-    job: std::cell::UnsafeCell<RepairJob>,
+    job: std::cell::UnsafeCell<T>,
 }
+
+/// The repair thread's jobs.
+type RepairRing = JobRing<RepairJob>;
 
 // SAFETY: a slot's job is written only by the producer that claimed its
 // place (by the tail's compare-exchange) before the release store of its
 // sequence, and read only by the one consumer after the acquire load of it.
-unsafe impl Sync for RepairRing {}
-unsafe impl Send for RepairRing {}
+unsafe impl<T: Copy + Send> Sync for JobRing<T> {}
+unsafe impl<T: Copy + Send> Send for JobRing<T> {}
 
 impl RepairRing {
     fn new(capacity: usize) -> Arc<Self> {
+        JobRing::with_empty(capacity, RepairJob::EMPTY)
+    }
+}
+
+impl<T: Copy> JobRing<T> {
+    fn with_empty(capacity: usize, empty: T) -> Arc<Self> {
         let capacity = capacity.next_power_of_two().max(2);
-        let mut slots: Vec<RepairSlot> = Vec::with_capacity(capacity);
+        let mut slots: Vec<RepairSlot<T>> = Vec::with_capacity(capacity);
         for place in 0..capacity {
             slots.push(RepairSlot {
                 sequence: AtomicUsize::new(place),
-                job: std::cell::UnsafeCell::new(RepairJob::EMPTY),
+                job: std::cell::UnsafeCell::new(empty),
             });
         }
         let mut slots = slots.into_boxed_slice();
@@ -703,7 +847,7 @@ impl RepairRing {
 
     /// Fill a free slot with `fill`; `false` when the ring is full. Never
     /// waits on the consumer.
-    fn push(&self, fill: impl FnOnce(&mut RepairJob)) -> bool {
+    fn push(&self, fill: impl FnOnce(&mut T)) -> bool {
         let mut place = self.tail.load(Ordering::Relaxed);
         loop {
             let slot = &self.slots[place & self.mask()];
@@ -736,7 +880,7 @@ impl RepairRing {
     }
 
     /// The oldest job, copied out, if one is ready. One consumer.
-    fn pop(&self) -> Option<RepairJob> {
+    fn pop(&self) -> Option<T> {
         let place = self.head.load(Ordering::Relaxed);
         let slot = &self.slots[place & self.mask()];
         if slot.sequence.load(Ordering::Acquire) != place.wrapping_add(1) {
@@ -796,6 +940,9 @@ impl EdgeFastLane {
             fanout_inline_sends: AtomicU32::new(DEFAULT_FANOUT_INLINE_SENDS as u32),
             repair_thread: AtomicBool::new(true),
             repair_jobs: OnceLock::new(),
+            defer_stats: OnceLock::new(),
+            partials: JobRing::with_empty(PARTIAL_QUEUE, PartialJob::EMPTY),
+            send_pacing: OnceLock::new(),
             fanout_inline_shard: AtomicBool::new(DEFAULT_FANOUT_INLINE_SHARD),
             fanout_nice: std::sync::atomic::AtomicI32::new(DEFAULT_FANOUT_NICE),
             class_arena_warm_bytes: AtomicUsize::new(CLASS_ARENA_WARM_BYTES),
@@ -1104,7 +1251,7 @@ impl EdgeFastLane {
     }
 
     /// Give the lane its client sockets and subscriber table.
-    pub fn arm(&self, sockets: EdgeSockets, table: Table, stats: Arc<EdgeUdpStats>) {
+    pub fn arm(self: &Arc<Self>, sockets: EdgeSockets, table: Table, stats: Arc<EdgeUdpStats>) {
         // The send-only twins of the client sockets when there are (no
         // runtime is woken by their sends), else the sockets themselves.
         let audio = sockets.send_fd(TrafficClass::Audio);
@@ -1121,6 +1268,7 @@ impl EdgeFastLane {
             self.fds[0].store(audio as u64, Ordering::Release);
             self.fds[1].store(video as u64, Ordering::Release);
             self.enable_txtime();
+            self.pace_sockets(self);
             if self.repair_thread.load(Ordering::Relaxed) {
                 self.start_repair_thread();
             }
@@ -1260,7 +1408,122 @@ impl EdgeFastLane {
             class_compact_max_us: load(&self.stats.class_compact_max_us),
             class_send_max_us: load(&self.stats.class_send_max_us),
             class_arena_warm_bytes: load(&self.stats.class_arena_warm_bytes),
+            send_defer: self.defer_snapshot(),
+            partial_parts: load(&self.stats.partial_parts),
+            partial_datagrams: load(&self.stats.partial_datagrams),
+            partial_late: load(&self.stats.partial_late),
+            partial_uncached: load(&self.stats.partial_uncached),
         }
+    }
+
+    /// The video thread's kept datagrams, with the hand-offs.
+    fn defer_snapshot(&self) -> super::send_defer::DeferSnapshot {
+        let load = |value: &AtomicU64| value.load(Ordering::Relaxed);
+        let mut snapshot = self
+            .defer_stats
+            .get()
+            .map(|stats| stats.snapshot())
+            .unwrap_or_default();
+        snapshot.handed_parts = load(&self.stats.handed_parts);
+        snapshot.handed_symbols = load(&self.stats.handed_symbols);
+        snapshot.handed_dropped = load(&self.stats.handed_dropped);
+        snapshot
+    }
+
+    /// The class thread gives up a part's kept symbols for a client: the
+    /// cache-fed lane is told which it lacks (send240, A). Never waits, and
+    /// allocates nothing: a full ring drops the hand-off (counted).
+    pub fn hand_off(&self, expired: &super::send_defer::Expired, now_ns: u64) {
+        let _ = now_ns;
+        if u32::from(expired.k) <= expired.from_esi || expired.symbol_size == 0 {
+            // No source symbol is missing (repair alone was given up), or
+            // the datagram carried no geometry to rebuild it from.
+            return;
+        }
+        let pushed = self.partials.push(|job| {
+            *job = PartialJob {
+                stream_id: expired.stream,
+                part: expired.part,
+                peer: expired.target,
+                from_esi: expired.from_esi,
+                k: expired.k,
+                repair: expired.repair,
+                transfer_length: expired.transfer_length,
+                symbol_size: expired.symbol_size,
+                kept_ns: expired.kept_ns,
+            };
+        });
+        if pushed {
+            self.stats.handed_parts.fetch_add(1, Ordering::Relaxed);
+            self.stats.handed_symbols.fetch_add(
+                u64::from(u32::from(expired.k) - expired.from_esi),
+                Ordering::Relaxed,
+            );
+        } else {
+            self.stats.handed_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The next hand-off for the cache-fed lane (its one consumer).
+    pub fn take_partial(&self) -> Option<PartialJob> {
+        self.partials.pop()
+    }
+
+    /// Kept datagrams the socket took: the lane's datagrams and bytes (the
+    /// edge's load counts them).
+    fn note_deferred_sent(&self, datagrams: usize, bytes: u64) {
+        if datagrams > 0 {
+            self.stats
+                .datagrams
+                .fetch_add(datagrams as u64, Ordering::Relaxed);
+            self.stats.bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// send240, B: pace the video client sockets (the fast lane's and the
+    /// cache-fed lane's) at k times the lane's measured egress (the lane's
+    /// bytes, audio's included: an upper bound).
+    pub fn set_send_pacing(self: &Arc<Self>, pacing: Option<Arc<super::send_pacing::SendPacing>>) {
+        if let Some(pacing) = pacing {
+            let _ = self.send_pacing.set(pacing);
+            self.pace_sockets(self);
+        }
+    }
+
+    /// The fast lane's video socket, paced at k times the lane's bytes
+    /// (audio's included: an upper bound), and the cache-fed lane's at k
+    /// times the edge's client bytes.
+    fn pace_sockets(&self, this: &Arc<Self>) {
+        use std::os::fd::AsRawFd;
+        if let (Some(pacing), Some(armed)) = (self.send_pacing.get(), self.armed.get()) {
+            let lane = Arc::downgrade(this);
+            pacing.register(armed.sockets.send_fd(TrafficClass::Video), move || {
+                lane.upgrade()
+                    .map_or(0, |lane| lane.stats.bytes.load(Ordering::Relaxed))
+            });
+            let stats = Arc::downgrade(&armed.stats);
+            pacing.register(
+                armed.sockets.class_socket(TrafficClass::Video).as_raw_fd(),
+                move || stats.upgrade().map_or(0, |stats| stats.bytes.load(Ordering::Relaxed)),
+            );
+        }
+    }
+
+    /// The edge's rank (its repair ordinals).
+    pub fn rank(&self) -> u32 {
+        self.rank
+    }
+
+    /// Tests: the sockets a host's stall of the video path stops: the fast
+    /// lane's and the cache-fed lane's.
+    #[cfg(test)]
+    pub fn video_fds_for_test(&self) -> Vec<RawFd> {
+        use std::os::fd::AsRawFd;
+        let mut fds: Vec<RawFd> = self.fd(TrafficClass::Video).into_iter().collect();
+        if let Some(armed) = self.armed.get() {
+            fds.push(armed.sockets.class_socket(TrafficClass::Video).as_raw_fd());
+        }
+        fds
     }
 
     /// The canonical compact datagram of a one-symbol object whose source
@@ -1636,6 +1899,11 @@ struct PlannedClient {
     peer: SocketAddr,
     /// Its client, by index in `ClientPlan::clients`.
     client: u32,
+    /// The part's source symbols (K), and the repair the client's policy
+    /// asks of them: what a send the socket refused needs to be kept and,
+    /// past its deadline, handed to the cache-fed lane (send240, A).
+    k: u16,
+    repair: u16,
 }
 
 /// One class thread's working state of the fast client lane: the rewrap
@@ -1669,6 +1937,8 @@ pub struct ClientPlan {
     /// The stream and the part of each message of the batch.
     streams: [u64; sys::RECV_BATCH],
     parts: [u64; sys::RECV_BATCH],
+    /// The ESI of each message's symbol (send240, A: a kept datagram's tag).
+    esis: [u32; sys::RECV_BATCH],
     pacer: Pacer,
     runs: Vec<(usize, usize)>,
     departures: Vec<u64>,
@@ -1683,6 +1953,10 @@ pub struct ClientPlan {
     compact_sent: Vec<(u64, u64, u8, u16)>,
     /// When the class thread handed this plan to a fan-out thread.
     dispatched_at: Option<Instant>,
+    /// What the socket refused, kept for each client and sent first when
+    /// it takes datagrams again (send240, A; the video thread's plan with
+    /// `--send-defer-ms` above 0).
+    defer: Option<Box<super::send_defer::SendDefer>>,
 }
 
 const REPAIR_MEMO: usize = 64;
@@ -1766,6 +2040,7 @@ impl ClientPlan {
             now_ns: 0,
             streams: [0; sys::RECV_BATCH],
             parts: [0; sys::RECV_BATCH],
+            esis: [0; sys::RECV_BATCH],
             pacer: Pacer::default(),
             // A run per send at most (fix4-video: the unpaced GSO send
             // made its list per send on the video thread).
@@ -1775,6 +2050,7 @@ impl ClientPlan {
             sent_us: 0,
             compact_sent: Vec::with_capacity(sys::RECV_BATCH),
             dispatched_at: None,
+            defer: None,
         };
         plan.touch();
         plan
@@ -1827,6 +2103,40 @@ impl ClientPlan {
 
     /// The plan of a video thread: it measures its streams' rates, and
     /// paces its clients when the lane paces.
+    /// Keep what the client socket refuses (`config`), made and touched
+    /// now, on the thread that makes the plan (send240, A). The lane shows
+    /// its counters.
+    pub fn with_defer(
+        mut self,
+        config: Option<super::send_defer::DeferConfig>,
+        lane: Option<&EdgeFastLane>,
+    ) -> Self {
+        self.defer = config.map(|config| Box::new(super::send_defer::SendDefer::new(config)));
+        if let (Some(defer), Some(lane)) = (&self.defer, lane) {
+            let _ = lane.defer_stats.set(Arc::clone(&defer.stats));
+        }
+        self
+    }
+
+    /// Whether datagrams are kept: the class thread's wait is then short
+    /// and it drains them at each pass ([`Self::drain_deferred`]).
+    pub fn has_deferred(&self) -> bool {
+        self.defer.as_ref().is_some_and(|defer| !defer.is_empty())
+    }
+
+    /// Send what the client socket takes of the kept datagrams, and hand
+    /// the cache-fed lane what has passed its deadline (send240, A). Called
+    /// by the class thread at a pass without new datagrams; a send drains
+    /// first itself.
+    pub fn drain_deferred(&mut self, lane: &EdgeFastLane) {
+        let Some(defer) = self.defer.as_deref_mut().filter(|defer| !defer.is_empty()) else {
+            return;
+        };
+        let now_ns = sys::monotonic_ns();
+        let (sent, bytes) = defer.drain(now_ns, self.gso, |expired| lane.hand_off(&expired, now_ns));
+        lane.note_deferred_sent(sent, bytes);
+    }
+
     pub fn with_video(mut self, video: bool) -> Self {
         self.video = video;
         self
@@ -1915,6 +2225,7 @@ impl ClientPlan {
         self.compact_lens[message] = 0;
         self.streams[message] = stream_id;
         self.parts[message] = part;
+        self.esis[message] = view.esi;
         if self.video {
             self.pacer
                 .rates
@@ -1971,6 +2282,11 @@ impl ClientPlan {
                     continue;
                 }
             }
+            let policy_repair = if copies.is_some() {
+                0
+            } else {
+                self.repair_symbols(group.repair, k).min(u32::from(u16::MAX)) as u16
+            };
             // The clients take turns at the head of the batch, part by part.
             let count = group.clients.len();
             let first = (part % count.max(1) as u64) as usize;
@@ -2003,6 +2319,8 @@ impl ClientPlan {
                         part,
                         peer: *peer,
                         client: self.clients.len() as u32,
+                        k: k.min(u32::from(u16::MAX)) as u16,
+                        repair: policy_repair,
                     });
                 }
                 if copies.is_some() {
@@ -2167,6 +2485,19 @@ impl ClientPlan {
             self.clients.clear();
             return;
         };
+        // send240, A: what this thread kept for a client goes before
+        // anything newer of the client's.
+        let defer_on = self.defer.is_some() && patience.is_none() && class == TrafficClass::Video;
+        if defer_on {
+            self.divert_to_kept(lane, fd);
+        } else if super::send_defer::any_blocked() {
+            self.refuse_stalled(lane, fd);
+        }
+        if self.sends.is_empty() {
+            self.sent_us = crate::now_unix_us();
+            self.clients.clear();
+            return;
+        }
         let use_gso = self.gso && class == TrafficClass::Video;
         // Video is paced per client when the lane paces (and the host takes
         // SO_TXTIME).
@@ -2268,6 +2599,10 @@ impl ClientPlan {
         let mut bytes = 0_u64;
         let (mut would_block, mut errors, mut given_back) = (0_u64, 0_u64, 0_u64);
         let (sends, clients, first_sent) = (&self.sends, &self.clients, &mut self.first_sent);
+        // send240, A: a refused symbol of a part of several is kept for its
+        // client, not its part given back (the defer's own counters).
+        let (streams, esis, now_ns) = (&self.streams, &self.esis, self.now_ns);
+        let mut defer = self.defer.as_deref_mut().filter(|_| defer_on);
         for (index, send) in sends[..sent.min(sends.len())].iter().enumerate() {
             first_sent[usize::from(send.message)].get_or_insert(send.peer);
             bytes += message(index).0.len() as u64;
@@ -2287,7 +2622,32 @@ impl ClientPlan {
                         first_sent[usize::from(send.message)].get_or_insert(send.peer);
                         return;
                     }
-                    sys::RestOutcome::WouldBlock => would_block += 1,
+                    sys::RestOutcome::WouldBlock => {
+                        would_block += 1;
+                        let send = &sends[index];
+                        if let Some(defer) = defer
+                            .as_deref_mut()
+                            .filter(|_| send.k > 1 && send.compact.is_none())
+                        {
+                            let at = usize::from(send.message);
+                            defer.keep(
+                                fd,
+                                send.peer,
+                                message(index).0,
+                                super::send_defer::Tag {
+                                    stream: streams[at],
+                                    part: send.part,
+                                    esi: esis[at],
+                                    k: send.k,
+                                    repair: send.repair,
+                                    source: send.source,
+                                },
+                                now_ns,
+                                |expired| lane.hand_off(&expired, now_ns),
+                            );
+                            return;
+                        }
+                    }
                     sys::RestOutcome::Error => errors += 1,
                 }
                 let send = &sends[index];
@@ -2297,6 +2657,11 @@ impl ClientPlan {
                 }
             },
         );
+        if would_block > 0 {
+            if let Some(defer) = defer {
+                defer.note_would_block();
+            }
+        }
         for (counter, count) in [
             (&lane.stats.would_block, would_block),
             (&lane.stats.send_errors, errors),
@@ -2311,6 +2676,79 @@ impl ClientPlan {
         self.sent_us = crate::now_unix_us();
         self.sends.clear();
         self.clients.clear();
+    }
+
+    /// send240, A: drain what is kept (the socket may take it now), then
+    /// keep, behind it, each send of the batch to a client that still has
+    /// datagrams kept (or, in a test, whose path is stalled). A part of one
+    /// symbol, and a compact datagram, go as before.
+    fn divert_to_kept(&mut self, lane: &EdgeFastLane, fd: RawFd) {
+        let gso = self.gso;
+        let Some(defer) = self.defer.as_deref_mut() else {
+            return;
+        };
+        let now_ns = self.now_ns;
+        if !defer.is_empty() {
+            let (sent, bytes) = defer.drain(now_ns, gso, |expired| lane.hand_off(&expired, now_ns));
+            lane.note_deferred_sent(sent, bytes);
+        }
+        if defer.is_empty() && !super::send_defer::any_blocked() {
+            return;
+        }
+        let Self {
+            sends,
+            buffers,
+            lens,
+            streams,
+            esis,
+            ..
+        } = self;
+        sends.retain(|send| {
+            if send.k <= 1
+                || send.compact.is_some()
+                || !(defer.is_waiting(fd, send.peer) || super::send_defer::blocked(fd, send.peer))
+            {
+                return true;
+            }
+            let message = usize::from(send.message);
+            let start = message * REWRAP_BYTES;
+            defer.keep(
+                fd,
+                send.peer,
+                &buffers[start..start + usize::from(lens[message])],
+                super::send_defer::Tag {
+                    stream: streams[message],
+                    part: send.part,
+                    esi: esis[message],
+                    k: send.k,
+                    repair: send.repair,
+                    source: send.source,
+                },
+                now_ns,
+                |expired| lane.hand_off(&expired, now_ns),
+            );
+            false
+        });
+    }
+
+    /// Tests, without keeping: a send to a client whose path a test stalls
+    /// is refused as a full socket refuses it (its part given back).
+    fn refuse_stalled(&mut self, lane: &EdgeFastLane, fd: RawFd) {
+        let Self { sends, clients, .. } = self;
+        let (mut refused, mut given_back) = (0, 0);
+        sends.retain(|send| {
+            if !super::send_defer::blocked(fd, send.peer) {
+                return true;
+            }
+            refused += 1;
+            if send.source {
+                clients[send.client as usize].give_back(send.part);
+                given_back += 1;
+            }
+            false
+        });
+        lane.stats.would_block.fetch_add(refused, Ordering::Relaxed);
+        lane.stats.given_back.fetch_add(given_back, Ordering::Relaxed);
     }
 
     /// The sends planned for the batch so far.
@@ -2374,6 +2812,7 @@ impl ClientPlan {
         }
         into.streams[message] = self.streams[message];
         into.parts[message] = self.parts[message];
+        into.esis[message] = self.esis[message];
     }
 
     /// Shed the sends of fan-out `shard` (of `shards`) unsent: each part
@@ -3180,6 +3619,8 @@ mod tests {
                         part,
                         peer,
                         client: plan.clients.len() as u32,
+                        k: 48,
+                        repair: 0,
                     });
                 }
                 plan.clients.push(Arc::clone(client));
@@ -3761,6 +4202,8 @@ mod tests {
                     part: 7,
                     peer,
                     client: plan.clients.len() as u32,
+                    k: 48,
+                    repair: 0,
                 });
                 plan.clients.push(FastClient::new(turn as u64));
             }
@@ -3940,6 +4383,8 @@ mod tests {
                         part: 3,
                         peer,
                         client: plan.clients.len() as u32,
+                        k: 48,
+                        repair: 0,
                     });
                     plan.clients.push(FastClient::new(0));
                 }
