@@ -488,6 +488,27 @@ impl EdgeUdpStats {
             .collect()
     }
 
+    /// Subscribers now of each stream that has any, as (fast lane, other
+    /// lanes) (place240: what each costs the edge).
+    pub(crate) fn subscribers_by_stream_and_lane(&self) -> crate::heavy::LaneCounts {
+        let Some(table) = self.table.get() else {
+            return HashMap::new();
+        };
+        let table = table.0.lock().unwrap();
+        table
+            .iter()
+            .filter(|(_, entry)| !entry.subscribers.is_empty())
+            .map(|(stream_id, entry)| {
+                let fast = entry
+                    .subscribers
+                    .values()
+                    .filter(|subscriber| subscriber.fast.is_some())
+                    .count() as u64;
+                (*stream_id, (fast, entry.subscribers.len() as u64 - fast))
+            })
+            .collect()
+    }
+
     /// Bytes that the client lanes sent, every lane (cache-fed,
     /// cut-through, compact, NACK answers, window repair and the fast lane),
     /// with their IP and UDP headers.
@@ -3114,6 +3135,34 @@ async fn admit(
         .await;
         return;
     }
+    // Place240 rule 2: the edge's own cap of heavy sessions, by the cost
+    // model (a lone leg that moves here is taken, as above), the
+    // session's cost reserved until the admission ends so that two
+    // admissions at once each count the other.
+    let mut _heavy_hold = None;
+    if !(from_part.is_some() && others == NO_OTHER_LEGS) {
+        let lane = if fast_lane && sockets.fast_lane().is_some_and(|lane| lane.is_armed()) {
+            crate::heavy::Lane::UdpFast
+        } else {
+            crate::heavy::Lane::UdpCache
+        };
+        match router.heavy_reserve(stream_id, lane).await {
+            Ok(hold) => _heavy_hold = hold,
+            Err(_) => {
+            stats.refusals.fetch_add(1, Ordering::Relaxed);
+            send_control(
+                &socket,
+                peer,
+                &Control::Refused {
+                    stream_id,
+                    reason: "edge-busy".into(),
+                },
+            )
+            .await;
+            return;
+            }
+        }
+    }
     if hedge_over_gate(
         from_part,
         others,
@@ -3836,6 +3885,7 @@ async fn run_stream_sender(
         demand_at: Instant::now(),
         replica_at: Instant::now(),
         draining: router.lifecycle.is_draining().await,
+        hinted: HashMap::new(),
     };
     let mut last_sent = Instant::now();
     loop {
@@ -4147,6 +4197,9 @@ struct Housekeeping {
     /// drain begun or lifted) runs it at the stream's next part, not at
     /// the next tick of up to [`HOUSEKEEPING`] (fix 4, F6a).
     draining: bool,
+    /// Place240 rule 4: when each one-leg subscriber was last told of the
+    /// edge's distress.
+    hinted: HashMap<SocketAddr, Instant>,
 }
 
 /// What the stream sender does after its housekeeping.
@@ -4395,6 +4448,7 @@ async fn housekeeping_moves(
         if active {
             house.at = Instant::now() + DRAIN_TICK;
         }
+        distress_hints(house, router, table, socket, stream_id, now).await;
         AfterHousekeeping::Send
     };
     // B rule 3: `MOVE` again to a leaving subscriber that stays, and the
@@ -4421,6 +4475,67 @@ async fn housekeeping_moves(
         house.at = house.at.min(Instant::now() + LEAVING_TICK);
     }
     after
+}
+
+/// Place240 rule 4: while the edge is in distress and the stream is heavy,
+/// its one-leg subscribers (no other leg named, not leaving) are sent
+/// `MOVE distress-<why>` once a second: a hint, not a move (they stay
+/// served, unmarked); the client moves make-before-break. Each hint counted.
+async fn distress_hints(
+    house: &mut Housekeeping,
+    router: &AppRouter,
+    table: &Table,
+    socket: &UdpSocket,
+    stream_id: u64,
+    now: Instant,
+) {
+    let Some(why) = router.heavy_distress_for(stream_id).await else {
+        house.hinted.clear();
+        return;
+    };
+    let due: Vec<SocketAddr> = {
+        let guard = table.lock().unwrap();
+        let Some(entry) = guard.get(&stream_id) else {
+            return;
+        };
+        house
+            .hinted
+            .retain(|peer, _| entry.subscribers.contains_key(peer));
+        entry
+            .subscribers
+            .iter()
+            .filter(|(_, subscriber)| {
+                subscriber.others == NO_OTHER_LEGS && subscriber.leaving.is_none()
+            })
+            .map(|(peer, _)| *peer)
+            .filter(|peer| {
+                house.hinted.get(peer).is_none_or(|at| {
+                    now.saturating_duration_since(*at) >= crate::heavy::DISTRESS_HINT_EVERY
+                })
+            })
+            .collect()
+    };
+    if due.is_empty() {
+        return;
+    }
+    router
+        .heavy
+        .stats
+        .distress_hints
+        .fetch_add(due.len() as u64, Ordering::Relaxed);
+    let reason = format!("{}{why}", crate::heavy::DISTRESS_PREFIX);
+    for peer in due {
+        house.hinted.insert(peer, now);
+        send_control(
+            socket,
+            peer,
+            &Control::Move {
+                stream_id,
+                reason: reason.clone(),
+            },
+        )
+        .await;
+    }
 }
 
 /// What a stream sender's look at a subscriber's session found.

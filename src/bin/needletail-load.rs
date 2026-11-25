@@ -98,6 +98,10 @@ struct Args {
     /// though it is not level.
     #[arg(long, default_value_t = av_mesh::client_director::DEFAULT_LEVEL_WAIT_MS)]
     level_wait_ms: u64,
+    /// Place240 rules 3 and 4: a lone leg's late or missing parts, and
+    /// its edge's distress.
+    #[command(flatten)]
+    quality: av_mesh::client_quality::QualityArgs,
     /// A leg's first SUBs are each sent again this soon (0: off).
     #[arg(long, default_value_t = av_mesh::client_session::DEFAULT_FIRST_DOUBLE_MS)]
     first_double_ms: u64,
@@ -371,6 +375,7 @@ fn config(args: &Args) -> Result<LoadConfig> {
         lone_hedge_after: Duration::from_millis(args.lone_hedge_after_ms),
         plan_hold: av_mesh::client_session::PLAN_HOLD,
         plan_smoothing: av_mesh::client_session::PLAN_SMOOTHING,
+        quality: args.quality.config(),
     };
     let mut config = LoadConfig::new(session, edges, args.listeners);
     let director = &mut config.director;
@@ -380,6 +385,7 @@ fn config(args: &Args) -> Result<LoadConfig> {
     director.token_wait = Duration::from_millis(args.token_ms);
     director.rebalance_giveup = Duration::from_millis(args.rebalance_giveup_ms);
     director.level_wait = Duration::from_millis(args.level_wait_ms);
+    args.quality.apply(director);
     director.first_retry = Duration::from_millis(args.first_retry_ms);
     director.assignment_udp_port = args.assignment_udp_port;
     director.assignment_https_after = Duration::from_millis(args.assignment_https_after_ms);

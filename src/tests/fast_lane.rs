@@ -394,7 +394,7 @@ impl LaneEdge {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn start_full(
+    pub(super) async fn start_full(
         ip: Ipv4Addr,
         client: SocketAddr,
         hole_distance: Duration,

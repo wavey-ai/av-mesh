@@ -640,6 +640,17 @@ impl EdgeAdmission {
         }
     }
 
+    /// Forget a session admitted a moment ago (place240: a heavy reader its
+    /// edge's own cap refused after the admission): it is refused again at
+    /// its next request rather than served as one admitted.
+    pub fn forget_session(&self, session_id: &str) {
+        self.inner
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(session_id);
+    }
+
     /// Sessions already sent to another cache that made a request here in
     /// the last `within_ms`: readers that still fetch the parts they were
     /// told about. A draining edge waits for them, as the session gauge no

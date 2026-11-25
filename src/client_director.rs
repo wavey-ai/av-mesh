@@ -116,6 +116,33 @@ const PARENTS_LOST: &str = "parents-lost";
 pub const APPORTION: &str = "apportion";
 /// Refusals for load, which passes in seconds.
 const BUSY_REFUSALS: [&str; 2] = ["edge-busy", "edge-full"];
+/// Place240: the reasons of a move the listener makes itself (rule 3) or
+/// that its edge's distress asks for (rule 4).
+pub const LATE_PARTS: &str = "late-parts";
+pub const MISSING_PARTS: &str = "missing-parts";
+/// A leaving leg of a stream of objects is kept, after its replacement's
+/// first object, until the replacement has brought a part at least as new
+/// as the newest the leaving leg brought, or this long after the move
+/// (place240: parts the old leg completed during the overlap were lost
+/// with it when it went at the first object).
+pub const OBJECT_HANDOVER_MAX: Duration = Duration::from_secs(2);
+/// Defaults of `--quality-hold-off-ms` (a node left for late or missing
+/// parts is not taken again for this long), `--quality-moves-per-minute`,
+/// `--quality-no-better-ms` and `--quality-giveup-ms`.
+pub const DEFAULT_QUALITY_HOLD_OFF_MS: u64 = 30_000;
+pub const DEFAULT_QUALITY_MOVES_PER_MINUTE: u32 = 2;
+pub const DEFAULT_QUALITY_NO_BETTER_MS: u64 = 10_000;
+pub const DEFAULT_QUALITY_GIVEUP_MS: u64 = 3_000;
+/// A listener with two legs moves for distress only when every leg's edge
+/// said so within this long.
+pub const DISTRESS_TOGETHER: Duration = Duration::from_secs(2);
+
+/// Whether a leaving reason is one of place240's own moves.
+fn quality_reason(reason: &str) -> bool {
+    reason == LATE_PARTS
+        || reason == MISSING_PARTS
+        || reason.starts_with(crate::client_udp::DISTRESS_MOVE_PREFIX)
+}
 
 pub const DEFAULT_PATHS: u8 = 2;
 pub const DEFAULT_TOKEN_MS: u64 = 400;
@@ -173,6 +200,9 @@ pub struct LegView {
     /// The leg's median lag behind the first arrival over the last 32
     /// delivered parts (zero when it was first).
     pub lag: Option<Duration>,
+    /// The highest part the leg brought whole (a first arrival or a
+    /// duplicate).
+    pub highest: Option<u64>,
 }
 
 /// Why the session gave a leg up.
@@ -235,6 +265,13 @@ pub enum LegEvent {
     /// 8 of the last 16 parts came as RaptorQ objects (a stream over the
     /// two-path bit rate): once.
     ObjectLane,
+    /// Place240 rule 3: the lone leg delivers parts late or misses them
+    /// (`late-parts`, `missing-parts`): the leg still delivers, and the
+    /// director moves it make-before-break.
+    Degraded { leg: LegKey, reason: String },
+    /// Place240 rule 4: the leg's edge says it is in distress (`MOVE
+    /// distress-<why>`); it keeps serving the leg.
+    Distress { leg: LegKey, reason: String },
 }
 
 /// The surface of the session that the director drives (B 3.1, 3.2). Every
@@ -344,6 +381,17 @@ pub struct DirectorConfig {
     pub udp_port: Option<u16>,
     /// Seed of the requests' nonces (the caller's randomness).
     pub nonce_seed: u64,
+    /// Place240 rule 3 (`--quality-*`): a node left for late or missing
+    /// parts, or for its distress, is skipped this long; such moves are
+    /// made at most this many a minute; a degradation within `no_better`
+    /// of the last such move is not moved for (the cause is not the edge:
+    /// upstream, or the client's own path), and holds such moves off for
+    /// `hold_off`; a move whose replacement brought nothing within
+    /// `giveup` is given up and the old leg kept.
+    pub quality_hold_off: Duration,
+    pub quality_moves_per_minute: u32,
+    pub quality_no_better: Duration,
+    pub quality_giveup: Duration,
 }
 
 impl DirectorConfig {
@@ -364,6 +412,10 @@ impl DirectorConfig {
             assignment_timeout: Duration::from_millis(DEFAULT_ASSIGNMENT_TIMEOUT_MS),
             udp_port: None,
             nonce_seed: 0,
+            quality_hold_off: Duration::from_millis(DEFAULT_QUALITY_HOLD_OFF_MS),
+            quality_moves_per_minute: DEFAULT_QUALITY_MOVES_PER_MINUTE,
+            quality_no_better: Duration::from_millis(DEFAULT_QUALITY_NO_BETTER_MS),
+            quality_giveup: Duration::from_millis(DEFAULT_QUALITY_GIVEUP_MS),
         }
     }
 }
@@ -448,6 +500,32 @@ impl ShortGrants {
     }
 }
 
+/// Place240: the listener's own moves by reason, and those it did not make.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QualityMoves {
+    pub late_parts: u64,
+    pub missing_parts: u64,
+    /// Its edge's distress (a one-leg listener, or every leg's edge).
+    pub distress: u64,
+    /// A degradation soon after such a move (the new edge no better), or
+    /// in the hold-off that followed one: not moved for.
+    pub no_better: u64,
+    /// Over `--quality-moves-per-minute`: not moved for.
+    pub over_budget: u64,
+    /// The replacement brought nothing within `--quality-giveup-ms`: the
+    /// old leg kept.
+    pub given_up: u64,
+    /// Distress hints of one leg beside another that delivers: ignored.
+    pub distress_ignored: u64,
+}
+
+impl QualityMoves {
+    /// The moves made, by reason, for a report.
+    pub fn moves(&self) -> u64 {
+        self.late_parts + self.missing_parts + self.distress
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DirectorStats {
     /// Requests made, and answers taken by each way.
@@ -472,6 +550,8 @@ pub struct DirectorStats {
     pub home_returns: u64,
     pub takebacks: u64,
     pub short_grants: ShortGrants,
+    /// Place240 rules 3 and 4.
+    pub quality: QualityMoves,
 }
 
 /// A leg as the director holds it.
@@ -554,6 +634,9 @@ enum SkipCause {
     NoToken,
     /// Refused for load, or sent away for a rebalance before its `OK`.
     Busy,
+    /// Left for late or missing parts, or its distress (place240): for
+    /// `--quality-hold-off-ms`.
+    Quality,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -641,6 +724,10 @@ enum Handover {
     },
     /// A rebalance not level by the give-up: `old` is taken back.
     GiveUp { old: LegKey },
+    /// Place240: a move of the listener's own whose replacement brought
+    /// nothing by the give-up: the old leg is kept (its edge never sent it
+    /// away), the replacements released.
+    Keep { old: LegKey },
 }
 
 #[derive(Debug, Clone)]
@@ -709,6 +796,15 @@ pub struct Director {
     urls: HashMap<String, String>,
     next_check: Instant,
     wake: Instant,
+    /// Place240: the listener's own moves of the last minute, the last
+    /// one, the hold-off after a move that was no better, and the distress
+    /// hints of each leg.
+    quality_moves: Vec<Instant>,
+    last_quality_move: Option<Instant>,
+    quality_quiet_until: Option<Instant>,
+    distress_seen: Vec<(LegKey, Instant)>,
+    /// The last `edge-busy` refusal with no leg delivering (place240).
+    last_busy: Option<Instant>,
 }
 
 fn sender(out: &mut Vec<Action>) -> impl FnMut(SocketAddr, &[u8]) + '_ {
@@ -796,6 +892,11 @@ impl Director {
             urls: HashMap::new(),
             next_check: now,
             wake: now,
+            quality_moves: Vec::new(),
+            last_quality_move: None,
+            quality_quiet_until: None,
+            distress_seen: Vec::new(),
+            last_busy: None,
         };
         let urls = director.config.entries.clone();
         director.home = urls.iter().map(|url| director.entry_index(url)).collect();
@@ -995,6 +1096,7 @@ impl Director {
             SkipCause::Failed => Some(now + SKIP_FAILED),
             SkipCause::NoToken => Some(now + SKIP_NO_TOKEN),
             SkipCause::Busy => Some(now + SKIP_BUSY),
+            SkipCause::Quality => Some(now + self.config.quality_hold_off),
         };
         // A failure always takes its 30 s. A move's skip gives way only to
         // a failure; a token's or a busy edge's skip never shortens a
@@ -1004,7 +1106,7 @@ impl Director {
             let keep = match cause {
                 SkipCause::Failed => false,
                 SkipCause::Moved => old.cause == SkipCause::Failed,
-                SkipCause::NoToken | SkipCause::Busy => old
+                SkipCause::NoToken | SkipCause::Busy | SkipCause::Quality => old
                     .until
                     .is_none_or(|end| until.is_some_and(|new_end| end >= new_end)),
             };
@@ -1312,12 +1414,31 @@ impl Director {
             // seconds; a drain, lost parents or anything else is the
             // edge's for longer.
             LegEvent::Refused { leg, reason } => {
-                let cause = if reason == REBALANCE || BUSY_REFUSALS.contains(&reason.as_str()) {
+                let busy = BUSY_REFUSALS.contains(&reason.as_str());
+                let cause = if reason == REBALANCE || busy {
                     SkipCause::Busy
                 } else {
                     SkipCause::Failed
                 };
-                self.fail(legs, leg, &reason, cause, now, out)
+                self.fail(legs, leg, &reason, cause, now, out);
+                // Place240: an edge at its heavy cap refuses `edge-busy`; with
+                // every edge of the region at it the entry names the least
+                // full again, which refuses again. A listener with no leg
+                // asks again after the retry wait, not at once (an honest
+                // busy answer, not a loop of refusals); one with a leg
+                // that delivers asks at once, as before.
+                if busy && !self.any_delivering(legs, now, None) {
+                    // The first is asked again at once (the entry places
+                    // it on the next edge with room: one round trip more);
+                    // another within a second waits.
+                    if self
+                        .last_busy
+                        .is_some_and(|at| now.saturating_duration_since(at) < Duration::from_secs(1))
+                    {
+                        self.retry_at = Some(now + RETRY_ALONE);
+                    }
+                    self.last_busy = Some(now);
+                }
             }
             LegEvent::NoToken(key) => {
                 if let Some(index) = self.leg_index(key) {
@@ -1337,7 +1458,82 @@ impl Director {
             LegEvent::TakenBack(_) => {}
             LegEvent::AllSilent => self.on_all_silent(legs, now, out),
             LegEvent::ObjectLane => self.on_object_lane(legs, now, out),
+            LegEvent::Degraded { leg, reason } => self.quality_move(leg, &reason, now),
+            LegEvent::Distress { leg, reason } => self.on_distress(legs, leg, reason, now),
         }
+    }
+
+    /// Place240 rule 4: the edge of `key` says it is in distress. A
+    /// listener whose other legs deliver ignores it unless every leg's edge
+    /// said so lately; one with a lone leg moves (as rule 3).
+    fn on_distress<S: SessionLegs>(&mut self, legs: &S, key: LegKey, reason: String, now: Instant) {
+        self.distress_seen
+            .retain(|(leg, at)| *leg != key && now.saturating_duration_since(*at) < DISTRESS_TOGETHER);
+        self.distress_seen.push((key, now));
+        let others: Vec<LegKey> = self
+            .legs
+            .iter()
+            .filter(|leg| leg.key != key && leg.counted() && Self::view(legs, leg.key, now).delivering)
+            .map(|leg| leg.key)
+            .collect();
+        let together = others
+            .iter()
+            .all(|other| self.distress_seen.iter().any(|(leg, _)| leg == other));
+        if !together {
+            self.stats.quality.distress_ignored += 1;
+            return;
+        }
+        self.quality_move(key, &reason, now);
+    }
+
+    /// Place240 rule 3: leave the leg `key` make-before-break for `reason`
+    /// (late or missing parts, or its edge's distress): it is leaving (the
+    /// session keeps taking its parts), its node skipped for the hold-off,
+    /// and the entry asked at once for another edge; the old leg goes at
+    /// its replacement's first object (one leg) or once level. Guarded
+    /// against flapping: at most `quality_moves_per_minute`, and none for a
+    /// degradation within `quality_no_better` of the last such move (the
+    /// new edge is no better: the cause is upstream or the client's own),
+    /// which also holds such moves off for `quality_hold_off`.
+    fn quality_move(&mut self, key: LegKey, reason: &str, now: Instant) {
+        let Some(index) = self.leg_index(key) else {
+            return;
+        };
+        if !self.legs[index].counted() || !self.legs[index].live {
+            return;
+        }
+        if self.quality_quiet_until.is_some_and(|until| now < until) {
+            self.stats.quality.no_better += 1;
+            return;
+        }
+        if self
+            .last_quality_move
+            .is_some_and(|at| now.saturating_duration_since(at) < self.config.quality_no_better)
+        {
+            self.stats.quality.no_better += 1;
+            self.quality_quiet_until = Some(now + self.config.quality_hold_off);
+            return;
+        }
+        self.quality_moves
+            .retain(|at| now.saturating_duration_since(*at) < Duration::from_secs(60));
+        if self.quality_moves.len() >= self.config.quality_moves_per_minute as usize {
+            self.stats.quality.over_budget += 1;
+            return;
+        }
+        self.quality_moves.push(now);
+        self.last_quality_move = Some(now);
+        match reason {
+            LATE_PARTS => self.stats.quality.late_parts += 1,
+            MISSING_PARTS => self.stats.quality.missing_parts += 1,
+            _ => self.stats.quality.distress += 1,
+        }
+        let leg = &mut self.legs[index];
+        leg.leaving = Some((reason.to_owned(), now));
+        leg.passed_over = None;
+        let node = leg.node.clone();
+        self.skip_node(&node, SkipCause::Quality, now);
+        self.place_opened(now);
+        self.deferred_ask = None;
     }
 
     fn on_tokened<S: SessionLegs>(
@@ -2071,7 +2267,12 @@ impl Director {
             .legs
             .iter()
             .filter(|leg| leg.hedge_for.is_none())
-            .all(|leg| leg.leaving.is_some() && !leg.rebalance() && !leg.leaving_for(PARENTS_LOST));
+            .all(|leg| {
+                leg.leaving.is_some()
+                    && !leg.rebalance()
+                    && !leg.leaving_for(PARENTS_LOST)
+                    && !leg.leaving.as_ref().is_some_and(|(why, _)| quality_reason(why))
+            });
         if usable.is_empty() && all_leaving && !self.failover.is_empty() {
             let url = self.failover[0].clone();
             self.answered = Some((request, now + ANSWERED_KEPT));
@@ -2151,7 +2352,12 @@ impl Director {
                 chosen.push((node, addr));
             }
         }
-        let delivering = self.any_delivering(legs, now, None);
+        // A leg left for late or missing parts (place240) delivers, but
+        // late: its holes are the new leg's, which starts from the oldest.
+        let delivering = self.legs.iter().any(|leg| {
+            !leg.leaving.as_ref().is_some_and(|(why, _)| quality_reason(why))
+                && Self::view(legs, leg.key, now).delivering
+        });
         let from = if delivering {
             StartFrom::AfterNewest
         } else {
@@ -2780,6 +2986,20 @@ impl Director {
                     }
                     self.take_back(legs, old, now, out);
                 }
+                Handover::Keep { old } => {
+                    while let Some(new) = self
+                        .legs
+                        .iter()
+                        .find(|leg| leg.stands_for == Some(old) && leg.hedge_for.is_none())
+                        .map(|leg| leg.key)
+                    {
+                        self.release(legs, new, now, out);
+                    }
+                    if let Some(index) = self.leg_index(old) {
+                        self.legs[index].leaving = None;
+                    }
+                    self.stats.quality.given_up += 1;
+                }
             }
         }
         // A hedge whose leg came back is released once that leg has been
@@ -2872,7 +3092,17 @@ impl Director {
                     return false;
                 }
                 if self.objects {
-                    return true;
+                    // Until the new leg has caught up with what the old one
+                    // brought (bounded): what the old leg completes in the
+                    // overlap is taken, and none of its parts is lost
+                    // with it.
+                    let old_highest = Self::view(legs, old.key, now).highest;
+                    let new_highest = Self::view(legs, new.key, now).highest;
+                    return match (old_highest, new_highest) {
+                        (Some(old), Some(new)) => new >= old,
+                        (None, _) => true,
+                        (Some(_), None) => false,
+                    } || now >= *moved_at + OBJECT_HANDOVER_MAX;
                 }
                 let first = Self::view(legs, new.key, now).first_part;
                 let holes_ok = match (hole, first) {
@@ -2896,6 +3126,11 @@ impl Director {
             }
             if rebalance && now >= *moved_at + self.config.rebalance_giveup {
                 return Some(Handover::GiveUp { old: old.key });
+            }
+            if old.leaving.as_ref().is_some_and(|(why, _)| quality_reason(why))
+                && now >= *moved_at + self.config.quality_giveup
+            {
+                return Some(Handover::Keep { old: old.key });
             }
         }
         None
@@ -6083,5 +6318,251 @@ mod tests {
             ]
         );
         assert!(path.spans.is_empty() && !path.is_open(), "{:?}", path.spans);
+    }
+
+    /// A 4K viewer on one leg at e1, objects shown, a spare at e2.
+    fn one_leg_viewer(sid: &str) -> World {
+        let mut w = World::new(sid, 2, true);
+        w.poll();
+        let (to, nonce, _) = w.requests().pop().unwrap();
+        w.answer_why(
+            to,
+            nonce,
+            vec![cache(1), cache(2), cache(3)],
+            1,
+            true,
+            None,
+            Some(ShortGrant::Bitrate),
+        );
+        w.live("e1");
+        assert!(w.token_from(edge_addr(2), 0x22));
+        w.event(LegEvent::ObjectLane);
+        w.run_to(w.ms() + 100);
+        w.take();
+        w
+    }
+
+    /// Place240 rule 3: a lone leg judged late is left make-before-break:
+    /// the entry is asked at once with its node skipped, the old leg is
+    /// kept until the replacement's first object, and the move is counted
+    /// by reason; the node stays skipped for the hold-off.
+    #[test]
+    fn a_degraded_lone_leg_moves_make_before_break_and_its_node_is_held_off() {
+        let mut w = one_leg_viewer("late-1");
+        let e1 = w.key("e1");
+        w.event(LegEvent::Degraded {
+            leg: e1,
+            reason: LATE_PARTS.into(),
+        });
+        assert!(w.leaving("e1"));
+        let requests = w.requests();
+        let (to, nonce, request) = requests.last().cloned().expect("asked at once");
+        let Control::Assign { skip, .. } = &request else {
+            unreachable!()
+        };
+        assert!(skip.contains(&"e1".to_owned()), "{skip:?}");
+        w.answer(to, nonce, vec![cache(3)], 1, false, None);
+        assert!(!w.s.legs[&e1].released, "kept until the new leg delivers");
+        // The late leg's holes are the new leg's: it starts from the oldest.
+        assert_eq!(w.fake("e3").start.from, StartFrom::OldestHole);
+        w.live("e3");
+        w.run_to(w.ms() + 5);
+        assert!(w.s.legs[&e1].released);
+        assert_eq!(w.held(), ["e3"]);
+        assert_eq!(w.d.stats.quality.late_parts, 1);
+        let replaced = w.d.replacements.last().unwrap();
+        assert_eq!((replaced.reason.as_str(), replaced.kind), (LATE_PARTS, ReplacementKind::Handover));
+        // Skipped for the hold-off, not just the move's 3 s.
+        w.run_to(w.ms() + 20_000);
+        assert!(w.d.skipped(w.now).contains(&"e1".to_owned()));
+        w.run_to(w.ms() + 11_000);
+        assert!(!w.d.skipped(w.now).contains(&"e1".to_owned()));
+    }
+
+    /// Place240 rule 3's guards: a degradation soon after such a move (the
+    /// new edge no better: an upstream stall at every edge) moves nobody
+    /// and holds such moves off; more than the minute's budget moves
+    /// nobody; a replacement that brings nothing is given up and the old
+    /// leg kept.
+    #[test]
+    fn quality_moves_do_not_ping_pong() {
+        let mut w = one_leg_viewer("upstream-1");
+        let e1 = w.key("e1");
+        w.event(LegEvent::Degraded {
+            leg: e1,
+            reason: LATE_PARTS.into(),
+        });
+        let (to, nonce, _) = w.requests().pop().unwrap();
+        w.answer(to, nonce, vec![cache(3)], 1, false, None);
+        w.live("e3");
+        w.run_to(w.ms() + 5);
+        assert_eq!(w.held(), ["e3"]);
+        // e3 is late too, 2 s later: no better.
+        w.run_to(w.ms() + 2_000);
+        let e3 = w.key("e3");
+        w.event(LegEvent::Degraded {
+            leg: e3,
+            reason: LATE_PARTS.into(),
+        });
+        assert!(!w.leaving("e3"));
+        assert!(w.requests().is_empty());
+        assert_eq!(w.d.stats.quality.no_better, 1);
+        // And in the hold-off that follows, still none.
+        w.run_to(w.ms() + 15_000);
+        w.event(LegEvent::Degraded {
+            leg: e3,
+            reason: MISSING_PARTS.into(),
+        });
+        assert!(!w.leaving("e3"));
+        assert_eq!(w.d.stats.quality.no_better, 2);
+        assert_eq!(w.d.stats.quality.moves(), 1);
+
+        // The budget: at most two a minute.
+        let mut w = one_leg_viewer("budget-1");
+        w.d.config.quality_no_better = Duration::ZERO;
+        for (index, next) in [3_u8, 4].into_iter().enumerate() {
+            let node = w.held()[0].clone();
+            let key = w.key(&node);
+            w.event(LegEvent::Degraded {
+                leg: key,
+                reason: MISSING_PARTS.into(),
+            });
+            let (to, nonce, _) = w.requests().pop().unwrap();
+            w.answer(to, nonce, vec![cache(next)], 1, false, None);
+            w.live(&format!("e{next}"));
+            w.run_to(w.ms() + 1_000);
+            assert_eq!(w.d.stats.quality.missing_parts, index as u64 + 1);
+        }
+        let e4 = w.key("e4");
+        w.event(LegEvent::Degraded {
+            leg: e4,
+            reason: MISSING_PARTS.into(),
+        });
+        assert!(!w.leaving("e4"));
+        assert_eq!(w.d.stats.quality.over_budget, 1);
+
+        // No replacement within the give-up: the old leg stays.
+        let mut w = one_leg_viewer("giveup-1");
+        let e1 = w.key("e1");
+        w.event(LegEvent::Degraded {
+            leg: e1,
+            reason: LATE_PARTS.into(),
+        });
+        let (to, nonce, _) = w.requests().pop().unwrap();
+        w.answer(to, nonce, vec![cache(3)], 1, false, None);
+        w.run_to(w.ms() + 3_100);
+        assert_eq!(w.held(), ["e1"]);
+        assert!(!w.leaving("e1"));
+        assert_eq!(w.d.stats.quality.given_up, 1);
+        assert!(w.requests().is_empty(), "nothing asked once it is kept");
+    }
+
+    /// Place240 rule 4: an edge's distress hint moves a one-leg listener;
+    /// a two-leg listener ignores it unless both legs' edges say so.
+    #[test]
+    fn a_distress_hint_moves_one_leg_and_two_legs_only_together() {
+        let mut w = one_leg_viewer("distress-1");
+        let e1 = w.key("e1");
+        w.event(LegEvent::Distress {
+            leg: e1,
+            reason: "distress-send-blocked".into(),
+        });
+        assert!(w.leaving("e1"));
+        assert_eq!(w.d.stats.quality.distress, 1);
+
+        let mut w = World::new("distress-2", 2, true);
+        w.join(&[1, 2], Some(3));
+        let (e1, e2) = (w.key("e1"), w.key("e2"));
+        w.event(LegEvent::Distress {
+            leg: e1,
+            reason: "distress-tee-shed".into(),
+        });
+        assert!(!w.leaving("e1"));
+        assert_eq!(w.d.stats.quality.distress_ignored, 1);
+        w.run_to(w.ms() + 500);
+        w.event(LegEvent::Distress {
+            leg: e2,
+            reason: "distress-tee-shed".into(),
+        });
+        assert!(w.leaving("e2"), "both legs said so");
+    }
+
+    /// Place240 follow-up 2: a leaving leg of a stream of objects is kept
+    /// after its replacement's first object until the replacement has
+    /// brought a part as new as the newest the old leg brought (what the
+    /// old leg completes in the overlap is taken, none is lost with it), or
+    /// OBJECT_HANDOVER_MAX after the move.
+    #[test]
+    fn an_objects_leg_is_released_once_its_replacement_has_caught_up() {
+        let mut w = one_leg_viewer("catch-up-1");
+        let e1 = w.key("e1");
+        w.view("e1", |view| view.highest = Some(1_000));
+        w.event(LegEvent::Degraded {
+            leg: e1,
+            reason: LATE_PARTS.into(),
+        });
+        let (to, nonce, _) = w.requests().pop().unwrap();
+        w.answer(to, nonce, vec![cache(3)], 1, false, None);
+        w.live("e3");
+        // The new leg's first object is part 990: the old leg's 991-1000
+        // may still come only from the old leg.
+        w.view("e3", |view| view.highest = Some(990));
+        w.run_to(w.ms() + 100);
+        assert!(!w.s.legs[&e1].released, "kept until the new leg caught up");
+        w.view("e1", |view| view.highest = Some(1_004));
+        w.view("e3", |view| view.highest = Some(1_003));
+        w.run_to(w.ms() + 100);
+        assert!(!w.s.legs[&e1].released);
+        w.view("e3", |view| view.highest = Some(1_004));
+        w.run_to(w.ms() + 10);
+        assert!(w.s.legs[&e1].released);
+        // A replacement that never catches up: released at the limit.
+        let mut w = one_leg_viewer("catch-up-2");
+        let e1 = w.key("e1");
+        w.view("e1", |view| view.highest = Some(1_000));
+        w.event(LegEvent::Degraded {
+            leg: e1,
+            reason: LATE_PARTS.into(),
+        });
+        let moved = w.ms();
+        let (to, nonce, _) = w.requests().pop().unwrap();
+        w.answer(to, nonce, vec![cache(3)], 1, false, None);
+        w.live("e3");
+        w.view("e3", |view| view.highest = Some(900));
+        w.run_to(moved + OBJECT_HANDOVER_MAX.as_millis() as u64 - 50);
+        assert!(!w.s.legs[&e1].released);
+        w.run_to(moved + OBJECT_HANDOVER_MAX.as_millis() as u64 + 10);
+        assert!(w.s.legs[&e1].released);
+    }
+
+    /// Place240 follow-up 3: an edge's own cap refuses `edge-busy` when two
+    /// entries placed onto it at once; a listener with no leg asks again at
+    /// once (the entry names the next edge with room: one round trip more,
+    /// not a failed join), and only a second refusal within a second waits.
+    #[test]
+    fn a_busy_refusal_is_asked_again_at_once_and_a_second_waits() {
+        let mut w = World::new("busy-1", 1, false);
+        w.poll();
+        let (to, nonce, _) = w.requests().pop().unwrap();
+        w.answer(to, nonce, vec![cache(1), cache(2)], 1, false, None);
+        let e1 = w.key("e1");
+        w.event(LegEvent::Refused {
+            leg: e1,
+            reason: "edge-busy".into(),
+        });
+        let (to, nonce, request) = w.requests().pop().expect("asked again at once");
+        let Control::Assign { skip, .. } = &request else {
+            unreachable!()
+        };
+        assert!(skip.contains(&"e1".to_owned()));
+        w.answer(to, nonce, vec![cache(2)], 1, false, None);
+        let e2 = w.key("e2");
+        w.event(LegEvent::Refused {
+            leg: e2,
+            reason: "edge-busy".into(),
+        });
+        assert!(w.requests().is_empty(), "a second refusal within a second waits");
+        w.run_to(w.ms() + 250);
+        assert!(!w.requests().is_empty());
     }
 }
