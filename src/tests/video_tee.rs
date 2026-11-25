@@ -414,7 +414,11 @@ pub(super) fn tee_4k(options: TeeOptions) -> TeeRun {
     let target = relay.secondary_video.unwrap();
     let start = Instant::now() + Duration::from_millis(50);
     let node_threads = ["needletail-fast"];
-    let tee_threads = ["vtee-rt", "needletail-tee"];
+    // Since 4k-repair each lane's tee is a thread of its own (nt-tee-*);
+    // the decode pool and the repair thread are counted apart.
+    let tee_threads = ["vtee-rt", "needletail-tee", "nt-tee"];
+    let repair_threads = ["needletail-deco", "needletail-rep"];
+    let repair_before = threads_cpu_ns(&repair_threads);
     let interval = Duration::from_nanos(1_000_000_000 / options.fps);
     let (before, after) = std::thread::scope(|scope| {
         let frames = &frames;
@@ -501,6 +505,12 @@ pub(super) fn tee_4k(options: TeeOptions) -> TeeRun {
                 .count() as u64
         })
         .sum();
+    println!(
+        "  decode pool and repair thread: {:.1} % of a CPU (over the run, warm-up included)",
+        threads_cpu_ns(&repair_threads).saturating_sub(repair_before) as f64 / 1e9
+            / (elapsed + options.seconds as f64).max(1.0)
+            * 100.0
+    );
     let run = TeeRun {
         options,
         offered_per_second: wire_datagrams as f64 / window_seconds,
