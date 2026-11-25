@@ -178,6 +178,13 @@ pub struct RelayClassConfig {
     /// lacks here and a margin (`RepairTrim`); repair-only children take
     /// all of it.
     pub trim_forwarded_repair: bool,
+    /// `--reader-slice-us` (hls4k): the small-part lane's tee asks the
+    /// kernel for the same slice as the LL-HLS readers' threads, so that at
+    /// its nice 0 it keeps its precedence over them (nice 5) when a part
+    /// wakes both: with the kernel's slice the readers' 200 µs gave them the
+    /// earlier deadline. 0 keeps the kernel's. The large-part lane's tee
+    /// keeps the kernel's slice at nice 10.
+    pub small_lane_tee_slice_us: u64,
     /// Tests: the tee of this class panics on its first datagram.
     #[cfg(test)]
     pub test_tee_panic: Option<TrafficClass>,
@@ -224,6 +231,7 @@ impl Default for RelayClassConfig {
             decode_pool: None,
             trim_to_margin: false,
             trim_forwarded_repair: true,
+            small_lane_tee_slice_us: 0,
             #[cfg(test)]
             test_tee_panic: None,
             #[cfg(test)]
@@ -749,6 +757,8 @@ pub struct FastPlaneSnapshot {
     pub video_tee_cpu_us: u64,
     pub video_tee_batches: u64,
     pub video_tee_lag_max_us: u64,
+    /// The small-part lane's tee: its longest lag (µs).
+    pub audio_tee_lag_max_us: u64,
     pub video_tee_parts_shed: u64,
     /// Tee copies refused while a ring was growing (in `tee_dropped` too),
     /// and the bytes of the video tee ring in use.
@@ -841,6 +851,7 @@ impl FastPlaneStats {
             video_tee_cpu_us: load(&self.tee_cpu_us[1]),
             video_tee_batches: load(&self.tee_batches[1]),
             video_tee_lag_max_us: load(&self.tee_lag_max_us[1]),
+            audio_tee_lag_max_us: load(&self.tee_lag_max_us[0]),
             video_tee_parts_shed: load(&self.tee_parts_shed),
             tee_dropped_growing: load(&self.tee_dropped_growing),
             video_tee_ring_bytes: load(&self.tee_ring_bytes[1]),
@@ -3612,6 +3623,11 @@ pub async fn run_relay_class_ingest(
         }
         let (ended_tx, ended_rx) = tokio::sync::oneshot::channel();
         let nice = tee_nice(class);
+        let slice_us = if class == TrafficClass::Audio {
+            config.small_lane_tee_slice_us
+        } else {
+            0
+        };
         // The tee logs where its caller logs.
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let started = std::thread::Builder::new()
@@ -3619,6 +3635,9 @@ pub async fn run_relay_class_ingest(
             .spawn(move || {
                 let _log = tracing::dispatcher::set_default(&dispatch);
                 let _ = sys::set_nice(nice);
+                if slice_us > 0 {
+                    crate::set_thread_slice(slice_us);
+                }
                 let result = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()

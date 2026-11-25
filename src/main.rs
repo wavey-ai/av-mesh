@@ -9440,6 +9440,10 @@ struct LiveTsCache {
     /// The node's memory guard: a new video playlist is refused above its
     /// soft limit. Unset (tests), nothing is refused.
     memory_guard: OnceLock<Arc<av_mesh::mem_guard::Guard>>,
+    /// The runtime the cache was made on (the node's): releases of a
+    /// replaced stream's bytes are spawned there, never on the runtime of
+    /// a tee thread that commits the new session's first part.
+    node_runtime: Option<tokio::runtime::Handle>,
 }
 
 impl LiveTsCache {
@@ -9584,6 +9588,7 @@ impl LiveTsCache {
             parent_feeds: OnceLock::new(),
             started_unix_us,
             memory_guard: OnceLock::new(),
+            node_runtime: tokio::runtime::Handle::try_current().ok(),
         })
     }
 
@@ -11354,9 +11359,16 @@ impl LiveTsCache {
             return;
         };
         let chunk_cache = Arc::clone(&self.chunk_cache);
-        tokio::spawn(async move {
+        let release = async move {
             chunk_cache.release_hidden(hidden).await;
-        });
+        };
+        // On the node's runtime: the commit that replaces a session runs on
+        // a lane's tee thread (its own runtime), which must not spend its
+        // time giving back a 4K window.
+        match &self.node_runtime {
+            Some(runtime) => drop(runtime.spawn(release)),
+            None => drop(tokio::spawn(release)),
+        }
     }
 
     /// Drop the local copy of a playlist that the cache mesh supplied.
@@ -47072,6 +47084,7 @@ mod tests {
                 decode_pool: None,
                 trim_to_margin: false,
                 trim_forwarded_repair: true,
+                small_lane_tee_slice_us: 0,
                 test_tee_panic: Some(fast_plane::TrafficClass::Audio),
                 test_tees_on_caller_runtime: false,
                 test_video_tee_spin_ns: 0,
