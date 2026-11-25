@@ -3742,6 +3742,7 @@ async fn run_stream_sender(
         demand_at: Instant::now(),
         replica_at: Instant::now(),
         draining: router.lifecycle.is_draining().await,
+        hinted: HashMap::new(),
     };
     let mut last_sent = Instant::now();
     loop {
@@ -4053,6 +4054,9 @@ struct Housekeeping {
     /// drain begun or lifted) runs it at the stream's next part, not at
     /// the next tick of up to [`HOUSEKEEPING`] (fix 4, F6a).
     draining: bool,
+    /// Place240 rule 4: when each one-leg subscriber was last told of the
+    /// edge's distress.
+    hinted: HashMap<SocketAddr, Instant>,
 }
 
 /// What the stream sender does after its housekeeping.
@@ -4301,6 +4305,7 @@ async fn housekeeping_moves(
         if active {
             house.at = Instant::now() + DRAIN_TICK;
         }
+        distress_hints(house, router, table, socket, stream_id, now).await;
         AfterHousekeeping::Send
     };
     // B rule 3: `MOVE` again to a leaving subscriber that stays, and the
@@ -4327,6 +4332,67 @@ async fn housekeeping_moves(
         house.at = house.at.min(Instant::now() + LEAVING_TICK);
     }
     after
+}
+
+/// Place240 rule 4: while the edge is in distress and the stream is heavy,
+/// its one-leg subscribers (no other leg named, not leaving) are sent
+/// `MOVE distress-<why>` once a second: a hint, not a move (they stay
+/// served, unmarked); the client moves make-before-break. Each hint counted.
+async fn distress_hints(
+    house: &mut Housekeeping,
+    router: &AppRouter,
+    table: &Table,
+    socket: &UdpSocket,
+    stream_id: u64,
+    now: Instant,
+) {
+    let Some(why) = router.heavy_distress_for(stream_id) else {
+        house.hinted.clear();
+        return;
+    };
+    let due: Vec<SocketAddr> = {
+        let guard = table.lock().unwrap();
+        let Some(entry) = guard.get(&stream_id) else {
+            return;
+        };
+        house
+            .hinted
+            .retain(|peer, _| entry.subscribers.contains_key(peer));
+        entry
+            .subscribers
+            .iter()
+            .filter(|(_, subscriber)| {
+                subscriber.others == NO_OTHER_LEGS && subscriber.leaving.is_none()
+            })
+            .map(|(peer, _)| *peer)
+            .filter(|peer| {
+                house.hinted.get(peer).is_none_or(|at| {
+                    now.saturating_duration_since(*at) >= crate::heavy::DISTRESS_HINT_EVERY
+                })
+            })
+            .collect()
+    };
+    if due.is_empty() {
+        return;
+    }
+    router
+        .heavy
+        .stats
+        .distress_hints
+        .fetch_add(due.len() as u64, Ordering::Relaxed);
+    let reason = format!("{}{why}", crate::heavy::DISTRESS_PREFIX);
+    for peer in due {
+        house.hinted.insert(peer, now);
+        send_control(
+            socket,
+            peer,
+            &Control::Move {
+                stream_id,
+                reason: reason.clone(),
+            },
+        )
+        .await;
+    }
 }
 
 /// What a stream sender's look at a subscriber's session found.

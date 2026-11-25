@@ -41,8 +41,8 @@ use crate::client_director::{
 };
 use crate::client_quality::{LatenessHistogram, QualityConfig, QualityJudge};
 use crate::client_udp::{
-    Control, ObjectKind, ObjectReceiver, PartObject, RepairPolicy, MAX_OTHER_LEGS, REFRESH,
-    UNMEASURED_LOSS,
+    Control, ObjectKind, ObjectReceiver, PartObject, RepairPolicy, DISTRESS_MOVE_PREFIX,
+    MAX_OTHER_LEGS, REFRESH, UNMEASURED_LOSS,
 };
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -1939,6 +1939,15 @@ impl UdpSession {
             Control::Subscribed {
                 next_part, compact, ..
             } => self.on_subscribed(index, next_part, compact, now),
+            // Place240 rule 4: an edge's distress hint. The edge keeps
+            // serving the leg; the director decides.
+            Control::Move { reason, .. } if reason.starts_with(DISTRESS_MOVE_PREFIX) => {
+                if leg.is_live() {
+                    self.distress_hints += 1;
+                    self.events.push_back(LegEvent::Distress { leg: key, reason });
+                }
+                Received::Control
+            }
             Control::Move { reason, .. } => {
                 // A MOVE within a round trip of a take-back (the first
                 // retry's wait while the leg has none), before its OK,
@@ -4995,4 +5004,27 @@ mod tests {
         assert!(session.quality.missing_total >= 2);
     }
 
+    /// Place240 rule 4: an edge's distress hint is reported, and the leg
+    /// stays live (the edge keeps serving it; the director decides).
+    #[test]
+    fn a_distress_hint_is_reported_and_the_leg_stays_live() {
+        let now = Instant::now();
+        let mut session = lone_4k_leg(now);
+        let mut send = |_: SocketAddr, _: &[u8]| {};
+        let hint = Control::Move {
+            stream_id: 1,
+            reason: "distress-send-blocked".into(),
+        }
+        .encode();
+        assert_eq!(session.on_datagram(edge(), &hint, now, &mut send), Received::Control);
+        assert_eq!(
+            events(&mut session),
+            vec![LegEvent::Distress {
+                leg: A,
+                reason: "distress-send-blocked".into()
+            }]
+        );
+        assert_eq!(only(&session).state, State::Live);
+        assert_eq!(session.distress_hints, 1);
+    }
 }

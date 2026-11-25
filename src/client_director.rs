@@ -260,6 +260,9 @@ pub enum LegEvent {
     /// (`late-parts`, `missing-parts`): the leg still delivers, and the
     /// director moves it make-before-break.
     Degraded { leg: LegKey, reason: String },
+    /// Place240 rule 4: the leg's edge says it is in distress (`MOVE
+    /// distress-<why>`); it keeps serving the leg.
+    Distress { leg: LegKey, reason: String },
 }
 
 /// The surface of the session that the director drives (B 3.1, 3.2). Every
@@ -1435,7 +1438,31 @@ impl Director {
             LegEvent::AllSilent => self.on_all_silent(legs, now, out),
             LegEvent::ObjectLane => self.on_object_lane(legs, now, out),
             LegEvent::Degraded { leg, reason } => self.quality_move(leg, &reason, now),
+            LegEvent::Distress { leg, reason } => self.on_distress(legs, leg, reason, now),
         }
+    }
+
+    /// Place240 rule 4: the edge of `key` says it is in distress. A
+    /// listener whose other legs deliver ignores it unless every leg's edge
+    /// said so lately; one with a lone leg moves (as rule 3).
+    fn on_distress<S: SessionLegs>(&mut self, legs: &S, key: LegKey, reason: String, now: Instant) {
+        self.distress_seen
+            .retain(|(leg, at)| *leg != key && now.saturating_duration_since(*at) < DISTRESS_TOGETHER);
+        self.distress_seen.push((key, now));
+        let others: Vec<LegKey> = self
+            .legs
+            .iter()
+            .filter(|leg| leg.key != key && leg.counted() && Self::view(legs, leg.key, now).delivering)
+            .map(|leg| leg.key)
+            .collect();
+        let together = others
+            .iter()
+            .all(|other| self.distress_seen.iter().any(|(leg, _)| leg == other));
+        if !together {
+            self.stats.quality.distress_ignored += 1;
+            return;
+        }
+        self.quality_move(key, &reason, now);
     }
 
     /// Place240 rule 3: leave the leg `key` make-before-break for `reason`
@@ -6399,4 +6426,33 @@ mod tests {
         assert!(w.requests().is_empty(), "nothing asked once it is kept");
     }
 
+    /// Place240 rule 4: an edge's distress hint moves a one-leg listener;
+    /// a two-leg listener ignores it unless both legs' edges say so.
+    #[test]
+    fn a_distress_hint_moves_one_leg_and_two_legs_only_together() {
+        let mut w = one_leg_viewer("distress-1");
+        let e1 = w.key("e1");
+        w.event(LegEvent::Distress {
+            leg: e1,
+            reason: "distress-send-blocked".into(),
+        });
+        assert!(w.leaving("e1"));
+        assert_eq!(w.d.stats.quality.distress, 1);
+
+        let mut w = World::new("distress-2", 2, true);
+        w.join(&[1, 2], Some(3));
+        let (e1, e2) = (w.key("e1"), w.key("e2"));
+        w.event(LegEvent::Distress {
+            leg: e1,
+            reason: "distress-tee-shed".into(),
+        });
+        assert!(!w.leaving("e1"));
+        assert_eq!(w.d.stats.quality.distress_ignored, 1);
+        w.run_to(w.ms() + 500);
+        w.event(LegEvent::Distress {
+            leg: e2,
+            reason: "distress-tee-shed".into(),
+        });
+        assert!(w.leaving("e2"), "both legs said so");
+    }
 }
