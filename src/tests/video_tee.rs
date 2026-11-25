@@ -962,3 +962,54 @@ fn small_lane_tee_cost() {
     );
     rt.block_on(relay.stop());
 }
+
+/// teeperf: where a one-symbol part's time goes on one thread, as the
+/// small-part lane's tee takes it: the decoding push (the receiver's full
+/// path: a one-symbol part completes at its symbol) and the commit.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "a measurement: run it alone, in release"]
+async fn small_part_dispatch_cost() {
+    let parts = env_u64("VT_PARTS", 20_000);
+    let peer: SocketAddr = "127.0.0.1:40002".parse().unwrap();
+    let mut dispatch = fast_test_dispatch(
+        "127.0.0.1:40001".parse().unwrap(),
+        peer,
+        ParentPath::PromotedSecondary,
+    );
+    dispatch
+        .receiver_mut()
+        .set_defer_decode(env_u64("VT_DEFER", 2) as u16);
+    let cache = LiveTsCache::new(5_001, Duration::from_millis(1), 2, 4_096, 4).await;
+    let deadline = now_unix_us() + 600_000_000;
+    let symbols: Vec<Vec<u8>> = (0..parts)
+        .map(|sequence| fast_audio_symbols(5_001, sequence, deadline).pop().unwrap())
+        .collect();
+    let (mut push, mut commit) = (Duration::ZERO, Duration::ZERO);
+    let allocated = crate::alloc_count::allocations();
+    for symbol in &symbols {
+        let started = Instant::now();
+        let outcome = dispatch.push(peer, symbol, now_unix_us()).unwrap();
+        push += started.elapsed();
+        if let RelayUdpDispatchOutcome::Relay(RelayIngressOutcome::Decoded {
+            object,
+            envelope,
+            slot,
+            ..
+        }) = outcome
+        {
+            let started = Instant::now();
+            commit_relay_object(&cache, *object, envelope, slot)
+                .await
+                .unwrap();
+            commit += started.elapsed();
+        }
+    }
+    let n = parts as f64;
+    println!(
+        "one-symbol parts: the decoding push {:.2} µs, the commit {:.2} µs a part; {:.1} \
+         allocations a part",
+        push.as_secs_f64() * 1e6 / n,
+        commit.as_secs_f64() * 1e6 / n,
+        (crate::alloc_count::allocations() - allocated) as f64 / n,
+    );
+}
