@@ -143,6 +143,10 @@ struct Args {
     /// this long takes over though it is not level.
     #[arg(long, default_value_t = av_mesh::client_director::DEFAULT_LEVEL_WAIT_MS)]
     level_wait_ms: u64,
+    /// Place240 rules 3 and 4: a lone leg's late or missing parts, and
+    /// its edge's distress.
+    #[command(flatten)]
+    quality: av_mesh::client_quality::QualityArgs,
     /// A leg's first tokenless SUB and its first SUB with the token are
     /// each sent again this soon. 0: off.
     #[arg(long, default_value_t = av_mesh::client_session::DEFAULT_FIRST_DOUBLE_MS)]
@@ -329,6 +333,7 @@ impl Args {
             lone_hedge_after: Duration::from_millis(self.lone_hedge_after_ms),
             plan_hold: av_mesh::client_session::PLAN_HOLD,
             plan_smoothing: av_mesh::client_session::PLAN_SMOOTHING,
+        quality: self.quality.config(),
         }
     }
 
@@ -339,6 +344,7 @@ impl Args {
         config.token_wait = Duration::from_millis(self.token_ms);
         config.rebalance_giveup = Duration::from_millis(self.rebalance_giveup_ms);
         config.level_wait = Duration::from_millis(self.level_wait_ms);
+        self.quality.apply(&mut config);
         config.first_retry = Duration::from_millis(self.first_retry_ms);
         config.assignment_udp_port = self.assignment_udp_port;
         config.assignment_https_after = Duration::from_millis(self.assignment_https_after_ms);
@@ -2336,6 +2342,7 @@ mod tests {
                 before_start: 1,
                 stale_generation: 0,
             },
+            lateness: Default::default(),
         }
     }
 

@@ -39,8 +39,10 @@ use crate::client_compact::{
 use crate::client_director::{
     LegEvent, LegFailure, LegKey, LegStart, LegView, SessionLegs, StartFrom,
 };
+use crate::client_quality::{LatenessHistogram, QualityConfig, QualityJudge};
 use crate::client_udp::{
-    Control, ObjectReceiver, PartObject, RepairPolicy, MAX_OTHER_LEGS, REFRESH, UNMEASURED_LOSS,
+    Control, ObjectKind, ObjectReceiver, PartObject, RepairPolicy, MAX_OTHER_LEGS, REFRESH,
+    UNMEASURED_LOSS,
 };
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -212,6 +214,9 @@ pub struct SessionConfig {
     /// The weight of a new loss sample in the estimate a compact plan
     /// follows ([`PLAN_SMOOTHING`]).
     pub plan_smoothing: f64,
+    /// Place240 rule 3: a lone leg's parts judged late or missing
+    /// ([`crate::client_quality`]).
+    pub quality: QualityConfig,
 }
 
 /// A move asks for a hole at most this many parts before the newest part
@@ -248,6 +253,7 @@ impl SessionConfig {
             lone_hedge_after: Duration::from_millis(DEFAULT_LONE_HEDGE_AFTER_MS),
             plan_hold: PLAN_HOLD,
             plan_smoothing: PLAN_SMOOTHING,
+            quality: QualityConfig::default(),
         }
     }
 
@@ -391,6 +397,8 @@ struct Leg {
     /// another: from then the stream is live at the edge, and the edge
     /// sends none of it.
     wait_heads: Option<(u64, Option<Instant>)>,
+    /// Place240: the lateness of the parts this leg delivered.
+    lateness: LatenessHistogram,
 }
 
 impl Leg {
@@ -491,6 +499,9 @@ pub struct LegReport {
     /// Its compact datagrams, first arrivals, duplicates and parts below
     /// the session's first part.
     pub stats: LegStats,
+    /// Place240: the lateness of the parts it delivered (arrival less
+    /// publication, less the path's least over 10 s).
+    pub lateness: LatenessHistogram,
 }
 
 /// One listener's subscription to a stream, held as one or more legs. See
@@ -570,6 +581,19 @@ pub struct UdpSession {
     raptorq_recent: u16,
     delivered_recent: u8,
     object_lane: bool,
+    /// Place240 rule 3: the parts judged for a lone leg, the leg judged
+    /// now, the last verdict reported, and the receiver's flows seen.
+    pub quality: QualityJudge,
+    judged_leg: Option<LegId>,
+    degraded_at: Option<Instant>,
+    quality_flows: u64,
+    /// The slot of the leg whose datagram came last, and when.
+    media_from: Option<(usize, Instant)>,
+    /// Lone legs reported late or missing parts (place240), and the
+    /// edges' distress hints heard.
+    pub degraded_late: u64,
+    pub degraded_missing: u64,
+    pub distress_hints: u64,
 }
 
 /// A released leg's second `UNSUB` goes this long after the first.
@@ -653,6 +677,14 @@ impl UdpSession {
             raptorq_recent: 0,
             delivered_recent: 0,
             object_lane: false,
+            quality: QualityJudge::new(config.quality),
+            judged_leg: None,
+            degraded_at: None,
+            quality_flows: 1,
+            media_from: None,
+            degraded_late: 0,
+            degraded_missing: 0,
+            distress_hints: 0,
         }
     }
 
@@ -746,6 +778,7 @@ impl UdpSession {
             wire_bytes: leg.wire_bytes,
             longest_gap: leg.longest_gap,
             stats: self.receiver.compact.leg_stats(leg.id),
+            lateness: leg.lateness.clone(),
         })
     }
 
@@ -974,6 +1007,7 @@ impl UdpSession {
             wire_bytes: 0,
             longest_gap: Duration::ZERO,
             wait_heads: None,
+            lateness: LatenessHistogram::default(),
         });
         if let Some(measured) = measured {
             let config = self.config;
@@ -1296,6 +1330,7 @@ impl UdpSession {
                 self.events.push_back(LegEvent::AllSilent);
             }
         }
+        self.judge_quality(now);
         for (index, cause, reason) in failed {
             if matches!(cause, LegFailure::Refusing | LegFailure::Stalled) {
                 if cause == LegFailure::Refusing {
@@ -1320,11 +1355,85 @@ impl UdpSession {
                 });
                 if !others_deliver {
                     self.receiver.new_flow();
+                    self.quality.new_flow();
                 }
             }
             if let Some(key) = self.legs[index].as_ref().map(|leg| leg.key) {
                 self.stop_leg(index, LegEvent::Failed { leg: key, cause }, reason);
             }
+        }
+    }
+
+    /// Place240 rule 3: the parts of a lone leg (the only live leg not
+    /// given up), judged on an empty socket and outside the end-of-run
+    /// hold. A verdict is reported once ([`LegEvent::Degraded`]), and again
+    /// two windows later if the leg is still the lone one.
+    fn judge_quality(&mut self, now: Instant) {
+        let verdict = self.quality.judge(now);
+        let lone = {
+            let mut live = self.legs_iter().filter(|leg| leg.is_live());
+            match (live.next(), live.next()) {
+                (Some(leg), None) => Some((leg.id, leg.key, leg.state == State::Live)),
+                _ => None,
+            }
+        };
+        let Some((id, key, live)) = lone else {
+            self.judged_leg = None;
+            return;
+        };
+        if self.judged_leg != Some(id) {
+            // A new lone leg: the window starts again.
+            self.judged_leg = Some(id);
+            self.quality.reset();
+            self.degraded_at = None;
+            return;
+        }
+        let Some(verdict) = verdict.filter(|_| live && !self.hold && !self.queued) else {
+            return;
+        };
+        let again = self.config.quality.window * 2;
+        if self
+            .degraded_at
+            .is_some_and(|at| now.saturating_duration_since(at) < again)
+        {
+            return;
+        }
+        self.degraded_at = Some(now);
+        match verdict {
+            crate::client_quality::Verdict::LateParts => self.degraded_late += 1,
+            crate::client_quality::Verdict::MissingParts => self.degraded_missing += 1,
+        }
+        self.events.push_back(LegEvent::Degraded {
+            leg: key,
+            reason: verdict.reason().to_owned(),
+        });
+    }
+
+    /// An object that came out of the receiver: its part judged and its
+    /// lateness booked to the leg that brought it (per part, not per
+    /// datagram).
+    fn observe(&mut self, object: &PartObject) {
+        if self.receiver.flows != self.quality_flows {
+            self.quality_flows = self.receiver.flows;
+            self.quality.new_flow();
+        }
+        let Some((index, at)) = self.media_from else {
+            return;
+        };
+        match object.kind {
+            ObjectKind::Part => {
+                let arrival_us = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_micros() as u64);
+                let late = self
+                    .quality
+                    .on_part(object.part, object.published_unix_us, arrival_us, at);
+                if let (Some(late), Some(leg)) = (late, self.legs[index].as_mut()) {
+                    leg.lateness.record(late);
+                }
+            }
+            ObjectKind::Gap => self.quality.on_gap(object.part, at),
+            ObjectKind::Init => {}
         }
     }
 
@@ -1707,6 +1816,9 @@ impl UdpSession {
                 verdict(&mut wake, leg.last_datagram + self.config.lone_hedge_after);
             }
         }
+        if let Some(at) = self.quality.next_deadline().filter(|_| judging) {
+            verdict(&mut wake, at);
+        }
         if let Some(last) = last_datagram.filter(|_| judging) {
             let at = (last + self.silence() + ms).max(self.next_all_silent.unwrap_or(last));
             verdict(&mut wake, at);
@@ -2040,6 +2152,7 @@ impl UdpSession {
     }
 
     fn on_media(&mut self, index: usize, datagram: &[u8], now: Instant) -> Received {
+        self.media_from = Some((index, now));
         let leg = self.legs[index].as_mut().expect("an attributed leg");
         let id = leg.id;
         if let Some(last) = leg.last_media {
@@ -2093,7 +2206,9 @@ impl UdpSession {
 
     /// The objects that the last media datagram delivered, one at a time.
     pub fn next_object(&mut self) -> Option<PartObject> {
-        self.pending.take().or_else(|| self.receiver.next_ready())
+        let object = self.pending.take().or_else(|| self.receiver.next_ready())?;
+        self.observe(&object);
+        Some(object)
     }
 
     /// Whether [`Self::next_object`] has objects now: after an `OK`, the
@@ -4777,4 +4892,107 @@ mod tests {
         }
         assert_eq!(reported, vec![16]);
     }
+
+    /// A part's datagrams, published at `published_unix_us`.
+    fn published_datagrams(part: u64, len: usize, published_unix_us: u64) -> Vec<Vec<u8>> {
+        let object = PartObject {
+            kind: ObjectKind::Part,
+            datagrams: 0,
+            stream_id: 1,
+            part,
+            available_unix_us: 0,
+            published_unix_us,
+            generation: 7,
+            payload: Bytes::from(vec![part as u8; len]),
+        };
+        encode_object(&object, 1_200, RepairPolicy::default()).unwrap()
+    }
+
+    fn unix_us() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64
+    }
+
+    /// Feed a lone 4K leg parts 1234.. at 24 a second, each `late(index)`
+    /// after its publication (`None`: never sent), polling as a client
+    /// does; the events and the index of the first `Degraded`.
+    fn feed_lone_leg(
+        late: impl Fn(usize) -> Option<u64>,
+        count: usize,
+    ) -> (UdpSession, Vec<LegEvent>, Option<usize>) {
+        let t0 = Instant::now();
+        let mut session = lone_4k_leg(t0);
+        let mut send = |_: SocketAddr, _: &[u8]| {};
+        let mut all = Vec::new();
+        let mut first = None;
+        for index in 0..count {
+            let now = t0 + Duration::from_micros(41_667 * (index as u64 + 1));
+            if let Some(late_us) = late(index) {
+                let published = unix_us().saturating_sub(late_us);
+                for datagram in published_datagrams(1_234 + index as u64, 4_000, published) {
+                    session.on_datagram(edge(), &datagram, now, &mut send);
+                    while session.next_object().is_some() {}
+                }
+            }
+            session.poll_legs(now, &mut send);
+            for event in events(&mut session) {
+                if matches!(event, LegEvent::Degraded { .. }) {
+                    first.get_or_insert(index);
+                }
+                all.push(event);
+            }
+        }
+        (session, all, first)
+    }
+
+    /// Place240 rule 3 (cmpd8: a 4K viewer's parts came 3 to 5.7 s late
+    /// on one leg and no rule fired): a lone leg whose parts come late is
+    /// reported `late-parts` within the window, once, and is not failed:
+    /// it keeps delivering until the director has its replacement.
+    #[test]
+    fn a_lone_leg_whose_parts_come_late_is_degraded_and_keeps_delivering() {
+        let (session, events, first) =
+            feed_lone_leg(|index| Some(if index < 48 { 30_000 } else { 2_030_000 }), 96);
+        let degraded: Vec<&LegEvent> = events
+            .iter()
+            .filter(|event| matches!(event, LegEvent::Degraded { .. }))
+            .collect();
+        assert_eq!(
+            degraded,
+            vec![&LegEvent::Degraded {
+                leg: A,
+                reason: "late-parts".into()
+            }],
+            "{events:?}"
+        );
+        assert!(first.is_some_and(|at| (49..=50).contains(&at)), "{first:?}");
+        assert!(!events.iter().any(|event| matches!(event, LegEvent::Failed { .. })));
+        assert_eq!(session.degraded_late, 1);
+        let report = session.leg_report(A).unwrap();
+        assert!(report.lateness.max_us >= 1_900_000, "{:?}", report.lateness);
+        // On time throughout: nothing.
+        let (_, events, first) = feed_lone_leg(|_| Some(30_000), 96);
+        assert_eq!(first, None, "{events:?}");
+    }
+
+    /// Place240 rule 3: a lone leg that skips parts at their playout
+    /// deadline is reported `missing-parts`.
+    #[test]
+    fn a_lone_leg_that_misses_parts_is_degraded() {
+        let (session, events, first) =
+            feed_lone_leg(|index| (index % 10 != 5 || index < 24).then_some(30_000), 120);
+        assert!(
+            events.contains(&LegEvent::Degraded {
+                leg: A,
+                reason: "missing-parts".into()
+            }),
+            "{events:?}"
+        );
+        // The second hole passes its deadline 0.5 s after the next part.
+        assert!(first.is_some_and(|at| at <= 50), "{first:?}");
+        assert!(session.quality.missing_total >= 2);
+    }
+
 }
