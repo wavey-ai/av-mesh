@@ -794,6 +794,8 @@ pub struct Director {
     last_quality_move: Option<Instant>,
     quality_quiet_until: Option<Instant>,
     distress_seen: Vec<(LegKey, Instant)>,
+    /// The last `edge-busy` refusal with no leg delivering (place240).
+    last_busy: Option<Instant>,
 }
 
 fn sender(out: &mut Vec<Action>) -> impl FnMut(SocketAddr, &[u8]) + '_ {
@@ -885,6 +887,7 @@ impl Director {
             last_quality_move: None,
             quality_quiet_until: None,
             distress_seen: Vec::new(),
+            last_busy: None,
         };
         let urls = director.config.entries.clone();
         director.home = urls.iter().map(|url| director.entry_index(url)).collect();
@@ -1416,7 +1419,16 @@ impl Director {
                 // busy answer, not a loop of refusals); one with a leg
                 // that delivers asks at once, as before.
                 if busy && !self.any_delivering(legs, now, None) {
-                    self.retry_at = Some(now + RETRY_ALONE);
+                    // The first is asked again at once (the entry places
+                    // it on the next edge with room: one round trip more);
+                    // another within a second waits.
+                    if self
+                        .last_busy
+                        .is_some_and(|at| now.saturating_duration_since(at) < Duration::from_secs(1))
+                    {
+                        self.retry_at = Some(now + RETRY_ALONE);
+                    }
+                    self.last_busy = Some(now);
                 }
             }
             LegEvent::NoToken(key) => {
@@ -6454,5 +6466,36 @@ mod tests {
             reason: "distress-tee-shed".into(),
         });
         assert!(w.leaving("e2"), "both legs said so");
+    }
+
+    /// Place240 follow-up 3: an edge's own cap refuses `edge-busy` when two
+    /// entries placed onto it at once; a listener with no leg asks again at
+    /// once (the entry names the next edge with room: one round trip more,
+    /// not a failed join), and only a second refusal within a second waits.
+    #[test]
+    fn a_busy_refusal_is_asked_again_at_once_and_a_second_waits() {
+        let mut w = World::new("busy-1", 1, false);
+        w.poll();
+        let (to, nonce, _) = w.requests().pop().unwrap();
+        w.answer(to, nonce, vec![cache(1), cache(2)], 1, false, None);
+        let e1 = w.key("e1");
+        w.event(LegEvent::Refused {
+            leg: e1,
+            reason: "edge-busy".into(),
+        });
+        let (to, nonce, request) = w.requests().pop().expect("asked again at once");
+        let Control::Assign { skip, .. } = &request else {
+            unreachable!()
+        };
+        assert!(skip.contains(&"e1".to_owned()));
+        w.answer(to, nonce, vec![cache(2)], 1, false, None);
+        let e2 = w.key("e2");
+        w.event(LegEvent::Refused {
+            leg: e2,
+            reason: "edge-busy".into(),
+        });
+        assert!(w.requests().is_empty(), "a second refusal within a second waits");
+        w.run_to(w.ms() + 250);
+        assert!(!w.requests().is_empty());
     }
 }

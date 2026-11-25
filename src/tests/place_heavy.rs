@@ -58,15 +58,24 @@ const ENTRY_OFFSET: u8 = 5;
 
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// The 4K rate of the test that runs (0: `PH_MBPS`, else 247 Mbit/s).
+static RATE_BPS: AtomicU64 = AtomicU64::new(0);
+
 fn mbps() -> u64 {
-    std::env::var("PH_MBPS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(247)
+    rate_bps() / 1_000_000
 }
 
 fn rate_bps() -> u64 {
-    mbps() * 1_000_000
+    match RATE_BPS.load(Ordering::Relaxed) {
+        0 => {
+            std::env::var("PH_MBPS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(247)
+                * 1_000_000
+        }
+        bps => bps,
+    }
 }
 
 // ------------------------------------------------------------------ source
@@ -187,13 +196,12 @@ impl Source {
         start_us + sequence * Self::interval_us()
     }
 
-    fn start(edges: Arc<StdMutex<Vec<Option<Arc<LaneEdge>>>>>) -> Self {
+    fn start(edges: Arc<StdMutex<Vec<Option<Arc<LaneEdge>>>>>, published: Arc<AtomicU64>) -> Self {
         let start_us = now_unix_us() + 300_000;
         let start = Instant::now() + Duration::from_millis(300);
         let made: Arc<(StdMutex<BTreeMap<u64, (u64, Symbols)>>, Condvar)> = Arc::default();
         let stamps: Arc<StdMutex<Vec<u64>>> = Arc::default();
         let next = Arc::new(AtomicU64::new(0));
-        let published = Arc::new(AtomicU64::new(0));
         let running = Arc::new(AtomicBool::new(true));
         let hold_until_us = Arc::new(AtomicU64::new(0));
         let mut threads = Vec::new();
@@ -327,23 +335,33 @@ impl Source {
     }
 }
 
-/// An audio stream (2.5 ms Opus) to every edge from both forwarders.
+/// An audio stream (`payload`) to every edge from both forwarders. While
+/// `hold_until_us` is ahead its parts are made (stamped) on time and held;
+/// then the held ones go back to back (a stall and its catch-up burst).
 fn audio_publisher(
     edges: Arc<StdMutex<Vec<Option<Arc<LaneEdge>>>>>,
     running: Arc<AtomicBool>,
+    payload: Payload,
+    hold_until_us: Arc<AtomicU64>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("ph-audio".into())
         .spawn(move || {
-            let payload = Payload::Opus;
             let start = Instant::now();
             let mut sequence = 0_u64;
+            let mut held: Vec<Bytes> = Vec::new();
             while running.load(Ordering::Relaxed) {
                 let due = start + Duration::from_micros(payload.part_us() * sequence);
                 if let Some(wait) = due.checked_duration_since(Instant::now()) {
                     std::thread::sleep(wait);
                 }
                 let (envelope, _) = payload.envelope(AUDIO, sequence);
+                sequence += 1;
+                held.push(envelope);
+                if now_unix_us() < hold_until_us.load(Ordering::Relaxed) {
+                    continue;
+                }
+                for envelope in std::mem::take(&mut held) {
                 let (sources, repairs) = payload.symbols(&envelope);
                 let running_edges: Vec<Arc<LaneEdge>> =
                     edges.lock().unwrap().iter().flatten().cloned().collect();
@@ -356,7 +374,7 @@ fn audio_publisher(
                         send_from(edge.forwarder_fd(1), symbol, edge.relay_port(1, false));
                     }
                 }
-                sequence += 1;
+                }
             }
         })
         .unwrap()
@@ -537,8 +555,12 @@ struct Region {
     entry_shutdown: watch::Sender<()>,
     entry_task: tokio::task::JoinHandle<anyhow::Result<()>>,
     source: Option<Source>,
+    /// The newest 4K part sent.
+    published: Arc<AtomicU64>,
     audio_running: Arc<AtomicBool>,
     audio: Option<std::thread::JoinHandle<()>>,
+    /// The audio publisher holds its parts until then (Unix µs).
+    audio_hold: Arc<AtomicU64>,
     advertiser: tokio::task::JoinHandle<()>,
 }
 
@@ -557,7 +579,7 @@ fn region_port(base: u8) -> u16 {
     panic!("no port free at 127.0.0.{base}+");
 }
 
-fn edge_snapshot(node: &str, front: SocketAddr, edge: &LaneEdge, head: u64) -> MeshSnapshot {
+async fn edge_snapshot(node: &str, front: SocketAddr, edge: &LaneEdge, head: u64) -> MeshSnapshot {
     let mut snapshot =
         telemetry_snapshot_for_tests(node, REGION, "test-continent", 51.6, -0.2, Vec::new(), STREAM);
     let mut service = EdgeServiceSnapshot::from_node(
@@ -582,15 +604,34 @@ fn edge_snapshot(node: &str, front: SocketAddr, edge: &LaneEdge, head: u64) -> M
         .collect();
     // The edge's own heavy advertisement, as its `local_mesh_snapshot`
     // makes it.
-    service.heavy = edge
-        .router
-        .heavy_advert([(STREAM, Some(rate_bps())), (AUDIO, Some(300_000))].into_iter());
+    service.heavy = edge.router.heavy_advert(vec![STREAM, AUDIO]).await;
     snapshot.edge_service = Some(service);
     snapshot
 }
 
 impl Region {
     async fn start(base: u8, edges: usize, rules: bool, egress_max_bps: u64, audio: bool) -> Self {
+        Self::start_with(
+            base,
+            edges,
+            rules,
+            egress_max_bps,
+            audio.then_some(Payload::Opus),
+            true,
+        )
+        .await
+    }
+
+    /// A region; its audio stream of `audio` if any, its 4K stream from
+    /// the start if `video` (else at [`Self::start_video`]).
+    async fn start_with(
+        base: u8,
+        edges: usize,
+        rules: bool,
+        egress_max_bps: u64,
+        audio: Option<Payload>,
+        video: bool,
+    ) -> Self {
         let port = region_port(base);
         let config = heavy_config(rules, egress_max_bps);
         let mut slots = Vec::new();
@@ -655,30 +696,36 @@ impl Region {
             Vec::new(),
             shutdown_rx,
         ));
-        let source = Source::start(Arc::clone(&edges));
-        let audio_running = Arc::new(AtomicBool::new(audio));
-        let audio = audio.then(|| audio_publisher(Arc::clone(&edges), Arc::clone(&audio_running)));
+        let published = Arc::new(AtomicU64::new(0));
+        let source = video.then(|| Source::start(Arc::clone(&edges), Arc::clone(&published)));
+        let audio_running = Arc::new(AtomicBool::new(audio.is_some()));
+        let audio_hold = Arc::new(AtomicU64::new(0));
+        let audio = audio.map(|payload| {
+            audio_publisher(
+                Arc::clone(&edges),
+                Arc::clone(&audio_running),
+                payload,
+                Arc::clone(&audio_hold),
+            )
+        });
         let advertiser = {
             let (edges, entry, published) = (
                 Arc::clone(&edges),
                 entry.clone(),
-                Arc::clone(&source.published),
+                Arc::clone(&published),
             );
             let fronts: Vec<(String, SocketAddr)> =
                 slots.iter().map(|slot| (slot.node.clone(), slot.front)).collect();
             tokio::spawn(async move {
                 loop {
                     let head = published.load(Ordering::Relaxed);
-                    let snapshots: Vec<MeshSnapshot> = {
-                        let edges = edges.lock().unwrap();
-                        fronts
-                            .iter()
-                            .zip(edges.iter())
-                            .filter_map(|((node, front), edge)| {
-                                Some(edge_snapshot(node, *front, edge.as_ref()?, head))
-                            })
-                            .collect()
-                    };
+                    let running: Vec<Option<Arc<LaneEdge>>> = edges.lock().unwrap().clone();
+                    let mut snapshots = Vec::new();
+                    for ((node, front), edge) in fronts.iter().zip(running) {
+                        if let Some(edge) = edge {
+                            snapshots.push(edge_snapshot(node, *front, &edge, head).await);
+                        }
+                    }
                     for snapshot in snapshots {
                         entry.telemetry.ingest_snapshot(snapshot).await;
                     }
@@ -695,18 +742,33 @@ impl Region {
             entry_url: format!("https://{ip}:19444"),
             entry_shutdown,
             entry_task,
-            source: Some(source),
+            source,
+            published,
             audio_running,
             audio,
+            audio_hold,
             advertiser,
         };
-        let published = Arc::clone(&region.source.as_ref().unwrap().published);
-        until("the stream runs at every edge", Duration::from_secs(10), || {
-            published.load(Ordering::Relaxed) > 2 * FPS
-        })
-        .await;
+        if video {
+            let published = Arc::clone(&region.published);
+            until("the stream runs at every edge", Duration::from_secs(10), || {
+                published.load(Ordering::Relaxed) > 2 * FPS
+            })
+            .await;
+        }
         tokio::time::sleep(ADVERTISE_EVERY * 3).await;
         region
+    }
+
+    /// The 4K stream starts now.
+    fn start_video(&mut self) {
+        self.source = Some(Source::start(Arc::clone(&self.edges), Arc::clone(&self.published)));
+    }
+
+    /// The audio publisher holds its parts for `hold`, then sends them.
+    fn stall_audio(&self, hold: Duration) {
+        self.audio_hold
+            .store(now_unix_us() + hold.as_micros() as u64, Ordering::Relaxed);
     }
 
     fn edge(&self, index: usize) -> Arc<LaneEdge> {
@@ -745,7 +807,7 @@ impl Region {
             stats.assignments.load(Ordering::Relaxed),
             stats.assignments_dropped.load(Ordering::Relaxed),
             stats.assignment_confirms.load(Ordering::Relaxed),
-            self.source().published.load(Ordering::Relaxed),
+            self.published.load(Ordering::Relaxed),
         ));
         lines.push(format!("viewers: {:?}", crowd.nodes()));
         eprintln!("{}", lines.join("\n"));
@@ -813,6 +875,9 @@ struct Run {
     refused: Vec<String>,
     degraded_late: u64,
     degraded_missing: u64,
+    /// Legs held (not leaving) and wanted at the end.
+    legs_at_end: usize,
+    want_at_end: u8,
 }
 
 #[derive(Debug, Default)]
@@ -943,6 +1008,12 @@ async fn view(
             }
         }
     }
+    run.legs_at_end = director
+        .legs()
+        .iter()
+        .filter(|leg| leg.live && leg.leaving.is_none())
+        .count();
+    run.want_at_end = director.want();
     director.leave(&mut session, Instant::now(), &mut actions);
     for action in actions.drain(..) {
         if let Action::Send { to, datagram } = action {
@@ -1250,7 +1321,7 @@ async fn at_budget_the_next_heavy_session_is_refused_and_audio_is_untouched() {
             Some(STREAM),
             Some("reader-2"),
             PlaybackAdmission::Admitted,
-        );
+        ).await;
         // The region's shutdown waits for every hold on its edges.
         drop(edge);
         let heavy_legs: Vec<u64> = (0..2).map(|index| region.legs_at(index, STREAM)).collect();
@@ -1295,10 +1366,150 @@ async fn at_budget_the_next_heavy_session_is_refused_and_audio_is_untouched() {
             assert!(matches!(http, Err(AssignmentError::HeavyFull)));
             assert_eq!(entry_http, 1);
             assert_eq!(edge_reader, PlaybackAdmission::Rejected);
-            assert!(viewers.iter().all(|run| run.replacements.is_empty()));
+            // Both are served and none moves for lateness (a join refused
+            // `edge-busy` by an edge another join filled a moment before
+            // is asked again at once: an `interrupt` record, not a move).
+            assert!(
+                viewers.iter().all(|run| !run.parts.is_empty()
+                    && run.stats.quality.moves() == 0
+                    && run.replacements.iter().all(|replacement| replacement.reason == "edge-busy")),
+                "{:?}",
+                viewers.iter().map(|run| (&run.replacements, run.stats.quality)).collect::<Vec<_>>()
+            );
             assert_eq!(audio_legs.iter().sum::<u64>(), 24, "every audio listener on two legs");
             assert!(audio_runs.iter().all(|run| run.refused.is_empty()));
             assert!(audio_missing.iter().all(|missing| *missing == 0), "{audio_missing:?}");
         }
     }
+}
+
+/// Place240 follow-up 1: the heavy class follows a stream's sustained rate
+/// (its newest parts' bytes over their own durations, 2 s), with
+/// hysteresis, never a peak. A 1 ms PCM stream through a 3 s stall and the
+/// catch-up burst after it stays small at every edge throughout, and its
+/// two-leg listeners keep two legs; a 4K stream (40 Mbit/s here) is heavy
+/// within about 2.5 s of its start, and viewers that join in its first
+/// second are placed (by the unmeasured estimate) and served, not refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_pcm_stall_and_catch_up_stay_small_and_4k_is_heavy_within_seconds() {
+    let _turn = SERIAL.lock().await;
+    RATE_BPS.store(40_000_000, Ordering::Relaxed);
+    let mut region = Region::start_with(160, 2, true, 600_000_000, Some(Payload::Pcm), false).await;
+    let sids: Vec<String> = (1..=4).map(|index| format!("pcm-{index}")).collect();
+    let audio = Crowd::join(&region, &sids, AUDIO, true, Duration::from_millis(10)).await;
+    until("every listener plays", Duration::from_secs(10), || {
+        audio.nodes().iter().all(Option::is_some)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    region.stall_audio(Duration::from_secs(3));
+    let mut audio_heavy = false;
+    let mut sustained_max = 0_u64;
+    let mut retained_max = 0_u64;
+    for _ in 0..80 {
+        for index in 0..2 {
+            let edge = region.edge(index);
+            let class = edge.router.heavy_class(AUDIO).await;
+            audio_heavy |= class.heavy;
+            sustained_max = sustained_max.max(class.bps.unwrap_or(0));
+            retained_max =
+                retained_max.max(edge.cache.playlist_bitrate_bps(AUDIO).await.unwrap_or(0));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let started = Instant::now();
+    region.start_video();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let viewers = Crowd::join(
+        &region,
+        &["early-1".to_owned(), "early-2".to_owned()],
+        STREAM,
+        true,
+        Duration::from_millis(200),
+    )
+    .await;
+    let mut heavy_after = None;
+    while started.elapsed() < Duration::from_secs(10) {
+        let mut heavy = false;
+        for index in 0..2 {
+            heavy |= region.edge(index).router.heavy_class(STREAM).await.heavy;
+        }
+        if heavy {
+            heavy_after = Some(started.elapsed());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    until("both early viewers play", Duration::from_secs(15), || {
+        viewers.nodes().iter().all(Option::is_some)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let viewer_runs = viewers.finish().await;
+    let audio_runs = audio.finish().await;
+    region.shutdown().await;
+    RATE_BPS.store(0, Ordering::Relaxed);
+    eprintln!(
+        "place240 class: PCM sustained max {:.2} Mbit/s, retained mean max {:.2} Mbit/s, heavy {audio_heavy}; 4K heavy after {heavy_after:?}; early viewers {:?}; PCM listeners legs {:?} want {:?}",
+        sustained_max as f64 / 1e6,
+        retained_max as f64 / 1e6,
+        viewer_runs
+            .iter()
+            .map(|run| (run.first_node.clone(), run.parts.len(), run.refused.clone()))
+            .collect::<Vec<_>>(),
+        audio_runs.iter().map(|run| run.legs_at_end).collect::<Vec<_>>(),
+        audio_runs.iter().map(|run| run.want_at_end).collect::<Vec<_>>(),
+    );
+    assert!(!audio_heavy, "a PCM stream was classed heavy");
+    assert!(sustained_max < 8_000_000, "{sustained_max}");
+    for run in &audio_runs {
+        // Never cut to one leg for the bit rate: want stays 2 and no
+        // answer granted one leg for it. (A 3 s stall of the source leaves
+        // some listeners of a 2-edge region on one leg for a while: a leg
+        // unanswered in the silence is failed and its edge skipped 30 s,
+        // and no third edge exists (`why=one-edge`): the B rules, not the
+        // class.)
+        assert_eq!(run.want_at_end, 2, "{:?}", run.replacements);
+        assert_eq!(run.stats.short_grants.bitrate, 0, "{:?}", run.stats.short_grants);
+        assert!(run.replacements.iter().all(|replacement| {
+            !replacement.reason.starts_with("distress-")
+                && replacement.reason != "late-parts"
+                && replacement.reason != "missing-parts"
+        }));
+    }
+    let heavy_after = heavy_after.expect("4K classed heavy");
+    assert!(heavy_after < Duration::from_millis(3_500), "{heavy_after:?}");
+    for run in &viewer_runs {
+        assert!(run.refused.is_empty(), "{:?}", run.refused);
+        assert!(run.parts.len() > 24, "{} parts", run.parts.len());
+    }
+}
+
+/// Place240 follow-up 3: an edge's admission of a heavy session reserves
+/// its cost in the same step as its check, so two admissions at once see
+/// each other (one fits: one is refused); the reservation is in the
+/// edge's advertised commitment until it ends, and released with it.
+#[tokio::test]
+async fn two_heavy_admissions_at_once_reserve_their_cost_and_one_is_refused() {
+    let cache = LiveTsCache::new(STREAM, Duration::from_millis(50), 2, 6, 64).await;
+    let mesh = mesh_handle_for_tests(Arc::clone(&cache.chunk_cache)).await;
+    let mut router = app_router_for_tests(cache, Arc::clone(&mesh)).with_heavy(heavy_config(true, 300_000_000));
+    router.cache_mesh_role = CacheMeshRole::Edge;
+    router.heavy.force_heavy(STREAM, 247_000_000);
+    let (first, second) = tokio::join!(
+        router.heavy_reserve(STREAM, heavy::Lane::UdpFast),
+        router.heavy_reserve(STREAM, heavy::Lane::UdpFast),
+    );
+    let (held, refused) = match (first, second) {
+        (Ok(Some(hold)), Err(refusal)) | (Err(refusal), Ok(Some(hold))) => (hold, refusal),
+        other => panic!("one of two at once fits: {:?}", other.0.is_ok()),
+    };
+    assert_eq!(refused, heavy::HeavyRefusal::Bytes);
+    let advert = router.heavy_advert(vec![STREAM]).await.unwrap();
+    assert_eq!(advert.committed_bps, 247_000_000, "the admission in progress is advertised");
+    drop(held);
+    let advert = router.heavy_advert(vec![STREAM]).await.unwrap();
+    assert_eq!(advert.committed_bps, 0);
+    assert!(matches!(router.heavy_reserve(STREAM, heavy::Lane::UdpFast).await, Ok(Some(_))));
+    mesh.shutdown();
 }

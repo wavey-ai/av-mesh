@@ -10934,6 +10934,7 @@ impl LiveTsCache {
                 object_part_stamp(&object),
                 self.window_parts,
             );
+            state.note_media_bytes(stream_id, seq, media_bytes);
             state.record_part_published(stream_id, seq, object_published_unix_us(&object));
             state.record_part_committed(stream_id, seq, Some(committed_us));
             debug!(
@@ -11003,6 +11004,7 @@ impl LiveTsCache {
             None,
             self.window_parts,
         );
+        state.note_media_bytes(stream_id, seq, media_bytes);
         debug!(
             stream_id,
             sequence = seq,
@@ -11118,6 +11120,7 @@ impl LiveTsCache {
             record.stamp,
             self.window_parts,
         );
+        state.note_media_bytes(stream_id, sequence, record.media_bytes);
         state.record_part_published(stream_id, sequence, record.published_unix_us);
         state.record_part_committed(stream_id, sequence, committed_unix_us);
         drop(state);
@@ -11334,6 +11337,14 @@ impl LiveTsCache {
                     .await;
             }
         }
+    }
+
+    /// Place240: a stream's sustained rate (see
+    /// `LiveState::sustained_bitrate_bps`).
+    async fn sustained_bitrate_bps(&self, stream_id: u64, window: Duration) -> Option<u64> {
+        let state = self.state.read().await;
+        let part_us = state.stream_part_target_us(stream_id);
+        state.sustained_bitrate_bps(stream_id, part_us, duration_us(window))
     }
 
     /// Measured bit rate of a playlist over its retained parts.
@@ -13379,6 +13390,10 @@ impl LiveTsCache {
 #[derive(Clone, Copy, Debug)]
 struct RetainedPartObservation {
     bytes: usize,
+    /// Place240: the part's media (the LL-HLS part a reader is sent), when
+    /// known; `bytes` is what the cache stores, the canonical slot with its
+    /// envelope, ~1 KB for a 1 ms PCM part of 304 bytes.
+    media_bytes: Option<u32>,
     available_unix_us: u64,
     /// When the contributor published the part, from the part itself.
     published_unix_us: Option<u64>,
@@ -13410,6 +13425,8 @@ struct RetainedStreamSummary {
 #[derive(Clone, Debug)]
 struct MeshPartRecord {
     media_kind: LiveMediaKind,
+    /// The part's media bytes (place240's sustained rate).
+    media_bytes: usize,
     init: Option<Bytes>,
     /// Duration of the part in microseconds.
     duration_us: Option<u32>,
@@ -13456,10 +13473,12 @@ impl MeshPartRecord {
             return None;
         }
         let media_kind = slot.media_kind();
+        let media_bytes = slot.media().len();
         let init = slot.init();
         if !bytes.starts_with(CANONICAL_LIVE_SLOT_MAGIC) {
             return Some(Self {
                 media_kind,
+                media_bytes,
                 init,
                 duration_us: None,
                 keyframe: false,
@@ -13474,6 +13493,7 @@ impl MeshPartRecord {
         let object = media_object::decode(bytes.get(CANONICAL_LIVE_SLOT_HEADER_LEN..)?).ok()?;
         Some(Self {
             media_kind,
+            media_bytes,
             init,
             duration_us: object_duration_us(&object),
             keyframe: object.is_keyframe(),
@@ -13921,6 +13941,7 @@ impl LiveState {
                 if let std::collections::btree_map::Entry::Vacant(entry) = parts.entry(sequence) {
                     entry.insert(RetainedPartObservation {
                         bytes,
+                        media_bytes: None,
                         available_unix_us,
                         published_unix_us: None,
                         committed_unix_us: None,
@@ -14402,6 +14423,43 @@ impl LiveState {
         });
         (duration_us > 0 && duration_us >= min_window_ms.saturating_mul(1_000) && bytes > 0)
             .then(|| bytes.saturating_mul(8_000_000).saturating_div(duration_us))
+    }
+
+    /// Place240: the media bytes of a part recorded (see
+    /// `RetainedPartObservation::media_bytes`).
+    fn note_media_bytes(&mut self, stream_id: u64, sequence: u64, media_bytes: usize) {
+        if let Some(part) = self
+            .stream_parts
+            .get_mut(&stream_id)
+            .and_then(|parts| parts.get_mut(&sequence))
+        {
+            part.media_bytes = u32::try_from(media_bytes).ok();
+        }
+    }
+
+    /// Place240: a stream's sustained rate: its newest parts' media bytes
+    /// (stored bytes where those are not known) over
+    /// their own declared durations (the part target where one names none)
+    /// once they cover `window_us`. Arrival times play no part, so a
+    /// catch-up burst after a stall, a warm copy or a replay reads as the
+    /// stream's own rate. `None` while the parts cover less.
+    fn sustained_bitrate_bps(
+        &self,
+        stream_id: u64,
+        nominal_part_us: u64,
+        window_us: u64,
+    ) -> Option<u64> {
+        let parts = self.stream_parts.get(&stream_id)?;
+        let (mut bytes, mut covered_us) = (0_u64, 0_u64);
+        for part in parts.values().rev() {
+            bytes = bytes.saturating_add(part.media_bytes.map_or(part.bytes as u64, u64::from));
+            covered_us = covered_us
+                .saturating_add(part.duration_us.map_or(nominal_part_us.max(1), u64::from));
+            if covered_us >= window_us.max(1) {
+                return Some(bytes.saturating_mul(8_000_000) / covered_us);
+            }
+        }
+        None
     }
 
     fn retained_stream_summaries(
@@ -22288,13 +22346,16 @@ impl AppRouter {
                 })
             })
             .collect();
-        edge_service.heavy = self.heavy_advert(
-            snapshot
-                .streams
-                .iter()
-                .filter(|stream| stream.active() && !stream.stale())
-                .map(|stream| (stream.stream_id, stream.bitrate_bps)),
-        );
+        edge_service.heavy = self
+            .heavy_advert(
+                snapshot
+                    .streams
+                    .iter()
+                    .filter(|stream| stream.active() && !stream.stale())
+                    .map(|stream| stream.stream_id)
+                    .collect(),
+            )
+            .await;
         snapshot.with_edge_service(edge_service)
     }
 
@@ -23091,7 +23152,9 @@ impl AppRouter {
             ..ReaderRequest::default()
         };
         // Place240 rule 2: a new heavy reader beyond this edge's budget.
-        let admission = self.heavy_admits_reader(stream_id, session_id, admission);
+        let admission = self
+            .heavy_admits_reader(stream_id, session_id, admission)
+            .await;
         if admission == PlaybackAdmission::Rejected {
             let alternatives = self.alternate_cache_urls(reader, path, query).await;
             self.edge_load.record_rejection();
@@ -23553,6 +23616,9 @@ impl AppRouter {
         };
         candidates.retain(|cache| !held(&cache.node_id));
         let playlist_bps = self.regional_playlist_bps(reader.stream_id).await;
+        // Place240: heavy by the region's sustained classes, not a peak.
+        let (heavy_session, two_path_bps) =
+            self.heavy_session(&snapshots, reader.stream_id, reader.udp);
         let now_ms = now_unix_ms();
         let key = reader
             .session
@@ -23605,7 +23671,8 @@ impl AppRouter {
             spare_held: reader.spare_held,
             place_at: reader.place_at,
             left_hosts: &left_hosts,
-            heavy: self.heavy_session(playlist_bps, reader.udp),
+            heavy: heavy_session,
+            two_path_bps,
         };
         // A rebalanced listener goes only to a cache heard of lately: an
         // edge that has just died still looks fresh, and empty, for a few

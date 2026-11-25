@@ -1391,7 +1391,12 @@ impl UdpSession {
             self.degraded_at = None;
             return;
         }
-        let Some(verdict) = verdict.filter(|_| live && !self.hold && !self.queued) else {
+        // One leg of a stream of objects (heavy, B 3.9): a small stream's
+        // lone leg has the compact lane's repair and hedges, and its
+        // catch-up after a stall upstream is late by design.
+        let Some(verdict) =
+            verdict.filter(|_| live && self.object_lane && !self.hold && !self.queued)
+        else {
             return;
         };
         let again = self.config.quality.window * 2;

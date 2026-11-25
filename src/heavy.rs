@@ -7,10 +7,16 @@
 //! hash alone decided and both of a region's 4K viewers and its readers
 //! landed on one 2-vCPU edge again and again while the other was healthy.
 //!
-//! A session is *heavy* when its stream's measured rate is above
-//! `--heavy-session-bps` (8 Mbit/s, the two-path rate). Streams are opaque
-//! bytes: every rule here keys on byte rates and measured conditions, never
-//! on what the stream carries.
+//! A session is *heavy* when the edges class its stream heavy: its
+//! sustained rate (its newest parts' media bytes over their own declared
+//! durations, 2 s; never a peak, never arrival times) above
+//! `--heavy-session-bps` (8 Mbit/s, the two-path rate) for 500 ms, and
+//! small again only after 10 s under 80 % of it ([`RateClass`]). The figure
+//! the cache measured before (`playlist_bitrate_bps`, kept as a peak by
+//! `EdgeAdmission::set_playlist_bps`) counts the stored canonical slot,
+//! envelope and all: 8.15 Mbit/s for 1 ms PCM, whose media is 2.43. Streams
+//! are opaque bytes: every rule here keys on byte rates and measured
+//! conditions, never on what the stream carries.
 //!
 //! What a heavy session costs an edge is a linear model ([`CostModel`]), in
 //! thousandths of one CPU, its coefficients settings whose defaults are
@@ -35,7 +41,7 @@
 //! `assignment::assign` places it.
 
 use crate::assignment::{HeavyRoom, HeavySession};
-use crate::{edge_admission, AppRouter};
+use crate::{edge_admission, AppRouter, MeshSnapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -172,6 +178,17 @@ pub(crate) struct HeavyConfig {
     pub(crate) unproven_for: Duration,
     pub(crate) max_unproven: usize,
     pub(crate) distress: DistressConfig,
+    /// A stream's class (heavy or small) follows its sustained rate: its
+    /// newest parts' bytes over their own declared durations once they
+    /// cover `sustain` (`--heavy-sustain-ms`, 2 s), never a peak and
+    /// never arrival times. Heavy once that rate is over `session_bps` for
+    /// `heavy_after` (`--heavy-after-ms`, 500 ms: two looks); small again
+    /// only after it is under `small_below_permille` (800) of it for
+    /// `small_after` (`--heavy-small-after-ms`, 10 s).
+    pub(crate) sustain: Duration,
+    pub(crate) heavy_after: Duration,
+    pub(crate) small_after: Duration,
+    pub(crate) small_below_permille: u32,
 }
 
 impl Default for HeavyConfig {
@@ -189,6 +206,10 @@ impl Default for HeavyConfig {
             unproven_for: Duration::from_millis(1_500),
             max_unproven: 8,
             distress: DistressConfig::default(),
+            sustain: Duration::from_secs(2),
+            heavy_after: Duration::from_millis(500),
+            small_after: Duration::from_secs(10),
+            small_below_permille: 800,
         }
     }
 }
@@ -259,9 +280,12 @@ pub(crate) struct HeavyAdvert {
     pub(crate) egress_max_bps: u64,
     /// The heavy sessions' bytes.
     pub(crate) committed_bps: u64,
-    /// The heavy streams held (their tee is paid).
+    /// The streams it classes heavy (their tee is paid).
     #[serde(default)]
     pub(crate) streams: Vec<HeavyStream>,
+    /// The streams it classes small (a sustained rate under the line).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) small: Vec<u64>,
     /// Why the edge is in distress, if it is (rule 4): placement avoids it
     /// for heavy sessions at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -557,6 +581,78 @@ impl HeavyRefusal {
     }
 }
 
+/// A stream's class at an edge (place240): heavy or small by its
+/// sustained rate, with hysteresis.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RateClass {
+    pub(crate) heavy: bool,
+    /// Its last sustained rate; `None` before the parts covered the window.
+    pub(crate) bps: Option<u64>,
+    above_since: Option<Instant>,
+    below_since: Option<Instant>,
+}
+
+impl RateClass {
+    /// A look at the stream's sustained rate (`None`: not yet known).
+    pub(crate) fn observe(&mut self, sample: Option<u64>, now: Instant, config: &HeavyConfig) {
+        let Some(bps) = sample else {
+            return;
+        };
+        self.bps = Some(bps);
+        if config.is_heavy(bps) {
+            self.below_since = None;
+            let since = *self.above_since.get_or_insert(now);
+            if now.saturating_duration_since(since) >= config.heavy_after {
+                self.heavy = true;
+            }
+            return;
+        }
+        self.above_since = None;
+        let low = u128::from(bps) * 1_000
+            < u128::from(config.session_bps) * u128::from(config.small_below_permille);
+        if !self.heavy || !low {
+            self.below_since = None;
+            return;
+        }
+        let since = *self.below_since.get_or_insert(now);
+        if now.saturating_duration_since(since) >= config.small_after {
+            self.heavy = false;
+            self.below_since = None;
+        }
+    }
+}
+
+/// A heavy session an edge admits and has not counted yet (place240: two
+/// admissions at once each counted the other's absence).
+#[derive(Debug, Clone, Copy)]
+struct Reservation {
+    id: u64,
+    stream_id: u64,
+    lane: Lane,
+    bps: u64,
+    at: Instant,
+}
+
+/// A reservation lapses after this however its admission ended.
+const RESERVATION_TTL: Duration = Duration::from_secs(10);
+
+/// An admission's reservation of its heavy cost at an edge, released when
+/// it is dropped (the subscriber is in the table by then, or refused).
+pub(crate) struct HeavyHold {
+    heavy: Arc<Heavy>,
+    id: u64,
+}
+
+impl Drop for HeavyHold {
+    fn drop(&mut self) {
+        self.heavy
+            .reservations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|reservation| reservation.id != self.id);
+    }
+}
+
 /// A node's heavy-session state: its settings, the entry's pending
 /// charges, the edge's distress and the counters.
 pub(crate) struct Heavy {
@@ -575,6 +671,13 @@ pub(crate) struct Heavy {
     send_side: Mutex<Vec<SendSideCounter>>,
     /// Test only: a distress reason forced on (`None`: measured).
     forced: Mutex<Option<&'static str>>,
+    /// The class of each stream this edge holds.
+    classes: Mutex<HashMap<u64, RateClass>>,
+    /// Heavy admissions in progress, and the lock that makes an admission's
+    /// check and its reservation one step.
+    reservations: Mutex<Vec<Reservation>>,
+    admit: Mutex<()>,
+    next_reservation: AtomicU64,
 }
 
 impl std::fmt::Debug for Heavy {
@@ -599,7 +702,18 @@ impl Heavy {
             held: Mutex::default(),
             send_side: Mutex::default(),
             forced: Mutex::default(),
+            classes: Mutex::default(),
+            reservations: Mutex::default(),
+            admit: Mutex::default(),
+            next_reservation: AtomicU64::new(1),
         }
+    }
+
+    /// The reservations that still stand.
+    fn reserved(&self, now: Instant) -> Vec<Reservation> {
+        let mut reservations = self.reservations.lock().unwrap_or_else(|p| p.into_inner());
+        reservations.retain(|reservation| now.saturating_duration_since(reservation.at) < RESERVATION_TTL);
+        reservations.clone()
     }
 
     /// HOOK: add a cumulative counter of client sends that the send side
@@ -619,6 +733,16 @@ impl Heavy {
             .iter()
             .map(|read| read())
             .sum()
+    }
+
+    /// Test only: class a stream heavy at `bps` (a look with no sample
+    /// keeps it).
+    #[cfg(test)]
+    pub(crate) fn force_heavy(&self, stream_id: u64, bps: u64) {
+        let mut classes = self.classes.lock().unwrap();
+        let class = classes.entry(stream_id).or_default();
+        class.heavy = true;
+        class.bps = Some(bps);
     }
 
     /// Test only: force distress on (`Some`) or back to measured.
@@ -735,11 +859,23 @@ impl AppRouter {
             .distress_at(Instant::now(), || self.distress_counters())
     }
 
+    /// The class of a stream this edge holds, after a look at its
+    /// sustained rate (place240).
+    pub(crate) async fn heavy_class(&self, stream_id: u64) -> RateClass {
+        let sample = self
+            .cache
+            .sustained_bitrate_bps(stream_id, self.heavy.config.sustain)
+            .await;
+        let mut classes = self.heavy.classes.lock().unwrap_or_else(|p| p.into_inner());
+        let class = classes.entry(stream_id).or_default();
+        class.observe(sample, Instant::now(), &self.heavy.config);
+        *class
+    }
+
     /// The distress reason for a stream's one-leg clients: the edge is in
-    /// distress and the stream is heavy.
-    pub(crate) fn heavy_distress_for(&self, stream_id: u64) -> Option<&'static str> {
-        let bps = self.edge_load.egress.measured_playlist_bps(stream_id)?;
-        if !self.heavy.config.is_heavy(bps) {
+    /// distress and the stream is classed heavy.
+    pub(crate) async fn heavy_distress_for(&self, stream_id: u64) -> Option<&'static str> {
+        if !self.heavy_class(stream_id).await.heavy {
             return None;
         }
         self.heavy_distress()
@@ -754,8 +890,13 @@ impl AppRouter {
     }
 
     /// The heavy streams this edge holds with their sessions by lane, and
-    /// the model's committed cost and bytes, from `held` (stream, rate).
-    fn heavy_streams(&self, held: &[(u64, u64)]) -> (Vec<HeavyStream>, u32, u64) {
+    /// the model's committed cost and bytes, from `held` (stream, rate),
+    /// the admissions in progress (`reserved`) counted too.
+    fn heavy_streams(
+        &self,
+        held: &[(u64, u64)],
+        reserved: &[Reservation],
+    ) -> (Vec<HeavyStream>, u32, u64) {
         let model = self.heavy.config.model;
         let udp = self.edge_udp_stats.subscribers_by_stream_and_lane();
         let http = self.edge_load.egress.sessions_by_playlist();
@@ -763,9 +904,6 @@ impl AppRouter {
         let mut bytes = 0_u64;
         let mut streams = Vec::new();
         for &(stream_id, bps) in held {
-            if !self.heavy.config.is_heavy(bps) {
-                continue;
-            }
             let (udp_fast, udp_cache) = udp.get(&stream_id).copied().unwrap_or((0, 0));
             let http = http.get(&stream_id).copied().unwrap_or(0);
             committed = committed
@@ -786,33 +924,39 @@ impl AppRouter {
                 http,
             });
         }
+        for reservation in reserved {
+            committed = committed.saturating_add(model.session(reservation.lane, reservation.bps));
+            bytes = bytes.saturating_add(reservation.bps);
+            if !held.iter().any(|(stream_id, _)| *stream_id == reservation.stream_id) {
+                committed = committed.saturating_add(model.stream(reservation.bps));
+            }
+        }
         (streams, committed, bytes)
     }
 
     /// The heavy part of this edge's advertisement, from the streams it
-    /// holds (stream, measured rate). `None` on a node that serves no
-    /// reader.
-    pub(crate) fn heavy_advert(
-        &self,
-        streams: impl Iterator<Item = (u64, Option<u64>)>,
-    ) -> Option<HeavyAdvert> {
+    /// holds: those it classes heavy with their sustained rates and
+    /// sessions (admissions in progress counted), and those it classes
+    /// small. `None` on a node that serves no reader.
+    pub(crate) async fn heavy_advert(&self, streams: Vec<u64>) -> Option<HeavyAdvert> {
         if self.cache_mesh_role != crate::CacheMeshRole::Edge {
             return None;
         }
-        let held: Vec<(u64, u64)> = streams
-            .filter_map(|(stream_id, bps)| {
-                let bps = self
-                    .edge_load
-                    .egress
-                    .measured_playlist_bps(stream_id)
-                    .or(bps)?;
-                self.heavy.config.is_heavy(bps).then_some((stream_id, bps))
-            })
-            .collect();
+        let mut held = Vec::new();
+        let mut small = Vec::new();
+        for stream_id in streams {
+            let class = self.heavy_class(stream_id).await;
+            match (class.heavy, class.bps) {
+                (true, Some(bps)) => held.push((stream_id, bps)),
+                (false, Some(_)) => small.push(stream_id),
+                _ => {}
+            }
+        }
         *self.heavy.held.lock().unwrap_or_else(|p| p.into_inner()) = held.clone();
         let config = self.heavy.config;
         let cpus = config.cpus();
-        let (streams, committed, bytes) = self.heavy_streams(&held);
+        let reserved = self.heavy.reserved(Instant::now());
+        let (streams, committed, bytes) = self.heavy_streams(&held, &reserved);
         Some(HeavyAdvert {
             cpus,
             budget_permille: config.heavy_budget(cpus),
@@ -821,38 +965,50 @@ impl AppRouter {
             egress_max_bps: config.egress_max_bps,
             committed_bps: bytes,
             streams,
+            small,
             distress: self.heavy_distress().map(str::to_owned),
         })
     }
 
-    /// The edge's own cap (rule 2): whether it takes one more session of
-    /// `stream_id` on `lane`. A small session, or one of a stream this edge
-    /// has not measured, is always taken.
-    pub(crate) fn heavy_admits(&self, stream_id: u64, lane: Lane) -> Result<(), HeavyRefusal> {
-        self.heavy_check(stream_id, lane, true)
+    /// The edge's own cap (rule 2): one more session of `stream_id` on
+    /// `lane`, its cost reserved at once (released when the hold is
+    /// dropped: the admission ended), so two admissions at once see each
+    /// other. A session of a stream this edge does not class heavy is
+    /// always taken (`Ok(None)`).
+    pub(crate) async fn heavy_reserve(
+        &self,
+        stream_id: u64,
+        lane: Lane,
+    ) -> Result<Option<HeavyHold>, HeavyRefusal> {
+        self.heavy_check(stream_id, lane, true).await
     }
 
-    /// [`Self::heavy_admits`]; `add`: the session is not counted in the
-    /// edge's sessions yet.
-    fn heavy_check(&self, stream_id: u64, lane: Lane, add: bool) -> Result<(), HeavyRefusal> {
+    /// [`Self::heavy_reserve`]; `add`: the session is not counted in the
+    /// edge's sessions yet (it is reserved when it fits).
+    async fn heavy_check(
+        &self,
+        stream_id: u64,
+        lane: Lane,
+        add: bool,
+    ) -> Result<Option<HeavyHold>, HeavyRefusal> {
         let config = self.heavy.config;
-        let Some(bps) = self.edge_load.egress.measured_playlist_bps(stream_id) else {
-            return Ok(());
+        let class = self.heavy_class(stream_id).await;
+        let (true, Some(bps)) = (class.heavy, class.bps) else {
+            return Ok(None);
         };
-        if !config.is_heavy(bps) {
-            return Ok(());
-        }
         // An edge in distress is avoided by placement (its advertisement)
         // and tells its one-leg clients to move; it does not refuse a
         // session the entry sent it (a hedge, a move in a stale view):
         // that made a loop of edge-busy refusals.
+        let _admit = self.heavy.admit.lock().unwrap_or_else(|p| p.into_inner());
         let mut held = self.heavy.held.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        let holds = held.iter().any(|(held, _)| *held == stream_id);
-        if !holds {
+        if !held.iter().any(|(held, _)| *held == stream_id) {
             held.push((stream_id, bps));
         }
+        let now = Instant::now();
+        let reserved = self.heavy.reserved(now);
         let cpus = config.cpus();
-        let (_, committed, bytes) = self.heavy_streams(&held);
+        let (_, committed, bytes) = self.heavy_streams(&held, &reserved);
         let (cpu_add, bps_add) = if add {
             (config.model.session(lane, bps), bps)
         } else {
@@ -869,13 +1025,31 @@ impl AppRouter {
             self.heavy.stats.refused_cpu.fetch_add(1, Ordering::Relaxed);
             return Err(HeavyRefusal::Cpu);
         }
-        Ok(())
+        if !add {
+            return Ok(None);
+        }
+        let id = self.heavy.next_reservation.fetch_add(1, Ordering::Relaxed);
+        self.heavy
+            .reservations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(Reservation {
+                id,
+                stream_id,
+                lane,
+                bps,
+                at: now,
+            });
+        Ok(Some(HeavyHold {
+            heavy: Arc::clone(&self.heavy),
+            id,
+        }))
     }
 
     /// The edge's cap for an LL-HLS reader: a session just admitted (and
     /// so counted in its playlist's sessions) that passes the heavy budget
     /// is forgotten and refused (429).
-    pub(crate) fn heavy_admits_reader(
+    pub(crate) async fn heavy_admits_reader(
         &self,
         stream_id: Option<u64>,
         session_id: Option<&str>,
@@ -886,19 +1060,44 @@ impl AppRouter {
         else {
             return admission;
         };
-        if self.heavy_check(stream_id, Lane::Http, false).is_err() {
+        if self.heavy_check(stream_id, Lane::Http, false).await.is_err() {
             self.edge_load.egress.forget_session(session_id);
             return edge_admission::PlaybackAdmission::Rejected;
         }
         admission
     }
 
-    /// The heavy session a reader of `stream_id` is (`None`: small), from
-    /// the region's measured rate.
-    pub(crate) fn heavy_session(&self, playlist_bps: Option<u64>, udp: bool) -> Option<HeavySession> {
-        self.heavy
-            .config
-            .session(playlist_bps, if udp { Lane::UdpFast } else { Lane::Http })
+    /// The heavy session a reader of `stream_id` is, from the classes the
+    /// region's edges advertise (place240), and the rate its legs are cut
+    /// by: heavy at the highest sustained rate an edge classes it heavy
+    /// at; small (two-path rate 0) when an edge classes it small and none
+    /// heavy; else not known yet: the unmeasured estimate, placed by room
+    /// and never refused, its legs as asked (`None`).
+    pub(crate) fn heavy_session(
+        &self,
+        snapshots: &[MeshSnapshot],
+        stream_id: u64,
+        udp: bool,
+    ) -> (Option<HeavySession>, Option<u64>) {
+        let lane = if udp { Lane::UdpFast } else { Lane::Http };
+        let mut heavy_bps: Option<u64> = None;
+        let mut small = false;
+        for advert in snapshots
+            .iter()
+            .filter(|snapshot| snapshot.node.region == self.node.region)
+            .filter_map(|snapshot| snapshot.edge_service.as_ref()?.heavy.as_ref())
+        {
+            if let Some(stream) = advert.streams.iter().find(|stream| stream.stream_id == stream_id) {
+                heavy_bps = Some(heavy_bps.map_or(stream.bps, |bps| bps.max(stream.bps)));
+            } else if advert.small.contains(&stream_id) {
+                small = true;
+            }
+        }
+        match heavy_bps {
+            Some(bps) => (self.heavy.config.session(Some(bps), lane), Some(bps)),
+            None if small => (None, Some(0)),
+            None => (self.heavy.config.session(None, lane), None),
+        }
     }
 
     /// The room an entry sees at a cache for `stream_id` (`None` for a cache
@@ -1034,6 +1233,15 @@ pub(crate) struct HeavyArgs {
     pub(crate) distress_core_ms: u64,
     #[arg(long = "heavy-distress-clear-ms", default_value_t = 3_000)]
     pub(crate) distress_clear_ms: u64,
+    /// A stream's class follows its sustained rate over this (its newest
+    /// parts' declared durations), heavy after it is over the line this
+    /// long, small again after it is under 80 % of it this long.
+    #[arg(long = "heavy-sustain-ms", default_value_t = 2_000)]
+    pub(crate) sustain_ms: u64,
+    #[arg(long = "heavy-after-ms", default_value_t = 500)]
+    pub(crate) heavy_after_ms: u64,
+    #[arg(long = "heavy-small-after-ms", default_value_t = 10_000)]
+    pub(crate) small_after_ms: u64,
 }
 
 impl HeavyArgs {
@@ -1060,6 +1268,9 @@ impl HeavyArgs {
                 core_busy_for: Duration::from_millis(self.distress_core_ms),
                 clear_after: Duration::from_millis(self.distress_clear_ms),
             },
+            sustain: Duration::from_millis(self.sustain_ms.max(100)),
+            heavy_after: Duration::from_millis(self.heavy_after_ms),
+            small_after: Duration::from_millis(self.small_after_ms),
             ..HeavyConfig::default()
         }
     }
@@ -1154,6 +1365,7 @@ mod tests {
             egress_max_bps: 600_000_000,
             committed_bps: 0,
             streams: Vec::new(),
+            small: Vec::new(),
             distress: None,
         };
         let room = advert.room(7, &pending.at("edge-1", 9_000, &config, later), &config.model);
@@ -1214,5 +1426,41 @@ mod tests {
         let read = Arc::clone(&value);
         heavy.register_send_side_counter(Arc::new(move || read.load(Ordering::Relaxed)));
         assert_eq!(heavy.send_side_total(), 7);
+    }
+
+    /// Place240 follow-up 1: a stream's class follows its sustained rate
+    /// with hysteresis: heavy only once over the line for `heavy_after`,
+    /// small again only after `small_after` under 80 % of it; a sample
+    /// that is not known yet changes nothing.
+    #[test]
+    fn a_class_needs_a_sustained_rate_to_change_and_longer_to_change_back() {
+        let config = HeavyConfig::default();
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut pcm = RateClass::default();
+        for ms in (0..20_000).step_by(100) {
+            pcm.observe(Some(2_400_000), at(ms), &config);
+            assert!(!pcm.heavy);
+        }
+        // One look over the line (a rate that is not sustained) is not heavy.
+        pcm.observe(Some(9_000_000), at(20_000), &config);
+        pcm.observe(Some(2_400_000), at(20_100), &config);
+        pcm.observe(Some(9_000_000), at(20_200), &config);
+        assert!(!pcm.heavy);
+        let mut video = RateClass::default();
+        video.observe(None, at(0), &config);
+        video.observe(Some(40_000_000), at(2_000), &config);
+        assert!(!video.heavy);
+        video.observe(Some(40_000_000), at(2_500), &config);
+        assert!(video.heavy);
+        // A dip into the band, and a short one under it: still heavy.
+        video.observe(Some(7_000_000), at(3_000), &config);
+        video.observe(Some(1_000_000), at(4_000), &config);
+        video.observe(Some(40_000_000), at(5_000), &config);
+        video.observe(Some(1_000_000), at(6_000), &config);
+        video.observe(Some(1_000_000), at(15_900), &config);
+        assert!(video.heavy);
+        video.observe(Some(1_000_000), at(16_000), &config);
+        assert!(!video.heavy, "10 s under 80 %");
     }
 }

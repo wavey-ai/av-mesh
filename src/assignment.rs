@@ -309,6 +309,18 @@ pub struct AssignmentRequest<'a> {
     /// The session is heavy (place240): it is placed by what it costs each
     /// cache, not by the tiers.
     pub heavy: Option<HeavySession>,
+    /// The rate that decides one leg or two (place240): the stream's
+    /// sustained rate as its edges class it (0 for a stream they class
+    /// small), rather than `playlist_bps`, a peak; `None` where no edge
+    /// classes it (as before: `playlist_bps`).
+    pub two_path_bps: Option<u64>,
+}
+
+impl AssignmentRequest<'_> {
+    /// The rate the two-path cut is judged by.
+    fn leg_cut_bps(&self) -> Option<u64> {
+        self.two_path_bps.or(self.playlist_bps)
+    }
 }
 
 impl Default for AssignmentRequest<'_> {
@@ -334,6 +346,7 @@ impl Default for AssignmentRequest<'_> {
             place_at: None,
             left_hosts: &[],
             heavy: None,
+            two_path_bps: None,
         }
     }
 }
@@ -542,7 +555,7 @@ pub fn assign(
     // none more to a listener that holds a leg of it (B 3.9: no second edge
     // is asked to send video; review of B Y1, finding 7).
     let wanted = if request
-        .playlist_bps
+        .leg_cut_bps()
         .is_some_and(|bps| bps > policy.two_path_max_bps)
     {
         if request.redundant {
@@ -953,13 +966,18 @@ fn assign_heavy(
             })
             .map(|(index, _)| index)
     };
-    let wanted = if request.redundant {
+    // One leg for a measured heavy session; an estimated one (no edge has
+    // classed the stream yet) gets the legs it asks for, as before (the
+    // client falls to one once its parts come as objects).
+    let wanted = if !heavy.refuse {
+        request.paths.min(MAX_PATHS)
+    } else if request.redundant {
         0
     } else {
         request.paths.min(1)
     };
     let mut caches: Vec<AssignedCache> = Vec::new();
-    if wanted > 0 {
+    if wanted > 0 && !request.redundant {
         let sticky = request
             .current
             .into_iter()
@@ -970,22 +988,36 @@ fn assign_heavy(
                     .copied()
                     .find(|cache| cache.node_id == name && healthy(cache) && !distressed(cache))
             });
-        match sticky {
-            Some(cache) => caches.push(assigned(cache, AssignmentReason::Sticky)),
-            None => {
-                let Some(index) = choose(&pool, "") else {
-                    return heavy.refuse.then_some(Err(AssignmentError::HeavyFull));
-                };
-                let cache = pool.remove(index);
-                let reason = if cache.holds_playlist() {
-                    AssignmentReason::HoldsPlaylist
-                } else {
-                    AssignmentReason::NewCopy
-                };
-                caches.push(assigned(cache, reason));
-            }
+        if let Some(cache) = sticky {
+            caches.push(assigned(cache, AssignmentReason::Sticky));
+            pool.retain(|other| other.node_id != cache.node_id);
         }
-        pool.retain(|cache| caches.iter().all(|leg| leg.node_id != cache.node_id));
+    }
+    while caches.len() < usize::from(wanted) {
+        let salt = if caches.is_empty() {
+            String::new()
+        } else {
+            format!("/leg{}", caches.len())
+        };
+        let Some(index) = choose(&pool, &salt) else {
+            if caches.is_empty() && heavy.refuse && !request.redundant {
+                return Some(Err(AssignmentError::HeavyFull));
+            }
+            if caches.is_empty() && !heavy.refuse {
+                // An estimate with no room anywhere: placed as before.
+                return None;
+            }
+            break;
+        };
+        let cache = pool.remove(index);
+        let reason = if !caches.is_empty() || request.redundant {
+            AssignmentReason::SecondPath
+        } else if cache.holds_playlist() {
+            AssignmentReason::HoldsPlaylist
+        } else {
+            AssignmentReason::NewCopy
+        };
+        caches.push(assigned(cache, reason));
     }
     let legs = u8::try_from(caches.len()).unwrap_or(MAX_PATHS);
     let mut spare = false;
@@ -1118,7 +1150,7 @@ pub fn assign_udp_in_region(
     // One leg, and why not the legs asked: as `assign` reckons it (review
     // of B Y2, finding 8).
     let wanted = if request
-        .playlist_bps
+        .leg_cut_bps()
         .is_some_and(|bps| bps > policy.two_path_max_bps)
     {
         request.paths.min(1)
@@ -2740,6 +2772,7 @@ mod tests {
             place_at: None,
             left_hosts: &[],
             heavy: None,
+            two_path_bps: None,
         }
     }
 

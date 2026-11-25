@@ -2999,14 +2999,19 @@ async fn admit(
         return;
     }
     // Place240 rule 2: the edge's own cap of heavy sessions, by the cost
-    // model (a lone leg that moves here is taken, as above).
+    // model (a lone leg that moves here is taken, as above), the
+    // session's cost reserved until the admission ends so that two
+    // admissions at once each count the other.
+    let mut _heavy_hold = None;
     if !(from_part.is_some() && others == NO_OTHER_LEGS) {
         let lane = if fast_lane && sockets.fast_lane().is_some_and(|lane| lane.is_armed()) {
             crate::heavy::Lane::UdpFast
         } else {
             crate::heavy::Lane::UdpCache
         };
-        if router.heavy_admits(stream_id, lane).is_err() {
+        match router.heavy_reserve(stream_id, lane).await {
+            Ok(hold) => _heavy_hold = hold,
+            Err(_) => {
             stats.refusals.fetch_add(1, Ordering::Relaxed);
             send_control(
                 &socket,
@@ -3018,6 +3023,7 @@ async fn admit(
             )
             .await;
             return;
+            }
         }
     }
     if hedge_over_gate(
@@ -4346,7 +4352,7 @@ async fn distress_hints(
     stream_id: u64,
     now: Instant,
 ) {
-    let Some(why) = router.heavy_distress_for(stream_id) else {
+    let Some(why) = router.heavy_distress_for(stream_id).await else {
         house.hinted.clear();
         return;
     };
