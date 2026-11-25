@@ -47541,4 +47541,5 @@ mod tests {
     /// A 4K viewer at an edge whose source session restarts, with a late
     /// copy of the old session in its cache (stuck4k).
     mod stuck_4k;
+    mod place_heavy;
 }

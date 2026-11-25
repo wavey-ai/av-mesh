@@ -720,7 +720,7 @@ impl Loss {
 }
 
 /// Receive one datagram with the kernel's receive time (Unix µs).
-async fn recv_stamped(
+pub(super) async fn recv_stamped(
     socket: &UdpSocket,
     buf: &mut [u8],
 ) -> std::io::Result<(usize, SocketAddr, u64)> {
