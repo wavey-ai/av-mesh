@@ -329,7 +329,12 @@ fn run(options: Options) -> Run {
         tokio::spawn(LaneEdge::start_with_playout(
             loopback(options.ip),
             Duration::from_millis(500),
-            move |config| config.send_defer = defer,
+            move |config| {
+                config.send_defer = defer;
+                // The node's ring (16 MB from the start): a 4K part at 247
+                // Mbit/s needs twice its 1.1 MB free to be teed.
+                config.tee_capacity = fast_plane::relay::DEFAULT_TEE_CAPACITY;
+            },
         ))
         .await
         .unwrap()
