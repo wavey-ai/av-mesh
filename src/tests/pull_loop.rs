@@ -81,6 +81,15 @@ async fn run(bypass: bool, ip: u8) -> PullRun {
         Arc::clone(&parent_cache.chunk_cache),
         CacheMeshConfig::new("pull-parent", "uk", unused_loopback_addr())
             .with_role(MeshRole::Distributor)
+            // As deployed (--cache-mesh-replication demand): a child gets a
+            // playlist pushed only while it holds a lease for it. The
+            // library's default (every playlist to every child) pushed the
+            // whole stored stream to the edge unasked, and the test counted
+            // whatever of that burst the edge's mesh socket read: 126 kB on
+            // 7e96000, whose spun tee shared the node runtime with the mesh
+            // receiver, 4-7 MB once each lane's tee had its own thread
+            // (integration 6).
+            .with_replication(playlists::mesh::ReplicationMode::Demand)
             .with_peer(edge_mesh.local_addr()),
     )
     .start()
