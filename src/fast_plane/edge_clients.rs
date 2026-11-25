@@ -634,6 +634,10 @@ pub struct EdgeFastLane {
     partials: Arc<JobRing<PartialJob>>,
     /// send240, B: the kernel's pacing of the video client sockets.
     send_pacing: OnceLock<Arc<super::send_pacing::SendPacing>>,
+    /// Rebuilds that left a client out (a leg released at a move, a client
+    /// gone): the class thread then drops what it kept for such clients at
+    /// once (integration 6).
+    departures: AtomicU64,
     pub stats: FastLaneStats,
 }
 
@@ -924,6 +928,7 @@ impl EdgeFastLane {
         // Faulted in here: the class threads write its counters.
         crate::memory::touched_arc(Self {
             snapshot: ArcSwap::from_pointee(FastSnapshot::default()),
+            departures: AtomicU64::new(0),
             retired: super::retired::Retired::default(),
             gone: super::retired::Retired::default(),
             eligible: DashMap::new(),
@@ -1343,6 +1348,7 @@ impl EdgeFastLane {
             .flatten()
             .flat_map(|group| group.clients.iter().map(|(_, client)| Arc::as_ptr(client)))
             .collect();
+        let mut departed = false;
         for (_, client) in old
             .streams
             .values()
@@ -1351,7 +1357,11 @@ impl EdgeFastLane {
         {
             if !kept.contains(&Arc::as_ptr(client)) {
                 self.gone.keep(Arc::clone(client));
+                departed = true;
             }
+        }
+        if departed {
+            self.departures.fetch_add(1, Ordering::Release);
         }
         self.retired.keep(old);
     }
@@ -1957,6 +1967,8 @@ pub struct ClientPlan {
     /// it takes datagrams again (send240, A; the video thread's plan with
     /// `--send-defer-ms` above 0).
     defer: Option<Box<super::send_defer::SendDefer>>,
+    /// The lane's departures last looked at (integration 6).
+    departures_seen: u64,
 }
 
 const REPAIR_MEMO: usize = 64;
@@ -2051,6 +2063,7 @@ impl ClientPlan {
             compact_sent: Vec::with_capacity(sys::RECV_BATCH),
             dispatched_at: None,
             defer: None,
+            departures_seen: 0,
         };
         plan.touch();
         plan
@@ -2129,6 +2142,7 @@ impl ClientPlan {
     /// by the class thread at a pass without new datagrams; a send drains
     /// first itself.
     pub fn drain_deferred(&mut self, lane: &EdgeFastLane) {
+        self.release_departed(lane);
         let Some(defer) = self.defer.as_deref_mut().filter(|defer| !defer.is_empty()) else {
             return;
         };
@@ -2682,7 +2696,31 @@ impl ClientPlan {
     /// keep, behind it, each send of the batch to a client that still has
     /// datagrams kept (or, in a test, whose path is stalled). A part of one
     /// symbol, and a compact datagram, go as before.
+    /// A client left the lane since the last look (its leg released at a
+    /// move, or gone): what was kept for it is dropped at once, never sent
+    /// to the old leg nor handed to the cache-fed lane (integration 6).
+    /// Without a departure, one atomic load.
+    fn release_departed(&mut self, lane: &EdgeFastLane) {
+        let departures = lane.departures.load(Ordering::Acquire);
+        if departures == self.departures_seen {
+            return;
+        }
+        self.departures_seen = departures;
+        let Some(defer) = self.defer.as_deref_mut().filter(|defer| !defer.is_empty()) else {
+            return;
+        };
+        let snapshot = lane.snapshot.load();
+        defer.release_where(|_, target| {
+            snapshot
+                .streams
+                .values()
+                .flatten()
+                .any(|group| group.clients.iter().any(|(peer, _)| *peer == target))
+        });
+    }
+
     fn divert_to_kept(&mut self, lane: &EdgeFastLane, fd: RawFd) {
+        self.release_departed(lane);
         let gso = self.gso;
         let Some(defer) = self.defer.as_deref_mut() else {
             return;

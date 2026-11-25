@@ -120,6 +120,16 @@ pub(crate) struct DistressConfig {
     /// send-side counters), a second (`--heavy-distress-blocked-per-s`, 20;
     /// 0: not judged).
     pub(crate) send_blocked_per_s: u64,
+    /// send240's keep-and-resend, integration 6: datagrams the video thread
+    /// kept for its clients because a socket refused them, a second
+    /// (`--heavy-distress-deferred-per-s`, 5,000: about 200 ms of one 247
+    /// Mbit/s viewer's datagrams within a second; a short stall kept and
+    /// resent is not distress), and parts given up for a client after the
+    /// keep's deadline (handed to the cache-fed lane with the symbols it
+    /// lacked, or dropped when its ring was full), a second
+    /// (`--heavy-distress-given-up-per-s`, 1). 0: not judged.
+    pub(crate) send_deferred_per_s: u64,
+    pub(crate) send_given_up_per_s: u64,
     /// Tee copies shed, a second (`--heavy-distress-tee-per-s`, 1,000; 0:
     /// not judged). cmpd8's hot edges shed 1.5k to 20k a second.
     pub(crate) tee_dropped_per_s: u64,
@@ -141,6 +151,8 @@ impl Default for DistressConfig {
     fn default() -> Self {
         Self {
             send_blocked_per_s: 20,
+            send_deferred_per_s: 5_000,
+            send_given_up_per_s: 1,
             tee_dropped_per_s: 1_000,
             memory: true,
             core_busy_permille: 0,
@@ -454,6 +466,10 @@ pub(crate) const DISTRESS_SAMPLE: Duration = Duration::from_millis(500);
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct DistressCounters {
     pub(crate) send_blocked: u64,
+    /// send240's counters of the client sends kept, and of the parts given
+    /// up after the keep (integration 6).
+    pub(crate) send_deferred: u64,
+    pub(crate) send_given_up: u64,
     pub(crate) tee_dropped: u64,
     /// The memory guard: 0 ok, 1 soft, 2 hard.
     pub(crate) memory: u8,
@@ -531,6 +547,16 @@ fn judge_inputs(
         && per_s(now.send_blocked, before.send_blocked) >= config.send_blocked_per_s as f64
     {
         return Some("send-blocked");
+    }
+    if config.send_given_up_per_s > 0
+        && per_s(now.send_given_up, before.send_given_up) >= config.send_given_up_per_s as f64
+    {
+        return Some("send-given-up");
+    }
+    if config.send_deferred_per_s > 0
+        && per_s(now.send_deferred, before.send_deferred) >= config.send_deferred_per_s as f64
+    {
+        return Some("send-deferred");
     }
     if config.tee_dropped_per_s > 0
         && per_s(now.tee_dropped, before.tee_dropped) >= config.tee_dropped_per_s as f64
@@ -837,13 +863,21 @@ impl AppRouter {
         let stats = &self.edge_udp_stats;
         let mut send_blocked = stats.would_block.load(Ordering::Relaxed)
             + stats.send_queue_drops.load(Ordering::Relaxed);
+        let (mut send_deferred, mut send_given_up) = (0, 0);
         if let Some(lane) = stats.fast_lane.get().and_then(std::sync::Weak::upgrade) {
             let lane = lane.snapshot_stats();
             send_blocked += lane.would_block + lane.given_back;
+            // The hook's send-side counters (integration 6): send240's
+            // keep-and-resend of the video thread, kept datagrams and the
+            // parts given up after the keep, each with its threshold.
+            send_deferred += lane.send_defer.deferred;
+            send_given_up += lane.send_defer.handed_parts + lane.send_defer.handed_dropped;
         }
         send_blocked += self.heavy.send_side_total();
         DistressCounters {
             send_blocked,
+            send_deferred,
+            send_given_up,
             tee_dropped: self.cache.relay_ingress_snapshot().fast_plane.tee_dropped,
             memory: av_mesh::mem_guard::installed()
                 .map_or(0, |installed| installed.guard.state() as u8),
@@ -1223,6 +1257,12 @@ pub(crate) struct HeavyArgs {
     /// long with every input under its threshold.
     #[arg(long = "heavy-distress-blocked-per-s", default_value_t = 20)]
     pub(crate) distress_blocked_per_s: u64,
+    /// send240's kept client datagrams a second, and parts given up after
+    /// the keep a second (integration 6; 0: a rule off).
+    #[arg(long = "heavy-distress-deferred-per-s", default_value_t = 5_000)]
+    pub(crate) distress_deferred_per_s: u64,
+    #[arg(long = "heavy-distress-given-up-per-s", default_value_t = 1)]
+    pub(crate) distress_given_up_per_s: u64,
     #[arg(long = "heavy-distress-tee-per-s", default_value_t = 1_000)]
     pub(crate) distress_tee_per_s: u64,
     #[arg(long = "heavy-distress-memory", default_value_t = true, action = clap::ArgAction::Set)]
@@ -1262,6 +1302,8 @@ impl HeavyArgs {
             cpus: self.cpus,
             distress: DistressConfig {
                 send_blocked_per_s: self.distress_blocked_per_s,
+                send_deferred_per_s: self.distress_deferred_per_s,
+                send_given_up_per_s: self.distress_given_up_per_s,
                 tee_dropped_per_s: self.distress_tee_per_s,
                 memory: self.distress_memory,
                 core_busy_permille: self.distress_core_permille,
@@ -1286,6 +1328,8 @@ mod tests {
     fn counters(send_blocked: u64, tee_dropped: u64, memory: u8) -> DistressCounters {
         DistressCounters {
             send_blocked,
+            send_deferred: 0,
+            send_given_up: 0,
             tee_dropped,
             memory,
         }
@@ -1382,6 +1426,36 @@ mod tests {
             pending.charge("edge-1", &format!("7/{index}"), 7, Lane::UdpFast, 240_000_000, false, now, 0);
         }
         assert_eq!(pending.at("edge-1", 0, &config, now).len(), config.max_unproven);
+    }
+
+    /// Integration 6: send240's counters reach the distress verdict, each
+    /// at its own threshold.
+    #[test]
+    fn kept_sends_and_parts_given_up_make_distress_at_their_thresholds() {
+        let config = DistressConfig {
+            core_busy_permille: 0,
+            ..DistressConfig::default()
+        };
+        let with = |deferred, given_up| DistressCounters {
+            send_deferred: deferred,
+            send_given_up: given_up,
+            ..counters(0, 0, 0)
+        };
+        assert_eq!(judge_inputs(&config, with(0, 0), with(4_000, 0), 1.0, false), None);
+        assert_eq!(
+            judge_inputs(&config, with(0, 0), with(6_000, 0), 1.0, false),
+            Some("send-deferred")
+        );
+        assert_eq!(
+            judge_inputs(&config, with(0, 0), with(10, 1), 1.0, false),
+            Some("send-given-up")
+        );
+        let off = DistressConfig {
+            send_deferred_per_s: 0,
+            send_given_up_per_s: 0,
+            ..config
+        };
+        assert_eq!(judge_inputs(&off, with(0, 0), with(60_000, 9), 1.0, false), None);
     }
 
     #[test]

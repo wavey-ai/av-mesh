@@ -1067,11 +1067,59 @@ impl ForwardPlan {
         self.defer.as_ref().is_some_and(|defer| !defer.is_empty())
     }
 
-    fn drain_deferred(&mut self, gso: bool) {
+    fn drain_deferred(
+        &mut self,
+        gso: bool,
+        class: TrafficClass,
+        forwarder: Option<&RelayDownstreamForwarder>,
+        lease: Option<(&LeaseChildren, &LeaseSnapshot)>,
+    ) {
         if let Some(defer) = self.defer.as_deref_mut().filter(|defer| !defer.is_empty()) {
-            defer.drain(sys::monotonic_ns(), gso, |_| {});
+            defer.drain_counted(sys::monotonic_ns(), gso, |_| {}, |fd, target, sent| {
+                credit_ledger(forwarder, lease, class, fd, target, sent);
+            });
         }
     }
+}
+
+/// Kept datagrams that left for a child are counted in its ledger then
+/// (integration 6: send240's pool beside the repair integration's loss
+/// reports). A compiled path is found by its socket and target, a lease
+/// child by the lease socket and the first child with that target (the
+/// ledger is sent once a target, from the first such child). The class
+/// thread's linear look, on the drain's path only; allocates nothing.
+fn credit_ledger(
+    forwarder: Option<&RelayDownstreamForwarder>,
+    lease: Option<(&LeaseChildren, &LeaseSnapshot)>,
+    class: TrafficClass,
+    fd: std::os::fd::RawFd,
+    target: SocketAddr,
+    sent: usize,
+) {
+    if let Some(forwarder) = forwarder {
+        for (index, path) in forwarder.paths.iter().enumerate() {
+            if forwarder.class_fd(class, path.group) == fd
+                && forwarder.class_target(class, index) == target
+            {
+                path.sent[class.index()].fetch_add(sent as u64, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+    if let Some((lease, snapshot)) = lease {
+        if lease.fd(class) == fd {
+            if let Some(child) = snapshot
+                .children
+                .iter()
+                .find(|child| child.targets[class.index()] == target)
+            {
+                child.sent[class.index()].fetch_add(sent as u64, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+impl ForwardPlan {
 
     fn clear(&mut self) {
         for group in &mut self.groups {
@@ -1417,6 +1465,7 @@ impl RelayDownstreamForwarder {
     /// more try for what the kernel did not take. Never waits. With `gso`
     /// (video only) a child's run of equal symbols is one UDP GSO message;
     /// a host without UDP GSO clears `gso` and the batch goes without it.
+    #[allow(clippy::too_many_arguments)]
     fn send_fast_plan(
         &self,
         class: TrafficClass,
@@ -1424,6 +1473,7 @@ impl RelayDownstreamForwarder {
         plan: &mut ForwardPlan,
         stats: &FastPlaneStats,
         gso: &mut bool,
+        lease: Option<(&LeaseChildren, &LeaseSnapshot)>,
     ) {
         let ForwardPlan {
             groups,
@@ -1440,7 +1490,9 @@ impl RelayDownstreamForwarder {
         // datagrams kept behind them.
         let now_ns = defer.is_some().then(sys::monotonic_ns).unwrap_or(0);
         if let Some(defer) = defer.as_deref_mut() {
-            defer.drain(now_ns, use_gso, |_| {});
+            defer.drain_counted(now_ns, use_gso, |_| {}, |fd, target, sent| {
+                credit_ledger(Some(self), lease, class, fd, target, sent);
+            });
             for (group, sends) in groups.iter_mut().enumerate() {
                 let fd = self.class_fd(class, group);
                 defer.divert(sends, now_ns, |send| {
@@ -2253,7 +2305,13 @@ impl ClassThread {
                 }
             }
             if deferred {
-                plan.drain_deferred(gso);
+                let lease_now = self.lease.as_deref().map(|lease| (lease, lease.load()));
+                plan.drain_deferred(
+                    gso,
+                    self.class,
+                    self.forwarder.as_deref(),
+                    lease_now.as_ref().map(|(lease, guard)| (*lease, &***guard)),
+                );
                 if let Some(lane) = &self.edge_clients {
                     clients.drain_deferred(lane);
                 }
@@ -2627,7 +2685,7 @@ impl ClassThread {
             });
         }
         if let Some(forwarder) = &self.forwarder {
-            forwarder.send_fast_plan(class, batch, plan, &self.stats, gso);
+            forwarder.send_fast_plan(class, batch, plan, &self.stats, gso, lease);
             // Held-back sources are kept only once every child has its
             // datagrams, in this class's own buffers.
             forwarder.buffer_fast_warm(class, batch, plan, now_us);
@@ -3384,7 +3442,7 @@ impl Tee {
                 forwarded,
                 video_kind,
             } => {
-                self.process_symbol(&item, bytes, forwarded, video_kind)
+                self.process_symbol(&item, bytes, forwarded, video_kind, lag_us)
                     .await;
             }
             TeeKind::Unchecked => {
@@ -3447,6 +3505,7 @@ impl Tee {
         bytes: &[u8],
         forwarded: Option<(SocketAddr, u64)>,
         video_kind: bool,
+        lag_us: u64,
     ) {
         let peer = item.peer;
         // The symbol's header, read again in place, for the fast lane's
@@ -3611,9 +3670,10 @@ impl Tee {
                     | raptorq_datagram_fec::MediaObjectKind::CodecConfig
             );
             if let Some(stream_id) = view.stream_id().filter(|_| media) {
-                // send240, C: the tee's lag (a lagging lane pulls nothing)
-                // and the part's size (the pull budget's charge).
-                let lag_us = now_unix_us().saturating_sub(item.woken_us);
+                // send240, C: the tee's lag (a lagging lane pulls nothing),
+                // as the tee loop measured it with its one clock read an
+                // item (teeperf; integration 6), and the part's size (the
+                // pull budget's charge).
                 let part_bytes = u64::from(view.source_symbols) * view.fec.len() as u64;
                 holes
                     .arrived_from_tee(stream_id, view.object, self.class, lag_us, part_bytes)
@@ -3928,6 +3988,7 @@ pub async fn run_relay_class_ingest(
                         Arc::clone(&stats),
                         class,
                     )
+                    .with_shed_gate(Arc::clone(&cache.pull_gate))
                 }),
             lease: config.lease.clone(),
             requester_tick: requester_ticks

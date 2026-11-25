@@ -9434,7 +9434,13 @@ fn spawn_memory_guard(cache: Arc<LiveTsCache>, idle_ms: u64) {
             let rss = av_mesh::mem_guard::rss_bytes();
             // The pinned rings and the cache's slot index are fixed; the
             // heap beyond them and the parts is watched for growth (mem2).
-            let fixed = memory::locked_bytes().saturating_add(cache.ring_index_bytes());
+            // send240's pools of kept datagrams are made and touched at
+            // start, a fixed size: fixed too (integration 6).
+            let fixed = memory::locked_bytes()
+                .saturating_add(cache.ring_index_bytes())
+                .saturating_add(
+                    av_mesh::mem_guard::SEND_DEFER_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+                );
             // The repair stores are accounted too (integration 6): what
             // they hold is not the unaccounted heap.
             let stores = av_mesh::mem_guard::store_totals().held_bytes();

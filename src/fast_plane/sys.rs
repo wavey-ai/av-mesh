@@ -808,6 +808,38 @@ pub fn receive_buffer(socket: &impl AsRawFd) -> Option<usize> {
     (result == 0).then(|| usize::try_from(value).unwrap_or(0))
 }
 
+/// The send buffer of socket `fd` as the kernel reports it (`SO_SNDBUF`:
+/// twice what was asked) and the bytes queued in it now (`SIOCOUTQ`: for
+/// UDP, what the socket's datagrams still hold of it, in the qdisc and the
+/// NIC's ring until sent). Integration 6: the repair thread leaves the
+/// class thread headroom by them.
+pub fn send_buffer_and_queued(fd: std::os::fd::RawFd) -> Option<(usize, usize)> {
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: getsockopt writes a c_int into `value`, of the size given.
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            std::ptr::from_mut(&mut value).cast(),
+            &mut len,
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    let mut queued: libc::c_int = 0;
+    // SAFETY: SIOCOUTQ (TIOCOUTQ) writes a c_int into `queued`.
+    let result = unsafe { libc::ioctl(fd, libc::TIOCOUTQ, std::ptr::from_mut(&mut queued)) };
+    (result == 0).then(|| {
+        (
+            usize::try_from(value).unwrap_or(0),
+            usize::try_from(queued).unwrap_or(0),
+        )
+    })
+}
+
 /// Ask for a receive buffer of `bytes` on `socket`: `SO_RCVBUF` (up to
 /// `net.core.rmem_max`), then `SO_RCVBUFFORCE` (CAP_NET_ADMIN) if the
 /// kernel gave less. The buffer as the kernel then reports it.

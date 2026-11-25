@@ -72,6 +72,74 @@ const NONE: u32 = u32::MAX;
 /// After a socket was found full, the kept datagrams are tried again this
 /// much later at the soonest.
 const RETRY_FULL_NS: u64 = 250_000;
+/// The repair symbols of a client's parts (tagged, not sources) take at
+/// most this share (permille) of the client's queue, so that a stalled
+/// client's kept repair never leaves its live sources without room
+/// (integration 6).
+pub const REPAIR_SHARE_PERMILLE: u64 = 500;
+
+/// Destinations with datagrams kept by any class thread, published for the
+/// repair thread (integration 6): its answers, link repair and regenerated
+/// sources leave from the class threads' sockets, and must neither jump
+/// ahead of a destination's kept live datagrams nor fill a socket the class
+/// thread is waiting on. One relaxed store when a queue opens or closes;
+/// the repair thread scans the table (off the class threads).
+const PUBLISHED: usize = 1_024;
+static WAITING: [AtomicU64; PUBLISHED] = [const { AtomicU64::new(0) }; PUBLISHED];
+const UNPUBLISHED: u16 = u16::MAX;
+
+fn destination_key(fd: RawFd, target: SocketAddr) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    fd.hash(&mut hasher);
+    target.hash(&mut hasher);
+    hasher.finish() | 1
+}
+
+fn publish(fd: RawFd, target: SocketAddr) -> u16 {
+    let key = destination_key(fd, target);
+    let start = (key as usize) % PUBLISHED;
+    for step in 0..PUBLISHED {
+        let at = (start + step) % PUBLISHED;
+        if WAITING[at]
+            .compare_exchange(0, key, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return at as u16;
+        }
+    }
+    UNPUBLISHED
+}
+
+fn unpublish(at: u16) {
+    if at != UNPUBLISHED {
+        WAITING[usize::from(at)].store(0, Ordering::Relaxed);
+    }
+}
+
+/// Whether a class thread keeps datagrams for `target` on socket `fd` now
+/// (or a test stalls that path): the repair thread then sends it nothing.
+pub fn destination_waiting(fd: RawFd, target: SocketAddr) -> bool {
+    if blocked(fd, target) {
+        return true;
+    }
+    let key = destination_key(fd, target);
+    WAITING
+        .iter()
+        .any(|slot| slot.load(Ordering::Relaxed) == key)
+}
+
+/// The longest any pool keeps a datagram (ms): the repair thread's sends to
+/// a socket give up after it too (integration 6). 0 until a pool is made.
+static BOUND_MS: AtomicU64 = AtomicU64::new(0);
+
+/// [`BOUND_MS`], or `default_ms` before any pool was made (keeping off).
+pub fn bound_ms_or(default_ms: u64) -> u64 {
+    match BOUND_MS.load(Ordering::Relaxed) {
+        0 => default_ms,
+        ms => ms,
+    }
+}
 
 /// The bound of a pool: its time, its bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +234,10 @@ struct Queue {
     /// entries share the deadline of the first of them.
     part: (u64, u64),
     part_deadline_ns: u64,
+    /// Bytes of tagged repair kept (not sources): [`REPAIR_SHARE_PERMILLE`].
+    repair_bytes: u64,
+    /// Its place in the published table ([`destination_waiting`]).
+    published: u16,
 }
 
 const EMPTY_QUEUE: Queue = Queue {
@@ -177,6 +249,8 @@ const EMPTY_QUEUE: Queue = Queue {
     bytes: 0,
     part: (u64::MAX, u64::MAX),
     part_deadline_ns: 0,
+    repair_bytes: 0,
+    published: UNPUBLISHED,
 };
 
 /// The counters of a pool (`/api/node`).
@@ -196,6 +270,9 @@ pub struct DeferStats {
     pub refused: AtomicU64,
     /// Datagrams dropped by an error of their send.
     pub errors: AtomicU64,
+    /// Datagrams dropped because their destination left (a client's leg
+    /// released at a move: integration 6).
+    pub released: AtomicU64,
     /// Bytes kept now and the most kept at once.
     pub kept_bytes: AtomicU64,
     pub high_water_bytes: AtomicU64,
@@ -215,6 +292,7 @@ pub struct DeferSnapshot {
     pub expired_parts: u64,
     pub refused: u64,
     pub errors: u64,
+    pub released: u64,
     pub kept_bytes: u64,
     pub high_water_bytes: u64,
     pub pool_bytes: u64,
@@ -237,6 +315,7 @@ impl DeferStats {
             expired_parts: load(&self.expired_parts),
             refused: load(&self.refused),
             errors: load(&self.errors),
+            released: load(&self.released),
             kept_bytes: load(&self.kept_bytes),
             high_water_bytes: load(&self.high_water_bytes),
             pool_bytes: load(&self.pool_bytes),
@@ -289,6 +368,9 @@ impl std::fmt::Debug for SendDefer {
 
 impl Drop for SendDefer {
     fn drop(&mut self) {
+        for position in 0..self.active_len {
+            unpublish(self.queues[usize::from(self.active[position])].published);
+        }
         POOL_BYTES.fetch_sub(self.data.len() as u64, Ordering::Relaxed);
     }
 }
@@ -340,6 +422,7 @@ impl SendDefer {
             .bound_ms
             .store(config.bound_ns / 1_000_000, Ordering::Relaxed);
         POOL_BYTES.fetch_add(data.len() as u64, Ordering::Relaxed);
+        BOUND_MS.fetch_max(config.bound_ns / 1_000_000, Ordering::Relaxed);
         Self {
             config,
             queue_cap_bytes: (data.len() as u64 * QUEUE_SHARE_PERMILLE / 1_000)
@@ -442,6 +525,7 @@ impl SendDefer {
                 self.queues[index] = Queue {
                     fd,
                     target,
+                    published: publish(fd, target),
                     ..EMPTY_QUEUE
                 };
                 self.active[self.active_len] = index as u16;
@@ -450,8 +534,15 @@ impl SendDefer {
             }
             None => None,
         };
+        // Tagged repair (an edge client's part's repair symbols) keeps to
+        // its share of the queue: the sources after it find room.
+        let repair = !tag.untagged() && !tag.source;
         let room = queue_index.is_some_and(|index| {
-            self.queues[index].bytes + SLOT_BYTES as u64 <= self.queue_cap_bytes
+            let queue = &self.queues[index];
+            queue.bytes + SLOT_BYTES as u64 <= self.queue_cap_bytes
+                && (!repair
+                    || queue.repair_bytes + SLOT_BYTES as u64
+                        <= self.queue_cap_bytes * REPAIR_SHARE_PERMILLE / 1_000)
         }) && self.free_len > 0
             && datagram.len() <= SLOT_BYTES;
         let Some(index) = queue_index.filter(|_| room) else {
@@ -488,6 +579,9 @@ impl SendDefer {
             queue.part = key;
             queue.part_deadline_ns = now_ns.saturating_add(self.config.bound_ns);
         }
+        if repair {
+            queue.repair_bytes += SLOT_BYTES as u64;
+        }
         self.entries[slot as usize] = Entry {
             len: datagram.len() as u16,
             next: NONE,
@@ -518,6 +612,10 @@ impl SendDefer {
         let queue = &mut self.queues[index];
         let slot = queue.head;
         debug_assert_ne!(slot, NONE);
+        let tag = self.entries[slot as usize].tag;
+        if !tag.untagged() && !tag.source {
+            queue.repair_bytes = queue.repair_bytes.saturating_sub(SLOT_BYTES as u64);
+        }
         queue.head = self.entries[slot as usize].next;
         if queue.head == NONE {
             queue.tail = NONE;
@@ -537,6 +635,7 @@ impl SendDefer {
         {
             self.active_len -= 1;
             self.active[at] = self.active[self.active_len];
+            unpublish(self.queues[index].published);
             self.queues[index] = EMPTY_QUEUE;
             self.spare[self.spare_len] = index as u16;
             self.spare_len += 1;
@@ -613,6 +712,21 @@ impl SendDefer {
     /// order (as UDP GSO messages with `gso`), until a socket is full or
     /// all is sent. Returns the datagrams sent and their bytes.
     pub fn drain(&mut self, now_ns: u64, gso: bool, expired: impl FnMut(Expired)) -> (usize, u64) {
+        self.drain_counted(now_ns, gso, expired, |_, _, _| {})
+    }
+
+    /// [`Self::drain`], telling `sent` of each destination's datagrams as
+    /// they leave (socket, destination, count): a forwarder counts them in
+    /// its child's ledger then, not when they were kept (integration 6: a
+    /// ledger that counted kept datagrams would show the child a loss, and
+    /// one that never counted them a gain, the repair review's S1).
+    pub fn drain_counted(
+        &mut self,
+        now_ns: u64,
+        gso: bool,
+        expired: impl FnMut(Expired),
+        mut sent: impl FnMut(RawFd, SocketAddr, usize),
+    ) -> (usize, u64) {
         self.expire(now_ns, expired);
         if self.active_len == 0 || now_ns < self.retry_after_ns {
             return (0, 0);
@@ -636,7 +750,11 @@ impl SendDefer {
                     position += 1;
                     continue;
                 }
+                let target = self.queues[index].target;
                 let (taken, bytes, socket_full) = self.send_front(index, gso);
+                if taken > 0 {
+                    sent(fd, target, taken);
+                }
                 sent_total += taken;
                 bytes_total += bytes;
                 progressed |= taken > 0;
@@ -666,6 +784,35 @@ impl SendDefer {
             .kept_bytes
             .store(self.kept_bytes, Ordering::Relaxed);
         (sent_total, bytes_total)
+    }
+
+    /// Drop everything kept for each destination that `keep` refuses (a
+    /// client whose leg was released at a move: its kept datagrams are not
+    /// sent, nor handed to the cache-fed lane). Returns the datagrams
+    /// dropped. Allocates nothing.
+    pub fn release_where(&mut self, keep: impl Fn(RawFd, SocketAddr) -> bool) -> u64 {
+        let mut dropped = 0;
+        let mut position = 0;
+        while position < self.active_len {
+            let index = usize::from(self.active[position]);
+            let (fd, target) = (self.queues[index].fd, self.queues[index].target);
+            if keep(fd, target) {
+                position += 1;
+                continue;
+            }
+            while self.queues[index].head != NONE {
+                self.pop_front(index);
+                dropped += 1;
+            }
+            self.release_queue(index);
+        }
+        if dropped > 0 {
+            self.stats.released.fetch_add(dropped, Ordering::Relaxed);
+            self.stats
+                .kept_bytes
+                .store(self.kept_bytes, Ordering::Relaxed);
+        }
+        dropped
     }
 
     /// Send the front of queue `index` (up to [`GATHER`]): the datagrams
@@ -946,5 +1093,56 @@ mod tests {
         }
         assert_eq!(defer.stats.snapshot().refused, 2);
         assert_eq!(defer.drain(0, true, |_| {}).0, 8);
+    }
+
+    /// Integration 6: a client's kept repair symbols keep to half its share,
+    /// so its sources after them still find room; the destination is
+    /// published while it holds datagrams (the repair thread then sends it
+    /// nothing) and its drain says what left, for the child's ledger.
+    #[test]
+    fn repair_keeps_to_its_share_and_a_waiting_destination_is_published() {
+        let (sender, receiver) = pair();
+        let target = receiver.local_addr().unwrap();
+        let fd = sender.as_raw_fd();
+        // 8 slots: a destination keeps 4, its repair 2.
+        let mut defer = SendDefer::new(DeferConfig::new(100, 8 * SLOT_BYTES).unwrap());
+        assert!(!destination_waiting(fd, target));
+        let repair = |esi| Tag { k: 2, ..tag(1, esi) };
+        assert!(defer.keep(fd, target, &[1; 10], repair(5), 0, |_| {}));
+        assert!(defer.keep(fd, target, &[1; 10], repair(6), 0, |_| {}));
+        assert!(!defer.keep(fd, target, &[1; 10], repair(7), 0, |_| {}), "repair over its share");
+        let source = |esi| Tag { k: 8, source: true, ..tag(2, esi) };
+        assert!(defer.keep(fd, target, &[2; 10], source(0), 0, |_| panic!("room")));
+        assert!(defer.keep(fd, target, &[2; 10], source(1), 0, |_| panic!("room")));
+        assert!(destination_waiting(fd, target));
+        let mut counted = Vec::new();
+        let (sent, _) = defer.drain_counted(0, false, |_| {}, |f, t, n| counted.push((f, t, n)));
+        assert_eq!(sent, 4);
+        assert_eq!(counted, vec![(fd, target, 4)]);
+        assert!(!destination_waiting(fd, target), "an empty queue is unpublished");
+    }
+
+    /// Integration 6: a released destination's datagrams are dropped at
+    /// once, the others kept.
+    #[test]
+    fn a_released_destination_s_datagrams_are_dropped() {
+        let (sender, receiver) = pair();
+        let (_, other) = pair();
+        let (a, b) = (receiver.local_addr().unwrap(), other.local_addr().unwrap());
+        let fd = sender.as_raw_fd();
+        let mut defer = SendDefer::new(DeferConfig::new(100, 16 * SLOT_BYTES).unwrap());
+        for esi in 0..3 {
+            defer.keep(fd, a, &[1; 10], tag(1, esi), 0, |_| {});
+            defer.keep(fd, b, &[2; 10], tag(1, esi), 0, |_| {});
+        }
+        assert_eq!(defer.release_where(|_, target| target != a), 3);
+        assert!(!defer.is_waiting(fd, a));
+        assert!(!destination_waiting(fd, a));
+        assert!(defer.is_waiting(fd, b));
+        assert_eq!(defer.stats.snapshot().released, 3);
+        assert_eq!(defer.drain(0, false, |_| panic!("nothing expired")).0, 3);
+        let got = received(&other);
+        assert_eq!(got.len(), 3);
+        assert!(received(&receiver).is_empty());
     }
 }

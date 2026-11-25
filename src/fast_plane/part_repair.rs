@@ -868,6 +868,16 @@ pub struct PartRepairStats {
     /// thread that panicked (caught: the thread goes on).
     pub window_spent: AtomicU64,
     pub repair_panics: AtomicU64,
+    /// Integration 6, the repair thread's sends beside send240's pools:
+    /// sends to a destination whose class thread keeps datagrams for it
+    /// (repair yields to the live symbols), datagrams not sent within the
+    /// send-defer bound for want of socket headroom, and waits for it.
+    pub repair_yielded: AtomicU64,
+    pub repair_send_dropped: AtomicU64,
+    pub repair_send_waits: AtomicU64,
+    /// Asks not made for a part the node's own tee shed (send240's pull
+    /// gate): nothing of it is pulled.
+    pub shed_not_asked: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, Default, PartialEq, Eq)]
@@ -905,6 +915,10 @@ pub struct PartRepairSnapshot {
     pub refused_stale: u64,
     pub window_spent: u64,
     pub repair_panics: u64,
+    pub repair_yielded: u64,
+    pub repair_send_dropped: u64,
+    pub repair_send_waits: u64,
+    pub shed_not_asked: u64,
 }
 
 impl PartRepairStats {
@@ -943,6 +957,10 @@ impl PartRepairStats {
             refused_stale: load(&self.refused_stale),
             window_spent: load(&self.window_spent),
             repair_panics: load(&self.repair_panics),
+            repair_yielded: load(&self.repair_yielded),
+            repair_send_dropped: load(&self.repair_send_dropped),
+            repair_send_waits: load(&self.repair_send_waits),
+            shed_not_asked: load(&self.shed_not_asked),
         }
     }
 }
@@ -1432,21 +1450,78 @@ fn answer(
     let _ = sys::send_batch(via.send_fd(), 1, |_| (&bytes[..], to));
 }
 
-/// Send `datagrams` to `to`, waiting briefly on a full socket (this is the
-/// repair thread, not a class thread).
-fn send_all(via: &dyn SendSocket, to: SocketAddr, datagrams: &[Vec<u8>]) -> usize {
+/// Datagrams of one repair send call: the class threads' sockets are left
+/// between two.
+const REPAIR_SEND_CHUNK: usize = 64;
+/// The repair thread's sends give up after this when no send-defer pool
+/// sets the bound (the old 50 waits of 200 µs).
+const REPAIR_SEND_BOUND_MS: u64 = 10;
+/// And never wait longer than this for one destination, whatever the
+/// pools' bound: the repair thread's other children's answers queue behind
+/// it.
+const REPAIR_SEND_WAIT_MAX_MS: u64 = 20;
+
+/// Send `datagrams` to `to` from a class thread's socket (this is the
+/// repair thread, not a class thread). Integration 6 (the repair review's
+/// S3, beside send240's pools): repair is never sent to a destination whose
+/// class thread keeps datagrams for it (they would be overtaken, and the
+/// path is stalled), it goes a chunk at a time and only while the socket
+/// keeps half its send buffer free for the class thread's live symbols, and
+/// what has not left within the send-defer bound is given up (counted).
+/// Never sleeps on a socket the class thread is waiting on.
+fn send_all(
+    via: &dyn SendSocket,
+    to: SocketAddr,
+    datagrams: &[Vec<u8>],
+    stats: &PartRepairStats,
+) -> usize {
+    let fd = via.send_fd();
+    let bound = Duration::from_millis(
+        super::send_defer::bound_ms_or(REPAIR_SEND_BOUND_MS).min(REPAIR_SEND_WAIT_MAX_MS),
+    );
+    let started = Instant::now();
     let mut sent = 0;
-    let mut tries = 0;
-    while sent < datagrams.len() && tries < 50 {
-        let more = sys::send_batch(via.send_fd(), datagrams.len() - sent, |index| {
-            (&datagrams[sent + index][..], to)
-        })
-        .unwrap_or(0);
+    while sent < datagrams.len() {
+        if super::send_defer::destination_waiting(fd, to) {
+            stats.repair_yielded.fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+        // As many as fit in half the send buffer beside what is queued in
+        // it (the kernel books a datagram at about twice its bytes), at
+        // least one into an empty buffer, at most a chunk.
+        let mut chunk = (datagrams.len() - sent).min(REPAIR_SEND_CHUNK);
+        if let Some((buffer, queued)) = sys::send_buffer_and_queued(fd) {
+            let mut room = (buffer / 2).saturating_sub(queued);
+            let mut fit = 0;
+            for datagram in &datagrams[sent..sent + chunk] {
+                let booked = 2 * datagram.len();
+                if booked > room {
+                    break;
+                }
+                room -= booked;
+                fit += 1;
+            }
+            chunk = if fit == 0 && queued == 0 { 1 } else { fit };
+        }
+        let more = if chunk > 0 {
+            sys::send_batch(fd, chunk, |index| (&datagrams[sent + index][..], to)).unwrap_or(0)
+        } else {
+            0
+        };
         sent += more;
         if more == 0 {
-            tries += 1;
+            if started.elapsed() >= bound {
+                break;
+            }
+            stats.repair_send_waits.fetch_add(1, Ordering::Relaxed);
             std::thread::sleep(Duration::from_micros(200));
         }
+    }
+    let unsent = datagrams.len() - sent;
+    if unsent > 0 {
+        stats
+            .repair_send_dropped
+            .fetch_add(unsent as u64, Ordering::Relaxed);
     }
     sent
 }
@@ -1482,7 +1557,7 @@ fn run_repair_thread(
     };
     let send_counted = |via: &dyn SendSocket, to: SocketAddr, datagrams: &[Vec<u8>]| {
         count_extra(to, datagrams.len(), 0);
-        let sent = send_all(via, to, datagrams);
+        let sent = send_all(via, to, datagrams, &stats);
         if sent < datagrams.len() {
             count_extra(to, 0, datagrams.len() - sent);
         }
@@ -1620,6 +1695,9 @@ struct OpenPart {
     next_due_us: u64,
     /// A parent said it does not have the part.
     missing_at: [bool; 2],
+    /// The cache's id of its stream (`u64::MAX`: not one), read at its
+    /// first symbol: the pull gate's key for parts this node shed.
+    cache_stream: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1680,9 +1758,23 @@ pub struct Requester {
     expected_cache: [(u32, u32, u32); 2],
     /// Each lane's jitter: the mean longest gap within a part (µs).
     lane_gap_us: [u64; 2],
+    /// send240's pull gate: a part this node's class thread shed (some of
+    /// its datagrams never reached the tee) is never asked for
+    /// (integration 6: the pull loop's rule, for part repair's asks too).
+    shed_gate: Option<Arc<crate::pull_gate::PullGate>>,
+    /// Each stream's cache id as its parts' first symbols gave it (key
+    /// stream, cache id): a gap part, of which nothing came, takes its
+    /// stream's. At most `STREAMS`, the oldest replaced.
+    cache_streams: Vec<(u64, u64)>,
 }
 
 impl Requester {
+    /// Ask for no part that `gate` says this node shed.
+    pub(crate) fn with_shed_gate(mut self, gate: Arc<crate::pull_gate::PullGate>) -> Self {
+        self.shed_gate = Some(gate);
+        self
+    }
+
     pub fn new(
         repair: Arc<PartRepair>,
         sockets: [Option<Arc<dyn SendSocket>>; 2],
@@ -1700,6 +1792,8 @@ impl Requester {
             repair_tail_us: 0,
             expected_cache: [(u32::MAX, 0, 0); 2],
             lane_gap_us: [0; 2],
+            shed_gate: None,
+            cache_streams: Vec::with_capacity(STREAMS),
         }
     }
 
@@ -1788,6 +1882,7 @@ impl Requester {
             first_ask_us: 0,
             next_due_us: 0,
             missing_at: [false; 2],
+            cache_stream: view.stream_id().unwrap_or(u64::MAX),
         });
     }
 
@@ -1834,6 +1929,21 @@ impl Requester {
     }
 
     fn open_part(&mut self, part: OpenPart) {
+        if part.cache_stream != u64::MAX {
+            let at = self
+                .cache_streams
+                .iter()
+                .position(|(stream, _)| *stream == part.key.stream);
+            match at {
+                Some(at) => self.cache_streams[at].1 = part.cache_stream,
+                None => {
+                    if self.cache_streams.len() >= STREAMS {
+                        self.cache_streams.remove(0);
+                    }
+                    self.cache_streams.push((part.key.stream, part.cache_stream));
+                }
+            }
+        }
         if self.open.len() >= OPEN_PARTS {
             // The oldest goes: it is the nearest its deadline.
             if let Some((at, _)) = self
@@ -1935,6 +2045,7 @@ impl Requester {
                 first_ask_us: 0,
                 next_due_us: 0,
                 missing_at: [false; 2],
+                cache_stream: u64::MAX,
             });
         }
         true
@@ -2109,6 +2220,22 @@ impl Requester {
             };
             if !due {
                 continue;
+            }
+            if let Some(gate) = &self.shed_gate {
+                let cache_stream = if part.cache_stream != u64::MAX {
+                    Some(part.cache_stream)
+                } else {
+                    self.cache_streams
+                        .iter()
+                        .find(|(stream, _)| *stream == part.key.stream)
+                        .map(|(_, id)| *id)
+                };
+                if cache_stream.is_some_and(|id| gate.is_shed(id, part.key.object)) {
+                    self.stats().shed_not_asked.fetch_add(1, Ordering::Relaxed);
+                    index -= 1;
+                    self.open.swap_remove(index);
+                    continue;
+                }
             }
             self.ask(index - 1, now_us);
         }
@@ -2594,6 +2721,7 @@ mod tests {
             first_ask_us: 0,
             next_due_us: 0,
             missing_at: [false; 2],
+            cache_stream: u64::MAX,
         };
         let attempts = |requester: &Requester, object| {
             requester.open.iter().find(|part| part.key.object == object).unwrap().attempts
@@ -2612,6 +2740,88 @@ mod tests {
         requester.open_part(part(3, 0));
         requester.poll(15_000);
         assert_eq!(attempts(&requester, 3), 1);
+    }
+
+    /// Integration 6: a part this node's own tee shed (send240's pull gate
+    /// recorded it) is never asked for, a gap part (nothing of it came)
+    /// included: its stream's cache id comes from the stream's other
+    /// parts. A part not shed is asked for as before.
+    #[test]
+    fn a_requester_never_asks_for_a_part_its_own_tee_shed() {
+        let lanes = Arc::new(super::super::relay::FastPlaneStats::default());
+        let gate = Arc::new(crate::pull_gate::PullGate::default());
+        let repair = repair_with(STORE_BYTES);
+        let mut requester = Requester::new(
+            Arc::clone(&repair),
+            [None, None],
+            Arc::clone(&lanes),
+            TrafficClass::Video,
+        )
+        .with_shed_gate(Arc::clone(&gate));
+        let peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let part = |object, cache_stream| OpenPart {
+            key: PartKey {
+                stream: 7,
+                epoch: 1,
+                object,
+            },
+            k: 1_000,
+            held: if cache_stream == u64::MAX { 0 } else { 500 },
+            first_us: 1_000,
+            last_us: 10_000,
+            last_source_us: 10_000,
+            gap_us: 500,
+            regenerated: 0,
+            link_done_us: 0,
+            moved_on_us: 11_000,
+            parents: [Some(peer), None],
+            attempts: 0,
+            first_ask_us: 0,
+            next_due_us: 0,
+            missing_at: [false; 2],
+            cache_stream,
+        };
+        requester.open_part(part(1, 77));
+        requester.open_part(part(2, u64::MAX));
+        requester.open_part(part(3, 77));
+        gate.record_shed(TrafficClass::Video, 77, 2);
+        gate.record_shed(TrafficClass::Video, 77, 3);
+        requester.poll(20_000);
+        let objects: Vec<u64> = requester.open.iter().map(|part| part.key.object).collect();
+        assert_eq!(objects, vec![1], "the shed parts are dropped, not asked for");
+        assert_eq!(requester.open[0].attempts, 1);
+        assert_eq!(repair.stats.shed_not_asked.load(Ordering::Relaxed), 2);
+    }
+
+    /// Integration 6: the repair thread sends nothing to a destination that
+    /// a class thread keeps datagrams for (send240's pool), and sends as
+    /// before once the pool has let them go.
+    #[test]
+    fn repair_yields_to_a_destination_with_kept_live_datagrams() {
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender.set_nonblocking(true).unwrap();
+        let to = receiver.local_addr().unwrap();
+        let fd = sender.as_raw_fd();
+        let stats = PartRepairStats::default();
+        let mut pool = super::super::send_defer::SendDefer::new(
+            super::super::send_defer::DeferConfig::new(200, 64 * 1_536).unwrap(),
+        );
+        assert!(pool.keep(fd, to, &[1; 100], super::super::send_defer::Tag::UNTAGGED, 0, |_| {}));
+        let datagrams = vec![vec![2_u8; 100]; 10];
+        assert_eq!(send_all(&sender, to, &datagrams, &stats), 0);
+        assert_eq!(stats.repair_yielded.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.repair_send_dropped.load(Ordering::Relaxed), 10);
+        assert_eq!(pool.drain(0, false, |_| {}).0, 1);
+        assert_eq!(send_all(&sender, to, &datagrams, &stats), 10);
+        let mut buf = [0_u8; 256];
+        let mut got = Vec::new();
+        while let Ok(len) = receiver.recv(&mut buf) {
+            got.push(buf[0]);
+            assert_eq!(len, 100);
+        }
+        assert_eq!(got, [vec![1], vec![2; 10]].concat(), "the live datagram first");
     }
 
     #[test]
