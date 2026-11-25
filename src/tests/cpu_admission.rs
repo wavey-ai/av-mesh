@@ -16,8 +16,8 @@
 //!   refuses before its CPUs or any send thread is full, edge 2 takes the
 //!   spill; with no second edge the rest are refused, counted.
 //! - (c) `an_overloaded_edge_sheds_two_leg_listeners_without_loss`
-//!   (ignored): two-leg listeners admitted past the full point with the
-//!   check off; with it on, the edge asks two-leg listeners to give up their
+//!   (ignored): two-leg listeners (edge 1 and one of three more) admitted
+//!   past edge 1's full point with the check off; with it on, the edge asks two-leg listeners to give up their
 //!   leg there (`MOVE shed`) until it is under full, and none misses a part.
 //!
 //! Each proof prints its "after" line and, with `CPUADMIT_OFF=1`, runs the
@@ -1045,7 +1045,10 @@ fn an_overloaded_edge_sheds_two_leg_listeners_without_loss() {
     let (samples, result) = ramp(
         &Ramp {
             name: "c-shed",
-            edges: 3,
+            // Edge 1 takes every listener's first leg (360); the second
+            // legs spread over three more edges (120 each), well under
+            // their full point, so that only edge 1 is over it.
+            edges: 4,
             listeners,
             per_step: 60,
             every: Duration::from_millis(500),
