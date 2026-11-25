@@ -9,6 +9,7 @@ mod edge_udp;
 mod fast_control;
 mod fast_path;
 mod fast_plane;
+mod charge;
 mod heavy;
 mod hop_journal;
 mod lifecycle;
@@ -4606,6 +4607,7 @@ async fn main() -> Result<()> {
     )
     .with_assignment_udp_in_region(args.assignment_udp_in_region)
     .with_heavy(args.heavy.config());
+    router.heavy.set_client_symbol_size(args.client_udp_symbol_size);
     let rebalance_config = RebalanceConfig {
         target_permille: args.rebalance_target_permille,
         margin_permille: args.client_udp_rebalance_margin_permille,
@@ -11347,6 +11349,14 @@ impl LiveTsCache {
         state.sustained_bitrate_bps(stream_id, part_us, duration_us(window))
     }
 
+    /// rm/charge: a stream's sustained media (see
+    /// `LiveState::sustained_media`).
+    async fn sustained_media(&self, stream_id: u64, window: Duration) -> Option<charge::SustainedMedia> {
+        let state = self.state.read().await;
+        let part_us = state.stream_part_target_us(stream_id);
+        state.sustained_media(stream_id, part_us, duration_us(window))
+    }
+
     /// Measured bit rate of a playlist over its retained parts.
     async fn playlist_bitrate_bps(&self, stream_id: u64) -> Option<u64> {
         let state = self.state.read().await;
@@ -14449,14 +14459,32 @@ impl LiveState {
         nominal_part_us: u64,
         window_us: u64,
     ) -> Option<u64> {
+        self.sustained_media(stream_id, nominal_part_us, window_us)
+            .map(|media| media.media_bps)
+    }
+
+    /// The stream's sustained media (rm/charge): media bits a second, parts
+    /// a second and bytes a part over its newest parts' declared durations
+    /// once they cover `window_us`.
+    fn sustained_media(
+        &self,
+        stream_id: u64,
+        nominal_part_us: u64,
+        window_us: u64,
+    ) -> Option<charge::SustainedMedia> {
         let parts = self.stream_parts.get(&stream_id)?;
-        let (mut bytes, mut covered_us) = (0_u64, 0_u64);
+        let (mut bytes, mut covered_us, mut count) = (0_u64, 0_u64, 0_u64);
         for part in parts.values().rev() {
             bytes = bytes.saturating_add(part.media_bytes.map_or(part.bytes as u64, u64::from));
             covered_us = covered_us
                 .saturating_add(part.duration_us.map_or(nominal_part_us.max(1), u64::from));
+            count += 1;
             if covered_us >= window_us.max(1) {
-                return Some(bytes.saturating_mul(8_000_000) / covered_us);
+                return Some(charge::SustainedMedia {
+                    media_bps: bytes.saturating_mul(8_000_000) / covered_us,
+                    parts_per_second: count as f64 * 1e6 / covered_us as f64,
+                    part_bytes: bytes / count,
+                });
             }
         }
         None
@@ -15749,6 +15777,9 @@ struct PlaylistHolding {
     /// a starting edge opens no copy of it to be warm (C 3.1 E5).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     video: bool,
+    /// rm/charge: what a session of each lane sends, bits a second.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lane_bps: Option<charge::LaneCharges>,
 }
 
 impl EdgeServiceSnapshot {
@@ -22290,12 +22321,15 @@ impl AppRouter {
                 &self.control,
             )
             .await;
-        // Admission works from the bit rate of each playlist held here.
+        // Admission charges a reader of each playlist held here what its
+        // lane sends (rm/charge), not the stored slots' peak.
+        let mut charges = HashMap::new();
         for stream in &snapshot.streams {
-            if let Some(bitrate_bps) = stream.bitrate_bps {
+            if let Some(lanes) = self.stream_charges(stream.stream_id).await {
                 self.edge_load
                     .egress
-                    .set_playlist_bps(stream.stream_id, bitrate_bps);
+                    .set_playlist_charge(stream.stream_id, lanes.http_bps);
+                charges.insert(stream.stream_id, lanes);
             }
         }
         let sessions = self.edge_load.egress.sessions_by_playlist();
@@ -22327,14 +22361,14 @@ impl AppRouter {
                 Some(PlaylistHolding {
                     stream_id: stream.stream_id,
                     head_part: stream.latest_mesh_part?,
-                    // The highest bit rate that this cache has measured. What
-                    // a session is charged also depends on the capacity of
-                    // the node, and stays with the node.
-                    bitrate_bps: self
-                        .edge_load
-                        .egress
-                        .measured_playlist_bps(stream.stream_id)
-                        .or(stream.bitrate_bps),
+                    // rm/charge: the sustained media rate, and what a session
+                    // of each lane sends (a node without its own figure yet
+                    // says what admission charges).
+                    bitrate_bps: charges
+                        .get(&stream.stream_id)
+                        .map(|lanes| lanes.media_bps)
+                        .or_else(|| self.edge_load.egress.measured_playlist_bps(stream.stream_id)),
+                    lane_bps: charges.get(&stream.stream_id).copied(),
                     sessions: sessions.get(&stream.stream_id).copied().unwrap_or(0)
                         + udp_legs.get(&stream.stream_id).copied().unwrap_or(0),
                     request_rate: self
@@ -23118,8 +23152,8 @@ impl AppRouter {
         {
             return;
         }
-        if let Some(bps) = self.regional_playlist_bps(stream_id).await {
-            self.edge_load.egress.set_playlist_bps(stream_id, bps);
+        if let Some(bps) = self.regional_reader_charge(stream_id).await {
+            self.edge_load.egress.set_playlist_charge(stream_id, bps);
         }
     }
 
@@ -23297,9 +23331,29 @@ impl AppRouter {
             .flat_map(|edge| edge.playlists.iter())
             .filter(|playlist| playlist.stream_id == stream_id)
             .collect::<Vec<_>>();
+        // rm/charge: a reader's charge is what its lane sends (the stored
+        // slots' rate where no cache says yet).
         let regional_bps = holdings
             .iter()
-            .filter_map(|playlist| playlist.bitrate_bps)
+            .filter_map(|playlist| playlist.lane_bps.map(|lanes| lanes.http_bps))
+            .max()
+            .or_else(|| holdings.iter().filter_map(|playlist| playlist.bitrate_bps).max());
+        let heavy_class = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.node.region == self.node.region)
+            .filter_map(|snapshot| snapshot.edge_service.as_ref()?.heavy.as_ref())
+            .any(|advert| advert.streams.iter().any(|stream| stream.stream_id == stream_id));
+        let regional_udp_bps = holdings
+            .iter()
+            .filter_map(|playlist| {
+                playlist.lane_bps.map(|lanes| {
+                    if heavy_class {
+                        lanes.raptorq_bps
+                    } else {
+                        lanes.compact_bps
+                    }
+                })
+            })
             .max();
         let regional_rate = holdings
             .iter()
@@ -23394,6 +23448,7 @@ impl AppRouter {
                             Duration::from_secs(edge.egress_window_seconds.max(1)),
                         )
                     },
+                    udp_charge_bps: regional_udp_bps,
                     heavy: self.heavy_room(
                         &snapshot.node.node_id,
                         edge.heavy.as_ref(),
@@ -23510,7 +23565,10 @@ impl AppRouter {
         reader: ReaderRequest<'_>,
         remember: bool,
     ) -> (Result<Assignment, AssignmentError>, Vec<CacheCandidate>) {
-        let candidates_all = self.cache_candidates(reader.stream_id).await;
+        let mut candidates_all = self.cache_candidates(reader.stream_id).await;
+        if reader.udp {
+            charge::charge_udp(&mut candidates_all);
+        }
         let skipped = |node_id: &str| reader.skip.iter().any(|name| name == node_id);
         let held = |node_id: &str| reader.hold.iter().any(|name| name == node_id);
         // The hosts of the legs it holds: a new leg goes to another host.
@@ -23882,7 +23940,8 @@ impl AppRouter {
         current: &[String],
         hold: &[String],
     ) -> bool {
-        let candidates = self.cache_candidates(stream_id).await;
+        let mut candidates = self.cache_candidates(stream_id).await;
+        charge::charge_udp(&mut candidates);
         let mut legs: Vec<String> = Vec::new();
         for node_id in current {
             if !legs.contains(node_id)
@@ -39244,6 +39303,7 @@ mod tests {
                 bitrate_bps: Some(16_000_000),
                 sessions: 3,
                 video: false,
+                lane_bps: None,
             })
             .into_iter()
             .collect();
@@ -47609,4 +47669,5 @@ mod tests {
     /// copy of the old session in its cache (stuck4k).
     mod stuck_4k;
     mod place_heavy;
+    mod charge_wire;
 }

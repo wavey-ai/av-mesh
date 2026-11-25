@@ -635,6 +635,7 @@ async fn edge_snapshot(node: &str, front: SocketAddr, edge: &LaneEdge, head: u64
             bitrate_bps: Some(bps),
             sessions: 0,
             video: false,
+            lane_bps: None,
         })
         .collect();
     // The edge's own heavy advertisement, as its `local_mesh_snapshot`
@@ -919,6 +920,10 @@ struct Run {
 struct Live {
     node: StdMutex<Option<String>>,
     stop: AtomicBool,
+    /// rm/charge: the live legs held now (not leaving, hedges included).
+    legs: std::sync::atomic::AtomicUsize,
+    /// rm/charge: each change of the legs held: when, the legs, the skips.
+    log: StdMutex<Vec<String>>,
 }
 
 async fn view(
@@ -1002,6 +1007,29 @@ async fn view(
             run.first_node.clone_from(&held);
         }
         *live.node.lock().unwrap() = held;
+        let shape = format!(
+            "{:?} skip {:?}",
+            director
+                .legs()
+                .iter()
+                .map(|leg| (leg.node.clone(), leg.live, leg.leaving.as_ref().map(|l| l.0.clone()), leg.hedge_for.is_some()))
+                .collect::<Vec<_>>(),
+            director.skipped(now),
+        );
+        {
+            let mut log = live.log.lock().unwrap();
+            if log.last().is_none_or(|last| !last.ends_with(&shape)) {
+                log.push(format!("{} {shape}", now_unix_us() / 1_000 % 100_000));
+            }
+        }
+        live.legs.store(
+            director
+                .legs()
+                .iter()
+                .filter(|leg| leg.live && leg.leaving.is_none())
+                .count(),
+            Ordering::Relaxed,
+        );
         let wake = session
             .next_wake()
             .min(director.next_wake())
@@ -1086,6 +1114,13 @@ impl Crowd {
             tokio::time::sleep(spacing).await;
         }
         Self { lives, tasks }
+    }
+
+    fn legs(&self) -> Vec<usize> {
+        self.lives
+            .iter()
+            .map(|live| live.legs.load(Ordering::Relaxed))
+            .collect()
     }
 
     fn nodes(&self) -> Vec<Option<String>> {
@@ -1499,11 +1534,9 @@ async fn a_pcm_stall_and_catch_up_stay_small_and_4k_is_heavy_within_seconds() {
     assert!(sustained_max < 8_000_000, "{sustained_max}");
     for run in &audio_runs {
         // Never cut to one leg for the bit rate: want stays 2 and no
-        // answer granted one leg for it. (A 3 s stall of the source leaves
-        // some listeners of a 2-edge region on one leg for a while: a leg
-        // unanswered in the silence is failed and its edge skipped 30 s,
-        // and no third edge exists (`why=one-edge`): the B rules, not the
-        // class.)
+        // answer granted one leg for it. (rm/charge: nor failed for the
+        // stall itself, see
+        // `after_a_source_stall_listeners_are_back_on_two_legs_within_a_second`.)
         assert_eq!(run.want_at_end, 2, "{:?}", run.replacements);
         assert_eq!(run.stats.short_grants.bitrate, 0, "{:?}", run.stats.short_grants);
         assert!(run.replacements.iter().all(|replacement| {
@@ -1517,6 +1550,61 @@ async fn a_pcm_stall_and_catch_up_stay_small_and_4k_is_heavy_within_seconds() {
     for run in &viewer_runs {
         assert!(run.refused.is_empty(), "{:?}", run.refused);
         assert!(run.parts.len() > 24, "{} parts", run.parts.len());
+    }
+}
+
+/// rm/charge: a 3 s stall of the source in a 2-edge region silences every
+/// edge at once, and the stream's head stops everywhere. No edge is judged
+/// by it (none is skipped as failed): each listener is back on two legs
+/// within about 1 s of the source resuming.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn after_a_source_stall_listeners_are_back_on_two_legs_within_a_second() {
+    let _turn = SERIAL.lock().await;
+    let region = Region::start_with(165, 2, true, 600_000_000, Some(Payload::Pcm), false).await;
+    let sids: Vec<String> = (1..=6).map(|index| format!("stall-{index}")).collect();
+    let audio = Crowd::join(&region, &sids, AUDIO, true, Duration::from_millis(10)).await;
+    until("every listener holds two legs", Duration::from_secs(15), || {
+        audio.legs().iter().all(|legs| *legs >= 2)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    region.stall_audio(Duration::from_secs(3));
+    let resumed = Instant::now() + Duration::from_secs(3);
+    let mut fewest = usize::MAX;
+    while Instant::now() < resumed {
+        fewest = fewest.min(audio.legs().into_iter().min().unwrap_or(0));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Back on two legs: every listener, from the source's resumption.
+    let mut back = vec![None; sids.len()];
+    while Instant::now() < resumed + Duration::from_secs(5) {
+        for (index, legs) in audio.legs().into_iter().enumerate() {
+            if legs >= 2 {
+                back[index].get_or_insert(Instant::now().saturating_duration_since(resumed));
+            } else {
+                back[index] = None;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let logs: Vec<Vec<String>> = audio.lives.iter().map(|live| live.log.lock().unwrap().clone()).collect();
+    let runs = audio.finish().await;
+    region.shutdown().await;
+    eprintln!(
+        "rm/charge stall: fewest legs in the stall {fewest}; back on two legs after {back:?}; skips {:?}",
+        runs.iter()
+            .map(|run| run.replacements.iter().map(|r| r.reason.clone()).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+    );
+    for (run, back) in runs.iter().zip(&back) {
+        let back = back.unwrap_or_else(|| panic!("{} not on two legs: {:?} {logs:#?}", run.sid, run.replacements));
+        assert!(back <= Duration::from_millis(1_200), "{}: {back:?} {:?}", run.sid, run.replacements);
+        assert!(
+            run.replacements.iter().all(|replacement| replacement.reason != "unanswered"),
+            "{}: {:?}",
+            run.sid,
+            run.replacements
+        );
     }
 }
 

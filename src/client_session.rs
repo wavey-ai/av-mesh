@@ -570,6 +570,12 @@ pub struct UdpSession {
     /// of the last report.
     all_silent: bool,
     next_all_silent: Option<Instant>,
+    /// rm/charge: when media came again after no leg brought any for the
+    /// silence (the source stalled, the head moving nowhere): the other
+    /// legs' silence and want of media count from then, not from before
+    /// the stall, so the edge that resumes a moment later is not failed
+    /// for the stall.
+    silence_ended: Option<Instant>,
     silent_for: Duration,
     next_loss_check: Instant,
     /// When the timers last ran: a verdict whose time is not after it was
@@ -672,6 +678,7 @@ impl UdpSession {
             joint_burst: None,
             all_silent: false,
             next_all_silent: None,
+            silence_ended: None,
             silent_for: config.silence,
             next_loss_check: now + LOSS_CHECK,
             polled_at: now,
@@ -1250,8 +1257,11 @@ impl UdpSession {
                     continue;
                 };
                 let (id, key) = (leg.id, leg.key);
-                let quiet = now.saturating_duration_since(leg.last_datagram);
-                let no_media = now.saturating_duration_since(leg.media_since());
+                // A silence that every leg shared is no leg's fault: each is
+                // judged from its end (rm/charge).
+                let shared = self.silence_ended.unwrap_or(leg.added_at);
+                let quiet = now.saturating_duration_since(leg.last_datagram.max(shared));
+                let no_media = now.saturating_duration_since(leg.media_since().max(shared));
                 let here = self.receiver.compact.leg_highest(id);
                 let (mut other_datagram, mut other_delivers, mut other_first, mut ahead) =
                     (false, false, false, false);
@@ -2171,6 +2181,17 @@ impl UdpSession {
     }
 
     fn on_media(&mut self, index: usize, datagram: &[u8], now: Instant) -> Received {
+        // The stream was quiet on every leg (the source stalled: no edge
+        // brought media, whatever controls they sent): its first media
+        // again ends a silence that no leg is judged by (rm/charge).
+        let newest = self
+            .legs_iter()
+            .filter(|leg| leg.is_live())
+            .filter_map(|leg| leg.last_media)
+            .max();
+        if newest.is_some_and(|newest| now.saturating_duration_since(newest) >= self.config.silence) {
+            self.silence_ended = Some(now);
+        }
         self.media_from = Some((index, now));
         let leg = self.legs[index].as_mut().expect("an attributed leg");
         let id = leg.id;
@@ -4372,6 +4393,60 @@ mod tests {
         session.on_datagram(edge(), &part(106), at, &mut sender(&mut sent));
         session.poll_legs(at + Duration::from_millis(150), &mut sender(&mut sent));
         assert!(!events(&mut session).contains(&LegEvent::AllSilent));
+    }
+
+    /// rm/charge: the source stalls, every leg goes silent; when it
+    /// resumes one edge's media comes first. The other leg is judged from
+    /// that moment, not from before the stall: it is not failed while it
+    /// resumes too (a few ms later), and is failed if it stays silent for
+    /// the silence after the first leg resumed.
+    #[test]
+    fn a_silence_every_leg_shared_fails_no_leg_when_one_resumes_first() {
+        let now = Instant::now();
+        let mut session = two_legs(SessionConfig::new(1), 100, now);
+        let mut sent = Sent::new();
+        for number in [100_u64, 101, 102] {
+            for target in [edge(), edge_b()] {
+                session.on_datagram(target, &part(number), now, &mut sender(&mut sent));
+            }
+        }
+        events(&mut session);
+        // Three seconds of nothing from either edge.
+        let mut at = now;
+        while at < now + Duration::from_secs(3) {
+            at = session.next_wake().max(at + Duration::from_micros(100));
+            session.poll_legs(at, &mut sender(&mut sent));
+            for event in events(&mut session) {
+                assert!(matches!(event, LegEvent::AllSilent | LegEvent::HedgeDue(_)), "{event:?}");
+            }
+        }
+        // Edge A resumes; edge B 30 ms later.
+        let resumed = at;
+        session.on_datagram(edge(), &part(103), resumed, &mut sender(&mut sent));
+        session.poll_legs(resumed + Duration::from_millis(1), &mut sender(&mut sent));
+        session.on_datagram(edge(), &part(104), resumed + Duration::from_millis(2), &mut sender(&mut sent));
+        session.poll_legs(resumed + Duration::from_millis(20), &mut sender(&mut sent));
+        assert!(!held(&session, B).is_failed(), "{:?}", events(&mut session));
+        session.on_datagram(edge_b(), &part(103), resumed + Duration::from_millis(30), &mut sender(&mut sent));
+        session.on_datagram(edge_b(), &part(104), resumed + Duration::from_millis(30), &mut sender(&mut sent));
+        let mut at = resumed + Duration::from_millis(30);
+        for number in 105_u64..150 {
+            at += Duration::from_millis(1);
+            for target in [edge(), edge_b()] {
+                session.on_datagram(target, &part(number), at, &mut sender(&mut sent));
+            }
+            session.poll_legs(at, &mut sender(&mut sent));
+        }
+        assert!(!held(&session, A).is_failed() && !held(&session, B).is_failed());
+        assert!(!events(&mut session).iter().any(|event| matches!(event, LegEvent::Failed { .. })));
+        // A leg that stays silent after the other resumed is an edge fault.
+        let mut at = at;
+        for number in 150_u64..500 {
+            at += Duration::from_millis(1);
+            session.on_datagram(edge(), &part(number), at, &mut sender(&mut sent));
+            session.poll_legs(at, &mut sender(&mut sent));
+        }
+        assert!(held(&session, B).is_failed() || session.leg(B, at).is_none());
     }
 
     /// B X5: a leg with no `TOKEN` in its own token wait is passed over

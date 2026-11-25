@@ -678,6 +678,12 @@ pub(crate) struct Heavy {
     reservations: Mutex<Vec<Reservation>>,
     admit: Mutex<()>,
     next_reservation: AtomicU64,
+    /// rm/charge: each stream's lane charges with their hysteresis, the
+    /// compact lane's last count of parts and extra datagrams (and the ratio
+    /// it gave), and the client symbol size.
+    pub(crate) charges: Mutex<HashMap<u64, crate::charge::ChargeTracker>>,
+    pub(crate) compact_mark: Mutex<(u64, u64, f64)>,
+    symbol_size: std::sync::atomic::AtomicU16,
 }
 
 impl std::fmt::Debug for Heavy {
@@ -706,7 +712,19 @@ impl Heavy {
             reservations: Mutex::default(),
             admit: Mutex::default(),
             next_reservation: AtomicU64::new(1),
+            charges: Mutex::default(),
+            compact_mark: Mutex::new((0, 0, 0.0)),
+            symbol_size: std::sync::atomic::AtomicU16::new(av_mesh::client_udp::DEFAULT_SYMBOL_SIZE),
         }
+    }
+
+    /// rm/charge: the client UDP symbol size (`--client-udp-symbol-size`).
+    pub(crate) fn client_symbol_size(&self) -> u16 {
+        self.symbol_size.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_client_symbol_size(&self, size: u16) {
+        self.symbol_size.store(size, Ordering::Relaxed);
     }
 
     /// The reservations that still stand.

@@ -1165,6 +1165,7 @@ fn holder_snapshot(
             sessions: 1,
             request_rate: None,
             video,
+            lane_bps: None,
         })
         .collect();
     snapshot.edge_service = Some(edge);
