@@ -2518,7 +2518,8 @@ struct Args {
     #[arg(long, env = "NEEDLETAIL_NODE_WARM_FILE")]
     node_warm_file: Option<PathBuf>,
 
-    /// Wave 9 (cold start): glibc's heap trim threshold fixed at 256 MB and
+    /// Wave 9 (cold start): glibc's heap trim threshold fixed (16 MiB since
+    /// mem2; 256 MiB kept every thread arena's freed top for good) and its
     /// mmap threshold at 32 MB, so freed memory stays in the heaps for the
     /// next allocation instead of going back to the kernel and returning as
     /// page faults. `false`: glibc's dynamic thresholds, as before.
@@ -9349,7 +9350,18 @@ fn spawn_memory_guard(cache: Arc<LiveTsCache>, idle_ms: u64) {
         loop {
             ticks.tick().await;
             let rss = av_mesh::mem_guard::rss_bytes();
-            let tick = memory.guard.tick(rss, cache.chunk_cache.held_bytes());
+            // The pinned rings and the cache's slot index are fixed; the
+            // heap beyond them and the parts is watched for growth (mem2).
+            let fixed = memory::locked_bytes().saturating_add(cache.ring_index_bytes());
+            // The repair stores are accounted too (integration 6): what
+            // they hold is not the unaccounted heap.
+            let stores = av_mesh::mem_guard::store_totals().held_bytes();
+            let tick = memory.guard.tick_with_accounts(
+                rss,
+                cache.chunk_cache.held_bytes(),
+                fixed,
+                stores,
+            );
             if tick.changed {
                 warn!(
                     state = ?tick.state,
@@ -9375,10 +9387,10 @@ fn spawn_memory_guard(cache: Arc<LiveTsCache>, idle_ms: u64) {
             // follow the state too, shed here on the guard's own task.
             let repair_shed = av_mesh::mem_guard::stores_pass(tick.state);
             if tick.trim || repair_shed >= av_mesh::mem_guard::TRIM_AFTER_RELEASE_BYTES {
-                if let Ok(returned) =
-                    tokio::task::spawn_blocking(av_mesh::mem_guard::trim).await
+                if let Ok(trimmed) =
+                    tokio::task::spawn_blocking(av_mesh::mem_guard::trim_measured).await
                 {
-                    memory.guard.note_trim(returned);
+                    memory.guard.note_trim_measured(trimmed);
                 }
             }
         }
@@ -9629,6 +9641,17 @@ impl LiveTsCache {
             memory_guard: OnceLock::new(),
             node_runtime: tokio::runtime::Handle::try_current().ok(),
         })
+    }
+
+    /// The bytes of the cache's slot index: every playlist's ring of slots,
+    /// allocated at start (mem2: 134 bytes a slot, measured; 261 MB for 16
+    /// playlists of 132,000 slots).
+    fn ring_index_bytes(&self) -> u64 {
+        let options = &self.chunk_cache.options;
+        (options.num_playlists as u64)
+            .saturating_mul(options.max_parts_per_segment as u64)
+            .saturating_mul(options.max_segments as u64)
+            .saturating_mul(RING_SLOT_INDEX_BYTES)
     }
 
     fn stream_classes(&self) -> &fast_plane::StreamClasses {
@@ -13837,6 +13860,10 @@ struct CacheByteBudget {
     /// streams that hold at least [`LARGE_STREAM_BYTES`].
     node: u64,
 }
+
+/// The bytes of one cache ring slot's index (its lock, its slot and its
+/// tag), as the memory bench measures them.
+const RING_SLOT_INDEX_BYTES: u64 = 134;
 
 /// Above the memory guard's soft limit, a new playlist whose first part is
 /// this large or larger is refused.
