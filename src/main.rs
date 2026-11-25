@@ -1509,6 +1509,84 @@ struct Args {
     )]
     relay_loss_report: bool,
 
+    /// 4k-repair: a node asks its fast-plane parents for what a video part
+    /// lacks once the parent has moved on (RLQ1: "N more symbols of part
+    /// X", or a part of which nothing came), again after the measured round
+    /// trip; and keeps each video part it decoded to answer its children
+    /// with fresh repair symbols of it (RLA1 and the symbols). Needs
+    /// --relay-class-threads. The children's video sessions must admit
+    /// repair from each parent (the deploy's promoted parents).
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_PART_REPAIR",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_part_repair: bool,
+
+    /// 4k-repair: each fast-plane child gets a video ledger (RLL1) and
+    /// reports the loss of its lane (RLR1); a video part decoded here is
+    /// sent, after its forwarded symbols, with fresh repair sized to each
+    /// lossy child's measured loss (none on a clean link).
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_LINK_REPAIR",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_link_repair: bool,
+
+    /// 4k-repair: the round trip to a parent assumed until one is measured
+    /// (answers echo each ask's time; a parent is probed every 500 ms).
+    #[arg(long, env = "NEEDLETAIL_RELAY_PART_REPAIR_RTT_MS", default_value_t = 50)]
+    relay_part_repair_rtt_ms: u64,
+
+    /// 4k-repair: the video thread forwards a part's upstream repair to the
+    /// children that take this node's sources only up to what the part
+    /// lacks here, and a margin (repair-only children take it all): each
+    /// hop's link repair covers its own link, so repair no longer grows
+    /// with the hops.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_TRIM_FORWARDED_REPAIR",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_trim_forwarded_repair: bool,
+
+    /// 4k-repair: a part decoded here goes, before its link repair, to the
+    /// children that take this node's sources with the source symbols it
+    /// lacked (byte for byte its source's), so that below a lossy link a
+    /// node gets whole sources and needs no decode.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_REGENERATE_SOURCES",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    relay_regenerate_sources: bool,
+
+    /// 4k-repair: with --relay-regenerate-sources, forward source-taking
+    /// children only the trim's margin of upstream repair: below a lossy
+    /// link they wait for this node's decode and need none of their own
+    /// (less processor time at edges, a decode's time more latency on a
+    /// damaged part). Off (the default): they also get the upstream repair
+    /// of what the part lacks here, and decode as soon as they hold K.
+    #[arg(
+        long,
+        env = "NEEDLETAIL_RELAY_TRIM_TO_MARGIN",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    relay_trim_to_margin: bool,
+
+    /// 4k-repair: workers that run RaptorQ decodes of damaged parts off the
+    /// tees, at the tee's nice value (+10), unpinned. Default: the node's
+    /// CPUs less the two class threads, at least 1, at most 4 (1 on a
+    /// 2-vCPU node). 0 decodes on the tees.
+    #[arg(long, env = "NEEDLETAIL_RELAY_DECODE_WORKERS")]
+    relay_decode_workers: Option<usize>,
+
     /// Wave 7 item 5: renditions of one source, `;`-separated groups of
     /// `,`-separated stream ids (the DAW lane's FLAC, Opus and PCM from base
     /// stream 2001 are "2001,3001,4001"). A forwarder sends a rendition of a
@@ -4470,6 +4548,25 @@ async fn main() -> Result<()> {
         socket_buffer_bytes: args.udp_socket_buffer_bytes,
         video_socket_buffer_ms: args.relay_video_socket_buffer_ms,
         video_socket_buffer_max_bytes: args.relay_video_socket_buffer_max_mb.saturating_mul(1 << 20),
+        part_repair: (args.relay_part_repair || args.relay_link_repair).then(|| {
+            fast_plane::part_repair::PartRepair::start(
+                fast_plane::part_repair::PartRepairConfig {
+                    requests: args.relay_part_repair,
+                    link_repair: args.relay_link_repair,
+                    initial_rtt_us: args.relay_part_repair_rtt_ms.saturating_mul(1_000),
+                    window: fast_plane::part_repair::window_for(&node_id),
+                    deadline_us: args.relay_media_deadline_us(),
+                    regenerate_sources: args.relay_regenerate_sources,
+                },
+                relay_session::RelayLimits::default(),
+            )
+        }),
+        trim_forwarded_repair: args.relay_trim_forwarded_repair,
+        trim_to_margin: args.relay_trim_to_margin,
+        decode_pool: fast_plane::decode_pool::DecodePool::start(
+            args.relay_decode_workers
+                .unwrap_or_else(fast_plane::decode_pool::default_workers),
+        ),
         ..Default::default()
     };
     let fec_ingest_task = match (fec_socket, class_sockets) {
@@ -6561,6 +6658,9 @@ struct RelayForwardPath {
     warm_sources: [StdMutex<WarmSourceReplayBuffer>; 2],
     /// The child's last demand report (`RLD1`, wave 7 item 5).
     demand: fast_plane::demand::DemandSlot,
+    /// Datagrams each class thread handed the kernel for this child, by
+    /// class: the counts of its ledgers (`RLL1`, 4k-repair link repair).
+    sent: [AtomicU64; 2],
 }
 
 struct RelayDownstreamForwarder {
@@ -6615,6 +6715,9 @@ struct RelayDownstreamForwarder {
     /// whose child does not read them. Unset or empty: none.
     demand_groups: OnceLock<fast_plane::demand::RenditionGroups>,
     hop_journal: OnceLock<Arc<HopJournal>>,
+    /// The node's part repair (4k-repair): the demand readers hand it the
+    /// children's asks and loss reports.
+    part_repair: OnceLock<Arc<fast_plane::part_repair::PartRepair>>,
     /// Children whose non-blocking send a test reports as full, as a bit
     /// set of path indexes.
     #[cfg(test)]
@@ -6755,6 +6858,7 @@ impl RelayDownstreamForwarder {
                     })
                 }),
                 demand: Default::default(),
+                sent: [AtomicU64::new(0), AtomicU64::new(0)],
             });
         }
         Ok(Some(Arc::new(Self {
@@ -6792,6 +6896,7 @@ impl RelayDownstreamForwarder {
             warm_hold_us: AtomicU64::new(DEFAULT_RELAY_MEDIA_DEADLINE_MS * 1_000),
             demand_groups: OnceLock::new(),
             hop_journal: OnceLock::new(),
+            part_repair: OnceLock::new(),
             #[cfg(test)]
             test_would_block: AtomicU64::new(0),
             #[cfg(test)]
@@ -7122,6 +7227,14 @@ impl RelayDownstreamForwarder {
                             tokio::time::sleep(Duration::from_millis(50)).await;
                             continue;
                         };
+                        // A child's ask or loss report (4k-repair).
+                        if let Some(repair) = forwarder.part_repair.get() {
+                            let via: Arc<dyn fast_plane::part_repair::SendSocket> =
+                                Arc::clone(&socket) as _;
+                            if repair.handle_child_datagram(&via, from, &buf[..len]) {
+                                continue;
+                            }
+                        }
                         let Some(streams) = fast_plane::demand::decode_demand(&buf[..len]) else {
                             continue;
                         };
@@ -46955,7 +47068,12 @@ mod tests {
                 socket_buffer_bytes: 4 << 20,
                 video_socket_buffer_ms: 0,
                 video_socket_buffer_max_bytes: 0,
+                part_repair: None,
+                decode_pool: None,
+                trim_to_margin: false,
+                trim_forwarded_repair: true,
                 test_tee_panic: Some(fast_plane::TrafficClass::Audio),
+                test_tees_on_caller_runtime: false,
                 test_video_tee_spin_ns: 0,
                 test_alloc_counter: None,
                 test_video_alloc_counter: None,
@@ -47439,6 +47557,11 @@ mod tests {
     /// bounds, the release of a replaced or quiet stream, the memory guard,
     /// and the in-process memory bench.
     mod memory_bound;
+
+    /// 4k-repair: a 4K stream through contributor, forwarder, long-haul
+    /// forwarder, edge and viewer over impaired links, repaired by asks,
+    /// answers and link repair.
+    mod part_repair_chain;
 
     /// Edge capacity (wave 7, item 10): listeners of 1 ms parts per edge,
     /// and an ingest that never drops for the fan-out.

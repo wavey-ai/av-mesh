@@ -277,6 +277,8 @@ impl Ingress {
             lease_descriptors: false,
             video_gro: false,
             media_deadline_us: BUDGET,
+            trim_repair: false,
+            trim_regenerated: false,
             epochs: Arc::clone(&epochs),
             feeds: Arc::clone(&feeds),
             test_alloc_counter: None,

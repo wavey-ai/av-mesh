@@ -14,12 +14,14 @@
 //! back, and a stall of the runtime never stops forwarding.
 
 pub mod burst_copy;
+pub mod decode_pool;
 pub mod dedup;
 pub mod demand;
 pub mod edge_clients;
 pub mod lease;
 pub mod loss_report;
 pub mod parent_feeds;
+pub mod part_repair;
 /// Compiled in the library, whose relay ingress keeps a table of them too.
 pub use av_mesh::media_clock;
 pub mod relay;

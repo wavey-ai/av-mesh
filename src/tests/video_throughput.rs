@@ -120,7 +120,7 @@ impl Frame {
 /// The canonical envelope of 4K frame `sequence` of `media_bytes`, as
 /// av-contrib's `build_fmp4_media_object` builds it, at `fps` frames a
 /// second.
-fn frame_envelope(stream_id: u64, sequence: u64, media_bytes: usize, fps: u64) -> Vec<u8> {
+pub(super) fn frame_envelope(stream_id: u64, sequence: u64, media_bytes: usize, fps: u64) -> Vec<u8> {
     let mut media = vec![0_u8; media_bytes];
     for (index, byte) in media.iter_mut().enumerate() {
         *byte = ((index as u64 * 31 + sequence * 7) % 251) as u8;
@@ -566,7 +566,7 @@ fn delivery(
 
 /// W3_PTRACER=1 lets a sampling profiler that is not this process's parent
 /// (eu-stack) read the stacks of its threads.
-fn allow_sampling() {
+pub(super) fn allow_sampling() {
     if std::env::var_os("W3_PTRACER").is_some() {
         // SAFETY: prctl with integer arguments only.
         unsafe { libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY, 0, 0, 0) };
@@ -665,6 +665,9 @@ pub(super) fn forward_4k(mbps: u64, seconds: u64, children: usize, gso: bool) ->
             ParentPath::PromotedSecondary,
             &targets,
             fast_plane::relay::RelayClassConfig {
+                // Every symbol to the children, as before 4k-repair's trim: these
+                // measure forwarding and the tee, and count each repair symbol.
+                trim_forwarded_repair: false,
                 port_offset: OFFSET,
                 cpus: [None, None],
                 realtime: false,
@@ -1173,6 +1176,9 @@ async fn children_of_a_shared_socket_take_4k_as_gso_messages() {
         ParentPath::PromotedSecondary,
         &endpoints,
         fast_plane::relay::RelayClassConfig {
+            // Every symbol to the children, as before 4k-repair's trim: these
+            // measure forwarding and the tee, and count each repair symbol.
+            trim_forwarded_repair: false,
             port_offset: OFFSET,
             cpus: [None, None],
             realtime: false,

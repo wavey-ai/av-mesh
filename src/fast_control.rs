@@ -17,6 +17,7 @@
 
 use crate::fast_plane::lease::{LeaseChild, LeaseChildren};
 use crate::fast_plane::parent_feeds::ParentFeeds;
+use crate::fast_plane::part_repair::{PartRepair, SendSocket};
 use crate::fast_plane::relay::{FailoverInputs, FastPlaneStats};
 use crate::fast_plane::{sys, TrafficClass};
 use crate::{
@@ -311,6 +312,7 @@ pub(crate) fn spawn_lease_inbound_drain(
         .filter_map(|socket| tokio::net::UdpSocket::from_std(socket).ok())
         .map(|socket| {
             let lease = Arc::clone(lease);
+            let socket = Arc::new(socket);
             let mut shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0_u8; 2_048];
@@ -318,8 +320,13 @@ pub(crate) fn spawn_lease_inbound_drain(
                     tokio::select! {
                         _ = shutdown.changed() => return,
                         received = socket.recv_from(&mut buf) => {
-                            if received.is_ok() {
+                            if let Ok((len, from)) = received {
                                 lease.stats.inbound.fetch_add(1, Ordering::Relaxed);
+                                // A child's ask or loss report (4k-repair).
+                                if let Some(repair) = lease.part_repair.get() {
+                                    let via: Arc<dyn SendSocket> = Arc::clone(&socket) as _;
+                                    repair.handle_child_datagram(&via, from, &buf[..len]);
+                                }
                             } else {
                                 tokio::time::sleep(Duration::from_millis(50)).await;
                             }
@@ -500,5 +507,81 @@ mod mesh_socket_buffer_tests {
         off.turn(&[("class", Arc::clone(&socket), 0)], second);
         off.turn(&[("class", Arc::clone(&socket), 50_000_000)], second);
         assert_eq!(off.lane("class").unwrap().asked, floor);
+    }
+}
+
+/// Wake each tee's part repair asks every 2 ms (4k-repair): an ask is
+/// due a few ms after its part's parent moved on, which a tee that has no
+/// datagram to take would not see.
+pub(crate) async fn run_part_repair_tick(
+    ticks: Vec<Arc<tokio::sync::Notify>>,
+    mut shutdown_rx: watch::Receiver<()>,
+) {
+    let mut every = tokio::time::interval(Duration::from_millis(2));
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => return,
+            _ = every.tick() => {
+                for tick in &ticks {
+                    tick.notify_one();
+                }
+            }
+        }
+    }
+}
+
+/// How often each child gets its ledger.
+const CHILD_LEDGER_EVERY: Duration = Duration::from_millis(250);
+
+/// Send each fast-plane child its ledger on each lane (`RLL1`, 4k-repair): the
+/// datagrams handed to the kernel for it so far (forwarded, and the repair
+/// thread's), from the socket they leave from, four times a second. The
+/// child's video thread measures the lane's loss against it and reports it
+/// (`RLR1`), which sizes the child's link repair here.
+pub(crate) async fn run_child_ledgers(
+    forwarder: Option<Arc<crate::RelayDownstreamForwarder>>,
+    lease: Option<Arc<LeaseChildren>>,
+    repair: Arc<PartRepair>,
+    mut shutdown_rx: watch::Receiver<()>,
+) {
+    let mut every = tokio::time::interval(CHILD_LEDGER_EVERY);
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => return,
+            _ = every.tick() => {}
+        }
+        let mut sent = 0_u64;
+        if let Some(forwarder) = &forwarder {
+            for (fd, target, count) in forwarder.ledgers() {
+                let count = count + repair.extra_sent(target);
+                let ledger = crate::fast_plane::loss_report::encode_ledger(count);
+                if sys::send_batch(fd, 1, |_| (&ledger[..], target)).unwrap_or(0) == 1 {
+                    sent += 1;
+                }
+            }
+        }
+        if let Some(lease) = &lease {
+            let snapshot = lease.load();
+            let mut done: Vec<std::net::SocketAddr> = Vec::new();
+            for class in TrafficClass::ALL {
+                let fd = lease.fd(class);
+                for child in snapshot.children.iter() {
+                    let target = child.targets[class.index()];
+                    if done.contains(&target) {
+                        continue;
+                    }
+                    done.push(target);
+                    let count = child.sent[class.index()].load(Ordering::Relaxed)
+                        + repair.extra_sent(target);
+                    let ledger = crate::fast_plane::loss_report::encode_ledger(count);
+                    if sys::send_batch(fd, 1, |_| (&ledger[..], target)).unwrap_or(0) == 1 {
+                        sent += 1;
+                    }
+                }
+            }
+        }
+        repair.stats.ledgers.fetch_add(sent, Ordering::Relaxed);
     }
 }

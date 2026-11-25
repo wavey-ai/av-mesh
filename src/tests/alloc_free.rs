@@ -514,6 +514,9 @@ async fn a_forwarder_s_video_thread_allocates_frees_and_faults_nothing_once_it_r
             cpus: [None, None],
             realtime: false,
             lease: Some(Arc::clone(&lease)),
+            // The video thread measures its lanes against ledgers too
+            // (4k-repair): the meters and their reports are in the count.
+            loss_report: true,
             test_video_alloc_counter: Some(counter),
             ..Default::default()
         },
@@ -538,13 +541,24 @@ async fn a_forwarder_s_video_thread_allocates_frees_and_faults_nothing_once_it_r
     let repair_target = repair_child.local_addr().unwrap();
     let start = Instant::now();
     let interval = Duration::from_micros(41_667);
+    let (mut primary_sent, mut secondary_sent) = (0_u64, 0_u64);
     for (index, frame) in frames_a.iter().enumerate() {
         tokio::time::sleep_until((start + interval * index as u32).into()).await;
         // The primary lane takes the sources, the promoted secondary all.
         send_all(primary_fd, primary_video, &frame.datagrams[..frame.sources]).await;
         send_all(secondary_fd, secondary_video, &frame.datagrams).await;
+        primary_sent += frame.sources as u64;
+        secondary_sent += frame.datagrams.len() as u64;
         if index >= 36 {
             send_all(secondary_fd, secondary_video, &frames_b[index - 36].datagrams).await;
+            secondary_sent += frames_b[index - 36].datagrams.len() as u64;
+        }
+        // Each lane's ledger (RLL1), every few parts.
+        if index % 6 == 5 {
+            let ledger = fast_plane::loss_report::encode_ledger(primary_sent);
+            send_all(primary_fd, primary_video, &[ledger.to_vec()]).await;
+            let ledger = fast_plane::loss_report::encode_ledger(secondary_sent);
+            send_all(secondary_fd, secondary_video, &[ledger.to_vec()]).await;
         }
         match index {
             12 => lease.rebuild(&[served(primary_ip, stream_a), served(warm_ip, stream_a)]),
@@ -593,7 +607,13 @@ async fn a_forwarder_s_video_thread_allocates_frees_and_faults_nothing_once_it_r
         .chain(&frames_b)
         .map(|frame| frame.datagrams.len() as u64)
         .sum();
-    assert!(all >= symbols, "{all} of {symbols} at the child of every symbol");
+    // Every symbol, but the upstream repair that the part did not need
+    // here (4k-repair's trim, which this thread runs too).
+    assert!(
+        all + stats.repair_trimmed >= symbols,
+        "{all} and {} trimmed of {symbols} at the child of every symbol",
+        stats.repair_trimmed
+    );
     assert!(repair > 0 && primary > 0 && warm > 0, "{repair} {primary} {warm}");
     assert!(stats.duplicates > 0, "{stats:?}");
     assert_eq!(stats.tee_dropped, 0, "{stats:?}");
@@ -603,6 +623,7 @@ async fn a_forwarder_s_video_thread_allocates_frees_and_faults_nothing_once_it_r
     assert_eq!(stats.lease_children.warm_refused, 0, "{stats:?}");
     assert!(snapshot.warm_source_replayed_datagrams > 0, "{snapshot:?}");
     assert_eq!(snapshot.warm_source_refused_datagrams, 0, "{snapshot:?}");
+    assert!(stats.loss_reports > 0, "the video lanes were measured: {stats:?}");
     watched.assert_nothing(72);
 }
 
